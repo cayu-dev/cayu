@@ -174,6 +174,35 @@ def test_runner_workspace_reads_writes_and_lists_through_runner(tmp_path) -> Non
     assert list_result.truncated is False
 
 
+def test_runner_workspace_drops_identity_from_a_partial_remote_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def inconsistent_guard_read(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        return (
+            b"abc",
+            6,
+            "sha256:" + ("a" * 64),
+            "a" * 64,
+            "100644",
+        )
+
+    monkeypatch.setattr(runner_workspace_module, "guard_read", inconsistent_guard_read)
+    workspace = RunnerWorkspace(
+        _ListResultRunner({"ok": True, "paths": [], "total_count": 0}),
+        workspace_id="partial-identity-runner",
+    )
+
+    result = asyncio.run(workspace.read_bytes("changed.txt", max_bytes=3))
+
+    assert result.content == b"abc"
+    assert result.total_bytes == 6
+    assert result.truncated is True
+    assert result.revision is None
+    assert result.sha256 is None
+    assert result.git_mode is None
+
+
 def test_runner_workspace_lists_regular_files_and_symlinks_without_following(
     tmp_path: Path,
 ) -> None:

@@ -40,6 +40,7 @@ from tests.core.task_store_conformance import (
     assert_worker_terminalization_generation_conformance,
 )
 from tests.core.task_terminalization_conformance import (
+    assert_attached_task_recovery_terminalization_conformance,
     assert_live_ordinary_cancellation_conformance,
     assert_owner_lost_ordinary_cancellation_reconciliation_conformance,
     assert_recovered_continuation_terminalization_conformance,
@@ -2115,6 +2116,13 @@ def test_postgres_task_store_live_ordinary_cancellation_conformance(postgres_dsn
 def test_postgres_recovered_continuations_terminalize_all_ordinary_kinds(postgres_dsn):
     async def ops(store):
         await assert_recovered_continuation_terminalization_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_attached_task_recovery_terminalization_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_attached_task_recovery_terminalization_conformance(store)
 
     _run(postgres_dsn, ops)
 

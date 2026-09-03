@@ -4829,6 +4829,50 @@ class _EgressTeardownBinding(WorkspaceBinding):
     def _requires_mutation_quiescence(self, bound: BoundWorkspace) -> bool:
         return self._inner._requires_mutation_quiescence(bound)
 
+    def _completion_requires_successful_finalization(self, bound: BoundWorkspace) -> bool:
+        return self._inner._completion_requires_successful_finalization(bound)
+
+    def _completion_finalization_recovery_state(
+        self,
+        bound: BoundWorkspace,
+    ) -> dict[str, Any] | None:
+        return self._inner._completion_finalization_recovery_state(bound)
+
+    async def _recover_completion_finalization(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None,
+        environment_name: str | None,
+        recovery_state: dict[str, Any],
+    ) -> BoundWorkspace:
+        self._runner.begin_workspace_binding()
+        admission_active = True
+        try:
+            bound = await self._inner._recover_completion_finalization(
+                workspace,
+                runner,
+                session_id=session_id,
+                agent_name=agent_name,
+                environment_name=environment_name,
+                recovery_state=recovery_state,
+            )
+            requires_mutation_quiescence = self._inner._requires_mutation_quiescence(bound)
+            workspace_owner_key = bound.state_key or f"bound:{id(bound)}"
+            self._runner.finish_workspace_binding(
+                require_mutation_quiescence=requires_mutation_quiescence,
+                workspace_owner_key=(workspace_owner_key if requires_mutation_quiescence else None),
+            )
+            admission_active = False
+            return bound
+        finally:
+            if admission_active:
+                self._runner.finish_workspace_binding(
+                    require_mutation_quiescence=False,
+                )
+
     def abandon(self, bound: BoundWorkspace) -> bool:
         """Release inner retry ownership only after managed execution is quiescent."""
 

@@ -22,6 +22,7 @@ from cayu import (
     DockerImageIdentity,
     DockerWorkloadRestrictions,
     DockerWorkspaceTransferLimits,
+    EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     ExecCommand,
@@ -42,7 +43,7 @@ from cayu.runners.docker import (
     DockerRunner,
     DockerRuntimeConfigurationError,
 )
-from cayu.workspaces import LocalWorkspace, RunnerWorkspace
+from cayu.workspaces import LocalWorkspace, RunnerWorkspace, WorkspaceMutationResult
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimits,
     observe_deterministic_workspace,
@@ -153,6 +154,29 @@ class _LocalDockerRunner(DockerRunner):
     async def exec_stream(self, command, **kwargs: Any):
         kwargs["cwd"] = None
         return await self.local.exec_stream(command, **kwargs)
+
+
+def test_docker_runner_workspace_partial_read_drops_complete_file_identity(
+    tmp_path: Path,
+) -> None:
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    (target_root / "candidate.patch").write_bytes(b"0123456789abcdef")
+    workspace = RunnerWorkspace(
+        _LocalDockerRunner(target_root),
+        workspace_id="docker-target",
+        python_executable=sys.executable,
+    )
+
+    result = asyncio.run(workspace.read_bytes("candidate.patch", max_bytes=4))
+
+    assert result.content == b"0123"
+    assert result.total_bytes == 16
+    assert result.truncated is True
+    assert result.offset == 0
+    assert result.revision is None
+    assert result.sha256 is None
+    assert result.git_mode is None
 
 
 def _coding_product_test_binding(
@@ -858,6 +882,73 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
     assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
 
 
+def test_docker_coding_factory_reconnects_exact_preserved_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    restrictions = DockerWorkloadRestrictions()
+    calls: list[list[str]] = []
+
+    async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
+        del kwargs
+        calls.append(command.argv)
+        docker_args = command.argv[1:]
+        if docker_args[0] == "run":
+            return ExecResult(stdout=_CONTAINER_ID)
+        if docker_args[0] == "inspect":
+            return ExecResult(stdout=json.dumps(_inspection(restrictions)))
+        if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
+            return ExecResult(stdout=restrictions.user)
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path),
+        image_identity=_image_identity(),
+        restrictions=restrictions,
+        docker_path="/usr/bin/docker",
+    )
+    create_request = EnvironmentFactoryRequest(
+        session_id="reconnect",
+        agent_name="agent",
+        environment_name="coding",
+    )
+
+    async def run() -> None:
+        created = await factory.create(create_request)
+        assert created.reconnect_metadata["container_id"] == _CONTAINER_ID
+        assert len(created.reconnect_metadata["allocation_fingerprint"]) == 64
+        assert created.release is not None
+        await created.release(EnvironmentFactoryReleaseAction.PRESERVE)
+        assert not any(call[1:3] == ["rm", "-f"] for call in calls)
+
+        reconnect_request = replace(
+            create_request,
+            operation=EnvironmentFactoryOperation.RECONNECT,
+            reconnect_metadata=created.reconnect_metadata,
+        )
+        candidate = factory.execution_admission_candidate(reconnect_request)
+        assert candidate.evidence.claim_for("reconnect").state == "declared"  # type: ignore[union-attr]
+        reconnected = await factory.create(reconnect_request)
+        assert reconnected.reconnect_metadata == created.reconnect_metadata
+        assert reconnected.environment.runner is not None
+        assert reconnected.environment.runner.container_id == _CONTAINER_ID
+        assert (
+            reconnected.environment.runner.execution_capability_evidence()
+            .claim_for("reconnect")
+            .state
+            == "live_verified"
+        )
+        assert reconnected.release is not None
+        await reconnected.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(run())
+
+    assert sum(call[1] == "run" for call in calls) == 1
+    assert sum(call[1] == "inspect" for call in calls) == 2
+    assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
+
+
 def test_docker_coding_factory_structurally_refuses_a_missing_final_executable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -983,6 +1074,149 @@ def test_revision_aware_sync_reports_partial_publication(
     asyncio.run(run())
     assert (source_root / "a.txt").read_text(encoding="utf-8") == "a1"
     assert (source_root / "b.txt").read_text(encoding="utf-8") == "b0"
+
+
+def test_revision_aware_sync_recovery_never_overwrites_concurrent_source_change(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("a0", encoding="utf-8")
+    (source_root / "b.txt").write_text("b0", encoding="utf-8")
+
+    class FailOnceLocalWorkspace(LocalWorkspace):
+        fail_once = True
+
+        async def replace_bytes(
+            self,
+            path: str,
+            content: bytes,
+            *,
+            expected_revision: str,
+        ) -> WorkspaceMutationResult:
+            if path == "b.txt" and self.fail_once:
+                self.fail_once = False
+                raise OSError("injected copy-back failure for b.txt")
+            return await super().replace_bytes(
+                path,
+                content,
+                expected_revision=expected_revision,
+            )
+
+    source = FailOnceLocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(
+        target_workspace=target,
+        max_file_bytes=1024,
+        max_total_bytes=4096,
+        source_conflict_policy="require_revision",
+    )
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="initial-owner")
+        await target.write_bytes("a.txt", b"a1")
+        await target.write_bytes("b.txt", b"b1")
+        with pytest.raises(SyncBindingSourceConflictError):
+            await binding.finalize(bound, outcome="completed")
+        recovery_state = binding._completion_finalization_recovery_state(bound)
+        assert recovery_state is not None
+
+        await source.write_bytes("b.txt", b"external-change")
+        recovered_binding = SyncBinding(
+            target_workspace=target,
+            max_file_bytes=1024,
+            max_total_bytes=4096,
+            source_conflict_policy="require_revision",
+        )
+        recovered = await recovered_binding._recover_completion_finalization(
+            source,
+            None,
+            session_id="recovered-owner",
+            agent_name="agent",
+            environment_name="environment",
+            recovery_state=recovery_state,
+        )
+        try:
+            with pytest.raises(SyncBindingSourceConflictError) as caught:
+                await recovered_binding.finalize(recovered, outcome="completed")
+            assert caught.value.path == "b.txt"
+            assert caught.value.applied_paths == ("a.txt",)
+            retried = await recovered_binding._recover_completion_finalization(
+                source,
+                None,
+                session_id="recovered-owner",
+                agent_name="agent",
+                environment_name="environment",
+                recovery_state=recovery_state,
+            )
+            assert retried.state_key == recovered.state_key
+            with pytest.raises(SyncBindingSourceConflictError):
+                await recovered_binding.finalize(retried, outcome="completed")
+        finally:
+            recovered_binding.abandon(recovered)
+            binding.abandon(bound)
+
+    asyncio.run(run())
+
+    assert (source_root / "a.txt").read_text(encoding="utf-8") == "a1"
+    assert (source_root / "b.txt").read_text(encoding="utf-8") == "external-change"
+
+
+def test_docker_coding_recovery_restores_fresh_binding_authority(tmp_path: Path) -> None:
+    source_root = tmp_path / "source-docker-recovery"
+    target_root = tmp_path / "target-docker-recovery"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "code.py").write_text("value = 1\n", encoding="utf-8")
+    runner = _LocalDockerRunner(target_root)
+    source = LocalWorkspace(
+        source_root,
+        workspace_id="docker-recovery-source",
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+    )
+
+    def binding() -> DockerCodingWorkspaceBinding:
+        return DockerCodingWorkspaceBinding(
+            target_workspace=RunnerWorkspace(
+                runner,
+                workspace_id="docker-recovery-target",
+                python_executable=sys.executable,
+                excluded_directory_names=(".cayu", ".git", ".runtime"),
+            ),
+            limits=DockerWorkspaceTransferLimits(
+                max_file_bytes=1024,
+                max_total_bytes=4096,
+                max_archive_bytes=64 * 1024,
+            ),
+        )
+
+    async def run() -> None:
+        original = binding()
+        bound = await original.bind(source, runner, session_id="docker-recovery-session")
+        assert bound.workspace is not None
+        await bound.workspace.write_bytes("code.py", b"value = 2\n")
+        recovery_state = original._completion_finalization_recovery_state(bound)
+        assert recovery_state is not None
+        original.abandon(bound)
+
+        recovered_binding = binding()
+        recovered = await recovered_binding._recover_completion_finalization(
+            source,
+            runner,
+            session_id="docker-recovery-session",
+            agent_name="agent",
+            environment_name="environment",
+            recovery_state=recovery_state,
+        )
+        assert recovered.state_key in recovered_binding._coding_authorities
+        await recovered_binding.finalize(recovered, outcome="completed")
+        assert recovered_binding._coding_authorities == {}
+        assert recovered_binding._states == {}
+
+    asyncio.run(run())
+    assert (source_root / "code.py").read_text(encoding="utf-8") == "value = 2\n"
 
 
 def test_revision_aware_sync_preserves_copyback_process_control(tmp_path: Path) -> None:

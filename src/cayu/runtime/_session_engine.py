@@ -166,6 +166,7 @@ from cayu.runtime._environment_allocation import (
     require_authorized_environment_allocation_owners,
 )
 from cayu.runtime._environment_lifecycle import (
+    EnvironmentBindingFinalizeResult,
     EnvironmentLifecycle,
     exception_failure_payload,
     render_initial_system_prompt_with_contributions,
@@ -7425,6 +7426,7 @@ class SessionEngine:
         execution_profile: ExecutionProfileIdentity | None = None,
         model_completion_failure: BaseException | None = None,
         expected_recovery_claim_id: str | None = None,
+        checkpoint_mutation: dict[str, Any] | None = None,
     ) -> tuple[Session, Event | None, bool]:
         if invocation_context is not None:
             if type(invocation_context) is not InvocationContext or not isinstance(
@@ -7625,7 +7627,10 @@ class SessionEngine:
                 pending_action_kind = "user_input"
             elif tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
                 pending_action_kind = "tool_recovery"
-        if to_status is SessionStatus.COMPLETED:
+        completion_pending_finalization = (
+            to_status is SessionStatus.RUNNING and checkpoint_mutation is not None
+        )
+        if to_status is SessionStatus.COMPLETED or completion_pending_finalization:
             event_type = EventType.INTERACTION_COMPLETED
             interaction_status = InteractionStatus.COMPLETED
         elif pending_action_kind is not None:
@@ -7728,6 +7733,7 @@ class SessionEngine:
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
             model_completion_stage_settlement=model_completion_settlement,
+            checkpoint_mutation=checkpoint_mutation,
         )
         active_invocation_profile = (
             invocation_context.active_profile
@@ -7800,6 +7806,8 @@ class SessionEngine:
                     ),
                     "expected_recovery_claim_id": expected_recovery_claim_id,
                 }
+                if replay_transition.checkpoint_mutation is not None:
+                    transition_kwargs["checkpoint_mutation"] = replay_transition.checkpoint_mutation
                 if settlement_command is not None:
                     transition_kwargs.update(
                         {
@@ -14290,18 +14298,52 @@ class SessionEngine:
         session: Session,
         invocation_context: InvocationContext,
         registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
-    ) -> tuple[Session, Event | None, bool]:
+        execution_profile: ExecutionProfileIdentity | None,
+        task_id: str | None,
+    ) -> tuple[Session, Event | None, bool, dict[str, Any] | None]:
+        completion_marker: dict[str, Any] | None = None
+        checkpoint_mutation: dict[str, Any] | None = None
+        binding = (
+            None if registered_environment is None else registered_environment.environment.binding
+        )
+        if (
+            binding is not None
+            and registered_environment is not None
+            and registered_environment.bound_workspace is not None
+            and binding._completion_requires_successful_finalization(
+                registered_environment.bound_workspace
+            )
+        ):
+            if execution_profile is None:
+                raise RuntimeError(
+                    "Completion-critical workspace finalization lost its execution profile."
+                )
+            (
+                completion_marker,
+                checkpoint_mutation,
+            ) = self._environment_lifecycle.prepare_completion_finalization_transition(
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                task_id=task_id,
+            )
         try:
-            return await self._publish_interaction_transition(
+            transitioned, event, completed = await self._publish_interaction_transition(
                 session=session,
                 invocation_context=invocation_context,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
-                to_status=SessionStatus.COMPLETED,
+                to_status=(
+                    SessionStatus.RUNNING
+                    if checkpoint_mutation is not None
+                    else SessionStatus.COMPLETED
+                ),
                 only_if_no_queued_messages=True,
                 from_statuses={SessionStatus.RUNNING},
+                checkpoint_mutation=checkpoint_mutation,
             )
+            return transitioned, event, completed, completion_marker if completed else None
         except SessionStatusConflict:
             # An interrupt can win between the final provider response and the
             # atomic completion publication. Route that race through the normal
@@ -19836,6 +19878,7 @@ class SessionEngine:
         task_started = task_id is not None and not start_task_on_enter
         task_start_attempted = task_started
         task_finished = False
+        completion_finalization_marker: dict[str, Any] | None = None
         current_task = asyncio.current_task()
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None
         run_started_at = time.monotonic()
@@ -20295,11 +20338,15 @@ class SessionEngine:
                     session,
                     interaction_completed_event,
                     session_completed,
+                    completion_finalization_marker,
                 ) = await self._complete_session_if_no_queued_messages(
                     session=session,
                     invocation_context=invocation_context,
                     registered_agent=registered_agent,
+                    registered_environment=registered_environment,
                     environment_name=environment_name,
+                    execution_profile=execution_profile,
+                    task_id=task_id,
                 )
                 if interaction_completed_event is not None:
                     yield interaction_completed_event
@@ -21022,11 +21069,15 @@ class SessionEngine:
                             session,
                             interaction_completed_event,
                             session_completed,
+                            completion_finalization_marker,
                         ) = await self._complete_session_if_no_queued_messages(
                             session=session,
                             invocation_context=invocation_context,
                             registered_agent=registered_agent,
+                            registered_environment=registered_environment,
                             environment_name=environment_name,
+                            execution_profile=execution_profile,
+                            task_id=task_id,
                         )
                         if interaction_completed_event is not None:
                             yield interaction_completed_event
@@ -21121,11 +21172,15 @@ class SessionEngine:
                                     session,
                                     interaction_completed_event,
                                     session_completed,
+                                    completion_finalization_marker,
                                 ) = await self._complete_session_if_no_queued_messages(
                                     session=session,
                                     invocation_context=invocation_context,
                                     registered_agent=registered_agent,
+                                    registered_environment=registered_environment,
                                     environment_name=environment_name,
+                                    execution_profile=execution_profile,
+                                    task_id=task_id,
                                 )
                                 if interaction_completed_event is not None:
                                     yield interaction_completed_event
@@ -21341,11 +21396,15 @@ class SessionEngine:
                         session,
                         interaction_completed_event,
                         session_completed,
+                        completion_finalization_marker,
                     ) = await self._complete_session_if_no_queued_messages(
                         session=session,
                         invocation_context=invocation_context,
                         registered_agent=registered_agent,
+                        registered_environment=registered_environment,
                         environment_name=environment_name,
+                        execution_profile=execution_profile,
+                        task_id=task_id,
                     )
                     if interaction_completed_event is not None:
                         yield interaction_completed_event
@@ -21415,6 +21474,164 @@ class SessionEngine:
                         yield event
                     return
 
+            prefinalized_completion: EnvironmentBindingFinalizeResult | None = None
+            binding = (
+                None
+                if registered_environment is None
+                else registered_environment.environment.binding
+            )
+            if (
+                binding is not None
+                and registered_environment is not None
+                and registered_environment.bound_workspace is not None
+                and binding._completion_requires_successful_finalization(
+                    registered_environment.bound_workspace
+                )
+            ):
+                if execution_profile is None:
+                    raise RuntimeError(
+                        "Completion-critical workspace finalization lost its execution profile."
+                    )
+                completion_marker = completion_finalization_marker
+                if completion_marker is None:
+                    raise RuntimeError(
+                        "Completion-critical workspace finalization lost its durable marker."
+                    )
+                completion_event = await self._bind_event_to_session_run_operation(
+                    Event(
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                    ),
+                    session=session,
+                )
+                prefinalized_completion = await self._environment_lifecycle.finalize_terminal_event(
+                    event=completion_event,
+                    session=session,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                )
+                finalize_error = prefinalized_completion.event.payload.get("binding_finalize_error")
+                if type(finalize_error) is dict:
+                    # Capture conditional-write progress made before a partial
+                    # failure so a restarted worker resumes at the exact
+                    # revision boundary. A stale pre-attempt marker remains
+                    # replay-safe if this refresh itself cannot be acknowledged.
+                    completion_marker = (
+                        await self._environment_lifecycle.checkpoint_completion_finalization(
+                            session=session,
+                            registered_environment=registered_environment,
+                            execution_profile=execution_profile,
+                            task_id=task_id,
+                        )
+                    )
+                    error_message = finalize_error.get("error")
+                    error_type = finalize_error.get("error_type")
+                    if type(error_message) is not str or type(error_type) is not str:
+                        raise RuntimeError(
+                            "Workspace finalization failure lost its durable diagnostic."
+                        )
+                    if task_id is not None:
+                        task = await self._fail_task(
+                            task_id=task_id,
+                            task_worker_id=task_worker_id,
+                            task_handoff_id=task_handoff_id,
+                            session=session,
+                            error=task_failure_payload_from_diagnostic(
+                                ExceptionDiagnostic(
+                                    message=error_message,
+                                    error_type=error_type,
+                                ),
+                                session_id=session.id,
+                                additional_fields={
+                                    "phase": "workspace_finalize",
+                                    "workspace_output_committed": False,
+                                },
+                            ),
+                        )
+                        task_finished = True
+                        if active_run is not None:
+                            active_run.task_finished = True
+                        yield await self._event_writer.emit(
+                            _task_event(
+                                event_type=EventType.TASK_FAILED,
+                                task=task,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                            )
+                        )
+                    (
+                        session,
+                        interaction_failed_event,
+                        _,
+                    ) = await self._publish_sibling_interaction_transition(
+                        session=session,
+                        invocation_context=invocation_context,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        to_status=SessionStatus.FAILED,
+                        execution_profile=execution_profile,
+                    )
+                    if interaction_failed_event is not None:
+                        yield interaction_failed_event
+                    for failed_turn_event in await self._emit_turn_completed_once(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        status=SessionStatus.FAILED,
+                        run_started_at=run_started_at,
+                        usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                        invocation_context=invocation_context,
+                    ):
+                        yield failed_turn_event
+                    failed_payload = copy_json_value(
+                        prefinalized_completion.event.payload,
+                        "payload",
+                    )
+                    failed_payload.update(
+                        {
+                            "error": error_message,
+                            "error_type": error_type,
+                            "failure_phase": "workspace_finalize",
+                            "workspace_output_committed": False,
+                        }
+                    )
+                    failed_terminal = copy_event(prefinalized_completion.event).model_copy(
+                        update={
+                            "type": EventType.SESSION_FAILED,
+                            "payload": failed_payload,
+                        },
+                        deep=True,
+                    )
+                    failed_finalize_result = EnvironmentBindingFinalizeResult(
+                        event=failed_terminal,
+                        events=prefinalized_completion.events,
+                        cancellation=prefinalized_completion.cancellation,
+                        cancellation_requests_consumed=(
+                            prefinalized_completion.cancellation_requests_consumed
+                        ),
+                    )
+                    async for failed_terminal_event in self._emit_terminal_event_with_hooks(
+                        event=failed_terminal,
+                        phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                        environment_finalize_result=failed_finalize_result,
+                    ):
+                        yield failed_terminal_event
+                    return
+                session = await self._environment_lifecycle.complete_completion_finalization(
+                    session=session,
+                    expected_marker=completion_marker,
+                )
             if task_id is not None:
                 await self._session_control.raise_if_interrupted(session.id)
                 task = await self._complete_task(
@@ -21449,11 +21666,15 @@ class SessionEngine:
             ):
                 yield event
             async for event in self._emit_terminal_event_with_hooks(
-                event=Event(
-                    type=EventType.SESSION_COMPLETED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
+                event=(
+                    prefinalized_completion.event
+                    if prefinalized_completion is not None
+                    else Event(
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                    )
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
                 session=session,
@@ -21461,6 +21682,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
+                environment_finalize_result=prefinalized_completion,
             ):
                 yield event
         except ToolApprovalRequired as exc:
@@ -25804,6 +26026,7 @@ class SessionEngine:
         terminal_event_publisher: Callable[[Event], Awaitable[Event]] | None = None,
         expected_run_operation_epoch: int | None = None,
         run_runtime_hooks: bool = True,
+        environment_finalize_result: EnvironmentBindingFinalizeResult | None = None,
     ) -> AsyncGenerator[Event, None]:
         if invocation_context is not None:
             if (
@@ -25818,18 +26041,25 @@ class SessionEngine:
             ):
                 raise RuntimeError("Terminal publication substituted its execution profile.")
             execution_profile = invocation_context.profile
-        event = await self._bind_event_to_session_run_operation(
-            event,
-            session=session,
-            expected_run_operation_epoch=expected_run_operation_epoch,
-        )
-        finalize_result = await self._environment_lifecycle.finalize_terminal_event(
-            event=event,
-            session=session,
-            registered_environment=registered_environment,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-        )
+        if environment_finalize_result is None:
+            event = await self._bind_event_to_session_run_operation(
+                event,
+                session=session,
+                expected_run_operation_epoch=expected_run_operation_epoch,
+            )
+            finalize_result = await self._environment_lifecycle.finalize_terminal_event(
+                event=event,
+                session=session,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+            )
+        else:
+            finalize_result = environment_finalize_result
+            if finalize_result.event.model_dump(mode="json") != event.model_dump(mode="json"):
+                raise RuntimeError(
+                    "Pre-finalized environment result belongs to a different terminal event."
+                )
 
         async def emit_finalized_terminal_boundary() -> AsyncGenerator[Event, None]:
             for binding_event in finalize_result.events:

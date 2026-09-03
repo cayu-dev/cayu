@@ -2351,6 +2351,7 @@ class InteractionTransitionSpec(BaseModel):
     to_status: SessionStatus
     only_if_no_queued_messages: StrictBool = False
     model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None
+    checkpoint_mutation: dict[str, Any] | None = None
 
     @field_validator("event")
     @classmethod
@@ -2369,6 +2370,15 @@ class InteractionTransitionSpec(BaseModel):
             raise ValueError("Interaction transition source statuses must be unique.")
         return tuple(sorted(value, key=str))
 
+    @field_validator("checkpoint_mutation", mode="before")
+    @classmethod
+    def copy_checkpoint_mutation(cls, value: object) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if type(value) is not dict:
+            raise TypeError("checkpoint_mutation must be an object or None.")
+        return copy_durable_json_object(value, "checkpoint_mutation")
+
     @model_validator(mode="after")
     def validate_transition_shape(self) -> InteractionTransitionSpec:
         if self.event.interaction_id is None:
@@ -2378,7 +2388,10 @@ class InteractionTransitionSpec(BaseModel):
                 SessionStatus.FAILED,
                 SessionStatus.INTERRUPTED,
             },
-            EventType.INTERACTION_COMPLETED: {SessionStatus.COMPLETED},
+            EventType.INTERACTION_COMPLETED: {
+                SessionStatus.RUNNING,
+                SessionStatus.COMPLETED,
+            },
             EventType.INTERACTION_FAILED: {SessionStatus.FAILED},
             EventType.INTERACTION_INTERRUPTED: {SessionStatus.INTERRUPTED},
         }
@@ -2393,6 +2406,41 @@ class InteractionTransitionSpec(BaseModel):
             )
         if self.only_if_no_queued_messages and self.event.type != EventType.INTERACTION_COMPLETED:
             raise ValueError("only_if_no_queued_messages is valid only for interaction.completed.")
+        if self.to_status is SessionStatus.RUNNING and (
+            self.event.type != EventType.INTERACTION_COMPLETED
+            or not self.only_if_no_queued_messages
+            or self.checkpoint_mutation is None
+        ):
+            raise ValueError(
+                "A running interaction completion requires a queue-conditional checkpoint mutation."
+            )
+        if self.checkpoint_mutation is not None and (
+            self.event.type != EventType.INTERACTION_COMPLETED
+            or not self.only_if_no_queued_messages
+            or self.to_status is not SessionStatus.RUNNING
+        ):
+            raise ValueError(
+                "checkpoint_mutation is valid only for a queue-conditional running "
+                "interaction completion."
+            )
+        if self.checkpoint_mutation is not None:
+            operations = self.checkpoint_mutation.get("operations")
+            if type(operations) is not list or len(operations) != 1:
+                raise ValueError(
+                    "A completion-finalization transition requires exactly one checkpoint "
+                    "operation."
+                )
+            operation = operations[0]
+            if (
+                type(operation) is not dict
+                or operation.get("key") != PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
+                or operation.get("expected_value_digest") is not None
+                or operation.get("action") != "set"
+                or type(operation.get("value")) is not dict
+            ):
+                raise ValueError(
+                    "A completion-finalization transition must install a new pending marker."
+                )
         if self.model_completion_stage_settlement is not None:
             if self.only_if_no_queued_messages:
                 raise ValueError(
@@ -2458,13 +2506,14 @@ class _InteractionTransitionReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     record_type: Literal["cayu.interaction-transition"] = "cayu.interaction-transition"
-    schema_version: Literal[1, 2, 3, 4] = 1
+    schema_version: Literal[1, 2, 3, 4, 5] = 1
     session: Session
     event: Event
     from_statuses: tuple[SessionStatus, ...]
     to_status: SessionStatus
     only_if_no_queued_messages: StrictBool
     model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None
+    checkpoint_mutation: dict[str, Any] | None = None
     invocation_session_instance_id: str | None = None
     invocation_active_profile: ActiveInvocationExecutionProfile | None = None
     invocation_authority_state: Literal["active", "released"] | None = None
@@ -2481,6 +2530,15 @@ class _InteractionTransitionReceipt(BaseModel):
     @classmethod
     def copy_event(cls, value: Event) -> Event:
         return copy_event(value)
+
+    @field_validator("checkpoint_mutation", mode="before")
+    @classmethod
+    def copy_checkpoint_mutation(cls, value: object) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if type(value) is not dict:
+            raise TypeError("checkpoint_mutation must be an object or None.")
+        return copy_durable_json_object(value, "checkpoint_mutation")
 
     @field_validator("record_digest")
     @classmethod
@@ -2523,12 +2581,21 @@ class _InteractionTransitionReceipt(BaseModel):
                 or self.recovery_claim_id is not None
             ):
                 raise ValueError("Interaction-transition receipt version conflicts with authority.")
-        else:
+        elif self.schema_version == 4:
             if self.recovery_claim_id is None or (
                 carries_invocation_authority != (self.invocation_authority_state is not None)
             ):
                 raise ValueError("Interaction-transition receipt version conflicts with authority.")
             require_clean_nonblank(self.recovery_claim_id, "recovery_claim_id")
+        else:
+            if (
+                self.checkpoint_mutation is None
+                or self.recovery_claim_id is not None
+                or (not carries_invocation_authority or self.invocation_authority_state != "active")
+            ):
+                raise ValueError("Interaction-transition receipt version conflicts with mutation.")
+        if self.schema_version < 5 and self.checkpoint_mutation is not None:
+            raise ValueError("Interaction-transition receipt version conflicts with mutation.")
         if carries_invocation_authority:
             SessionInvocationBinding.validate_session_instance_id(
                 self.invocation_session_instance_id
@@ -4851,6 +4918,7 @@ RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS = 128
 RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES = 512
 RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS = 512
 RUNTIME_PUBLICATION_MAX_TOOL_CALLS = 256
+PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY = "pending_completion_finalization"
 _PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
     {
@@ -7205,6 +7273,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     AMBIGUOUS_PENDING_USER_INPUT = "ambiguous_pending_user_input"
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
     REPAIRED_WORKSPACE_OBSERVATION = "repaired_workspace_observation"
+    REPAIRED_WORKSPACE_FINALIZATION = "repaired_workspace_finalization"
     REPAIRED_PROVIDER_OPERATION_RESOLUTION = "repaired_provider_operation_resolution"
     INTERRUPTED_ABANDONED = "interrupted_abandoned"
     FINALIZED_INTERRUPT = "finalized_interrupt"
@@ -9801,6 +9870,7 @@ class SessionStore(ABC):
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
         model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
+        checkpoint_mutation: dict[str, Any] | None = None,
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
@@ -14413,6 +14483,7 @@ class InMemorySessionStore(SessionStore):
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
         model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
+        checkpoint_mutation: dict[str, Any] | None = None,
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
@@ -14435,12 +14506,14 @@ class InMemorySessionStore(SessionStore):
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
             model_completion_stage_settlement=model_completion_stage_settlement,
+            checkpoint_mutation=checkpoint_mutation,
         )
         copied_event = transition.event
         allowed_statuses = set(transition.from_statuses)
         target_status = transition.to_status
         conditional = transition.only_if_no_queued_messages
         settlement_request = transition.model_completion_stage_settlement
+        checkpoint_mutation_request = transition.checkpoint_mutation
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -14570,6 +14643,14 @@ class InMemorySessionStore(SessionStore):
                 session,
                 [copied_event],
             )
+            updated_checkpoint = self._checkpoints.get(session_id)
+            if not queued and checkpoint_mutation_request is not None:
+                updated_checkpoint = _apply_runtime_publication_checkpoint_mutation(
+                    RuntimePublicationMutation.model_validate(checkpoint_mutation_request),
+                    updated_checkpoint,
+                )
+                if updated_checkpoint is None:
+                    raise AssertionError("Interaction checkpoint mutation deleted its checkpoint.")
             updated = session.model_copy(update={"last_activity_at": now})
             if not queued:
                 updated = updated.model_copy(
@@ -14586,6 +14667,7 @@ class InMemorySessionStore(SessionStore):
                 to_status=target_status,
                 only_if_no_queued_messages=conditional,
                 model_completion_stage_settlement=settlement_request,
+                checkpoint_mutation=checkpoint_mutation_request,
                 status_changed=not queued,
                 invocation_session_instance_id=expected_session_instance_id,
                 invocation_active_profile=expected_active_invocation_profile,
@@ -14608,6 +14690,9 @@ class InMemorySessionStore(SessionStore):
             if applied != updated:
                 raise RuntimeError("Prepared interaction transition result changed during commit.")
             self._sessions[session_id] = updated
+            if not queued and checkpoint_mutation_request is not None:
+                assert updated_checkpoint is not None
+                self._checkpoints[session_id] = updated_checkpoint
             self._refresh_child_lifecycle_candidate_unlocked(updated)
             if settlement_record is not None and settlement_storage_key is not None:
                 operation_records[settlement_storage_key] = settlement_record
@@ -14629,17 +14714,19 @@ class InMemorySessionStore(SessionStore):
         if type(copied) is not SettleInvocationCommand:
             raise TypeError("command must be a SettleInvocationCommand.")
         transition = copied.transition
-        return await self.publish_interaction_transition(
-            copied.session_id,
-            event=transition.event,
-            from_statuses=set(transition.from_statuses),
-            to_status=transition.to_status,
-            only_if_no_queued_messages=transition.only_if_no_queued_messages,
-            model_completion_stage_settlement=transition.model_completion_stage_settlement,
-            expected_session_instance_id=copied.expected_session_instance_id,
-            expected_active_invocation_profile=copied.expected_active_profile,
-            expected_invocation_authority_state=copied.expected_authority_state,
-        )
+        kwargs: dict[str, Any] = {
+            "event": transition.event,
+            "from_statuses": set(transition.from_statuses),
+            "to_status": transition.to_status,
+            "only_if_no_queued_messages": transition.only_if_no_queued_messages,
+            "model_completion_stage_settlement": transition.model_completion_stage_settlement,
+            "expected_session_instance_id": copied.expected_session_instance_id,
+            "expected_active_invocation_profile": copied.expected_active_profile,
+            "expected_invocation_authority_state": copied.expected_authority_state,
+        }
+        if transition.checkpoint_mutation is not None:
+            kwargs["checkpoint_mutation"] = transition.checkpoint_mutation
+        return await self.publish_interaction_transition(copied.session_id, **kwargs)
 
     async def load_interaction_transition_receipt(
         self,
@@ -15769,6 +15856,13 @@ class InMemorySessionStore(SessionStore):
             if session.status not in {SessionStatus.PENDING, SessionStatus.RUNNING}:
                 raise SessionStatusConflict(
                     "Session messages may be enqueued only while a session is pending or running."
+                )
+            if (
+                self._checkpoints.get(session.id) is not None
+                and PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in self._checkpoints[session.id]
+            ):
+                raise SessionStatusConflict(
+                    "Session messages cannot be enqueued while completion finalization is pending."
                 )
             accepted_at = self._ownership_clock()
             queue_id = str(uuid4())
@@ -21692,6 +21786,7 @@ def _interaction_transition_receipt_record(
     to_status: SessionStatus,
     only_if_no_queued_messages: bool,
     model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None,
+    checkpoint_mutation: dict[str, Any] | None,
     status_changed: bool,
     invocation_session_instance_id: str | None = None,
     invocation_active_profile: ActiveInvocationExecutionProfile | None = None,
@@ -21702,7 +21797,9 @@ def _interaction_transition_receipt_record(
         raise TypeError("Interaction-transition invocation authority is incomplete.")
     if invocation_active_profile is None and invocation_authority_state != "active":
         raise TypeError("Released interaction authority requires an invocation profile.")
-    if recovery_claim_id is not None:
+    if checkpoint_mutation is not None:
+        schema_version = 5
+    elif recovery_claim_id is not None:
         recovery_claim_id = require_clean_nonblank(recovery_claim_id, "recovery_claim_id")
         schema_version = 4
     else:
@@ -21726,10 +21823,15 @@ def _interaction_transition_receipt_record(
         payload["model_completion_stage_settlement"] = model_completion_stage_settlement.model_dump(
             mode="json"
         )
+    if checkpoint_mutation is not None:
+        payload["checkpoint_mutation"] = copy_durable_json_object(
+            checkpoint_mutation,
+            "checkpoint_mutation",
+        )
     if invocation_active_profile is not None:
         payload["invocation_session_instance_id"] = invocation_session_instance_id
         payload["invocation_active_profile"] = invocation_active_profile.model_dump(mode="json")
-    if schema_version == 3 or (schema_version == 4 and invocation_active_profile is not None):
+    if schema_version == 3 or (schema_version in {4, 5} and invocation_active_profile is not None):
         payload["invocation_authority_state"] = invocation_authority_state
     if recovery_claim_id is not None:
         payload["recovery_claim_id"] = recovery_claim_id
@@ -21741,12 +21843,13 @@ def _interaction_transition_receipt_record(
         to_status=to_status,
         only_if_no_queued_messages=only_if_no_queued_messages,
         model_completion_stage_settlement=model_completion_stage_settlement,
+        checkpoint_mutation=checkpoint_mutation,
         invocation_session_instance_id=invocation_session_instance_id,
         invocation_active_profile=invocation_active_profile,
         invocation_authority_state=(
             invocation_authority_state
             if schema_version == 3
-            or (schema_version == 4 and invocation_active_profile is not None)
+            or (schema_version in {4, 5} and invocation_active_profile is not None)
             else None
         ),
         recovery_claim_id=recovery_claim_id,
@@ -21770,8 +21873,10 @@ def _load_interaction_transition_receipt(record: object) -> _InteractionTransiti
             digest_payload.pop("invocation_authority_state", None)
         elif receipt.schema_version < 3:
             digest_payload.pop("invocation_authority_state", None)
-        if receipt.schema_version < 4:
+        if receipt.schema_version < 4 or receipt.recovery_claim_id is None:
             digest_payload.pop("recovery_claim_id", None)
+        if receipt.schema_version < 5:
+            digest_payload.pop("checkpoint_mutation", None)
         if _canonical_runtime_publication_digest(digest_payload) != receipt.record_digest:
             raise ValueError
     except (TypeError, ValueError) as exc:
@@ -21892,6 +21997,7 @@ def _interaction_transition_spec_from_receipt(
         to_status=receipt.to_status,
         only_if_no_queued_messages=receipt.only_if_no_queued_messages,
         model_completion_stage_settlement=(receipt.model_completion_stage_settlement),
+        checkpoint_mutation=receipt.checkpoint_mutation,
     )
 
 
@@ -21934,7 +22040,14 @@ def _require_invocation_release_settlement_record(
         expected_active_invocation_profile=expected_active_invocation_profile,
     )
     if receipt.status_changed:
-        settlement_status_matches = (
+        completion_finalization_committed = (
+            transition.to_status is SessionStatus.RUNNING
+            and transition.event.type == EventType.INTERACTION_COMPLETED
+            and transition.checkpoint_mutation is not None
+            and receipt.session.status is SessionStatus.RUNNING
+            and current_session.status is SessionStatus.COMPLETED
+        )
+        settlement_status_matches = completion_finalization_committed or (
             receipt.session.status is transition.to_status
             and current_session.status is transition.to_status
         )
@@ -27296,6 +27409,7 @@ def _prepare_interaction_transition(
     to_status: SessionStatus,
     only_if_no_queued_messages: bool,
     model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
+    checkpoint_mutation: dict[str, Any] | None = None,
 ) -> tuple[str, InteractionTransitionSpec]:
     session_id = require_clean_nonblank(session_id, "session_id")
     if type(event) is not Event:
@@ -27320,6 +27434,7 @@ def _prepare_interaction_transition(
         to_status=to_status,
         only_if_no_queued_messages=only_if_no_queued_messages,
         model_completion_stage_settlement=model_completion_stage_settlement,
+        checkpoint_mutation=checkpoint_mutation,
     )
     if transition.event.session_id != session_id:
         raise ValueError("Interaction transition event belongs to a different session.")

@@ -980,14 +980,19 @@ class RunnerWorkspace(
             backend="Runner",
             python_executable=self.python_executable,
         )
+        complete = offset == 0 and total_bytes == len(content)
         return WorkspaceReadResult(
             content=content,
             total_bytes=max(total_bytes, offset + len(content)),
             truncated=total_bytes > offset + len(content),
             offset=offset,
-            revision=revision,
-            sha256=digest,
-            git_mode=git_mode,
+            # Identity describes the complete file, never one bounded page. A
+            # remote guard may observe a file changing between its identity
+            # snapshot and the bounded read result; do not let stale identity
+            # metadata turn a valid partial page into an invalid value object.
+            revision=revision if complete else None,
+            sha256=digest if complete else None,
+            git_mode=git_mode if complete else None,
         )
 
     async def write_bytes(self, path: str, content: bytes) -> None:

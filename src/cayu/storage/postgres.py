@@ -216,6 +216,7 @@ from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+    PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
@@ -263,6 +264,7 @@ from cayu.runtime.sessions import (
     QueuedDispatchTerminalReceiptQuery,
     RunnerObservedEventIdentity,
     RunRequest,
+    RuntimePublicationMutation,
     RuntimePublicationReceipt,
     RuntimePublicationResult,
     Session,
@@ -567,6 +569,8 @@ from cayu.runtime.tasks import (
     _ensure_claim_query_supported,
     _ensure_exact_owned_active_task_lease,
     _ensure_owned_active_task_lease,
+    _ensure_recovered_attached_task_failure_authority,
+    _ensure_recovered_attached_task_session,
     _ensure_retry_series_queue_attempt,
     _ensure_task_handoff_authority,
     _ensure_task_terminalization_lease_authority,
@@ -28006,6 +28010,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
         model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
+        checkpoint_mutation: dict[str, Any] | None = None,
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
@@ -28031,12 +28036,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
             model_completion_stage_settlement=model_completion_stage_settlement,
+            checkpoint_mutation=checkpoint_mutation,
         )
         copied_event = transition.event
         allowed_statuses = set(transition.from_statuses)
         target_status = transition.to_status
         conditional = transition.only_if_no_queued_messages
         settlement_request = transition.model_completion_stage_settlement
+        checkpoint_mutation_request = transition.checkpoint_mutation
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -28247,6 +28254,21 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     order_row = await cur.fetchone()
                     if order_row is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    if not queued and checkpoint_mutation_request is not None:
+                        transformed_checkpoint = _apply_runtime_publication_checkpoint_mutation(
+                            RuntimePublicationMutation.model_validate(checkpoint_mutation_request),
+                            await self._load_checkpoint(cur, session_id),
+                        )
+                        if transformed_checkpoint is None:
+                            raise AssertionError(
+                                "Interaction checkpoint mutation deleted its checkpoint."
+                            )
+                        await self._upsert_checkpoint(
+                            cur,
+                            session_id,
+                            transformed_checkpoint,
+                            updated_at,
+                        )
                     if settlement_record is not None and settlement_storage_key is not None:
                         await cur.execute(
                             "INSERT INTO cayu_session_operations "
@@ -28323,6 +28345,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         to_status=target_status,
                         only_if_no_queued_messages=conditional,
                         model_completion_stage_settlement=settlement_request,
+                        checkpoint_mutation=checkpoint_mutation_request,
                         status_changed=not queued,
                         invocation_session_instance_id=expected_session_instance_id,
                         invocation_active_profile=expected_active_invocation_profile,
@@ -28360,17 +28383,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if type(copied) is not SettleInvocationCommand:
             raise TypeError("command must be a SettleInvocationCommand.")
         transition = copied.transition
-        return await self.publish_interaction_transition(
-            copied.session_id,
-            event=transition.event,
-            from_statuses=set(transition.from_statuses),
-            to_status=transition.to_status,
-            only_if_no_queued_messages=transition.only_if_no_queued_messages,
-            model_completion_stage_settlement=transition.model_completion_stage_settlement,
-            expected_session_instance_id=copied.expected_session_instance_id,
-            expected_active_invocation_profile=copied.expected_active_profile,
-            expected_invocation_authority_state=copied.expected_authority_state,
-        )
+        kwargs: dict[str, Any] = {
+            "event": transition.event,
+            "from_statuses": set(transition.from_statuses),
+            "to_status": transition.to_status,
+            "only_if_no_queued_messages": transition.only_if_no_queued_messages,
+            "model_completion_stage_settlement": transition.model_completion_stage_settlement,
+            "expected_session_instance_id": copied.expected_session_instance_id,
+            "expected_active_invocation_profile": copied.expected_active_profile,
+            "expected_invocation_authority_state": copied.expected_authority_state,
+        }
+        if transition.checkpoint_mutation is not None:
+            kwargs["checkpoint_mutation"] = transition.checkpoint_mutation
+        return await self.publish_interaction_transition(copied.session_id, **kwargs)
 
     async def load_interaction_transition_receipt(
         self,
@@ -29909,6 +29934,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if loaded.status not in {SessionStatus.PENDING, SessionStatus.RUNNING}:
                         raise SessionStatusConflict(
                             "Session messages may be enqueued only while a session is pending or running."
+                        )
+                    checkpoint = await self._load_checkpoint(cur, request.session_id)
+                    if (
+                        checkpoint is not None
+                        and PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in checkpoint
+                    ):
+                        raise SessionStatusConflict(
+                            "Session messages cannot be enqueued while completion finalization "
+                            "is pending."
                         )
                     transcript_cursor = await _transcript_cursor(cur, request.session_id)
                     accepted_at = await self._session_store_now(cur)
@@ -36060,6 +36094,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
+    supports_attached_task_recovery_terminalization: ClassVar[bool] = True
     supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
@@ -37547,6 +37582,140 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             now=now,
                         )
                     assert terminal_row is not None
+                    terminal_task = pg_support.task_from_row(terminal_row)
+                    await cur.execute(
+                        "INSERT INTO cayu_task_terminalization_receipts "
+                        "(task_id, idempotency_key, request_sha256, worker_id, "
+                        "terminal_kind, task_json, committed_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            request.task_id,
+                            request.idempotency_key,
+                            request_sha256,
+                            request.worker_id,
+                            request.kind.value,
+                            _dumps(terminal_task.model_dump(mode="json")),
+                            now,
+                        ),
+                    )
+                await conn.commit()
+                return terminal_task.model_copy(deep=True)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def recover_attached_task_failure(
+        self,
+        request: TaskTerminalizationRequest,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        request, request_sha256 = prepare_task_terminalization(request)
+        session_id = require_clean_nonblank(session_id, "session_id")
+        session_instance_id = require_clean_nonblank(
+            session_instance_id,
+            "session_instance_id",
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    task = await self._load_task_locked(cur, request.task_id)
+                    await cur.execute(
+                        "SELECT request_sha256, worker_id, terminal_kind, "
+                        "task_json, committed_at "
+                        "FROM cayu_task_terminalization_receipts "
+                        "WHERE task_id = %s AND idempotency_key = %s",
+                        (request.task_id, request.idempotency_key),
+                    )
+                    receipt_row = await cur.fetchone()
+                    if receipt_row is not None:
+                        receipt = _postgres_task_terminalization_receipt(
+                            task_id=request.task_id,
+                            idempotency_key=request.idempotency_key,
+                            row=receipt_row,
+                        )
+                        replayed = _replay_task_terminalization_receipt(
+                            request=request,
+                            request_sha256=request_sha256,
+                            receipt=receipt,
+                            current_task=task,
+                        )
+                        _ensure_recovered_attached_task_session(
+                            replayed,
+                            session_id=session_id,
+                            session_instance_id=session_instance_id,
+                        )
+                        await conn.commit()
+                        return replayed
+
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                        (request.task_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise WorkAttemptExecutionClaimLost(
+                            "Admitted work attempts cannot use attached-task recovery "
+                            "terminalization."
+                        )
+                    now = await self._database_now(cur)
+                    _ensure_recovered_attached_task_failure_authority(
+                        task,
+                        request,
+                        session_id=session_id,
+                        session_instance_id=session_instance_id,
+                        now=now,
+                    )
+                    verified_work_support.require_contracted_completion_authority(
+                        task,
+                        TaskStatus.FAILED,
+                    )
+                    await cur.execute(
+                        f"""
+                        UPDATE cayu_tasks
+                        SET status = %s,
+                            status_reason = NULL,
+                            status_payload = NULL,
+                            result = NULL,
+                            error = %s,
+                            worker_id = NULL,
+                            lease_expires_at = NULL,
+                            interrupted_handoff_id = NULL,
+                            started_at = COALESCE(started_at, %s),
+                            completed_at = %s,
+                            updated_at = %s
+                        WHERE id = %s
+                          AND status = %s
+                          AND session_id = %s
+                          AND session_instance_id = %s
+                          AND worker_id = %s
+                          AND lease_expires_at = %s
+                          AND lease_expires_at <= %s
+                          AND interrupted_handoff_id IS NOT DISTINCT FROM %s
+                        RETURNING {pg_support.TASK_COLUMNS}
+                        """,
+                        (
+                            str(TaskStatus.FAILED),
+                            _dumps(request.error),
+                            now,
+                            now,
+                            now,
+                            request.task_id,
+                            str(TaskStatus.RUNNING),
+                            session_id,
+                            session_instance_id,
+                            request.worker_id,
+                            request.lease_expires_at,
+                            now,
+                            request.handoff_id,
+                        ),
+                    )
+                    terminal_row = await cur.fetchone()
+                    if terminal_row is None:
+                        raise TaskClaimLost(
+                            "Attached-task recovery lost its exact durable authority."
+                        )
                     terminal_task = pg_support.task_from_row(terminal_row)
                     await cur.execute(
                         "INSERT INTO cayu_task_terminalization_receipts "

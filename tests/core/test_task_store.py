@@ -26,6 +26,7 @@ from tests.core.task_store_conformance import (
     assert_worker_terminalization_generation_conformance,
 )
 from tests.core.task_terminalization_conformance import (
+    assert_attached_task_recovery_terminalization_conformance,
     assert_live_ordinary_cancellation_conformance,
     assert_owner_lost_ordinary_cancellation_reconciliation_conformance,
     assert_recovered_continuation_terminalization_conformance,
@@ -338,6 +339,22 @@ def test_recovered_continuations_terminalize_all_ordinary_kinds(
     async def run_store_operations() -> None:
         try:
             await assert_recovered_continuation_terminalization_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_attached_task_recovery_terminalization_conformance(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_attached_task_recovery_terminalization_conformance(store)
         finally:
             await _close_store(store)
 

@@ -1341,7 +1341,12 @@ class ReleaseInvocationCommand(_InvocationCommandModel):
             SessionStatus.COMPLETED,
             SessionStatus.FAILED,
             SessionStatus.INTERRUPTED,
-        }:
+        } and not (
+            self.settlement_transition.to_status is SessionStatus.RUNNING
+            and self.settlement_transition.event.type == EventType.INTERACTION_COMPLETED
+            and self.settlement_transition.only_if_no_queued_messages
+            and self.settlement_transition.checkpoint_mutation is not None
+        ):
             raise ValueError("Release requires a terminal settlement transition.")
         return self
 
@@ -1782,6 +1787,12 @@ def _require_receipt_result_matches_command(
         permitted_statuses = {transition.to_status}
         if transition.only_if_no_queued_messages:
             permitted_statuses.update(transition.from_statuses)
+        if (
+            transition.to_status is SessionStatus.RUNNING
+            and transition.event.type == EventType.INTERACTION_COMPLETED
+            and transition.checkpoint_mutation is not None
+        ):
+            permitted_statuses.add(SessionStatus.COMPLETED)
         if result.status not in permitted_statuses:
             raise RuntimeError("Durable invocation release receipt forged settlement status.")
         return

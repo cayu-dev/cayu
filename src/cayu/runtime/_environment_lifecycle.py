@@ -149,9 +149,12 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.sessions import (
+    PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
     CheckpointTransform,
     EventOrder,
     EventQuery,
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
     Session,
     SessionRunFenced,
     SessionStatus,
@@ -195,6 +198,7 @@ _LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS = 0.01
 DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS = 256
 _FINAL_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS = 30.0
 _MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS = 64
+_MAX_COMPLETION_FINALIZATION_CHECKPOINT_BYTES = 4 * 1024 * 1024
 
 _RunFenceReleaseKey = tuple[str, int]
 
@@ -284,6 +288,50 @@ class EnvironmentBindingFinalizeResult:
     events: list[Event]
     cancellation: asyncio.CancelledError | None = None
     cancellation_requests_consumed: int = 0
+
+
+def pending_completion_finalization_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return one validated private completion-finalization recovery marker."""
+
+    if checkpoint is None:
+        return None
+    raw = checkpoint.get(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
+    if raw is None:
+        return None
+    if type(raw) is not dict:
+        raise ValueError("Pending completion finalization checkpoint must be an object.")
+    marker = copy_durable_json_object(raw, "pending completion finalization")
+    if marker.get("version") != 1 or marker.get("outcome") != "completed":
+        raise ValueError("Pending completion finalization checkpoint has an unsupported format.")
+    for field_name in (
+        "environment_name",
+        "binding_generation_id",
+        "execution_profile_fingerprint",
+    ):
+        value = marker.get(field_name)
+        if type(value) is not str:
+            raise ValueError(f"Pending completion finalization {field_name} must be a string.")
+        require_clean_nonblank(value, field_name)
+    task_id = marker.get("task_id")
+    if task_id is not None:
+        if type(task_id) is not str:
+            raise ValueError("Pending completion finalization task_id must be a string.")
+        require_clean_nonblank(task_id, "task_id")
+    if type(marker.get("binding_state")) is not dict:
+        raise ValueError("Pending completion finalization binding state must be an object.")
+    if (
+        len(
+            canonical_durable_json_bytes(
+                marker,
+                "pending completion finalization",
+            )
+        )
+        > _MAX_COMPLETION_FINALIZATION_CHECKPOINT_BYTES
+    ):
+        raise ValueError("Pending completion finalization checkpoint exceeds its byte limit.")
+    return marker
 
 
 @dataclass(frozen=True)
@@ -1579,6 +1627,197 @@ class EnvironmentLifecycle:
             self.checkpoint_transform_preserving_runtime_state(checkpoint),
         )
 
+    async def checkpoint_completion_finalization(
+        self,
+        *,
+        session: Session,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity,
+        task_id: str | None,
+    ) -> dict[str, Any]:
+        """Persist exact private retry state before completion can be published."""
+
+        marker = self._completion_finalization_marker(
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            task_id=task_id,
+        )
+
+        binding = registered_environment.environment.binding
+        bound = registered_environment.bound_workspace
+        if binding is None or bound is None:
+            raise RuntimeError("Completion finalization checkpoint requires a bound workspace.")
+
+        def checkpoint_marker(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if (
+                current_session.instance_id != session.instance_id
+                or current_session.run_epoch != session.run_epoch
+            ):
+                raise RuntimeError(
+                    "Session changed before completion finalization was checkpointed."
+                )
+            copied = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            existing = pending_completion_finalization_from_checkpoint(copied)
+            if existing is not None:
+                for field_name in (
+                    "version",
+                    "outcome",
+                    "environment_name",
+                    "binding_generation_id",
+                    "execution_profile_fingerprint",
+                    "task_id",
+                ):
+                    if existing.get(field_name) != marker.get(field_name):
+                        raise RuntimeError("Completion finalization recovery authority changed.")
+            copied[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = copy_json_value(
+                marker,
+                "pending completion finalization",
+            )
+            return copied
+
+        await self._session_store.transform_checkpoint(session.id, checkpoint_marker)
+        return copy_json_value(marker, "pending completion finalization")
+
+    def prepare_completion_finalization_transition(
+        self,
+        *,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity,
+        task_id: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Prepare the marker installed by the atomic no-queued-input boundary."""
+
+        marker = self._completion_finalization_marker(
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            task_id=task_id,
+        )
+        mutation = RuntimePublicationMutation(
+            operations=(
+                RuntimePublicationCheckpointOperation(
+                    key=PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
+                    expected_value_digest=None,
+                    action="set",
+                    value=marker,
+                ),
+            )
+        )
+        return (
+            copy_json_value(marker, "pending completion finalization"),
+            mutation.model_dump(mode="json"),
+        )
+
+    def _completion_finalization_marker(
+        self,
+        *,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity,
+        task_id: str | None,
+    ) -> dict[str, Any]:
+        binding = registered_environment.environment.binding
+        bound = registered_environment.bound_workspace
+        if binding is None or bound is None:
+            raise RuntimeError("Completion finalization checkpoint requires a bound workspace.")
+        binding_state = binding._completion_finalization_recovery_state(bound)
+        if binding_state is None:
+            raise RuntimeError(
+                "Completion-critical workspace binding has no durable recovery state."
+            )
+        marker = {
+            "version": 1,
+            "outcome": "completed",
+            "task_id": None if task_id is None else require_clean_nonblank(task_id, "task_id"),
+            "environment_name": require_clean_nonblank(
+                registered_environment.spec.name,
+                "environment_name",
+            ),
+            "binding_generation_id": require_clean_nonblank(
+                registered_environment.binding_generation_id,
+                "binding_generation_id",
+            ),
+            "execution_profile_fingerprint": require_clean_nonblank(
+                execution_profile.fingerprint,
+                "execution_profile_fingerprint",
+            ),
+            "binding_state": copy_durable_json_object(
+                binding_state,
+                "completion finalization binding state",
+            ),
+        }
+        pending_completion_finalization_from_checkpoint(
+            {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: marker}
+        )
+        return marker
+
+    async def clear_completion_finalization(
+        self,
+        *,
+        session_id: str,
+        expected_marker: dict[str, Any],
+    ) -> None:
+        """Clear the exact marker only after its source synchronization succeeds."""
+
+        expected = pending_completion_finalization_from_checkpoint(
+            {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: expected_marker}
+        )
+        if expected is None:  # pragma: no cover - constructed immediately above
+            raise AssertionError("Completion finalization marker is unavailable.")
+
+        def clear_marker(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            current = pending_completion_finalization_from_checkpoint(checkpoint)
+            if current is None:
+                return checkpoint
+            if current != expected:
+                raise RuntimeError("Completion finalization marker changed before cleanup.")
+            copied = copy_json_value(checkpoint, "checkpoint")
+            copied.pop(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
+            return copied or None
+
+        await self._session_store.transform_checkpoint(session_id, clear_marker)
+
+    async def complete_completion_finalization(
+        self,
+        *,
+        session: Session,
+        expected_marker: dict[str, Any],
+    ) -> Session:
+        """Atomically publish success only after the exact workspace commit succeeds."""
+
+        expected = pending_completion_finalization_from_checkpoint(
+            {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: expected_marker}
+        )
+        if expected is None:  # pragma: no cover - constructed immediately above
+            raise AssertionError("Completion finalization marker is unavailable.")
+
+        def complete_and_clear(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            if (
+                current_session.instance_id != session.instance_id
+                or current_session.run_epoch != session.run_epoch
+            ):
+                raise SessionRunFenced("Completion finalization lost its exact session authority.")
+            current = pending_completion_finalization_from_checkpoint(checkpoint)
+            if current != expected:
+                raise RuntimeError("Completion finalization marker changed before commit.")
+            copied = copy_json_value(checkpoint, "checkpoint")
+            copied.pop(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
+            return copied or None
+
+        return await self._session_store.transition_status_and_checkpoint(
+            session.id,
+            from_statuses={SessionStatus.RUNNING},
+            to_status=SessionStatus.COMPLETED,
+            checkpoint_transform=complete_and_clear,
+        )
+
     def checkpoint_transform_preserving_runtime_state(
         self,
         checkpoint: dict[str, Any],
@@ -1591,6 +1830,7 @@ class EnvironmentLifecycle:
             ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+            PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
         )
 
         def transform(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
@@ -1762,6 +2002,7 @@ class EnvironmentLifecycle:
         started_event: Event | None,
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
+        completion_finalization_recovery_state: dict[str, Any] | None = None,
     ) -> EnvironmentBindingResult:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -1878,7 +2119,20 @@ class EnvironmentLifecycle:
         self._release_pending_environment_owner_admission(session.id)
         release_failed_binding_reservations: Callable[[], None] | None = None
         try:
-            if registered_environment.unclaimed_factory_result is not None:
+            if completion_finalization_recovery_state is not None:
+                bound = await environment_operation_boundary.await_environment_operation(
+                    lambda: binding._recover_completion_finalization(
+                        registered_environment.environment.workspace,
+                        registered_environment.environment.runner,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        recovery_state=completion_finalization_recovery_state,
+                    ),
+                    operation_name="Environment workspace completion recovery",
+                    redactor=self._secret_redactor,
+                )
+            elif registered_environment.unclaimed_factory_result is not None:
                 attempt = _EnvironmentLifecycleBindAttempt()
                 try:
                     bound = await environment_operation_boundary.await_environment_operation(
@@ -2645,6 +2899,12 @@ class EnvironmentLifecycle:
             if setup_owner is not None:
                 setup_owner.cleanup_release_safe = True
                 setup_owner.pending_finalize_failure_event = None
+                if binding._completion_requires_successful_finalization(bound_workspace):
+                    # The target may hold the only copy of successful tool
+                    # mutations. Keep its exact owner for a later bounded retry
+                    # after the failure evidence is durable.
+                    setup_owner.cleanup_requires_finalize_retry = True
+                    setup_owner.cleanup_settlement_deferred = True
             if persist_cancellation is not None:
                 aggregate = append_binding_finalize_cancellation(
                     exc,
@@ -2938,6 +3198,13 @@ class EnvironmentLifecycle:
                         operation_name="Environment binding cleanup retry",
                         redactor=self._secret_redactor,
                     )
+                    checkpoint = await self._session_store.load_checkpoint(session_id)
+                    marker = pending_completion_finalization_from_checkpoint(checkpoint)
+                    if marker is not None:
+                        await self.clear_completion_finalization(
+                            session_id=session_id,
+                            expected_marker=marker,
+                        )
                 except BaseException as retry_error:
                     setup_owner.cleanup_error = retry_error
                     return retry_error

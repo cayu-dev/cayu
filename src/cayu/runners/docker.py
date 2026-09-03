@@ -1301,6 +1301,108 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             _runtime_evidence=runtime_evidence,
         )
 
+    @classmethod
+    async def reconnect_strict(
+        cls,
+        name: str,
+        *,
+        container_id: str,
+        image_identity: DockerImageIdentity,
+        workload_restrictions: DockerWorkloadRestrictions,
+        default_cwd: str = DEFAULT_DOCKER_CWD,
+        runtime: str | None = None,
+        seccomp_profile: str | None = None,
+        docker_path: str | None = None,
+        required_executables: Sequence[str] = (),
+        toolchain_profile_fingerprint: str | None = None,
+    ) -> DockerRunner:
+        """Reattach to one exact strict container after re-verifying live evidence."""
+
+        name = require_clean_nonblank(name, "name")
+        if (
+            type(container_id) is not str
+            or _DOCKER_CONTAINER_ID_PATTERN.fullmatch(container_id) is None
+        ):
+            raise ValueError("container_id must be a full lowercase Docker container ID.")
+        if not isinstance(image_identity, DockerImageIdentity):
+            raise TypeError("image_identity must be DockerImageIdentity.")
+        if not isinstance(workload_restrictions, DockerWorkloadRestrictions):
+            raise TypeError("workload_restrictions must be DockerWorkloadRestrictions.")
+        owned_image_identity = DockerImageIdentity.model_validate(
+            image_identity.model_dump(mode="python")
+        )
+        owned_restrictions = DockerWorkloadRestrictions.model_validate(
+            workload_restrictions.model_dump(mode="python")
+        )
+        default_cwd = _validate_guest_cwd(default_cwd)
+        if not any(
+            default_cwd == mount.target or default_cwd.startswith(mount.target.rstrip("/") + "/")
+            for mount in owned_restrictions.tmpfs
+        ):
+            raise ValueError("Strict Docker reconnect cwd must be inside bounded tmpfs.")
+        runtime = _validate_runtime(runtime)
+        seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
+        executable_requirements = _normalize_required_executables(required_executables)
+        if toolchain_profile_fingerprint is not None and (
+            type(toolchain_profile_fingerprint) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", toolchain_profile_fingerprint) is None
+        ):
+            raise ValueError(
+                "toolchain_profile_fingerprint must be a lowercase SHA-256 identity or None."
+            )
+        docker = _require_docker(docker_path)
+        inspection = await _inspect_strict_container(
+            docker,
+            container_id,
+            docker_cli_env_allowlist=(),
+        )
+        image_id, image_reference = _verify_strict_container_inspection(
+            inspection,
+            container_id=container_id,
+            image_identity=owned_image_identity,
+            restrictions=owned_restrictions,
+            network_mode="none",
+            runtime=runtime,
+            seccomp_profile=seccomp_profile,
+        )
+        executable_availability = await _probe_strict_container(
+            docker,
+            container_id,
+            restrictions=owned_restrictions,
+            required_executables=executable_requirements,
+            docker_cli_env_allowlist=(),
+        )
+        observed_at = datetime.now(UTC)
+        runtime_evidence = _DockerRuntimeEvidence(
+            container_id=container_id,
+            image_id=image_id,
+            image_reference=image_reference,
+            network_mode="none",
+            default_cwd=default_cwd,
+            runtime=runtime,
+            seccomp_profile_sha256=_seccomp_profile_fingerprint(seccomp_profile),
+            restrictions=owned_restrictions,
+            image_identity=owned_image_identity,
+            toolchain_profile_fingerprint=toolchain_profile_fingerprint,
+            required_executables=executable_requirements,
+            executable_availability=executable_availability,
+            observed_at=observed_at,
+            valid_until=observed_at + timedelta(seconds=300),
+        )
+        return cls(
+            name,
+            image=owned_image_identity.reference,
+            default_cwd=default_cwd,
+            close_action="remove",
+            docker_path=docker,
+            credential_mode=CredentialMode.TRUSTED_TOOL,
+            allow_raw_secret_env=False,
+            cancellation_cleanup="sandbox",
+            timeout_cleanup="sandbox",
+            _container_id=container_id,
+            _runtime_evidence=runtime_evidence,
+        )
+
     def execution_capability_evidence(self):
         """Describe Docker honestly and bind strict evidence to the exact container."""
 
@@ -1430,11 +1532,6 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 reason_code="docker_host_inputs_not_mounted",
                 remediation_code="use_workspace_sync",
             ),
-            ExecutionCapabilityClaim.unsupported(
-                "reconnect",
-                reason_code="docker_reconnect_unsupported",
-                remediation_code="select_reconnectable_execution",
-            ),
         )
         executable_availability = dict(evidence.executable_availability)
         tool_requirements = ExecutionToolRequirementEvidence(
@@ -1498,6 +1595,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                         CapabilityDetail(name="close_remove", value=True),
                         CapabilityDetail(name="exact_container_owner", value=True),
                     ),
+                ),
+                live_claim(
+                    "reconnect",
+                    observation="supported",
+                    details=(CapabilityDetail(name="exact_container_id", value=True),),
                 ),
                 *unsupported,
             ),

@@ -337,6 +337,14 @@ copy limits never reuse it.
 wait-duration facts. Durable lifecycle-phase projection remains the responsibility of the
 environment progress contract. See the `*_sync_binding_live.py` examples below.
 
+For runtime-managed completed outcomes that require sync-back, finalization is a commit boundary:
+the linked task and public session-completed event are published only after the durable source is
+updated. A failure leaves a private bounded recovery marker and the retained target generation,
+fails the task/session with `workspace_output_committed=false`, and can be retried with
+`CayuApp.recover_incomplete_session(...)` after reconnecting the same target. Recovery validates the
+binding policy and, when `source_conflict_policy="require_revision"`, the original revision baseline;
+it does not repeat model or tool execution.
+
 A `SyncBinding` target plan factory is an identity-resolution boundary, not an
 allocation owner: `target_workspace_plan_factory` returns a
 `SyncTargetWorkspacePlan` containing an already lifecycle-owned, quiescent

@@ -53,6 +53,7 @@ from cayu.workspaces import (
     WorkspaceGitMode,
     WorkspaceGitModeMutator,
     WorkspaceIdentity,
+    WorkspaceMutationResult,
     WorkspacePathRevision,
     WorkspaceReadResult,
     WorkspaceRevisionObservation,
@@ -127,6 +128,7 @@ class _SyncBindingState:
     target_resource_key: tuple[object, ...]
     phase: Literal["active", "finalizing"] = "active"
     defer_finalize_release: bool = False
+    recovered: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +393,32 @@ def _reserve_sync_resources(
                 raise ValueError(
                     f"SyncBinding {role} workspace {workspace.id!r} is already bound "
                     "by an active session."
+                )
+        for _, _, resource_key in resources:
+            _SYNC_RESOURCE_OWNERS[resource_key] = generation
+
+
+def _recover_sync_resources(
+    source: Workspace,
+    target: Workspace,
+    *,
+    source_resource_key: tuple[object, ...],
+    target_resource_key: tuple[object, ...],
+    generation: str,
+) -> None:
+    """Restore one process-local reservation from durable exact-generation state."""
+
+    resources = (
+        ("source", source, source_resource_key),
+        ("target", target, target_resource_key),
+    )
+    with _SYNC_RESOURCE_OWNERS_LOCK:
+        for role, workspace, resource_key in resources:
+            owner = _SYNC_RESOURCE_OWNERS.get(resource_key)
+            if owner is not None and owner != generation:
+                raise ValueError(
+                    f"SyncBinding {role} workspace {workspace.id!r} is already bound "
+                    "by a different active session."
                 )
         for _, _, resource_key in resources:
             _SYNC_RESOURCE_OWNERS[resource_key] = generation
@@ -670,6 +698,40 @@ class WorkspaceBinding(ABC):
         if type(bound) is not BoundWorkspace:
             raise TypeError("WorkspaceBinding quiescence query requires a BoundWorkspace.")
         return False
+
+    def _completion_requires_successful_finalization(self, bound: BoundWorkspace) -> bool:
+        """Whether completed work depends on this binding persisting its output."""
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("WorkspaceBinding completion query requires a BoundWorkspace.")
+        return False
+
+    def _completion_finalization_recovery_state(
+        self,
+        bound: BoundWorkspace,
+    ) -> dict[str, Any] | None:
+        """Return bounded private state needed to retry completion finalization."""
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("WorkspaceBinding recovery query requires a BoundWorkspace.")
+        return None
+
+    async def _recover_completion_finalization(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None,
+        environment_name: str | None,
+        recovery_state: dict[str, Any],
+    ) -> BoundWorkspace:
+        """Restore a bound owner without repeating its mutating bind operation."""
+
+        del workspace, runner, session_id, agent_name, environment_name, recovery_state
+        raise RuntimeError(
+            f"{type(self).__name__} does not support durable completion finalization recovery."
+        )
 
 
 class NativeBinding(WorkspaceBinding):
@@ -1294,7 +1356,10 @@ class SyncBinding(WorkspaceBinding):
     reserved until that exact generation finalizes successfully or is explicitly
     abandoned; elapsed time is not evidence that a live binding released them.
     Direct callers whose lifecycle will not invoke ``finalize`` must call
-    ``abandon`` with the matching bound workspace.
+    ``abandon`` with the matching bound workspace. Runtime-managed completed
+    outcomes persist a bounded private copy of the generation state before
+    finalization so incomplete-session recovery can reconnect the same target
+    and retry revision-aware copy-back without repeating bind or workload work.
     """
 
     def __init__(
@@ -1901,6 +1966,7 @@ class SyncBinding(WorkspaceBinding):
                     deleted_paths=deleted_paths,
                     revisions=state.source_revisions,
                     staging_capacity=self.staging_capacity,
+                    allow_idempotent_replay=state.recovered,
                 )
             else:
                 copied_bytes = await _copy_paths(
@@ -1964,6 +2030,7 @@ class SyncBinding(WorkspaceBinding):
         deleted_paths: tuple[str, ...],
         revisions: tuple[_SyncSourceRevision, ...],
         staging_capacity: SyncBindingStagingCapacity,
+        allow_idempotent_replay: bool,
     ) -> tuple[int, tuple[_SyncSourceRevision, ...]]:
         max_file_bytes = cast("int", self.max_file_bytes)
         max_total_bytes = cast("int", self.max_total_bytes)
@@ -2003,14 +2070,15 @@ class SyncBinding(WorkspaceBinding):
                 )
                 members = {member.name: member for member in tar}
             revision_map = {item.path: item for item in revisions}
-            await _verify_sync_source_revisions(
-                source,
-                revisions,
-                max_file_bytes=max_file_bytes,
-                max_total_bytes=max_total_bytes,
-                preserve_git_modes=self.preserve_git_modes,
-                staging_capacity=None if archive is not None else staging_capacity,
-            )
+            if not allow_idempotent_replay:
+                await _verify_sync_source_revisions(
+                    source,
+                    revisions,
+                    max_file_bytes=max_file_bytes,
+                    max_total_bytes=max_total_bytes,
+                    preserve_git_modes=self.preserve_git_modes,
+                    staging_capacity=None if archive is not None else staging_capacity,
+                )
             applied: list[str] = []
             operations = tuple(sorted(set(copy_back_paths).union(deleted_paths)))
             for path in operations:
@@ -2035,41 +2103,73 @@ class SyncBinding(WorkspaceBinding):
                             git_mode = (
                                 _tar_member_git_mode(member) if self.preserve_git_modes else None
                             )
-                            if self.preserve_git_modes:
-                                if not isinstance(source, WorkspaceGitModeMutator):
-                                    raise RuntimeError(
-                                        "SyncBinding Git-mode copy-back requires a mode-aware "
-                                        "source."
-                                    )
-                                if git_mode is None:
-                                    raise AssertionError(
-                                        "SyncBinding validated Git mode authority is unavailable."
-                                    )
-                                if expected is None:
-                                    result = await source.create_bytes_with_git_mode(
-                                        path,
-                                        content,
-                                        git_mode=git_mode,
-                                    )
-                                else:
-                                    if expected.git_mode is None:
+                            try:
+                                if self.preserve_git_modes:
+                                    if not isinstance(source, WorkspaceGitModeMutator):
                                         raise RuntimeError(
-                                            f"SyncBinding source omitted Git mode authority: {path}"
+                                            "SyncBinding Git-mode copy-back requires a mode-aware "
+                                            "source."
                                         )
-                                    result = await source.replace_bytes_with_git_mode(
+                                    if git_mode is None:
+                                        raise AssertionError(
+                                            "SyncBinding validated Git mode authority is "
+                                            "unavailable."
+                                        )
+                                    if expected is None:
+                                        result = await source.create_bytes_with_git_mode(
+                                            path,
+                                            content,
+                                            git_mode=git_mode,
+                                        )
+                                    else:
+                                        if expected.git_mode is None:
+                                            raise RuntimeError(
+                                                "SyncBinding source omitted Git mode authority: "
+                                                f"{path}"
+                                            )
+                                        result = await source.replace_bytes_with_git_mode(
+                                            path,
+                                            content,
+                                            expected_revision=expected.revision,
+                                            expected_git_mode=expected.git_mode,
+                                            git_mode=git_mode,
+                                        )
+                                elif expected is None:
+                                    result = await source.create_bytes(path, content)
+                                else:
+                                    result = await source.replace_bytes(
                                         path,
                                         content,
                                         expected_revision=expected.revision,
-                                        expected_git_mode=expected.git_mode,
-                                        git_mode=git_mode,
                                     )
-                            elif expected is None:
-                                result = await source.create_bytes(path, content)
-                            else:
-                                result = await source.replace_bytes(
+                            except Exception:
+                                if not allow_idempotent_replay:
+                                    raise
+                                current = await _read_sync_file_result(
+                                    source,
                                     path,
-                                    content,
-                                    expected_revision=expected.revision,
+                                    max_file_bytes=max_file_bytes,
+                                    max_total_bytes=max_total_bytes,
+                                    copied_bytes=0,
+                                )
+                                if (
+                                    current.content != content
+                                    or current.revision is None
+                                    or (self.preserve_git_modes and current.git_mode != git_mode)
+                                ):
+                                    raise
+                                result = WorkspaceMutationResult(
+                                    operation="replace" if expected is not None else "create",
+                                    before_revision=(
+                                        current.revision if expected is not None else None
+                                    ),
+                                    after_revision=current.revision,
+                                    before_sha256=current.sha256 if expected is not None else None,
+                                    after_sha256=current.sha256,
+                                    before_bytes=(
+                                        len(current.content) if expected is not None else None
+                                    ),
+                                    after_bytes=len(current.content),
                                 )
                             if result.after_revision is None:
                                 raise RuntimeError(
@@ -2082,10 +2182,14 @@ class SyncBinding(WorkspaceBinding):
                             )
                         else:
                             expected = revision_map[path]
-                            await source.delete_if_revision(
-                                path,
-                                expected_revision=expected.revision,
-                            )
+                            try:
+                                await source.delete_if_revision(
+                                    path,
+                                    expected_revision=expected.revision,
+                                )
+                            except FileNotFoundError:
+                                if not allow_idempotent_replay:
+                                    raise
                             del revision_map[path]
                         applied.append(path)
                         self._update_conflict_state(
@@ -2174,6 +2278,267 @@ class SyncBinding(WorkspaceBinding):
             _validate_sync_generation_ownership(bound, state)
             return True
 
+    def _completion_requires_successful_finalization(self, bound: BoundWorkspace) -> bool:
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("SyncBinding completion query requires a BoundWorkspace.")
+        return _should_sync_back(self.sync_back, "completed")
+
+    def _completion_finalization_recovery_state(
+        self,
+        bound: BoundWorkspace,
+    ) -> dict[str, Any] | None:
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("SyncBinding recovery query requires a BoundWorkspace.")
+        state_key = bound.state_key
+        if state_key is None:
+            raise ValueError("SyncBinding recovery requires in-process bind state.")
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None:
+                raise ValueError("SyncBinding recovery requires an active bind generation.")
+            _validate_sync_generation_ownership(bound, state)
+            if state.phase != "active":
+                raise RuntimeError(
+                    "SyncBinding recovery state cannot be captured while finalizing."
+                )
+            source_paths = list(state.source_paths)
+            target_baseline_paths = list(state.target_baseline_paths)
+            source_revisions = [
+                {
+                    "path": item.path,
+                    "revision": item.revision,
+                    "git_mode": item.git_mode,
+                }
+                for item in state.source_revisions
+            ]
+        if bound.source_workspace is None or bound.workspace is None:
+            raise ValueError("SyncBinding recovery requires source and target workspaces.")
+        snapshot = (
+            None
+            if bound.snapshot is None
+            else {
+                "snapshot_id": bound.snapshot.snapshot_id,
+                "workspace_id": bound.snapshot.workspace_id,
+                "version": bound.snapshot.version,
+                "source": bound.snapshot.source,
+                "metadata": copy_json_value(bound.snapshot.metadata, "snapshot metadata"),
+            }
+        )
+        return copy_durable_json_object(
+            {
+                "version": 1,
+                "kind": "sync_binding",
+                "generation": state_key,
+                "source_workspace_id": bound.source_workspace.id,
+                "target_workspace_id": bound.workspace.id,
+                "source_paths": source_paths,
+                "target_baseline_paths": target_baseline_paths,
+                "source_revisions": source_revisions,
+                "path": bound.path,
+                "metadata": copy_json_value(bound.metadata, "binding metadata"),
+                "snapshot": snapshot,
+            },
+            "SyncBinding completion finalization recovery state",
+        )
+
+    async def _recover_completion_finalization(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None,
+        environment_name: str | None,
+        recovery_state: dict[str, Any],
+    ) -> BoundWorkspace:
+        if workspace is None:
+            raise ValueError("SyncBinding recovery requires a source workspace.")
+        state = copy_durable_json_object(recovery_state, "SyncBinding recovery state")
+        if state.get("version") != 1 or state.get("kind") != "sync_binding":
+            raise ValueError("SyncBinding recovery state has an unsupported format.")
+        raw_generation = state.get("generation")
+        raw_source_workspace_id = state.get("source_workspace_id")
+        raw_target_workspace_id = state.get("target_workspace_id")
+        if type(raw_generation) is not str:
+            raise ValueError("SyncBinding recovery generation must be a string.")
+        if type(raw_source_workspace_id) is not str:
+            raise ValueError("SyncBinding recovery source workspace id must be a string.")
+        if type(raw_target_workspace_id) is not str:
+            raise ValueError("SyncBinding recovery target workspace id must be a string.")
+        generation = require_durable_clean_nonblank(
+            raw_generation,
+            "SyncBinding recovery generation",
+        )
+        source_workspace_id = require_durable_clean_nonblank(
+            raw_source_workspace_id,
+            "SyncBinding recovery source workspace id",
+        )
+        target_workspace_id = require_durable_clean_nonblank(
+            raw_target_workspace_id,
+            "SyncBinding recovery target workspace id",
+        )
+        if workspace.id != source_workspace_id:
+            raise RuntimeError("SyncBinding recovery resolved a different source workspace.")
+        raw_metadata = state.get("metadata")
+        if type(raw_metadata) is not dict:
+            raise ValueError("SyncBinding recovery metadata must be an object.")
+        bound_metadata = copy_durable_json_object(raw_metadata, "SyncBinding recovery metadata")
+        durable_config = bound_metadata.get("sync_binding")
+        if type(durable_config) is not dict:
+            raise ValueError("SyncBinding recovery metadata lost its binding policy.")
+        expected_config = {
+            "source_workspace_id": workspace.id,
+            "target_workspace_id": target_workspace_id,
+            "pattern": self.pattern,
+            "max_files": self.max_files,
+            "max_file_bytes": self.max_file_bytes,
+            "max_total_bytes": self.max_total_bytes,
+            "max_archive_bytes": self.max_archive_bytes,
+            "clean_target": self.clean_target,
+            "sync_back": self.sync_back,
+            "delete_missing": self.delete_missing,
+            "source_conflict_policy": self.source_conflict_policy,
+            "preserve_git_modes": self.preserve_git_modes,
+        }
+        if any(durable_config.get(key) != value for key, value in expected_config.items()):
+            raise RuntimeError("SyncBinding recovery policy changed since the original bind.")
+        request_metadata = {
+            key: copy_json_value(value, f"SyncBinding recovery metadata {key!r}")
+            for key, value in bound_metadata.items()
+            if key != "sync_binding"
+        }
+        context = SyncBindingContext(
+            source_workspace=workspace,
+            runner=runner,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            metadata=request_metadata,
+        )
+        target, _provision = await self._target_workspace(context)
+        if target.id != target_workspace_id:
+            raise RuntimeError("SyncBinding recovery resolved a different target workspace.")
+        source_resource_key, target_resource_key = _reject_same_or_indeterminate_target(
+            workspace,
+            target,
+        )
+
+        def paths(field_name: str) -> tuple[str, ...]:
+            raw = state.get(field_name)
+            if type(raw) is not list or len(raw) > self.max_files:
+                raise ValueError(f"SyncBinding recovery {field_name} must be a bounded list.")
+            parsed = tuple(
+                require_durable_clean_nonblank(
+                    item,
+                    f"SyncBinding recovery {field_name} path",
+                )
+                for item in raw
+            )
+            if any(not _safe_git_observation_path(item) for item in parsed):
+                raise ValueError(f"SyncBinding recovery {field_name} contains an unsafe path.")
+            if tuple(sorted(set(parsed))) != parsed:
+                raise ValueError(f"SyncBinding recovery {field_name} must be sorted and unique.")
+            return parsed
+
+        source_paths = paths("source_paths")
+        target_baseline_paths = paths("target_baseline_paths")
+        raw_revisions = state.get("source_revisions")
+        if type(raw_revisions) is not list or len(raw_revisions) > self.max_files:
+            raise ValueError("SyncBinding recovery source_revisions must be a bounded list.")
+        revisions: list[_SyncSourceRevision] = []
+        for raw_revision in raw_revisions:
+            if type(raw_revision) is not dict:
+                raise ValueError("SyncBinding recovery source revision must be an object.")
+            path = require_durable_clean_nonblank(
+                raw_revision.get("path"),
+                "SyncBinding recovery source path",
+            )
+            if not _safe_git_observation_path(path):
+                raise ValueError("SyncBinding recovery source revision path is unsafe.")
+            revision = require_durable_clean_nonblank(
+                raw_revision.get("revision"),
+                "SyncBinding recovery source revision",
+            )
+            git_mode = raw_revision.get("git_mode")
+            if git_mode not in {None, "100644", "100755"}:
+                raise ValueError("SyncBinding recovery source Git mode is invalid.")
+            revisions.append(
+                _SyncSourceRevision(
+                    path=path,
+                    revision=revision,
+                    git_mode=cast("WorkspaceGitMode | None", git_mode),
+                )
+            )
+        source_revisions = tuple(revisions)
+        if tuple(sorted({item.path for item in source_revisions})) != tuple(
+            item.path for item in source_revisions
+        ):
+            raise ValueError("SyncBinding recovery source revisions must be sorted and unique.")
+        if (
+            self.source_conflict_policy == "require_revision"
+            and tuple(item.path for item in source_revisions) != source_paths
+        ):
+            raise ValueError("SyncBinding recovery lost source revision authority.")
+        raw_path = state.get("path")
+        if raw_path is not None:
+            raw_path = require_clean_nonblank(raw_path, "SyncBinding recovery path")
+        raw_snapshot = state.get("snapshot")
+        snapshot = None
+        if raw_snapshot is not None:
+            if type(raw_snapshot) is not dict:
+                raise ValueError("SyncBinding recovery snapshot must be an object or null.")
+            snapshot = WorkspaceSnapshot(
+                snapshot_id=raw_snapshot.get("snapshot_id"),
+                workspace_id=raw_snapshot.get("workspace_id"),
+                version=raw_snapshot.get("version"),
+                source=raw_snapshot.get("source"),
+                metadata=raw_snapshot.get("metadata", {}),
+            )
+        bound = BoundWorkspace(
+            workspace=target,
+            source_workspace=workspace,
+            runner=runner,
+            path=raw_path,
+            metadata=bound_metadata,
+            snapshot=snapshot,
+            state_key=generation,
+        )
+        restored = _SyncBindingState(
+            source_paths=source_paths,
+            target_baseline_paths=target_baseline_paths,
+            source_revisions=source_revisions,
+            source_resource_key=source_resource_key,
+            target_id=target.id,
+            target_resource_key=target_resource_key,
+            recovered=True,
+        )
+        with self._state_lock:
+            existing = self._states.get(generation)
+            if existing is not None:
+                _validate_sync_generation_ownership(bound, existing)
+                if existing.phase != "active":
+                    raise RuntimeError(
+                        "SyncBinding recovery generation is already being finalized."
+                    )
+                return bound
+        _recover_sync_resources(
+            workspace,
+            target,
+            source_resource_key=source_resource_key,
+            target_resource_key=target_resource_key,
+            generation=generation,
+        )
+        try:
+            self._record_sync_state(generation, restored)
+        except BaseException:
+            _release_sync_resources(
+                source_resource_key,
+                target_resource_key,
+                generation=generation,
+            )
+            raise
+        return bound
+
     def _record_sync_state(self, state_key: str, state: _SyncBindingState) -> None:
         with self._state_lock:
             if state_key in self._states:
@@ -2210,7 +2575,7 @@ class SyncBinding(WorkspaceBinding):
                     return state_key, finalizing
         raise ValueError(
             "SyncBinding finalize requires in-process bind state. "
-            "Use a custom WorkspaceBinding when sync finalization must survive process restart."
+            "Runtime-managed completion retries must use incomplete-session recovery."
         )
 
     def _restore_sync_state(self, state_key: str) -> None:

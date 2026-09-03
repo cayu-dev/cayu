@@ -123,12 +123,77 @@ from cayu.runtime.egress import (
     VirtualEgressEnvironmentFactory,
     _await_cleanup_task,
     _EgressManagedRunner,
+    _EgressTeardownBinding,
     _workspace_dispatch_settlement_kind,
 )
 from cayu.testing import verify_provider_credential_isolation
 
 REAL_SECRET = "sk_test_51FactoryRealSecret"
 POLICY_NAME = "provider-example"
+
+
+def test_egress_wrapper_propagates_sync_completion_recovery_state(
+    tmp_path: Path,
+) -> None:
+    class RecordingBindingFence:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool | None, str | None]] = []
+
+        def begin_workspace_binding(self) -> None:
+            self.calls.append(("begin", None, None))
+
+        def finish_workspace_binding(
+            self,
+            *,
+            require_mutation_quiescence: bool,
+            workspace_owner_key: str | None = None,
+        ) -> None:
+            self.calls.append(
+                (
+                    "finish",
+                    require_mutation_quiescence,
+                    workspace_owner_key,
+                )
+            )
+
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    inner = SyncBinding(target_workspace=target)
+    bound = asyncio.run(inner.bind(source, None, session_id="wrapped-sync"))
+    wrapper = object.__new__(_EgressTeardownBinding)
+    wrapper._inner = inner
+
+    assert wrapper._completion_requires_successful_finalization(bound) is True
+    recovery_state = wrapper._completion_finalization_recovery_state(bound)
+    assert recovery_state is not None
+    assert recovery_state["generation"] == bound.state_key
+
+    inner.abandon(bound)
+    recovered_inner = SyncBinding(target_workspace=target)
+    recovered_wrapper = object.__new__(_EgressTeardownBinding)
+    recovered_wrapper._inner = recovered_inner
+    fence = RecordingBindingFence()
+    recovered_wrapper._runner = fence
+    recovered = asyncio.run(
+        recovered_wrapper._recover_completion_finalization(
+            source,
+            None,
+            session_id="wrapped-sync",
+            agent_name="agent",
+            environment_name="environment",
+            recovery_state=recovery_state,
+        )
+    )
+
+    assert fence.calls == [
+        ("begin", None, None),
+        ("finish", True, recovered.state_key),
+    ]
+    recovered_inner.abandon(recovered)
 
 
 class _ClosedRejectingRunnerWorkspace(RunnerBoundWorkspace):

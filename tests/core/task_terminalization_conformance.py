@@ -18,6 +18,7 @@ from cayu import (
     TaskCancellationReconciliationRejected,
     TaskCancellationReconciliationRequest,
     TaskCancellationReconciliationResult,
+    TaskClaimLost,
     TaskCreate,
     TaskStatus,
     TaskStore,
@@ -146,6 +147,74 @@ async def assert_recovered_continuation_terminalization_conformance(
         )
         assert receipt is not None
         assert receipt.task == terminal
+
+
+async def assert_attached_task_recovery_terminalization_conformance(
+    store: TaskStore,
+) -> None:
+    """Prove exact session/lease fencing and durable replay for crash recovery."""
+
+    assert store.supports_attached_task_recovery_terminalization is True
+    await store.create_task(TaskCreate(task_id="attached-recovery", type="review"))
+    claimed = await store.claim_task("attached-recovery-worker", lease_seconds=1)
+    assert claimed is not None
+    assert claimed.lease_expires_at is not None
+    attached = await store.attach_task(
+        claimed.id,
+        session_id="attached-recovery-session",
+        session_invocation=await task_backed_session_invocation(
+            store,
+            claimed.id,
+            "attached-recovery-session",
+        ),
+        worker_id=claimed.worker_id,
+        lease_expires_at=claimed.lease_expires_at,
+    )
+    assert attached.session_instance_id is not None
+    request = TaskTerminalizationRequest(
+        task_id=attached.id,
+        worker_id=claimed.worker_id,
+        lease_expires_at=claimed.lease_expires_at,
+        kind=TaskTerminalKind.FAILED,
+        error={"code": "session_recovery"},
+        idempotency_key="attached-recovery-failure",
+    )
+
+    with pytest.raises(TaskClaimLost, match="lease is still active"):
+        await store.recover_attached_task_failure(
+            request,
+            session_id=attached.session_id,
+            session_instance_id=attached.session_instance_id,
+        )
+    await asyncio.sleep(1.05)
+    terminal = await store.recover_attached_task_failure(
+        request,
+        session_id=attached.session_id,
+        session_instance_id=attached.session_instance_id,
+    )
+    replayed = await store.recover_attached_task_failure(
+        request,
+        session_id=attached.session_id,
+        session_instance_id=attached.session_instance_id,
+    )
+    receipt = await store.load_task_terminalization_receipt(
+        request.task_id,
+        request.idempotency_key,
+    )
+
+    assert terminal.status is TaskStatus.FAILED
+    assert terminal.error == {"code": "session_recovery"}
+    assert terminal.worker_id is None
+    assert terminal.lease_expires_at is None
+    assert replayed == terminal
+    assert receipt is not None
+    assert receipt.task == terminal
+    with pytest.raises(TaskClaimLost, match="session incarnation"):
+        await store.recover_attached_task_failure(
+            request,
+            session_id="different-session",
+            session_instance_id=attached.session_instance_id,
+        )
 
 
 async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(

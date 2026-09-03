@@ -20,6 +20,7 @@ from cayu._coding_product_authority import (
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    require_durable_clean_nonblank,
     thaw_json_value,
 )
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
@@ -260,6 +261,208 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             raise
         return bound
 
+    def _completion_finalization_recovery_state(
+        self,
+        bound: BoundWorkspace,
+    ) -> dict[str, Any] | None:
+        sync_state = super()._completion_finalization_recovery_state(bound)
+        if sync_state is None:  # pragma: no cover - SyncBinding is completion-critical.
+            raise AssertionError("Docker coding recovery lost its sync state.")
+        authority = self._bind_authority(bound)
+        return copy_durable_json_object(
+            {
+                "version": 1,
+                "kind": "docker_coding_sync_binding",
+                "sync_binding": sync_state,
+                "authority": {
+                    "session_id": authority.session_id,
+                    "source": (
+                        None
+                        if authority.source is None
+                        else authority.source.model_dump(mode="json")
+                    ),
+                    "workspace_baseline": (
+                        None
+                        if authority.workspace_baseline is None
+                        else authority.workspace_baseline.model_dump(mode="json")
+                    ),
+                    "git": {
+                        "head_revision": authority.git.head_revision,
+                        "staged_entries_sha256": authority.git.staged_entries_sha256,
+                        "tracked_flags_sha256": authority.git.tracked_flags_sha256,
+                        "configuration_sha256": authority.git.configuration_sha256,
+                    },
+                    "git_transformed_baseline_paths": sorted(
+                        authority.git_transformed_baseline_paths
+                    ),
+                },
+            },
+            "Docker coding completion finalization recovery state",
+        )
+
+    async def _recover_completion_finalization(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None,
+        environment_name: str | None,
+        recovery_state: dict[str, Any],
+    ) -> BoundWorkspace:
+        if not isinstance(workspace, LocalWorkspace):
+            raise TypeError("Docker coding recovery requires a LocalWorkspace source.")
+        if not isinstance(runner, DockerRunner) or not self._docker_target.is_bound_to_runner(
+            runner
+        ):
+            raise ValueError("Docker coding recovery requires its exact DockerRunner.")
+        protected_source = LocalWorkspace(
+            workspace.root,
+            workspace_id=workspace.id,
+            excluded_directory_names=_merge_protected_directory_names(
+                workspace.excluded_directory_names
+            ),
+            excluded_path_patterns=workspace.excluded_path_patterns,
+        )
+        if frozenset(self._docker_target.excluded_directory_names) != frozenset(
+            protected_source.excluded_directory_names
+        ) or frozenset(
+            pattern.casefold() for pattern in self._docker_target.excluded_path_patterns
+        ) != frozenset(pattern.casefold() for pattern in protected_source.excluded_path_patterns):
+            raise ValueError("Docker coding recovery path projections changed.")
+
+        state = copy_durable_json_object(
+            recovery_state,
+            "Docker coding completion finalization recovery state",
+        )
+        if state.get("version") != 1 or state.get("kind") != "docker_coding_sync_binding":
+            raise ValueError("Docker coding recovery state has an unsupported format.")
+        raw_sync_state = state.get("sync_binding")
+        raw_authority = state.get("authority")
+        if type(raw_sync_state) is not dict or type(raw_authority) is not dict:
+            raise ValueError("Docker coding recovery state is incomplete.")
+        sync_state = copy_durable_json_object(raw_sync_state, "Docker coding sync state")
+        authority_state = copy_durable_json_object(
+            raw_authority,
+            "Docker coding bind authority",
+        )
+        if set(authority_state) != {
+            "session_id",
+            "source",
+            "workspace_baseline",
+            "git",
+            "git_transformed_baseline_paths",
+        }:
+            raise ValueError("Docker coding bind authority has unsupported fields.")
+        recovered_session_id = require_durable_clean_nonblank(
+            cast("str", authority_state.get("session_id")),
+            "Docker coding recovery session id",
+        )
+        if recovered_session_id != session_id:
+            raise RuntimeError("Docker coding recovery authority belongs to another session.")
+        raw_source = authority_state.get("source")
+        source = (
+            None
+            if raw_source is None
+            else CodingProductSourceCopyAuthority.model_validate(raw_source)
+        )
+        if source != self._source_copy_authority:
+            raise RuntimeError("Docker coding source-copy authority changed during recovery.")
+        raw_workspace_baseline = authority_state.get("workspace_baseline")
+        workspace_baseline = (
+            None
+            if raw_workspace_baseline is None
+            else WorkspaceRevisionObservation.model_validate(raw_workspace_baseline)
+        )
+        if (source is None) != (workspace_baseline is None):
+            raise ValueError("Docker coding recovery source authority is incomplete.")
+        if workspace_baseline is not None:
+            if source is None:  # pragma: no cover - paired authority checked above.
+                raise AssertionError("Docker coding recovery source authority disappeared.")
+            if (
+                workspace_baseline.status is not WorkspaceRevisionObservationStatus.SUPPORTED
+                or workspace_baseline.path_scope != "complete"
+                or workspace_baseline.revision != source.baseline_revision
+                or workspace_baseline.identity.workspace_id != self._docker_target.id
+            ):
+                raise RuntimeError("Docker coding recovery baseline conflicts with its authority.")
+        raw_git = authority_state.get("git")
+        if type(raw_git) is not dict or set(raw_git) != {
+            "head_revision",
+            "staged_entries_sha256",
+            "tracked_flags_sha256",
+            "configuration_sha256",
+        }:
+            raise ValueError("Docker coding recovery Git authority is malformed.")
+        git = _EphemeralGitBaseline(
+            head_revision=require_durable_clean_nonblank(
+                raw_git.get("head_revision"),
+                "Docker coding recovery Git head",
+            ),
+            staged_entries_sha256=require_durable_clean_nonblank(
+                raw_git.get("staged_entries_sha256"),
+                "Docker coding recovery staged-entry identity",
+            ),
+            tracked_flags_sha256=require_durable_clean_nonblank(
+                raw_git.get("tracked_flags_sha256"),
+                "Docker coding recovery tracked-flag identity",
+            ),
+            configuration_sha256=require_durable_clean_nonblank(
+                raw_git.get("configuration_sha256"),
+                "Docker coding recovery Git configuration identity",
+            ),
+        )
+        raw_transformed_paths = authority_state.get("git_transformed_baseline_paths")
+        if type(raw_transformed_paths) is not list or len(raw_transformed_paths) > self.max_files:
+            raise ValueError("Docker coding transformed-path authority must be bounded.")
+        transformed_paths = tuple(
+            require_durable_clean_nonblank(path, "Docker coding transformed path")
+            for path in raw_transformed_paths
+        )
+        if tuple(sorted(set(transformed_paths))) != transformed_paths:
+            raise ValueError("Docker coding transformed paths must be sorted and unique.")
+        baseline_paths = (
+            frozenset()
+            if workspace_baseline is None
+            else frozenset(entry.path for entry in workspace_baseline.paths)
+        )
+        if not set(transformed_paths).issubset(baseline_paths):
+            raise ValueError("Docker coding transformed paths exceed the recovered baseline.")
+        recovered_authority = _DockerCodingBindAuthority(
+            session_id=session_id,
+            source=source,
+            workspace_baseline=workspace_baseline,
+            git=git,
+            git_transformed_baseline_paths=frozenset(transformed_paths),
+        )
+
+        bound: BoundWorkspace | None = None
+        try:
+            bound = await super()._recover_completion_finalization(
+                protected_source,
+                runner,
+                session_id=session_id,
+                agent_name=agent_name,
+                environment_name=environment_name,
+                recovery_state=sync_state,
+            )
+            state_key = bound.state_key
+            if state_key is None:
+                raise RuntimeError("Docker coding recovery lost its sync generation.")
+            with self._coding_authority_lock:
+                existing = self._coding_authorities.get(state_key)
+                if existing is not None and existing != recovered_authority:
+                    raise RuntimeError("Docker coding recovery authority changed.")
+                self._coding_authorities[state_key] = recovered_authority
+            return bound
+        except BaseException:
+            if bound is not None:
+                with self._coding_authority_lock:
+                    retained = self._coding_authorities.get(bound.state_key or "")
+                if retained is None:
+                    self.abandon(bound)
+            raise
+
     async def finalize(
         self,
         bound: BoundWorkspace,
@@ -415,7 +618,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
-            behavior_version="9",
+            behavior_version="10",
             implementation_version=self._configuration_fingerprint,
         )
 
@@ -432,6 +635,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     ) -> ExecutionAdmissionCandidate:
         if not isinstance(request, EnvironmentFactoryRequest):
             raise TypeError("Docker coding admission requires EnvironmentFactoryRequest.")
+        self._validate_request(request)
         return self._configured_candidate()
 
     def create_workspace_binding(
@@ -483,26 +687,44 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         if _read_seccomp_sha256(self.seccomp_profile) != self._seccomp_sha256:
             raise RuntimeError("Docker coding seccomp profile changed after factory admission.")
 
-        runner = await DockerRunner.create(
-            f"cayu-coding-{uuid4().hex}",
-            image=self.image_identity.reference,
-            runtime=self.runtime,
-            default_cwd="/workspace",
-            close_action="remove",
-            docker_path=self.docker_path,
-            replace=False,
-            cancellation_cleanup="sandbox",
-            timeout_cleanup="sandbox",
-            credential_mode=CredentialMode.TRUSTED_TOOL,
-            allow_raw_secret_env=False,
-            network="none",
-            seccomp_profile=self.seccomp_profile,
-            image_identity=self.image_identity,
-            workload_restrictions=self.restrictions,
-            required_executables=self.required_executables,
-            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
-        )
+        if request.operation is EnvironmentFactoryOperation.CREATE:
+            runner = await DockerRunner.create(
+                f"cayu-coding-{uuid4().hex}",
+                image=self.image_identity.reference,
+                runtime=self.runtime,
+                default_cwd="/workspace",
+                close_action="remove",
+                docker_path=self.docker_path,
+                replace=False,
+                cancellation_cleanup="sandbox",
+                timeout_cleanup="sandbox",
+                credential_mode=CredentialMode.TRUSTED_TOOL,
+                allow_raw_secret_env=False,
+                network="none",
+                seccomp_profile=self.seccomp_profile,
+                image_identity=self.image_identity,
+                workload_restrictions=self.restrictions,
+                required_executables=self.required_executables,
+                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            )
+        else:
+            container_id = cast("str", request.reconnect_metadata.get("container_id"))
+            runner = await DockerRunner.reconnect_strict(
+                f"cayu-coding-reconnect-{container_id[:12]}",
+                container_id=container_id,
+                image_identity=self.image_identity,
+                workload_restrictions=self.restrictions,
+                default_cwd="/workspace",
+                runtime=self.runtime,
+                seccomp_profile=self.seccomp_profile,
+                docker_path=self.docker_path,
+                required_executables=self.required_executables,
+                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            )
         try:
+            exact_container_id = runner.container_id
+            if exact_container_id is None:
+                raise RuntimeError("Docker coding runner lost its exact container identity.")
             final_candidate = runner.execution_admission_candidate()
             final_evidence = final_candidate.evidence
             if (
@@ -533,7 +755,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             workspace = RunnerWorkspace(
                 runner,
                 cwd=None,
-                workspace_id=f"docker:{runner.container_id}:workspace",
+                workspace_id=f"docker:{exact_container_id}:workspace",
                 python_executable="python3",
                 default_read_limit_bytes=self.transfer_limits.max_file_bytes,
                 default_list_limit=self.transfer_limits.max_files,
@@ -549,7 +771,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             evidence_metadata = final_decision.evidence.to_metadata()
             metadata = {
                 "kind": "docker_coding",
-                "container_id": runner.container_id,
+                "container_id": exact_container_id,
                 "image_fingerprint": self.image_identity.fingerprint,
                 "configuration_fingerprint": self._configuration_fingerprint,
                 **self.toolchain_profile.evidence(),
@@ -580,17 +802,26 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 runner=runner,
                 binding=binding,
             )
+            reconnect_metadata = _docker_coding_reconnect_metadata(
+                container_id=exact_container_id,
+                configuration_fingerprint=self._configuration_fingerprint,
+                image_fingerprint=self.image_identity.fingerprint,
+                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            )
 
             async def release(action: EnvironmentFactoryReleaseAction) -> None:
-                del action
-                await runner.close()
+                if action is EnvironmentFactoryReleaseAction.DISCARD:
+                    await runner.close()
 
             return EnvironmentFactoryResult(
                 environment=environment,
                 metadata=metadata,
+                reconnect_metadata=reconnect_metadata,
                 release=release,
             )
         except BaseException as original:
+            if request.operation is EnvironmentFactoryOperation.RECONNECT:
+                raise
             try:
                 await runner.close()
             except BaseException as cleanup_error:
@@ -603,8 +834,25 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     def _validate_request(self, request: EnvironmentFactoryRequest) -> None:
         if not isinstance(request, EnvironmentFactoryRequest):
             raise TypeError("Docker coding create requires EnvironmentFactoryRequest.")
-        if request.operation is not EnvironmentFactoryOperation.CREATE:
-            raise ValueError("Docker coding environments do not support reconnect.")
+        if request.operation is EnvironmentFactoryOperation.CREATE:
+            if request.reconnect_metadata:
+                raise ValueError("Docker coding creation forbids reconnect metadata.")
+            return
+        container_id = request.reconnect_metadata.get("container_id")
+        if (
+            type(container_id) is not str
+            or len(container_id) != 64
+            or any(character not in "0123456789abcdef" for character in container_id)
+        ):
+            raise ValueError("Docker coding reconnect requires one full lowercase container ID.")
+        expected = _docker_coding_reconnect_metadata(
+            container_id=container_id,
+            configuration_fingerprint=self._configuration_fingerprint,
+            image_fingerprint=self.image_identity.fingerprint,
+            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+        )
+        if request.reconnect_metadata != expected:
+            raise ValueError("Docker coding reconnect metadata does not match this factory.")
 
     def _configured_candidate(self) -> ExecutionAdmissionCandidate:
         environment_fingerprint = self._configuration_fingerprint
@@ -643,11 +891,6 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 reason_code="docker_host_inputs_not_mounted",
                 remediation_code="use_workspace_sync",
             ),
-            ExecutionCapabilityClaim.unsupported(
-                "reconnect",
-                reason_code="docker_reconnect_unsupported",
-                remediation_code="select_reconnectable_execution",
-            ),
         )
         evidence = ExecutionCapabilityEvidence(
             subject="docker",
@@ -661,6 +904,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 ExecutionCapabilityClaim.declared("host_filesystem_isolation"),
                 ExecutionCapabilityClaim.declared("confirmed_cancellation"),
                 ExecutionCapabilityClaim.declared("confirmed_cleanup"),
+                ExecutionCapabilityClaim.declared("reconnect"),
                 *unsupported,
             ),
             tool_requirements=ExecutionToolRequirementEvidence(
@@ -1273,6 +1517,29 @@ def _docker_coding_configuration_fingerprint(
         "sha256:"
         + sha256(canonical_durable_json_bytes(material, "docker_coding_configuration")).hexdigest()
     )
+
+
+def _docker_coding_reconnect_metadata(
+    *,
+    container_id: str,
+    configuration_fingerprint: str,
+    image_fingerprint: str,
+    toolchain_profile_fingerprint: str,
+) -> dict[str, Any]:
+    identity = {
+        "version": 1,
+        "kind": "docker_coding",
+        "container_id": container_id,
+        "configuration_fingerprint": configuration_fingerprint,
+        "image_fingerprint": image_fingerprint,
+        "toolchain_profile_fingerprint": toolchain_profile_fingerprint,
+    }
+    return {
+        **identity,
+        "allocation_fingerprint": sha256(
+            canonical_durable_json_bytes(identity, "docker_coding_reconnect")
+        ).hexdigest(),
+    }
 
 
 async def _run_toolchain_admission_probes(

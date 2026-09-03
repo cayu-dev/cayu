@@ -3158,6 +3158,7 @@ class TaskStore(ABC):
     supports_delayed_availability: ClassVar[bool] = False
     supports_task_topology: ClassVar[bool] = False
     supports_idempotent_terminalization: ClassVar[bool] = False
+    supports_attached_task_recovery_terminalization: ClassVar[bool] = False
     supports_interrupted_task_handoffs: ClassVar[bool] = False
     supports_task_cancellation_reconciliation: ClassVar[bool] = False
     supports_task_retry_series: ClassVar[bool] = False
@@ -3750,6 +3751,24 @@ class TaskStore(ABC):
         """Load exact durable commit evidence for receipt reconciliation."""
         raise NotImplementedError("This TaskStore does not support task terminalization receipts.")
 
+    async def recover_attached_task_failure(
+        self,
+        request: TaskTerminalizationRequest,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        """Fail one exact expired task owner after its attached session is fenced.
+
+        Custom stores opt into this operation explicitly. Implementations must
+        atomically validate the task's session incarnation, worker, lease, and
+        handoff generation before bypassing the ordinary active-lease rule.
+        """
+
+        raise NotImplementedError(
+            "This TaskStore does not support attached-task recovery terminalization."
+        )
+
     async def release_interrupted_task_worker(
         self,
         request: TaskInterruptedHandoffRequest,
@@ -4050,6 +4069,7 @@ class InMemoryTaskStore(TaskStore):
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
+    supports_attached_task_recovery_terminalization: ClassVar[bool] = True
     supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
@@ -5939,6 +5959,68 @@ class InMemoryTaskStore(TaskStore):
                 task=receipt.task.model_copy(deep=True),
                 committed_at=receipt.committed_at,
             )
+
+    async def recover_attached_task_failure(
+        self,
+        request: TaskTerminalizationRequest,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        request, request_sha256 = prepare_task_terminalization(request)
+        session_id = require_clean_nonblank(session_id, "session_id")
+        session_instance_id = require_clean_nonblank(
+            session_instance_id,
+            "session_instance_id",
+        )
+        receipt_key = (request.task_id, request.idempotency_key)
+        async with self._lock:
+            existing = self._terminalization_receipts.get(receipt_key)
+            if existing is not None:
+                replayed = _replay_task_terminalization_receipt(
+                    request=request,
+                    request_sha256=request_sha256,
+                    receipt=existing,
+                    current_task=self._tasks.get(request.task_id),
+                )
+                _ensure_recovered_attached_task_session(
+                    replayed,
+                    session_id=session_id,
+                    session_instance_id=session_instance_id,
+                )
+                return replayed
+
+            task = self._require_task(request.task_id)
+            if request.task_id in self._latest_admission_id_by_task:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admitted work attempts cannot use attached-task recovery terminalization."
+                )
+            committed_at = self._ownership_clock()
+            _ensure_recovered_attached_task_failure_authority(
+                task,
+                request,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+                now=committed_at,
+            )
+            terminal_task = self._finish_task(
+                request.task_id,
+                TaskStatus.FAILED,
+                result=None,
+                error=request.error,
+                worker_id=None,
+                now=committed_at,
+            )
+            self._terminalization_receipts[receipt_key] = TaskTerminalizationReceipt(
+                task_id=request.task_id,
+                idempotency_key=request.idempotency_key,
+                worker_id=request.worker_id,
+                kind=request.kind,
+                request_sha256=request_sha256,
+                task=terminal_task,
+                committed_at=committed_at,
+            )
+            return terminal_task.model_copy(deep=True)
 
     async def release_interrupted_task_worker(
         self,
@@ -11322,6 +11404,59 @@ def _ensure_task_terminalization_lease_authority(
         raise TaskClaimLost(
             "Unattached task terminalization requires the exact worker lease generation."
         )
+
+
+def _ensure_recovered_attached_task_session(
+    task: Task,
+    *,
+    session_id: str,
+    session_instance_id: str,
+) -> None:
+    """Require a task to belong to one exact durable session incarnation."""
+
+    if task.session_id != session_id or task.session_instance_id != session_instance_id:
+        raise TaskClaimLost(
+            "Attached-task recovery no longer owns the expected session incarnation."
+        )
+
+
+def _ensure_recovered_attached_task_failure_authority(
+    task: Task,
+    request: TaskTerminalizationRequest,
+    *,
+    session_id: str,
+    session_instance_id: str,
+    now: datetime,
+) -> None:
+    """Fence recovery failure to one exact expired attached-task generation."""
+
+    now = normalize_utc_datetime(now, "now")
+    _ensure_recovered_attached_task_session(
+        task,
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+    )
+    if request.kind is not TaskTerminalKind.FAILED:
+        raise ValueError("Attached-task recovery can only publish task failure.")
+    if task.retry_series is not None:
+        raise ValueError(
+            "Retry-series tasks require settle_task_retry_attempt for completion or failure."
+        )
+    if task.status is not TaskStatus.RUNNING:
+        raise TaskClaimLost("Attached-task recovery requires a running task.")
+    if (
+        task.worker_id != request.worker_id
+        or task.lease_expires_at is None
+        or request.lease_expires_at is None
+        or task.lease_expires_at != request.lease_expires_at
+    ):
+        raise TaskClaimLost(
+            "Attached-task recovery no longer owns the expected worker lease generation."
+        )
+    _ensure_task_handoff_authority(task, request.handoff_id)
+    if task.lease_expires_at > now:
+        raise TaskClaimLost("Attached-task recovery owner lease is still active.")
+    _validate_ordinary_task_terminalization_against_cancellation(task, request)
 
 
 def _ensure_task_handoff_authority(task: Task, handoff_id: str | None) -> None:
