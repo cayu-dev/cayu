@@ -101,7 +101,11 @@ cleanup explicitly grouped into one phase receives a bounded concurrent
 attempt. Ordered steps remain dependency barriers and resume under a reserved
 continuation only after an outcome-unknown predecessor settles. The original
 Runtime failure remains authoritative and typed timeout evidence is attached to
-it.
+it. Failure ordering remains stable if cancellation arrives during a later
+cleanup step, and cancellation carries deadline evidence for every retained
+independent owner. Same-step ordering preserves whichever event was already
+authoritative: a settled failure remains ahead of later cancellation, while a
+failure produced in response to forwarded cancellation remains behind it.
 
 Timed-out work remains strongly owned until it settles, and its operation's
 durable claim, fence, run-operation, provider-operation, or lifecycle marker
@@ -110,8 +114,10 @@ untracked cleanup task starts. Operators can inspect content-free counters with
 `CayuApp.recovery_cleanup_status()` and use
 `CayuApp.drain_recovery_cleanups(...)` during bounded shutdown; drain follows
 active-to-retained-to-continuation transitions for the whole configured grace
-period. The application manifest and generator plan advance from schema version
-14 to 15, and the manifest fingerprints the complete cleanup policy.
+period. Late retained-owner failures are classified separately from successful
+late completion and logged without their potentially sensitive message. The
+application manifest and generator plan advance from schema version 14 to 15,
+and the manifest fingerprints the complete cleanup policy.
 
 ### Durable knowledge enrichment keeps curation off the foreground path
 

@@ -18,6 +18,7 @@ from cayu.runtime.recovery_cleanup import (
     RecoveryCleanupDeadlineScope,
     RecoveryCleanupPolicy,
     RecoveryCleanupStep,
+    RecoveryCleanupStepInput,
     RecoveryCleanupSupervisor,
 )
 from cayu.runtime.sessions import (
@@ -241,6 +242,159 @@ def test_recovery_cleanup_independent_phase_reports_failures_in_declared_order()
             ("first independent cleanup", first_failure),
             ("second independent cleanup", second_failure),
         )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("independent", [False, True], ids=["ordered", "independent"])
+def test_recovery_cleanup_preserves_prior_fatal_failure_over_later_cancellation(
+    independent: bool,
+) -> None:
+    class FatalCleanupSignal(BaseException):
+        pass
+
+    async def scenario() -> None:
+        second_started = asyncio.Event()
+        fatal = FatalCleanupSignal("first cleanup failed fatally")
+
+        async def fail_first() -> None:
+            raise fatal
+
+        async def await_cancellation() -> None:
+            second_started.set()
+            await asyncio.sleep(3600)
+
+        second_step = (
+            RecoveryCleanupStep(
+                "later cleanup",
+                await_cancellation,
+                independent_with_previous=True,
+            )
+            if independent
+            else RecoveryCleanupStep("later cleanup", await_cancellation)
+        )
+        owner = asyncio.create_task(
+            _run_recovery_cleanup_steps(
+                authoritative_failure=None,
+                steps=(
+                    ("prior fatal cleanup", fail_first),
+                    second_step,
+                ),
+            )
+        )
+        await second_started.wait()
+        owner.cancel("operator cancelled later cleanup")
+
+        with pytest.raises(FatalCleanupSignal) as raised:
+            await owner
+        assert raised.value is fatal
+        assert isinstance(fatal.__cause__, BaseExceptionGroup)
+        assert len(fatal.__cause__.exceptions) == 1
+        assert isinstance(fatal.__cause__.exceptions[0], asyncio.CancelledError)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("independent", [False, True], ids=["ordered", "independent"])
+def test_recovery_cleanup_preserves_caller_cancellation_before_same_step_failure(
+    independent: bool,
+) -> None:
+    async def scenario() -> None:
+        started = (asyncio.Event(), asyncio.Event())
+        cleanup_failure = RuntimeError("cleanup rejected cancellation")
+
+        async def fail_from_cancellation() -> None:
+            started[0].set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise cleanup_failure from None
+
+        async def peer() -> None:
+            started[1].set()
+            await asyncio.sleep(3600)
+
+        steps: tuple[RecoveryCleanupStepInput, ...] = (
+            (
+                ("cleanup", fail_from_cancellation),
+                RecoveryCleanupStep(
+                    "independent peer",
+                    peer,
+                    independent_with_previous=True,
+                ),
+            )
+            if independent
+            else (("cleanup", fail_from_cancellation),)
+        )
+        owner = asyncio.create_task(
+            _run_recovery_cleanup_steps(
+                authoritative_failure=None,
+                steps=steps,
+            )
+        )
+        await started[0].wait()
+        if independent:
+            await started[1].wait()
+        owner.cancel("operator cancelled cleanup")
+
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await owner
+        assert raised.value.args == ("operator cancelled cleanup",)
+        assert isinstance(raised.value.__cause__, BaseExceptionGroup)
+        assert raised.value.__cause__.exceptions == (cleanup_failure,)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("independent", [False, True], ids=["ordered", "independent"])
+def test_recovery_cleanup_preserves_settled_failure_before_later_cancellation(
+    independent: bool,
+) -> None:
+    class FatalCleanupSignal(BaseException):
+        pass
+
+    async def scenario() -> None:
+        owner: asyncio.Task[Any] | None = None
+        fatal = FatalCleanupSignal("cleanup settled before cancellation delivery")
+
+        async def succeed() -> None:
+            return None
+
+        async def fail_then_cancel_owner() -> None:
+            assert owner is not None
+            asyncio.get_running_loop().call_soon(
+                owner.cancel,
+                "operator cancelled after cleanup settlement",
+            )
+            raise fatal
+
+        steps: tuple[RecoveryCleanupStepInput, ...] = (
+            (
+                ("successful peer", succeed),
+                RecoveryCleanupStep(
+                    "settled fatal cleanup",
+                    fail_then_cancel_owner,
+                    independent_with_previous=True,
+                ),
+            )
+            if independent
+            else (("settled fatal cleanup", fail_then_cancel_owner),)
+        )
+        owner = asyncio.create_task(
+            _run_recovery_cleanup_steps(
+                authoritative_failure=None,
+                steps=steps,
+            )
+        )
+
+        with pytest.raises(FatalCleanupSignal) as raised:
+            await owner
+        assert raised.value is fatal
+        assert isinstance(fatal.__cause__, BaseExceptionGroup)
+        assert len(fatal.__cause__.exceptions) == 1
+        cancellation = fatal.__cause__.exceptions[0]
+        assert isinstance(cancellation, asyncio.CancelledError)
+        assert cancellation.args == ("operator cancelled after cleanup settlement",)
 
     asyncio.run(scenario())
 
@@ -475,6 +629,66 @@ def test_recovery_cleanup_caller_cancellation_is_bounded_and_retained() -> None:
         assert snapshot.retained_tasks == 1
         assert snapshot.retained_after_cancellation == 1
         assert snapshot.retained[0].caller_cancellation_observed is True
+
+        release.set()
+        assert await supervisor.drain(timeout_s=1) is True
+
+    asyncio.run(scenario())
+
+
+def test_recovery_cleanup_cancellation_retains_every_independent_deadline() -> None:
+    async def scenario() -> None:
+        release = asyncio.Event()
+        started = (asyncio.Event(), asyncio.Event())
+
+        def resist_cancellation(index: int):
+            async def run() -> None:
+                started[index].set()
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        continue
+
+            return run
+
+        supervisor = RecoveryCleanupSupervisor(
+            RecoveryCleanupPolicy(
+                step_timeout_seconds=0.01,
+                overall_timeout_seconds=0.1,
+            )
+        )
+        owner = asyncio.create_task(
+            supervisor.run_steps(
+                steps=(
+                    ("first cancelled cleanup", resist_cancellation(0)),
+                    RecoveryCleanupStep(
+                        "second cancelled cleanup",
+                        resist_cancellation(1),
+                        independent_with_previous=True,
+                    ),
+                ),
+                shield_caller_cancellation=False,
+            )
+        )
+        await asyncio.gather(*(signal.wait() for signal in started))
+        owner.cancel("operator cancelled cleanup phase")
+
+        failures = await asyncio.wait_for(owner, timeout=1)
+        assert len(failures) == 1
+        cancellation = failures[0][1]
+        assert isinstance(cancellation, asyncio.CancelledError)
+        assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+        deadline_failures = cancellation.__cause__.exceptions
+        assert [
+            failure.operation
+            for failure in deadline_failures
+            if isinstance(failure, RecoveryCleanupDeadlineExceeded)
+        ] == ["first cancelled cleanup", "second cancelled cleanup"]
+        assert all(
+            isinstance(failure, RecoveryCleanupDeadlineExceeded) for failure in deadline_failures
+        )
+        assert supervisor.snapshot().retained_tasks == 2
 
         release.set()
         assert await supervisor.drain(timeout_s=1) is True
@@ -723,6 +937,46 @@ def test_recovery_cleanup_reissues_deadline_cancel_after_prior_step_consumes_cal
         assert await supervisor.drain(timeout_s=1) is True
 
     asyncio.run(scenario())
+
+
+def test_recovery_cleanup_reports_late_failure_from_sequential_retained_owner(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> None:
+        late_failure = RuntimeError("late cleanup failure must remain private")
+
+        async def fail_after_deadline_cancellation() -> None:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise late_failure from None
+
+        supervisor = RecoveryCleanupSupervisor(
+            RecoveryCleanupPolicy(
+                step_timeout_seconds=0.01,
+                overall_timeout_seconds=0.1,
+            )
+        )
+        failures = await supervisor.run_steps(
+            steps=(("late sequential cleanup", fail_after_deadline_cancellation),),
+            shield_caller_cancellation=False,
+        )
+        assert len(failures) == 1
+        assert isinstance(failures[0][1], RecoveryCleanupDeadlineExceeded)
+        assert await supervisor.drain(timeout_s=1) is True
+
+        snapshot = supervisor.snapshot()
+        assert snapshot.completed_after_timeout == 0
+        assert snapshot.failed_after_timeout == 1
+
+    with caplog.at_level("WARNING", logger="cayu.runtime.recovery_cleanup"):
+        asyncio.run(scenario())
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "operation=late sequential cleanup error_type=RuntimeError" in message
+        for message in messages
+    )
+    assert all("late cleanup failure must remain private" not in message for message in messages)
 
 
 def test_cayu_app_uses_one_configured_recovery_cleanup_supervisor() -> None:

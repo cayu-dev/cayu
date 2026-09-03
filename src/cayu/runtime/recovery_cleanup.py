@@ -13,6 +13,13 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
+from cayu._exception_groups import (
+    exception_cause,
+    exception_context,
+    exception_suppresses_context,
+    set_exception_cause,
+)
+
 DEFAULT_RECOVERY_CLEANUP_STEP_TIMEOUT_SECONDS = 30.0
 DEFAULT_RECOVERY_CLEANUP_OVERALL_TIMEOUT_SECONDS = 120.0
 DEFAULT_RECOVERY_CLEANUP_MAX_SUPERVISED_TASKS = 256
@@ -242,6 +249,14 @@ class _SequentialCleanupProgress:
     caller_cancellation_forwarded_ordinal: int | None = None
 
 
+@dataclass(frozen=True)
+class _ObservedCallerCancellation:
+    step_ordinal: int
+    operation: str
+    error: asyncio.CancelledError
+    forwarded_to_observed_step: bool
+
+
 @dataclass
 class _CleanupContinuationBarrier:
     pending_tasks: set[asyncio.Task[BaseException | None]]
@@ -340,11 +355,59 @@ class RecoveryCleanupSupervisor:
         overall_deadline = loop.time() + self._policy.overall_timeout_seconds
         failures: list[tuple[str, BaseException]] = []
         sequence_context = copy_context()
-        caller_cancellation: tuple[str, asyncio.CancelledError] | None = None
+        caller_cancellation: _ObservedCallerCancellation | None = None
+        caller_cancellation_recorded = False
+
+        def append_group_failures(
+            *,
+            group_start_ordinal: int,
+            phase: tuple[RecoveryCleanupStep, ...],
+            phase_failures: list[BaseException | None],
+        ) -> None:
+            """Publish one group's failures and cancellation in step order."""
+
+            nonlocal caller_cancellation_recorded
+            for phase_ordinal, (step, failure) in enumerate(
+                zip(phase, phase_failures, strict=True)
+            ):
+                matching_cancellation = (
+                    caller_cancellation
+                    if caller_cancellation is not None
+                    and not caller_cancellation_recorded
+                    and caller_cancellation.step_ordinal == group_start_ordinal + phase_ordinal
+                    else None
+                )
+                if (
+                    matching_cancellation is not None
+                    and matching_cancellation.forwarded_to_observed_step
+                ):
+                    failures.append(
+                        (
+                            matching_cancellation.operation,
+                            matching_cancellation.error,
+                        )
+                    )
+                if failure is not None:
+                    failures.append((step.operation, failure))
+                if (
+                    matching_cancellation is not None
+                    and not matching_cancellation.forwarded_to_observed_step
+                ):
+                    failures.append(
+                        (
+                            matching_cancellation.operation,
+                            matching_cancellation.error,
+                        )
+                    )
+                if matching_cancellation is not None:
+                    caller_cancellation_recorded = True
 
         for group_index, group in enumerate(groups):
             self._harvest_completed()
             phase = group.steps
+            group_start_ordinal = sum(
+                len(earlier_group.steps) for earlier_group in groups[:group_index]
+            )
             remaining_steps = tuple(
                 step
                 for remaining_group in groups[group_index + 1 :]
@@ -386,7 +449,7 @@ class RecoveryCleanupSupervisor:
                     started_at=loop.time(),
                     failures=segment_failures,
                     caller_cancellation=(
-                        None if caller_cancellation is None else caller_cancellation[1]
+                        None if caller_cancellation is None else caller_cancellation.error
                     ),
                 )
                 task = asyncio.create_task(
@@ -416,12 +479,33 @@ class RecoveryCleanupSupervisor:
                         if shield_caller_cancellation:
                             continue
                         if caller_cancellation is None:
-                            caller_cancellation = (progress.operation, cancellation)
-                            failures.append(caller_cancellation)
-                        progress.caller_cancellation = caller_cancellation[1]
-                        if progress.caller_cancellation_forwarded_ordinal != progress.phase_ordinal:
-                            progress.caller_cancellation_forwarded_ordinal = progress.phase_ordinal
-                            task.cancel(*cancellation.args)
+                            progress.caller_cancellation = cancellation
+                            cancellation_was_forwarded = False
+                            if (
+                                progress.caller_cancellation_forwarded_ordinal
+                                != progress.phase_ordinal
+                            ):
+                                cancellation_was_forwarded = task.cancel(*cancellation.args)
+                                if cancellation_was_forwarded:
+                                    progress.caller_cancellation_forwarded_ordinal = (
+                                        progress.phase_ordinal
+                                    )
+                            caller_cancellation = _ObservedCallerCancellation(
+                                step_ordinal=group_start_ordinal + progress.phase_ordinal,
+                                operation=progress.operation,
+                                error=cancellation,
+                                forwarded_to_observed_step=cancellation_was_forwarded,
+                            )
+                        else:
+                            progress.caller_cancellation = caller_cancellation.error
+                            if (
+                                progress.caller_cancellation_forwarded_ordinal
+                                != progress.phase_ordinal
+                                and task.cancel(*cancellation.args)
+                            ):
+                                progress.caller_cancellation_forwarded_ordinal = (
+                                    progress.phase_ordinal
+                                )
                         continue
 
                 if task.done():
@@ -436,10 +520,10 @@ class RecoveryCleanupSupervisor:
                         and task_failure is not None
                     ):
                         segment_failures[progress.phase_ordinal] = task_failure
-                    failures.extend(
-                        (phase[ordinal].operation, failure)
-                        for ordinal, failure in enumerate(segment_failures)
-                        if failure is not None
+                    append_group_failures(
+                        group_start_ordinal=group_start_ordinal,
+                        phase=phase,
+                        phase_failures=segment_failures,
                     )
                     sequence_context = segment_context
                     continue
@@ -473,22 +557,24 @@ class RecoveryCleanupSupervisor:
                     caller_cancellation_observed=(caller_cancellation is not None),
                     continuation_barrier=continuation_barrier,
                 )
-                failures.extend(
-                    (phase[ordinal].operation, failure)
-                    for ordinal, failure in enumerate(segment_failures)
-                    if failure is not None
-                )
                 if cancellation_was_forwarded and caller_cancellation is not None:
                     self._retained_after_cancellation += 1
-                    cancellation = caller_cancellation[1]
+                    cancellation = caller_cancellation.error
                     cancellation.add_note(
                         "Recovery cleanup remained outcome-unknown during "
                         f"{timed_out_step.operation}."
                     )
-                    if cancellation.__cause__ is None:
-                        cancellation.__cause__ = deadline_failure
+                    self._attach_cancellation_deadline_evidence(
+                        cancellation,
+                        (deadline_failure,),
+                    )
                 else:
-                    failures.append((timed_out_step.operation, deadline_failure))
+                    segment_failures[timed_out_ordinal] = deadline_failure
+                append_group_failures(
+                    group_start_ordinal=group_start_ordinal,
+                    phase=phase,
+                    phase_failures=segment_failures,
+                )
                 if continuation_barrier is not None:
                     self._seal_continuation_barrier(continuation_barrier)
                 break
@@ -544,6 +630,7 @@ class RecoveryCleanupSupervisor:
 
             running = list(phase_states)
             phase_timed_out = False
+            cancellation_deadline_failures: list[RecoveryCleanupDeadlineExceeded] = []
             while running:
                 completed = [state for state in running if state.task.done()]
                 for state in completed:
@@ -600,13 +687,12 @@ class RecoveryCleanupSupervisor:
                         )
                         if state.caller_cancellation_forwarded and caller_cancellation is not None:
                             self._retained_after_cancellation += 1
-                            cancellation = caller_cancellation[1]
+                            cancellation = caller_cancellation.error
                             cancellation.add_note(
                                 "Recovery cleanup remained outcome-unknown during "
                                 f"{state.step.operation}."
                             )
-                            if cancellation.__cause__ is None:
-                                cancellation.__cause__ = deadline_failure
+                            cancellation_deadline_failures.append(deadline_failure)
                         else:
                             phase_failures[state.phase_ordinal] = deadline_failure
                     continue
@@ -625,21 +711,42 @@ class RecoveryCleanupSupervisor:
                     if shield_caller_cancellation:
                         continue
                     if caller_cancellation is None:
-                        caller_cancellation = (running[0].step.operation, cancellation)
-                        failures.append(caller_cancellation)
+                        cancellation_step = next(
+                            (state for state in running if not state.task.done()),
+                            running[-1],
+                        )
+                        cancellation_was_forwarded = False
+                        for state in running:
+                            if state.caller_cancellation_forwarded:
+                                continue
+                            forwarded = state.task.cancel(*cancellation.args)
+                            state.caller_cancellation_forwarded = forwarded
+                            if state is cancellation_step:
+                                cancellation_was_forwarded = forwarded
+                        caller_cancellation = _ObservedCallerCancellation(
+                            step_ordinal=(group_start_ordinal + cancellation_step.phase_ordinal),
+                            operation=cancellation_step.step.operation,
+                            error=cancellation,
+                            forwarded_to_observed_step=cancellation_was_forwarded,
+                        )
+                        continue
                     for state in running:
                         if state.caller_cancellation_forwarded:
                             continue
-                        state.caller_cancellation_forwarded = True
-                        state.task.cancel(*cancellation.args)
+                        state.caller_cancellation_forwarded = state.task.cancel(*cancellation.args)
                     # Give exact cleanup owners the remainder of their finite
                     # budgets to reconcile an acknowledgement-boundary cancel.
                     continue
 
-            failures.extend(
-                (phase[ordinal].operation, failure)
-                for ordinal, failure in enumerate(phase_failures)
-                if failure is not None
+            if cancellation_deadline_failures and caller_cancellation is not None:
+                self._attach_cancellation_deadline_evidence(
+                    caller_cancellation.error,
+                    tuple(cancellation_deadline_failures),
+                )
+            append_group_failures(
+                group_start_ordinal=group_start_ordinal,
+                phase=phase,
+                phase_failures=phase_failures,
             )
             if phase_timed_out:
                 if continuation_barrier is not None:
@@ -742,15 +849,17 @@ class RecoveryCleanupSupervisor:
         *,
         steps: tuple[RecoveryCleanupStep, ...],
         progress: _SequentialCleanupProgress,
-    ) -> None:
+    ) -> BaseException | None:
         loop = asyncio.get_running_loop()
         for phase_ordinal, step in enumerate(steps):
             progress.phase_ordinal = phase_ordinal
             progress.operation = step.operation
             progress.started_at = loop.time()
+            settlement_failure: BaseException | None = None
             try:
                 await step.cleanup()
             except BaseException as error:
+                settlement_failure = error
                 current_failure: BaseException | None = error
                 if (
                     isinstance(error, asyncio.CancelledError)
@@ -761,7 +870,33 @@ class RecoveryCleanupSupervisor:
                 if current_failure is not None:
                     progress.failures[phase_ordinal] = current_failure
             if progress.abort_after_current:
-                return
+                return settlement_failure
+        return None
+
+    @staticmethod
+    def _attach_cancellation_deadline_evidence(
+        cancellation: asyncio.CancelledError,
+        deadline_failures: tuple[RecoveryCleanupDeadlineExceeded, ...],
+    ) -> None:
+        """Attach every retained owner without discarding prior causal evidence."""
+
+        if not deadline_failures:
+            return
+        existing = exception_cause(cancellation)
+        if existing is None and not exception_suppresses_context(cancellation):
+            existing = exception_context(cancellation)
+        causes: list[BaseException] = list(deadline_failures)
+        if existing is not None and not any(existing is cause for cause in causes):
+            causes.append(existing)
+        combined = (
+            causes[0]
+            if len(causes) == 1
+            else BaseExceptionGroup(
+                "Recovery cleanup cancellation retained outcome-unknown owners",
+                causes,
+            )
+        )
+        set_exception_cause(cancellation, combined)
 
     @staticmethod
     def _validate_steps(

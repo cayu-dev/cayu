@@ -2734,6 +2734,12 @@ its explicitly independent peers from being attempted. The caller receives a
 operation, deadline scope, configured bound, and `outcome_unknown=true`. When
 cleanup follows another Runtime failure, that failure remains authoritative and
 the timeout is attached to its exception graph rather than replacing it.
+Failures remain ordered by cleanup step when caller cancellation arrives, and a
+cancelled independent phase retains typed deadline evidence for every
+outcome-unknown owner rather than only the first owner. An already-settled
+same-step failure precedes a later cancellation, while authenticated caller
+cancellation precedes a failure produced by that owner while handling the
+forwarded cancellation.
 
 Retaining a task is process-local liveness, not durable authority. Restart
 convergence continues to come from the operation-specific durable marker that
@@ -2751,7 +2757,9 @@ bounded content-free counters and retained deadline evidence, and
 `drain_recovery_cleanups(...)` gives workers an explicit bounded shutdown wait
 for active, retained, and reserved continuation work without cancelling tasks
 that remain outcome-unknown. Drain follows ownership transitions until the
-grace deadline instead of treating its first task snapshot as final.
+grace deadline instead of treating its first task snapshot as final. A retained
+owner that later settles with failure increments `failed_after_timeout` and is
+logged by operation and error type without exposing the exception message.
 
 The typed publication-uncertainty error above is the public
 `TerminalEventPublicationUncertain` contract. “Preserving the run-operation
