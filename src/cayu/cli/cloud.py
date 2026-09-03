@@ -434,7 +434,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     service = commands.add_parser(
         "service",
-        help="Operate long-running Agent infrastructure.",
+        help="Operate long-horizon Agent infrastructure.",
         description="Operate the long-running web, worker, and schedule infrastructure.",
     )
     service_commands = service.add_subparsers(dest="service_command", required=True)

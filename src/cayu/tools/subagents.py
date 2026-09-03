@@ -1531,7 +1531,7 @@ async def _summarize_child_session(
         }
     # Tail-limited retrieval: fetch only the last assistant message and an event
     # summary/outcome instead of reloading the child's full transcript and every
-    # event, which scales badly for long-running subagents.
+    # event, which scales badly for long-horizon subagents.
     result_text, result_truncated = await _load_last_assistant_text(
         session_store, child.id, max_chars=max_chars
     )

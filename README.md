@@ -16,7 +16,7 @@ Applications can use them directly without a separate workflow engine.
 Applications retain control of their UI, authentication, domain logic, and
 business workflows.
 
-Cayu is designed for agents that do consequential or long-running work. You
+Cayu is designed for agents that do consequential or long-horizon work. You
 compose its runtime primitives directly in your application.
 
 ## Why we built Cayu
@@ -59,7 +59,7 @@ deployments.
 
 | Need | Cayu primitive |
 | --- | --- |
-| Long-running work | Durable sessions, transcripts, events, resume, fork, interruption |
+| Long-horizon work | Durable sessions, transcripts, events, resume, fork, interruption |
 | Safe effects | Typed tools, effect declarations, policies, approvals, idempotency keys |
 | Human interaction | User-input checkpoints, approval resolution, manual recovery |
 | Context pressure | Token counting, projection, compaction, overflow recovery |

@@ -901,7 +901,12 @@ Cayu separates agent definition, execution environment, and session state:
 - `Environment`: workspace, artifact store, runner, vault, credential proxy, MCP servers, and execution metadata.
 - `RunRequest` / `ResumeRequest` / `Session`: one run of an agent, optionally in a named environment, with messages, status, events, and checkpoints.
 
-This mirrors the useful Managed Agents separation of brain, hands, and durable run history without copying any one provider API. A run may omit an environment for simple provider/tool tests, but concrete file, command, sandbox, vault, or MCP-backed tools should hang off an environment.
+This is a Cayu-owned runtime contract, not an adaptation of a managed-agent or
+coding-agent runtime. Provider adapters translate model APIs into Cayu's
+provider-neutral contracts; an external agent runtime does not participate in
+this execution path. A run may omit an environment for simple provider/tool
+tests, but concrete file, command, sandbox, vault, or MCP-backed tools should
+hang off an environment.
 
 `AgentSpec.workflow_tool_names` is the machine-checkable subset of registered
 tools that the agent's workflow instructions explicitly expect to call.

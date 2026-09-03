@@ -2,9 +2,17 @@
 
 This is a design/maintainer document for Cayu's production agent runtime. It records architecture decisions and intended direction; it is not a complete end-user guide.
 
-Cayu is a production agent runtime for building long-running agents, multi-agent workflows, and sandboxed tool runtimes.
+Cayu is a production agent runtime for building long-horizon agents, multi-agent workflows, and sandboxed tool runtimes.
 
 The runtime should run locally, on a VPS, in Docker, in ECS, or in any other standard execution environment. Hosted deployments should be adapters around the runtime, not a requirement for using it.
+
+Cayu executes application-owned agents directly. `SessionEngine`,
+`ModelStepExecutor`, and `ToolRoundExecutor` own the agent loop; provider
+adapters translate model APIs into Cayu's provider-neutral contracts; durable
+events record execution; and the optional OpenTelemetry sink projects those
+events into traces. Claude Code and other coding agents may author a Cayu
+application. The Claude Agent SDK and other coding-agent runtimes are not
+runtime dependencies or sources of execution authority.
 
 ## Core Decisions
 
