@@ -1009,10 +1009,11 @@ async def test_provider_conformance_idle_failure_is_bounded(
         await harness.aclose()
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
-    expected_error_type = (
-        "BedrockProtocolError" if registration.name == "bedrock" else "SseIdleTimeoutError"
-    )
-    assert events[0].payload["error_type"] == expected_error_type
+    assert events[0].payload["error_type"] == "ModelStreamDeadlineError"
+    assert events[0].payload["provider_deadline_kind"] == "transport_idle"
+    assert events[0].payload["retryable"] is False
+    assert events[0].payload["provider_effect_outcome"] == "unknown"
+    assert events[0].payload["provider_recovery_disposition"] == "manual_settlement_required"
     assert events[0].payload["error"].strip()
 
 

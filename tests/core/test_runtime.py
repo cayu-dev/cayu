@@ -4,7 +4,10 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -47,6 +50,7 @@ from tests.core.task_invocation_fixtures import task_backed_session_invocation
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.providers._credential_boundary as credential_boundary_module
+import cayu.providers.deadlines as provider_deadlines_module
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._model_completion_publication as model_completion_publication_module
 import cayu.runtime._model_step_executor as model_step_executor_module
@@ -122,15 +126,23 @@ from cayu.providers import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
     OpenAIProvider,
+    ProviderOperationAdapter,
+    ProviderOperationConnection,
+    ProviderOperationMode,
+    ProviderOperationSnapshot,
+    ProviderOperationStartRequest,
+    ProviderOperationState,
     UsageDialect,
     bedrock_billing_identity,
     completed_bedrock_billing_identity,
 )
 from cayu.providers.cache import CacheBreakpoint, CachePolicy, RequestCacheProjection
+from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -204,6 +216,8 @@ from cayu.runtime import (
     LoopPolicy,
     MessageWindowContextPolicy,
     ModelCompactor,
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionManualRecoveryRequired,
     ModelPrice,
     ModelTarget,
     NativeStructuredOutputUnsupported,
@@ -1602,7 +1616,7 @@ def _private_record_for_public_event(
 
 
 async def _private_events_for_public_events(
-    store: InMemorySessionStore,
+    store: SessionStore,
     session_id: str,
     events: list[Event],
 ) -> list[Event]:
@@ -13705,17 +13719,16 @@ def test_cayu_app_does_not_report_caller_stream_read_cancellation_as_provider_fa
     asyncio.run(run())
 
 
-def test_cayu_app_rejects_provider_dispatch_when_live_cleanup_capacity_is_exhausted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_cayu_app_rejects_provider_dispatch_when_live_cleanup_capacity_is_exhausted() -> None:
     async def run() -> None:
-        monkeypatch.setattr(
-            credential_boundary_module,
-            "_MAX_OWNED_PROVIDER_STREAM_CLEANUPS",
-            1,
-        )
-        held = credential_boundary_module.reserve_provider_stream_cleanup()
-        provider = FakeProvider([ModelStreamEvent.completed({})])
+        held = credential_boundary_module.reserve_provider_stream_cleanup(1)
+
+        class CapacityProvider(FakeProvider):
+            @property
+            def stream_deadlines(self) -> ProviderStreamDeadlines:
+                return ProviderStreamDeadlines(max_concurrent_streams=1)
+
+        provider = CapacityProvider([ModelStreamEvent.completed({})])
         app = CayuApp(enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -27006,8 +27019,242 @@ def test_cayu_app_retries_provider_exception_and_keeps_transcript_clean():
     assert transcript[1].content[0].text == "ok"
 
 
-def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean(
+def test_cayu_app_does_not_redispatch_after_established_openai_sse_reset(
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ResetAfterIdentityBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield (
+                b'data: {"type":"response.created","sequence_number":0,'
+                b'"response":{"id":"resp-reset","model":"fake-model",'
+                b'"status":"in_progress","output":[]}}\n\n'
+            )
+            request = httpx.Request("POST", "https://example.test/v1/responses")
+            raise httpx.RemoteProtocolError(
+                "peer reset the established response stream",
+                request=request,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    class StreamContext:
+        def __init__(self, response: httpx.Response) -> None:
+            self.response = response
+
+        async def __aenter__(self) -> httpx.Response:
+            return self.response
+
+        async def __aexit__(self, *args: Any) -> None:
+            await self.response.aclose()
+
+    class ResetHttpClient:
+        calls = 0
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.is_closed = False
+
+        def stream(self, *args: Any, **kwargs: Any) -> StreamContext:
+            type(self).calls += 1
+            request = httpx.Request("POST", "https://example.test/v1/responses")
+            return StreamContext(
+                httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=ResetAfterIdentityBody(),
+                    request=request,
+                )
+            )
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", ResetHttpClient)
+    provider = OpenAIProvider(
+        api_key="test-key",
+        base_url="https://example.test",
+    )
+    app = CayuApp(
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess-established-openai-reset",
+                messages=[Message.text("user", "do not duplicate this request")],
+            ),
+        )
+    )
+
+    assert ResetHttpClient.calls == 1
+    assert EventType.MODEL_ERROR in {event.type for event in events}
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    model_error = next(event for event in events if event.type is EventType.MODEL_ERROR)
+    assert model_error.payload["provider_error_type"] == "RemoteProtocolError"
+    assert model_error.payload["retryable"] is False
+
+
+_SEMANTIC_DEADLINE_PROCESS_EXIT_CODE = 87
+_SEMANTIC_DEADLINE_PROCESS_SESSION_ID = "semantic-deadline-process-loss"
+
+
+class ProcessLossSemanticDeadlineProvider(ModelProvider):
+    name = "process-loss-semantic-deadline"
+
+    def __init__(self, marker: str) -> None:
+        self._marker = Path(marker)
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="test.process-loss-semantic-deadline-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        return ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            protocol_idle_timeout_s=1,
+            semantic_progress_timeout_s=0.02,
+            absolute_stream_timeout_s=1,
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        prior = int(self._marker.read_text(encoding="utf-8")) if self._marker.exists() else 0
+        self._marker.write_text(str(prior + 1), encoding="utf-8")
+        await asyncio.Event().wait()
+        yield ModelStreamEvent.completed({})  # pragma: no cover
+
+
+def _run_until_semantic_deadline_process_exit(database: str, marker: str) -> None:
+    async def run() -> None:
+        store = SQLiteSessionStore(database)
+        provider = ProcessLossSemanticDeadlineProvider(marker)
+        app = CayuApp(
+            session_store=store,
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        try:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=_SEMANTIC_DEADLINE_PROCESS_SESSION_ID,
+                    messages=[Message.text("user", "wait until the semantic deadline")],
+                )
+            ):
+                pass
+        except ModelStreamDeadlineError as failure:
+            if failure.deadline_evidence.deadline_kind.value != "semantic_idle":
+                raise
+            active = await store.load_active_model_completion_stage(
+                _SEMANTIC_DEADLINE_PROCESS_SESSION_ID
+            )
+            durable_events = await store.load_events(_SEMANTIC_DEADLINE_PROCESS_SESSION_ID)
+            deadline_events = [
+                event for event in durable_events if event.type is EventType.MODEL_ERROR
+            ]
+            if (
+                active is None
+                or active.stage.state != "in_flight"
+                or len(deadline_events) != 1
+                or deadline_events[0].payload.get("provider_recovery_disposition")
+                != "manual_settlement_required"
+            ):
+                raise AssertionError(
+                    "semantic deadline evidence was not durable before exit"
+                ) from None
+            os._exit(_SEMANTIC_DEADLINE_PROCESS_EXIT_CODE)
+        raise AssertionError("the child provider did not reach its semantic deadline")
+
+    asyncio.run(run())
+
+
+def test_semantic_deadline_process_loss_cannot_redispatch_before_settlement(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "semantic-deadline-process-loss.sqlite"
+    marker = tmp_path / "semantic-deadline-provider-count"
+    repository_root = Path(__file__).resolve().parents[2]
+    child_script = (
+        "from tests.core.test_runtime import "
+        "_run_until_semantic_deadline_process_exit as run; "
+        f"run({str(database)!r}, {str(marker)!r})"
+    )
+    child_environment = os.environ.copy()
+    existing_python_path = child_environment.get("PYTHONPATH")
+    child_environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(repository_root / "src"), existing_python_path) if path
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", child_script],
+        cwd=repository_root,
+        env=child_environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert child.returncode == _SEMANTIC_DEADLINE_PROCESS_EXIT_CODE, child.stderr
+    assert marker.read_text(encoding="utf-8") == "1"
+
+    store = SQLiteSessionStore(database)
+    active = asyncio.run(
+        store.load_active_model_completion_stage(_SEMANTIC_DEADLINE_PROCESS_SESSION_ID)
+    )
+    durable_events = asyncio.run(store.load_events(_SEMANTIC_DEADLINE_PROCESS_SESSION_ID))
+    deadline_events = [event for event in durable_events if event.type is EventType.MODEL_ERROR]
+    assert active is not None
+    assert active.stage.state == "in_flight"
+    assert len(deadline_events) == 1
+    deadline = deadline_events[0]
+    assert deadline.payload["provider_deadline_kind"] == "semantic_idle"
+    assert deadline.payload["provider_recovery_disposition"] == "manual_settlement_required"
+    assert deadline.payload["model_step_id"] == active.stage.logical_step_id
+    assert deadline.payload["model_attempt_id"] == active.stage.intent["model_attempt_id"]
+    assert EventType.MODEL_RETRY not in {event.type for event in durable_events}
+
+    restarted_provider = ProcessLossSemanticDeadlineProvider(str(marker))
+    restarted = CayuApp(session_store=store, enable_logging=False)
+    restarted.register_provider(restarted_provider, default=True)
+    restarted.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    with pytest.raises(ModelCompletionManualRecoveryRequired):
+        asyncio.run(
+            restarted.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=_SEMANTIC_DEADLINE_PROCESS_SESSION_ID,
+                    inactive_for_seconds=0,
+                )
+            )
+        )
+
+    assert marker.read_text(encoding="utf-8") == "1"
+    after_recovery = asyncio.run(
+        store.load_active_model_completion_stage(_SEMANTIC_DEADLINE_PROCESS_SESSION_ID)
+    )
+    assert after_recovery is not None
+    assert after_recovery.stage.stage_id == active.stage.stage_id
+    assert (
+        after_recovery.stage.intent["model_attempt_id"] == active.stage.intent["model_attempt_id"]
+    )
+    asyncio.run(store.close())
+
+
+def test_cayu_app_fences_typed_semantic_stream_deadline_until_manual_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     class StreamingBody(httpx.AsyncByteStream):
         def __init__(self, *, idle: bool) -> None:
@@ -27070,11 +27317,15 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
             self.is_closed = True
 
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", FlakyHttpClient)
-    store = InMemorySessionStore()
+    database = tmp_path / "semantic-deadline-recovery.sqlite"
+    store = SQLiteSessionStore(database)
     provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        stream_idle_timeout_s=0.05,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=0.05,
+        absolute_stream_timeout_s=1.0,
     )
     app = CayuApp(
         session_store=store,
@@ -27083,35 +27334,38 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_retry_sse_idle",
-                messages=[Message.text("user", "hi")],
-            ),
+    async def collect_until_deadline() -> tuple[list[Event], ModelStreamDeadlineError]:
+        observed: list[Event] = []
+        with pytest.raises(ModelStreamDeadlineError) as caught:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_retry_sse_idle",
+                    messages=[Message.text("user", "hi")],
+                )
+            ):
+                observed.append(event)
+        return (
+            _without_request_evidence(_without_interaction_lifecycle(observed)),
+            caught.value,
         )
-    )
+
+    events, failure = asyncio.run(collect_until_deadline())
     transcript = asyncio.run(store.load_transcript("sess_retry_sse_idle"))
     private_events = asyncio.run(
         _private_events_for_public_events(store, "sess_retry_sse_idle", events)
     )
 
-    assert FlakyHttpClient.calls == 2
+    assert FlakyHttpClient.calls == 1
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_ERROR,
-        EventType.MODEL_RETRY,
-        EventType.MODEL_ATTEMPT_DISCARDED,
-        EventType.MODEL_STARTED,
-        EventType.MODEL_TEXT_DELTA,
-        EventType.MODEL_COMPLETED,
-        EventType.TURN_COMPLETED,
-        EventType.SESSION_COMPLETED,
     ]
+    assert failure.deadline_evidence.deadline_kind.value == "semantic_idle"
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    assert EventType.MODEL_ATTEMPT_DISCARDED not in {event.type for event in events}
     assert events[2].payload == {
         "delta": "partial answer",
         "step": 1,
@@ -27121,30 +27375,180 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
         "model_attempt_id": events[1].payload["model_attempt_id"],
         "execution_profile_fingerprint": events[1].payload["execution_profile_fingerprint"],
     }
-    retry = events[4]
-    assert retry.payload["reason"] == "connection"
-    assert retry.payload["attempt"] == 1
-    assert retry.payload["next_attempt"] == 2
-    discarded = events[5]
-    assert discarded.payload["reason"] == "connection"
-    assert discarded.payload["attempt"] == 1
-    assert discarded.payload["next_attempt"] == 2
-    assert events[7].payload == {
-        "delta": "ok",
-        "step": 1,
-        "attempt": 2,
-        "max_attempts": 2,
-        "model_step_id": events[6].payload["model_step_id"],
-        "model_attempt_id": events[6].payload["model_attempt_id"],
-        "execution_profile_fingerprint": events[6].payload["execution_profile_fingerprint"],
-    }
-    assert private_events[1].payload["model_step_id"] == private_events[6].payload["model_step_id"]
+    deadline = events[3]
+    assert deadline.payload["error_type"] == "ModelStreamDeadlineError"
+    assert deadline.payload["provider_error_type"] == "ModelStreamDeadlineError"
+    assert deadline.payload["provider_error_code"] == "provider_stream_semantic_idle_timeout"
+    assert deadline.payload["provider_deadline_kind"] == "semantic_idle"
+    assert deadline.payload["provider_deadline_timeout_s"] == 0.05
+    assert deadline.payload["provider_stream_elapsed_s"] >= 0.05
+    assert deadline.payload["provider_last_progress_kind"] == "content"
     assert (
-        private_events[1].payload["model_attempt_id"]
-        != private_events[6].payload["model_attempt_id"]
+        0
+        <= deadline.payload["provider_last_progress_elapsed_s"]
+        <= deadline.payload["provider_stream_elapsed_s"]
     )
-    assert [message.role for message in transcript] == ["user", "assistant"]
-    assert transcript[1].content[0].text == "ok"
+    assert (
+        datetime.fromisoformat(deadline.payload["provider_last_progress_at"]).utcoffset()
+        is not None
+    )
+    assert deadline.payload["provider_effect_outcome"] == "unknown"
+    assert deadline.payload["provider_recovery_disposition"] == "manual_settlement_required"
+    assert deadline.payload["retryable"] is False
+    assert deadline.payload["effective_max_attempts"] == 1
+    assert deadline.payload["model_step_id"] == events[1].payload["model_step_id"]
+    assert deadline.payload["model_attempt_id"] == events[1].payload["model_attempt_id"]
+    assert "partial answer" not in repr(deadline.payload)
+
+    private_started = private_events[1]
+    private_deadline = private_events[3]
+    assert private_deadline.payload["model_step_id"] == private_started.payload["model_step_id"]
+    assert (
+        private_deadline.payload["model_attempt_id"] == private_started.payload["model_attempt_id"]
+    )
+    assert [message.role for message in transcript] == ["user"]
+
+    active = asyncio.run(store.load_active_model_completion_stage("sess_retry_sse_idle"))
+    session = asyncio.run(store.load("sess_retry_sse_idle"))
+    assert active is not None
+    assert active.stage.state == "in_flight"
+    assert active.stage.logical_step_id == private_started.payload["model_step_id"]
+    assert active.stage.intent["model_attempt_id"] == private_started.payload["model_attempt_id"]
+    assert session is not None and session.status is SessionStatus.RUNNING
+    assert (
+        asyncio.run(
+            store.load_model_completion_stage_dispatch(
+                "sess_retry_sse_idle",
+                active.stage.stage_id,
+            )
+        )
+        is not None
+    )
+
+    asyncio.run(store.close())
+    reopened_store = SQLiteSessionStore(database)
+    restarted_provider = ChatCompletionsProvider(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=0.05,
+        absolute_stream_timeout_s=1.0,
+    )
+    restarted = CayuApp(session_store=reopened_store, enable_logging=False)
+    restarted.register_provider(restarted_provider, default=True)
+    restarted.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    with pytest.raises(ModelCompletionManualRecoveryRequired):
+        asyncio.run(
+            restarted.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id="sess_retry_sse_idle",
+                    inactive_for_seconds=0,
+                )
+            )
+        )
+    assert FlakyHttpClient.calls == 1
+    recovered_owner = asyncio.run(reopened_store.load("sess_retry_sse_idle"))
+    assert recovered_owner is not None
+    assert recovered_owner.run_epoch > session.run_epoch
+
+    settlement = asyncio.run(
+        restarted.recover_model_completion_stage(
+            ModelCompletionManualRecoveryRequest(
+                session_id="sess_retry_sse_idle",
+                stage_id=active.stage.stage_id,
+                expected_run_epoch=recovered_owner.run_epoch,
+                terminal_status=SessionStatus.FAILED,
+            )
+        )
+    )
+    assert settlement.settlement.disposition is (
+        sessions_module.ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+    )
+    assert settlement.settlement.reason_code == "operator_outcome_unknown"
+    assert (
+        asyncio.run(reopened_store.load_active_model_completion_stage("sess_retry_sse_idle"))
+        is None
+    )
+    assert FlakyHttpClient.calls == 1
+    asyncio.run(reopened_store.close())
+
+
+def test_cayu_app_preserves_stream_deadline_when_model_error_acknowledgement_is_lost() -> None:
+    class ModelErrorAcknowledgementLosingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_failure = RuntimeError("model.error acknowledgement lost")
+            self.failed = False
+
+        async def append_event(self, session_id: str, event: Event) -> None:
+            await super().append_event(session_id, event)
+            if not self.failed and event.type is EventType.MODEL_ERROR:
+                self.failed = True
+                raise self.publication_failure
+
+    class BlockingDeadlineProvider(ModelProvider):
+        name = "blocking-deadline"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        @property
+        def stream_deadlines(self) -> ProviderStreamDeadlines:
+            return ProviderStreamDeadlines(
+                transport_idle_timeout_s=1,
+                protocol_idle_timeout_s=1,
+                semantic_progress_timeout_s=0.01,
+                absolute_stream_timeout_s=1,
+            )
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            await asyncio.Event().wait()
+            yield ModelStreamEvent.completed({})  # pragma: no cover
+
+    async def run() -> None:
+        session_id = "sess_deadline_model_error_acknowledgement_lost"
+        store = ModelErrorAcknowledgementLosingStore()
+        provider = BlockingDeadlineProvider()
+        app = CayuApp(
+            session_store=store,
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(ExceptionGroup) as caught:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "wait")],
+                )
+            ):
+                pass
+
+        leaves = [
+            failure
+            for failure in iter_exception_tree(caught.value)
+            if not isinstance(failure, BaseExceptionGroup)
+        ]
+        deadlines = [failure for failure in leaves if isinstance(failure, ModelStreamDeadlineError)]
+        assert len(leaves) == 2
+        assert len(deadlines) == 1
+        assert sum(failure is store.publication_failure for failure in leaves) == 1
+        assert len(provider.requests) == 1
+        events = await store.load_events(session_id)
+        assert [event.type for event in events].count(EventType.MODEL_ERROR) == 1
+        active = await store.load_active_model_completion_stage(session_id)
+        session = await store.load(session_id)
+        assert active is not None and active.stage.state == "in_flight"
+        assert session is not None and session.status is SessionStatus.RUNNING
+
+    asyncio.run(run())
 
 
 def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean():
@@ -37664,7 +38068,7 @@ def test_automatic_compaction_cancellation_during_publication_reconciliation_pro
         reconciliation_started = asyncio.Event()
         allow_reconciliation = asyncio.Event()
         original_emit_many = app._event_writer.emit_many
-        original_persist_many = app._event_writer.persist_many
+        original_complete_stage = store.complete_model_completion_stage
         original_is_persisted = app._event_writer.is_persisted
 
         async def fail_start_publication(session_id: str, events: list[Event]):
@@ -37672,10 +38076,11 @@ def test_automatic_compaction_cancellation_during_publication_reconciliation_pro
                 raise RuntimeError("publication acknowledgement failed")
             return await original_emit_many(session_id, events)
 
-        async def fail_completion_persistence(session_id: str, events: list[Event]):
-            if any(event.type == EventType.MODEL_COMPLETED for event in events):
+        async def fail_completion_persistence(session_id: str, **kwargs):
+            result = await original_complete_stage(session_id, **kwargs)
+            if result.stage.purpose == "context-compaction":
                 raise RuntimeError("publication acknowledgement failed")
-            return await original_persist_many(session_id, events)
+            return result
 
         async def block_target_reconciliation(event: Event) -> bool:
             if event.type == publication_type:
@@ -37687,7 +38092,9 @@ def test_automatic_compaction_cancellation_during_publication_reconciliation_pro
         if publication_type == EventType.CONTEXT_COMPACTION_STARTED:
             monkeypatch.setattr(app._event_writer, "emit_many", fail_start_publication)
         else:
-            monkeypatch.setattr(app._event_writer, "persist_many", fail_completion_persistence)
+            monkeypatch.setattr(
+                store, "complete_model_completion_stage", fail_completion_persistence
+            )
         monkeypatch.setattr(app._event_writer, "is_persisted", block_target_reconciliation)
         if not release_reconciliation:
             monkeypatch.setattr(
@@ -37862,11 +38269,12 @@ def test_automatic_compaction_late_completion_commit_keeps_one_accounting_event(
             self.blocked_once = False
             self.cancellations = 0
 
-        async def append_events(self, session_id: str, events: list[Event]) -> None:
+        async def complete_model_completion_stage(self, session_id: str, **kwargs):
+            publication = kwargs["publication"]
             if not self.blocked_once and any(
                 event.type == EventType.MODEL_COMPLETED
                 and event.payload.get("purpose") == "context_compaction"
-                for event in events
+                for event in publication.events
             ):
                 self.blocked_once = True
                 self.blocked.set()
@@ -37877,7 +38285,7 @@ def test_automatic_compaction_late_completion_commit_keeps_one_accounting_event(
                         # Match a SQLite worker whose physical commit continues
                         # after cancellation of the awaiting task.
                         self.cancellations += 1
-            await super().append_events(session_id, events)
+            return await super().complete_model_completion_stage(session_id, **kwargs)
 
     class CompletionProvider(ModelProvider):
         name = "automatic-late-completion-provider"
@@ -47673,15 +48081,16 @@ def test_automatic_compaction_cancellation_during_outcome_persistence_is_lossles
             self.context_batch_started = asyncio.Event()
             self.allow_context_batch = asyncio.Event()
 
-        async def append_events(self, session_id: str, events: list[Event]) -> None:
+        async def complete_model_completion_stage(self, session_id: str, **kwargs):
+            publication = kwargs["publication"]
             if any(
                 event.type == EventType.MODEL_COMPLETED
                 and event.payload.get("purpose") == "context_compaction"
-                for event in events
+                for event in publication.events
             ):
                 self.context_batch_started.set()
                 await self.allow_context_batch.wait()
-            await super().append_events(session_id, events)
+            return await super().complete_model_completion_stage(session_id, **kwargs)
 
     async def run() -> None:
         session_id = "sess_compaction_outcome_persistence_cancellation"
@@ -48012,16 +48421,22 @@ def test_automatic_compaction_lost_completion_ack_fails_closed_without_retry() -
             super().__init__()
             self.failed = False
 
-        async def append_events(self, session_id: str, events: list[Event]) -> None:
-            is_compaction_completion = any(
-                event.type == EventType.MODEL_COMPLETED
-                and event.payload.get("purpose") == "context_compaction"
-                for event in events
+        async def promote_model_completion_stage(
+            self,
+            session_id: str,
+            *,
+            stage_id: str,
+            expected_run_epoch: int,
+        ):
+            result = await super().promote_model_completion_stage(
+                session_id,
+                stage_id=stage_id,
+                expected_run_epoch=expected_run_epoch,
             )
-            await super().append_events(session_id, events)
-            if is_compaction_completion and not self.failed:
+            if not self.failed:
                 self.failed = True
                 raise ConnectionError("compaction completion acknowledgement lost")
+            return result
 
     class RetryableFailureProvider(ModelProvider):
         name = "retryable-compaction"
@@ -51192,10 +51607,35 @@ def test_automatic_compaction_cancellation_stays_authoritative_if_settlement_fai
         assert exc_info.value.__notes__ == [
             "Automatic compaction budget settlement also failed: "
             "RuntimeError: budget ledger unavailable",
+            "Continuation recovery cleanup failed during cancelled session "
+            "finalization: ModelCompletionBudgetSettlementPending. The original "
+            "failure remains authoritative.",
         ]
-        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        cleanup_failure = exception_cause(exc_info.value)
+        assert isinstance(cleanup_failure, BaseExceptionGroup)
+        settlement_failure = exception_cause(cleanup_failure)
+        assert type(settlement_failure) is RuntimeError
+        assert str(settlement_failure) == "budget ledger unavailable"
+        cleanup_failures = tuple(iter_exception_tree(cleanup_failure))
+        assert (
+            sum(
+                isinstance(
+                    failure,
+                    run_limits_module.ModelCompletionBudgetSettlementPending,
+                )
+                for failure in cleanup_failures
+            )
+            == 1
+        )
         assert len(compactor_provider.requests) == 1
         assert runtime_provider.requests == []
+        active = await app.session_store.load_active_model_completion_stage(
+            "sess_compaction_cancelled_settlement_failure"
+        )
+        assert active is not None
+        assert active.stage.state == "completed"
+        records = tuple(ledger._records.values())
+        assert [record.status for record in records] == ["active"]
 
     asyncio.run(run())
 
@@ -51258,24 +51698,56 @@ def test_automatic_compaction_settles_other_limits_after_one_reconciliation_fail
         ),
     )
 
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id=session_id,
-                messages=[
-                    Message.text("user", "old"),
-                    Message.text("assistant", "old answer"),
-                    Message.text("user", "current"),
-                ],
-            ),
+    async def run():
+        events = []
+        with pytest.raises(RuntimeError, match="middle reconciliation failed") as exc_info:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                )
+            ):
+                events.append(event)
+        return (
+            events,
+            exc_info.value,
+            await app.session_store.load(session_id),
+            await app.session_store.load_active_model_completion_stage(session_id),
         )
-    )
+
+    events, failure, session, active = asyncio.run(run())
 
     records = tuple(ledger._records.values())
     assert ledger.reconcile_calls == 3
     assert [record.status for record in records] == ["reconciled", "active", "reconciled"]
+    assert active is not None
+    assert active.stage.state == "completed"
+    assert set(active.stage.reservation_ids) == {record.reservation_id for record in records}
+    assert session is not None and session.status == SessionStatus.RUNNING
+    assert EventType.SESSION_FAILED not in [event.type for event in events]
+    assert failure.__notes__ == [
+        "Automatic compaction budget settlement failed for reservation "
+        f"{records[1].reservation_id}."
+    ]
+    failure_cause = exception_cause(failure)
+    assert isinstance(failure_cause, BaseExceptionGroup)
+    cause_failures = tuple(iter_exception_tree(failure_cause))
+    assert (
+        sum(
+            isinstance(
+                item,
+                run_limits_module.ModelCompletionBudgetSettlementPending,
+            )
+            for item in cause_failures
+        )
+        == 1
+    )
+
     reconciled = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
     private_reconciled = asyncio.run(
         _private_events_for_public_events(app.session_store, session_id, reconciled)
@@ -51286,8 +51758,39 @@ def test_automatic_compaction_settles_other_limits_after_one_reconciliation_fail
     ]
     assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
-    assert events[-1].type == EventType.SESSION_FAILED
-    assert events[-1].payload["error"] == "middle reconciliation failed"
+
+    with pytest.raises(
+        ModelCompletionManualRecoveryRequired,
+        match="promoted without a durable context checkpoint",
+    ):
+        asyncio.run(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_for_seconds=0,
+                )
+            )
+        )
+
+    recovered_records = tuple(ledger._records.values())
+    assert ledger.reconcile_calls == 4
+    assert [record.status for record in recovered_records] == [
+        "reconciled",
+        "reconciled",
+        "reconciled",
+    ]
+    assert recovered_records[1].reason == (run_limits_module.UNKNOWN_POST_DISPATCH_BUDGET_REASON)
+    assert asyncio.run(app.session_store.load_active_model_completion_stage(session_id)) is None
+    recovered_events = asyncio.run(app.session_store.load_events(session_id))
+    recovered_completions = [
+        event
+        for event in recovered_events
+        if event.type is EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    assert len(recovered_completions) == 1
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
 
 
 @pytest.mark.parametrize(
@@ -51427,6 +51930,7 @@ def test_automatic_compaction_does_not_retry_after_settlement_failure() -> None:
 
     compactor_provider = RetryableFailureProvider()
     runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    ledger = FailingReconcileLedger()
     app = CayuApp(
         budget_policy=BudgetPolicy(
             limits=(
@@ -51438,7 +51942,7 @@ def test_automatic_compaction_does_not_retry_after_settlement_failure() -> None:
                 ),
             )
         ),
-        budget_ledger=FailingReconcileLedger(),
+        budget_ledger=ledger,
     )
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
@@ -51454,25 +51958,83 @@ def test_automatic_compaction_does_not_retry_after_settlement_failure() -> None:
         ),
     )
 
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_compaction_settlement_failure_no_retry",
-                messages=[
-                    Message.text("user", "old"),
-                    Message.text("assistant", "old answer"),
-                    Message.text("user", "current"),
-                ],
-            ),
+    session_id = "sess_compaction_settlement_failure_no_retry"
+
+    async def run():
+        events = []
+        with pytest.raises(ModelProviderError, match="provider overloaded") as exc_info:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                )
+            ):
+                events.append(event)
+        return (
+            events,
+            exc_info.value,
+            await app.session_store.load(session_id),
+            await app.session_store.load_active_model_completion_stage(session_id),
         )
-    )
+
+    events, failure, session, active = asyncio.run(run())
 
     assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
-    assert events[-1].type == EventType.SESSION_FAILED
-    assert events[-1].payload["error"] == "provider overloaded"
+    assert EventType.SESSION_FAILED not in [event.type for event in events]
+    assert session is not None and session.status == SessionStatus.RUNNING
+    assert failure.__notes__ == [
+        "Automatic compaction budget settlement also failed: "
+        "RuntimeError: ledger reconciliation failed"
+    ]
+    failure_cause = exception_cause(failure)
+    assert isinstance(failure_cause, BaseExceptionGroup)
+    cause_failures = tuple(iter_exception_tree(failure_cause))
+    assert (
+        sum(
+            type(item) is RuntimeError and str(item) == "ledger reconciliation failed"
+            for item in cause_failures
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(
+                item,
+                run_limits_module.ModelCompletionBudgetSettlementPending,
+            )
+            for item in cause_failures
+        )
+        == 1
+    )
+    assert active is not None and active.stage.state == "completed"
+
+    with pytest.raises(RuntimeError, match="ledger reconciliation failed"):
+        asyncio.run(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_for_seconds=0,
+                )
+            )
+        )
+
+    recovered_active = asyncio.run(app.session_store.load_active_model_completion_stage(session_id))
+    assert recovered_active == active
+    assert [record.status for record in ledger._records.values()] == ["active"]
+    recovered_events = asyncio.run(app.session_store.load_events(session_id))
+    assert not any(
+        event.type is EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+        for event in recovered_events
+    )
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
 
 
 def test_prompt_cache_compaction_does_not_fallback_after_settlement_failure() -> None:
@@ -51551,20 +52113,48 @@ def test_prompt_cache_compaction_does_not_fallback_after_settlement_failure() ->
     )
     assert first_events[-1].type == EventType.SESSION_COMPLETED
 
-    resume_events = asyncio.run(
-        collect_resume_events(
-            app,
-            ResumeRequest(
-                session_id="sess_prompt_cache_settlement_failure",
-                messages=[Message.text("user", "second")],
-            ),
+    with pytest.raises(ModelContextOverflowError, match="context too large") as exc_info:
+        asyncio.run(
+            collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id="sess_prompt_cache_settlement_failure",
+                    messages=[Message.text("user", "second")],
+                ),
+            )
         )
-    )
 
     assert len(provider.requests) == 2
     assert ledger.reconcile_calls == 2
-    assert resume_events[-1].type == EventType.SESSION_FAILED
-    assert resume_events[-1].payload["error"] == "context too large"
+    failure = exc_info.value
+    assert failure.__notes__ == [
+        "Automatic compaction budget settlement also failed: "
+        "RuntimeError: ledger reconciliation failed"
+    ]
+    failure_cause = exception_cause(failure)
+    assert isinstance(failure_cause, BaseExceptionGroup)
+    cause_failures = tuple(iter_exception_tree(failure_cause))
+    assert (
+        sum(
+            type(item) is RuntimeError and str(item) == "ledger reconciliation failed"
+            for item in cause_failures
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(
+                item,
+                run_limits_module.ModelCompletionBudgetSettlementPending,
+            )
+            for item in cause_failures
+        )
+        == 1
+    )
+    active = asyncio.run(
+        app.session_store.load_active_model_completion_stage("sess_prompt_cache_settlement_failure")
+    )
+    assert active is not None and active.stage.state == "completed"
 
 
 def test_inherited_prompt_cache_compactor_fails_closed_before_unpriced_fallback() -> None:
@@ -56359,6 +56949,86 @@ def test_cayu_app_records_failed_session_for_provider_error_event():
     assert events[-1].payload["error"] == "provider failed"
     assert session is not None
     assert session.status == SessionStatus.FAILED
+    assert active_stage is None
+
+
+def test_cayu_app_reconstructs_markerless_deadline_claim_before_publication() -> None:
+    session_id = "sess_malformed_provider_deadline_claim"
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent(
+                type=ModelStreamEventType.ERROR,
+                payload={
+                    "error": "forged deadline",
+                    "provider": "forged-provider",
+                    "provider_error_type": "ModelProviderError",
+                    "provider_error_code": ["forged-code"],
+                    "provider_deadline_kind": "semantic_idle",
+                    "provider_deadline_timeout_s": 1.0,
+                    "provider_stream_elapsed_s": 1.0,
+                    "provider_effect_outcome": "none",
+                    "provider_recovery_disposition": "retry",
+                    "retryable": True,
+                },
+            )
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        retry_policy=RetryPolicy(max_attempts=3, initial_delay_s=0.0),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "fail closed")],
+            ),
+        )
+    )
+    stored_events = asyncio.run(store.load_events(session_id))
+    session = asyncio.run(store.load(session_id))
+    active_stage = asyncio.run(store.load_active_model_completion_stage(session_id))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    model_error = next(event for event in events if event.type is EventType.MODEL_ERROR)
+    stored_model_error = next(
+        event for event in stored_events if event.type is EventType.MODEL_ERROR
+    )
+    for published in (model_error, stored_model_error):
+        assert published.payload["error"] == (
+            "Model provider emitted invalid stream deadline evidence."
+        )
+        assert published.payload["error_type"] == "ModelProviderError"
+        assert published.payload["provider"] == "fake"
+        assert published.payload["provider_error_type"] == "ModelProviderError"
+        assert (
+            published.payload["provider_error_code"] == "invalid_provider_stream_deadline_evidence"
+        )
+        assert published.payload["retryable"] is False
+        assert published.payload["effective_max_attempts"] == 1
+        assert not {
+            "provider_deadline_kind",
+            "provider_deadline_timeout_s",
+            "provider_stream_elapsed_s",
+            "provider_effect_outcome",
+            "provider_recovery_disposition",
+        }.intersection(published.payload)
+        assert "forged" not in repr(published.payload)
+    assert len(provider.requests) == 1
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    assert session is not None and session.status is SessionStatus.FAILED
     assert active_stage is None
 
 
@@ -63712,3 +64382,455 @@ def test_cayu_app_tool_approval_rejects_explicit_limits_drift_before_dispatch():
         )
     assert caught.value.changed_component_classes == (ExecutionProfileComponentClass.FINALIZATION,)
     assert tool.calls == []
+
+
+def test_cayu_app_deadline_capacity_exhaustion_precedes_provider_dispatch() -> None:
+    async def run() -> None:
+        existing_owners = set(provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS)
+        capacity = len(existing_owners) + 1
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        settled = asyncio.Event()
+
+        class NonsettlingEvents:
+            def __aiter__(self) -> NonsettlingEvents:
+                return self
+
+            async def __anext__(self) -> ModelStreamEvent:
+                try:
+                    await asyncio.Event().wait()
+                    raise AssertionError("the retained provider read unexpectedly resumed")
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+                    try:
+                        await release.wait()
+                        return ModelStreamEvent.text_delta("late provider value")
+                    finally:
+                        settled.set()
+
+            async def aclose(self) -> None:
+                return None
+
+        async def completed_events() -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+        class CapacityProvider(ModelProvider):
+            name = "runtime-deadline-capacity"
+
+            def __init__(self, source: AsyncIterator[ModelStreamEvent]) -> None:
+                self.source = source
+                self.entered = 0
+
+            @property
+            def stream_deadlines(self) -> ProviderStreamDeadlines:
+                return ProviderStreamDeadlines(
+                    transport_idle_timeout_s=1,
+                    protocol_idle_timeout_s=1,
+                    semantic_progress_timeout_s=0.01,
+                    absolute_stream_timeout_s=1,
+                    max_concurrent_streams=capacity,
+                )
+
+            def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+                del request
+                self.entered += 1
+                return self.source
+
+        class RejectedBackgroundAdapter(ProviderOperationAdapter):
+            def __init__(self) -> None:
+                self.start_calls = 0
+
+            async def start(
+                self,
+                request: ProviderOperationStartRequest,
+            ) -> ProviderOperationConnection:
+                del request
+                self.start_calls += 1
+                raise AssertionError("background provider start must not be entered")
+
+            async def retrieve(
+                self,
+                state: ProviderOperationState,
+            ) -> ProviderOperationSnapshot:
+                del state
+                raise AssertionError("rejected background operation cannot be retrieved")
+
+            async def reconnect(
+                self,
+                state: ProviderOperationState,
+            ) -> ProviderOperationConnection:
+                del state
+                raise AssertionError("rejected background operation cannot reconnect")
+
+        class BackgroundCapacityProvider(CapacityProvider):
+            def __init__(self) -> None:
+                super().__init__(completed_events())
+                self.adapter = RejectedBackgroundAdapter()
+
+            @property
+            def provider_operation_mode(self) -> ProviderOperationMode:
+                return ProviderOperationMode.BACKGROUND
+
+            @property
+            def provider_operations(self) -> ProviderOperationAdapter:
+                return self.adapter
+
+        occupying_provider = CapacityProvider(NonsettlingEvents())
+        occupying_stream = occupying_provider.runtime_stream(
+            ModelRequest(
+                model="occupying-model",
+                messages=[Message.text("user", "occupy the bounded deadline slot")],
+            )
+        )
+        with pytest.raises(ModelStreamDeadlineError):
+            await asyncio.wait_for(anext(occupying_stream), timeout=0.5)
+        assert cancellation_seen.is_set()
+        assert not settled.is_set()
+
+        store = InMemorySessionStore()
+        rejected_provider = CapacityProvider(completed_events())
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(rejected_provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        rejected_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_deadline_capacity_rejected",
+                messages=[Message.text("user", "do not enter the provider")],
+            ),
+        )
+
+        assert rejected_provider.entered == 0
+        assert rejected_events[-1].type is EventType.SESSION_FAILED
+        assert (
+            await store.load_active_model_completion_stage("sess_deadline_capacity_rejected")
+            is None
+        )
+
+        background_store = InMemorySessionStore()
+        background_provider = BackgroundCapacityProvider()
+        background_app = CayuApp(
+            session_store=background_store,
+            enable_logging=False,
+        )
+        background_app.register_provider(background_provider, default=True)
+        background_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        background_events = await collect_events(
+            background_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_background_deadline_capacity_rejected",
+                messages=[Message.text("user", "do not start a background operation")],
+            ),
+        )
+        assert background_provider.adapter.start_calls == 0
+        assert background_provider.entered == 0
+        assert background_events[-1].type is EventType.SESSION_FAILED
+        assert (
+            await background_store.load_active_model_completion_stage(
+                "sess_background_deadline_capacity_rejected"
+            )
+            is None
+        )
+
+        release.set()
+        await asyncio.wait_for(settled.wait(), timeout=0.5)
+        await asyncio.sleep(0)
+        assert len(provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS) == len(
+            existing_owners
+        )
+
+        admitted_provider = CapacityProvider(completed_events())
+        admitted_app = CayuApp(enable_logging=False)
+        admitted_app.register_provider(admitted_provider, default=True)
+        admitted_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        admitted_events = await collect_events(
+            admitted_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_deadline_capacity_recovered",
+                messages=[Message.text("user", "capacity is available again")],
+            ),
+        )
+        assert admitted_provider.entered == 1
+        assert admitted_events[-1].type is EventType.SESSION_COMPLETED
+
+    asyncio.run(run())
+
+
+_AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE = 88
+_AUTOMATIC_COMPACTION_PROCESS_SESSION_ID = "automatic-compaction-process-loss"
+
+
+class ProcessLossSuccessfulCompactionProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self, marker: str) -> None:
+        self._marker = Path(marker)
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="test.process-loss-successful-compaction-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        prior = int(self._marker.read_text(encoding="utf-8")) if self._marker.exists() else 0
+        self._marker.write_text(str(prior + 1), encoding="utf-8")
+        yield ModelStreamEvent.text_delta("durable summary")
+        yield ModelStreamEvent.completed(
+            {
+                "model": request.model,
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            }
+        )
+
+
+class ProcessLossAutomaticCompactionStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self, database: str, *, crash_point: str) -> None:
+        super().__init__(database)
+        self._crash_point = crash_point
+
+    async def complete_model_completion_stage(self, session_id: str, **kwargs):
+        result = await super().complete_model_completion_stage(session_id, **kwargs)
+        if (
+            self._crash_point == "completed"
+            and result.stage.purpose == "context-compaction"
+            and not result.replayed
+        ):
+            os._exit(_AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE)
+        return result
+
+    async def promote_model_completion_stage(
+        self,
+        session_id: str,
+        *,
+        stage_id: str,
+        expected_run_epoch: int,
+    ):
+        active = await self.load_active_model_completion_stage(session_id)
+        result = await super().promote_model_completion_stage(
+            session_id,
+            stage_id=stage_id,
+            expected_run_epoch=expected_run_epoch,
+        )
+        if (
+            self._crash_point == "promoted"
+            and active is not None
+            and active.stage.purpose == "context-compaction"
+        ):
+            os._exit(_AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE)
+        return result
+
+
+def _automatic_compaction_process_budget_policy() -> BudgetPolicy:
+    return BudgetPolicy(
+        limits=(
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("1"),
+                pricing=compaction_price_book(),
+                reservation=BudgetReservation(
+                    max_input_tokens=10,
+                    max_output_tokens=10,
+                ),
+            ),
+        )
+    )
+
+
+def _run_until_automatic_compaction_process_exit(
+    database: str,
+    ledger_database: str,
+    marker: str,
+    crash_point: str,
+) -> None:
+    async def run() -> None:
+        store = ProcessLossAutomaticCompactionStore(
+            database,
+            crash_point=crash_point,
+        )
+        provider = ProcessLossSuccessfulCompactionProvider(marker)
+        ledger = SQLiteBudgetLedger(ledger_database)
+        app = CayuApp(
+            session_store=store,
+            budget_ledger=ledger,
+            budget_policy=_automatic_compaction_process_budget_policy(),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=_AUTOMATIC_COMPACTION_PROCESS_SESSION_ID,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            )
+        ):
+            pass
+        raise AssertionError("the child did not reach the compaction crash point")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("crash_point", ["completed", "promoted"])
+def test_successful_automatic_compaction_process_loss_cannot_redispatch(
+    tmp_path: Path,
+    crash_point: str,
+) -> None:
+    database = tmp_path / f"automatic-compaction-{crash_point}.sqlite"
+    ledger_database = tmp_path / f"automatic-compaction-{crash_point}-budget.sqlite"
+    marker = tmp_path / f"automatic-compaction-{crash_point}-provider-count"
+    repository_root = Path(__file__).resolve().parents[2]
+    child_script = (
+        "from tests.core.test_runtime import "
+        "_run_until_automatic_compaction_process_exit as run; "
+        f"run({str(database)!r}, {str(ledger_database)!r}, "
+        f"{str(marker)!r}, {crash_point!r})"
+    )
+    child_environment = os.environ.copy()
+    existing_python_path = child_environment.get("PYTHONPATH")
+    child_environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(repository_root / "src"), existing_python_path) if path
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", child_script],
+        cwd=repository_root,
+        env=child_environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert child.returncode == _AUTOMATIC_COMPACTION_PROCESS_EXIT_CODE, child.stderr
+    assert marker.read_text(encoding="utf-8") == "1"
+
+    store = SQLiteSessionStore(database)
+    active = asyncio.run(
+        store.load_active_model_completion_stage(_AUTOMATIC_COMPACTION_PROCESS_SESSION_ID)
+    )
+    durable_events = asyncio.run(store.load_events(_AUTOMATIC_COMPACTION_PROCESS_SESSION_ID))
+    completions = [
+        event
+        for event in durable_events
+        if event.type is EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    assert not any(event.type is EventType.SESSION_CHECKPOINTED for event in durable_events)
+    if crash_point == "completed":
+        assert active is not None
+        assert active.stage.state == "completed"
+        assert completions == []
+    else:
+        assert active is None
+        assert len(completions) == 1
+        assert type(completions[0].payload.get("parent_model_step_id")) is str
+
+    restarted_provider = ProcessLossSuccessfulCompactionProvider(str(marker))
+    ledger = SQLiteBudgetLedger(ledger_database)
+    restarted = CayuApp(
+        session_store=store,
+        budget_ledger=ledger,
+        budget_policy=_automatic_compaction_process_budget_policy(),
+        enable_logging=False,
+    )
+    restarted.register_provider(restarted_provider, default=True)
+    restarted.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=restarted_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    recovery_failure: ModelCompletionManualRecoveryRequired | None = None
+    try:
+        asyncio.run(
+            restarted.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=_AUTOMATIC_COMPACTION_PROCESS_SESSION_ID,
+                    inactive_for_seconds=0,
+                )
+            )
+        )
+    except ModelCompletionManualRecoveryRequired as failure:
+        recovery_failure = failure
+    if crash_point == "completed":
+        assert recovery_failure is not None
+
+    recovered_events = asyncio.run(store.load_events(_AUTOMATIC_COMPACTION_PROCESS_SESSION_ID))
+    recovered_completions = [
+        event
+        for event in recovered_events
+        if event.type is EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    assert len(recovered_completions) == 1
+    assert type(recovered_completions[0].payload.get("parent_model_step_id")) is str
+    assert not any(event.type is EventType.SESSION_CHECKPOINTED for event in recovered_events)
+    completed_model_step_id = recovered_completions[0].payload["model_step_id"]
+    assert type(completed_model_step_id) is str
+    completed_stage = asyncio.run(
+        store.load_model_completion_stage(
+            _AUTOMATIC_COMPACTION_PROCESS_SESSION_ID,
+            f"{completed_model_step_id}:dispatch:0",
+        )
+    )
+    assert completed_stage is not None
+    assert len(completed_stage.reservation_ids) == 1
+    reservation = asyncio.run(ledger.load_reservation(completed_stage.reservation_ids[0]))
+    assert reservation is not None
+    assert reservation.status == "reconciled"
+    assert reservation.actual_amount == Decimal("0.000023")
+
+    if recovery_failure is not None:
+        asyncio.run(
+            interrupt_and_release_test_invocation(
+                store,
+                _AUTOMATIC_COMPACTION_PROCESS_SESSION_ID,
+            )
+        )
+    blocked_events = asyncio.run(
+        collect_resume_events(
+            restarted,
+            ResumeRequest(
+                session_id=_AUTOMATIC_COMPACTION_PROCESS_SESSION_ID,
+                messages=[Message.text("user", "retry after process loss")],
+            ),
+        )
+    )
+    assert marker.read_text(encoding="utf-8") == "1"
+    assert blocked_events[-1].type is EventType.SESSION_FAILED
+    assert "no later durable context checkpoint" in blocked_events[-1].payload["error"]
+    assert not any(
+        event.type is EventType.MODEL_STARTED
+        and event.payload.get("purpose") == "context_compaction"
+        for event in blocked_events
+    )
+    asyncio.run(ledger.close())
+    asyncio.run(store.close())

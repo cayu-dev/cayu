@@ -24,7 +24,7 @@ import certifi
 import httpx
 
 from cayu._exception_state import exception_state_contains
-from cayu._validation import require_clean_nonblank, require_finite, require_nonblank
+from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     aclosing_provider_stream,
@@ -36,15 +36,22 @@ from cayu.providers._sse import (
     DEFAULT_SSE_MAX_EVENT_BYTES,
     SseEventLimitError,
     SseEventTimeoutError,
-    SseIdleTimeoutError,
     _aiter_bounded_sse_lines,
     aiter_sse_json_events,
 )
 from cayu.providers.base import (
     ModelContextOverflowError,
     ModelProviderError,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
     ModelStreamEventType,
+)
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineController,
+    ProviderStreamDeadlineExceeded,
+    ProviderStreamDeadlines,
+    current_provider_deadline_controller,
 )
 from cayu.vaults.redaction import SecretRedactor
 
@@ -207,7 +214,7 @@ _SAFE_INTERNAL_PROVIDER_ERROR_TYPES = frozenset(
         "ProviderStreamCleanupError",
         "SseEventLimitError",
         "SseEventTimeoutError",
-        "SseIdleTimeoutError",
+        "ModelStreamDeadlineError",
     }
 )
 _SAFE_PROVIDER_ERROR_TYPES = {
@@ -318,6 +325,7 @@ _SAFE_PROVIDER_EXCEPTION_TYPE_NAMES = frozenset(
         "Exception",
         "ModelContextOverflowError",
         "ModelProviderError",
+        "ModelStreamDeadlineError",
         "OpenAIAPIError",
         "OpenAIContextOverflowError",
         "OpenAIError",
@@ -327,7 +335,6 @@ _SAFE_PROVIDER_EXCEPTION_TYPE_NAMES = frozenset(
         "RuntimeError",
         "SseEventLimitError",
         "SseEventTimeoutError",
-        "SseIdleTimeoutError",
         "VertexAPIError",
         "VertexContextOverflowError",
         "VertexError",
@@ -511,7 +518,10 @@ async def stream_sse_json_events(
     headers: Mapping[str, str],
     payload: Mapping[str, Any],
     timeout_s: float,
-    stream_idle_timeout_s: float,
+    transport_idle_timeout_s: float,
+    protocol_idle_timeout_s: float,
+    semantic_progress_timeout_s: float,
+    absolute_stream_timeout_s: float,
     request_label: str,
     response_label: str,
     api_error: Callable[..., Exception],
@@ -532,12 +542,19 @@ async def stream_sse_json_events(
     that are authoritative when the response body cannot be read safely.
     """
     method = require_clean_nonblank(method, "method").upper()
-    error_body_idle_timeout_s = require_finite(
-        float(stream_idle_timeout_s),
-        "stream_idle_timeout_s",
+    deadlines = ProviderStreamDeadlines(
+        transport_idle_timeout_s=transport_idle_timeout_s,
+        protocol_idle_timeout_s=protocol_idle_timeout_s,
+        semantic_progress_timeout_s=semantic_progress_timeout_s,
+        absolute_stream_timeout_s=absolute_stream_timeout_s,
     )
-    if error_body_idle_timeout_s <= 0:
-        raise ValueError("stream_idle_timeout_s must be greater than zero.")
+    deadline_controller = current_provider_deadline_controller()
+    owns_deadline_controller = deadline_controller is None
+    if deadline_controller is None:
+        deadline_controller = ProviderStreamDeadlineController(deadlines)
+    elif deadline_controller.deadlines != deadlines:
+        raise ValueError("Provider transport deadline policy changed after dispatch admission.")
+    error_body_idle_timeout_s = deadline_controller.deadlines.transport_idle_timeout_s
     request_timeout_s = float(timeout_s)
     error_body_max_duration_s = (
         min(request_timeout_s, error_body_idle_timeout_s * 2)
@@ -545,6 +562,7 @@ async def stream_sse_json_events(
         else error_body_idle_timeout_s * 2
     )
     timeout = httpx.Timeout(timeout_s, read=None)
+    successful_response_established = False
     try:
         request_kwargs: dict[str, Any] = {
             "headers": _identity_sse_headers(headers),
@@ -555,7 +573,16 @@ async def stream_sse_json_events(
         response_context = client.stream(method, url, **request_kwargs)
         responses = _aiter_owned_stream_response(response_context)
         async with aclosing_provider_stream(responses):
-            response = await anext(responses)
+            response = await deadline_controller.wait_for(
+                anext(responses),
+                kinds=(
+                    ProviderDeadlineKind.TRANSPORT_IDLE,
+                    ProviderDeadlineKind.PROTOCOL_IDLE,
+                    ProviderDeadlineKind.ABSOLUTE,
+                ),
+            )
+            deadline_controller.observe_transport()
+            successful_response_established = response.status_code < 400
             if response.status_code >= 400:
                 identity_encoding = _response_uses_identity_encoding(response)
                 error_response: httpx.Response | None = None
@@ -610,15 +637,22 @@ async def stream_sse_json_events(
                     max_line_bytes=DEFAULT_SSE_MAX_EVENT_BYTES,
                     provider_label=response_label,
                     emit_byte_activity=True,
+                    deadline_controller=deadline_controller,
                 )
                 async for event in aiter_sse_json_events(
                     bounded_lines,
-                    idle_timeout_s=stream_idle_timeout_s,
+                    deadline_controller=deadline_controller,
                     provider_label=response_label,
                     protocol_error=protocol_error,
                 ):
                     yield _TrustedSseJsonEvent(event, retry_after_s=retry_after_s)
-    except (SseIdleTimeoutError, SseEventTimeoutError) as exc:
+    except ProviderStreamDeadlineExceeded as exc:
+        raise ModelStreamDeadlineError(
+            provider=response_label.lower().replace(" ", "_"),
+            evidence=exc.evidence,
+            stream_cleanup_failed=exc.stream_cleanup_failed,
+        ) from None
+    except SseEventTimeoutError as exc:
         raise api_error(
             str(exc),
             error_type=type(exc).__name__,
@@ -632,8 +666,15 @@ async def stream_sse_json_events(
         ) from exc
     except httpx.RequestError as exc:
         raise _request_api_error(
-            api_error, request_label=request_label, url=url, cause=exc
+            api_error,
+            request_label=request_label,
+            url=url,
+            cause=exc,
+            retryable=False if successful_response_established else None,
         ) from exc
+    finally:
+        if owns_deadline_controller:
+            deadline_controller.close()
 
 
 def _request_api_error(
@@ -642,11 +683,12 @@ def _request_api_error(
     request_label: str,
     url: str,
     cause: httpx.RequestError,
+    retryable: bool | None = None,
 ) -> Exception:
     return api_error(
         f"{request_label} request failed for {url}: {cause}",
         error_type=_trusted_httpx_request_error_type(cause),
-        retryable=_is_retryable_transport_error(cause),
+        retryable=(_is_retryable_transport_error(cause) if retryable is None else retryable),
     )
 
 
@@ -901,6 +943,13 @@ def credential_safe_error_event(
     redacting every known model-provider credential before the event can enter
     runtime persistence or diagnostics.
     """
+    if type(exc) is ModelStreamDeadlineError:
+        safe = ModelStreamDeadlineError(
+            provider=provider_name,
+            evidence=exc.deadline_evidence,
+            stream_cleanup_failed=exc.stream_cleanup_failed,
+        )
+        return ModelStreamEvent.error(str(safe), cause=safe)
     safe_message = (
         require_nonblank(unresolved_message, "unresolved_message")
         if unresolved_message is not None
@@ -1047,6 +1096,12 @@ def credential_safe_provider_exception(
     }
     if isinstance(exc, ModelContextOverflowError):
         return ModelContextOverflowError(message, **common)
+    if type(exc) is ModelStreamDeadlineError:
+        return ModelStreamDeadlineError(
+            provider=provider_name,
+            evidence=exc.deadline_evidence,
+            stream_cleanup_failed=exc.stream_cleanup_failed,
+        )
     if isinstance(exc, ProviderStreamCleanupError):
         return ProviderStreamCleanupError(
             message,

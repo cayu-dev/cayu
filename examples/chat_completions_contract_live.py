@@ -239,7 +239,10 @@ class _RecordingChatCompletionsTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         self.calls.append(deepcopy(dict(payload)))
         async for event in self._delegate.stream_chat_completions(
@@ -247,7 +250,10 @@ class _RecordingChatCompletionsTransport:
             headers=headers,
             payload=payload,
             timeout_s=timeout_s,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
         ):
             yield event
 

@@ -10,15 +10,17 @@ import pytest
 
 from cayu import AgentSpec, CayuApp, InMemorySessionStore, ResumeRequest, RunRequest
 from cayu.core import EventType, Message
-from cayu.core.messages import MessageRole, ProviderStatePart
+from cayu.core.messages import MessageRole, ProviderStatePart, TextPart
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import (
     HttpxOpenAITransport,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEventType,
     OpenAIAPIError,
     OpenAIProtocolError,
     OpenAIProvider,
+    ProviderDeadlineKind,
     ProviderOperationCancellationSupport,
     ProviderOperationMalformedError,
     ProviderOperationMode,
@@ -26,6 +28,7 @@ from cayu.providers import (
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
+    ProviderProgressKind,
     TargetedToolProjectionRequest,
     ToolDiscoveryProjectionRequest,
 )
@@ -259,7 +262,10 @@ class BackgroundTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         self.start_calls.append(
             {
@@ -267,7 +273,10 @@ class BackgroundTransport:
                 "headers": dict(headers),
                 "payload": dict(payload),
                 "timeout_s": timeout_s,
-                "stream_idle_timeout_s": stream_idle_timeout_s,
+                "transport_idle_timeout_s": transport_idle_timeout_s,
+                "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                "absolute_stream_timeout_s": absolute_stream_timeout_s,
             }
         )
         if not self.start_batches:
@@ -299,7 +308,10 @@ class BackgroundTransport:
         headers: Mapping[str, str],
         starting_after: int,
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         self.reconnect_calls.append(
             {
@@ -307,7 +319,10 @@ class BackgroundTransport:
                 "headers": dict(headers),
                 "starting_after": starting_after,
                 "timeout_s": timeout_s,
-                "stream_idle_timeout_s": stream_idle_timeout_s,
+                "transport_idle_timeout_s": transport_idle_timeout_s,
+                "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                "absolute_stream_timeout_s": absolute_stream_timeout_s,
             }
         )
         if not self.reconnect_batches:
@@ -449,6 +464,330 @@ async def test_openai_background_start_publishes_identity_before_output() -> Non
 
 
 @pytest.mark.anyio
+async def test_openai_background_start_preserves_deadline_through_close_failure() -> None:
+    secret = "background-close-secret-must-not-survive"
+
+    class FailingCloseEvents:
+        def __aiter__(self) -> FailingCloseEvents:
+            return self
+
+        async def __anext__(self) -> Mapping[str, Any]:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration  # pragma: no cover
+
+        async def aclose(self) -> None:
+            raise RuntimeError(secret)
+
+    class BlockingStartTransport(BackgroundTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events = FailingCloseEvents()
+
+        def stream_response_events(self, **kwargs: Any) -> AsyncIterator[Mapping[str, Any]]:
+            self.start_calls.append(dict(kwargs))
+            return self.events
+
+    transport = BlockingStartTransport()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.01,
+        absolute_stream_timeout_s=1,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        await adapter.start(
+            ProviderOperationStartRequest(request=_request(), idempotency_key="start-id")
+        )
+
+    failure = captured.value
+    assert failure.deadline_evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
+    assert failure.stream_cleanup_failed is True
+    assert failure.error_payload_fields()["provider_effect_outcome"] == "unknown"
+    assert failure.error_payload_fields()["stream_cleanup_failed"] is True
+    assert secret not in repr(failure)
+    assert secret not in repr(failure.error_payload_fields())
+
+
+@pytest.mark.anyio
+async def test_cayu_app_preserves_typed_background_start_deadline() -> None:
+    class BlockingStartEvents:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self) -> BlockingStartEvents:
+            return self
+
+        async def __anext__(self) -> Mapping[str, Any]:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration  # pragma: no cover
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class BlockingStartTransport(BackgroundTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events = BlockingStartEvents()
+
+        def stream_response_events(self, **kwargs: Any) -> AsyncIterator[Mapping[str, Any]]:
+            self.start_calls.append(dict(kwargs))
+            return self.events
+
+    transport = BlockingStartTransport()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.01,
+        absolute_stream_timeout_s=1,
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+    session_id = "openai-background-start-deadline"
+    observed = []
+
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "wait for response identity")],
+            )
+        ):
+            observed.append(event)
+
+    assert len(transport.start_calls) == 1
+    assert transport.events.closed is True
+    assert captured.value.deadline_evidence.deadline_kind is (ProviderDeadlineKind.SEMANTIC_IDLE)
+    assert EventType.PROVIDER_OPERATION_STARTING in {event.type for event in observed}
+    assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in observed}
+    assert EventType.SESSION_INTERRUPTED not in {event.type for event in observed}
+    assert EventType.MODEL_RETRY not in {event.type for event in observed}
+    model_started = next(event for event in observed if event.type is EventType.MODEL_STARTED)
+    model_error = next(event for event in observed if event.type is EventType.MODEL_ERROR)
+    assert model_error.payload["provider"] == "openai"
+    assert model_error.payload["provider_error_type"] == "ModelStreamDeadlineError"
+    assert model_error.payload["provider_deadline_kind"] == "semantic_idle"
+    assert model_error.payload["provider_deadline_timeout_s"] == 0.01
+    assert model_error.payload["provider_stream_elapsed_s"] >= 0.01
+    assert model_error.payload["provider_effect_outcome"] == "unknown"
+    assert model_error.payload["provider_recovery_disposition"] == ("manual_settlement_required")
+    assert model_error.payload["model_step_id"] == model_started.payload["model_step_id"]
+    assert model_error.payload["model_attempt_id"] == model_started.payload["model_attempt_id"]
+    stage = await store.load_active_model_completion_stage(session_id)
+    session = await store.load(session_id)
+    durable_events = await store.load_events(session_id)
+    durable_errors = [event for event in durable_events if event.type is EventType.MODEL_ERROR]
+    assert len(durable_errors) == 1
+    [durable_error] = durable_errors
+    assert stage is not None and stage.stage.state == "in_flight"
+    assert durable_error.payload["provider_deadline_kind"] == "semantic_idle"
+    assert (
+        durable_error.payload["provider_stream_elapsed_s"]
+        == model_error.payload["provider_stream_elapsed_s"]
+    )
+    assert durable_error.payload["model_step_id"] == stage.stage.logical_step_id
+    assert durable_error.payload["model_attempt_id"] == stage.stage.intent["model_attempt_id"]
+    assert session is not None and session.status is SessionStatus.RUNNING
+
+
+@pytest.mark.anyio
+async def test_cayu_app_background_deadline_projects_exact_reattachment() -> None:
+    class CreatedThenBlockingTransport(BackgroundTransport):
+        async def stream_response_events(
+            self,
+            *,
+            url: str,
+            headers: Mapping[str, str],
+            payload: Mapping[str, Any],
+            timeout_s: float,
+            transport_idle_timeout_s: float,
+            protocol_idle_timeout_s: float,
+            semantic_progress_timeout_s: float,
+            absolute_stream_timeout_s: float,
+        ) -> AsyncIterator[Mapping[str, Any]]:
+            self.start_calls.append(
+                {
+                    "url": url,
+                    "headers": dict(headers),
+                    "payload": dict(payload),
+                    "timeout_s": timeout_s,
+                    "transport_idle_timeout_s": transport_idle_timeout_s,
+                    "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                    "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                    "absolute_stream_timeout_s": absolute_stream_timeout_s,
+                }
+            )
+            yield _created(response_id="resp_background_deadline")
+            await asyncio.Event().wait()
+            raise AssertionError("the background stream unexpectedly resumed")
+
+    transport = CreatedThenBlockingTransport()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.01,
+        absolute_stream_timeout_s=1,
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+    session_id = "openai-background-exact-deadline"
+    observed = []
+
+    with pytest.raises(ModelStreamDeadlineError):
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "reattach this exact response")],
+            )
+        ):
+            observed.append(event)
+
+    model_error = next(event for event in observed if event.type is EventType.MODEL_ERROR)
+    assert model_error.payload["provider_recovery_disposition"] == ("reattach_exact_operation")
+    assert model_error.payload["provider_effect_outcome"] == "unknown"
+    assert EventType.PROVIDER_OPERATION_STARTED in {event.type for event in observed}
+    assert EventType.MODEL_RETRY not in {event.type for event in observed}
+    assert len(transport.start_calls) == 1
+
+    transport.retrieve_responses.append(
+        _completed(response_id="resp_background_deadline")["response"]
+    )
+    recovered = await app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(
+            session_id=session_id,
+            inactive_for_seconds=0,
+        )
+    )
+
+    assert recovered.status is SessionStatus.INTERRUPTED
+    assert len(transport.start_calls) == 1
+    assert len(transport.retrieve_calls) == 1
+    transcript = await store.load_transcript(session_id)
+    completed_text = transcript[-1].content[0]
+    assert isinstance(completed_text, TextPart)
+    assert completed_text.text == "finished"
+
+
+@pytest.mark.anyio
+async def test_openai_background_deadline_does_not_wait_for_nonsettling_close() -> None:
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class BlockingCloseEvents:
+        def __aiter__(self) -> BlockingCloseEvents:
+            return self
+
+        async def __anext__(self) -> Mapping[str, Any]:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration  # pragma: no cover
+
+        async def aclose(self) -> None:
+            close_started.set()
+            await close_release.wait()
+            close_finished.set()
+
+    class BlockingStartTransport(BackgroundTransport):
+        def stream_response_events(self, **kwargs: Any) -> AsyncIterator[Mapping[str, Any]]:
+            self.start_calls.append(dict(kwargs))
+            return BlockingCloseEvents()
+
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=BlockingStartTransport(),
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.01,
+        absolute_stream_timeout_s=1,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+
+    try:
+        with pytest.raises(ModelStreamDeadlineError) as captured:
+            await asyncio.wait_for(
+                adapter.start(
+                    ProviderOperationStartRequest(
+                        request=_request(),
+                        idempotency_key="start-id",
+                    )
+                ),
+                timeout=0.5,
+            )
+
+        assert captured.value.deadline_evidence.deadline_kind is (
+            ProviderDeadlineKind.SEMANTIC_IDLE
+        )
+        assert captured.value.stream_cleanup_failed is True
+        assert close_started.is_set()
+        assert not close_finished.is_set()
+    finally:
+        close_release.set()
+        await asyncio.wait_for(close_finished.wait(), timeout=0.5)
+
+
+@pytest.mark.anyio
+async def test_openai_background_real_cancellation_during_deadline_cleanup_wins() -> None:
+    close_started = asyncio.Event()
+
+    class BlockingCloseEvents:
+        def __aiter__(self) -> BlockingCloseEvents:
+            return self
+
+        async def __anext__(self) -> Mapping[str, Any]:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration  # pragma: no cover
+
+        async def aclose(self) -> None:
+            close_started.set()
+            await asyncio.Event().wait()
+
+    class BlockingStartTransport(BackgroundTransport):
+        def stream_response_events(self, **kwargs: Any) -> AsyncIterator[Mapping[str, Any]]:
+            self.start_calls.append(dict(kwargs))
+            return BlockingCloseEvents()
+
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=BlockingStartTransport(),
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.01,
+        absolute_stream_timeout_s=1,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+
+    task = asyncio.create_task(
+        adapter.start(ProviderOperationStartRequest(request=_request(), idempotency_key="start-id"))
+    )
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    task.cancel("caller cancellation during stream cleanup")
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.anyio
 async def test_openai_background_retains_targeted_tool_ownership_through_stream() -> None:
     transport = BackgroundTransport()
     transport.start_batches.append([_created(), _completed(sequence_number=1)])
@@ -543,7 +882,10 @@ async def test_openai_background_reconnect_starts_after_last_accepted_sequence()
             },
             "starting_after": 1,
             "timeout_s": 60.0,
-            "stream_idle_timeout_s": 120.0,
+            "transport_idle_timeout_s": 120.0,
+            "protocol_idle_timeout_s": 120.0,
+            "semantic_progress_timeout_s": 120.0,
+            "absolute_stream_timeout_s": 600.0,
         }
     ]
     assert len(events) == 1
@@ -551,6 +893,278 @@ async def test_openai_background_reconnect_starts_after_last_accepted_sequence()
     assert events[0].recovery_metadata is not None
     assert events[0].recovery_metadata.cursor == 2
     assert events[0].recovery_metadata.opaque["sequence_number"] == 2
+
+
+@pytest.mark.anyio
+async def test_openai_background_runtime_handoff_excludes_consumer_pause_from_semantic_idle() -> (
+    None
+):
+    transport = BackgroundTransport()
+    transport.start_batches.append(
+        [
+            _created(),
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "finished",
+            },
+            _completed(sequence_number=2),
+        ]
+    )
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.01,
+        absolute_stream_timeout_s=1,
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+    stream = app.run(
+        RunRequest(
+            agent_name="assistant",
+            session_id="openai-background-consumer-pause",
+            messages=[Message.text("user", "finish in the background")],
+        )
+    )
+    events = []
+    while True:
+        event = await anext(stream)
+        events.append(event)
+        if event.type is EventType.PROVIDER_OPERATION_STARTED:
+            break
+
+    await asyncio.sleep(0.03)
+    events.extend([event async for event in stream])
+
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    assert EventType.MODEL_ERROR not in {event.type for event in events}
+
+
+@pytest.mark.anyio
+async def test_openai_background_reconnect_handoff_excludes_semantic_idle_pause() -> None:
+    transport = BackgroundTransport()
+    transport.reconnect_batches.append(
+        [
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "finished",
+            },
+            _completed(sequence_number=2),
+        ]
+    )
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.01,
+        absolute_stream_timeout_s=1,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+    state = ProviderOperationState.model_validate(
+        {
+            "operation_id": "resp_background_pause",
+            "stream_protocol": "openai-responses-background-v1",
+            "recovery_metadata": {"cursor": 0, "opaque": {"sequence_number": 0}},
+        }
+    )
+
+    connection = await adapter.reconnect(state)
+    await asyncio.sleep(0.03)
+    events = [event async for event in connection.events]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+
+
+@pytest.mark.anyio
+async def test_openai_background_handoff_pause_still_consumes_absolute_lifetime() -> None:
+    transport = BackgroundTransport()
+    transport.start_batches.append([_created(), _completed(sequence_number=1)])
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=0.01,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+
+    connection = await adapter.start(
+        ProviderOperationStartRequest(request=_request(), idempotency_key="start-id")
+    )
+    await asyncio.sleep(0.03)
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        _ = [event async for event in connection.events]
+
+    assert captured.value.deadline_evidence.deadline_kind is ProviderDeadlineKind.ABSOLUTE
+
+
+@pytest.mark.anyio
+async def test_openai_background_reconnect_semantic_deadline_retains_exact_identity() -> None:
+    class NoopReconnectTransport(BackgroundTransport):
+        async def reconnect_response_events(
+            self,
+            *,
+            url: str,
+            headers: Mapping[str, str],
+            starting_after: int,
+            timeout_s: float,
+            transport_idle_timeout_s: float,
+            protocol_idle_timeout_s: float,
+            semantic_progress_timeout_s: float,
+            absolute_stream_timeout_s: float,
+        ) -> AsyncIterator[Mapping[str, Any]]:
+            del (
+                headers,
+                timeout_s,
+                transport_idle_timeout_s,
+                protocol_idle_timeout_s,
+                semantic_progress_timeout_s,
+                absolute_stream_timeout_s,
+            )
+            self.reconnect_calls.append(
+                {
+                    "url": url,
+                    "starting_after": starting_after,
+                }
+            )
+            sequence_number = starting_after
+            while True:
+                await asyncio.sleep(0.003)
+                sequence_number += 1
+                yield {
+                    "type": "response.output_text.delta",
+                    "sequence_number": sequence_number,
+                    "delta": "",
+                }
+
+    transport = NoopReconnectTransport()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.03,
+        absolute_stream_timeout_s=1,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+    state = ProviderOperationState.model_validate(
+        {
+            "operation_id": "resp_background_exact",
+            "stream_protocol": "openai-responses-background-v1",
+            "recovery_metadata": {"cursor": 0, "opaque": {"sequence_number": 0}},
+        }
+    )
+
+    connection = await adapter.reconnect(state)
+    observed = []
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        async for event in connection.events:
+            observed.append(event)
+
+    assert connection.state == state
+    assert transport.reconnect_calls == [
+        {
+            "url": "https://api.openai.com/v1/responses/resp_background_exact",
+            "starting_after": 0,
+        }
+    ]
+    assert observed
+    assert all(
+        event.type is ModelStreamEventType.THINKING and not event.delta for event in observed
+    )
+    evidence = captured.value.deadline_evidence
+    assert captured.value.error_payload_fields()["provider_recovery_disposition"] == (
+        "reattach_exact_operation"
+    )
+    assert evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
+    assert evidence.last_progress_kind is ProviderProgressKind.RESPONSE_IDENTITY
+
+
+@pytest.mark.anyio
+async def test_openai_background_reconnect_first_read_deadline_retains_exact_identity() -> None:
+    secret = "reconnect-close-secret-0123456789"
+
+    class FailingCloseReconnectEvents:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self) -> FailingCloseReconnectEvents:
+            return self
+
+        async def __anext__(self) -> Mapping[str, Any]:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration  # pragma: no cover
+
+        async def aclose(self) -> None:
+            self.closed = True
+            raise RuntimeError(secret)
+
+    class BlockingReconnectTransport(BackgroundTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events = FailingCloseReconnectEvents()
+
+        def reconnect_response_events(
+            self,
+            **kwargs: Any,
+        ) -> AsyncIterator[Mapping[str, Any]]:
+            self.reconnect_calls.append(
+                {
+                    "url": kwargs["url"],
+                    "starting_after": kwargs["starting_after"],
+                }
+            )
+            return self.events
+
+    transport = BlockingReconnectTransport()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.01,
+        absolute_stream_timeout_s=1,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+    state = ProviderOperationState.model_validate(
+        {
+            "operation_id": "resp_background_first_read_deadline",
+            "stream_protocol": "openai-responses-background-v1",
+            "recovery_metadata": {"cursor": 0, "opaque": {"sequence_number": 0}},
+        }
+    )
+
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        await adapter.reconnect(state)
+
+    failure = captured.value
+    assert transport.events.closed is True
+    assert failure.stream_cleanup_failed is True
+    assert failure.deadline_evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
+    assert failure.deadline_evidence.last_progress_kind is ProviderProgressKind.RESPONSE_IDENTITY
+    assert failure.error_payload_fields()["provider_recovery_disposition"] == (
+        "reattach_exact_operation"
+    )
+    assert secret not in repr(failure)
+    assert secret not in repr(failure.error_payload_fields())
 
 
 @pytest.mark.anyio
@@ -664,6 +1278,137 @@ async def test_openai_background_generic_stream_error_remains_reconnectable() ->
     assert len(transport.reconnect_calls) == 2
     inspection = await inspect_provider_operation(store, session_id)
     assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("reconnect_progress", "expected_progress_kind"),
+    [
+        (False, ProviderProgressKind.RESPONSE_IDENTITY),
+        (True, ProviderProgressKind.CONTENT),
+    ],
+    ids=("first-read", "mid-stream"),
+)
+async def test_openai_background_reconnect_deadline_is_durable_exact_evidence(
+    reconnect_progress: bool,
+    expected_progress_kind: ProviderProgressKind,
+) -> None:
+    class DeadlineReconnectTransport(BackgroundTransport):
+        async def reconnect_response_events(
+            self,
+            *,
+            url: str,
+            headers: Mapping[str, str],
+            starting_after: int,
+            timeout_s: float,
+            transport_idle_timeout_s: float,
+            protocol_idle_timeout_s: float,
+            semantic_progress_timeout_s: float,
+            absolute_stream_timeout_s: float,
+        ) -> AsyncIterator[Mapping[str, Any]]:
+            self.reconnect_calls.append(
+                {
+                    "url": url,
+                    "headers": dict(headers),
+                    "starting_after": starting_after,
+                    "timeout_s": timeout_s,
+                    "transport_idle_timeout_s": transport_idle_timeout_s,
+                    "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                    "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                    "absolute_stream_timeout_s": absolute_stream_timeout_s,
+                }
+            )
+            if reconnect_progress:
+                yield {
+                    "type": "response.output_text.delta",
+                    "sequence_number": starting_after + 1,
+                    "delta": "continued",
+                }
+            await asyncio.Event().wait()
+            raise AssertionError("the reconnect stream unexpectedly resumed")
+
+    transport = DeadlineReconnectTransport()
+    transport.start_batches.append(
+        [
+            _created(response_id="resp_reconnect_deadline"),
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "partial",
+            },
+            SimulatedWorkerLoss("worker disappeared after cursor publication"),
+        ]
+    )
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=0.02,
+        absolute_stream_timeout_s=1,
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+    session_id = f"openai-reconnect-deadline-{'progress' if reconnect_progress else 'first'}"
+
+    with pytest.raises(SimulatedWorkerLoss):
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "preserve reconnect deadline evidence")],
+                )
+            )
+        ]
+    stage_before = await store.load_active_model_completion_stage(session_id)
+    assert stage_before is not None
+
+    recovered = await app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(
+            session_id=session_id,
+            inactive_for_seconds=0,
+        )
+    )
+
+    assert recovered.status is SessionStatus.INTERRUPTED
+    assert len(transport.start_calls) == 1
+    assert len(transport.reconnect_calls) == 1
+    assert transport.retrieve_calls == []
+    stage_after = await store.load_active_model_completion_stage(session_id)
+    assert stage_after is not None
+    assert stage_after.stage.stage_id == stage_before.stage.stage_id
+
+    durable_events = await store.load_events(session_id)
+    deadline_errors = [
+        event
+        for event in durable_events
+        if event.type is EventType.MODEL_ERROR
+        and event.payload.get("error_type") == "ModelStreamDeadlineError"
+    ]
+    assert len(deadline_errors) == 1
+    [deadline_error] = deadline_errors
+    assert deadline_error.payload["provider"] == "openai"
+    assert deadline_error.payload["provider_deadline_kind"] == "semantic_idle"
+    assert deadline_error.payload["provider_deadline_timeout_s"] == 0.02
+    assert deadline_error.payload["provider_last_progress_kind"] == expected_progress_kind.value
+    assert deadline_error.payload["provider_effect_outcome"] == "unknown"
+    assert deadline_error.payload["provider_recovery_disposition"] == ("reattach_exact_operation")
+    assert deadline_error.payload["model_step_id"] == stage_before.stage.logical_step_id
+    assert (
+        deadline_error.payload["model_attempt_id"] == stage_before.stage.intent["model_attempt_id"]
+    )
+    deadline_index = durable_events.index(deadline_error)
+    recovery_required_index = next(
+        index
+        for index, event in enumerate(durable_events)
+        if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+    )
+    assert deadline_index < recovery_required_index
 
 
 @pytest.mark.anyio
@@ -1045,7 +1790,10 @@ async def test_openai_background_http_transport_uses_retrieve_resume_and_cancel_
                 headers={"authorization": "Bearer test-key"},
                 starting_after=7,
                 timeout_s=1.0,
-                stream_idle_timeout_s=1.0,
+                transport_idle_timeout_s=1.0,
+                protocol_idle_timeout_s=1.0,
+                semantic_progress_timeout_s=1.0,
+                absolute_stream_timeout_s=1.0,
             )
         ]
         cancelled = await transport.cancel_response(

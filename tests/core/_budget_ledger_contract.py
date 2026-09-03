@@ -106,6 +106,7 @@ async def assert_runtime_manual_model_recovery_settles_dispatched_reservation(
         recovery_contexts=(context,),
         session=session,
         provider_name="fake",
+        model=session.model,
         model_attempt_identity=attempt_identity,
         dispatch_id=dispatch_id,
     )

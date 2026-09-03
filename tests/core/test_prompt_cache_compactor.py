@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator
+from decimal import Decimal
+from hashlib import sha256
+from pathlib import Path
 
 import pytest
 from tests._session_provenance import session_fixture
@@ -16,22 +22,49 @@ from cayu import (
     ContextUsageState,
     Environment,
     EnvironmentSpec,
+    Event,
     EventType,
+    IncompleteSessionRecoveryRequest,
     LocalArtifactStore,
     Message,
     ModelCompactor,
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionManualRecoveryRequired,
     ModelTarget,
     PromptCacheCompactor,
     ResumeRequest,
     RetryPolicy,
     RunRequest,
+    SessionStatus,
+    SQLiteSessionStore,
     TextPart,
     ThinkingConfig,
 )
 from cayu.artifacts import RESOLVED_FILE_ATTACHMENTS_OPTION
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
+from cayu.providers import (
+    ModelContextOverflowError,
+    ModelProvider,
+    ModelProviderError,
+    ModelRequest,
+    ModelStreamDeadlineError,
+    ModelStreamEvent,
+    ProviderDeadlineKind,
+    ProviderProgressKind,
+    ProviderStreamDeadlineEvidence,
+    ProviderStreamDeadlines,
+)
+from cayu.runtime import (
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReservation,
+    InMemoryBudgetLedger,
+    InMemorySessionStore,
+)
 from cayu.runtime.context import ContextBuildError
+from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.storage import SQLiteBudgetLedger
 
 
 class RecordingProvider(ModelProvider):
@@ -110,6 +143,296 @@ class ToolCallFailureProvider(ModelProvider):
         )
 
 
+class ToolCallDeadlineProvider(ModelProvider):
+    name = "tool-call-deadline"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        return ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            protocol_idle_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            absolute_stream_timeout_s=1,
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        yield ModelStreamEvent.tool_call(
+            id="call_1",
+            name="inspect_report",
+            arguments={},
+        )
+        await asyncio.Event().wait()
+        yield ModelStreamEvent.completed({})  # pragma: no cover
+
+
+class RestartStableRecordingProvider(RecordingProvider):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="test.recording-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+
+class RestartStableToolCallDeadlineProvider(ToolCallDeadlineProvider):
+    @property
+    def billing_provider_name(self) -> str:
+        return "tool-call-deadline-billing"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="test.compaction-deadline-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+
+class RestartStablePromptCacheCompactor(PromptCacheCompactor):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="test.prompt-cache-compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+
+class RejectContextCompactionReceiptStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rejected_receipts = 0
+
+    async def mark_model_completion_stage_dispatched(self, session_id, *, stage):
+        if stage.purpose == "context-compaction":
+            self.rejected_receipts += 1
+            raise RuntimeError("context-compaction receipt rejected before commit")
+        return await super().mark_model_completion_stage_dispatched(
+            session_id,
+            stage=stage,
+        )
+
+
+class RejectPreProviderReleaseLedger(InMemoryBudgetLedger):
+    def __init__(self) -> None:
+        super().__init__(reservation_ttl_seconds=None)
+        self.reject_releases = True
+        self.release_attempts = 0
+
+    async def release_pre_provider_dispatch(self, **kwargs):
+        self.release_attempts += 1
+        if self.reject_releases:
+            raise RuntimeError("pre-provider compaction release rejected")
+        return await super().release_pre_provider_dispatch(**kwargs)
+
+
+_CONTEXT_COMPACTION_RECEIPT_EXIT_CODE = 86
+_OVERFLOW_COMPACTION_DISPATCH_EXIT_CODE = 87
+
+
+class ExitBeforeContextCompactionReceiptStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
+    async def mark_model_completion_stage_dispatched(self, session_id, *, stage):
+        if stage.purpose == "context-compaction":
+            os._exit(_CONTEXT_COMPACTION_RECEIPT_EXIT_CODE)
+        return await super().mark_model_completion_stage_dispatched(
+            session_id,
+            stage=stage,
+        )
+
+
+class MarkerToolCallDeadlineProvider(RestartStableToolCallDeadlineProvider):
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self._marker = Path(marker)
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self._marker.write_text("provider entered", encoding="utf-8")
+        async for event in super().stream(request):
+            yield event
+
+
+class ExitDuringOverflowCompactionProvider(RestartStableToolCallDeadlineProvider):
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self._marker = Path(marker)
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        self._marker.write_text("provider entered", encoding="utf-8")
+        os._exit(_OVERFLOW_COMPACTION_DISPATCH_EXIT_CODE)
+        yield ModelStreamEvent.completed({})  # pragma: no cover
+
+
+class OverflowThenSuccessProvider(RestartStableRecordingProvider):
+    def __init__(self) -> None:
+        super().__init__([])
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            overflow = ModelContextOverflowError(
+                "context too large",
+                provider=self.name,
+                status_code=400,
+                error_code="context_length_exceeded",
+            )
+            yield ModelStreamEvent.error(str(overflow), cause=overflow)
+            return
+        yield ModelStreamEvent.text_delta("answer after compaction")
+        yield ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})
+
+
+class SuccessfulOverflowCompactionProvider(RestartStableToolCallDeadlineProvider):
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        yield ModelStreamEvent.text_delta("bounded summary")
+        yield ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})
+
+
+def _restart_compaction_budget_policy(
+    *,
+    assistant_model: str,
+    compactor_model: str,
+) -> BudgetPolicy:
+    return BudgetPolicy(
+        limits=(
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("1"),
+                pricing=PriceBook(
+                    prices=(
+                        ModelPrice.fixed(
+                            provider_name="recording",
+                            model=assistant_model,
+                            input_per_million=Decimal("1"),
+                            output_per_million=Decimal("1"),
+                        ),
+                        ModelPrice.fixed(
+                            provider_name="tool-call-deadline-billing",
+                            model=compactor_model,
+                            input_per_million=Decimal("1"),
+                            output_per_million=Decimal("1"),
+                        ),
+                    )
+                ),
+                reservation=BudgetReservation(
+                    max_input_tokens=1_000,
+                    max_output_tokens=1_000,
+                ),
+            ),
+        )
+    )
+
+
+def _resume_until_context_compaction_receipt_exit(
+    database: str,
+    budget_database: str,
+    provider_marker: str,
+) -> None:
+    async def run() -> None:
+        assistant_model = "assistant-model"
+        compactor_model = "compactor-model"
+        store = ExitBeforeContextCompactionReceiptStore(database)
+        budget_ledger = SQLiteBudgetLedger(budget_database)
+        main_provider = RestartStableRecordingProvider(
+            [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})]
+        )
+        compactor_provider = MarkerToolCallDeadlineProvider(provider_marker)
+        app = CayuApp(
+            session_store=store,
+            budget_policy=_restart_compaction_budget_policy(
+                assistant_model=assistant_model,
+                compactor_model=compactor_model,
+            ),
+            budget_ledger=budget_ledger,
+            enable_logging=False,
+        )
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model=assistant_model),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=RestartStablePromptCacheCompactor(
+                    provider=compactor_provider,
+                    model=compactor_model,
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+        async for _event in app.resume(
+            ResumeRequest(
+                session_id="app-compaction-receipt-process-loss",
+                messages=[Message.text("user", "second request")],
+            )
+        ):
+            pass
+
+    asyncio.run(run())
+
+
+def _run_until_overflow_compaction_dispatch_exit(
+    database: str,
+    budget_database: str,
+    provider_marker: str,
+) -> None:
+    async def run() -> None:
+        assistant_model = "assistant-model"
+        compactor_model = "compactor-model"
+        overflow = ModelContextOverflowError(
+            "context too large",
+            provider="recording",
+            status_code=400,
+            error_code="context_length_exceeded",
+        )
+        main_provider = RestartStableRecordingProvider(
+            [ModelStreamEvent.error(str(overflow), cause=overflow)]
+        )
+        compactor_provider = ExitDuringOverflowCompactionProvider(provider_marker)
+        app = CayuApp(
+            session_store=SQLiteSessionStore(database),
+            budget_policy=_restart_compaction_budget_policy(
+                assistant_model=assistant_model,
+                compactor_model=compactor_model,
+            ),
+            budget_ledger=SQLiteBudgetLedger(budget_database),
+            enable_logging=False,
+        )
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model=assistant_model),
+            context_overflow_policy=CheckpointCompactionContextPolicy(
+                compactor=RestartStablePromptCacheCompactor(
+                    provider=compactor_provider,
+                    model=compactor_model,
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        async for _event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="overflow-compaction-dispatch-process-loss",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "current request"),
+                ],
+            )
+        ):
+            pass
+
+    asyncio.run(run())
+
+
 class ToolThenBoundedProviderErrorProvider(ModelProvider):
     name = "tool-then-bounded-error"
 
@@ -149,6 +472,12 @@ class InspectReportTool(Tool):
 
 async def collect_events(stream) -> list:
     return [event async for event in stream]
+
+
+def _exception_group_leaves(error: BaseException) -> list[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        return [leaf for child in error.exceptions for leaf in _exception_group_leaves(child)]
+    return [error]
 
 
 def test_prompt_cache_compactor_extends_the_exact_model_request_prefix() -> None:
@@ -567,6 +896,44 @@ def test_prompt_cache_compactor_degrades_when_exact_tool_call_stream_fails(
         "compaction tool-call attempt ended without provider completion usage"
     )
     assert "usage_metrics" not in result.model_completed_payloads[0]
+
+
+def test_prompt_cache_compactor_does_not_degrade_typed_deadline_after_tool_call() -> None:
+    provider = ToolCallDeadlineProvider()
+    cached_request = ModelRequest(
+        model="claude-sonnet-4-6",
+        messages=[Message.text("user", "full cached context")],
+        tools=[
+            {
+                "name": "inspect_report",
+                "description": "Inspect a report.",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ],
+    )
+
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        asyncio.run(
+            PromptCacheCompactor(provider=provider).compact(
+                CompactionRequest(
+                    session=session_fixture(
+                        id="prompt-cache-tool-call-deadline",
+                        agent_name="assistant",
+                        provider_name=provider.name,
+                        model="claude-sonnet-4-6",
+                    ),
+                    agent=AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+                    messages=[Message.text("user", "newly compactable context")],
+                    context_messages=cached_request.messages,
+                    cache_prefix_request=cached_request,
+                )
+            )
+        )
+
+    assert len(provider.requests) == 1
+    evidence = captured.value.deadline_evidence
+    assert evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
+    assert evidence.last_progress_kind is ProviderProgressKind.TOOL_CALL
 
 
 def test_model_compactor_detaches_provider_failure_after_tool_call() -> None:
@@ -1578,6 +1945,1040 @@ def test_cayu_app_uses_cache_prefix_then_bounded_delta_and_accounts_for_both() -
     assert usage.usage.output_tokens == 22
     assert usage.usage.cache.read_tokens == 80
     assert usage.usage.cache.uncached_input_tokens == 183
+
+
+def test_cayu_app_releases_compaction_budget_when_stage_receipt_is_rejected() -> None:
+    assistant_model = "assistant-model"
+    compactor_model = "compactor-model"
+    store = RejectContextCompactionReceiptStore()
+    budget_ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+    main_provider = RestartStableRecordingProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})]
+    )
+    compactor_provider = RestartStableToolCallDeadlineProvider()
+    app = CayuApp(
+        session_store=store,
+        budget_policy=_restart_compaction_budget_policy(
+            assistant_model=assistant_model,
+            compactor_model=compactor_model,
+        ),
+        budget_ledger=budget_ledger,
+        enable_logging=False,
+    )
+    app.register_provider(main_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model=assistant_model),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=RestartStablePromptCacheCompactor(
+                provider=compactor_provider,
+                model=compactor_model,
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+    session_id = "app-compaction-receipt-rejected"
+
+    events = asyncio.run(
+        collect_events(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old request"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current request"),
+                    ],
+                )
+            )
+        )
+    )
+
+    assert store.rejected_receipts == 1
+    assert compactor_provider.requests == []
+    assert main_provider.requests == []
+    assert asyncio.run(store.load_active_model_completion_stage(session_id)) is None
+    records = tuple(budget_ledger._records.values())
+    assert len(records) == 1
+    [record] = records
+    assert record.provider_name == compactor_provider.billing_provider_name
+    assert record.model == compactor_model
+    assert record.dispatch_id == record.model_attempt_id
+    assert record.status == "released"
+    assert EventType.BUDGET_RESERVATION_RELEASED in {event.type for event in events}
+    assert EventType.BUDGET_RECONCILED not in {event.type for event in events}
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert events[-1].payload["error"] == ("context-compaction receipt rejected before commit")
+
+
+def test_cayu_app_retains_receiptless_compaction_stage_when_budget_release_fails() -> None:
+    assistant_model = "assistant-model"
+    compactor_model = "compactor-model"
+    store = RejectContextCompactionReceiptStore()
+    budget_ledger = RejectPreProviderReleaseLedger()
+    main_provider = RestartStableRecordingProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})]
+    )
+    compactor_provider = RestartStableToolCallDeadlineProvider()
+    app = CayuApp(
+        session_store=store,
+        budget_policy=_restart_compaction_budget_policy(
+            assistant_model=assistant_model,
+            compactor_model=compactor_model,
+        ),
+        budget_ledger=budget_ledger,
+        enable_logging=False,
+    )
+    app.register_provider(main_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model=assistant_model),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=RestartStablePromptCacheCompactor(
+                provider=compactor_provider,
+                model=compactor_model,
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+    session_id = "app-compaction-release-rejected"
+
+    with pytest.raises(RuntimeError, match="pre-provider compaction release rejected"):
+        asyncio.run(
+            collect_events(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[
+                            Message.text("user", "old request"),
+                            Message.text("assistant", "old answer"),
+                            Message.text("user", "current request"),
+                        ],
+                    )
+                )
+            )
+        )
+
+    assert store.rejected_receipts == 1
+    assert budget_ledger.release_attempts >= 2
+    assert compactor_provider.requests == []
+    assert main_provider.requests == []
+    active = asyncio.run(store.load_active_model_completion_stage(session_id))
+    assert active is not None
+    assert active.stage.purpose == "context-compaction"
+    assert (
+        asyncio.run(
+            store.load_model_completion_stage_dispatch(
+                session_id,
+                active.stage.stage_id,
+            )
+        )
+        is None
+    )
+    records = tuple(budget_ledger._records.values())
+    assert len(records) == 1
+    [record] = records
+    assert record.dispatch_id == active.stage.intent["model_attempt_id"]
+    assert record.status == "active"
+
+    budget_ledger.reject_releases = False
+    asyncio.run(
+        app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_for_seconds=0,
+            )
+        )
+    )
+    assert asyncio.run(store.load_active_model_completion_stage(session_id)) is None
+    released = asyncio.run(budget_ledger.load_reservation(record.reservation_id))
+    assert released is not None
+    assert released.status == "released"
+
+
+def test_receiptless_compaction_process_loss_releases_exact_budget_without_redispatch(
+    tmp_path,
+) -> None:
+    database = tmp_path / "compaction-receipt-process-loss.sqlite"
+    budget_database = tmp_path / "compaction-receipt-process-loss-budget.sqlite"
+    provider_marker = tmp_path / "provider-entered"
+    assistant_model = "assistant-model"
+    compactor_model = "compactor-model"
+    budget_policy = _restart_compaction_budget_policy(
+        assistant_model=assistant_model,
+        compactor_model=compactor_model,
+    )
+    store = SQLiteSessionStore(database)
+    budget_ledger = SQLiteBudgetLedger(budget_database)
+    main_provider = RestartStableRecordingProvider(
+        [
+            ModelStreamEvent.text_delta("first answer"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        budget_policy=budget_policy,
+        budget_ledger=budget_ledger,
+        enable_logging=False,
+    )
+    app.register_provider(main_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model=assistant_model),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=RestartStablePromptCacheCompactor(
+                provider=RestartStableToolCallDeadlineProvider(),
+                model=compactor_model,
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+    session_id = "app-compaction-receipt-process-loss"
+    asyncio.run(
+        collect_events(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first request")],
+                )
+            )
+        )
+    )
+    asyncio.run(store.close())
+    asyncio.run(budget_ledger.close())
+
+    repository_root = Path(__file__).resolve().parents[2]
+    child_script = (
+        "from tests.core.test_prompt_cache_compactor import "
+        "_resume_until_context_compaction_receipt_exit as run; "
+        f"run({str(database)!r}, {str(budget_database)!r}, {str(provider_marker)!r})"
+    )
+    child_environment = os.environ.copy()
+    existing_python_path = child_environment.get("PYTHONPATH")
+    child_environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(repository_root / "src"), existing_python_path) if path
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", child_script],
+        cwd=repository_root,
+        env=child_environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert child.returncode == _CONTEXT_COMPACTION_RECEIPT_EXIT_CODE, child.stderr
+    assert not provider_marker.exists()
+
+    reopened_store = SQLiteSessionStore(database)
+    reopened_budget_ledger = SQLiteBudgetLedger(budget_database)
+    active = asyncio.run(reopened_store.load_active_model_completion_stage(session_id))
+    assert active is not None
+    assert active.stage.purpose == "context-compaction"
+    assert (
+        asyncio.run(
+            reopened_store.load_model_completion_stage_dispatch(
+                session_id,
+                active.stage.stage_id,
+            )
+        )
+        is None
+    )
+    assert len(active.stage.reservation_ids) == 1
+    reservation_id = active.stage.reservation_ids[0]
+    reservation = asyncio.run(reopened_budget_ledger.load_reservation(reservation_id))
+    assert reservation is not None
+    assert reservation.status == "active"
+    assert reservation.dispatch_id == active.stage.intent["model_attempt_id"]
+
+    restarted_main = RestartStableRecordingProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})]
+    )
+    restarted_compactor = RestartStableToolCallDeadlineProvider()
+    restarted = CayuApp(
+        session_store=reopened_store,
+        budget_policy=budget_policy,
+        budget_ledger=reopened_budget_ledger,
+        enable_logging=False,
+    )
+    restarted.register_provider(restarted_main, default=True)
+    restarted.register_agent(
+        AgentSpec(name="assistant", model=assistant_model),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=RestartStablePromptCacheCompactor(
+                provider=restarted_compactor,
+                model=compactor_model,
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+    asyncio.run(
+        restarted.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_for_seconds=0,
+            )
+        )
+    )
+
+    assert restarted_main.requests == []
+    assert restarted_compactor.requests == []
+    assert not provider_marker.exists()
+    assert asyncio.run(reopened_store.load_active_model_completion_stage(session_id)) is None
+    released = asyncio.run(reopened_budget_ledger.load_reservation(reservation_id))
+    assert released is not None
+    assert released.status == "released"
+    assert released.dispatch_id == active.stage.intent["model_attempt_id"]
+    asyncio.run(reopened_store.close())
+    asyncio.run(reopened_budget_ledger.close())
+
+
+def test_overflow_compaction_settles_borrowed_stage_budget_during_live_success() -> None:
+    assistant_model = "assistant-model"
+    compactor_model = "compactor-model"
+    session_id = "overflow-compaction-live-budget"
+    store = InMemorySessionStore()
+    budget_ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+    main_provider = OverflowThenSuccessProvider()
+    compactor_provider = SuccessfulOverflowCompactionProvider()
+    app = CayuApp(
+        session_store=store,
+        budget_policy=_restart_compaction_budget_policy(
+            assistant_model=assistant_model,
+            compactor_model=compactor_model,
+        ),
+        budget_ledger=budget_ledger,
+        enable_logging=False,
+    )
+    app.register_provider(main_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model=assistant_model),
+        context_overflow_policy=CheckpointCompactionContextPolicy(
+            compactor=RestartStablePromptCacheCompactor(
+                provider=compactor_provider,
+                model=compactor_model,
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old request"),
+                        Message.text("user", "current request"),
+                    ],
+                )
+            )
+        )
+    )
+
+    session = asyncio.run(store.load(session_id))
+    assert session is not None and session.status is SessionStatus.COMPLETED
+    assert len(main_provider.requests) == 2
+    assert len(compactor_provider.requests) == 1
+    companion_records = [
+        record
+        for record in store._session_operation_records[session_id].values()
+        if record.get("record_type") == "cayu.borrowed-automatic-compaction-budget"
+    ]
+    assert len(companion_records) == 1
+    [companion] = companion_records
+    assert companion["status"] == "settled"
+    assert len(companion["reservation_ids"]) == 1
+    compactor_reservation = asyncio.run(
+        budget_ledger.load_reservation(companion["reservation_ids"][0])
+    )
+    assert compactor_reservation is not None
+    assert compactor_reservation.status == "reconciled"
+    assert compactor_reservation.provider_name == compactor_provider.billing_provider_name
+    assert compactor_reservation.model == compactor_model
+    assert EventType.BUDGET_RECONCILED in {event.type for event in events}
+    assert asyncio.run(store.load_active_model_completion_stage(session_id)) is None
+
+
+def test_overflow_compaction_process_loss_recovers_borrowed_stage_budget_without_redispatch(
+    tmp_path,
+) -> None:
+    database = tmp_path / "overflow-compaction-dispatch-process-loss.sqlite"
+    budget_database = tmp_path / "overflow-compaction-dispatch-process-loss-budget.sqlite"
+    provider_marker = tmp_path / "overflow-compactor-entered"
+    repository_root = Path(__file__).resolve().parents[2]
+    child_script = (
+        "from tests.core.test_prompt_cache_compactor import "
+        "_run_until_overflow_compaction_dispatch_exit as run; "
+        f"run({str(database)!r}, {str(budget_database)!r}, {str(provider_marker)!r})"
+    )
+    child_environment = os.environ.copy()
+    existing_python_path = child_environment.get("PYTHONPATH")
+    child_environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(repository_root / "src"), existing_python_path) if path
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", child_script],
+        cwd=repository_root,
+        env=child_environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert child.returncode == _OVERFLOW_COMPACTION_DISPATCH_EXIT_CODE, child.stderr
+    assert provider_marker.read_text(encoding="utf-8") == "provider entered"
+
+    session_id = "overflow-compaction-dispatch-process-loss"
+    assistant_model = "assistant-model"
+    compactor_model = "compactor-model"
+    store = SQLiteSessionStore(database)
+    budget_ledger = SQLiteBudgetLedger(budget_database)
+    active = asyncio.run(store.load_active_model_completion_stage(session_id))
+    assert active is not None
+    assert active.stage.purpose == "assistant-turn"
+    assert (
+        asyncio.run(
+            store.load_model_completion_stage_dispatch(
+                session_id,
+                active.stage.stage_id,
+            )
+        )
+        is not None
+    )
+    durable_events = asyncio.run(store.load_events(session_id))
+    compactor_reservations = [
+        event
+        for event in durable_events
+        if event.type is EventType.BUDGET_RESERVED
+        and event.payload.get("provider_name") == "tool-call-deadline-billing"
+        and event.payload.get("model") == compactor_model
+    ]
+    assert len(compactor_reservations) == 1
+    compactor_reservation_id = compactor_reservations[0].payload["reservation_id"]
+    assert compactor_reservation_id not in active.stage.reservation_ids
+    compactor_reservation = asyncio.run(budget_ledger.load_reservation(compactor_reservation_id))
+    assert compactor_reservation is not None
+    assert compactor_reservation.status == "active"
+    assert (
+        compactor_reservation.dispatch_id == compactor_reservations[0].payload["model_attempt_id"]
+    )
+    companion_key = (
+        "cayu:borrowed-automatic-compaction-budget:v1:"
+        + sha256(active.stage.stage_id.encode("utf-8")).hexdigest()
+    )
+    companion = asyncio.run(store.load_session_operation(session_id, companion_key))
+    assert companion is not None
+    assert companion["status"] == "pending"
+    assert companion["reservation_ids"] == [compactor_reservation_id]
+
+    restarted_main = RestartStableRecordingProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})]
+    )
+    restarted_compactor = RestartStableToolCallDeadlineProvider()
+    restarted = CayuApp(
+        session_store=store,
+        budget_policy=_restart_compaction_budget_policy(
+            assistant_model=assistant_model,
+            compactor_model=compactor_model,
+        ),
+        budget_ledger=budget_ledger,
+        enable_logging=False,
+    )
+    restarted.register_provider(restarted_main, default=True)
+    restarted.register_agent(
+        AgentSpec(name="assistant", model=assistant_model),
+        context_overflow_policy=CheckpointCompactionContextPolicy(
+            compactor=RestartStablePromptCacheCompactor(
+                provider=restarted_compactor,
+                model=compactor_model,
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+    with pytest.raises(ModelCompletionManualRecoveryRequired):
+        asyncio.run(
+            restarted.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_for_seconds=0,
+                )
+            )
+        )
+
+    assert restarted_main.requests == []
+    assert restarted_compactor.requests == []
+    recovered_compactor_reservation = asyncio.run(
+        budget_ledger.load_reservation(compactor_reservation_id)
+    )
+    assert recovered_compactor_reservation is not None
+    assert recovered_compactor_reservation.status == "reconciled"
+    assert recovered_compactor_reservation.actual_amount == (
+        recovered_compactor_reservation.reserved_amount
+    )
+    recovered_companion = asyncio.run(store.load_session_operation(session_id, companion_key))
+    assert recovered_companion is not None
+    assert recovered_companion["status"] == "pending"
+    recovered_session = asyncio.run(store.load(session_id))
+    assert recovered_session is not None
+    settlement = asyncio.run(
+        restarted.recover_model_completion_stage(
+            ModelCompletionManualRecoveryRequest(
+                session_id=session_id,
+                stage_id=active.stage.stage_id,
+                expected_run_epoch=recovered_session.run_epoch,
+                terminal_status=SessionStatus.FAILED,
+            )
+        )
+    )
+    assert settlement.settlement.reason_code == "operator_outcome_unknown"
+    assert asyncio.run(store.load_active_model_completion_stage(session_id)) is None
+    settled_companion = asyncio.run(store.load_session_operation(session_id, companion_key))
+    assert settled_companion is not None
+    assert settled_companion["status"] == "settled"
+    replayed = asyncio.run(
+        restarted.recover_model_completion_stage(
+            ModelCompletionManualRecoveryRequest(
+                session_id=session_id,
+                stage_id=active.stage.stage_id,
+                expected_run_epoch=recovered_session.run_epoch,
+                terminal_status=SessionStatus.FAILED,
+            )
+        )
+    )
+    assert replayed.replayed is True
+    assert replayed.settlement == settlement.settlement
+    assert restarted_main.requests == []
+    assert restarted_compactor.requests == []
+    asyncio.run(store.close())
+    asyncio.run(budget_ledger.close())
+
+
+def test_cayu_app_compaction_deadline_is_durable_and_not_replayed_after_restart(
+    tmp_path,
+) -> None:
+    database = tmp_path / "compaction-deadline.sqlite"
+    budget_database = tmp_path / "compaction-deadline-budget.sqlite"
+    assistant_model = "assistant-model"
+    compactor_model = "compactor-model"
+    budget_policy = BudgetPolicy(
+        limits=(
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("1"),
+                pricing=PriceBook(
+                    prices=(
+                        ModelPrice.fixed(
+                            provider_name="recording",
+                            model=assistant_model,
+                            input_per_million=Decimal("1"),
+                            output_per_million=Decimal("1"),
+                        ),
+                        ModelPrice.fixed(
+                            provider_name="tool-call-deadline-billing",
+                            model=compactor_model,
+                            input_per_million=Decimal("1"),
+                            output_per_million=Decimal("1"),
+                        ),
+                    )
+                ),
+                reservation=BudgetReservation(
+                    max_input_tokens=1_000,
+                    max_output_tokens=1_000,
+                ),
+            ),
+        )
+    )
+    budget_ledger = SQLiteBudgetLedger(budget_database)
+    store = SQLiteSessionStore(database)
+    main_provider = RestartStableRecordingProvider(
+        [
+            ModelStreamEvent.text_delta("first answer"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+        ]
+    )
+    compactor_provider = RestartStableToolCallDeadlineProvider()
+    policy = CheckpointCompactionContextPolicy(
+        compactor=RestartStablePromptCacheCompactor(
+            provider=compactor_provider,
+            model=compactor_model,
+        ),
+        max_user_turns=1,
+        compact_after_messages=2,
+    )
+    app = CayuApp(
+        session_store=store,
+        budget_policy=budget_policy,
+        budget_ledger=budget_ledger,
+        enable_logging=False,
+    )
+    app.register_provider(main_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model=assistant_model),
+        context_policy=policy,
+    )
+    session_id = "app-compaction-deadline"
+
+    asyncio.run(
+        collect_events(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first request")],
+                )
+            )
+        )
+    )
+
+    async def resume_until_deadline() -> tuple[list, ModelStreamDeadlineError]:
+        observed = []
+        with pytest.raises(ModelStreamDeadlineError) as captured:
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "second request")],
+                )
+            ):
+                observed.append(event)
+        return observed, captured.value
+
+    events, failure = asyncio.run(resume_until_deadline())
+    assert len(main_provider.requests) == 1
+    assert len(compactor_provider.requests) == 1
+    assert failure.deadline_evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
+    compaction_started = [
+        event
+        for event in events
+        if event.type is EventType.MODEL_STARTED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    compaction_completed = [
+        event
+        for event in events
+        if event.type is EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    deadline_events = [
+        event
+        for event in events
+        if event.type is EventType.MODEL_ERROR
+        and event.payload.get("stage") == "context_compaction_stream"
+    ]
+    assert len(compaction_started) == len(compaction_completed) == len(deadline_events) == 1
+    [model_started] = compaction_started
+    [deadline_event] = deadline_events
+    assert deadline_event.payload["provider"] == compactor_provider.name
+    assert deadline_event.payload["provider_error_type"] == "ModelStreamDeadlineError"
+    assert deadline_event.payload["provider_deadline_kind"] == "semantic_idle"
+    assert deadline_event.payload["provider_last_progress_kind"] == "tool_call"
+    assert deadline_event.payload["provider_effect_outcome"] == "unknown"
+    assert deadline_event.payload["provider_recovery_disposition"] == ("manual_settlement_required")
+    assert deadline_event.payload["model_step_id"] == model_started.payload["model_step_id"]
+    assert deadline_event.payload["model_attempt_id"] == model_started.payload["model_attempt_id"]
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+
+    active = asyncio.run(store.load_active_model_completion_stage(session_id))
+    session = asyncio.run(store.load(session_id))
+    durable_events = asyncio.run(store.load_events(session_id))
+    durable_started = [
+        event
+        for event in durable_events
+        if event.type is EventType.MODEL_STARTED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    assert len(durable_started) == 1
+    assert active is not None
+    assert active.stage.state == "in_flight"
+    assert active.stage.purpose == "context-compaction"
+    assert active.stage.intent["provider_name"] == compactor_provider.name
+    assert active.stage.intent["pricing_provider_name"] == (
+        compactor_provider.billing_provider_name
+    )
+    assert active.stage.intent["requested_model"] == compactor_model
+    assert len(active.stage.reservation_ids) == 1
+    reservation_id = active.stage.reservation_ids[0]
+    reservation = asyncio.run(budget_ledger.load_reservation(reservation_id))
+    assert reservation is not None
+    assert reservation.dispatch_id == active.stage.intent["model_attempt_id"]
+    assert reservation.model_step_id == active.stage.logical_step_id
+    assert reservation.model_attempt_id == active.stage.intent["model_attempt_id"]
+    assert reservation.provider_name == compactor_provider.billing_provider_name
+    assert reservation.model == compactor_model
+    assert reservation.status == "reconciled"
+    assert active.stage.logical_step_id == durable_started[0].payload["model_step_id"]
+    assert active.stage.intent["model_attempt_id"] == durable_started[0].payload["model_attempt_id"]
+    assert deadline_event.payload["model_completion_stage_id"] == active.stage.stage_id
+    assert session is not None and session.status is SessionStatus.RUNNING
+    assert (
+        asyncio.run(store.load_model_completion_stage_dispatch(session_id, active.stage.stage_id))
+        is not None
+    )
+    durable_deadlines = [
+        event
+        for event in durable_events
+        if event.type is EventType.MODEL_ERROR
+        and event.payload.get("stage") == "context_compaction_stream"
+    ]
+    assert len(durable_deadlines) == 1
+    assert (
+        sum(
+            event.type is EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+            for event in durable_events
+        )
+        == 1
+    )
+    assert durable_deadlines[0].payload["model_step_id"] == active.stage.logical_step_id
+    assert (
+        durable_deadlines[0].payload["model_attempt_id"] == active.stage.intent["model_attempt_id"]
+    )
+    assert durable_deadlines[0].payload["provider_deadline_kind"] == "semantic_idle"
+
+    asyncio.run(store.close())
+    asyncio.run(budget_ledger.close())
+    reopened_store = SQLiteSessionStore(database)
+    reopened_budget_ledger = SQLiteBudgetLedger(budget_database)
+    restarted_main = RestartStableRecordingProvider(
+        [
+            ModelStreamEvent.text_delta("must not dispatch"),
+            ModelStreamEvent.completed({}),
+        ]
+    )
+    restarted_compactor = RestartStableToolCallDeadlineProvider()
+    restarted = CayuApp(
+        session_store=reopened_store,
+        budget_policy=budget_policy,
+        budget_ledger=reopened_budget_ledger,
+        enable_logging=False,
+    )
+    restarted.register_provider(restarted_main, default=True)
+    restarted.register_agent(
+        AgentSpec(name="assistant", model=assistant_model),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=RestartStablePromptCacheCompactor(
+                provider=restarted_compactor,
+                model=compactor_model,
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+    with pytest.raises(ModelCompletionManualRecoveryRequired):
+        asyncio.run(
+            restarted.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_for_seconds=0,
+                )
+            )
+        )
+    assert len(compactor_provider.requests) == 1
+    assert restarted_compactor.requests == []
+    assert restarted_main.requests == []
+    recovered_session = asyncio.run(reopened_store.load(session_id))
+    assert recovered_session is not None
+    manual_recovery_request = ModelCompletionManualRecoveryRequest(
+        session_id=session_id,
+        stage_id=active.stage.stage_id,
+        expected_run_epoch=recovered_session.run_epoch,
+        terminal_status=SessionStatus.FAILED,
+    )
+
+    settlement = asyncio.run(restarted.recover_model_completion_stage(manual_recovery_request))
+    assert settlement.settlement.reason_code == "operator_outcome_unknown"
+    assert asyncio.run(reopened_store.load_active_model_completion_stage(session_id)) is None
+    replayed = asyncio.run(restarted.recover_model_completion_stage(manual_recovery_request))
+    assert replayed.replayed is True and replayed.settlement == settlement.settlement
+    assert len(compactor_provider.requests) == 1
+    assert restarted_compactor.requests == []
+    asyncio.run(reopened_store.close())
+    asyncio.run(reopened_budget_ledger.close())
+
+
+def test_cayu_app_compaction_rejects_provider_exact_reattachment_claim() -> None:
+    class ExactReattachmentClaimProvider(ModelProvider):
+        name = "exact-reattachment-claim"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="test.exact-reattachment-claim-provider",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            raise ModelStreamDeadlineError(
+                provider=self.name,
+                evidence=ProviderStreamDeadlineEvidence(
+                    deadline_kind=ProviderDeadlineKind.SEMANTIC_IDLE,
+                    configured_timeout_s=0.01,
+                    elapsed_s=0.02,
+                    last_progress_kind=None,
+                    last_progress_elapsed_s=None,
+                    last_progress_at=None,
+                ),
+                recovery_disposition="reattach_exact_operation",
+            )
+            yield ModelStreamEvent.completed({})  # pragma: no cover
+
+    async def run() -> None:
+        session_id = "app-compaction-provider-exact-reattachment-claim"
+        store = InMemorySessionStore()
+        main_provider = RestartStableRecordingProvider([ModelStreamEvent.completed({})])
+        compactor_provider = ExactReattachmentClaimProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="assistant-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=RestartStablePromptCacheCompactor(
+                    provider=compactor_provider,
+                    model="compactor-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        observed: list[Event] = []
+        with pytest.raises(ModelStreamDeadlineError) as captured:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                )
+            ):
+                observed.append(event)
+
+        assert captured.value.recovery_disposition == "manual_settlement_required"
+        assert len(compactor_provider.requests) == 1
+        assert main_provider.requests == []
+        assert EventType.MODEL_RETRY not in {event.type for event in observed}
+        deadline_events = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.MODEL_ERROR
+            and event.payload.get("stage") == "context_compaction_stream"
+        ]
+        assert len(deadline_events) == 1
+        assert deadline_events[0].payload["provider_recovery_disposition"] == (
+            "manual_settlement_required"
+        )
+        active = await store.load_active_model_completion_stage(session_id)
+        assert active is not None
+        assert active.stage.state == "in_flight"
+        assert active.stage.purpose == "context-compaction"
+        with pytest.raises(ModelCompletionManualRecoveryRequired):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_for_seconds=0,
+                )
+            )
+        assert len(compactor_provider.requests) == 1
+        assert main_provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_compaction_deadline_survives_context_failure_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        session_id = "app-compaction-deadline-context-persistence-failure"
+        store = InMemorySessionStore()
+        main_provider = RestartStableRecordingProvider(
+            [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})]
+        )
+        compactor_provider = RestartStableToolCallDeadlineProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="assistant-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=RestartStablePromptCacheCompactor(
+                    provider=compactor_provider,
+                    model="compactor-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        persistence_failure = RuntimeError("context failure persistence rejected")
+        original_emit_many = app._event_writer.emit_many
+
+        async def fail_context_failure_batch(
+            emitted_session_id: str,
+            events: list[Event],
+        ) -> list[Event]:
+            if any(event.type is EventType.CONTEXT_COMPACTION_FAILED for event in events):
+                raise persistence_failure
+            return await original_emit_many(emitted_session_id, events)
+
+        monkeypatch.setattr(app._event_writer, "emit_many", fail_context_failure_batch)
+        with pytest.raises(ExceptionGroup) as captured:
+            await collect_events(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[
+                            Message.text("user", "old"),
+                            Message.text("assistant", "old answer"),
+                            Message.text("user", "current"),
+                        ],
+                    )
+                )
+            )
+
+        leaves = _exception_group_leaves(captured.value)
+        deadlines = [leaf for leaf in leaves if isinstance(leaf, ModelStreamDeadlineError)]
+        assert len(deadlines) == 1
+        assert sum(leaf is persistence_failure for leaf in leaves) == 1
+        assert len(leaves) == 2
+        assert len(compactor_provider.requests) == 1
+        assert main_provider.requests == []
+
+        active = await store.load_active_model_completion_stage(session_id)
+        session = await store.load(session_id)
+        durable_events = await store.load_events(session_id)
+        durable_deadlines = [
+            event
+            for event in durable_events
+            if event.type is EventType.MODEL_ERROR
+            and event.payload.get("stage") == "context_compaction_stream"
+        ]
+        assert len(durable_deadlines) == 1
+        assert active is not None
+        assert active.stage.state == "in_flight"
+        assert active.stage.purpose == "context-compaction"
+        assert durable_deadlines[0].payload["model_completion_stage_id"] == active.stage.stage_id
+        assert session is not None and session.status is SessionStatus.RUNNING
+        assert EventType.SESSION_FAILED not in {event.type for event in durable_events}
+
+        with pytest.raises(ModelCompletionManualRecoveryRequired):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_for_seconds=0,
+                )
+            )
+        assert len(compactor_provider.requests) == 1
+        assert main_provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_overflow_compaction_deadline_survives_failed_overflow_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        session_id = "overflow-compaction-deadline-diagnostic-failure"
+        store = InMemorySessionStore()
+        overflow = ModelContextOverflowError(
+            "context too large",
+            provider="recording",
+            status_code=400,
+            error_code="context_length_exceeded",
+        )
+        main_provider = RestartStableRecordingProvider(
+            [ModelStreamEvent.error(str(overflow), cause=overflow)]
+        )
+        compactor_provider = RestartStableToolCallDeadlineProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="assistant-model"),
+            context_overflow_policy=CheckpointCompactionContextPolicy(
+                compactor=RestartStablePromptCacheCompactor(
+                    provider=compactor_provider,
+                    model="compactor-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        publication_failure = RuntimeError("context overflow diagnostic rejected")
+        original_emit = app._event_writer.emit
+
+        async def fail_overflow_diagnostic(event: Event) -> Event:
+            if event.type is EventType.CONTEXT_OVERFLOW_FAILED:
+                raise publication_failure
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", fail_overflow_diagnostic)
+        with pytest.raises(ExceptionGroup) as captured:
+            await collect_events(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[
+                            Message.text("user", "old"),
+                            Message.text("user", "current"),
+                        ],
+                    )
+                )
+            )
+
+        leaves = _exception_group_leaves(captured.value)
+        deadlines = [leaf for leaf in leaves if isinstance(leaf, ModelStreamDeadlineError)]
+        assert len(deadlines) == 1
+        assert sum(leaf is publication_failure for leaf in leaves) == 1
+        assert len(leaves) == 2
+        assert len(main_provider.requests) == 1
+        assert len(compactor_provider.requests) == 1
+
+        active = await store.load_active_model_completion_stage(session_id)
+        session = await store.load(session_id)
+        durable_events = await store.load_events(session_id)
+        durable_deadlines = [
+            event
+            for event in durable_events
+            if event.type is EventType.MODEL_ERROR
+            and event.payload.get("stage") == "context_compaction_stream"
+        ]
+        assert len(durable_deadlines) == 1
+        assert active is not None
+        assert active.stage.state == "in_flight"
+        assert active.stage.purpose == "assistant-turn"
+        assert durable_deadlines[0].payload["model_completion_stage_id"] == active.stage.stage_id
+        assert session is not None and session.status is SessionStatus.RUNNING
+        assert EventType.SESSION_FAILED not in {event.type for event in durable_events}
+        assert EventType.CONTEXT_OVERFLOW_FAILED not in {event.type for event in durable_events}
+
+        with pytest.raises(ModelCompletionManualRecoveryRequired):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_for_seconds=0,
+                )
+            )
+        assert len(main_provider.requests) == 1
+        assert len(compactor_provider.requests) == 1
+
+    asyncio.run(run())
 
 
 def test_cayu_app_resume_model_override_cannot_reuse_previous_model_cache() -> None:

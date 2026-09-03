@@ -22,7 +22,11 @@ from cayu._exception_state import (
     set_exception_state,
 )
 from cayu._validation import require_durable_nonblank
-from cayu.providers.base import ModelProviderError
+from cayu.providers.base import ModelProviderError, ModelStreamDeadlineError
+from cayu.providers.deadlines import (
+    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    ProviderStreamDeadlineExceeded,
+)
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -47,9 +51,13 @@ _PROVIDER_CANCELLATION_FAILURE_CLASSIFICATIONS = {
         "BillingIdentityCleanupError",
     ),
 }
-_MAX_OWNED_PROVIDER_STREAM_CLEANUPS = 64
+_MAX_OWNED_PROVIDER_STREAM_DEADLINE_CLEANUPS = 64
 _PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK = Lock()
 _PROVIDER_STREAM_CLEANUP_REGISTRIES: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    set[_ProviderStreamCleanupOwnership],
+] = WeakKeyDictionary()
+_PROVIDER_STREAM_DEADLINE_CLEANUP_REGISTRIES: WeakKeyDictionary[
     asyncio.AbstractEventLoop,
     set[_ProviderStreamCleanupOwnership],
 ] = WeakKeyDictionary()
@@ -80,10 +88,18 @@ class _ProviderStreamCleanupOutcome:
 class _ProviderStreamCleanupOwnership:
     """Explicit live-model ownership for one possibly opaque stream close."""
 
-    __slots__ = ("_loop", "_released", "_task")
+    __slots__ = ("_loop", "_registries", "_released", "_task")
 
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        registries: WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            set[_ProviderStreamCleanupOwnership],
+        ],
+    ) -> None:
         self._loop = loop
+        self._registries = registries
         self._released = False
         self._task: asyncio.Task[_ProviderStreamCleanupOutcome] | None = None
 
@@ -102,22 +118,49 @@ class _ProviderStreamCleanupOwnership:
             return
         self._released = True
         with _PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK:
-            owners = _PROVIDER_STREAM_CLEANUP_REGISTRIES.get(self._loop)
+            owners = self._registries.get(self._loop)
             if owners is not None:
                 owners.discard(self)
                 if not owners:
-                    _PROVIDER_STREAM_CLEANUP_REGISTRIES.pop(self._loop, None)
+                    self._registries.pop(self._loop, None)
 
 
-def reserve_provider_stream_cleanup() -> _ProviderStreamCleanupOwnership:
+def reserve_provider_stream_cleanup(
+    max_concurrent_streams: int | None = None,
+) -> _ProviderStreamCleanupOwnership:
     """Reserve bounded cleanup ownership for one live model dispatch."""
 
+    if max_concurrent_streams is None:
+        max_concurrent_streams = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS
+    if type(max_concurrent_streams) is not int:
+        raise TypeError("max_concurrent_streams must be an int.")
+    if max_concurrent_streams < 1:
+        raise ValueError("max_concurrent_streams must be >= 1.")
     loop = asyncio.get_running_loop()
     with _PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK:
         owners = _PROVIDER_STREAM_CLEANUP_REGISTRIES.setdefault(loop, set())
-        if len(owners) >= _MAX_OWNED_PROVIDER_STREAM_CLEANUPS:
+        if len(owners) >= max_concurrent_streams:
             raise RuntimeError("Provider stream cleanup capacity is exhausted.")
-        ownership = _ProviderStreamCleanupOwnership(loop)
+        ownership = _ProviderStreamCleanupOwnership(
+            loop,
+            _PROVIDER_STREAM_CLEANUP_REGISTRIES,
+        )
+        owners.add(ownership)
+    return ownership
+
+
+def _reserve_provider_stream_deadline_cleanup() -> _ProviderStreamCleanupOwnership:
+    """Reserve bounded ownership for cleanup that outlives a stream deadline."""
+
+    loop = asyncio.get_running_loop()
+    with _PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK:
+        owners = _PROVIDER_STREAM_DEADLINE_CLEANUP_REGISTRIES.setdefault(loop, set())
+        if len(owners) >= _MAX_OWNED_PROVIDER_STREAM_DEADLINE_CLEANUPS:
+            raise RuntimeError("Provider stream deadline cleanup capacity is exhausted.")
+        ownership = _ProviderStreamCleanupOwnership(
+            loop,
+            _PROVIDER_STREAM_DEADLINE_CLEANUP_REGISTRIES,
+        )
         owners.add(ownership)
     return ownership
 
@@ -360,6 +403,35 @@ def _raise_detached_provider_stream_cleanup_error(
         failure.__context__ = None
 
 
+def _deadline_with_cleanup_failure(
+    failure: BaseException,
+) -> ProviderStreamDeadlineExceeded | ModelStreamDeadlineError | None:
+    if type(failure) is ProviderStreamDeadlineExceeded:
+        return ProviderStreamDeadlineExceeded(
+            failure.evidence,
+            stream_cleanup_failed=True,
+        )
+    if type(failure) is ModelStreamDeadlineError:
+        return ModelStreamDeadlineError(
+            provider=failure.provider,
+            evidence=failure.deadline_evidence,
+            stream_cleanup_failed=True,
+        )
+    return None
+
+
+def _raise_detached_stream_deadline_failure(
+    failure: ProviderStreamDeadlineExceeded | ModelStreamDeadlineError,
+) -> NoReturn:
+    """Raise preserved deadline evidence without either cleanup traceback."""
+
+    try:
+        raise failure from None
+    finally:
+        failure.__cause__ = None
+        failure.__context__ = None
+
+
 def _detached_cleanup_failure(failure: BaseException) -> BaseException:
     """Rebuild a provider cleanup failure without retaining provider-controlled data."""
 
@@ -401,6 +473,54 @@ def _contains_fatal_signal(failure: BaseException) -> bool:
                 return True
             pending.extend(children)
     return False
+
+
+async def close_provider_stream_after_deadline(source: AsyncIterator[object]) -> bool:
+    """Start bounded retained cleanup without delaying an established deadline.
+
+    The returned flag is true when cleanup failed, did not settle immediately,
+    or could not obtain bounded retained ownership. Genuine caller cancellation
+    and process-level control signals remain authoritative.
+    """
+
+    try:
+        close = getattr(source, "aclose", None)
+    except (GeneratorExit, KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        return True
+    if not callable(close):
+        return False
+    try:
+        ownership = _reserve_provider_stream_deadline_cleanup()
+    except RuntimeError:
+        return True
+    close_operation = cast("Callable[[], Awaitable[None]]", close)
+
+    async def capture_close() -> _ProviderStreamCleanupOutcome:
+        try:
+            await close_operation()
+        except BaseException as exc:
+            return _ProviderStreamCleanupOutcome(error=exc)
+        return _ProviderStreamCleanupOutcome()
+
+    try:
+        cleanup_task = asyncio.create_task(capture_close())
+        ownership.track(cleanup_task)
+    except BaseException:
+        ownership.release()
+        raise
+    await asyncio.sleep(0)
+    if not cleanup_task.done():
+        # Let a caller already awakened by cleanup startup deliver real
+        # cancellation before the bounded handoff completes.
+        await asyncio.sleep(0)
+    if not cleanup_task.done():
+        return True
+    cleanup_failure = cleanup_task.result().error
+    if cleanup_failure is not None and _contains_fatal_signal(cleanup_failure):
+        raise cleanup_failure
+    return cleanup_failure is not None
 
 
 @asynccontextmanager
@@ -449,7 +569,15 @@ async def aclosing_provider_stream(
         try:
             task = asyncio.current_task()
             cleanup_cancellation_baseline = task.cancelling() if task is not None else 0
-            close = getattr(source, "aclose", None)
+            deadline_failure = (
+                type(operation_failure) is ProviderStreamDeadlineExceeded
+                or type(operation_failure) is ModelStreamDeadlineError
+            )
+            close = None
+            if deadline_failure and cleanup_ownership is None:
+                cleanup_unsettled = await close_provider_stream_after_deadline(source)
+            else:
+                close = getattr(source, "aclose", None)
             if callable(close):
                 close_operation = cast("Callable[[], Awaitable[None]]", close)
                 if cleanup_ownership is None:
@@ -467,10 +595,14 @@ async def aclosing_provider_stream(
                     cleanup_ownership.track(cleanup_task)
                     cleanup_task_tracked = True
                     current_count = task.cancelling() if task is not None else 0
-                    if current_count > cancellation_baseline:
+                    if deadline_failure or current_count > cancellation_baseline:
                         # Start the retained close before releasing the live-model
                         # caller. The child owns any later physical settlement.
                         await asyncio.sleep(0)
+                        if deadline_failure and not cleanup_task.done():
+                            # Let a caller awakened by cleanup startup deliver
+                            # cancellation before the bounded handoff completes.
+                            await asyncio.sleep(0)
                         cleanup_unsettled = not cleanup_task.done()
                         if cleanup_task.done():
                             cleanup_failure = cleanup_task.result().error
@@ -573,7 +705,13 @@ async def aclosing_provider_stream(
         if cleanup_failure is not None:
             raise operation_failure from cleanup_failure
         raise operation_failure
-    if cleanup_failure is not None and operation_failure is not None:
+    if (cleanup_failure is not None or cleanup_unsettled) and operation_failure is not None:
+        deadline_failure = _deadline_with_cleanup_failure(operation_failure)
+        if deadline_failure is not None:
+            operation_failure = None
+            cleanup_failure = None
+            task = None
+            _raise_detached_stream_deadline_failure(deadline_failure)
         terminal_failure = _provider_stream_cleanup_error(operation_failure)
         operation_failure = None
         cleanup_failure = None

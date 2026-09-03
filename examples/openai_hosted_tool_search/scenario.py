@@ -137,9 +137,20 @@ class FixtureOpenAITransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
-        del url, headers, timeout_s, stream_idle_timeout_s
+        del (
+            url,
+            headers,
+            timeout_s,
+            transport_idle_timeout_s,
+            protocol_idle_timeout_s,
+            semantic_progress_timeout_s,
+            absolute_stream_timeout_s,
+        )
         self.requests.append(dict(payload))
         if not self._batches:
             raise AssertionError("The fixture received an unexpected provider request.")

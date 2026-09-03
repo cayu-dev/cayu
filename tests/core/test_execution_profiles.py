@@ -165,6 +165,7 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
     OpenAIProvider,
+    ProviderStreamDeadlines,
 )
 from cayu.runtime._event_projection import (
     prepare_new_runtime_event,
@@ -220,6 +221,29 @@ def test_openai_background_mode_is_part_of_the_builtin_provider_profile() -> Non
     assert synchronous["background"] is False
     assert background["background"] is True
     assert synchronous != background
+
+
+def test_builtin_provider_deadlines_are_exact_execution_profile_material() -> None:
+    material = execution_profile_admission._cayu_provider_material(
+        OpenAIProvider(
+            api_key="test-key",
+            transport_idle_timeout_s=11,
+            protocol_idle_timeout_s=12,
+            semantic_progress_timeout_s=13,
+            absolute_stream_timeout_s=14,
+            max_concurrent_streams=128,
+        )
+    )
+
+    assert material is not None
+    assert material["version"] == 6
+    assert material["stream_deadlines"] == {
+        "transport_idle_timeout_s": 11.0,
+        "protocol_idle_timeout_s": 12.0,
+        "semantic_progress_timeout_s": 13.0,
+        "absolute_stream_timeout_s": 14.0,
+        "max_concurrent_streams": 128,
+    }
 
 
 def test_openai_additional_tools_allowlist_is_part_of_the_builtin_provider_profile() -> None:
@@ -1604,6 +1628,55 @@ def _test_behavior_identity(
         behavior_version=behavior_version,
         implementation_version=implementation_version,
     )
+
+
+def test_application_versioned_provider_still_binds_exact_stream_deadlines() -> None:
+    identity = _test_behavior_identity("deadline-provider")
+
+    class DeadlineProvider(IdentityConfiguredProvider):
+        def __init__(self, deadlines: ProviderStreamDeadlines) -> None:
+            super().__init__(identity)
+            self._deadlines = deadlines
+
+        @property
+        def stream_deadlines(self) -> ProviderStreamDeadlines:
+            return self._deadlines
+
+    def profile(deadlines: ProviderStreamDeadlines) -> ExecutionProfileIdentity:
+        provider = DeadlineProvider(deadlines)
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="deadline-model"))
+        return session_engine_module._execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name=provider.name,
+            registered_provider=app._providers[provider.name],
+            model="deadline-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity="deadline-profile-test",
+        )
+
+    baseline = profile(ProviderStreamDeadlines())
+    changed = profile(
+        ProviderStreamDeadlines(
+            transport_idle_timeout_s=21,
+            protocol_idle_timeout_s=22,
+            semantic_progress_timeout_s=23,
+            absolute_stream_timeout_s=24,
+        )
+    )
+    changed_capacity = profile(ProviderStreamDeadlines(max_concurrent_streams=101))
+
+    component_class = ExecutionProfileComponentClass.PROVIDER_ADAPTER
+    assert (
+        baseline.component(component_class).strength
+        is ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+    )
+    assert baseline.component(component_class) != changed.component(component_class)
+    assert baseline != changed
+    assert baseline.component(component_class) != changed_capacity.component(component_class)
+    assert baseline != changed_capacity
 
 
 def test_profile_strengths_report_identity_provenance() -> None:

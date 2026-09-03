@@ -22,8 +22,13 @@ from cayu.providers import (
     HostedToolCapabilityError,
     ModelContextOverflowError,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEventType,
     OpenAIWebSearch,
+)
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineEvidence,
 )
 from cayu.providers.openai import OpenAIAPIError
 from cayu.providers.openai_subscription import (
@@ -58,7 +63,10 @@ class RecordingTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ):
         self.calls.append(
             {
@@ -66,7 +74,10 @@ class RecordingTransport:
                 "headers": dict(headers),
                 "payload": dict(payload),
                 "timeout_s": timeout_s,
-                "stream_idle_timeout_s": stream_idle_timeout_s,
+                "transport_idle_timeout_s": transport_idle_timeout_s,
+                "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                "absolute_stream_timeout_s": absolute_stream_timeout_s,
             }
         )
         yield {"type": "response.output_text.delta", "delta": "hello"}
@@ -849,6 +860,7 @@ def test_subscription_context_overflow_projection_omits_provider_authority() -> 
     rendered = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
     assert canary not in rendered
     assert str(exc_info.value) == "OpenAI subscription context window exceeded."
+    assert exc_info.value.provider == "openai_subscription"
     assert exc_info.value.status_code == 400
     assert exc_info.value.request_id is None
     assert exc_info.value.response_body is None
@@ -861,3 +873,59 @@ def test_subscription_context_overflow_projection_omits_provider_authority() -> 
     cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
     assert canary not in repr([(frame.name, frame.locals) for frame in cayu_frames])
     assert all(frame.name != "stream_response_events" for frame in captured.stack)
+
+
+@pytest.mark.anyio
+async def test_subscription_deadline_uses_execution_provider_identity() -> None:
+    evidence = ProviderStreamDeadlineEvidence(
+        deadline_kind=ProviderDeadlineKind.TRANSPORT_IDLE,
+        configured_timeout_s=0.02,
+        elapsed_s=0.02,
+        last_progress_kind=None,
+        last_progress_elapsed_s=None,
+        last_progress_at=None,
+    )
+
+    class DeadlineTransport(RecordingTransport):
+        async def stream_response_events(self, **_kwargs: Any):
+            raise ModelStreamDeadlineError(
+                provider="openai",
+                evidence=evidence,
+            )
+            yield  # pragma: no cover
+
+    provider = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(),
+        transport=DeadlineTransport(),
+    )
+    request = ModelRequest(
+        model="gpt-5.4",
+        messages=[Message.text("user", "Say hello")],
+    )
+
+    direct_events = [event async for event in provider.runtime_stream(request)]
+
+    assert [event.type for event in direct_events] == [ModelStreamEventType.ERROR]
+    assert direct_events[0].payload["provider"] == "openai_subscription"
+    assert direct_events[0].payload["provider_deadline_kind"] == "transport_idle"
+
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+    session_id = "subscription-deadline-execution-provider"
+    with pytest.raises(ModelStreamDeadlineError):
+        [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Say hello")],
+                )
+            )
+        ]
+
+    durable_events = await app.session_store.load_events(session_id)
+    model_error = next(event for event in durable_events if event.type is EventType.MODEL_ERROR)
+    assert model_error.payload["provider"] == "openai_subscription"
+    assert model_error.payload["model_attempt_id"]

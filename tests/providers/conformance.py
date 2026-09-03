@@ -105,7 +105,7 @@ class ProviderHarness:
                 model=self.model,
                 messages=[Message.text("user", "Say hello.")],
             )
-        return [event async for event in self.provider.stream(request)]
+        return [event async for event in self.provider.runtime_stream(request)]
 
     async def aclose(self) -> None:
         if self.close is not None:

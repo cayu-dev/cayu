@@ -20,6 +20,11 @@ from cayu.providers._credential_boundary import (
 )
 from cayu.providers._http import sanitize_provider_cancellation
 from cayu.providers.base import ModelProviderError
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineEvidence,
+    ProviderStreamDeadlineExceeded,
+)
 
 
 class _FailingCloseStream:
@@ -296,6 +301,67 @@ async def test_explicit_live_model_cleanup_owner_releases_caller_during_opaque_c
 
     close_release.set()
     await close_finished.wait()
+
+
+@pytest.mark.anyio
+async def test_explicit_cleanup_owner_preserves_real_cancellation_after_deadline() -> None:
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class BlockingCloseStream(_FailingCloseStream):
+        async def aclose(self) -> None:
+            close_started.set()
+            await close_release.wait()
+            close_finished.set()
+
+    deadline = ProviderStreamDeadlineExceeded(
+        ProviderStreamDeadlineEvidence(
+            deadline_kind=ProviderDeadlineKind.SEMANTIC_IDLE,
+            configured_timeout_s=1.0,
+            elapsed_s=1.0,
+            last_progress_kind=None,
+            last_progress_elapsed_s=None,
+            last_progress_at=None,
+        )
+    )
+
+    async def consume() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        ownership = credential_boundary_module.reserve_provider_stream_cleanup()
+        async with aclosing_provider_stream(
+            BlockingCloseStream(),
+            cancellation_baseline=task.cancelling(),
+            cleanup_ownership=ownership,
+        ):
+            raise deadline
+
+    task = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(close_started.wait(), timeout=0.5)
+        task.cancel("caller cancelled deadline cleanup")
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert task.cancelling() == 1
+        assert task.cancelled()
+        assert provider_cancellation_failures(exc_info.value) == (
+            {
+                "phase": "model_stream",
+                "error": "Model provider stream failed before cancellation.",
+                "error_type": "ModelProviderStreamError",
+            },
+            {
+                "phase": "provider_stream_cleanup",
+                "error": "Provider stream cleanup did not complete normally.",
+                "error_type": "ProviderStreamCleanupError",
+            },
+        )
+    finally:
+        close_release.set()
+        await asyncio.wait_for(close_finished.wait(), timeout=0.5)
 
 
 @pytest.mark.anyio

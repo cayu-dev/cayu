@@ -150,7 +150,11 @@ class BedrockProvider(ModelProvider):
         client: Any | None = None,
         name: str = "bedrock",
         max_tokens: int = 4096,
-        stream_idle_timeout_s: float = 120.0,
+        transport_idle_timeout_s: float = 120.0,
+        protocol_idle_timeout_s: float = 120.0,
+        semantic_progress_timeout_s: float = 120.0,
+        absolute_stream_timeout_s: float = 600.0,
+        stream_close_timeout_s: float = 5.0,
     ) -> None: ...
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...

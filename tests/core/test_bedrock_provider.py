@@ -4,7 +4,7 @@ import asyncio
 import base64
 import threading
 import traceback
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from decimal import Decimal
 from types import SimpleNamespace
@@ -17,6 +17,7 @@ from tests.provider_traceback_assertions import (
 )
 
 import cayu.providers.bedrock as bedrock_module
+import cayu.providers.deadlines as provider_deadlines_module
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
@@ -40,6 +41,14 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
     bedrock_billing_identity,
+)
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderProgressKind,
+    ProviderStreamDeadlineController,
+    ProviderStreamDeadlines,
+    bind_provider_deadline_controller,
+    reset_provider_deadline_controller,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
@@ -1104,6 +1113,46 @@ async def test_bedrock_provider_bounds_blocking_sdk_stream_close() -> None:
 
 
 @pytest.mark.anyio
+async def test_bedrock_real_cancellation_during_deadline_worker_settlement_wins() -> None:
+    class SettlementBlockingBedrockStream(BlockingBedrockStream):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_started = threading.Event()
+
+        def close(self) -> None:
+            self.closed = True
+            self.close_started.set()
+
+    stream = SettlementBlockingBedrockStream()
+    provider = BedrockProvider(
+        client=BlockingBedrockClient(stream),
+        transport_idle_timeout_s=0.01,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
+        stream_close_timeout_s=1,
+    )
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[Message.text("user", "Hello")],
+    )
+
+    async def consume() -> None:
+        async for _event in provider.stream(request):
+            pass
+
+    task = asyncio.create_task(consume())
+    try:
+        assert await asyncio.to_thread(stream.close_started.wait, 1) is True
+        task.cancel("caller cancellation during worker settlement")
+        stream.released.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.25)
+    finally:
+        stream.released.set()
+
+
+@pytest.mark.anyio
 async def test_bedrock_provider_does_not_duplicate_events_after_queue_put_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1144,6 +1193,49 @@ async def test_bedrock_provider_does_not_duplicate_events_after_queue_put_timeou
     assert [event.delta for event in events if event.type == ModelStreamEventType.TEXT_DELTA] == [
         "once"
     ]
+
+
+@pytest.mark.anyio
+async def test_bedrock_provider_excludes_consumer_pause_from_idle_deadlines() -> None:
+    provider = BedrockProvider(
+        client=FakeBedrockClient(
+            [
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"text": "first"},
+                    }
+                },
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"text": "second"},
+                    }
+                },
+                {"messageStop": {"stopReason": "end_turn"}},
+            ]
+        ),
+        transport_idle_timeout_s=0.1,
+        protocol_idle_timeout_s=0.1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=2,
+    )
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[Message.text("user", "Hello")],
+    )
+    events = provider.stream(request)
+
+    first = await anext(events)
+    await asyncio.sleep(0.2)
+    remaining = [event async for event in events]
+
+    assert [event.type for event in [first, *remaining]] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert [first.delta, remaining[0].delta] == ["first", "second"]
 
 
 @pytest.mark.anyio
@@ -1215,7 +1307,10 @@ async def test_bedrock_provider_reports_idle_stream_timeout_and_closes_stream() 
     stream = BlockingBedrockStream()
     provider = BedrockProvider(
         client=BlockingBedrockClient(stream),
-        stream_idle_timeout_s=0.01,
+        transport_idle_timeout_s=0.01,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
         stream_close_timeout_s=1,
     )
     request = ModelRequest(model="anthropic.claude-test", messages=[Message.text("user", "Hello")])
@@ -1224,8 +1319,166 @@ async def test_bedrock_provider_reports_idle_stream_timeout_and_closes_stream() 
 
     assert len(events) == 1
     assert events[0].type == ModelStreamEventType.ERROR
-    assert events[0].payload["error"] == "Bedrock provider protocol failure"
+    assert events[0].payload["provider_deadline_kind"] == "transport_idle"
+    assert events[0].payload["provider_effect_outcome"] == "unknown"
+    assert events[0].payload["retryable"] is False
     assert stream.closed is True
+
+
+@pytest.mark.anyio
+async def test_bedrock_nonsettling_workers_hold_deadline_capacity_until_settlement() -> None:
+    existing_owners = set(provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS)
+    capacity = len(existing_owners) + 1
+
+    class NonsettlingBedrockStream:
+        def __init__(self) -> None:
+            self.worker_started = threading.Event()
+            self.worker_release = threading.Event()
+            self.worker_finished = threading.Event()
+            self.close_started = threading.Event()
+            self.close_release = threading.Event()
+            self.close_finished = threading.Event()
+
+        def __iter__(self) -> NonsettlingBedrockStream:
+            return self
+
+        def __next__(self) -> dict[str, Any]:
+            self.worker_started.set()
+            self.worker_release.wait()
+            self.worker_finished.set()
+            raise StopIteration
+
+        def close(self) -> None:
+            self.close_started.set()
+            self.close_release.wait()
+            self.close_finished.set()
+
+    class NonsettlingBedrockClient:
+        def __init__(self, owned_stream: NonsettlingBedrockStream) -> None:
+            self.stream = owned_stream
+            self.converse_calls = 0
+
+        def converse_stream(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            self.converse_calls += 1
+            return {"stream": self.stream}
+
+    stream = NonsettlingBedrockStream()
+    first_client = NonsettlingBedrockClient(stream)
+    first = BedrockProvider(
+        client=first_client,
+        transport_idle_timeout_s=0.01,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
+        max_concurrent_streams=capacity,
+        stream_close_timeout_s=0.01,
+    )
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[Message.text("user", "Hello")],
+    )
+
+    try:
+        first_events = [event async for event in first.runtime_stream(request)]
+
+        assert [event.type for event in first_events] == [ModelStreamEventType.ERROR]
+        assert first_events[0].payload["provider_deadline_kind"] == "transport_idle"
+        assert stream.worker_started.is_set()
+        assert stream.close_started.is_set()
+        retained_owners = (
+            provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS - existing_owners
+        )
+        assert len(retained_owners) == 1
+        retained_owner = next(iter(retained_owners))
+        rejected_client = FakeBedrockClient([{"messageStop": {"stopReason": "end_turn"}}])
+        rejected = BedrockProvider(
+            client=rejected_client,
+            max_concurrent_streams=capacity,
+        )
+        with pytest.raises(RuntimeError, match="deadline-read capacity is exhausted"):
+            await anext(rejected.runtime_stream(request))
+        assert rejected_client.converse_calls == []
+
+        stream.worker_release.set()
+        assert await asyncio.to_thread(stream.worker_finished.wait, 1) is True
+        await asyncio.sleep(0)
+        assert retained_owner in provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS
+
+        stream.close_release.set()
+        assert await asyncio.to_thread(stream.close_finished.wait, 1) is True
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if retained_owner not in provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS:
+                break
+        assert retained_owner not in provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS
+
+        admitted_client = FakeBedrockClient([{"messageStop": {"stopReason": "end_turn"}}])
+        admitted = BedrockProvider(
+            client=admitted_client,
+            max_concurrent_streams=capacity,
+        )
+        admitted_events = [event async for event in admitted.runtime_stream(request)]
+        assert [event.type for event in admitted_events] == [ModelStreamEventType.COMPLETED]
+        assert len(admitted_client.converse_calls) == 1
+    finally:
+        stream.worker_release.set()
+        stream.close_release.set()
+
+
+@pytest.mark.anyio
+async def test_bedrock_deadline_preserves_bounded_close_failure_diagnostic() -> None:
+    secret = "bedrock-close-secret-must-not-survive"
+
+    class FailingCloseBedrockStream(BlockingBedrockStream):
+        def close(self) -> None:
+            self.closed = True
+            self.released.set()
+            raise RuntimeError(secret)
+
+    stream = FailingCloseBedrockStream()
+    provider = BedrockProvider(
+        client=BlockingBedrockClient(stream),
+        transport_idle_timeout_s=0.01,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
+        stream_close_timeout_s=1,
+    )
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[Message.text("user", "Hello")],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert len(events) == 1
+    payload = events[0].payload
+    assert payload["provider_deadline_kind"] == "transport_idle"
+    assert payload["stream_cleanup_failed"] is True
+    assert payload["provider_effect_outcome"] == "unknown"
+    assert secret not in repr(payload)
+
+
+@pytest.mark.anyio
+async def test_bedrock_provider_rejects_duplicate_content_block_start() -> None:
+    block = {
+        "contentBlockStart": {
+            "contentBlockIndex": 0,
+            "start": {"toolUse": {"toolUseId": "tool-1", "name": "read_file"}},
+        }
+    }
+    provider = BedrockProvider(client=FakeBedrockClient([block, block]))
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[Message.text("user", "Hello")],
+    )
+
+    events = [event async for event in provider.runtime_stream(request)]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error_type"] == "BedrockProtocolError"
+    assert "provider_deadline_kind" not in events[0].payload
 
 
 def test_bedrock_provider_reports_unfinished_tool_blocks() -> None:
@@ -1252,17 +1505,24 @@ def test_bedrock_provider_reports_unfinished_tool_blocks() -> None:
 
 
 @pytest.mark.parametrize(
-    "stream_idle_timeout_s",
+    "field_name",
+    [
+        "transport_idle_timeout_s",
+        "protocol_idle_timeout_s",
+        "semantic_progress_timeout_s",
+        "absolute_stream_timeout_s",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
     [float("nan"), float("inf"), float("-inf"), 10**1000],
 )
-def test_bedrock_provider_rejects_nonfinite_stream_idle_timeout(
-    stream_idle_timeout_s: int | float,
+def test_bedrock_provider_rejects_nonfinite_stream_deadline(
+    field_name: str,
+    value: int | float,
 ) -> None:
-    with pytest.raises(ValueError, match="stream_idle_timeout_s"):
-        BedrockProvider(
-            client=FakeBedrockClient([]),
-            stream_idle_timeout_s=stream_idle_timeout_s,
-        )
+    with pytest.raises(ValueError, match=field_name):
+        BedrockProvider(client=FakeBedrockClient([]), **{field_name: value})
 
 
 @pytest.mark.parametrize(
@@ -1289,6 +1549,72 @@ async def test_bedrock_stream_rejects_semantic_output_after_message_stop() -> No
         [event async for event in bedrock_module.bedrock_converse_stream_events(raw_events())]
 
 
+@pytest.mark.parametrize(
+    ("prefix_events", "expected_progress", "error_match"),
+    [
+        (
+            (
+                {
+                    "contentBlockStart": {
+                        "contentBlockIndex": 0,
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": "tool-1",
+                                "name": "read_file",
+                            }
+                        },
+                    }
+                },
+            ),
+            ProviderProgressKind.TOOL_CALL,
+            "unfinished tool blocks",
+        ),
+        (
+            (
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"reasoningContent": {"text": "still thinking"}},
+                    }
+                },
+            ),
+            ProviderProgressKind.REASONING,
+            "unfinished reasoning blocks",
+        ),
+    ],
+    ids=["tool", "reasoning"],
+)
+@pytest.mark.anyio
+async def test_bedrock_message_stop_rejects_unfinished_assembly_before_tail(
+    prefix_events: tuple[dict[str, Any], ...],
+    expected_progress: ProviderProgressKind,
+    error_match: str,
+) -> None:
+    tail_read = False
+
+    async def raw_events() -> AsyncIterator[dict[str, Any]]:
+        nonlocal tail_read
+        for event in prefix_events:
+            yield event
+        yield {"messageStop": {"stopReason": "end_turn"}}
+        tail_read = True
+        raise AssertionError("optional Bedrock tail must not be read")
+
+    controller = ProviderStreamDeadlineController(ProviderStreamDeadlines())
+    token = bind_provider_deadline_controller(controller)
+    events = bedrock_module.bedrock_converse_stream_events(raw_events())
+    try:
+        with pytest.raises(bedrock_module.BedrockProtocolError, match=error_match):
+            await anext(events)
+        evidence = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
+    finally:
+        await events.aclose()
+        reset_provider_deadline_controller(token)
+
+    assert tail_read is False
+    assert evidence.last_progress_kind is expected_progress
+
+
 @pytest.mark.anyio
 async def test_bedrock_stream_accepts_metadata_after_message_stop() -> None:
     async def raw_events():
@@ -1297,3 +1623,156 @@ async def test_bedrock_stream_accepts_metadata_after_message_stop() -> None:
 
     events = [event async for event in bedrock_module.bedrock_converse_stream_events(raw_events())]
     assert events[-1].payload["usage"] == {"input_tokens": 1, "output_tokens": 2}
+
+
+@pytest.mark.anyio
+async def test_bedrock_stream_rejects_repeated_metadata_without_refreshing_progress() -> None:
+    async def raw_events() -> AsyncIterator[dict[str, Any]]:
+        yield {"messageStop": {"stopReason": "end_turn"}}
+        yield {"metadata": {"usage": {"inputTokens": 1, "outputTokens": 2}}}
+        yield {"metadata": {}}
+
+    controller = ProviderStreamDeadlineController(ProviderStreamDeadlines())
+    token = bind_provider_deadline_controller(controller)
+    events = bedrock_module.bedrock_converse_stream_events(raw_events())
+    try:
+        completed = await anext(events)
+        accepted = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
+        with pytest.raises(bedrock_module.BedrockProtocolError, match="repeated metadata"):
+            await anext(events)
+        rejected = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
+    finally:
+        await events.aclose()
+        reset_provider_deadline_controller(token)
+
+    assert completed.payload["usage"] == {"input_tokens": 1, "output_tokens": 2}
+    assert accepted.last_progress_kind is ProviderProgressKind.USAGE
+    assert rejected.last_progress_kind is ProviderProgressKind.USAGE
+    assert rejected.last_progress_elapsed_s == accepted.last_progress_elapsed_s
+
+
+@pytest.mark.anyio
+async def test_bedrock_runtime_persists_completion_before_stalled_metadata_tail_failure() -> None:
+    class TerminalMetadataBlockingStream(BlockingBedrockStream):
+        def __init__(self) -> None:
+            super().__init__()
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> dict[str, Any]:
+            if self.index == 0:
+                self.index += 1
+                return {"messageStop": {"stopReason": "end_turn"}}
+            if self.index == 1:
+                self.index += 1
+                return {
+                    "metadata": {
+                        "usage": {
+                            "inputTokens": 3,
+                            "outputTokens": 2,
+                            "totalTokens": 5,
+                        }
+                    }
+                }
+            self.released.wait(timeout=5)
+            raise StopIteration
+
+        def close(self) -> None:
+            self.closed = True
+            self.released.set()
+
+    stream = TerminalMetadataBlockingStream()
+    provider = BedrockProvider(
+        client=BlockingBedrockClient(stream),
+        transport_idle_timeout_s=0.02,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
+        stream_close_timeout_s=1,
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="anthropic.claude-test"))
+    session_id = "bedrock-completed-before-stalled-tail"
+    observed = []
+
+    async for event in app.run(
+        RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[Message.text("user", "Hello")],
+        )
+    ):
+        observed.append(event)
+
+    durable_events = await app.session_store.load_events(session_id)
+    completed = [event for event in durable_events if event.type is EventType.MODEL_COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].payload["usage_metrics"]["input_tokens"] == 3
+    assert completed[0].payload["usage_metrics"]["output_tokens"] == 2
+    assert completed[0].payload["step_classification"]["type"] == "failed"
+    assert [event.type for event in observed].count(EventType.MODEL_COMPLETED) == 1
+    assert observed[-1].type is EventType.SESSION_FAILED
+    assert observed[-1].payload["error"] == (
+        "Model provider stream exceeded its transport_idle deadline."
+    )
+    assert observed[-1].payload["error_type"] == "ModelProviderError"
+    assert EventType.MODEL_RETRY not in {event.type for event in observed}
+    assert await app.session_store.load_active_model_completion_stage(session_id) is None
+    assert stream.closed is True
+
+
+@pytest.mark.anyio
+async def test_bedrock_runtime_persists_message_stop_before_stalled_optional_tail() -> None:
+    class TerminalBlockingStream(BlockingBedrockStream):
+        def __init__(self) -> None:
+            super().__init__()
+            self.message_stop_emitted = False
+
+        def __next__(self) -> dict[str, Any]:
+            if not self.message_stop_emitted:
+                self.message_stop_emitted = True
+                return {"messageStop": {"stopReason": "end_turn"}}
+            return super().__next__()
+
+    stream = TerminalBlockingStream()
+    provider = BedrockProvider(
+        client=BlockingBedrockClient(stream),
+        transport_idle_timeout_s=0.02,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
+        stream_close_timeout_s=1,
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="anthropic.claude-test"))
+    session_id = "bedrock-message-stop-before-stalled-optional-tail"
+    observed = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "Hello")],
+            )
+        )
+    ]
+
+    durable_events = await app.session_store.load_events(session_id)
+    completed = [event for event in durable_events if event.type is EventType.MODEL_COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].payload["completion"]["raw_finish_reason"] == "end_turn"
+    assert "usage" not in completed[0].payload
+    assert completed[0].payload["step_classification"]["type"] == "failed"
+    assert [event.type for event in observed].count(EventType.MODEL_COMPLETED) == 1
+    assert observed[-1].type is EventType.SESSION_FAILED
+    assert observed[-1].payload["error"] == (
+        "Model provider stream exceeded its transport_idle deadline."
+    )
+    assert observed[-1].payload["error_type"] == "ModelProviderError"
+    assert EventType.MODEL_RETRY not in {event.type for event in observed}
+    assert await app.session_store.load_active_model_completion_stage(session_id) is None
+    assert stream.closed is True

@@ -1818,7 +1818,10 @@ class StreamingRecordingTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ):
         self.calls.append(
             {
@@ -1826,7 +1829,10 @@ class StreamingRecordingTransport:
                 "headers": dict(headers),
                 "payload": dict(payload),
                 "timeout_s": timeout_s,
-                "stream_idle_timeout_s": stream_idle_timeout_s,
+                "transport_idle_timeout_s": transport_idle_timeout_s,
+                "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                "absolute_stream_timeout_s": absolute_stream_timeout_s,
             }
         )
         if not self.event_batches:
@@ -1933,7 +1939,10 @@ async def test_anthropic_provider_streams_sse_events_incrementally() -> None:
     call = transport.calls[0]
     assert call["url"] == "https://api.anthropic.com/v1/messages"
     assert call["payload"]["stream"] is True
-    assert call["stream_idle_timeout_s"] == 120.0
+    assert call["transport_idle_timeout_s"] == 120.0
+    assert call["protocol_idle_timeout_s"] == 120.0
+    assert call["semantic_progress_timeout_s"] == 120.0
+    assert call["absolute_stream_timeout_s"] == 600.0
     assert call["headers"]["x-api-key"] == "test-key"
 
 
@@ -2344,11 +2353,11 @@ async def test_anthropic_stream_events_rejects_unordered_deltas() -> None:
         [event async for event in anthropic_stream_events(_aiter_events(events))]
 
 
-def test_anthropic_provider_rejects_invalid_stream_idle_timeout() -> None:
-    with pytest.raises(ValueError, match="stream_idle_timeout_s"):
-        AnthropicProvider(api_key="test-key", stream_idle_timeout_s=0)
-    with pytest.raises(TypeError, match="stream_idle_timeout_s"):
-        AnthropicProvider(api_key="test-key", stream_idle_timeout_s="60")  # type: ignore[arg-type]
+def test_anthropic_provider_rejects_invalid_transport_idle_timeout() -> None:
+    with pytest.raises(ValueError, match="transport_idle_timeout_s"):
+        AnthropicProvider(api_key="test-key", transport_idle_timeout_s=0)
+    with pytest.raises(TypeError, match="transport_idle_timeout_s"):
+        AnthropicProvider(api_key="test-key", transport_idle_timeout_s="60")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf"), 10**1000])
@@ -2473,6 +2482,25 @@ async def test_anthropic_stream_rejects_duplicate_start_and_post_stop_output() -
         async for event in anthropic_stream_events(_aiter_events(events)):
             emitted.append(event)
     assert ModelStreamEventType.COMPLETED not in {event.type for event in emitted}
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_rejects_duplicate_content_block_start() -> None:
+    start = {"type": "message_start", "message": {"id": "m-1", "model": "claude"}}
+    block = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "tool_use", "id": "tool-1", "name": "read_file"},
+    }
+    transport = StreamingRecordingTransport([[start, block, block]])
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hello")])
+
+    events = [event async for event in provider.runtime_stream(request)]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error_type"] == "AnthropicProtocolError"
+    assert "provider_deadline_kind" not in events[0].payload
 
 
 @pytest.mark.anyio

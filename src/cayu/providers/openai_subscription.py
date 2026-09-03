@@ -54,15 +54,25 @@ from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
     _preflight_provider_portable_messages,
+    _terminal_preserving_provider_stream,
     privacy_safe_provider_option_projection,
+)
+from cayu.providers.deadlines import (
+    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+    ProviderStreamDeadlines,
+    _resolve_provider_stream_deadlines,
 )
 from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 from cayu.providers.openai import (
-    DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS,
     DEFAULT_OPENAI_TIMEOUT_SECONDS,
     OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN,
     HttpxOpenAITransport,
@@ -634,6 +644,10 @@ class OpenAISubscriptionProvider(ModelProvider):
     usage_dialect = UsageDialect.OPENAI
     supports_native_structured_output = True
 
+    @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        return self._stream_deadlines
+
     def preflight_portable_messages(
         self,
         *,
@@ -694,7 +708,12 @@ class OpenAISubscriptionProvider(ModelProvider):
         name: str = "openai_subscription",
         base_url: str = DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL,
         timeout_s: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
-        stream_idle_timeout_s: float = DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS,
+        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+        stream_idle_timeout_s: float | None = None,
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         hosted_web_search_supported: bool | None = None,
@@ -717,8 +736,13 @@ class OpenAISubscriptionProvider(ModelProvider):
             else hosted_web_search_supported
         )
         self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
-        self.stream_idle_timeout_s = positive_finite_seconds(
-            stream_idle_timeout_s, "stream_idle_timeout_s"
+        self._stream_deadlines = _resolve_provider_stream_deadlines(
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
+            max_concurrent_streams=max_concurrent_streams,
+            stream_idle_timeout_s=stream_idle_timeout_s,
         )
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         self.extra_headers = copy_headers(
@@ -739,6 +763,7 @@ class OpenAISubscriptionProvider(ModelProvider):
         del request
         return None
 
+    @_terminal_preserving_provider_stream
     @detach_provider_stream_traceback
     async def stream(self, request: ModelRequest):
         credentials: OpenAISubscriptionCredentials | None = None
@@ -756,7 +781,10 @@ class OpenAISubscriptionProvider(ModelProvider):
                 headers=self._headers(credentials),
                 payload=payload,
                 timeout_s=self.timeout_s,
-                stream_idle_timeout_s=self.stream_idle_timeout_s,
+                transport_idle_timeout_s=self.stream_deadlines.transport_idle_timeout_s,
+                protocol_idle_timeout_s=self.stream_deadlines.protocol_idle_timeout_s,
+                semantic_progress_timeout_s=self.stream_deadlines.semantic_progress_timeout_s,
+                absolute_stream_timeout_s=self.stream_deadlines.absolute_stream_timeout_s,
             )
             events = openai_stream_events(raw_events, reasoning_state="inline")
             async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
@@ -780,7 +808,7 @@ class OpenAISubscriptionProvider(ModelProvider):
                 post_completion_failure = credential_safe_post_completion_failure(
                     exc,
                     provider_label="OpenAI subscription",
-                    provider_name="openai",
+                    provider_name=self.name,
                     credential_values=credential_sanitization_values(
                         *_subscription_credential_values(credentials),
                         extra_headers=self.extra_headers,
@@ -791,6 +819,7 @@ class OpenAISubscriptionProvider(ModelProvider):
                 overflow_failure = _safe_subscription_context_overflow(
                     exc,
                     credentials,
+                    provider_name=self.name,
                     extra_header_values=tuple(self.extra_headers.values()),
                 )
         except OpenAIAPIError as exc:
@@ -803,7 +832,7 @@ class OpenAISubscriptionProvider(ModelProvider):
                 post_completion_failure = credential_safe_post_completion_failure(
                     exc,
                     provider_label="OpenAI subscription",
-                    provider_name="openai",
+                    provider_name=self.name,
                     credential_values=credential_sanitization_values(
                         *_subscription_credential_values(credentials),
                         extra_headers=self.extra_headers,
@@ -814,6 +843,7 @@ class OpenAISubscriptionProvider(ModelProvider):
                 error_event = _safe_subscription_error_event(
                     exc,
                     credentials,
+                    provider_name=self.name,
                     extra_header_values=tuple(self.extra_headers.values()),
                 )
         except Exception as exc:
@@ -821,7 +851,7 @@ class OpenAISubscriptionProvider(ModelProvider):
                 post_completion_failure = credential_safe_post_completion_failure(
                     exc,
                     provider_label="OpenAI subscription",
-                    provider_name="openai",
+                    provider_name=self.name,
                     credential_values=credential_sanitization_values(
                         *_subscription_credential_values(credentials),
                         extra_headers=self.extra_headers,
@@ -832,6 +862,7 @@ class OpenAISubscriptionProvider(ModelProvider):
                 error_event = _safe_subscription_error_event(
                     exc,
                     credentials,
+                    provider_name=self.name,
                     extra_header_values=tuple(self.extra_headers.values()),
                 )
         credentials = None
@@ -1104,10 +1135,18 @@ def _safe_subscription_error_event(
     exc: Exception,
     credentials: OpenAISubscriptionCredentials | None,
     *,
+    provider_name: str,
     extra_header_values: tuple[str, ...] = (),
 ) -> ModelStreamEvent:
     """Project a provider failure through an allowlisted, credential-safe shape."""
 
+    if type(exc) is ModelStreamDeadlineError:
+        safe = ModelStreamDeadlineError(
+            provider=provider_name,
+            evidence=exc.deadline_evidence,
+            stream_cleanup_failed=exc.stream_cleanup_failed,
+        )
+        return ModelStreamEvent.error(str(safe), cause=safe)
     if isinstance(exc, OpenAISubscriptionAuthError):
         message = "OpenAI subscription authentication failed. Run `cayu auth openai login` again."
     else:
@@ -1122,7 +1161,7 @@ def _safe_subscription_error_event(
             for key, value in exc.error_payload_fields().items()
             if key in {"status_code", "retryable", "retry_after_s"}
         }
-        typed_fields["provider"] = "openai"
+        typed_fields["provider"] = provider_name
         safe_error_type = _safe_subscription_error_identity(
             exc.error_type,
             field_name="error_type",
@@ -1168,14 +1207,14 @@ def _safe_subscription_context_overflow(
     exc: ModelContextOverflowError,
     credentials: OpenAISubscriptionCredentials | None,
     *,
+    provider_name: str,
     extra_header_values: tuple[str, ...] = (),
 ) -> ModelContextOverflowError:
     message = "OpenAI subscription context window exceeded."
     del credentials, extra_header_values
-    provider = "openai"
     return ModelContextOverflowError(
         message,
-        provider=provider,
+        provider=provider_name,
         status_code=exc.status_code,
         error_type=_safe_subscription_error_identity(
             exc.error_type,

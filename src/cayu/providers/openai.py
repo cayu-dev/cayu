@@ -47,6 +47,7 @@ from cayu.providers._api_keys import resolve_api_key
 from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
+    close_provider_stream_after_deadline,
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
 )
@@ -72,6 +73,8 @@ from cayu.providers._http import (
     validate_url,
 )
 from cayu.providers.base import (
+    EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
+    MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION,
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
     OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
@@ -86,6 +89,7 @@ from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
@@ -93,10 +97,28 @@ from cayu.providers.base import (
     ToolDiscoveryProjectionRequest,
     ToolDiscoveryProjectionResult,
     UsageDialect,
+    _guard_normalized_provider_stream,
     _preflight_provider_portable_messages,
+    _terminal_preserving_provider_stream,
     call_tool_core_callable,
     privacy_safe_provider_option_projection,
     targeted_tool_native_cache_anchor_name,
+)
+from cayu.providers.deadlines import (
+    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+    ProviderDeadlineKind,
+    ProviderProgressKind,
+    ProviderStreamDeadlineController,
+    ProviderStreamDeadlineExceeded,
+    ProviderStreamDeadlines,
+    _resolve_provider_stream_deadlines,
+    bind_provider_deadline_controller,
+    observe_provider_semantic_progress,
+    reset_provider_deadline_controller,
 )
 from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 from cayu.providers.operations import (
@@ -119,7 +141,6 @@ if TYPE_CHECKING:
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
-DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN = 6
 _CAYU_SEARCH_TOOLS_NAME = "search_tools"
 _CAYU_CALL_TOOL_NAME = "call_tool"
@@ -316,7 +337,10 @@ class OpenAITransport(Protocol):
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         """POST a streaming Responses API payload and yield decoded SSE data objects."""
 
@@ -340,7 +364,10 @@ class OpenAIBackgroundTransport(OpenAITransport, Protocol):
         headers: Mapping[str, str],
         starting_after: int,
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         """Resume one stored background response after an accepted sequence."""
 
@@ -399,7 +426,10 @@ class HttpxOpenAITransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url")
         events = stream_sse_json_events(
@@ -408,7 +438,10 @@ class HttpxOpenAITransport:
             headers=headers,
             payload=payload,
             timeout_s=timeout_s,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -442,7 +475,10 @@ class HttpxOpenAITransport:
         headers: Mapping[str, str],
         starting_after: int,
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         reconnect_url = f"{url}?{urlencode({'stream': 'true', 'starting_after': starting_after})}"
         events = stream_sse_json_events(
@@ -452,7 +488,10 @@ class HttpxOpenAITransport:
             headers=headers,
             payload={},
             timeout_s=timeout_s,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -530,16 +569,24 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
         payload["background"] = True
         payload["store"] = True
         raw_events: AsyncIterator[Mapping[str, Any]] | None = None
+        controller = ProviderStreamDeadlineController(self._provider.stream_deadlines)
+        controller_handed_off = False
         try:
             raw_events = self._transport.stream_response_events(
                 url=f"{self._provider.base_url}/v1/responses",
                 headers=self._provider._headers(),
                 payload=payload,
                 timeout_s=self._provider.timeout_s,
-                stream_idle_timeout_s=self._provider.stream_idle_timeout_s,
+                transport_idle_timeout_s=self._provider.stream_deadlines.transport_idle_timeout_s,
+                protocol_idle_timeout_s=self._provider.stream_deadlines.protocol_idle_timeout_s,
+                semantic_progress_timeout_s=(
+                    self._provider.stream_deadlines.semantic_progress_timeout_s
+                ),
+                absolute_stream_timeout_s=self._provider.stream_deadlines.absolute_stream_timeout_s,
             )
             created = await self._next_raw_event(
                 raw_events,
+                controller=controller,
                 empty_message="OpenAI background start ended before response.created.",
             )
             state, status = _openai_background_created_state(
@@ -553,24 +600,46 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                     _openai_discovery_ownership_tokens(request.request.tool_discovery_projection)
                 ),
             )
+            controller.observe_semantic(ProviderProgressKind.RESPONSE_IDENTITY)
+            semantic_pause_started = controller.idle_pause_started()
+            connection = ProviderOperationConnection(
+                state=state,
+                status=status,
+                events=self._events(
+                    raw_events,
+                    state=state,
+                    controller=controller,
+                    semantic_pause_started=semantic_pause_started,
+                ),
+            )
+            controller_handed_off = True
+            return connection
         except asyncio.CancelledError as exc:
             if raw_events is not None:
-                await _close_openai_operation_stream(raw_events)
+                await self._close_raw_events(raw_events)
             raise self._safe_cancellation(exc) from None
         except Exception as exc:
-            if raw_events is not None:
-                await _close_openai_operation_stream(raw_events)
-            raise self._safe_failure(exc) from None
+            cleanup_failed = (
+                False
+                if raw_events is None
+                else await self._close_raw_events(
+                    raw_events,
+                    deadline_failure=type(exc) is ModelStreamDeadlineError,
+                )
+            )
+            raise self._safe_failure(
+                _openai_operation_failure_after_close(
+                    exc,
+                    cleanup_failed=cleanup_failed,
+                )
+            ) from None
         except BaseException:
             if raw_events is not None:
                 await _close_openai_operation_stream(raw_events)
             raise
-        assert raw_events is not None
-        return ProviderOperationConnection(
-            state=state,
-            status=status,
-            events=self._events(raw_events, state=state),
-        )
+        finally:
+            if not controller_handed_off:
+                controller.close()
 
     async def retrieve(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
         state = _require_openai_background_state(state)
@@ -603,15 +672,43 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
         sequence_number = _openai_recovery_sequence_number(state.recovery_metadata)
         url = _openai_operation_url(self._provider.base_url, state.operation_id)
         raw_events: AsyncIterator[Mapping[str, Any]] | None = None
+        controller = ProviderStreamDeadlineController(self._provider.stream_deadlines)
+        controller_handed_off = False
+        controller.observe_semantic(ProviderProgressKind.RESPONSE_IDENTITY)
         try:
             raw_events = self._transport.reconnect_response_events(
                 url=url,
                 headers=self._provider._headers(),
                 starting_after=sequence_number,
                 timeout_s=self._provider.timeout_s,
-                stream_idle_timeout_s=self._provider.stream_idle_timeout_s,
+                transport_idle_timeout_s=self._provider.stream_deadlines.transport_idle_timeout_s,
+                protocol_idle_timeout_s=self._provider.stream_deadlines.protocol_idle_timeout_s,
+                semantic_progress_timeout_s=(
+                    self._provider.stream_deadlines.semantic_progress_timeout_s
+                ),
+                absolute_stream_timeout_s=self._provider.stream_deadlines.absolute_stream_timeout_s,
             )
-            first = await self._next_raw_event(raw_events, empty_message=None)
+            first = await self._next_raw_event(
+                raw_events,
+                controller=controller,
+                empty_message=None,
+                exact_operation=True,
+            )
+            status = _openai_stream_operation_status(first)
+            semantic_pause_started = controller.idle_pause_started()
+            connection = ProviderOperationConnection(
+                state=state,
+                status=status,
+                events=self._events(
+                    raw_events,
+                    state=state,
+                    first=first,
+                    controller=controller,
+                    semantic_pause_started=semantic_pause_started,
+                ),
+            )
+            controller_handed_off = True
+            return connection
         except StopAsyncIteration:
             return ProviderOperationConnection(
                 state=state,
@@ -620,7 +717,7 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
             )
         except OpenAIAPIError as exc:
             if raw_events is not None:
-                await _close_openai_operation_stream(raw_events)
+                await self._close_raw_events(raw_events)
             return ProviderOperationConnection(
                 state=state,
                 status=(
@@ -632,19 +729,38 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
             )
         except asyncio.CancelledError as exc:
             if raw_events is not None:
-                await _close_openai_operation_stream(raw_events)
+                await self._close_raw_events(raw_events)
             raise self._safe_cancellation(exc) from None
         except Exception as exc:
-            if raw_events is not None:
-                await _close_openai_operation_stream(raw_events)
-            raise self._safe_failure(exc) from None
-        assert raw_events is not None
-        status = _openai_stream_operation_status(first)
-        return ProviderOperationConnection(
-            state=state,
-            status=status,
-            events=self._events(raw_events, state=state, first=first),
-        )
+            cleanup_failed = (
+                False
+                if raw_events is None
+                else await self._close_raw_events(
+                    raw_events,
+                    deadline_failure=type(exc) is ModelStreamDeadlineError,
+                )
+            )
+            safe_failure = self._safe_failure(
+                _openai_operation_failure_after_close(
+                    exc,
+                    cleanup_failed=cleanup_failed,
+                )
+            )
+            if type(safe_failure) is ModelStreamDeadlineError:
+                # Reconnect is entered with a validated exact response identity.
+                # Restore runtime exact-operation authority after the generic
+                # credential boundary has deliberately stripped any provider-
+                # supplied recovery claim.
+                safe_failure = ModelStreamDeadlineError(
+                    provider=safe_failure.provider,
+                    evidence=safe_failure.deadline_evidence,
+                    stream_cleanup_failed=safe_failure.stream_cleanup_failed,
+                    recovery_disposition=EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
+                )
+            raise safe_failure from None
+        finally:
+            if not controller_handed_off:
+                controller.close()
 
     async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
         state = _require_openai_background_state(state)
@@ -676,18 +792,37 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
         self,
         raw_events: AsyncIterator[Mapping[str, Any]],
         *,
+        controller: ProviderStreamDeadlineController,
         empty_message: str | None,
+        exact_operation: bool = False,
     ) -> Mapping[str, Any]:
+        token = bind_provider_deadline_controller(controller)
         try:
-            return await anext(raw_events)
+            return await controller.wait_for(
+                anext(raw_events),
+                kinds=(ProviderDeadlineKind.SEMANTIC_IDLE, ProviderDeadlineKind.ABSOLUTE),
+            )
         except StopAsyncIteration:
             if empty_message is None:
                 raise
             raise OpenAIProtocolError(empty_message) from None
         except asyncio.CancelledError as exc:
             raise self._safe_cancellation(exc) from None
+        except ProviderStreamDeadlineExceeded as exc:
+            raise ModelStreamDeadlineError(
+                provider=self._provider.name,
+                evidence=exc.evidence,
+                stream_cleanup_failed=exc.stream_cleanup_failed,
+                recovery_disposition=(
+                    EXACT_MODEL_STREAM_RECOVERY_DISPOSITION
+                    if exact_operation
+                    else MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION
+                ),
+            ) from None
         except Exception as exc:
             raise self._safe_failure(exc) from None
+        finally:
+            reset_provider_deadline_controller(token)
 
     async def _events(
         self,
@@ -695,7 +830,13 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
         *,
         state: ProviderOperationState,
         first: Mapping[str, Any] | None = None,
+        controller: ProviderStreamDeadlineController,
+        semantic_pause_started: float,
     ) -> AsyncIterator[ModelStreamEvent]:
+        controller.exclude_idle_pause(
+            semantic_pause_started,
+            kinds=(ProviderDeadlineKind.SEMANTIC_IDLE,),
+        )
         try:
             events = _openai_background_stream_events(
                 raw_events,
@@ -703,13 +844,46 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                 first=first,
                 reasoning_state=self._provider.reasoning_state,
             )
-            async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
-                async for event in events:
+            guarded = _guard_normalized_provider_stream(
+                events,
+                provider=self._provider.name,
+                deadlines=self._provider.stream_deadlines,
+                controller=controller,
+            )
+            async with (
+                aclosing_provider_stream(raw_events),
+                aclosing_provider_stream(events),
+                aclosing_provider_stream(guarded),
+            ):
+                async for event in guarded:
                     yield event
+        except ModelStreamDeadlineError as exc:
+            raise ModelStreamDeadlineError(
+                provider=exc.provider,
+                evidence=exc.deadline_evidence,
+                stream_cleanup_failed=exc.stream_cleanup_failed,
+                recovery_disposition=EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
+            ) from None
         except asyncio.CancelledError as exc:
             raise self._safe_cancellation(exc) from None
         except Exception as exc:
             raise self._safe_failure(exc) from None
+        finally:
+            controller.close()
+
+    async def _close_raw_events(
+        self,
+        raw_events: AsyncIterator[Mapping[str, Any]],
+        *,
+        deadline_failure: bool = False,
+    ) -> bool:
+        try:
+            return await _close_openai_operation_stream(
+                raw_events,
+                deadline_failure=deadline_failure,
+            )
+        except asyncio.CancelledError as exc:
+            raise self._safe_cancellation(exc) from None
 
     def _safe_cancellation(self, exc: asyncio.CancelledError) -> asyncio.CancelledError:
         return sanitize_provider_cancellation(
@@ -731,6 +905,8 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                 extra_headers=self._provider.extra_headers,
             ),
         )
+        if type(safe) is ModelStreamDeadlineError:
+            return safe
         if isinstance(exc, (OpenAIProtocolError, ProviderOperationMalformedError)):
             return ProviderOperationMalformedError(str(safe))
         return OpenAIAPIError(
@@ -751,6 +927,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
     name = "openai"
     usage_dialect = UsageDialect.OPENAI
     supports_native_structured_output = True
+
+    @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        return self._stream_deadlines
 
     @property
     def provider_operation_mode(self) -> ProviderOperationMode:
@@ -920,7 +1100,12 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         name: str = "openai",
         base_url: str = DEFAULT_OPENAI_BASE_URL,
         timeout_s: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
-        stream_idle_timeout_s: float = DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS,
+        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+        stream_idle_timeout_s: float | None = None,
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         reasoning_state: str = "inline",
@@ -971,8 +1156,13 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             )
         self.background = background
         self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
-        self.stream_idle_timeout_s = positive_finite_seconds(
-            stream_idle_timeout_s, "stream_idle_timeout_s"
+        self._stream_deadlines = _resolve_provider_stream_deadlines(
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
+            max_concurrent_streams=max_concurrent_streams,
+            stream_idle_timeout_s=stream_idle_timeout_s,
         )
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         if self.background:
@@ -997,6 +1187,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             _OpenAIBackgroundOperationAdapter(self) if self.background else None
         )
 
+    @_terminal_preserving_provider_stream
     @detach_provider_stream_traceback
     async def stream(
         self,
@@ -1271,7 +1462,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             headers=self._headers(),
             payload=payload,
             timeout_s=self.timeout_s,
-            stream_idle_timeout_s=self.stream_idle_timeout_s,
+            transport_idle_timeout_s=self.stream_deadlines.transport_idle_timeout_s,
+            protocol_idle_timeout_s=self.stream_deadlines.protocol_idle_timeout_s,
+            semantic_progress_timeout_s=self.stream_deadlines.semantic_progress_timeout_s,
+            absolute_stream_timeout_s=self.stream_deadlines.absolute_stream_timeout_s,
         )
         events = openai_stream_events(raw_events, reasoning_state=self.reasoning_state)
         async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
@@ -1899,6 +2093,7 @@ def _openai_background_parser_state(
     metadata: ProviderOperationRecoveryMetadata,
 ) -> tuple[
     dict[int, _PendingFunctionCall],
+    dict[int, tuple[str, str] | None],
     set[int],
     dict[int, dict[str, Any]],
     dict[int, dict[str, Any]],
@@ -1906,18 +2101,23 @@ def _openai_background_parser_state(
 ]:
     parser = metadata.opaque.get("parser")
     if parser is None:
-        return {}, set(), {}, {}, {}
+        return {}, {}, set(), {}, {}, {}
     if type(parser) is not dict:
         raise OpenAIProtocolError("OpenAI recovery parser state must be an object.")
     parser = cast("dict[str, Any]", parser)
     raw_calls = parser.get("pending_function_calls", [])
-    raw_reasoning = parser.get("pending_reasoning_output_indexes", [])
+    has_reasoning_indexes = "pending_reasoning_output_indexes" in parser
+    raw_reasoning_indexes = parser.get("pending_reasoning_output_indexes", [])
+    raw_reasoning_items = parser.get("pending_reasoning_items", [])
+    raw_completed_reasoning = parser.get("completed_reasoning_output_indexes", [])
     raw_tool_search = parser.get("pending_tool_search_calls", [])
     raw_completed_tool_search = parser.get("completed_tool_search_items", [])
     raw_completed_function_calls = parser.get("completed_function_call_digests", [])
     if (
         type(raw_calls) is not list
-        or type(raw_reasoning) is not list
+        or type(raw_reasoning_indexes) is not list
+        or type(raw_reasoning_items) is not list
+        or type(raw_completed_reasoning) is not list
         or type(raw_tool_search) is not list
         or type(raw_completed_tool_search) is not list
         or type(raw_completed_function_calls) is not list
@@ -1940,11 +2140,36 @@ def _openai_background_parser_state(
             name=_mapping_optional_string(raw, "name"),
             arguments="",
         )
-    reasoning: set[int] = set()
-    for raw_index in raw_reasoning:
-        if type(raw_index) is not int or raw_index < 0:
+    reasoning: dict[int, tuple[str, str] | None] = {}
+    for raw_index in raw_reasoning_indexes:
+        if type(raw_index) is not int or raw_index < 0 or raw_index in reasoning:
             raise OpenAIProtocolError("OpenAI pending reasoning index is malformed.")
-        reasoning.add(raw_index)
+        reasoning[raw_index] = None
+    for raw in raw_reasoning_items:
+        if type(raw) is not dict:
+            raise OpenAIProtocolError("OpenAI pending reasoning state is malformed.")
+        raw = cast("dict[str, Any]", raw)
+        output_index = raw.get("output_index")
+        item_id = _mapping_optional_string(raw, "item_id")
+        if (
+            type(output_index) is not int
+            or output_index < 0
+            or item_id is None
+            or (has_reasoning_indexes and output_index not in reasoning)
+            or reasoning.get(output_index) is not None
+        ):
+            raise OpenAIProtocolError("OpenAI pending reasoning state is malformed.")
+        reasoning[output_index] = ("reasoning", item_id)
+    completed_reasoning: set[int] = set()
+    for raw_index in raw_completed_reasoning:
+        if (
+            type(raw_index) is not int
+            or raw_index < 0
+            or raw_index in reasoning
+            or raw_index in completed_reasoning
+        ):
+            raise OpenAIProtocolError("OpenAI completed reasoning index is malformed.")
+        completed_reasoning.add(raw_index)
     tool_search: dict[int, dict[str, Any]] = {}
     for raw in raw_tool_search:
         if type(raw) is not dict:
@@ -2033,7 +2258,14 @@ def _openai_background_parser_state(
         ):
             raise OpenAIProtocolError("OpenAI completed function-call state is malformed.")
         completed_function_calls[output_index] = item_sha256
-    return calls, reasoning, tool_search, completed_tool_search, completed_function_calls
+    return (
+        calls,
+        reasoning,
+        completed_reasoning,
+        tool_search,
+        completed_tool_search,
+        completed_function_calls,
+    )
 
 
 def _openai_background_recovery_metadata(
@@ -2041,7 +2273,8 @@ def _openai_background_recovery_metadata(
     cursor: int,
     sequence_number: int,
     pending_function_calls: Mapping[int, _PendingFunctionCall],
-    pending_reasoning_items: set[int],
+    pending_reasoning_items: Mapping[int, tuple[str, str] | None],
+    completed_reasoning_items: set[int],
     pending_tool_search_calls: Mapping[int, Mapping[str, Any]],
     completed_tool_search_items: Mapping[int, Mapping[str, Any]],
     completed_function_call_digests: Mapping[int, str],
@@ -2060,6 +2293,7 @@ def _openai_background_recovery_metadata(
     if (
         pending_function_calls
         or pending_reasoning_items
+        or completed_reasoning_items
         or pending_tool_search_calls
         or completed_tool_search_items
         or completed_function_call_digests
@@ -2077,6 +2311,15 @@ def _openai_background_recovery_metadata(
         opaque["parser"] = {
             "pending_function_calls": calls,
             "pending_reasoning_output_indexes": sorted(pending_reasoning_items),
+            "pending_reasoning_items": [
+                {
+                    "output_index": output_index,
+                    "item_id": pending[1],
+                }
+                for output_index, pending in sorted(pending_reasoning_items.items())
+                if pending is not None
+            ],
+            "completed_reasoning_output_indexes": sorted(completed_reasoning_items),
             "pending_tool_search_calls": [
                 {
                     "output_index": output_index,
@@ -2110,7 +2353,8 @@ def _openai_background_event_with_recovery(
     cursor: int,
     sequence_number: int,
     pending_function_calls: Mapping[int, _PendingFunctionCall],
-    pending_reasoning_items: set[int],
+    pending_reasoning_items: Mapping[int, tuple[str, str] | None],
+    completed_reasoning_items: set[int],
     pending_tool_search_calls: Mapping[int, Mapping[str, Any]],
     completed_tool_search_items: Mapping[int, Mapping[str, Any]],
     completed_function_call_digests: Mapping[int, str],
@@ -2124,6 +2368,7 @@ def _openai_background_event_with_recovery(
                 sequence_number=sequence_number,
                 pending_function_calls=pending_function_calls,
                 pending_reasoning_items=pending_reasoning_items,
+                completed_reasoning_items=completed_reasoning_items,
                 pending_tool_search_calls=pending_tool_search_calls,
                 completed_tool_search_items=completed_tool_search_items,
                 completed_function_call_digests=completed_function_call_digests,
@@ -2152,6 +2397,7 @@ async def _openai_background_stream_events(
     (
         pending_function_calls,
         pending_reasoning_items,
+        completed_reasoning_items,
         pending_tool_search_calls,
         completed_tool_search_items,
         completed_function_call_digests,
@@ -2190,8 +2436,28 @@ async def _openai_background_stream_events(
             normalized = ModelStreamEvent.thinking(delta)
         elif event_type == "response.output_item.added":
             item = event.get("item")
+            reasoning_added = False
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
-                pending_reasoning_items.add(_stream_output_index(event))
+                output_index = _stream_output_index(event)
+                if (
+                    output_index in pending_reasoning_items
+                    or output_index in completed_reasoning_items
+                ):
+                    raise OpenAIProtocolError(
+                        "OpenAI background reasoning output_item.added was repeated."
+                    )
+                item_id = _mapping_optional_string(item, "id")
+                if item_id is None:
+                    raise OpenAIProtocolError(
+                        "OpenAI reasoning output_item.added requires nonblank id."
+                    )
+                if item.get("status") not in {None, "in_progress", "incomplete"}:
+                    raise OpenAIProtocolError(
+                        "OpenAI reasoning output_item.added has invalid lifecycle status."
+                    )
+                _validate_stream_reasoning_shape(item, output_index)
+                pending_reasoning_items[output_index] = ("reasoning", item_id)
+                reasoning_added = True
             if isinstance(item, Mapping) and item.get("type") == "function_call":
                 output_index = _stream_output_index(event)
                 if (
@@ -2241,14 +2507,43 @@ async def _openai_background_stream_events(
                     "id": item_id,
                     "call_id": call_id,
                 }
-            _record_stream_output_item_added(event, pending_function_calls)
+            function_call_added = _record_stream_output_item_added(
+                event,
+                pending_function_calls,
+            )
+            if reasoning_added:
+                observe_provider_semantic_progress(ProviderProgressKind.REASONING)
+            if function_call_added:
+                observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
+            elif isinstance(item, Mapping) and item.get("type") == "tool_search_call":
+                observe_provider_semantic_progress(
+                    ProviderProgressKind.TOOL_CALL
+                    if item.get("execution") == "client"
+                    else ProviderProgressKind.HOSTED_TOOL
+                )
             normalized = ModelStreamEvent.thinking()
         elif event_type == "response.output_item.done":
             item = event.get("item")
-            if isinstance(item, Mapping) and item.get("type") == "reasoning":
-                pending_reasoning_items.discard(_stream_output_index(event))
             if not isinstance(item, Mapping):
                 raise OpenAIProtocolError("OpenAI output_item.done requires item object.")
+            reasoning_completed = False
+            if item.get("type") == "reasoning":
+                output_index = _stream_output_index(event)
+                if output_index in completed_reasoning_items:
+                    raise OpenAIProtocolError(
+                        "OpenAI background reasoning output_item.done was repeated."
+                    )
+                _validate_completed_stream_reasoning(item, output_index)
+                pending = pending_reasoning_items.get(output_index)
+                item_id = _mapping_optional_string(item, "id")
+                if pending is not None and item_id != pending[1]:
+                    raise OpenAIProtocolError(
+                        "OpenAI background reasoning output_item.done identity conflicts "
+                        "with added item."
+                    )
+                pending_reasoning_items.pop(output_index, None)
+                completed_reasoning_items.add(output_index)
+                reasoning_completed = True
             if item.get("type") == "tool_search_call":
                 output_index = _stream_output_index(event)
                 pending = pending_tool_search_calls.pop(output_index, None)
@@ -2288,11 +2583,16 @@ async def _openai_background_stream_events(
                     item_index=output_index,
                 )
                 completed_tool_search_items[output_index] = tool_search_output
+                observe_provider_semantic_progress(ProviderProgressKind.HOSTED_TOOL)
                 normalized = ModelStreamEvent.thinking()
             else:
                 normalized = ModelStreamEvent.thinking()
+            if reasoning_completed:
+                observe_provider_semantic_progress(ProviderProgressKind.REASONING)
         elif event_type == "response.function_call_arguments.delta":
             _record_stream_function_call_delta(event, pending_function_calls)
+            if event.get("delta"):
+                observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
             normalized = ModelStreamEvent.thinking()
         elif event_type == "response.function_call_arguments.done":
             normalized, output_item = _stream_function_call_event(
@@ -2334,6 +2634,7 @@ async def _openai_background_stream_events(
                     sequence_number=sequence_number,
                     pending_function_calls=pending_function_calls,
                     pending_reasoning_items=pending_reasoning_items,
+                    completed_reasoning_items=completed_reasoning_items,
                     pending_tool_search_calls=pending_tool_search_calls,
                     completed_tool_search_items=completed_tool_search_items,
                     completed_function_call_digests=completed_function_call_digests,
@@ -2376,6 +2677,7 @@ async def _openai_background_stream_events(
             sequence_number=sequence_number,
             pending_function_calls=pending_function_calls,
             pending_reasoning_items=pending_reasoning_items,
+            completed_reasoning_items=completed_reasoning_items,
             pending_tool_search_calls=pending_tool_search_calls,
             completed_tool_search_items=completed_tool_search_items,
             completed_function_call_digests=completed_function_call_digests,
@@ -2399,13 +2701,43 @@ async def _empty_model_stream() -> AsyncIterator[ModelStreamEvent]:
 
 async def _close_openai_operation_stream(
     raw_events: AsyncIterator[Mapping[str, Any]],
-) -> None:
+    *,
+    deadline_failure: bool = False,
+) -> bool:
+    """Close one pre-publication operation stream and report bounded failure."""
+
+    if deadline_failure:
+        return await close_provider_stream_after_deadline(raw_events)
     close = getattr(raw_events, "aclose", None)
-    if close is not None:
-        try:
-            await close()
-        except BaseException:
-            return
+    if close is None:
+        return False
+    task = asyncio.current_task()
+    cancellation_baseline = 0 if task is None else task.cancelling()
+    try:
+        await close()
+    except asyncio.CancelledError:
+        if task is not None and task.cancelling() > cancellation_baseline:
+            raise
+        return True
+    except (GeneratorExit, KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        return True
+    return False
+
+
+def _openai_operation_failure_after_close(
+    failure: Exception,
+    *,
+    cleanup_failed: bool,
+) -> Exception:
+    if type(failure) is not ModelStreamDeadlineError or not cleanup_failed:
+        return failure
+    return ModelStreamDeadlineError(
+        provider=failure.provider,
+        evidence=failure.deadline_evidence,
+        stream_cleanup_failed=True,
+    )
 
 
 def _openai_input_tokens_from_count_response(response: Mapping[str, Any]) -> int:
@@ -2500,6 +2832,7 @@ async def _openai_stream_events(
     assembled_text_length = 0
     fallback_output_items: dict[int, dict[str, Any]] = {}
     pending_replay_items: dict[int, tuple[str, str]] = {}
+    response_id: str | None = None
     completed = False
     async for event in _stream_events_with_cancellation_marker(events):
         if not isinstance(event, Mapping):
@@ -2509,6 +2842,18 @@ async def _openai_stream_events(
             for call_id, _status in pending_web_search_calls.values():
                 yield _web_search_outcome_unknown_event(call_id)
             pending_web_search_calls.clear()
+            continue
+        if event_type == "response.created":
+            response = event.get("response")
+            candidate_response_id = response.get("id") if isinstance(response, Mapping) else None
+            if isinstance(candidate_response_id, str) and candidate_response_id.strip():
+                if response_id is None:
+                    response_id = candidate_response_id
+                    observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
+                elif candidate_response_id != response_id:
+                    raise OpenAIProtocolError(
+                        "OpenAI stream emitted conflicting response identities."
+                    )
             continue
         if event_type == "response.output_text.delta":
             delta = event.get("delta")
@@ -2566,9 +2911,16 @@ async def _openai_stream_events(
             continue
         if event_type == "response.output_item.added":
             item = event.get("item")
+            reasoning_added = False
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
-                pending_reasoning_items.add(_stream_output_index(event))
+                output_index = _stream_output_index(event)
+                if output_index in pending_reasoning_items or output_index in fallback_output_items:
+                    raise OpenAIProtocolError("OpenAI reasoning output_item.added was repeated.")
+                pending_reasoning_items.add(output_index)
+                reasoning_added = True
             _record_stream_replay_item_added(event, pending_replay_items)
+            if reasoning_added:
+                observe_provider_semantic_progress(ProviderProgressKind.REASONING)
             if isinstance(item, Mapping) and item.get("type") == "web_search_call":
                 output_index = _stream_output_index(event)
                 if output_index in pending_web_search_calls:
@@ -2625,7 +2977,18 @@ async def _openai_stream_events(
                     "id": item_id,
                     "call_id": call_id,
                 }
-            _record_stream_output_item_added(event, pending_function_calls)
+            function_call_added = _record_stream_output_item_added(
+                event,
+                pending_function_calls,
+            )
+            if function_call_added:
+                observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
+            elif isinstance(item, Mapping) and item.get("type") == "tool_search_call":
+                observe_provider_semantic_progress(
+                    ProviderProgressKind.TOOL_CALL
+                    if item.get("execution") == "client"
+                    else ProviderProgressKind.HOSTED_TOOL
+                )
             continue
         if event_type in {
             "response.web_search_call.in_progress",
@@ -2705,6 +3068,7 @@ async def _openai_stream_events(
                 )
                 fallback_output_items[output_index] = normalized_output
                 hosted_tool_search_output_index = output_index
+                observe_provider_semantic_progress(ProviderProgressKind.HOSTED_TOOL)
             _record_stream_output_item_done(
                 event,
                 fallback_output_items,
@@ -2713,9 +3077,12 @@ async def _openai_stream_events(
             )
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
                 pending_reasoning_items.discard(_stream_output_index(event))
+                observe_provider_semantic_progress(ProviderProgressKind.REASONING)
             continue
         if event_type == "response.function_call_arguments.delta":
             _record_stream_function_call_delta(event, pending_function_calls)
+            if event.get("delta"):
+                observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
             continue
         if event_type == "response.function_call_arguments.done":
             tool_call_event, output_item = _stream_function_call_event(
@@ -2763,6 +3130,7 @@ async def _openai_stream_events(
                     yield _web_search_outcome_unknown_event(call_id)
                 pending_web_search_calls.clear()
                 pending_tool_search_calls.clear()
+            observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
             for terminal_event in _stream_terminal_events(
                 event,
                 fallback_output_items,
@@ -3850,20 +4218,23 @@ def _sorted_output_items(
 def _record_stream_output_item_added(
     event: Mapping[str, Any],
     pending_function_calls: dict[int, _PendingFunctionCall],
-) -> None:
+) -> bool:
     output_index = _stream_output_index(event)
     item = event.get("item")
     if not isinstance(item, Mapping):
         raise OpenAIProtocolError("OpenAI output_item.added requires item object.")
     item_type = item.get("type")
     if item_type != "function_call":
-        return
+        return False
+    if output_index in pending_function_calls:
+        raise OpenAIProtocolError("OpenAI function_call output_item.added was repeated.")
     pending_function_calls[output_index] = _PendingFunctionCall(
         item_id=_mapping_optional_string(item, "id"),
         call_id=_mapping_optional_string(item, "call_id"),
         name=_mapping_optional_string(item, "name"),
         arguments=_mapping_string_or_default(item, "arguments", ""),
     )
+    return True
 
 
 def _record_stream_replay_item_added(

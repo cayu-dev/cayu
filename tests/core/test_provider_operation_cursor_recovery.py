@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,9 @@ from cayu.providers import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
+    ProviderDeadlineKind,
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
@@ -31,6 +34,8 @@ from cayu.providers import (
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
+    ProviderProgressKind,
+    ProviderStreamDeadlineEvidence,
 )
 from cayu.providers._credential_boundary import ProviderStreamCleanupError
 from cayu.runtime import (
@@ -1697,6 +1702,80 @@ def test_profiled_recovery_requires_profile_on_matching_output_evidence() -> Non
 
         with pytest.raises(ProviderOperationEvidenceError, match="no execution-profile evidence"):
             await load_recoverable_provider_operation(store, stage)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_timeout",
+        "wrong_provider",
+        "inconsistent_progress",
+        "unexpected_status",
+    ],
+)
+def test_recovery_rejects_malformed_exact_operation_deadline_diagnostic(
+    corruption: str,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _CursorReplayProvider()
+        session_id = f"provider-deadline-diagnostic-{corruption}"
+        stage, identity, _state = await _stage_partial_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
+        deadline = ModelStreamDeadlineError(
+            provider=provider.name,
+            evidence=ProviderStreamDeadlineEvidence(
+                deadline_kind=ProviderDeadlineKind.SEMANTIC_IDLE,
+                configured_timeout_s=0.01,
+                elapsed_s=0.02,
+                last_progress_kind=ProviderProgressKind.RESPONSE_IDENTITY,
+                last_progress_elapsed_s=0.005,
+                last_progress_at=datetime.now(UTC),
+            ),
+            recovery_disposition="reattach_exact_operation",
+        )
+        payload = {
+            "error": str(deadline),
+            "error_type": type(deadline).__name__,
+            **deadline.error_payload_fields(),
+            "step": 1,
+            "attempt": 1,
+            "max_attempts": 1,
+            **identity.payload(),
+            "execution_profile_fingerprint": _stage_execution_profile_fingerprint(stage),
+        }
+        if corruption == "missing_timeout":
+            payload.pop("provider_deadline_timeout_s")
+        elif corruption == "wrong_provider":
+            payload["provider"] = "another-provider"
+        elif corruption == "inconsistent_progress":
+            payload["provider_last_progress_elapsed_s"] = 1.0
+        elif corruption == "unexpected_status":
+            payload["status_code"] = 504
+        else:  # pragma: no cover - parametrization owns the closed vocabulary
+            raise AssertionError(f"Unsupported corruption: {corruption}")
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.MODEL_ERROR,
+                session_id=session_id,
+                interaction_id=f"interaction-{session_id}",
+                agent_name="assistant",
+                payload=payload,
+            ),
+        )
+
+        with pytest.raises(ProviderOperationEvidenceError, match="malformed"):
+            await load_recoverable_provider_operation(store, stage)
+
+        assert provider.adapter.start_calls == 0
+        assert provider.adapter.retrieve_calls == 0
+        assert provider.adapter.reconnect_calls == []
 
     asyncio.run(scenario())
 

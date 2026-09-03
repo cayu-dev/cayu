@@ -32,10 +32,12 @@ from cayu.core.messages import (
 )
 from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
+    aclosing_provider_stream,
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
+    credential_safe_post_completion_failure,
     sanitize_provider_cancellation,
 )
 from cayu.providers._reasoning_state import (
@@ -53,13 +55,30 @@ from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
+    ModelStreamEventType,
     UsageDialect,
     _preflight_provider_portable_messages,
+    _terminal_preserving_provider_stream,
+)
+from cayu.providers.deadlines import (
+    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+    ProviderDeadlineKind,
+    ProviderProgressKind,
+    ProviderStreamDeadlineController,
+    ProviderStreamDeadlineExceeded,
+    ProviderStreamDeadlines,
+    _resolve_provider_stream_deadlines,
+    current_provider_deadline_controller,
+    observe_provider_semantic_progress,
 )
 
 DEFAULT_BEDROCK_MAX_TOKENS = 4096
-DEFAULT_BEDROCK_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_BEDROCK_STREAM_CLOSE_TIMEOUT_SECONDS = 5.0
 BedrockResourceType = Literal[
     "foundation_model",
@@ -307,6 +326,10 @@ class BedrockProvider(ModelProvider):
     billing_provider_name = "bedrock"
     usage_dialect = UsageDialect.ANTHROPIC
 
+    @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        return self._stream_deadlines
+
     def preflight_portable_messages(
         self,
         *,
@@ -358,7 +381,12 @@ class BedrockProvider(ModelProvider):
         client: Any | None = None,
         name: str = "bedrock",
         max_tokens: int = DEFAULT_BEDROCK_MAX_TOKENS,
-        stream_idle_timeout_s: float = DEFAULT_BEDROCK_STREAM_IDLE_TIMEOUT_SECONDS,
+        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+        stream_idle_timeout_s: float | None = None,
         stream_close_timeout_s: float = DEFAULT_BEDROCK_STREAM_CLOSE_TIMEOUT_SECONDS,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
@@ -374,7 +402,14 @@ class BedrockProvider(ModelProvider):
         if max_tokens <= 0:
             raise ValueError("max_tokens must be greater than zero.")
         self.max_tokens = max_tokens
-        self.stream_idle_timeout_s = _positive_float(stream_idle_timeout_s, "stream_idle_timeout_s")
+        self._stream_deadlines = _resolve_provider_stream_deadlines(
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
+            max_concurrent_streams=max_concurrent_streams,
+            stream_idle_timeout_s=stream_idle_timeout_s,
+        )
         self.stream_close_timeout_s = _positive_float(
             stream_close_timeout_s, "stream_close_timeout_s"
         )
@@ -463,40 +498,82 @@ class BedrockProvider(ModelProvider):
             effective_service_tier=effective_tier,
         )
 
+    @_terminal_preserving_provider_stream
     @detach_provider_stream_traceback
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         client: Any = None
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: BedrockContextOverflowError | None = None
+        post_completion_failure: ModelProviderError | None = None
         error_event: ModelStreamEvent | None = None
+        completion_emitted = False
+        deadline_controller: ProviderStreamDeadlineController | None = None
+        owns_deadline_controller = False
         try:
             payload = build_bedrock_converse_payload(request, default_max_tokens=self.max_tokens)
             client = await self._get_client()
+            deadline_controller = current_provider_deadline_controller()
+            owns_deadline_controller = deadline_controller is None
+            if deadline_controller is None:
+                deadline_controller = ProviderStreamDeadlineController(self.stream_deadlines)
+            elif deadline_controller.deadlines != self.stream_deadlines:
+                raise ValueError("Bedrock stream deadline policy changed after dispatch admission.")
             raw_events = _boto3_stream_events(
                 client,
                 payload,
-                idle_timeout_s=self.stream_idle_timeout_s,
+                deadline_controller=deadline_controller,
                 close_timeout_s=self.stream_close_timeout_s,
             )
-            async for event in bedrock_converse_stream_events(raw_events):
-                yield event
+            events = bedrock_converse_stream_events(raw_events)
+            async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
+                async for event in events:
+                    if event.type is ModelStreamEventType.COMPLETED:
+                        completion_emitted = True
+                    yield event
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
                 provider_label="Bedrock",
                 credential_values=(),
             )
+        except ProviderStreamDeadlineExceeded as exc:
+            deadline_error = ModelStreamDeadlineError(
+                provider=self.name,
+                evidence=exc.evidence,
+                stream_cleanup_failed=exc.stream_cleanup_failed,
+            )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    deadline_error,
+                    provider_label="Bedrock",
+                    provider_name=self.name,
+                    credential_values=(),
+                )
+            else:
+                error_event = ModelStreamEvent.error(str(deadline_error), cause=deadline_error)
         except Exception as exc:
             safe = _credential_safe_bedrock_error(_bedrock_error_from_exception(exc))
-            if isinstance(safe, BedrockContextOverflowError):
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    safe,
+                    provider_label="Bedrock",
+                    provider_name=self.name,
+                    credential_values=(),
+                )
+            elif isinstance(safe, BedrockContextOverflowError):
                 overflow_failure = safe
             else:
                 error_event = ModelStreamEvent.error(str(safe), cause=safe)
+        finally:
+            if owns_deadline_controller and deadline_controller is not None:
+                deadline_controller.close()
         client = None
         if cancellation is not None:
             raise cancellation from None
         if overflow_failure is not None:
             raise overflow_failure from None
+        if post_completion_failure is not None:
+            raise post_completion_failure from None
         if error_event is not None:
             yield error_event
 
@@ -707,21 +784,84 @@ def _bedrock_request_options(
     return inference_config, copied_options
 
 
+def _bedrock_completion_metadata_payload(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    raw_usage = metadata.get("usage")
+    if raw_usage is not None:
+        usage = _mapping(raw_usage, "metadata.usage")
+        payload["usage"] = _canonical_bedrock_usage(usage)
+        payload["bedrock_usage"] = copy_json_value(dict(usage), "bedrock_usage")
+    metrics = metadata.get("metrics")
+    if metrics is not None:
+        payload["metrics"] = copy_json_value(metrics, "bedrock metrics")
+    service_tier = metadata.get("serviceTier")
+    if service_tier is not None:
+        service_tier_payload = _mapping(service_tier, "metadata.serviceTier")
+        payload["bedrock_service_tier"] = _required_string(service_tier_payload, "type")
+    return payload
+
+
 async def bedrock_converse_stream_events(
     raw_events: AsyncIterator[Mapping[str, Any]],
 ) -> AsyncIterator[ModelStreamEvent]:
     tool_blocks: dict[int, _PendingToolUse] = {}
     reasoning_blocks: dict[int, _PendingReasoning] = {}
+    started_block_indexes: set[int] = set()
     stop_reason: str | None = None
-    metadata: dict[str, Any] = {}
+    completion_metadata_payload: dict[str, Any] = {}
+    metadata_seen = False
     saw_message_stop = False
+    completion_emitted = False
+    post_terminal_failure: BaseException | None = None
 
-    async for raw in raw_events:
+    def validate_terminal_assembly() -> None:
+        if tool_blocks:
+            raise BedrockProtocolError("Bedrock stream ended with unfinished tool blocks.")
+        if reasoning_blocks:
+            raise BedrockProtocolError("Bedrock stream ended with unfinished reasoning blocks.")
+
+    def completed_event() -> ModelStreamEvent:
+        validate_terminal_assembly()
+        if not saw_message_stop or stop_reason is None:
+            raise BedrockProtocolError("Bedrock stream ended before messageStop.")
+        return ModelStreamEvent.completed(
+            {
+                "stop_reason": stop_reason,
+                **completion_metadata_payload,
+            }
+        )
+
+    iterator = raw_events.__aiter__()
+    while True:
+        try:
+            raw = await iterator.__anext__()
+        except StopAsyncIteration:
+            break
+        except asyncio.CancelledError as exc:
+            if not saw_message_stop:
+                raise
+            post_terminal_failure = exc
+            break
+        except Exception as exc:
+            if not saw_message_stop:
+                raise
+            post_terminal_failure = exc
+            break
         if not isinstance(raw, Mapping):
             raise BedrockProtocolError("Bedrock stream events must be objects.")
         if saw_message_stop:
             if "metadata" in raw and len(raw) == 1:
-                metadata = dict(_mapping(raw["metadata"], "metadata"))
+                if metadata_seen:
+                    raise BedrockProtocolError("Bedrock stream emitted repeated metadata.")
+                new_metadata = _mapping(raw["metadata"], "metadata")
+                completion_metadata_payload = _bedrock_completion_metadata_payload(new_metadata)
+                metadata_seen = True
+                if "usage" in completion_metadata_payload:
+                    observe_provider_semantic_progress(ProviderProgressKind.USAGE)
+                completion_emitted = True
+                yield completed_event()
                 continue
             if "messageStop" in raw and len(raw) == 1:
                 repeated = _mapping(raw["messageStop"], "messageStop")
@@ -732,6 +872,11 @@ async def bedrock_converse_stream_events(
         if "contentBlockStart" in raw:
             start_event = _mapping(raw["contentBlockStart"], "contentBlockStart")
             index = _nonnegative_int(start_event.get("contentBlockIndex"), "contentBlockIndex")
+            if index in started_block_indexes:
+                raise BedrockProtocolError(
+                    "Bedrock stream emitted duplicate contentBlockStart index."
+                )
+            started_block_indexes.add(index)
             start = _mapping(start_event.get("start"), "contentBlockStart.start")
             tool_use = start.get("toolUse")
             if tool_use is not None:
@@ -740,6 +885,7 @@ async def bedrock_converse_stream_events(
                     id=_required_string(tool, "toolUseId"),
                     name=_required_string(tool, "name"),
                 )
+                observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
             continue
         if "contentBlockDelta" in raw:
             delta_event = _mapping(raw["contentBlockDelta"], "contentBlockDelta")
@@ -760,6 +906,8 @@ async def bedrock_converse_stream_events(
                 if type(tool_input) is not str:
                     raise BedrockProtocolError("Bedrock tool input delta must be a string.")
                 tool.input_json += tool_input
+                if tool_input:
+                    observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
             reasoning_delta = delta.get("reasoningContent")
             if reasoning_delta is not None:
                 reasoning = _mapping(reasoning_delta, "reasoningContent delta")
@@ -771,6 +919,8 @@ async def bedrock_converse_stream_events(
                     if type(reasoning_text) is not str:
                         raise BedrockProtocolError("Bedrock reasoning text delta must be a string.")
                     pending.text_parts.append(reasoning_text)
+                    if reasoning_text:
+                        observe_provider_semantic_progress(ProviderProgressKind.REASONING)
                 if "signature" in reasoning:
                     members += 1
                     signature = reasoning["signature"]
@@ -779,6 +929,8 @@ async def bedrock_converse_stream_events(
                             "Bedrock reasoning signature delta must be a string."
                         )
                     pending.signature_parts.append(signature)
+                    if signature:
+                        observe_provider_semantic_progress(ProviderProgressKind.REASONING)
                 if "redactedContent" in reasoning:
                     members += 1
                     redacted = reasoning["redactedContent"]
@@ -787,6 +939,8 @@ async def bedrock_converse_stream_events(
                             "Bedrock redacted reasoning delta must contain bytes."
                         )
                     pending.redacted_parts.append(bytes(redacted))
+                    if redacted:
+                        observe_provider_semantic_progress(ProviderProgressKind.REASONING)
                 if members != 1:
                     raise BedrockProtocolError(
                         "Bedrock reasoning delta must contain exactly one union member."
@@ -846,39 +1000,39 @@ async def bedrock_converse_stream_events(
             continue
         if "messageStop" in raw:
             message_stop = _mapping(raw["messageStop"], "messageStop")
-            stop_reason = _required_string(message_stop, "stopReason")
+            candidate_stop_reason = _required_string(message_stop, "stopReason")
+            validate_terminal_assembly()
+            stop_reason = candidate_stop_reason
             saw_message_stop = True
+            observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
+            if metadata_seen:
+                completion_emitted = True
+                yield completed_event()
             continue
         if "metadata" in raw:
-            metadata = dict(_mapping(raw["metadata"], "metadata"))
+            if metadata_seen:
+                raise BedrockProtocolError("Bedrock stream emitted repeated metadata.")
+            new_metadata = _mapping(raw["metadata"], "metadata")
+            completion_metadata_payload = _bedrock_completion_metadata_payload(new_metadata)
+            metadata_seen = True
+            if "usage" in completion_metadata_payload:
+                observe_provider_semantic_progress(ProviderProgressKind.USAGE)
 
-    if tool_blocks:
-        raise BedrockProtocolError("Bedrock stream ended with unfinished tool blocks.")
-    if reasoning_blocks:
-        raise BedrockProtocolError("Bedrock stream ended with unfinished reasoning blocks.")
-    if not saw_message_stop or stop_reason is None:
-        raise BedrockProtocolError("Bedrock stream ended before messageStop.")
-    payload: dict[str, Any] = {"stop_reason": stop_reason}
-    raw_usage = metadata.get("usage")
-    if raw_usage is not None:
-        usage = _mapping(raw_usage, "metadata.usage")
-        payload["usage"] = _canonical_bedrock_usage(usage)
-        payload["bedrock_usage"] = copy_json_value(dict(usage), "bedrock_usage")
-    metrics = metadata.get("metrics")
-    if metrics is not None:
-        payload["metrics"] = copy_json_value(metrics, "bedrock metrics")
-    service_tier = metadata.get("serviceTier")
-    if service_tier is not None:
-        service_tier_payload = _mapping(service_tier, "metadata.serviceTier")
-        payload["bedrock_service_tier"] = _required_string(service_tier_payload, "type")
-    yield ModelStreamEvent.completed(payload)
+    if not completion_emitted:
+        yield completed_event()
+    if post_terminal_failure is not None:
+        failure = post_terminal_failure
+        post_terminal_failure = None
+        raw = {}
+        del iterator, raw_events
+        raise failure from None
 
 
 async def _boto3_stream_events(
     client: Any,
     payload: Mapping[str, Any],
     *,
-    idle_timeout_s: float,
+    deadline_controller: ProviderStreamDeadlineController,
     close_timeout_s: float,
 ) -> AsyncIterator[Mapping[str, Any]]:
     loop = asyncio.get_running_loop()
@@ -908,6 +1062,7 @@ async def _boto3_stream_events(
             if stream is None:
                 raise BedrockProtocolError("Bedrock converse_stream response omitted stream.")
             stream_holder.append(stream)
+            put("transport", None)
             for raw in stream:
                 if stop.is_set() or not put("event", raw):
                     break
@@ -917,35 +1072,85 @@ async def _boto3_stream_events(
             put("done", None)
 
     worker = asyncio.create_task(asyncio.to_thread(consume))
+    close_task: asyncio.Task[Any] | None = None
+    deadline_failure: ProviderStreamDeadlineExceeded | None = None
+    cleanup_failed = False
     try:
-        while True:
-            try:
-                kind, value = await asyncio.wait_for(queue.get(), timeout=idle_timeout_s)
-            except TimeoutError as exc:
-                raise BedrockProtocolError(
-                    f"Bedrock stream produced no event for {idle_timeout_s:g} seconds."
-                ) from exc
-            if kind == "event":
-                yield value
-            elif kind == "error":
-                raise value
-            elif kind == "done":
-                break
+        try:
+            while True:
+                kind, value = await deadline_controller.wait_for(
+                    queue.get(),
+                    kinds=(
+                        ProviderDeadlineKind.TRANSPORT_IDLE,
+                        ProviderDeadlineKind.PROTOCOL_IDLE,
+                        ProviderDeadlineKind.ABSOLUTE,
+                    ),
+                )
+                if kind == "transport":
+                    deadline_controller.observe_transport()
+                elif kind == "event":
+                    deadline_controller.observe_transport()
+                    deadline_controller.observe_protocol()
+                    pause_started = deadline_controller.idle_pause_started()
+                    yield value
+                    deadline_controller.exclude_idle_pause(
+                        pause_started,
+                        kinds=(
+                            ProviderDeadlineKind.TRANSPORT_IDLE,
+                            ProviderDeadlineKind.PROTOCOL_IDLE,
+                        ),
+                    )
+                elif kind == "error":
+                    raise value
+                elif kind == "done":
+                    break
+        except ProviderStreamDeadlineExceeded as exc:
+            deadline_failure = exc
     finally:
-        stop.set()
-        close_deadline = loop.time() + close_timeout_s
-        if stream_holder:
-            close = getattr(stream_holder[0], "close", None)
-            if callable(close):
+        try:
+            task = asyncio.current_task()
+            cleanup_cancellation_baseline = 0 if task is None else task.cancelling()
+            stop.set()
+            close_deadline = loop.time() + close_timeout_s
+            if stream_holder:
+                close = getattr(stream_holder[0], "close", None)
+                if callable(close):
+                    remaining = max(0.0, close_deadline - loop.time())
+                    if remaining > 0:
+                        pending_close = asyncio.create_task(asyncio.to_thread(close))
+                        close_task = pending_close
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(pending_close),
+                                timeout=remaining,
+                            )
+                        except Exception:
+                            cleanup_failed = True
+            if not worker.done():
                 remaining = max(0.0, close_deadline - loop.time())
                 if remaining > 0:
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(asyncio.to_thread(close), timeout=remaining)
-        if not worker.done():
-            remaining = max(0.0, close_deadline - loop.time())
-            if remaining > 0:
-                with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-                    await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
+                    try:
+                        await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
+                    except TimeoutError:
+                        cleanup_failed = True
+                    except asyncio.CancelledError:
+                        if task is not None and task.cancelling() > cleanup_cancellation_baseline:
+                            raise
+                        cleanup_failed = True
+                    except Exception:
+                        if deadline_failure is None:
+                            raise
+                        cleanup_failed = True
+        finally:
+            if close_task is not None and not close_task.done():
+                deadline_controller.retain_dispatched_operation(close_task)
+            if not worker.done():
+                deadline_controller.retain_dispatched_operation(worker)
+    if deadline_failure is not None:
+        raise ProviderStreamDeadlineExceeded(
+            deadline_failure.evidence,
+            stream_cleanup_failed=(deadline_failure.stream_cleanup_failed or cleanup_failed),
+        ) from None
 
 
 def _bedrock_system_content(parts: Sequence[Any]) -> list[dict[str, Any]]:

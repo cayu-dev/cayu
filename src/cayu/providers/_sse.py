@@ -14,6 +14,10 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from cayu._validation import require_finite
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineController,
+)
 
 DEFAULT_SSE_MAX_EVENT_BYTES = 16 * 1024 * 1024
 DEFAULT_SSE_MAX_EVENT_LINES = 4_096
@@ -35,10 +39,6 @@ _SSE_BYTE_ACTIVITY = _SseByteActivity(line_in_progress=False)
 _SSE_PENDING_LINE_ACTIVITY = _SseByteActivity(line_in_progress=True)
 
 
-class SseIdleTimeoutError(TimeoutError):
-    """Raised when an SSE stream produces no activity before its idle deadline."""
-
-
 class SseEventTimeoutError(TimeoutError):
     """Raised when one unterminated SSE event exceeds its duration ceiling."""
 
@@ -53,6 +53,7 @@ async def _aiter_bounded_sse_lines(
     max_line_bytes: int,
     provider_label: str,
     emit_byte_activity: bool = False,
+    deadline_controller: ProviderStreamDeadlineController | None = None,
 ) -> AsyncIterator[str | _SseByteActivity]:
     """Decode UTF-8 SSE lines without allowing unbounded line accumulation.
 
@@ -71,6 +72,8 @@ async def _aiter_bounded_sse_lines(
 
     async for chunk in chunks:
         chunk_had_bytes = bool(chunk)
+        if chunk_had_bytes and deadline_controller is not None:
+            deadline_controller.observe_transport()
         yielded_line = False
         chunk_view = memoryview(chunk)
         offset = 0
@@ -133,7 +136,7 @@ async def _aiter_bounded_sse_lines(
 async def aiter_sse_json_events(
     lines: AsyncIterator[str | _SseByteActivity],
     *,
-    idle_timeout_s: float,
+    deadline_controller: ProviderStreamDeadlineController,
     provider_label: str,
     protocol_error: type[Exception],
     max_event_bytes: int = DEFAULT_SSE_MAX_EVENT_BYTES,
@@ -142,33 +145,29 @@ async def aiter_sse_json_events(
 ) -> AsyncIterator[Mapping[str, Any]]:
     """Decode an SSE line stream into JSON data objects.
 
-    Every received line counts as stream activity. The bundled raw-byte decoder
-    also supplies private activity signals while a line is incomplete, so slow
-    but progressing bytes do not trip the idle timeout. A separate duration
-    ceiling bounds one incomplete line/event even while data keeps arriving.
+    Raw bytes refresh only the transport clock. Only complete, valid JSON data
+    events refresh the protocol clock; comments, incomplete lines, and malformed
+    events do not. A separate duration ceiling bounds one incomplete line/event
+    even while raw data keeps arriving.
     Error messages are prefixed with ``provider_label``; malformed SSE data
     raises ``protocol_error``.
     """
-    if type(idle_timeout_s) not in {int, float}:
-        raise TypeError("idle_timeout_s must be a number.")
-    idle_timeout_s = require_finite(float(idle_timeout_s), "idle_timeout_s")
-    if idle_timeout_s <= 0:
-        raise ValueError("idle_timeout_s must be greater than zero.")
+    if type(deadline_controller) is not ProviderStreamDeadlineController:
+        raise TypeError("deadline_controller must be ProviderStreamDeadlineController.")
     if type(max_event_bytes) is not int or max_event_bytes <= 0:
         raise ValueError("max_event_bytes must be a positive integer.")
     if type(max_event_lines) is not int or max_event_lines <= 0:
         raise ValueError("max_event_lines must be a positive integer.")
     if max_event_duration_s is None:
-        max_event_duration_s = idle_timeout_s * DEFAULT_SSE_EVENT_DURATION_MULTIPLIER
+        max_event_duration_s = (
+            deadline_controller.deadlines.protocol_idle_timeout_s
+            * DEFAULT_SSE_EVENT_DURATION_MULTIPLIER
+        )
     if type(max_event_duration_s) not in {int, float}:
         raise ValueError("max_event_duration_s must be greater than zero.")
     max_event_duration_s = require_finite(float(max_event_duration_s), "max_event_duration_s")
     if max_event_duration_s <= 0:
         raise ValueError("max_event_duration_s must be greater than zero.")
-    idle_message = (
-        f"{provider_label} streaming response produced no SSE events "
-        f"for {idle_timeout_s:g} seconds."
-    )
     event_timeout_message = (
         f"{provider_label} streaming response did not finish one SSE event "
         f"within {max_event_duration_s:g} seconds."
@@ -187,7 +186,6 @@ async def aiter_sse_json_events(
 
     iterator = lines.__aiter__()
     loop = asyncio.get_running_loop()
-    last_activity_at = loop.time()
     event_started_at: float | None = None
     pending_line_started_at: float | None = None
     event_bytes = 0
@@ -197,9 +195,6 @@ async def aiter_sse_json_events(
 
     while True:
         now = loop.time()
-        idle_remaining = idle_timeout_s - (now - last_activity_at)
-        if idle_remaining <= 0:
-            raise SseIdleTimeoutError(idle_message)
         duration_started_at = (
             event_started_at if event_started_at is not None else pending_line_started_at
         )
@@ -208,31 +203,29 @@ async def aiter_sse_json_events(
             event_remaining = max_event_duration_s - (now - duration_started_at)
             if event_remaining <= 0:
                 raise SseEventTimeoutError(event_timeout_message)
-        remaining = (
-            idle_remaining if event_remaining is None else min(idle_remaining, event_remaining)
+        read = deadline_controller.wait_for(
+            iterator.__anext__(),
+            kinds=(
+                ProviderDeadlineKind.TRANSPORT_IDLE,
+                ProviderDeadlineKind.PROTOCOL_IDLE,
+                ProviderDeadlineKind.ABSOLUTE,
+            ),
         )
-        deadline = asyncio.timeout(remaining)
+        deadline = asyncio.timeout(event_remaining) if event_remaining is not None else None
         try:
-            async with deadline:
-                line = await iterator.__anext__()
+            if deadline is None:
+                line = await read
+            else:
+                async with deadline:
+                    line = await read
         except StopAsyncIteration:
             break
         except TimeoutError:
-            if not deadline.expired():
+            if deadline is None or not deadline.expired():
                 raise
-            now = loop.time()
-            duration_started_at = (
-                event_started_at if event_started_at is not None else pending_line_started_at
-            )
-            if (
-                duration_started_at is not None
-                and now - duration_started_at >= max_event_duration_s
-            ):
-                raise SseEventTimeoutError(event_timeout_message) from None
-            raise SseIdleTimeoutError(idle_message) from None
+            raise SseEventTimeoutError(event_timeout_message) from None
 
         received_at = loop.time()
-        last_activity_at = received_at
 
         if isinstance(line, _SseByteActivity):
             if (
@@ -264,13 +257,19 @@ async def aiter_sse_json_events(
                 continue
             has_data = False
             if data == "[DONE]":
+                deadline_controller.observe_protocol()
                 break
             decoded = decode(data)
+            deadline_controller.observe_protocol()
+            pause_started = deadline_controller.idle_pause_started()
             yield decoded
-            # Time spent by the downstream consumer handling a completed event
-            # is not provider silence; begin the next idle window when reading
-            # resumes.
-            last_activity_at = loop.time()
+            deadline_controller.exclude_idle_pause(
+                pause_started,
+                kinds=(
+                    ProviderDeadlineKind.TRANSPORT_IDLE,
+                    ProviderDeadlineKind.PROTOCOL_IDLE,
+                ),
+            )
             continue
         if event_started_at is None:
             event_started_at = (
@@ -294,7 +293,17 @@ async def aiter_sse_json_events(
     if data_lines:
         data = "\n".join(data_lines)
         if data != "[DONE]":
-            yield decode(data)
+            decoded = decode(data)
+            deadline_controller.observe_protocol()
+            pause_started = deadline_controller.idle_pause_started()
+            yield decoded
+            deadline_controller.exclude_idle_pause(
+                pause_started,
+                kinds=(
+                    ProviderDeadlineKind.TRANSPORT_IDLE,
+                    ProviderDeadlineKind.PROTOCOL_IDLE,
+                ),
+            )
 
 
 __all__ = [
@@ -303,6 +312,5 @@ __all__ = [
     "DEFAULT_SSE_MAX_EVENT_LINES",
     "SseEventLimitError",
     "SseEventTimeoutError",
-    "SseIdleTimeoutError",
     "aiter_sse_json_events",
 ]

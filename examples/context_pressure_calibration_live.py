@@ -304,7 +304,7 @@ async def _model_events(
     provider: ModelProvider,
     request: ModelRequest,
 ) -> AsyncIterator[ModelStreamEvent]:
-    async for event in provider.stream(request):
+    async for event in provider.runtime_stream(request):
         yield event
 
 

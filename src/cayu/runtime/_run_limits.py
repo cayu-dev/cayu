@@ -7,7 +7,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapp
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Generic, Literal, TypeVar, cast
+from hashlib import sha256
+from typing import Any, Generic, Literal, TypeVar, cast
+
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._exception_groups import add_exception_note_safely, exception_cause
 from cayu._exception_state import exception_state, set_exception_state
@@ -98,8 +101,11 @@ from cayu.runtime.execution_units import (
 from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
+    ModelCompletionStage,
     Session,
+    SessionOperationPublication,
     SessionRunFenced,
+    SessionStatus,
     SessionStore,
 )
 from cayu.runtime.stop_policy import (
@@ -152,7 +158,13 @@ def _event_with_budget_authority(
 UNKNOWN_POST_DISPATCH_BUDGET_REASON = (
     "provider usage unknown after dispatch; charged reserved amount"
 )
+AUTOMATIC_CONTEXT_COMPACTION_UNCERTAIN_USAGE_BUDGET_REASON = (
+    "automatic context compaction dispatch has uncertain usage; charged reserved amount"
+)
 PRE_PROVIDER_DISPATCH_BUDGET_RELEASE_REASON = "model completion abandoned before provider dispatch"
+_BORROWED_AUTOMATIC_COMPACTION_BUDGET_OPERATION_PREFIX = (
+    "cayu:borrowed-automatic-compaction-budget:v1:"
+)
 
 _OperationResultT = TypeVar("_OperationResultT")
 _StreamResultT = TypeVar("_StreamResultT")
@@ -170,6 +182,117 @@ def _merge_events_by_id(*groups: list[Event]) -> list[Event]:
             seen.add(event.id)
             merged.append(event)
     return merged
+
+
+def _borrowed_automatic_compaction_budget_operation_key(stage_id: str) -> str:
+    stage_id = require_clean_nonblank(stage_id, "stage_id")
+    return (
+        _BORROWED_AUTOMATIC_COMPACTION_BUDGET_OPERATION_PREFIX
+        + sha256(stage_id.encode("utf-8")).hexdigest()
+    )
+
+
+class _BorrowedAutomaticCompactionBudgetAuthority(BaseModel):
+    """Durable reservation owner for compaction under an assistant stage."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    record_type: Literal["cayu.borrowed-automatic-compaction-budget"] = (
+        "cayu.borrowed-automatic-compaction-budget"
+    )
+    schema_version: Literal[1] = 1
+    status: Literal["pending", "settled"]
+    session_id: str
+    stage_id: str
+    stage_preparation_digest: str
+    provider_name: str
+    pricing_provider_name: str
+    requested_model: str
+    model_step_id: str
+    model_attempt_id: str
+    reservation_ids: tuple[str, ...]
+    recovery_contexts: tuple[BudgetReservationRecoveryContext, ...]
+
+    @field_validator(
+        "session_id",
+        "stage_id",
+        "provider_name",
+        "pricing_provider_name",
+        "requested_model",
+        "model_step_id",
+        "model_attempt_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("stage_preparation_digest")
+    @classmethod
+    def validate_stage_preparation_digest(cls, value: str) -> str:
+        value = require_clean_nonblank(value, "stage_preparation_digest")
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("stage_preparation_digest must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("reservation_ids", mode="before")
+    @classmethod
+    def validate_reservation_ids(cls, value: object) -> tuple[str, ...]:
+        if type(value) not in {list, tuple}:
+            raise TypeError("reservation_ids must be a list or tuple.")
+        values = cast("list[object] | tuple[object, ...]", value)
+        if any(type(reservation_id) is not str for reservation_id in values):
+            raise TypeError("reservation_ids items must be strings.")
+        copied = tuple(
+            require_clean_nonblank(
+                cast("str", reservation_id),
+                "reservation_ids item",
+            )
+            for reservation_id in values
+        )
+        if not copied:
+            raise ValueError("Borrowed compaction budget authority requires reservations.")
+        if len(copied) > 32:
+            raise ValueError("reservation_ids cannot contain more than 32 ids.")
+        if len(set(copied)) != len(copied):
+            raise ValueError("reservation_ids must be distinct.")
+        return copied
+
+    @field_validator("recovery_contexts", mode="before")
+    @classmethod
+    def copy_recovery_contexts(
+        cls,
+        value: object,
+    ) -> tuple[BudgetReservationRecoveryContext, ...]:
+        if type(value) not in {list, tuple}:
+            raise TypeError("recovery_contexts must be a list or tuple.")
+        values = cast("list[object] | tuple[object, ...]", value)
+        return tuple(
+            BudgetReservationRecoveryContext.model_validate(
+                item.model_dump(mode="python")
+                if isinstance(item, BudgetReservationRecoveryContext)
+                else item
+            )
+            for item in values
+        )
+
+    @model_validator(mode="after")
+    def validate_recovery_authority(self) -> _BorrowedAutomaticCompactionBudgetAuthority:
+        if tuple(context.reservation_id for context in self.recovery_contexts) != (
+            self.reservation_ids
+        ):
+            raise ValueError("Borrowed compaction recovery contexts changed reservation order.")
+        return self
+
+
+def _borrowed_automatic_compaction_budget_record_matches(
+    current: _BorrowedAutomaticCompactionBudgetAuthority,
+    expected: _BorrowedAutomaticCompactionBudgetAuthority,
+    *,
+    ignore_status: bool = False,
+) -> bool:
+    if not ignore_status:
+        return current == expected
+    return current.model_copy(update={"status": expected.status}) == expected
 
 
 def _execution_identity_payload(
@@ -655,6 +778,10 @@ class ProviderIteratorCleanupError(RuntimeError):
     """Credential-free evidence that a cancelled provider iterator did not stop cleanly."""
 
 
+class BorrowedAutomaticCompactionOutcomeUnknown(RuntimeError):
+    """Raised when restart finds a compactor dispatch without a captured outcome."""
+
+
 _PROVIDER_CLEANUP_FAILURE_ATTRIBUTE = "_cayu_budget_provider_cleanup_failure"
 _PROVIDER_CLEANUP_FAILURE_TOKEN = object()
 
@@ -1101,6 +1228,7 @@ class BudgetedOperationFailed:
 class _BudgetedOperationLifecycle:
     reservations: list[BudgetStepReservation] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
+    reservation_dispatch_id: str | None = None
     provider_dispatch_started: bool = False
     settled: bool = False
     predispatch_release_reason: str = "context compaction reservation lost before provider dispatch"
@@ -1214,6 +1342,451 @@ class RunLimitController:
     @property
     def reservation_ttl_seconds(self) -> int | None:
         return self._budget_ledger.reservation_ttl_seconds
+
+    async def prepare_borrowed_automatic_compaction_budget_authority(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        provider_name: str,
+        pricing_provider_name: str,
+        model: str,
+        model_attempt_identity: ModelAttemptIdentity,
+        reservations: tuple[BudgetStepReservation, ...],
+    ) -> BaseException | None:
+        """Own compactor reservations that cannot be attached to a borrowed stage."""
+
+        if not reservations:
+            return None
+        if type(session) is not Session or type(stage) is not ModelCompletionStage:
+            raise TypeError("Borrowed compaction authority requires an exact session and stage.")
+        if (
+            stage.session_id != session.id
+            or stage.purpose != "assistant-turn"
+            or stage.state != "in_flight"
+        ):
+            raise RuntimeError(
+                "Borrowed compaction budget authority requires an active assistant stage."
+            )
+        provider_name = require_clean_nonblank(provider_name, "provider_name")
+        pricing_provider_name = require_clean_nonblank(
+            pricing_provider_name,
+            "pricing_provider_name",
+        )
+        model = require_clean_nonblank(model, "model")
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        reservation_ids = tuple(reservation.record.reservation_id for reservation in reservations)
+        recovery_contexts = tuple(
+            BudgetReservationRecoveryContext(
+                reservation_id=reservation.record.reservation_id,
+                budget_limit_id=reservation.record.budget_limit_id,
+                reservation_authority_sha256=budget_reservation_authority_sha256(
+                    reservation.record
+                ),
+            )
+            for reservation in reservations
+        )
+        for reservation in reservations:
+            record = reservation.record
+            if (
+                record.session_id != session.id
+                or record.agent_name != session.agent_name
+                or record.environment_name != session.environment_name
+                or record.provider_name != pricing_provider_name
+                or record.model != model
+                or record.model_step_id != model_attempt_identity.model_step_id
+                or record.model_attempt_id != model_attempt_identity.model_attempt_id
+                or record.dispatch_id is not None
+                or record.status != "active"
+            ):
+                raise RuntimeError(
+                    "Borrowed compaction reservation conflicts with its dispatch authority."
+                )
+        candidate = _BorrowedAutomaticCompactionBudgetAuthority(
+            status="pending",
+            session_id=session.id,
+            stage_id=stage.stage_id,
+            stage_preparation_digest=stage.preparation_digest,
+            provider_name=provider_name,
+            pricing_provider_name=pricing_provider_name,
+            requested_model=model,
+            model_step_id=model_attempt_identity.model_step_id,
+            model_attempt_id=model_attempt_identity.model_attempt_id,
+            reservation_ids=reservation_ids,
+            recovery_contexts=recovery_contexts,
+        )
+        storage_key = _borrowed_automatic_compaction_budget_operation_key(stage.stage_id)
+
+        def prepare_operation(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current_record: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            if current_session.id != session.id:
+                raise SessionRunFenced(
+                    "Borrowed compaction budget authority changed session identity."
+                )
+            selected = candidate
+            if current_record is not None:
+                try:
+                    current = _BorrowedAutomaticCompactionBudgetAuthority.model_validate(
+                        current_record
+                    )
+                except Exception:
+                    raise RuntimeError(
+                        "Borrowed compaction budget authority is malformed."
+                    ) from None
+                if (
+                    current.session_id != candidate.session_id
+                    or current.stage_id != candidate.stage_id
+                    or current.stage_preparation_digest != candidate.stage_preparation_digest
+                ):
+                    raise RuntimeError(
+                        "Borrowed compaction budget authority changed stage ownership."
+                    )
+                if current == candidate:
+                    selected = current
+                elif _borrowed_automatic_compaction_budget_record_matches(
+                    current,
+                    candidate,
+                    ignore_status=True,
+                ):
+                    raise RuntimeError("Borrowed compaction budget attempt is already settled.")
+                elif current.status != "settled":
+                    raise RuntimeError(
+                        "Borrowed compaction stage retains another unsettled budget attempt."
+                    )
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={storage_key: selected.model_dump(mode="json")},
+            )
+
+        async def load_prepared() -> _BorrowedAutomaticCompactionBudgetAuthority | None:
+            raw = await self._session_store.load_session_operation(session.id, storage_key)
+            if raw is None:
+                return None
+            try:
+                return _BorrowedAutomaticCompactionBudgetAuthority.model_validate(raw)
+            except Exception:
+                raise RuntimeError("Borrowed compaction budget authority is malformed.") from None
+
+        try:
+            await self._session_store.publish_session_operation(
+                session.id,
+                idempotency_key=storage_key,
+                operation_transform=prepare_operation,
+                events=[],
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=session.run_epoch,
+                expected_transcript_cursor=stage.source_transcript_cursor,
+            )
+        except BaseException as publication_failure:
+            try:
+                persisted = await load_prepared()
+            except BaseException as reconciliation_failure:
+                add_exception_note_safely(
+                    publication_failure,
+                    "Borrowed compaction budget-authority reconciliation also failed: "
+                    f"{type(reconciliation_failure).__name__}: {reconciliation_failure}",
+                )
+                raise publication_failure from reconciliation_failure
+            if persisted == candidate:
+                add_exception_note_safely(
+                    publication_failure,
+                    "Borrowed compaction budget authority is durable; provider dispatch was "
+                    "suppressed after acknowledgement failure.",
+                )
+                return publication_failure
+            raise
+        persisted = await load_prepared()
+        if persisted != candidate:
+            raise RuntimeError("Borrowed compaction budget authority changed after publication.")
+        return None
+
+    async def reconcile_borrowed_automatic_compaction_budget_authority(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        allow_outcome_unknown: bool = False,
+    ) -> list[Event]:
+        """Settle every reservation owned by the borrowed-stage companion record."""
+
+        if type(session) is not Session or type(stage) is not ModelCompletionStage:
+            raise TypeError("Borrowed compaction reconciliation requires a session and stage.")
+        if stage.session_id != session.id:
+            raise RuntimeError("Borrowed compaction stage belongs to another session.")
+        if type(allow_outcome_unknown) is not bool:
+            raise TypeError("allow_outcome_unknown must be a bool.")
+        if stage.purpose != "assistant-turn":
+            return []
+        storage_key = _borrowed_automatic_compaction_budget_operation_key(stage.stage_id)
+        raw = await self._session_store.load_session_operation(session.id, storage_key)
+        if raw is None:
+            return []
+        try:
+            authority = _BorrowedAutomaticCompactionBudgetAuthority.model_validate(raw)
+        except Exception:
+            raise RuntimeError("Borrowed compaction budget authority is malformed.") from None
+        if (
+            authority.session_id != session.id
+            or authority.stage_id != stage.stage_id
+            or authority.stage_preparation_digest != stage.preparation_digest
+        ):
+            raise RuntimeError("Borrowed compaction budget authority changed stage ownership.")
+        model_attempt_identity = ModelAttemptIdentity(
+            model_step_id=authority.model_step_id,
+            model_attempt_id=authority.model_attempt_id,
+        )
+        records: list[BudgetReservationRecord] = []
+        for reservation_id, context in zip(
+            authority.reservation_ids,
+            authority.recovery_contexts,
+            strict=True,
+        ):
+            raw_record = await self._budget_ledger.load_reservation(reservation_id)
+            if raw_record is None:
+                raise KeyError(f"Budget reservation not found: {reservation_id}")
+            record = _validate_ledger_reservation_against_recovery_context(
+                raw_record,
+                context=context,
+                dispatch_id=authority.model_attempt_id,
+            )
+            if (
+                record.budget_limit_id != context.budget_limit_id
+                or record.session_id != session.id
+                or record.agent_name != session.agent_name
+                or record.environment_name != session.environment_name
+                or record.provider_name != authority.pricing_provider_name
+                or record.model != authority.requested_model
+                or record.model_step_id != authority.model_step_id
+                or record.model_attempt_id != authority.model_attempt_id
+                or record.status not in {"active", "reconciled", "released"}
+            ):
+                raise RuntimeError(
+                    "Borrowed compaction recovery found conflicting reservation authority."
+                )
+            records.append(record)
+        provider_dispatch_possible = any(record.dispatch_id is not None for record in records)
+
+        events = await self.recover_pending_budget_settlements(session_id=session.id)
+        if authority.status == "pending":
+            for record, context in zip(records, authority.recovery_contexts, strict=True):
+                if record.status == "active" and record.dispatch_id is None:
+                    events = _merge_events_by_id(
+                        events,
+                        await self.release_pre_provider_dispatch_reservations(
+                            reservation_ids=(record.reservation_id,),
+                            recovery_contexts=(context,),
+                            dispatch_id=authority.model_attempt_id,
+                        ),
+                    )
+                elif record.status == "active":
+                    events = _merge_events_by_id(
+                        events,
+                        await self.reconcile_manual_model_completion_reservations(
+                            reservation_ids=(record.reservation_id,),
+                            recovery_contexts=(context,),
+                            session=session,
+                            provider_name=authority.pricing_provider_name,
+                            model=authority.requested_model,
+                            model_attempt_identity=model_attempt_identity,
+                            dispatch_id=authority.model_attempt_id,
+                            is_automatic_context_compaction=True,
+                        ),
+                    )
+                else:
+                    await self.require_model_completion_reservation_settlements(
+                        reservation_ids=(record.reservation_id,),
+                        recovery_contexts=(context,),
+                        dispatch_id=authority.model_attempt_id,
+                    )
+            events = _merge_events_by_id(
+                events,
+                await self.recover_pending_budget_settlements(session_id=session.id),
+            )
+        await self.require_model_completion_reservation_settlements(
+            reservation_ids=authority.reservation_ids,
+            recovery_contexts=authority.recovery_contexts,
+            dispatch_id=authority.model_attempt_id,
+        )
+
+        if authority.status == "settled":
+            return events
+        if provider_dispatch_possible and not allow_outcome_unknown:
+            raise BorrowedAutomaticCompactionOutcomeUnknown(
+                "The borrowed assistant stage retains an automatic-compaction dispatch "
+                "without a durably captured outcome. Explicit model-stage settlement is "
+                f"required before retrying: {stage.stage_id}"
+            )
+        settled = authority.model_copy(update={"status": "settled"})
+
+        def settle_operation(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current_record: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            if current_session.id != session.id or current_record is None:
+                raise SessionRunFenced(
+                    "Borrowed compaction budget authority disappeared during settlement."
+                )
+            try:
+                current = _BorrowedAutomaticCompactionBudgetAuthority.model_validate(current_record)
+            except Exception:
+                raise RuntimeError("Borrowed compaction budget authority is malformed.") from None
+            if current != authority and current != settled:
+                raise RuntimeError(
+                    "Borrowed compaction budget authority changed during settlement."
+                )
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={storage_key: settled.model_dump(mode="json")},
+            )
+
+        try:
+            await self._session_store.publish_session_operation(
+                session.id,
+                idempotency_key=storage_key,
+                operation_transform=settle_operation,
+                events=[],
+                expected_run_epoch=session.run_epoch,
+            )
+        except BaseException as publication_failure:
+            try:
+                persisted_raw = await self._session_store.load_session_operation(
+                    session.id,
+                    storage_key,
+                )
+                persisted = (
+                    None
+                    if persisted_raw is None
+                    else _BorrowedAutomaticCompactionBudgetAuthority.model_validate(persisted_raw)
+                )
+            except BaseException as reconciliation_failure:
+                add_exception_note_safely(
+                    publication_failure,
+                    "Borrowed compaction settlement reconciliation also failed: "
+                    f"{type(reconciliation_failure).__name__}: {reconciliation_failure}",
+                )
+                raise publication_failure from reconciliation_failure
+            if persisted == settled:
+                add_exception_note_safely(
+                    publication_failure,
+                    "Borrowed compaction budget settlement is durable despite acknowledgement "
+                    "failure.",
+                )
+            raise
+        persisted_raw = await self._session_store.load_session_operation(session.id, storage_key)
+        if (
+            persisted_raw is None
+            or _BorrowedAutomaticCompactionBudgetAuthority.model_validate(persisted_raw) != settled
+        ):
+            raise RuntimeError("Borrowed compaction budget settlement changed after publication.")
+        return events
+
+    async def reconcile_completed_automatic_compaction_reservations(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        recovery_contexts: tuple[BudgetReservationRecoveryContext, ...],
+        pricing_provider_name: str,
+        model: str,
+        model_attempt_identity: ModelAttemptIdentity,
+    ) -> list[Event]:
+        """Settle active reservations before a completed compaction is promoted."""
+
+        if type(session) is not Session or type(stage) is not ModelCompletionStage:
+            raise TypeError("Completed compaction recovery requires a session and stage.")
+        if (
+            stage.session_id != session.id
+            or stage.purpose != "context-compaction"
+            or stage.state != "completed"
+        ):
+            raise RuntimeError("Completed compaction recovery requires its active terminal stage.")
+        pricing_provider_name = require_clean_nonblank(
+            pricing_provider_name,
+            "pricing_provider_name",
+        )
+        model = require_clean_nonblank(model, "model")
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        if (
+            stage.logical_step_id != model_attempt_identity.model_step_id
+            or stage.intent.get("model_attempt_id") != model_attempt_identity.model_attempt_id
+        ):
+            raise RuntimeError("Completed compaction recovery changed its model-attempt authority.")
+        reservation_ids = stage.reservation_ids
+        if tuple(context.reservation_id for context in recovery_contexts) != reservation_ids:
+            raise ValueError("Completed compaction recovery lost its reservation authority.")
+        if not reservation_ids:
+            return []
+
+        # Validate the complete batch before mutating any member. A prior live
+        # settlement may have committed only a prefix/suffix around one failed
+        # reservation; those exact terminal records remain authoritative while
+        # active members use the established conservative recovery policy.
+        records: list[BudgetReservationRecord] = []
+        for reservation_id, context in zip(
+            reservation_ids,
+            recovery_contexts,
+            strict=True,
+        ):
+            raw_record = await self._budget_ledger.load_reservation(reservation_id)
+            if raw_record is None:
+                raise KeyError(f"Budget reservation not found: {reservation_id}")
+            record = _validate_ledger_reservation_against_recovery_context(
+                raw_record,
+                context=context,
+                dispatch_id=model_attempt_identity.model_attempt_id,
+            )
+            if (
+                record.session_id != session.id
+                or record.agent_name != session.agent_name
+                or record.environment_name != session.environment_name
+                or record.provider_name != pricing_provider_name
+                or record.model != model
+                or record.model_step_id != model_attempt_identity.model_step_id
+                or record.model_attempt_id != model_attempt_identity.model_attempt_id
+                or record.dispatch_id != model_attempt_identity.model_attempt_id
+                or record.status not in {"active", "reconciled"}
+            ):
+                raise RuntimeError(
+                    "Completed compaction recovery found conflicting reservation authority."
+                )
+            records.append(record)
+
+        events = await self.recover_pending_budget_settlements(session_id=session.id)
+        for record, context in zip(records, recovery_contexts, strict=True):
+            if record.status == "active":
+                events = _merge_events_by_id(
+                    events,
+                    await self.reconcile_manual_model_completion_reservations(
+                        reservation_ids=(record.reservation_id,),
+                        recovery_contexts=(context,),
+                        session=session,
+                        provider_name=pricing_provider_name,
+                        model=model,
+                        model_attempt_identity=model_attempt_identity,
+                        dispatch_id=model_attempt_identity.model_attempt_id,
+                        is_automatic_context_compaction=True,
+                    ),
+                )
+            else:
+                await self.require_model_completion_reservation_settlements(
+                    reservation_ids=(record.reservation_id,),
+                    recovery_contexts=(context,),
+                    dispatch_id=model_attempt_identity.model_attempt_id,
+                )
+        events = _merge_events_by_id(
+            events,
+            await self.recover_pending_budget_settlements(session_id=session.id),
+        )
+        await self.require_model_completion_reservation_settlements(
+            reservation_ids=reservation_ids,
+            recovery_contexts=recovery_contexts,
+            dispatch_id=model_attempt_identity.model_attempt_id,
+        )
+        return events
 
     def budget_settlement_time(self) -> datetime:
         """Return the accounting clock used by the configured budget ledger."""
@@ -2543,10 +3116,12 @@ class RunLimitController:
         recovery_contexts: tuple[BudgetReservationRecoveryContext, ...],
         session: Session,
         provider_name: str,
+        model: str,
         model_attempt_identity: ModelAttemptIdentity,
         dispatch_id: str,
+        is_automatic_context_compaction: bool = False,
     ) -> list[Event]:
-        """Conservatively settle an ambiguous synchronous model dispatch."""
+        """Conservatively settle an ambiguous model dispatch."""
 
         if type(reservation_ids) is not tuple:
             raise TypeError("reservation_ids must be a tuple.")
@@ -2561,8 +3136,11 @@ class RunLimitController:
         if type(session) is not Session:
             raise TypeError("session must be a Session.")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
+        model = require_clean_nonblank(model, "model")
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
+        if type(is_automatic_context_compaction) is not bool:
+            raise TypeError("is_automatic_context_compaction must be a bool.")
 
         records: list[BudgetReservationRecord] = []
         for reservation_id, context in zip(reservation_ids, recovery_contexts, strict=True):
@@ -2582,7 +3160,7 @@ class RunLimitController:
                 or record.agent_name != session.agent_name
                 or record.environment_name != session.environment_name
                 or record.provider_name != provider_name
-                or record.model != session.model
+                or record.model != model
                 or record.dispatch_id != dispatch_id
                 or record.status not in {"active", "reconciled"}
             ):
@@ -2622,10 +3200,13 @@ class RunLimitController:
                     )
 
             reconciliation = settlement.reconciliation
-            if reconciliation.reason not in {
+            accepted_reasons = {
                 UNKNOWN_POST_DISPATCH_BUDGET_REASON,
                 record.settlement_fallback.reconciliation_reason,
-            }:
+            }
+            if is_automatic_context_compaction:
+                accepted_reasons.add(AUTOMATIC_CONTEXT_COMPACTION_UNCERTAIN_USAGE_BUDGET_REASON)
+            if reconciliation.reason not in accepted_reasons:
                 raise RuntimeError(
                     "Manual model recovery found a conflicting budget settlement reason."
                 )
@@ -3355,6 +3936,15 @@ class RunLimitController:
         execution_profile_fingerprint: str | None = None,
         reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
         before_provider_dispatch: Callable[[], Awaitable[None]] | None = None,
+        before_reservations_dispatched: Callable[
+            [tuple[BudgetStepReservation, ...]], Awaitable[None]
+        ]
+        | None = None,
+        after_reservations_dispatched: Callable[
+            [tuple[BudgetStepReservation, ...]], Awaitable[BaseException | None]
+        ]
+        | None = None,
+        on_pre_provider_dispatch_failure: Callable[[BaseException], Awaitable[None]] | None = None,
     ) -> (
         BudgetedOperationSucceeded[_OperationResultT]
         | BudgetedOperationRejected
@@ -3470,10 +4060,27 @@ class RunLimitController:
                 async def run_dispatched_operation() -> _OperationResultT:
                     if before_provider_dispatch is not None:
                         await before_provider_dispatch()
+                    if before_reservations_dispatched is not None:
+                        await before_reservations_dispatched(tuple(lifecycle.reservations))
                     deferred_dispatch_failure = await self.mark_reservations_dispatched(
                         lifecycle.reservations,
                         dispatch_id=model_attempt_identity.model_attempt_id,
                     )
+                    lifecycle.reservation_dispatch_id = model_attempt_identity.model_attempt_id
+                    if deferred_dispatch_failure is not None:
+                        raise deferred_dispatch_failure
+                    if after_reservations_dispatched is not None:
+                        deferred_dispatch_failure = await after_reservations_dispatched(
+                            tuple(lifecycle.reservations)
+                        )
+                        if deferred_dispatch_failure is not None and not isinstance(
+                            deferred_dispatch_failure,
+                            BaseException,
+                        ):
+                            raise TypeError(
+                                "Automatic-compaction dispatch finalization returned an "
+                                "invalid deferred failure."
+                            )
                     lifecycle.provider_dispatch_started = True
                     if deferred_dispatch_failure is not None:
                         raise deferred_dispatch_failure
@@ -3497,9 +4104,28 @@ class RunLimitController:
             authoritative_failure = exc
             authoritative_cause = exception_cause(exc)
             if not lifecycle.provider_dispatch_started:
+                if on_pre_provider_dispatch_failure is not None:
+                    try:
+                        await on_pre_provider_dispatch_failure(authoritative_failure)
+                    except BaseException as cleanup_failure:
+                        if isinstance(cleanup_failure, asyncio.CancelledError) and not isinstance(
+                            authoritative_failure,
+                            asyncio.CancelledError,
+                        ):
+                            cleanup_failure.add_note(
+                                "Cancellation arrived while cleaning up an automatic-compaction "
+                                "pre-provider dispatch failure."
+                            )
+                            authoritative_cause = authoritative_failure
+                            authoritative_failure = cleanup_failure
+                        else:
+                            authoritative_failure.add_note(
+                                "Automatic-compaction pre-provider cleanup also failed: "
+                                f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                            )
                 lifecycle.predispatch_release_reason = (
                     "reservation setup cancelled"
-                    if isinstance(exc, asyncio.CancelledError)
+                    if isinstance(authoritative_failure, asyncio.CancelledError)
                     else "reservation setup failed"
                 )
 
@@ -3536,6 +4162,7 @@ class RunLimitController:
             )
             cancellation_cause: BaseException | None = None
             if settlement_failure is not None:
+                propagated_cancellation.__dict__["_cayu_compaction_budget_settlement_failed"] = True
                 propagated_cancellation.add_note(
                     "Automatic compaction budget settlement also failed: "
                     f"{type(settlement_failure).__name__}: {settlement_failure}"
@@ -3570,6 +4197,7 @@ class RunLimitController:
                     cause=settlement_failure,
                     events=tuple(lifecycle.events),
                 )
+            settlement_failure.__dict__["_cayu_compaction_budget_settlement_failed"] = True
             return BudgetedOperationFailed(
                 error=settlement_failure,
                 cause=None,
@@ -3672,17 +4300,45 @@ class RunLimitController:
             raise first_failure
 
         if not lifecycle.provider_dispatch_started:
-            for reservation in list(lifecycle.reservations):
+            if lifecycle.reservation_dispatch_id is not None:
                 try:
-                    working_reservations = [reservation]
-                    async for reconciliation in self.release_operation_reservations(
-                        working_reservations,
-                        reason=lifecycle.predispatch_release_reason,
-                    ):
-                        settlement = await self._load_committed_settlement(reconciliation)
-                        lifecycle.events.append(await self.publish_budget_settlement(settlement))
+                    lifecycle.events.extend(
+                        await self.release_pre_provider_dispatch_reservations(
+                            reservation_ids=tuple(
+                                reservation.record.reservation_id
+                                for reservation in lifecycle.reservations
+                            ),
+                            recovery_contexts=tuple(
+                                BudgetReservationRecoveryContext(
+                                    reservation_id=reservation.record.reservation_id,
+                                    budget_limit_id=reservation.record.budget_limit_id,
+                                    reservation_authority_sha256=(
+                                        budget_reservation_authority_sha256(reservation.record)
+                                    ),
+                                )
+                                for reservation in lifecycle.reservations
+                            ),
+                            dispatch_id=lifecycle.reservation_dispatch_id,
+                        )
+                    )
                 except Exception as exc:
-                    settlement_failures.append((reservation.record.reservation_id, exc))
+                    settlement_failures.append(
+                        (lifecycle.reservations[0].record.reservation_id, exc)
+                    )
+            else:
+                for reservation in list(lifecycle.reservations):
+                    try:
+                        working_reservations = [reservation]
+                        async for reconciliation in self.release_operation_reservations(
+                            working_reservations,
+                            reason=lifecycle.predispatch_release_reason,
+                        ):
+                            settlement = await self._load_committed_settlement(reconciliation)
+                            lifecycle.events.append(
+                                await self.publish_budget_settlement(settlement)
+                            )
+                    except Exception as exc:
+                        settlement_failures.append((reservation.record.reservation_id, exc))
             lifecycle.settled = True
             raise_settlement_failure()
             return
@@ -3700,10 +4356,7 @@ class RunLimitController:
                         uncertain_completion_count += 1
                 if not completed_events:
                     actual_amount = reservation.record.reserved_amount
-                    reason = (
-                        "automatic context compaction dispatch has uncertain usage; "
-                        "charged reserved amount"
-                    )
+                    reason = AUTOMATIC_CONTEXT_COMPACTION_UNCERTAIN_USAGE_BUDGET_REASON
                 else:
                     actual_amount = sum(
                         (priced.amount for priced in priced_actuals),

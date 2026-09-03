@@ -723,7 +723,10 @@ class StreamingRecordingTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ):
         self.calls.append(
             {
@@ -731,7 +734,10 @@ class StreamingRecordingTransport:
                 "headers": dict(headers),
                 "payload": dict(payload),
                 "timeout_s": timeout_s,
-                "stream_idle_timeout_s": stream_idle_timeout_s,
+                "transport_idle_timeout_s": transport_idle_timeout_s,
+                "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                "absolute_stream_timeout_s": absolute_stream_timeout_s,
             }
         )
         if not self.event_batches:
@@ -801,7 +807,31 @@ async def test_vertex_provider_streams_sse_events_incrementally() -> None:
     assert "model" not in call["payload"]
     assert call["payload"]["anthropic_version"] == "vertex-2023-10-16"
     assert call["headers"]["Authorization"] == "Bearer fake-token"
-    assert call["stream_idle_timeout_s"] == 120.0
+    assert call["transport_idle_timeout_s"] == 120.0
+    assert call["protocol_idle_timeout_s"] == 120.0
+    assert call["semantic_progress_timeout_s"] == 120.0
+    assert call["absolute_stream_timeout_s"] == 600.0
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_rejects_duplicate_content_block_start() -> None:
+    start = {
+        "type": "message_start",
+        "message": {"id": "msg_v1", "model": "claude-sonnet-4-6"},
+    }
+    block = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "tool_use", "id": "tool-1", "name": "read_file"},
+    }
+    transport = StreamingRecordingTransport(event_batches=[[start, block, block]])
+    provider = _provider(transport)
+
+    events = [event async for event in provider.runtime_stream(_request())]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error_type"] == "VertexProtocolError"
+    assert "provider_deadline_kind" not in events[0].payload
 
 
 @pytest.mark.anyio
@@ -1301,11 +1331,11 @@ async def test_runtime_does_not_retry_conflicting_buffered_vertex_identity(
     assert events[-1].type == EventType.SESSION_FAILED
 
 
-def test_vertex_provider_rejects_invalid_stream_idle_timeout() -> None:
-    with pytest.raises(ValueError, match="stream_idle_timeout_s"):
-        _provider(FailingTransport(), stream_idle_timeout_s=0)
-    with pytest.raises(TypeError, match="stream_idle_timeout_s"):
-        _provider(FailingTransport(), stream_idle_timeout_s="60")
+def test_vertex_provider_rejects_invalid_transport_idle_timeout() -> None:
+    with pytest.raises(ValueError, match="transport_idle_timeout_s"):
+        _provider(FailingTransport(), transport_idle_timeout_s=0)
+    with pytest.raises(TypeError, match="transport_idle_timeout_s"):
+        _provider(FailingTransport(), transport_idle_timeout_s="60")
 
 
 @pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf"), 10**1000])

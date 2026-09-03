@@ -6,7 +6,7 @@ import json
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
@@ -70,6 +70,7 @@ from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
@@ -4378,6 +4379,73 @@ def _identify_compaction_dispatch_failure(
             error.__dict__["rejected_usage_payload"] = identified_payload
 
 
+async def _await_owned_compaction_provider_stream(
+    operation: Awaitable[tuple[str, dict[str, Any]]],
+) -> tuple[str, dict[str, Any]]:
+    """Settle one governed stream without losing caller cancellation identity.
+
+    The governed provider boundary deliberately replaces provider-visible
+    cancellation details with a credential-safe projection. Automatic
+    compaction still needs the original caller cancellation as the authority
+    carried through durable completion and budget settlement. Keep that signal
+    in this runtime-owned task and send only a generic cancellation into the
+    opaque provider child, then wait until the governed child has actually
+    settled before returning control to accounting.
+    """
+
+    owner_task = asyncio.current_task()
+    if owner_task is None:  # pragma: no cover - coroutine execution invariant
+        raise RuntimeError("Automatic compaction requires an owning task.")
+    cancellation_requests = owner_task.cancelling()
+    provider_task = asyncio.ensure_future(operation)
+    caller_cancellation: asyncio.CancelledError | None = None
+    try:
+        while True:
+            try:
+                result = await asyncio.shield(provider_task)
+            except asyncio.CancelledError as exc:
+                current_requests = owner_task.cancelling()
+                if current_requests > cancellation_requests:
+                    cancellation_requests = current_requests
+                    if caller_cancellation is None:
+                        caller_cancellation = exc
+                    else:
+                        caller_cancellation.add_note(
+                            "Automatic compaction provider settlement received an "
+                            "additional caller cancellation request."
+                        )
+                    if not provider_task.done():
+                        provider_task.cancel("Automatic compaction provider cancelled")
+                    continue
+                if caller_cancellation is not None:
+                    raise caller_cancellation from None
+                if provider_task.done():
+                    return provider_task.result()
+                raise
+            except BaseException as provider_failure:
+                if caller_cancellation is None:
+                    raise
+                if isinstance(provider_failure, (GeneratorExit, KeyboardInterrupt, SystemExit)):
+                    raise provider_failure from caller_cancellation
+                raise caller_cancellation from provider_failure
+            if caller_cancellation is not None:
+                raise caller_cancellation
+            return result
+    finally:
+        if not provider_task.done():
+            provider_task.cancel("Automatic compaction provider owner terminated")
+            provider_task.add_done_callback(_consume_compaction_provider_task_outcome)
+
+
+def _consume_compaction_provider_task_outcome(
+    task: asyncio.Future[tuple[str, dict[str, Any]]],
+) -> None:
+    """Consume a retained compactor task after process-control abandonment."""
+
+    with suppress(BaseException):
+        task.result()
+
+
 async def _run_compaction_model(
     *,
     provider: ModelProvider,
@@ -4519,12 +4587,14 @@ async def _run_compaction_model(
         dispatch_started = True
         provider_failure: ProviderExceptionControl | None = None
         try:
-            summary, completed_metadata = await _stream_compaction_model(
-                provider=provider,
-                provider_name=provider_name,
-                model_request=_detach_compaction_model_request(request_template),
-                usage_dialect=usage_dialect,
-                observe_completion=observe_completion_with_billing_identity,
+            summary, completed_metadata = await _await_owned_compaction_provider_stream(
+                _stream_compaction_model(
+                    provider=provider,
+                    provider_name=provider_name,
+                    model_request=_detach_compaction_model_request(request_template),
+                    usage_dialect=usage_dialect,
+                    observe_completion=observe_completion_with_billing_identity,
+                )
             )
         except (
             _CompactionCompletionValueError,
@@ -4572,6 +4642,7 @@ async def _run_compaction_model(
     try:
         attempt = 1
         terminal_dispatch_error: BaseException | None = None
+        terminal_dispatch_cause: BaseException | None = None
         while True:
             dispatch_started = False
             dispatch_model_attempt_identity = None
@@ -4760,6 +4831,13 @@ async def _run_compaction_model(
                         failure.__dict__["_cayu_compaction_budget_settlement_failed"] = True
                         if isinstance(failure, ModelProviderError):
                             failure.retryable = False
+                        terminal_dispatch_cause = exception_cause(exc)
+                        if terminal_dispatch_cause is not None:
+                            failure.add_note(
+                                "Automatic compaction budget settlement also failed: "
+                                f"{type(terminal_dispatch_cause).__name__}: "
+                                f"{terminal_dispatch_cause}"
+                            )
                         terminal_dispatch_error = failure
                         break
                     provider_error = failure if isinstance(failure, ModelProviderError) else None
@@ -4791,7 +4869,7 @@ async def _run_compaction_model(
                 raise billing_dispatch_cancellation
         if terminal_dispatch_error is not None:
             del provider
-            raise terminal_dispatch_error from None
+            raise terminal_dispatch_error from terminal_dispatch_cause
         raise RuntimeError("Compaction dispatch exited without a result.")
     finally:
         if completion_ledger_token is not None:
@@ -4813,7 +4891,7 @@ async def _stream_compaction_model(
     tool_call_failure: _CompactionToolCallError | None = None
     completed_dispatch_failure: _ProviderDispatchFailed | None = None
     try:
-        async for raw_event in provider.stream(model_request):
+        async for raw_event in provider.runtime_stream(model_request):
             event = _copy_compaction_stream_event_for_accounting(raw_event)
             if completed_payload is not None:
                 raise RuntimeError(
@@ -4877,6 +4955,12 @@ async def _stream_compaction_model(
         raise
     except Exception as exc:
         del provider
+        if isinstance(exc, ModelStreamDeadlineError):
+            # A deadline remains authoritative even after the exact cache-prefix
+            # request emitted a forbidden tool call. Reclassifying it as ordinary
+            # tool-call degradation would authorize another provider dispatch
+            # while the timed-out operation's outcome is still unknown.
+            raise
         if isinstance(
             exc,
             (_CompactionCompletionValueError, _CompactionCompletionObservationError),
@@ -5287,6 +5371,14 @@ def _failed_compaction_provider_attempt_payload(
             "usage_unavailable_reason": unavailable_reason,
         }
     )
+    if isinstance(error, ModelStreamDeadlineError):
+        # Keep the exact runtime-owned deadline claim alongside accounting
+        # evidence. The completion event sanitizer intentionally retains only
+        # accounting fields; the model-step owner uses these fields to publish
+        # separate durable recovery evidence before propagating the deadline.
+        payload.update(
+            {key: value for key, value in error.error_payload_fields().items() if key != "provider"}
+        )
     return payload
 
 

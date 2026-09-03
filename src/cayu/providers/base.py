@@ -35,6 +35,16 @@ from cayu.core.messages import (
     detach_message,
 )
 from cayu.providers.cache import CachePolicy, RequestCacheProjection
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderProgressKind,
+    ProviderStreamDeadlineController,
+    ProviderStreamDeadlineEvidence,
+    ProviderStreamDeadlineExceeded,
+    ProviderStreamDeadlines,
+    bind_provider_deadline_controller,
+    reset_provider_deadline_controller,
+)
 from cayu.providers.hosted import (
     HostedToolCapabilityError,
     OpenAIWebSearch,
@@ -380,6 +390,56 @@ class ModelProviderError(RuntimeError):
             payload["retryable"] = self.retryable
         if self.retry_after_s is not None:
             payload["retry_after_s"] = self.retry_after_s
+        return payload
+
+
+MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION = "manual_settlement_required"
+EXACT_MODEL_STREAM_RECOVERY_DISPOSITION = "reattach_exact_operation"
+ModelStreamRecoveryDisposition = Literal["manual_settlement_required", "reattach_exact_operation"]
+
+
+class ModelStreamDeadlineError(ModelProviderError):
+    """Typed content-free expiry of one dispatched model stream."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        evidence: ProviderStreamDeadlineEvidence,
+        stream_cleanup_failed: bool = False,
+        recovery_disposition: ModelStreamRecoveryDisposition = (
+            MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION
+        ),
+    ) -> None:
+        if type(evidence) is not ProviderStreamDeadlineEvidence:
+            raise TypeError("evidence must be ProviderStreamDeadlineEvidence.")
+        if type(stream_cleanup_failed) is not bool:
+            raise TypeError("stream_cleanup_failed must be a bool.")
+        if recovery_disposition not in {
+            MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION,
+            EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
+        }:
+            raise ValueError("recovery_disposition is unsupported.")
+        self.deadline_evidence = evidence
+        self.stream_cleanup_failed = stream_cleanup_failed
+        self.recovery_disposition = recovery_disposition
+        super().__init__(
+            f"Model provider stream exceeded its {evidence.deadline_kind.value} deadline.",
+            provider=provider,
+            error_type="ModelStreamDeadlineError",
+            error_code=f"provider_stream_{evidence.deadline_kind.value}_timeout",
+            retryable=False,
+        )
+
+    def error_payload_fields(self) -> dict[str, Any]:
+        payload = {
+            **super().error_payload_fields(),
+            **self.deadline_evidence.payload(),
+            "provider_effect_outcome": "unknown",
+            "provider_recovery_disposition": self.recovery_disposition,
+        }
+        if self.stream_cleanup_failed:
+            payload["stream_cleanup_failed"] = True
         return payload
 
 
@@ -1245,6 +1305,25 @@ class ModelProvider(ABC):
     """
 
     @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        """Return immutable dispatch deadlines for this provider."""
+
+        return ProviderStreamDeadlines()
+
+    def runtime_stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        """Open the governed model-attempt stream.
+
+        Runtime, application, example, and conformance callers must use this
+        entrance so normalized semantic and absolute deadlines also guard
+        opaque custom providers. Transparent provider wrappers must override
+        this entrance and delegate to the wrapped provider's ``runtime_stream``;
+        forwarding only the raw ``stream`` hook would add an opaque outer guard
+        that cannot trust terminal evidence accepted by the wrapped adapter.
+        """
+
+        return _runtime_provider_stream(self, request)
+
+    @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
         """Optional application-versioned identity for opaque adapter behavior."""
 
@@ -1472,7 +1551,10 @@ class ModelProvider(ABC):
 
     @abstractmethod
     def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        """Stream model events for one request.
+        """Implement the provider's raw, ungoverned adapter stream hook.
+
+        Direct calls bypass the provider-neutral normalized deadline guard.
+        Governed model attempts must call :meth:`runtime_stream` instead.
 
         Error contract: `ModelContextOverflowError` must propagate as an
         exception (never be flattened into an error event) so runtime
@@ -1480,3 +1562,139 @@ class ModelProvider(ABC):
         should surface as `ModelStreamEvent.error(message, cause=exc)` events
         so typed classification fields survive into the runtime payload.
         """
+
+
+_TERMINAL_PRESERVING_PROVIDER_STREAM = "__cayu_terminal_preserving_provider_stream__"
+
+
+def _terminal_preserving_provider_stream(
+    method: Callable[..., AsyncIterator[ModelStreamEvent]],
+) -> Callable[..., AsyncIterator[ModelStreamEvent]]:
+    """Mark a bundled stream that preserves accepted terminal cancellation.
+
+    The marker is attached to the concrete method rather than its provider
+    class so an extension that overrides ``stream()`` falls back to the opaque
+    provider guard unless it deliberately establishes the same contract.
+    """
+
+    setattr(method, _TERMINAL_PRESERVING_PROVIDER_STREAM, True)
+    return method
+
+
+def _normalized_provider_progress_kind(
+    event: ModelStreamEvent,
+) -> ProviderProgressKind | None:
+    if event.type is ModelStreamEventType.TEXT_DELTA:
+        return ProviderProgressKind.CONTENT if event.delta else None
+    if event.type is ModelStreamEventType.THINKING:
+        return (
+            ProviderProgressKind.REASONING
+            if event.delta or bool(event.payload.get("provider_state"))
+            else None
+        )
+    if event.type is ModelStreamEventType.TOOL_CALL:
+        return ProviderProgressKind.TOOL_CALL
+    if event.type is ModelStreamEventType.HOSTED_TOOL_CALL:
+        return ProviderProgressKind.HOSTED_TOOL
+    if event.type is ModelStreamEventType.CITATION:
+        return ProviderProgressKind.CITATION
+    if event.type is ModelStreamEventType.COMPLETED:
+        return ProviderProgressKind.TERMINAL
+    return None
+
+
+def _accepted_terminal_stream_event(event: object) -> bool:
+    """Recognize the sole bundled result trusted after read cancellation."""
+
+    return isinstance(event, ModelStreamEvent) and event.type is ModelStreamEventType.COMPLETED
+
+
+async def _guard_normalized_provider_stream(
+    events: AsyncIterator[ModelStreamEvent],
+    *,
+    provider: str,
+    deadlines: ProviderStreamDeadlines,
+    controller: ProviderStreamDeadlineController | None = None,
+    preserves_terminal_on_cancellation: bool = False,
+) -> AsyncIterator[ModelStreamEvent]:
+    # Import lazily because the credential boundary depends on the public base
+    # types defined in this module.
+    from cayu.providers._credential_boundary import aclosing_provider_stream
+
+    owns_controller = controller is None
+    if controller is None:
+        controller = ProviderStreamDeadlineController(deadlines)
+    elif controller.deadlines != deadlines:
+        raise ValueError("Provider stream deadline policy changed after dispatch admission.")
+    try:
+        iterator = events.__aiter__()
+        async with aclosing_provider_stream(iterator) as raw_guarded:
+            guarded = cast("AsyncIterator[ModelStreamEvent]", raw_guarded)
+            try:
+                while True:
+                    token = bind_provider_deadline_controller(controller)
+                    try:
+                        event = await controller.wait_for(
+                            guarded.__anext__(),
+                            kinds=(
+                                ProviderDeadlineKind.SEMANTIC_IDLE,
+                                ProviderDeadlineKind.ABSOLUTE,
+                            ),
+                            accept_cancelled_result=(
+                                _accepted_terminal_stream_event
+                                if preserves_terminal_on_cancellation
+                                else None
+                            ),
+                        )
+                    except StopAsyncIteration:
+                        return
+                    finally:
+                        reset_provider_deadline_controller(token)
+                    progress = _normalized_provider_progress_kind(event)
+                    if progress is not None:
+                        controller.observe_semantic(progress)
+                    pause_started = controller.idle_pause_started()
+                    yield event
+                    controller.exclude_idle_pause(
+                        pause_started,
+                        kinds=(ProviderDeadlineKind.SEMANTIC_IDLE,),
+                    )
+            except ProviderStreamDeadlineExceeded as exc:
+                raise ModelStreamDeadlineError(
+                    provider=provider,
+                    evidence=exc.evidence,
+                    stream_cleanup_failed=exc.stream_cleanup_failed,
+                ) from None
+    finally:
+        if owns_controller:
+            controller.close()
+
+
+async def _runtime_provider_stream(
+    provider: ModelProvider,
+    request: ModelRequest,
+) -> AsyncIterator[ModelStreamEvent]:
+    """Reserve deadline-read ownership before entering provider code."""
+
+    # Import lazily because the credential boundary depends on this module.
+    from cayu.providers._credential_boundary import aclosing_provider_stream
+
+    deadlines = provider.stream_deadlines
+    controller = ProviderStreamDeadlineController(deadlines)
+    try:
+        events = provider.stream(request)
+        preserves_terminal_on_cancellation = (
+            getattr(provider.stream, _TERMINAL_PRESERVING_PROVIDER_STREAM, False) is True
+        )
+        guarded = _guard_normalized_provider_stream(
+            events,
+            provider=provider.name,
+            deadlines=deadlines,
+            controller=controller,
+            preserves_terminal_on_cancellation=preserves_terminal_on_cancellation,
+        )
+        async with aclosing_provider_stream(guarded):
+            async for event in guarded:
+                yield event
+    finally:
+        controller.close()

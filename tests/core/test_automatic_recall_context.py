@@ -25,6 +25,7 @@ from cayu import (
     ScriptedModelProvider,
     StructuredOutputSpec,
 )
+from cayu._exception_groups import iter_exception_tree
 from cayu._validation import canonical_durable_json_bytes
 from cayu.core.agents import AgentSpec
 from cayu.core.messages import (
@@ -45,6 +46,7 @@ from cayu.providers import (
     ModelContextOverflowError,
     ModelProvider,
     ModelProviderError,
+    ModelStreamDeadlineError,
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
@@ -54,6 +56,11 @@ from cayu.providers import (
     ProviderOperationStatus,
 )
 from cayu.providers.base import ModelRequest
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineEvidence,
+    ProviderStreamDeadlines,
+)
 from cayu.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
@@ -1830,6 +1837,191 @@ def test_runtime_records_distinct_exposures_for_automatic_recall_retry() -> None
         assert recovered_terminal is not None
         assert recovered_terminal.state is ContextExposureState.FAILED
         assert knowledge.search_count == 1
+
+    asyncio.run(run())
+
+
+def test_runtime_records_stream_deadline_exposure_as_indeterminate() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-stream-deadline",
+                namespace="project:cayu",
+                text="Atlas stream deadline evidence says Friday.",
+            )
+        )
+        deadline = ModelStreamDeadlineError(
+            provider="scripted",
+            evidence=ProviderStreamDeadlineEvidence(
+                deadline_kind=ProviderDeadlineKind.SEMANTIC_IDLE,
+                configured_timeout_s=30,
+                elapsed_s=31,
+                last_progress_kind=None,
+                last_progress_elapsed_s=None,
+                last_progress_at=None,
+            ),
+        )
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.error(str(deadline), cause=deadline),
+                ModelStreamEvent.completed({"finish_reason": "error"}),
+            ]
+        )
+        app = CayuApp(
+            session_store=sessions,
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        with pytest.raises(ModelStreamDeadlineError):
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-stream-deadline",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            ):
+                pass
+
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-stream-deadline")
+            )
+        ).items
+        assert len(provider.requests) == 1
+        assert len(exposures) == 1
+        assert exposures[0].state is ContextExposureState.INDETERMINATE
+        assert [transition.state for transition in exposures[0].transitions] == [
+            ContextExposureState.PLANNED,
+            ContextExposureState.PREPARED,
+            ContextExposureState.DISPATCH_STARTED,
+            ContextExposureState.INDETERMINATE,
+        ]
+        assert (
+            exposures[0].transitions[-1].evidence_kind
+            is ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT
+        )
+
+    asyncio.run(run())
+
+
+def test_runtime_preserves_stream_deadline_when_exposure_terminalization_fails() -> None:
+    class IndeterminateExposureFailingStore(_CountingSessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.transition_failures = [
+                RuntimeError("context exposure deadline terminalization failed"),
+                RuntimeError("context exposure deadline terminalization replay failed"),
+            ]
+            self.failure_count = 0
+
+        async def transition_context_exposure(self, session_id, exposure_id, request):
+            if request.state is ContextExposureState.INDETERMINATE and self.failure_count < len(
+                self.transition_failures
+            ):
+                failure = self.transition_failures[self.failure_count]
+                self.failure_count += 1
+                raise failure
+            return await super().transition_context_exposure(session_id, exposure_id, request)
+
+    class BlockingDeadlineProvider(ModelProvider):
+        name = "automatic-recall-deadline"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        @property
+        def stream_deadlines(self) -> ProviderStreamDeadlines:
+            return ProviderStreamDeadlines(
+                transport_idle_timeout_s=1,
+                protocol_idle_timeout_s=1,
+                semantic_progress_timeout_s=0.01,
+                absolute_stream_timeout_s=1,
+            )
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            await asyncio.Event().wait()
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> None:
+        sessions = IndeterminateExposureFailingStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-stream-deadline-terminalization",
+                namespace="project:cayu",
+                text="Atlas stream deadline evidence says Friday.",
+            )
+        )
+        provider = BlockingDeadlineProvider()
+        session_id = "automatic-recall-deadline-terminalization-failure"
+        app = CayuApp(
+            session_store=sessions,
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        with pytest.raises(ExceptionGroup) as caught:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            ):
+                pass
+
+        leaves = [
+            failure
+            for failure in iter_exception_tree(caught.value)
+            if not isinstance(failure, BaseExceptionGroup)
+        ]
+        deadlines = [failure for failure in leaves if isinstance(failure, ModelStreamDeadlineError)]
+        assert len(leaves) == 2
+        assert len(deadlines) == 1
+        assert sum(failure is sessions.transition_failures[0] for failure in leaves) == 1
+        assert sessions.failure_count == 2
+        assert len(provider.requests) == 1
+        active = await sessions.load_active_model_completion_stage(session_id)
+        assert active is not None and active.stage.state == "in_flight"
+        exposures = (
+            await sessions.list_context_exposures(RecallEvidenceQuery(session_id=session_id))
+        ).items
+        assert len(exposures) == 1
+        assert exposures[0].state is ContextExposureState.DISPATCH_STARTED
 
     asyncio.run(run())
 

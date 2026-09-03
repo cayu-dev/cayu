@@ -341,7 +341,10 @@ def live_provider(provider_name: str | None = None) -> tuple[ModelProvider, str]
                 base_url=GEMINI_BASE_URL,
                 document_encoding="image_url",
                 timeout_s=60,
-                stream_idle_timeout_s=30,
+                transport_idle_timeout_s=30,
+                protocol_idle_timeout_s=30,
+                semantic_progress_timeout_s=30,
+                absolute_stream_timeout_s=300,
             ),
             os.environ.get("CAYU_GEMINI_MODEL", "gemini-3.1-flash-lite"),
         )

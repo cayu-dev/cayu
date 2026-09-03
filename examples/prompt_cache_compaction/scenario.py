@@ -55,6 +55,7 @@ from cayu.providers import (
     ModelStreamEvent,
     RequestCacheProjection,
 )
+from cayu.providers._credential_boundary import aclosing_provider_stream
 
 RETENTION_TOKEN = "CACHE_RETENTION_OK"
 _CACHE_COMPACTION_INSTRUCTION = (
@@ -84,6 +85,10 @@ class RecordingProvider(ModelProvider):
     def context_pressure_profile(self):
         return self.delegate.context_pressure_profile
 
+    @property
+    def stream_deadlines(self):
+        return self.delegate.stream_deadlines
+
     def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
         return self.delegate.request_cache_policy(request)
 
@@ -101,6 +106,16 @@ class RecordingProvider(ModelProvider):
 
     async def count_input_tokens(self, request: ModelRequest):
         return await self.delegate.count_input_tokens(request)
+
+    async def runtime_stream(
+        self,
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request.model_copy(deep=True))
+        events = self.delegate.runtime_stream(request)
+        async with aclosing_provider_stream(events):
+            async for event in events:
+                yield event
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         self.requests.append(request.model_copy(deep=True))

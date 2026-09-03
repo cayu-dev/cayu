@@ -533,6 +533,10 @@ class _RecordedProvider(ModelProvider):
         return self._source.context_pressure_profile
 
     @property
+    def stream_deadlines(self):
+        return self._source.stream_deadlines
+
+    @property
     def provider_operation_mode(self) -> ProviderOperationMode:
         return ProviderOperationMode.SYNCHRONOUS
 

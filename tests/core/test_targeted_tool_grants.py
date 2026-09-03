@@ -329,9 +329,20 @@ class _NativeOpenAITransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
-        del url, headers, timeout_s, stream_idle_timeout_s
+        del (
+            url,
+            headers,
+            timeout_s,
+            transport_idle_timeout_s,
+            protocol_idle_timeout_s,
+            semantic_progress_timeout_s,
+            absolute_stream_timeout_s,
+        )
         self.calls.append(dict(payload))
         if (self.retry_first or self.overflow_first) and len(self.calls) == 1:
             status_code = 503 if self.retry_first else 400
@@ -470,9 +481,20 @@ class _GatewayHistoryEchoOpenAITransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
-        del url, headers, timeout_s, stream_idle_timeout_s
+        del (
+            url,
+            headers,
+            timeout_s,
+            transport_idle_timeout_s,
+            protocol_idle_timeout_s,
+            semantic_progress_timeout_s,
+            absolute_stream_timeout_s,
+        )
         copied = dict(payload)
         self.calls.append(copied)
         if len(self.calls) == 1:
@@ -576,9 +598,20 @@ class _FinalOpenAITransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
-        del url, headers, timeout_s, stream_idle_timeout_s
+        del (
+            url,
+            headers,
+            timeout_s,
+            transport_idle_timeout_s,
+            protocol_idle_timeout_s,
+            semantic_progress_timeout_s,
+            absolute_stream_timeout_s,
+        )
         self.calls.append(dict(payload))
         yield {"type": "response.output_text.delta", "delta": "done"}
         yield {

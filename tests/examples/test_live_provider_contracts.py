@@ -396,6 +396,10 @@ def test_tool_result_projection_recording_provider_forwards_request_analysis_hoo
     delegate = tool_result_projection_live.AnthropicProvider(
         api_key="test-key",
         max_tokens=321,
+        transport_idle_timeout_s=11,
+        protocol_idle_timeout_s=12,
+        semantic_progress_timeout_s=13,
+        absolute_stream_timeout_s=14,
         cache_policy=CachePolicy(
             breakpoints=(
                 CacheBreakpoint.SYSTEM_PROMPT,
@@ -423,6 +427,44 @@ def test_tool_result_projection_recording_provider_forwards_request_analysis_hoo
     assert provider.request_fingerprint_options(request) == delegate.request_fingerprint_options(
         request
     )
+    assert provider.stream_deadlines == delegate.stream_deadlines
+    assert (
+        type(provider).runtime_stream
+        is tool_result_projection_live.RecordingProvider.runtime_stream
+    )
+
+
+@pytest.mark.anyio
+async def test_tool_result_projection_recording_provider_closes_runtime_delegate() -> None:
+    class ClosingDelegate(ModelProvider):
+        name = "closing-delegate"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def runtime_stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            try:
+                yield ModelStreamEvent.text_delta("partial")
+            finally:
+                self.closed = True
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield ModelStreamEvent.text_delta("raw")
+
+    delegate = ClosingDelegate()
+    events = tool_result_projection_live.RecordingProvider(delegate).runtime_stream(
+        ModelRequest(model="test-model", messages=[Message.text("user", "Hello")])
+    )
+
+    assert (await anext(events)).delta == "partial"
+    await events.aclose()
+
+    assert delegate.closed is True
 
 
 class _ProjectionLiveProvider(ModelProvider):

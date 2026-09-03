@@ -23,6 +23,8 @@ from cayu.core.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.providers import (
+    ModelProviderError,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
     ModelStreamEventType,
     ProviderOperationRecoveryMetadata,
@@ -31,10 +33,12 @@ from cayu.providers import (
     ProviderOperationStatus,
     copy_model_stream_event,
 )
+from cayu.providers.base import EXACT_MODEL_STREAM_RECOVERY_DISPOSITION
 from cayu.providers.operations import (
     PROVIDER_OPERATION_ID_MAX_CHARS,
     PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS,
 )
+from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.runtime.approvals import (
     ResolutionActor,
     copy_resolution_actor,
@@ -101,6 +105,28 @@ _PROVIDER_OPERATION_PROGRESS_EVENT_TYPES = (
     EventType.MODEL_ERROR,
     EventType.MODEL_COMPLETED,
     EventType.PROVIDER_OPERATION_PROGRESS,
+)
+_PROVIDER_OPERATION_DEADLINE_CONTROL_FIELDS = frozenset(
+    {
+        "provider",
+        "status_code",
+        "error_code",
+        "provider_error_type",
+        "provider_error_code",
+        "request_id",
+        "retryable",
+        "retry_after_s",
+        "context_overflow",
+        "provider_deadline_kind",
+        "provider_deadline_timeout_s",
+        "provider_stream_elapsed_s",
+        "provider_last_progress_kind",
+        "provider_last_progress_elapsed_s",
+        "provider_last_progress_at",
+        "provider_effect_outcome",
+        "provider_recovery_disposition",
+        "stream_cleanup_failed",
+    }
 )
 _PROVIDER_OPERATION_PROGRESS_RECORD_TYPE = "cayu.provider-operation-progress"
 _PROVIDER_OPERATION_PROGRESS_SCHEMA_VERSION = 1
@@ -857,6 +883,43 @@ def _provider_operation_progress_record(
     )
 
 
+def _is_exact_operation_deadline_diagnostic(
+    event: Event,
+    *,
+    provider: str,
+) -> bool:
+    """Distinguish a runtime deadline diagnostic from provider cursor progress."""
+
+    if (
+        event.type is not EventType.MODEL_ERROR
+        or "provider_operation_progress" in event.payload
+        or event.payload.get("error_type") != "ModelStreamDeadlineError"
+        or event.payload.get("provider") != provider
+    ):
+        return False
+    reconstructed: ModelProviderError | None = model_provider_error_from_payload(
+        event.payload,
+        fallback_provider=provider,
+        fallback_message="Provider operation exceeded its stream deadline.",
+    )
+    if (
+        type(reconstructed) is not ModelStreamDeadlineError
+        or reconstructed.recovery_disposition != EXACT_MODEL_STREAM_RECOVERY_DISPOSITION
+        or event.payload.get("error") != str(reconstructed)
+    ):
+        return False
+    expected = reconstructed.error_payload_fields()
+    observed_control = {
+        key: event.payload[key]
+        for key in _PROVIDER_OPERATION_DEADLINE_CONTROL_FIELDS
+        if key in event.payload
+    }
+    expected_control = {
+        key: expected[key] for key in _PROVIDER_OPERATION_DEADLINE_CONTROL_FIELDS if key in expected
+    }
+    return observed_control == expected_control
+
+
 def _parse_progress_envelope(event: Event) -> ProviderOperationProgressEnvelope:
     try:
         return ProviderOperationProgressEnvelope.model_validate(
@@ -1158,6 +1221,11 @@ async def _load_accepted_provider_operation_progress(
                 stage=stage,
                 label="Provider-operation progress evidence",
             )
+            if _is_exact_operation_deadline_diagnostic(
+                event,
+                provider=operation.provider,
+            ):
+                continue
             envelope = _parse_progress_envelope(event)
             if (
                 envelope.state_version != operation.state.version
@@ -1367,6 +1435,11 @@ async def load_recoverable_provider_operation(
                 stage=stage,
                 label="Provider-operation output evidence",
             )
+            if _is_exact_operation_deadline_diagnostic(
+                output_event,
+                provider=latest.provider,
+            ):
+                continue
             if (
                 output_event.type == EventType.MODEL_ATTEMPT_DISCARDED
                 or output_event.payload.get("provider_operation_progress") is None

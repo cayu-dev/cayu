@@ -23,6 +23,7 @@ from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamDeadlineError,
     ModelStreamEvent,
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
@@ -58,6 +59,13 @@ from cayu.providers.chat_completions import (
     HttpxChatCompletionsTransport,
     build_chat_completions_payload,
     chat_completions_stream_events,
+)
+from cayu.providers.deadlines import (
+    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    ProviderDeadlineKind,
+    ProviderProgressKind,
+    ProviderStreamDeadlineEvidence,
+    ProviderStreamDeadlines,
 )
 from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 from cayu.providers.openai import (
@@ -113,6 +121,7 @@ from cayu.providers.vertex import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS",
     "DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL",
     "PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES",
     "AnthropicAPIError",
@@ -150,6 +159,7 @@ __all__ = [
     "ModelProvider",
     "ModelProviderError",
     "ModelRequest",
+    "ModelStreamDeadlineError",
     "ModelStreamEvent",
     "ModelStreamEventType",
     "NativeStructuredOutputSchemaInvalid",
@@ -166,6 +176,7 @@ __all__ = [
     "OpenAISubscriptionProvider",
     "OpenAITransport",
     "OpenAIWebSearch",
+    "ProviderDeadlineKind",
     "ProviderOperationAdapter",
     "ProviderOperationCancellationSupport",
     "ProviderOperationConnection",
@@ -178,6 +189,9 @@ __all__ = [
     "ProviderOperationStartRequest",
     "ProviderOperationState",
     "ProviderOperationStatus",
+    "ProviderProgressKind",
+    "ProviderStreamDeadlineEvidence",
+    "ProviderStreamDeadlines",
     "RequestCacheProjection",
     "TargetedToolProjectionRequest",
     "ToolDiscoveryProjectionRequest",

@@ -17,7 +17,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextvars import Context
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal, Never, cast
@@ -143,13 +143,21 @@ from cayu.providers._credential_boundary import (
 )
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
+    EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
+    MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION,
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
+    ModelStreamDeadlineError,
     TargetedToolProjectionRequest,
     ToolDiscoveryProjectionRequest,
     ToolDiscoveryProjectionResult,
     copy_model_completion,
+)
+from cayu.providers.deadlines import (
+    ProviderStreamDeadlineAdmission,
+    bind_provider_deadline_admission,
+    reset_provider_deadline_admission,
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
@@ -184,6 +192,7 @@ from cayu.runtime._model_errors import (
     nonportable_model_provider_error,
     resolve_completion_billing_identity,
     resolve_request_billing_identity,
+    runtime_owned_model_stream_error_event,
 )
 from cayu.runtime._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
@@ -198,6 +207,7 @@ from cayu.runtime._run_limit_accounting import (
 from cayu.runtime._run_limits import (
     UNKNOWN_POST_DISPATCH_BUDGET_REASON,
     BudgetDispatchReservationFailed,
+    BudgetedOperationFailed,
     BudgetedOperationRejected,
     BudgetedOperationSucceeded,
     BudgetEvaluation,
@@ -282,6 +292,7 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     copy_model_step_identity,
     copy_tool_round_identity,
+    new_model_step_identity,
     strip_runtime_owned_execution_identity,
 )
 from cayu.runtime.model_steps import (
@@ -337,6 +348,7 @@ from cayu.runtime.sessions import (
     ModelCompletionStageRequest,
     ModelCompletionStageResult,
     RuntimePublicationOperationRecordMutation,
+    RuntimePublicationRequest,
     RuntimePublicationResult,
     Session,
     SessionRunFenced,
@@ -344,6 +356,7 @@ from cayu.runtime.sessions import (
     SessionStatusConflict,
     SessionStore,
     _current_session_interaction_id,
+    runtime_publication_checkpoint_mutation,
     runtime_publication_operation_record_value_digest,
 )
 from cayu.runtime.stop_policy import RunLimits
@@ -841,6 +854,8 @@ class ModelAttemptFailed(Exception):
     ) -> None:
         if type(provider_effect_observed) is not bool:
             raise TypeError("provider_effect_observed must be a bool.")
+        if type(automatic_retry_disabled) is not bool:
+            raise TypeError("automatic_retry_disabled must be a bool.")
         self.message = require_nonblank(message, "message")
         self.payload = copy_json_value(payload, "payload")
         self.emitted_error_event = emitted_error_event
@@ -2239,6 +2254,82 @@ def _combine_post_completion_failures(
     )
 
 
+def _combine_authoritative_model_failure(
+    authoritative: BaseException,
+    secondary: BaseException,
+    *,
+    message: str,
+) -> BaseException:
+    """Preserve one authoritative model failure beside later diagnostics."""
+
+    if authoritative is secondary:
+        return authoritative
+    if any(candidate is authoritative for candidate in iter_exception_tree(secondary)):
+        return secondary
+    if any(candidate is secondary for candidate in iter_exception_tree(authoritative)):
+        return authoritative
+    return BaseExceptionGroup(message, [authoritative, secondary])
+
+
+def _combine_context_build_failure_with_secondary(
+    error: ContextBuildError,
+    secondary: BaseException,
+    *,
+    message: str,
+) -> BaseException:
+    """Keep a compaction deadline visible beside later context diagnostics."""
+
+    if not any(
+        isinstance(candidate, ModelStreamDeadlineError)
+        for candidate in iter_exception_tree(error.cause)
+    ):
+        return secondary
+    return _combine_authoritative_model_failure(
+        error.cause,
+        secondary,
+        message=message,
+    )
+
+
+def _raise_context_build_cause(error: ContextBuildError) -> Never:
+    """Unwrap a context failure without replacing its prior causal evidence."""
+
+    authoritative = error.cause
+    prior_cause = exception_cause(authoritative)
+    if prior_cause is None or prior_cause is error:
+        raise authoritative from error
+    if exception_cause(error) is authoritative:
+        set_exception_cause(error, None)
+    if exception_context(error) is authoritative:
+        set_exception_context(error, None)
+    raise authoritative from BaseExceptionGroup(
+        "Context build failure retained prior authoritative evidence.",
+        [prior_cause, error],
+    )
+
+
+def _deadline_with_runtime_recovery_authority(
+    error: ModelStreamDeadlineError,
+    *,
+    exact_operation: bool,
+) -> ModelStreamDeadlineError:
+    """Project recovery disposition from runtime-owned durable operation state."""
+
+    disposition = (
+        EXACT_MODEL_STREAM_RECOVERY_DISPOSITION
+        if exact_operation
+        else MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION
+    )
+    if error.recovery_disposition == disposition:
+        return error
+    return ModelStreamDeadlineError(
+        provider=error.provider,
+        evidence=error.deadline_evidence,
+        stream_cleanup_failed=error.stream_cleanup_failed,
+        recovery_disposition=disposition,
+    )
+
+
 class _ProviderStreamSelfCancellation(asyncio.CancelledError):
     """Authenticated handoff for provider-originated stream cancellation."""
 
@@ -2325,16 +2416,41 @@ def _raise_model_provider_stream_boundary_failure(
     raise failure
 
 
+async def _admitted_model_provider_events(
+    provider: ModelProvider,
+    request: ModelRequest,
+    admission: ProviderStreamDeadlineAdmission,
+) -> AsyncGenerator[ModelStreamEvent, None]:
+    """Transfer one pre-dispatch deadline admission into the provider stream."""
+
+    events = provider.runtime_stream(request)
+    iterator = aiter(events)
+    try:
+        while True:
+            token = bind_provider_deadline_admission(admission)
+            try:
+                try:
+                    event = await anext(iterator)
+                except StopAsyncIteration:
+                    return
+            finally:
+                reset_provider_deadline_admission(token)
+            yield event
+    finally:
+        await _close_async_iterator(iterator)
+
+
 async def _owned_model_provider_events(
     source_factory: Callable[[], AsyncIterator[ModelStreamEvent]],
     *,
     cancellation_baseline: int,
+    max_concurrent_streams: int,
     cleanup_ownership: _ProviderStreamCleanupOwnership | None = None,
 ) -> AsyncGenerator[ModelStreamEvent, None]:
     """Authenticate cancellation at the live model-stream boundary."""
 
     if cleanup_ownership is None:
-        cleanup_ownership = reserve_provider_stream_cleanup()
+        cleanup_ownership = reserve_provider_stream_cleanup(max_concurrent_streams)
     try:
         source = source_factory()
     except BaseException as failure:
@@ -2494,7 +2610,10 @@ class _CompactionExecutionIdentityLedger:
     def begin_dispatch(self) -> ModelAttemptIdentity:
         if self.active_model_attempt_identity is not None:
             raise RuntimeError("Compaction provider dispatches cannot overlap.")
-        identity = self.model_step_identity.new_attempt()
+        # A compaction provider call is an independently settleable effect. It
+        # must not share the assistant turn's logical step because promoting a
+        # successful context-compaction stage records a winner for that step.
+        identity = new_model_step_identity().new_attempt()
         self.active_model_attempt_identity = identity
         self.issued_model_attempts_by_id[identity.model_attempt_id] = identity
         return copy_model_attempt_identity(identity)
@@ -2584,6 +2703,40 @@ class _CompactionExecutionIdentityLedger:
             payload.update(identity.payload())
             identified_payloads.append(payload)
         return identified_payloads
+
+
+@dataclass(frozen=True)
+class _AutomaticCompactionDispatchAuthority:
+    """Durable stage ownership for one automatic-compaction provider call."""
+
+    stage: ModelCompletionStage
+    owns_stage: bool
+    provider_name: str
+    step: int
+    attempt: int
+    max_attempts: int
+
+    def __post_init__(self) -> None:
+        if type(self.stage) is not ModelCompletionStage:
+            raise TypeError("Automatic compaction authority requires an exact stage.")
+        object.__setattr__(self, "stage", self.stage.model_copy(deep=True))
+        object.__setattr__(
+            self,
+            "provider_name",
+            require_durable_clean_nonblank(
+                self.provider_name,
+                "automatic_compaction_provider_name",
+            ),
+        )
+        if type(self.owns_stage) is not bool:
+            raise TypeError("Automatic compaction stage ownership must be a bool.")
+        for field_name, value in (
+            ("step", self.step),
+            ("attempt", self.attempt),
+            ("max_attempts", self.max_attempts),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer.")
 
 
 @dataclass(frozen=True)
@@ -2739,6 +2892,10 @@ class _AutomaticCompactionBudgetReservationFailed(RuntimeError):
     def __init__(self, result: BudgetReservationResult) -> None:
         super().__init__(f"Context compaction budget reservation failed: {result.message}")
         self.result = result
+
+
+class _AutomaticCompactionCheckpointRecoveryRequired(RuntimeError):
+    """A completed compaction has no later durable context checkpoint."""
 
 
 class _AutomaticCompactionAdmissionStopped(RuntimeError):
@@ -4277,31 +4434,86 @@ class ModelStepExecutor:
             status: ProviderOperationStatus | str,
             *,
             cleanup_failure: Exception | None = None,
+            deadline_failure: ModelStreamDeadlineError | None = None,
         ) -> ProviderOperationRecoveryResult:
-            await require_recovery_owner()
-            await recover_context_exposure(
-                store=self._session_store,
-                session_id=session.id,
-                stage_id=stage.stage_id,
-                stage_intent=stage.intent,
-                state=ContextExposureState.INDETERMINATE,
-                evidence_kind=ContextExposureEvidenceKind.RECOVERY_INDETERMINATE,
-                evidence_ref=f"provider-operation:{operation.state.operation_id}:unavailable",
-            )
-            status_value = status.value if isinstance(status, ProviderOperationStatus) else status
-            required = await _emit_provider_recovery_required_event(
-                self._event_writer,
-                recovery_event(
-                    EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
-                    status=status_value,
+            authoritative_deadline: ModelStreamDeadlineError | None = None
+            if deadline_failure is not None:
+                controlled_failure = copy_provider_exception_control(deadline_failure)
+                if type(controlled_failure.cause) is not ModelStreamDeadlineError:
+                    raise RuntimeError(
+                        "Provider reconnect deadline lost its typed control evidence."
+                    )
+                copied_deadline = controlled_failure.cause
+                authoritative_deadline = ModelStreamDeadlineError(
+                    provider=registered_provider.name,
+                    evidence=copied_deadline.deadline_evidence,
+                    stream_cleanup_failed=copied_deadline.stream_cleanup_failed,
+                    recovery_disposition=EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
+                )
+            try:
+                await require_recovery_owner()
+                if authoritative_deadline is not None:
+                    deadline_event = _event_with_model_identity_authority(
+                        Event(
+                            type=EventType.MODEL_ERROR,
+                            session_id=session.id,
+                            interaction_id=operation.interaction_id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload=_retry_attempt_payload(
+                                {
+                                    "error": str(authoritative_deadline),
+                                    "error_type": type(authoritative_deadline).__name__,
+                                    **authoritative_deadline.error_payload_fields(),
+                                },
+                                step=operation.step,
+                                attempt=operation.attempt,
+                                max_attempts=operation.max_attempts,
+                                model_attempt_identity=operation.model_attempt_identity,
+                            ),
+                        ),
+                        operation.model_attempt_identity,
+                    )
+                    deadline_event = event_with_execution_profile_fingerprint_authority(
+                        deadline_event,
+                        None
+                        if recovery_context is None
+                        else recovery_context.execution_profile_fingerprint,
+                    )
+                    recovered_events.append(await self._event_writer.emit(deadline_event))
+                await recover_context_exposure(
+                    store=self._session_store,
+                    session_id=session.id,
+                    stage_id=stage.stage_id,
+                    stage_intent=stage.intent,
+                    state=ContextExposureState.INDETERMINATE,
+                    evidence_kind=ContextExposureEvidenceKind.RECOVERY_INDETERMINATE,
+                    evidence_ref=f"provider-operation:{operation.state.operation_id}:unavailable",
+                )
+                status_value = (
+                    status.value if isinstance(status, ProviderOperationStatus) else status
+                )
+                required = await _emit_provider_recovery_required_event(
+                    self._event_writer,
+                    recovery_event(
+                        EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+                        status=status_value,
+                        recovery_reason=reason,
+                        cleanup_failure=cleanup_failure,
+                    ),
                     recovery_reason=reason,
                     cleanup_failure=cleanup_failure,
-                ),
-                recovery_reason=reason,
-                cleanup_failure=cleanup_failure,
-                redactor=self._secret_redactor,
-            )
-            recovered_events.append(required)
+                    redactor=self._secret_redactor,
+                )
+                recovered_events.append(required)
+            except Exception as diagnostic_failure:
+                if authoritative_deadline is None:
+                    raise
+                raise _combine_authoritative_model_failure(
+                    authoritative_deadline,
+                    diagnostic_failure,
+                    message=("Provider reconnect deadline and recovery diagnostics both failed."),
+                ) from None
             return ProviderOperationRecoveryResult(
                 status=ProviderOperationRecoveryStatus.UNAVAILABLE,
                 events=tuple(recovered_events),
@@ -4375,14 +4587,12 @@ class ModelStepExecutor:
                 raise ProviderOperationEvidenceError(
                     f"Legacy provider-operation evidence cannot safely reconstruct {kind}."
                 )
-            recovered_provider_error = (
-                model_provider_error_from_payload(
-                    stream_event.payload,
+            recovered_provider_error: ModelProviderError | None = None
+            if stream_event.type is ModelStreamEventType.ERROR:
+                stream_event, recovered_provider_error = runtime_owned_model_stream_error_event(
+                    stream_event,
                     fallback_provider=registered_provider.name,
                 )
-                if stream_event.type is ModelStreamEventType.ERROR
-                else None
-            )
             if persist_progress and stream_event.type is not ModelStreamEventType.COMPLETED:
                 runtime_event = None
                 if stream_event.type in {
@@ -4578,6 +4788,11 @@ class ModelStepExecutor:
                         else ProviderOperationUnavailableReason.UNAVAILABLE
                     ),
                     "malformed" if malformed else ProviderOperationStatus.UNAVAILABLE,
+                    deadline_failure=(
+                        recovery_failure
+                        if isinstance(recovery_failure, ModelStreamDeadlineError)
+                        else None
+                    ),
                 )
             try:
                 connection = copy_provider_operation_connection(raw_connection)
@@ -4628,6 +4843,7 @@ class ModelStepExecutor:
             ) = None
             reconnect_pending_status: ProviderOperationStatus | None = None
             reconnect_cleanup_failure: Exception | None = None
+            reconnect_deadline_failure: ModelStreamDeadlineError | None = None
             try:
                 async with aclosing_provider_stream(connection.events) as reconnect_events:
                     if connection.state != operation.state:
@@ -4680,6 +4896,8 @@ class ModelStepExecutor:
                 if completed_event is None:
                     if isinstance(stream_failure, Exception):
                         if reconnect_unavailable is None:
+                            if isinstance(stream_failure, ModelStreamDeadlineError):
+                                reconnect_deadline_failure = stream_failure
                             malformed = isinstance(stream_failure, ProviderOperationMalformedError)
                             reconnect_unavailable = (
                                 (
@@ -4699,6 +4917,7 @@ class ModelStepExecutor:
                 return await unavailable_recovery_result(
                     *reconnect_unavailable,
                     cleanup_failure=reconnect_cleanup_failure,
+                    deadline_failure=reconnect_deadline_failure,
                 )
             if reconnect_pending_status is not None and completed_event is None:
                 return await pending_recovery_result(reconnect_pending_status)
@@ -5720,6 +5939,7 @@ class ModelStepExecutor:
             )
             if context_pressure_event is not None:
                 yield context_pressure_event, None
+            deadline_admission: ProviderStreamDeadlineAdmission | None = None
             pre_count_completion_dispatch: ModelCompletionDispatch | None = None
             if (
                 memory_evidence_reference is not None
@@ -5734,13 +5954,18 @@ class ModelStepExecutor:
                 # perform network I/O. Commit the same durable dispatch/evidence
                 # fence used by the model call before handing them recalled
                 # context, then reuse that exact dispatch below.
+                deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
                 validate_live_model_semantics()
-                pre_count_completion_dispatch = await prepare_model_completion_dispatch(
-                    attempt_model_request,
-                    memory_evidence_reference,
-                    child_session_notification_binding,
-                    False,
-                )
+                try:
+                    pre_count_completion_dispatch = await prepare_model_completion_dispatch(
+                        attempt_model_request,
+                        memory_evidence_reference,
+                        child_session_notification_binding,
+                        False,
+                    )
+                except BaseException:
+                    deadline_admission.close()
+                    raise
             context_count_observation, context_count_event = await self._observe_context_count(
                 provider=provider,
                 model_request=attempt_model_request,
@@ -5797,8 +6022,12 @@ class ModelStepExecutor:
                 ),
                 None,
             )
+            if deadline_admission is None:
+                deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
+            assert deadline_admission is not None
             attempt_events = self._run_once(
                 provider=provider,
+                deadline_admission=deadline_admission,
                 model_request=attempt_model_request,
                 session=session,
                 registered_agent=registered_agent,
@@ -5911,27 +6140,40 @@ class ModelStepExecutor:
                     raise RuntimeError(
                         "Model attempt retained a retry decision for different attempt authority."
                     ) from exc
-                if decision.reason is not None and not exc.emitted_error_event:
-                    yield (
-                        await self._event_writer.emit(
-                            event_with_execution_profile_authority(
-                                Event(
-                                    type=EventType.MODEL_ERROR,
-                                    session_id=session.id,
-                                    agent_name=registered_agent.spec.name,
-                                    environment_name=environment_name,
-                                    payload=_retry_attempt_payload(
-                                        exc.payload,
-                                        step=step,
-                                        attempt=attempt,
-                                        max_attempts=retry_policy.max_attempts,
-                                        model_attempt_identity=model_attempt_identity,
-                                        decision=decision,
-                                    ),
-                                ),
-                                execution_profile,
-                            )
+                if not exc.emitted_error_event and (
+                    decision.reason is not None or isinstance(exc.cause, ModelStreamDeadlineError)
+                ):
+                    error_event = event_with_execution_profile_authority(
+                        Event(
+                            type=EventType.MODEL_ERROR,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload=_retry_attempt_payload(
+                                exc.payload,
+                                step=step,
+                                attempt=attempt,
+                                max_attempts=retry_policy.max_attempts,
+                                model_attempt_identity=model_attempt_identity,
+                                decision=decision,
+                            ),
                         ),
+                        execution_profile,
+                    )
+                    try:
+                        emitted_error = await self._event_writer.emit(error_event)
+                    except Exception as publication_failure:
+                        if not isinstance(exc.cause, ModelStreamDeadlineError):
+                            raise
+                        raise _combine_authoritative_model_failure(
+                            exc.cause,
+                            publication_failure,
+                            message=(
+                                "Model stream deadline and model.error publication both failed."
+                            ),
+                        ) from None
+                    yield (
+                        emitted_error,
                         None,
                     )
                 if not decision.retry:
@@ -5976,7 +6218,10 @@ class ModelStepExecutor:
                 prior_retry_failure = exc
                 attempt += 1
             finally:
-                await _close_async_iterator(attempt_events)
+                try:
+                    await _close_async_iterator(attempt_events)
+                finally:
+                    deadline_admission.close()
 
     async def _observe_request_footprint(
         self,
@@ -6229,6 +6474,7 @@ class ModelStepExecutor:
         self,
         *,
         provider: ModelProvider,
+        deadline_admission: ProviderStreamDeadlineAdmission,
         model_request: ModelRequest,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
@@ -6267,6 +6513,8 @@ class ModelStepExecutor:
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
+        if type(deadline_admission) is not ProviderStreamDeadlineAdmission:
+            raise TypeError("deadline_admission must be ProviderStreamDeadlineAdmission.")
         targeted_tool_reference_grant_ids = (
             None if targeted_tool_gateway is None else targeted_tool_gateway.reference_grant_ids()
         )
@@ -6347,6 +6595,7 @@ class ModelStepExecutor:
         context_exposure = (
             None if completion_dispatch is None else completion_dispatch.context_exposure
         )
+        stream_deadline_failure: ModelStreamDeadlineError | None = None
 
         async def advance_context_exposure(
             state: ContextExposureState,
@@ -6376,6 +6625,35 @@ class ModelStepExecutor:
                 else completion_dispatch.stage_id
             )
             return f"model-stage:{stage_ref}:{suffix}"
+
+        async def advance_context_exposure_preserving_deadline(
+            state: ContextExposureState,
+            evidence_kind: ContextExposureEvidenceKind,
+            evidence_ref: str,
+            *,
+            authoritative_failure: BaseException | None = None,
+            provider_request_id: str | None = None,
+        ) -> None:
+            try:
+                await advance_context_exposure(
+                    state,
+                    evidence_kind,
+                    evidence_ref,
+                    provider_request_id=provider_request_id,
+                )
+            except Exception as evidence_failure:
+                authoritative = (
+                    stream_deadline_failure
+                    if authoritative_failure is None
+                    else authoritative_failure
+                )
+                if authoritative is None:
+                    raise
+                raise _combine_authoritative_model_failure(
+                    authoritative,
+                    evidence_failure,
+                    message=("Model stream deadline and context-exposure persistence both failed."),
+                ) from None
 
         async def consume_child_session_notifications() -> None:
             nonlocal completion_dispatch
@@ -6501,8 +6779,11 @@ class ModelStepExecutor:
             if provider_operation_mode is ProviderOperationMode.SYNCHRONOUS:
                 await consume_child_session_notifications()
                 provider_events = _owned_model_provider_events(
-                    lambda: provider.stream(model_request),
+                    lambda: _admitted_model_provider_events(
+                        provider, model_request, deadline_admission
+                    ),
                     cancellation_baseline=provider_cancellation_baseline,
+                    max_concurrent_streams=deadline_admission.max_concurrent_streams,
                 )
                 provider_events_owned = True
             else:
@@ -6573,12 +6854,16 @@ class ModelStepExecutor:
                     # application code. Recheck at the last pre-dispatch seam.
                     validate_live_model_semantics()
                     await consume_child_session_notifications()
-                    return await provider_operation_adapter.start(
-                        ProviderOperationStartRequest(
-                            request=model_request,
-                            idempotency_key=start_id,
+                    token = bind_provider_deadline_admission(deadline_admission)
+                    try:
+                        return await provider_operation_adapter.start(
+                            ProviderOperationStartRequest(
+                                request=model_request,
+                                idempotency_key=start_id,
+                            )
                         )
-                    )
+                    finally:
+                        reset_provider_deadline_admission(token)
 
                 start_task = asyncio.create_task(start_provider_operation())
                 background_dispatch_invoked = True
@@ -6784,6 +7069,12 @@ class ModelStepExecutor:
                         raise_start_cancellation(start_error)
                     if not isinstance(start_error, Exception):
                         raise start_error
+                    if isinstance(start_error, ModelStreamDeadlineError):
+                        # Preserve the typed error for the common provider-error
+                        # boundary to defensively copy and publish. The normal
+                        # deadline stage fence then owns this pre-identity
+                        # background outcome.
+                        raise start_error from None
                     raise _ambiguous_provider_operation_start_error(
                         provider_name=registered_provider.name,
                         cause=start_error,
@@ -7452,17 +7743,40 @@ class ModelStepExecutor:
                 provider_error: ModelProviderError | None = None
                 message = ""
                 if stream_event.type == ModelStreamEventType.ERROR:
-                    message = str(stream_event.payload.get("error") or "Model provider error")
-                    provider_error = model_provider_error_from_payload(
-                        stream_event.payload,
+                    untrusted_message = str(
+                        stream_event.payload.get("error") or "Model provider error"
+                    )
+                    stream_event, provider_error = runtime_owned_model_stream_error_event(
+                        stream_event,
                         fallback_provider=registered_provider.name,
-                        fallback_message=message,
+                        fallback_message=untrusted_message,
                     )
-                    await advance_context_exposure(
-                        ContextExposureState.FAILED,
-                        ContextExposureEvidenceKind.CONCLUSIVE_FAILURE,
-                        context_exposure_ref("provider-error"),
-                    )
+                    message = str(stream_event.payload.get("error") or "Model provider error")
+                    if isinstance(provider_error, ModelStreamDeadlineError):
+                        provider_error = _deadline_with_runtime_recovery_authority(
+                            provider_error,
+                            exact_operation=background_exposure_recovery_pending(),
+                        )
+                        stream_event = ModelStreamEvent.error(
+                            str(provider_error),
+                            cause=provider_error,
+                            recovery_metadata=stream_event.recovery_metadata,
+                            provider_operation_status=stream_event.provider_operation_status,
+                        )
+                        message = str(provider_error)
+                        stream_deadline_failure = provider_error
+                        if not background_exposure_recovery_pending():
+                            await advance_context_exposure_preserving_deadline(
+                                ContextExposureState.INDETERMINATE,
+                                ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
+                                context_exposure_ref("provider-stream-deadline"),
+                            )
+                    else:
+                        await advance_context_exposure(
+                            ContextExposureState.FAILED,
+                            ContextExposureEvidenceKind.CONCLUSIVE_FAILURE,
+                            context_exposure_ref("provider-error"),
+                        )
                     if (
                         isinstance(provider_error, ModelContextOverflowError)
                         and provider_operation_state is None
@@ -7766,20 +8080,32 @@ class ModelStepExecutor:
                 raise
             post_completion_failure = exc
         except BaseExceptionGroup as exc:
+            grouped_deadline = next(
+                (
+                    candidate
+                    for candidate in iter_exception_tree(exc)
+                    if isinstance(candidate, ModelStreamDeadlineError)
+                ),
+                None,
+            )
+            if grouped_deadline is not None:
+                stream_deadline_failure = grouped_deadline
             if model_completion_publisher is None or not model_completed:
                 if not background_exposure_recovery_pending():
                     authentication_rejection = _provider_failure_proves_no_model_effect(exc)
                     if authentication_rejection and not provider_effect_observed:
-                        await advance_context_exposure(
+                        await advance_context_exposure_preserving_deadline(
                             ContextExposureState.FAILED,
                             ContextExposureEvidenceKind.CONCLUSIVE_FAILURE,
                             context_exposure_ref("provider-rejected-before-effect"),
+                            authoritative_failure=(exc if grouped_deadline is not None else None),
                         )
                     else:
-                        await advance_context_exposure(
+                        await advance_context_exposure_preserving_deadline(
                             ContextExposureState.INDETERMINATE,
                             ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
                             context_exposure_ref("exception-group-without-provider-outcome"),
+                            authoritative_failure=(exc if grouped_deadline is not None else None),
                         )
                     if authentication_rejection and provider_effect_observed:
                         late_failure = ModelProviderError(
@@ -7805,12 +8131,17 @@ class ModelStepExecutor:
                 raise
             post_completion_failure = exc
         except ModelAttemptFailed as exc:
+            if isinstance(exc.cause, ModelStreamDeadlineError):
+                stream_deadline_failure = exc.cause
             if model_completion_publisher is None or not model_completed:
                 if not background_exposure_recovery_pending():
-                    await advance_context_exposure(
+                    await advance_context_exposure_preserving_deadline(
                         ContextExposureState.INDETERMINATE,
                         ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
                         context_exposure_ref("attempt-failed-without-terminal-provider-evidence"),
+                        authoritative_failure=(
+                            exc.cause if isinstance(exc.cause, ModelStreamDeadlineError) else None
+                        ),
                     )
                 if background_dispatch_invoked and not exc.automatic_retry_disabled:
                     raise ModelAttemptFailed(
@@ -7825,6 +8156,12 @@ class ModelStepExecutor:
                 raise
             durable_stream_failure = exc
         except Exception as exc:
+            if stream_deadline_failure is not None and exc is not stream_deadline_failure:
+                raise _combine_authoritative_model_failure(
+                    stream_deadline_failure,
+                    exc,
+                    message="Model stream deadline and diagnostic publication both failed.",
+                ) from None
             provider_failure = None
             durable_error = extract_durable_value_error(exc)
             invalid_provider_error = False
@@ -7834,15 +8171,43 @@ class ModelStepExecutor:
                 except DurableValueError as portability_error:
                     durable_error = portability_error
                     invalid_provider_error = True
+            if provider_failure is not None and isinstance(
+                provider_failure.cause,
+                ModelStreamDeadlineError,
+            ):
+                deadline_error = _deadline_with_runtime_recovery_authority(
+                    provider_failure.cause,
+                    exact_operation=background_exposure_recovery_pending(),
+                )
+                provider_failure = replace(
+                    provider_failure,
+                    message=str(deadline_error),
+                    error_type=type(deadline_error).__name__,
+                    cause=deadline_error,
+                )
             if provider_failure is not None:
                 if isinstance(provider_failure.cause, ModelContextOverflowError):
                     provider_control_failure = provider_failure.cause
                 else:
+                    deadline_failure = isinstance(
+                        provider_failure.cause,
+                        ModelStreamDeadlineError,
+                    )
+                    if deadline_failure:
+                        stream_deadline_failure = cast(
+                            "ModelStreamDeadlineError",
+                            provider_failure.cause,
+                        )
                     durable_stream_failure = ModelAttemptFailed(
                         message=provider_failure.message,
                         payload={
                             "error": provider_failure.message,
                             "error_type": provider_failure.error_type,
+                            **(
+                                provider_failure.cause.error_payload_fields()
+                                if isinstance(provider_failure.cause, ModelProviderError)
+                                else {}
+                            ),
                         },
                         emitted_error_event=False,
                         cause=provider_failure.cause,
@@ -7850,6 +8215,7 @@ class ModelStepExecutor:
                             model_completion_publisher is not None and model_completed
                         ),
                         provider_effect_observed=provider_effect_observed,
+                        automatic_retry_disabled=deadline_failure,
                     )
             elif durable_error is not None:
                 if invalid_provider_error:
@@ -7988,7 +8354,7 @@ class ModelStepExecutor:
                     context_exposure_ref("provider-rejected-before-effect"),
                 )
             else:
-                await advance_context_exposure(
+                await advance_context_exposure_preserving_deadline(
                     ContextExposureState.INDETERMINATE,
                     ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
                     context_exposure_ref("stream-ended-without-completion"),
@@ -8552,6 +8918,7 @@ class ModelStepRun:
         stage: ModelCompletionStage,
         *,
         authoritative_failure: BaseException,
+        budget_dispatch_id: str | None = None,
     ) -> None:
         """Clear one provably undispatched stage without losing its root failure."""
 
@@ -8572,7 +8939,11 @@ class ModelStepRun:
                 recovery_contexts=(
                     () if recovery_context is None else recovery_context.budget_reservations
                 ),
-                dispatch_id=stage.stage_id,
+                dispatch_id=(
+                    stage.stage_id
+                    if budget_dispatch_id is None
+                    else require_clean_nonblank(budget_dispatch_id, "budget_dispatch_id")
+                ),
             )
         except BaseException as release_error:
             authoritative_failure.add_note(
@@ -8725,6 +9096,8 @@ class ModelStepRun:
         compaction_start_events: list[Event] = []
         compaction_completion_events: dict[str, Event] = {}
         compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
+        compaction_dispatch_authorities: dict[str, _AutomaticCompactionDispatchAuthority] = {}
+        settled_compaction_attempt_ids: set[str] = set()
         automatic_compaction_lifecycle = _AutomaticCompactionLifecycle()
 
         async def publish_recall_telemetry(
@@ -8747,6 +9120,11 @@ class ModelStepRun:
             execute: Callable[[], Awaitable[CompactionResult]],
             completed_payloads: Callable[[], list[dict[str, Any]]],
         ) -> CompactionResult:
+            if not published_compaction_attempt_ids:
+                await self._require_no_uncheckpointed_automatic_compaction(
+                    parent_model_step_identity=model_step_identity,
+                )
+
             await self._persist_automatic_compaction_start_with_retry(
                 compaction_started,
                 published_events=context_operation_events,
@@ -8762,6 +9140,8 @@ class ModelStepRun:
                         published_attempt_ids=published_compaction_attempt_ids,
                         published_events=context_operation_events,
                         completion_events=compaction_completion_events,
+                        dispatch_authorities=compaction_dispatch_authorities,
+                        settled_attempt_ids=settled_compaction_attempt_ids,
                     )
                 except BaseException as error:
                     automatic_compaction_lifecycle.attach_failure(
@@ -8784,11 +9164,24 @@ class ModelStepRun:
                     step=step,
                     model_step_identity=model_step_identity,
                     compaction_identity_ledger=compaction_identity_ledger,
+                    dispatch_authorities=compaction_dispatch_authorities,
+                    settled_attempt_ids=settled_compaction_attempt_ids,
+                    source_transcript_cursor=source_transcript_cursor,
+                    allow_borrowed_stage=False,
                     lifecycle=automatic_compaction_lifecycle,
                 )
 
             with _compaction_completion_publisher_scope(publish_completions):
-                return await run()
+                try:
+                    return await run()
+                except ModelStreamDeadlineError as error:
+                    authoritative = _deadline_with_runtime_recovery_authority(
+                        error,
+                        exact_operation=False,
+                    )
+                    if authoritative is error:
+                        raise
+                    raise authoritative from error
 
         current_task = asyncio.current_task()
         context_build_cancellation_requests = (
@@ -8879,7 +9272,13 @@ class ModelStepRun:
             for event in context_failure_events:
                 yield event, None
             if context_failure_persistence is not None:
-                raise context_failure_persistence from exc
+                raise _combine_context_build_failure_with_secondary(
+                    exc,
+                    context_failure_persistence,
+                    message=(
+                        "Context-compaction deadline and context failure persistence both failed."
+                    ),
+                ) from exc
             if isinstance(exc.cause, _AutomaticCompactionBudgetReservationFailed):
                 async for event in self._stop_for_budget_reservation_failure(
                     result=exc.cause.result,
@@ -8900,7 +9299,7 @@ class ModelStepRun:
                     await _close_async_iterator(admission_events)
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
-            raise exc.cause from exc
+            _raise_context_build_cause(exc)
         except BaseException as exc:
             await self._persist_context_build_termination_events(
                 exc,
@@ -9832,6 +10231,8 @@ class ModelStepRun:
         compaction_start_events: list[Event] = []
         compaction_completion_events: dict[str, Event] = {}
         compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
+        compaction_dispatch_authorities: dict[str, _AutomaticCompactionDispatchAuthority] = {}
+        settled_compaction_attempt_ids: set[str] = set()
         automatic_compaction_lifecycle = _AutomaticCompactionLifecycle()
         latest_model_attempt_identity: ModelAttemptIdentity | None = None
 
@@ -9952,6 +10353,11 @@ class ModelStepRun:
             execute: Callable[[], Awaitable[CompactionResult]],
             completed_payloads: Callable[[], list[dict[str, Any]]],
         ) -> CompactionResult:
+            if not published_compaction_attempt_ids:
+                await self._require_no_uncheckpointed_automatic_compaction(
+                    parent_model_step_identity=model_step_identity,
+                )
+
             await self._persist_automatic_compaction_start_with_retry(
                 compaction_started,
                 published_events=context_operation_events,
@@ -9967,6 +10373,8 @@ class ModelStepRun:
                         published_attempt_ids=published_compaction_attempt_ids,
                         published_events=context_operation_events,
                         completion_events=compaction_completion_events,
+                        dispatch_authorities=compaction_dispatch_authorities,
+                        settled_attempt_ids=settled_compaction_attempt_ids,
                     )
                 except BaseException as error:
                     automatic_compaction_lifecycle.attach_failure(
@@ -9989,6 +10397,10 @@ class ModelStepRun:
                     step=step,
                     model_step_identity=model_step_identity,
                     compaction_identity_ledger=compaction_identity_ledger,
+                    dispatch_authorities=compaction_dispatch_authorities,
+                    settled_attempt_ids=settled_compaction_attempt_ids,
+                    source_transcript_cursor=transcript_cursor_before_request,
+                    allow_borrowed_stage=True,
                     lifecycle=automatic_compaction_lifecycle,
                 )
 
@@ -10095,7 +10507,13 @@ class ModelStepRun:
             for event in context_failure_events:
                 yield event, None
             if context_failure_persistence is not None:
-                raise context_failure_persistence from exc
+                raise _combine_context_build_failure_with_secondary(
+                    exc,
+                    context_failure_persistence,
+                    message=(
+                        "Context-compaction deadline and context failure persistence both failed."
+                    ),
+                ) from exc
             if isinstance(exc.cause, _AutomaticCompactionBudgetReservationFailed):
                 settlement_events, settlement_error = await settle_provider_dispatch()
                 for event in settlement_events:
@@ -10126,8 +10544,8 @@ class ModelStepRun:
                     await _close_async_iterator(admission_events)
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
-            yield (
-                await self._executor._event_writer.emit(
+            try:
+                overflow_failed_event = await self._executor._event_writer.emit(
                     event_with_execution_profile_authority(
                         _event_with_model_identity_authority(
                             Event(
@@ -10148,10 +10566,18 @@ class ModelStepRun:
                         ),
                         self._execution_profile,
                     )
-                ),
-                None,
-            )
-            raise exc.cause from exc
+                )
+            except Exception as publication_failure:
+                raise _combine_context_build_failure_with_secondary(
+                    exc,
+                    publication_failure,
+                    message=(
+                        "Context-compaction deadline and context-overflow diagnostic "
+                        "publication both failed."
+                    ),
+                ) from exc
+            yield overflow_failed_event, None
+            _raise_context_build_cause(exc)
         except BaseException as exc:
             await self._persist_context_build_termination_events(
                 exc,
@@ -10460,6 +10886,61 @@ class ModelStepRun:
                 operation=f"{operation} side-effect delivery",
             )
         return error, outcome.cancellation
+
+    async def _require_no_uncheckpointed_automatic_compaction(
+        self,
+        *,
+        parent_model_step_identity: ModelStepIdentity,
+    ) -> None:
+        parent = copy_model_step_identity(parent_model_step_identity)
+        before_sequence: int | None = None
+        checkpointed_parent_model_step_ids: set[str] = set()
+        while True:
+            records = await self._executor._session_store.query_events(
+                EventQuery(
+                    session_id=self._session.id,
+                    event_types=(
+                        EventType.MODEL_COMPLETED,
+                        EventType.SESSION_CHECKPOINTED,
+                    ),
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    before_sequence=before_sequence,
+                    limit=100,
+                )
+            )
+            if not records:
+                return
+            for record in records:
+                event = record.event
+                if event.type is EventType.SESSION_CHECKPOINTED:
+                    checkpointed_parent = event.payload.get("model_step_id")
+                    if type(checkpointed_parent) is str:
+                        checkpointed_parent_model_step_ids.add(checkpointed_parent)
+                    continue
+                if (
+                    event.type is EventType.MODEL_COMPLETED
+                    and event.payload.get("purpose")
+                    == ModelCompletionPurpose.CONTEXT_COMPACTION.value
+                    and event.payload.get("compaction_outcome") is None
+                ):
+                    completed_parent = event.payload.get("parent_model_step_id")
+                    if completed_parent is None:
+                        # Completions from schema versions predating explicit parent
+                        # attribution cannot be classified by this restart fence.
+                        continue
+                    if type(completed_parent) is not str:
+                        raise _AutomaticCompactionCheckpointRecoveryRequired(
+                            "Successful automatic-compaction evidence has malformed "
+                            "parent model-step authority."
+                        )
+                    if completed_parent in checkpointed_parent_model_step_ids:
+                        continue
+                    raise _AutomaticCompactionCheckpointRecoveryRequired(
+                        "A successful automatic compaction has no later durable context "
+                        f"checkpoint for model step {completed_parent}; current model step "
+                        f"{parent.model_step_id} cannot dispatch another compactor."
+                    )
+            before_sequence = records[-1].sequence
 
     async def _persist_automatic_compaction_predispatch_event(
         self,
@@ -10805,6 +11286,355 @@ class ModelStepRun:
         if cancellation is not None:
             raise cancellation
 
+    async def _prepare_automatic_compaction_dispatch_authority(
+        self,
+        *,
+        provider_name: str,
+        pricing_provider_name: str,
+        model_request: ModelRequest,
+        model_attempt_identity: ModelAttemptIdentity,
+        parent_model_step_identity: ModelStepIdentity,
+        source_transcript_cursor: int,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+        billing_identity: BillingIdentity | None,
+        reservations: tuple[BudgetStepReservation, ...],
+        allow_borrowed_stage: bool,
+    ) -> _AutomaticCompactionDispatchAuthority:
+        """Prepare exact recovery authority before the budget dispatch fence."""
+
+        provider_name = require_durable_clean_nonblank(
+            provider_name,
+            "automatic_compaction_provider_name",
+        )
+        pricing_provider_name = require_durable_clean_nonblank(
+            pricing_provider_name,
+            "automatic_compaction_pricing_provider_name",
+        )
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        parent_model_step_identity = copy_model_step_identity(parent_model_step_identity)
+        active = await self._executor._session_store.load_active_model_completion_stage(
+            self._session.id
+        )
+        if active is not None:
+            stage = active.stage
+            if not allow_borrowed_stage:
+                raise RuntimeError(
+                    "Initial automatic compaction found an active model-completion stage."
+                )
+            if (
+                stage.purpose != "assistant-turn"
+                or stage.logical_step_id != parent_model_step_identity.model_step_id
+                or stage.source_transcript_cursor != source_transcript_cursor
+            ):
+                raise RuntimeError(
+                    "Context-overflow compaction cannot borrow a different active model stage."
+                )
+            dispatch = await self._executor._session_store.load_model_completion_stage_dispatch(
+                self._session.id,
+                stage.stage_id,
+            )
+            if dispatch is None:
+                raise RuntimeError(
+                    "Context-overflow compaction requires the assistant dispatch receipt."
+                )
+            return _AutomaticCompactionDispatchAuthority(
+                stage=stage,
+                owns_stage=False,
+                provider_name=provider_name,
+                step=step,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+
+        interaction_id = _current_session_interaction_id(self._session.id)
+        if interaction_id is None:
+            raise RuntimeError(
+                "Automatic compaction dispatch requires an active interaction identity."
+            )
+        recovery_context = self._model_completion_recovery_context_factory(
+            billing_identity,
+            reservations,
+        )
+        if type(recovery_context) is not ModelCompletionRecoveryContext:
+            raise RuntimeError("Automatic compaction dispatch requires durable recovery authority.")
+        if recovery_context.interaction_id is None:
+            recovery_context = recovery_context.model_copy(
+                update={"interaction_id": interaction_id},
+                deep=True,
+            )
+        elif recovery_context.interaction_id != interaction_id:
+            raise RuntimeError(
+                "Automatic compaction recovery authority belongs to another interaction."
+            )
+        request_fingerprint = _model_request_fingerprint(
+            provider_name=provider_name,
+            model_request=model_request,
+        )
+        logical_step_id = model_attempt_identity.model_step_id
+        stage_id = f"{logical_step_id}:dispatch:0"
+        intent = {
+            "schema_version": 1,
+            "purpose": "context-compaction",
+            "parent_model_step_id": parent_model_step_identity.model_step_id,
+            **model_attempt_identity.payload(),
+            "logical_step_id": logical_step_id,
+            "provider_name": provider_name,
+            "pricing_provider_name": pricing_provider_name,
+            "requested_model": model_request.model,
+            "source_transcript_cursor": source_transcript_cursor,
+            "request_fingerprint": request_fingerprint,
+            "interaction_id": interaction_id,
+            "recovery_context": recovery_context.model_dump(mode="json"),
+        }
+        prepared = await self._executor._session_store.prepare_model_completion_stage(
+            self._session.id,
+            request=ModelCompletionStageRequest(
+                stage_id=stage_id,
+                logical_step_id=logical_step_id,
+                dispatch_ordinal=0,
+                purpose="context-compaction",
+                intent=intent,
+                reservation_ids=tuple(
+                    reservation.record.reservation_id for reservation in reservations
+                ),
+            ),
+            expected_statuses={SessionStatus.RUNNING},
+            expected_run_epoch=self._session.run_epoch,
+            expected_transcript_cursor=source_transcript_cursor,
+        )
+        if not prepared.dispatch_authorized:
+            raise ModelCompletionDispatchNotAuthorized(
+                stage=prepared.stage,
+                request_fingerprint=request_fingerprint,
+            )
+        return _AutomaticCompactionDispatchAuthority(
+            stage=prepared.stage,
+            owns_stage=True,
+            provider_name=provider_name,
+            step=step,
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
+
+    async def _mark_automatic_compaction_dispatch_authority(
+        self,
+        authority: _AutomaticCompactionDispatchAuthority,
+    ) -> BaseException | None:
+        """Commit the provider fence, deferring only an ambiguous acknowledgement."""
+
+        if not authority.owns_stage:
+            return None
+        try:
+            await self._executor._session_store.mark_model_completion_stage_dispatched(
+                self._session.id,
+                stage=authority.stage,
+            )
+            return None
+        except BaseException as dispatch_failure:
+            try:
+                dispatch = await self._executor._session_store.load_model_completion_stage_dispatch(
+                    self._session.id,
+                    authority.stage.stage_id,
+                )
+            except BaseException as reconciliation_failure:
+                dispatch_failure.add_note(
+                    "Automatic-compaction dispatch receipt reconciliation also failed: "
+                    f"{type(reconciliation_failure).__name__}: {reconciliation_failure}"
+                )
+                return dispatch_failure
+            if dispatch is not None:
+                dispatch_failure.add_note(
+                    "The automatic-compaction dispatch receipt is durable; provider-effect "
+                    "ambiguity remains fenced."
+                )
+                return dispatch_failure
+            raise
+
+    async def _publish_owned_automatic_compaction_completion(
+        self,
+        *,
+        authority: _AutomaticCompactionDispatchAuthority,
+        event: Event,
+    ) -> Event:
+        """Complete one owned context-compaction stage before budget settlement."""
+
+        if not authority.owns_stage or authority.stage.purpose != "context-compaction":
+            raise ValueError("Automatic compaction completion requires its owned stage.")
+        prepared_event = self._executor._event_writer.prepare(event)
+        publication = RuntimePublicationRequest(
+            publication_id=authority.stage.logical_step_id,
+            kind="context-compaction",
+            interaction_id=authority.stage.intent.get("interaction_id"),
+            intent=authority.stage.intent,
+            mutation=runtime_publication_checkpoint_mutation(None, None),
+            transcript_messages=(),
+            events=(prepared_event,),
+        )
+
+        async def publish_once() -> Event:
+            await self._executor._session_store.complete_model_completion_stage(
+                self._session.id,
+                stage_id=authority.stage.stage_id,
+                publication=publication,
+            )
+            return prepared_event.model_copy(deep=True)
+
+        async def publish_exactly() -> Event:
+            try:
+                return await publish_once()
+            except (Exception, asyncio.CancelledError) as first_error:
+                try:
+                    await publish_once()
+                except (Exception, asyncio.CancelledError) as replay_error:
+                    replay_error.add_note(
+                        "Exact context-compaction stage publication also failed after "
+                        f"{type(first_error).__name__}: {first_error}"
+                    )
+                    raise replay_error from first_error
+                first_error.add_note(
+                    "Context-compaction evidence was durable after exact replay; the "
+                    "invocation will fail closed without another provider dispatch."
+                )
+                raise first_error
+
+        publication_task = asyncio.create_task(publish_exactly())
+        outcome = await await_shielded_task_outcome(
+            publication_task,
+            timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+        )
+        if outcome.timed_out:
+            publication_task.cancel()
+            drained = await await_shielded_task_outcome(
+                publication_task,
+                cancellation=outcome.cancellation,
+            )
+            error: BaseException | None = TimeoutError(
+                "Context-compaction durable publication exceeded "
+                f"{_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
+            )
+            if drained.error is not None:
+                error.add_note(
+                    "The timed-out context-compaction publication also failed while draining: "
+                    f"{type(drained.error).__name__}: {drained.error}"
+                )
+            result = drained.result
+            cancellation = drained.cancellation
+        else:
+            error = outcome.error
+            result = outcome.result
+            cancellation = outcome.cancellation
+        if isinstance(error, asyncio.CancelledError) and cancellation is None:
+            error = unexpected_child_cancellation_error(
+                error,
+                operation="Context-compaction durable publication",
+            )
+        if error is not None:
+            if cancellation is not None:
+                cancellation.add_note(
+                    "Context-compaction durable publication also failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+                raise cancellation from error
+            raise error
+        if result is None:
+            raise RuntimeError("Context-compaction durable publication returned no event.")
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _promote_settled_automatic_compaction_stage(
+        self,
+        *,
+        authority: _AutomaticCompactionDispatchAuthority,
+    ) -> list[Event]:
+        """Release one completed compaction stage only after budget settlement."""
+
+        if not authority.owns_stage or authority.stage.purpose != "context-compaction":
+            raise ValueError("Automatic compaction promotion requires its owned stage.")
+        active = await self._executor._session_store.load_active_model_completion_stage(
+            self._session.id
+        )
+        if active is None:
+            return []
+        if active.stage.stage_id != authority.stage.stage_id:
+            raise RuntimeError(
+                "Automatic compaction promotion found a different active model stage."
+            )
+        if active.stage.state == "in_flight":
+            return []
+        if active.stage.state != "completed":
+            raise RuntimeError("Automatic compaction promotion found an unsupported stage state.")
+        publication = active.stage.publication
+        if publication is None:
+            raise RuntimeError(
+                "Completed automatic compaction stage lost its terminal publication."
+            )
+        events = [event.model_copy(deep=True) for event in publication.events]
+        lost_acknowledgement: BaseException | None = None
+        try:
+            await self._executor._session_store.promote_model_completion_stage(
+                self._session.id,
+                stage_id=authority.stage.stage_id,
+                expected_run_epoch=self._session.run_epoch,
+            )
+        except BaseException as promotion_failure:
+            reconciled = await self._executor._session_store.load_active_model_completion_stage(
+                self._session.id
+            )
+            if reconciled is None:
+                lost_acknowledgement = promotion_failure
+            elif (
+                reconciled.stage.stage_id != authority.stage.stage_id
+                or reconciled.stage.state != "completed"
+            ):
+                raise RuntimeError(
+                    "Automatic compaction promotion reconciliation found conflicting state."
+                ) from promotion_failure
+            else:
+                raise
+        fanout_failure, cancellation = await self._fan_out_reconciled_automatic_compaction_events(
+            events,
+            cancellation=None,
+            operation="Automatic-compaction promotion",
+        )
+        if cancellation is not None:
+            secondary: BaseException | None
+            if lost_acknowledgement is not None and fanout_failure is not None:
+                secondary = _combine_authoritative_model_failure(
+                    lost_acknowledgement,
+                    fanout_failure,
+                    message=(
+                        "Automatic-compaction promotion acknowledgement and event "
+                        "fan-out both failed during cancellation."
+                    ),
+                )
+            else:
+                secondary = lost_acknowledgement or fanout_failure
+            cancellation.add_note(
+                "Automatic-compaction event fan-out was interrupted after durable promotion."
+            )
+            if secondary is not None:
+                raise cancellation from secondary
+            raise cancellation
+        if fanout_failure is not None:
+            if lost_acknowledgement is None:
+                raise fanout_failure
+            raise _combine_authoritative_model_failure(
+                lost_acknowledgement,
+                fanout_failure,
+                message=(
+                    "Automatic-compaction promotion acknowledgement and event fan-out both failed."
+                ),
+            ) from None
+        if lost_acknowledgement is not None:
+            lost_acknowledgement.add_note(
+                "Automatic-compaction promotion was durable after reconciliation."
+            )
+            raise lost_acknowledgement
+        return [event.model_copy(deep=True) for event in events]
+
     async def _persist_automatic_compaction_completions(
         self,
         payloads: list[dict[str, Any]],
@@ -10812,6 +11642,8 @@ class ModelStepRun:
         published_attempt_ids: set[str],
         published_events: list[Event],
         completion_events: dict[str, Event],
+        dispatch_authorities: dict[str, _AutomaticCompactionDispatchAuthority],
+        settled_attempt_ids: set[str],
     ) -> None:
         """Commit finalized provider evidence before another compactor dispatch."""
 
@@ -10822,19 +11654,41 @@ class ModelStepRun:
                 raise RuntimeError("Compaction completion evidence lost its attempt identity.")
             if attempt_id in published_attempt_ids:
                 continue
+            try:
+                execution_identity = ModelAttemptIdentity.model_validate(
+                    {
+                        "model_step_id": payload.get("model_step_id"),
+                        "model_attempt_id": payload.get("model_attempt_id"),
+                    }
+                )
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "Compaction completion carries an invalid model attempt identity."
+                ) from None
+            authority = dispatch_authorities.get(execution_identity.model_attempt_id)
+            if authority is None:
+                raise RuntimeError(
+                    "Compaction completion has no durable provider-dispatch authority."
+                )
+            provider_error = model_provider_error_from_payload(
+                payload,
+                fallback_provider=authority.provider_name,
+                fallback_message="Automatic compaction provider error",
+            )
+            deadline_error = (
+                provider_error if isinstance(provider_error, ModelStreamDeadlineError) else None
+            )
+            if deadline_error is not None:
+                # Automatic compaction uses a synchronous model stage and has no
+                # durable provider-operation identity to reattach. Recovery
+                # disposition therefore comes from this runtime-owned authority,
+                # never from provider-supplied exception payloads.
+                deadline_error = _deadline_with_runtime_recovery_authority(
+                    deadline_error,
+                    exact_operation=False,
+                )
             event = completion_events.get(attempt_id)
             if event is None:
-                try:
-                    execution_identity = ModelAttemptIdentity.model_validate(
-                        {
-                            "model_step_id": payload.get("model_step_id"),
-                            "model_attempt_id": payload.get("model_attempt_id"),
-                        }
-                    )
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        "Compaction completion carries an invalid model attempt identity."
-                    ) from None
                 event = _context_compaction_telemetry_event(
                     telemetry=ContextCompactionTelemetry(
                         event_type=EventType.MODEL_COMPLETED,
@@ -10846,13 +11700,124 @@ class ModelStepRun:
                     execution_identity=execution_identity,
                     execution_profile=self._execution_profile,
                 )
-                completion_events[attempt_id] = event.model_copy(deep=True)
+            parent_model_step_id = (
+                authority.stage.intent.get("parent_model_step_id")
+                if authority.owns_stage
+                else authority.stage.logical_step_id
+            )
+            if type(parent_model_step_id) is not str:
+                raise RuntimeError(
+                    "Automatic compaction stage lost its parent model-step identity."
+                )
+            parent_model_step_id = require_durable_clean_nonblank(
+                parent_model_step_id,
+                "parent_model_step_id",
+            )
+            event_payload = copy_durable_json_object(event.payload, "payload")
+            event_payload["parent_model_step_id"] = parent_model_step_id
+            event = event.model_copy(update={"payload": event_payload}, deep=True)
+            event = event_with_runtime_payload_authority(
+                event,
+                "parent_model_step_id",
+            )
+            completion_events[attempt_id] = event.model_copy(deep=True)
+            if authority.owns_stage and deadline_error is None:
+                promotion_allowed = (
+                    not authority.stage.reservation_ids
+                    or execution_identity.model_attempt_id in settled_attempt_ids
+                )
+                try:
+                    persisted_event = await self._publish_owned_automatic_compaction_completion(
+                        authority=authority,
+                        event=event,
+                    )
+                    if promotion_allowed:
+                        await self._promote_settled_automatic_compaction_stage(
+                            authority=authority,
+                        )
+                except BaseException as publication_error:
+                    try:
+                        event_durable = await self._executor._event_writer.is_persisted(event)
+                    except BaseException as reconciliation_error:
+                        if isinstance(reconciliation_error, asyncio.CancelledError):
+                            if not authority.stage.reservation_ids:
+                                try:
+                                    await self._promote_settled_automatic_compaction_stage(
+                                        authority=authority,
+                                    )
+                                except BaseException as promotion_failure:
+                                    reconciliation_error.add_note(
+                                        "Completed context-compaction promotion also failed "
+                                        "during cancelled publication reconciliation."
+                                    )
+                                    raise reconciliation_error from promotion_failure
+                            if publication_error is reconciliation_error:
+                                raise
+                            raise reconciliation_error from publication_error
+                        publication_error.add_note(
+                            "Context-compaction stage publication reconciliation also failed: "
+                            f"{type(reconciliation_error).__name__}: {reconciliation_error}"
+                        )
+                        raise publication_error from reconciliation_error
+                    if not event_durable and promotion_allowed:
+                        try:
+                            await self._promote_settled_automatic_compaction_stage(
+                                authority=authority,
+                            )
+                        except BaseException as promotion_failure:
+                            publication_error.add_note(
+                                "Reconciled context-compaction completion promotion also failed."
+                            )
+                            raise publication_error from promotion_failure
+                        event_durable = True
+                    if event_durable:
+                        # Exact stage replay proved the handoff durable even
+                        # though this invocation must still fail closed. Keep
+                        # later context-failure persistence from duplicating it.
+                        published_attempt_ids.add(attempt_id)
+                        published_events.append(event.model_copy(deep=True))
+                    raise publication_error
+                completion_events[attempt_id] = persisted_event.model_copy(deep=True)
+                published_attempt_ids.add(attempt_id)
+                if promotion_allowed:
+                    published_events.append(persisted_event)
+                continue
             pending.append(
                 (
                     attempt_id,
                     event.model_copy(deep=True),
                 )
             )
+            if deadline_error is not None:
+                error_payload = {
+                    "error": str(deadline_error),
+                    "error_type": type(deadline_error).__name__,
+                    "stage": "context_compaction_stream",
+                    "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                    "compactor": payload.get("compactor"),
+                    "compaction_outcome": payload.get("compaction_outcome"),
+                    "step": authority.step,
+                    "attempt": authority.attempt,
+                    "max_attempts": authority.max_attempts,
+                    _COMPACTION_ATTEMPT_ID_KEY: attempt_id,
+                    "model_completion_stage_id": authority.stage.stage_id,
+                    **execution_identity.payload(),
+                    **deadline_error.error_payload_fields(),
+                }
+                error_event = event_with_execution_profile_authority(
+                    _event_with_model_identity_authority(
+                        Event(
+                            type=EventType.MODEL_ERROR,
+                            session_id=self._session.id,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            payload=error_payload,
+                        ),
+                        execution_identity,
+                    ),
+                    self._execution_profile,
+                )
+                pending.append((attempt_id, error_event))
         if not pending:
             return
 
@@ -11195,6 +12160,9 @@ class ModelStepRun:
                     },
                 ),
                 self._execution_profile,
+            )
+            checkpoint_event = _event_with_model_identity_authority(
+                checkpoint_event, model_step_identity
             )
             atomic_events = self._executor._event_writer.prepare_many(
                 [*prepared_events, checkpoint_event]
@@ -11727,6 +12695,10 @@ class ModelStepRun:
         step: int,
         model_step_identity: ModelStepIdentity,
         compaction_identity_ledger: _CompactionExecutionIdentityLedger,
+        dispatch_authorities: dict[str, _AutomaticCompactionDispatchAuthority],
+        settled_attempt_ids: set[str],
+        source_transcript_cursor: int,
+        allow_borrowed_stage: bool,
         lifecycle: _AutomaticCompactionLifecycle,
     ) -> CompactionResult:
         del messages
@@ -11750,6 +12722,124 @@ class ModelStepRun:
             and not limit.allow_unpriced
             and any(price.pricing_context is not None for price in limit.pricing.prices)
         )
+
+        async def prepare_dispatch_authority(
+            *,
+            provider_name: str,
+            pricing_provider_name: str,
+            model_request: ModelRequest,
+            model_attempt_identity: ModelAttemptIdentity,
+            attempt: int,
+            max_attempts: int,
+            billing_identity: BillingIdentity | None,
+            reservations: tuple[BudgetStepReservation, ...],
+        ) -> None:
+            authority = await self._prepare_automatic_compaction_dispatch_authority(
+                provider_name=provider_name,
+                pricing_provider_name=pricing_provider_name,
+                model_request=model_request,
+                model_attempt_identity=model_attempt_identity,
+                parent_model_step_identity=model_step_identity,
+                source_transcript_cursor=source_transcript_cursor,
+                step=step,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                billing_identity=billing_identity,
+                reservations=reservations,
+                allow_borrowed_stage=allow_borrowed_stage,
+            )
+            existing = dispatch_authorities.setdefault(
+                model_attempt_identity.model_attempt_id,
+                authority,
+            )
+            if existing != authority:
+                raise RuntimeError(
+                    "Compaction provider attempt has conflicting durable stage authority."
+                )
+            if not authority.owns_stage:
+                deferred_failure = await (
+                    controller.prepare_borrowed_automatic_compaction_budget_authority(
+                        session=self._session,
+                        stage=authority.stage,
+                        provider_name=provider_name,
+                        pricing_provider_name=pricing_provider_name,
+                        model=model_request.model,
+                        model_attempt_identity=model_attempt_identity,
+                        reservations=reservations,
+                    )
+                )
+                if deferred_failure is not None:
+                    raise deferred_failure
+
+        def prepared_dispatch_authority(
+            model_attempt_identity: ModelAttemptIdentity,
+        ) -> _AutomaticCompactionDispatchAuthority:
+            authority = dispatch_authorities.get(model_attempt_identity.model_attempt_id)
+            if authority is None:
+                raise RuntimeError("Compaction provider attempt lost its prepared stage authority.")
+            return authority
+
+        async def mark_dispatch_authority(
+            model_attempt_identity: ModelAttemptIdentity,
+        ) -> BaseException | None:
+            authority = prepared_dispatch_authority(model_attempt_identity)
+            deferred_failure = await self._mark_automatic_compaction_dispatch_authority(authority)
+            if deferred_failure is not None:
+                return deferred_failure
+            try:
+                self._validate_live_model_semantics()
+            except BaseException as authority_failure:
+                # The durable stage receipt has already crossed the last local
+                # provider fence. Fail closed without entering provider code.
+                return authority_failure
+            return None
+
+        async def promote_settled_dispatch_authority(
+            model_attempt_identity: ModelAttemptIdentity,
+            *,
+            authoritative_failure: BaseException | None = None,
+        ) -> None:
+            authority = prepared_dispatch_authority(model_attempt_identity)
+            if not authority.owns_stage:
+                if authoritative_failure is not None:
+                    raise authoritative_failure
+                return
+            try:
+                promoted_events = await self._promote_settled_automatic_compaction_stage(
+                    authority=authority,
+                )
+            except BaseException as promotion_failure:
+                if authoritative_failure is None:
+                    raise
+                add_exception_note_safely(
+                    authoritative_failure,
+                    (
+                        "Settled automatic-compaction stage promotion also failed: "
+                        f"{type(promotion_failure).__name__}: {promotion_failure}"
+                    ),
+                )
+                raise authoritative_failure from promotion_failure
+            known_event_ids = {event.id for event in budget_events}
+            budget_events.extend(
+                event for event in promoted_events if event.id not in known_event_ids
+            )
+            if authoritative_failure is not None:
+                raise authoritative_failure
+
+        async def abandon_pre_provider_dispatch(
+            model_attempt_identity: ModelAttemptIdentity,
+            failure: BaseException,
+        ) -> None:
+            authority = dispatch_authorities.get(model_attempt_identity.model_attempt_id)
+            if authority is None or not authority.owns_stage:
+                return
+            await self._abandon_pre_dispatch_model_stage(
+                authority.stage,
+                authoritative_failure=failure,
+                # The budget fence uses the independent compaction attempt,
+                # while ordinary assistant stages use their stage identity.
+                budget_dispatch_id=model_attempt_identity.model_attempt_id,
+            )
 
         async def record_compaction_footprint(
             *,
@@ -11844,14 +12934,10 @@ class ModelStepRun:
         ) -> tuple[str, dict[str, Any]]:
             """Identify a built-in dispatch reached through an opaque wrapper."""
 
-            del (
-                actual_pricing_provider_name,
-                actual_model,
-                actual_usage_dialect,
-                billing_identity,
-            )
+            del actual_model, actual_usage_dialect
             self._validate_live_model_semantics()
             model_attempt_identity = compaction_identity_ledger.begin_dispatch()
+            deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
             try:
                 await record_compaction_footprint(
                     provider=provider,
@@ -11861,34 +12947,73 @@ class ModelStepRun:
                     max_attempts=max_attempts,
                     model_attempt_identity=model_attempt_identity,
                 )
+                await prepare_dispatch_authority(
+                    provider_name=actual_provider_name,
+                    pricing_provider_name=actual_pricing_provider_name,
+                    model_request=model_request,
+                    model_attempt_identity=model_attempt_identity,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    billing_identity=billing_identity,
+                    reservations=(),
+                )
+                try:
+                    deferred_dispatch_failure = await mark_dispatch_authority(
+                        model_attempt_identity
+                    )
+                except BaseException as dispatch_failure:
+                    await abandon_pre_provider_dispatch(
+                        model_attempt_identity,
+                        dispatch_failure,
+                    )
+                    raise
+                if deferred_dispatch_failure is not None:
+                    raise deferred_dispatch_failure
                 self._validate_live_model_semantics()
                 lifecycle.provider_dispatch_disposition = (
                     _AutomaticCompactionDispatchDisposition.UNKNOWN
                 )
+                token = bind_provider_deadline_admission(deadline_admission)
                 try:
-                    with _compaction_model_attempt_identity_scope(model_attempt_identity):
-                        result = await dispatch()
-                except BaseException as error:
-                    if automatic_compaction_failure_disposition_payload(error) is None:
-                        lifecycle.attach_failure(
-                            error,
-                            phase=_AutomaticCompactionLifecyclePhase.PROVIDER_DISPATCH,
-                            reason=(
-                                _AutomaticCompactionFailureReason.CANCELLED
-                                if isinstance(error, asyncio.CancelledError)
-                                else _AutomaticCompactionFailureReason.PROVIDER_FAILED
-                            ),
-                            retryable=False,
-                            recovery_action=(
-                                _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
-                            ),
+                    try:
+                        with _compaction_model_attempt_identity_scope(model_attempt_identity):
+                            result = await dispatch()
+                    except BaseException as dispatch_failure:
+                        if (
+                            automatic_compaction_failure_disposition_payload(dispatch_failure)
+                            is None
+                        ):
+                            lifecycle.attach_failure(
+                                dispatch_failure,
+                                phase=_AutomaticCompactionLifecyclePhase.PROVIDER_DISPATCH,
+                                reason=(
+                                    _AutomaticCompactionFailureReason.CANCELLED
+                                    if isinstance(dispatch_failure, asyncio.CancelledError)
+                                    else _AutomaticCompactionFailureReason.PROVIDER_FAILED
+                                ),
+                                retryable=False,
+                                recovery_action=(
+                                    _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
+                                ),
+                            )
+                        settled_attempt_ids.add(model_attempt_identity.model_attempt_id)
+                        await promote_settled_dispatch_authority(
+                            model_attempt_identity,
+                            authoritative_failure=dispatch_failure,
                         )
-                    raise
-                lifecycle.provider_dispatch_disposition = (
-                    _AutomaticCompactionDispatchDisposition.DISPATCHED
-                )
-                return result
+                        raise AssertionError(
+                            "Unreachable compaction failure handoff."
+                        ) from dispatch_failure
+                    lifecycle.provider_dispatch_disposition = (
+                        _AutomaticCompactionDispatchDisposition.DISPATCHED
+                    )
+                    settled_attempt_ids.add(model_attempt_identity.model_attempt_id)
+                    await promote_settled_dispatch_authority(model_attempt_identity)
+                    return result
+                finally:
+                    reset_provider_deadline_admission(token)
             finally:
+                deadline_admission.close()
                 compaction_identity_ledger.end_dispatch(model_attempt_identity)
 
         async def execute_with_post_dispatch_failure_disposition() -> CompactionResult:
@@ -12027,37 +13152,44 @@ class ModelStepRun:
                     "Compaction dispatch model identity differs from its admitted identity."
                 )
             model_attempt_identity = compaction_identity_ledger.begin_dispatch()
+            deadline_admission: ProviderStreamDeadlineAdmission | None = None
             before_count = len(completed_payloads())
             try:
 
                 async def identified_dispatch() -> tuple[str, dict[str, Any]]:
                     self._validate_live_model_semantics()
+                    if deadline_admission is None:
+                        raise RuntimeError("Compaction deadline admission was not prepared.")
                     lifecycle.provider_dispatch_disposition = (
                         _AutomaticCompactionDispatchDisposition.UNKNOWN
                     )
+                    token = bind_provider_deadline_admission(deadline_admission)
                     try:
-                        with _compaction_model_attempt_identity_scope(model_attempt_identity):
-                            result = await dispatch()
-                    except BaseException as error:
-                        if automatic_compaction_failure_disposition_payload(error) is None:
-                            lifecycle.attach_failure(
-                                error,
-                                phase=_AutomaticCompactionLifecyclePhase.PROVIDER_DISPATCH,
-                                reason=(
-                                    _AutomaticCompactionFailureReason.CANCELLED
-                                    if isinstance(error, asyncio.CancelledError)
-                                    else _AutomaticCompactionFailureReason.PROVIDER_FAILED
-                                ),
-                                retryable=False,
-                                recovery_action=(
-                                    _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
-                                ),
-                            )
-                        raise
-                    lifecycle.provider_dispatch_disposition = (
-                        _AutomaticCompactionDispatchDisposition.DISPATCHED
-                    )
-                    return result
+                        try:
+                            with _compaction_model_attempt_identity_scope(model_attempt_identity):
+                                result = await dispatch()
+                        except BaseException as error:
+                            if automatic_compaction_failure_disposition_payload(error) is None:
+                                lifecycle.attach_failure(
+                                    error,
+                                    phase=_AutomaticCompactionLifecyclePhase.PROVIDER_DISPATCH,
+                                    reason=(
+                                        _AutomaticCompactionFailureReason.CANCELLED
+                                        if isinstance(error, asyncio.CancelledError)
+                                        else _AutomaticCompactionFailureReason.PROVIDER_FAILED
+                                    ),
+                                    retryable=False,
+                                    recovery_action=(
+                                        _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
+                                    ),
+                                )
+                            raise
+                        lifecycle.provider_dispatch_disposition = (
+                            _AutomaticCompactionDispatchDisposition.DISPATCHED
+                        )
+                        return result
+                    finally:
+                        reset_provider_deadline_admission(token)
 
                 def completion_events(payloads: list[dict[str, Any]]) -> list[Event]:
                     identified = compaction_identity_ledger.identify_payloads(
@@ -12127,6 +13259,7 @@ class ModelStepRun:
                     )
                     raise stopped
                 budget_events.extend(limit_evaluation.events)
+                deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
                 if not limits:
                     self._validate_live_model_semantics()
                     await record_compaction_footprint(
@@ -12137,7 +13270,42 @@ class ModelStepRun:
                         max_attempts=max_attempts,
                         model_attempt_identity=model_attempt_identity,
                     )
-                    return await identified_dispatch()
+                    await prepare_dispatch_authority(
+                        provider_name=actual_provider_name,
+                        pricing_provider_name=actual_pricing_provider_name,
+                        model_request=model_request,
+                        model_attempt_identity=model_attempt_identity,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        billing_identity=billing_identity,
+                        reservations=(),
+                    )
+                    try:
+                        deferred_dispatch_failure = await mark_dispatch_authority(
+                            model_attempt_identity
+                        )
+                    except BaseException as dispatch_failure:
+                        await abandon_pre_provider_dispatch(
+                            model_attempt_identity,
+                            dispatch_failure,
+                        )
+                        raise
+                    if deferred_dispatch_failure is not None:
+                        raise deferred_dispatch_failure
+                    try:
+                        result = await identified_dispatch()
+                    except BaseException as dispatch_failure:
+                        settled_attempt_ids.add(model_attempt_identity.model_attempt_id)
+                        await promote_settled_dispatch_authority(
+                            model_attempt_identity,
+                            authoritative_failure=dispatch_failure,
+                        )
+                        raise AssertionError(
+                            "Unreachable compaction failure handoff."
+                        ) from dispatch_failure
+                    settled_attempt_ids.add(model_attempt_identity.model_attempt_id)
+                    await promote_settled_dispatch_authority(model_attempt_identity)
+                    return result
 
                 async def publish_dispatch_observation() -> None:
                     self._validate_live_model_semantics()
@@ -12151,7 +13319,36 @@ class ModelStepRun:
                     )
                     self._validate_live_model_semantics()
 
-                outcome = await controller.run_automatic_compaction_dispatch(
+                async def stage_prepared_compaction(
+                    reservations: tuple[BudgetStepReservation, ...],
+                ) -> None:
+                    self._validate_live_model_semantics()
+                    await prepare_dispatch_authority(
+                        provider_name=actual_provider_name,
+                        pricing_provider_name=actual_pricing_provider_name,
+                        model_request=model_request,
+                        model_attempt_identity=model_attempt_identity,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        billing_identity=billing_identity,
+                        reservations=reservations,
+                    )
+
+                async def stage_dispatched_compaction(
+                    reservations: tuple[BudgetStepReservation, ...],
+                ) -> BaseException | None:
+                    del reservations
+                    return await mark_dispatch_authority(model_attempt_identity)
+
+                async def abandon_stage_before_provider_dispatch(
+                    failure: BaseException,
+                ) -> None:
+                    await abandon_pre_provider_dispatch(
+                        model_attempt_identity,
+                        failure,
+                    )
+
+                budgeted_dispatch = controller.run_automatic_compaction_dispatch(
                     identified_dispatch,
                     completed_events=completed_events,
                     prior_completion_events=prior_completion_events,
@@ -12172,8 +13369,69 @@ class ModelStepRun:
                     ),
                     reservation_identity_guard=self._reservation_identity_guard,
                     before_provider_dispatch=publish_dispatch_observation,
+                    before_reservations_dispatched=stage_prepared_compaction,
+                    after_reservations_dispatched=stage_dispatched_compaction,
+                    on_pre_provider_dispatch_failure=(abandon_stage_before_provider_dispatch),
                 )
+                outcome = await budgeted_dispatch
                 budget_events.extend(outcome.events)
+                settlement_failed = (
+                    isinstance(outcome, BudgetedOperationFailed)
+                    and outcome.error.__dict__.get("_cayu_compaction_budget_settlement_failed")
+                    is True
+                )
+                if not settlement_failed:
+                    settled_attempt_ids.add(model_attempt_identity.model_attempt_id)
+                authority = dispatch_authorities.get(model_attempt_identity.model_attempt_id)
+                if authority is not None and not authority.owns_stage:
+                    try:
+                        recovered_budget_events = await (
+                            controller.reconcile_borrowed_automatic_compaction_budget_authority(
+                                session=self._session,
+                                stage=authority.stage,
+                                allow_outcome_unknown=True,
+                            )
+                        )
+                    except BaseException as reconciliation_failure:
+                        if isinstance(outcome, BudgetedOperationFailed):
+                            combined = _combine_authoritative_model_failure(
+                                outcome.error,
+                                reconciliation_failure,
+                                message=(
+                                    "Automatic compaction failed while its borrowed-stage "
+                                    "budget authority was reconciled."
+                                ),
+                            )
+                            if outcome.cause is not None:
+                                raise combined from outcome.cause
+                            raise combined from None
+                        raise
+                    known_budget_event_ids = {event.id for event in budget_events}
+                    budget_events.extend(
+                        event
+                        for event in recovered_budget_events
+                        if event.id not in known_budget_event_ids
+                    )
+                if authority is not None and authority.owns_stage and not settlement_failed:
+                    if isinstance(outcome, BudgetedOperationFailed):
+                        try:
+                            await promote_settled_dispatch_authority(
+                                model_attempt_identity,
+                            )
+                        except BaseException as promotion_failure:
+                            combined = _combine_authoritative_model_failure(
+                                outcome.error,
+                                promotion_failure,
+                                message=(
+                                    "Automatic compaction failed while its settled stage "
+                                    "was promoted."
+                                ),
+                            )
+                            if outcome.cause is not None:
+                                raise combined from outcome.cause
+                            raise combined from None
+                    else:
+                        await promote_settled_dispatch_authority(model_attempt_identity)
                 if isinstance(outcome, BudgetedOperationSucceeded):
                     return cast("tuple[str, dict[str, Any]]", outcome.result)
                 if isinstance(outcome, BudgetedOperationRejected):
@@ -12213,6 +13471,8 @@ class ModelStepRun:
                     raise outcome.error from outcome.cause
                 raise outcome.error
             finally:
+                if deadline_admission is not None:
+                    deadline_admission.close()
                 compaction_identity_ledger.end_dispatch(model_attempt_identity)
 
         with _automatic_compaction_dispatch_runner_scope(run_provider_dispatch):

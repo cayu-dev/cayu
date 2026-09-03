@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from examples.prompt_cache_compaction.deterministic import run
 from examples.prompt_cache_compaction.live import _thinking_for_model
 from examples.prompt_cache_compaction.scenario import (
     LoadStableContextTool,
+    RecordingProvider,
     _model_step_attempt_events,
     _paired_cost_quality_report,
     _retention_quality,
@@ -19,6 +21,7 @@ from examples.prompt_cache_compaction.scenario import (
 )
 
 from cayu import (
+    AnthropicProvider,
     CayuApp,
     Event,
     EventType,
@@ -29,10 +32,58 @@ from cayu import (
     SessionStatus,
     ToolEffect,
 )
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 
 
 def test_stable_context_loader_declares_its_read_only_effect() -> None:
     assert LoadStableContextTool.spec.effect is ToolEffect.NONE
+
+
+def test_prompt_cache_recording_provider_forwards_stream_deadlines() -> None:
+    delegate = AnthropicProvider(
+        api_key="test-key",
+        transport_idle_timeout_s=11,
+        protocol_idle_timeout_s=12,
+        semantic_progress_timeout_s=13,
+        absolute_stream_timeout_s=14,
+    )
+    provider = RecordingProvider(delegate)
+
+    assert provider.stream_deadlines == delegate.stream_deadlines
+    assert type(provider).runtime_stream is RecordingProvider.runtime_stream
+
+
+@pytest.mark.anyio
+async def test_prompt_cache_recording_provider_closes_runtime_delegate() -> None:
+    class ClosingDelegate(ModelProvider):
+        name = "closing-delegate"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def runtime_stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            try:
+                yield ModelStreamEvent.text_delta("partial")
+            finally:
+                self.closed = True
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield ModelStreamEvent.text_delta("raw")
+
+    delegate = ClosingDelegate()
+    events = RecordingProvider(delegate).runtime_stream(
+        ModelRequest(model="test-model", messages=[Message.text("user", "Hello")])
+    )
+
+    assert (await anext(events)).delta == "partial"
+    await events.aclose()
+
+    assert delegate.closed is True
 
 
 def test_runtime_failure_summary_keeps_provider_diagnostics_without_request_data() -> None:

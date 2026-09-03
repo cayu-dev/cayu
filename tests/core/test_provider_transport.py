@@ -2,9 +2,9 @@
 
 The OpenAI, Anthropic, Chat Completions, and Vertex adapters delegate their
 HTTP/SSE mechanics to ``cayu.providers._http`` and ``cayu.providers._sse``.
-These tests pin the shared behavior: one SSE parser with one heartbeat/idle
-timer (keep-alives count as activity for every provider), provider-labeled
-error messages, and the shared URL validation.
+These tests pin the shared behavior: one SSE parser with distinct raw-byte
+and decoded-event clocks, provider-labeled errors, bounded framing, and shared
+URL validation. Keep-alives prove transport activity only.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from cayu.providers import (
     AnthropicAPIError,
     AnthropicError,
     AnthropicProvider,
+    BedrockProvider,
     ChatCompletionsAPIError,
     ChatCompletionsError,
     ChatCompletionsProtocolError,
@@ -62,11 +63,28 @@ from cayu.providers._http import (
 from cayu.providers._sse import (
     SseEventLimitError,
     SseEventTimeoutError,
-    SseIdleTimeoutError,
     _aiter_bounded_sse_lines,
     aiter_sse_json_events,
 )
+from cayu.providers.base import ModelStreamDeadlineError
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineController,
+    ProviderStreamDeadlineExceeded,
+    ProviderStreamDeadlines,
+)
 from cayu.providers.openai_subscription import OpenAISubscriptionCredentials
+
+
+def _deadline_controller(protocol_idle_timeout_s: float = 1.0) -> ProviderStreamDeadlineController:
+    return ProviderStreamDeadlineController(
+        ProviderStreamDeadlines(
+            transport_idle_timeout_s=10.0,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=10.0,
+            absolute_stream_timeout_s=10.0,
+        )
+    )
 
 
 class _LineByteStream(httpx.AsyncByteStream):
@@ -126,6 +144,21 @@ class _DelayedChunkStream(_ChunkedByteStream):
             await asyncio.sleep(self._delay_s)
             self.yielded_chunks += 1
             yield chunk
+
+
+class _ResetAfterEventByteStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aiter__(self):
+        yield (b'data: {"type":"response.created","response":{"id":"resp-reset"}}\n\n')
+        raise httpx.RemoteProtocolError(
+            "forced established response-body reset",
+            request=httpx.Request("POST", "https://provider.example/v1/stream"),
+        )
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class _BlockingByteStream(httpx.AsyncByteStream):
@@ -360,7 +393,10 @@ async def test_http_transport_pass_through_closes_shared_sse_iterator(
         headers={},
         payload={},
         timeout_s=1.0,
-        stream_idle_timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
 
     assert await anext(events) == {"ok": True}
@@ -718,7 +754,10 @@ async def _stream_mock_sse(
     stream: httpx.AsyncByteStream,
     *,
     headers: Mapping[str, str] | None = None,
-    stream_idle_timeout_s: float = 1.0,
+    transport_idle_timeout_s: float = 1.0,
+    protocol_idle_timeout_s: float = 1.0,
+    semantic_progress_timeout_s: float = 1.0,
+    absolute_stream_timeout_s: float = 1.0,
 ) -> list[Mapping[str, Any]]:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -737,7 +776,10 @@ async def _stream_mock_sse(
                 headers={},
                 payload={},
                 timeout_s=1.0,
-                stream_idle_timeout_s=stream_idle_timeout_s,
+                transport_idle_timeout_s=transport_idle_timeout_s,
+                protocol_idle_timeout_s=protocol_idle_timeout_s,
+                semantic_progress_timeout_s=semantic_progress_timeout_s,
+                absolute_stream_timeout_s=absolute_stream_timeout_s,
                 request_label="OpenAI API",
                 response_label="OpenAI",
                 api_error=OpenAIAPIError,
@@ -789,7 +831,7 @@ def test_provider_error_projection_omits_arbitrary_identity_strings(
 
 @pytest.mark.parametrize(
     "error_type",
-    ["SseIdleTimeoutError", "SseEventTimeoutError", "SseEventLimitError"],
+    ["SseEventTimeoutError", "SseEventLimitError"],
 )
 def test_provider_error_projection_preserves_fixed_sse_classification(error_type: str) -> None:
     error = ModelProviderError(
@@ -948,17 +990,17 @@ def test_new_async_client_fails_closed_when_extra_ca_is_blank(
 
 
 class _StreamContext:
-    def __init__(self, response: _StreamingResponse) -> None:
+    def __init__(self, response: httpx.Response) -> None:
         self._response = response
 
-    async def __aenter__(self) -> _StreamingResponse:
+    async def __aenter__(self) -> httpx.Response:
         return self._response
 
     async def __aexit__(self, *args: Any) -> None:
         await self._response.aclose()
 
 
-def _client_factory(response: _StreamingResponse) -> type:
+def _client_factory(response: httpx.Response) -> type:
     class FakeClient:
         is_closed = False
 
@@ -1118,11 +1160,47 @@ _KEEPALIVE_LINES = [
 
 
 @pytest.mark.anyio
+async def test_openai_transport_classifies_established_sse_reset_separately_from_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _ResetAfterEventByteStream()
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=stream,
+        request=httpx.Request("POST", "https://provider.example/v1/stream"),
+    )
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
+    events = HttpxOpenAITransport().stream_response_events(
+        url="https://api.openai.com/v1/responses",
+        headers={},
+        payload={},
+        timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
+    )
+
+    assert await anext(events) == {
+        "type": "response.created",
+        "response": {"id": "resp-reset"},
+    }
+    with pytest.raises(OpenAIAPIError) as captured:
+        await anext(events)
+
+    assert type(captured.value) is OpenAIAPIError
+    assert captured.value.error_type == "RemoteProtocolError"
+    assert captured.value.retryable is False
+    assert captured.value.status_code is None
+    assert stream.closed is True
+
+
+@pytest.mark.anyio
 async def test_openai_transport_survives_keepalive_heartbeats(monkeypatch) -> None:
-    # Five heartbeats, each within one idle window (0.04 < 0.1) but 0.2s in
-    # total: the stream survives only if `:` comments refresh the idle timer.
-    # Before the transports shared one SSE parser, the OpenAI parser ignored
-    # heartbeats and killed exactly this stream.
+    # Five heartbeats, each within one transport-idle window (0.04 < 0.1)
+    # but 0.2s in total. Comments prove transport activity without claiming
+    # decoded protocol or semantic progress.
     response = _StreamingResponse(_KEEPALIVE_LINES, heartbeat_sleep_s=0.04)
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
 
@@ -1133,11 +1211,82 @@ async def test_openai_transport_survives_keepalive_heartbeats(monkeypatch) -> No
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=0.1,
+            transport_idle_timeout_s=0.1,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
         )
     ]
 
     assert events == [{"ok": True}]
+
+
+@pytest.mark.anyio
+async def test_byte_active_heartbeat_only_sse_crosses_semantic_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _StreamingResponse(
+        [item for _ in range(40) for item in (": keepalive", "")],
+        heartbeat_sleep_s=0.005,
+    )
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        transport_idle_timeout_s=0.1,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=0.03,
+        absolute_stream_timeout_s=1.0,
+    )
+
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        async for _ in provider.runtime_stream(
+            ModelRequest(model="test-model", messages=[Message.text("user", "hello")])
+        ):
+            pass
+
+    assert captured.value.deadline_evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
+    assert response.byte_stream.closed is True
+
+
+@pytest.mark.anyio
+async def test_semantically_active_real_sse_is_bounded_by_absolute_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lines = [
+        'data: {"type":"response.created","response":{"id":"resp-absolute"}}',
+        "",
+    ]
+    for output_index in range(12):
+        lines.extend(
+            [
+                (
+                    'data: {"type":"response.output_text.delta",'
+                    f'"output_index":{output_index},"content_index":0,"delta":"x"}}'
+                ),
+                "",
+            ]
+        )
+    response = _StreamingResponse(lines, heartbeat_sleep_s=0.04)
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
+    provider = OpenAIProvider(
+        api_key="test-key",
+        transport_idle_timeout_s=0.15,
+        protocol_idle_timeout_s=0.2,
+        semantic_progress_timeout_s=0.2,
+        absolute_stream_timeout_s=0.55,
+    )
+
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        async for _ in provider.runtime_stream(
+            ModelRequest(model="test-model", messages=[Message.text("user", "hello")])
+        ):
+            pass
+
+    evidence = captured.value.deadline_evidence
+    assert evidence.deadline_kind is ProviderDeadlineKind.ABSOLUTE
+    assert evidence.elapsed_s >= 0.5
+    assert evidence.last_progress_kind is not None
+    assert response.byte_stream.closed is True
 
 
 @pytest.mark.anyio
@@ -1152,7 +1301,10 @@ async def test_chat_completions_transport_survives_keepalive_heartbeats(monkeypa
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=0.1,
+            transport_idle_timeout_s=0.1,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
         )
     ]
 
@@ -1281,7 +1433,10 @@ async def test_http_sse_classifies_compressed_error_without_reading_body(
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=1.0,
+            transport_idle_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -1328,7 +1483,10 @@ async def test_http_sse_fails_closed_when_error_response_close_fails() -> None:
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=1.0,
+            transport_idle_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -1372,7 +1530,10 @@ async def test_http_sse_bounds_identity_error_body_before_classification(
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=1.0,
+            transport_idle_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -1410,7 +1571,10 @@ async def test_http_sse_bounds_active_never_ending_identity_error_body() -> None
             headers={},
             payload={},
             timeout_s=0.02,
-            stream_idle_timeout_s=0.01,
+            transport_idle_timeout_s=0.01,
+            protocol_idle_timeout_s=0.01,
+            semantic_progress_timeout_s=0.01,
+            absolute_stream_timeout_s=0.01,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -1447,7 +1611,10 @@ async def test_http_sse_bounds_stalled_identity_error_body_by_idle_timeout() -> 
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=0.01,
+            transport_idle_timeout_s=0.01,
+            protocol_idle_timeout_s=0.01,
+            semantic_progress_timeout_s=0.01,
+            absolute_stream_timeout_s=0.01,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -1485,7 +1652,10 @@ async def test_http_sse_error_body_reader_propagates_real_task_cancellation() ->
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=1.0,
+            transport_idle_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -1535,7 +1705,10 @@ async def test_http_sse_preserves_error_status_when_identity_body_read_fails() -
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=1.0,
+            transport_idle_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -1574,7 +1747,10 @@ async def test_http_sse_forces_identity_encoding_case_insensitively() -> None:
                 headers={"aCcEpT-EnCoDiNg": "gzip", "X-Test": "kept"},
                 payload={},
                 timeout_s=1.0,
-                stream_idle_timeout_s=1.0,
+                transport_idle_timeout_s=1.0,
+                protocol_idle_timeout_s=1.0,
+                semantic_progress_timeout_s=1.0,
+                absolute_stream_timeout_s=1.0,
                 request_label="OpenAI API",
                 response_label="OpenAI",
                 api_error=OpenAIAPIError,
@@ -1610,22 +1786,27 @@ async def test_http_sse_counts_fragmented_raw_bytes_as_idle_activity() -> None:
         delay_s=0.02,
     )
 
-    events = await _stream_mock_sse(stream, stream_idle_timeout_s=0.05)
+    events = await _stream_mock_sse(stream, transport_idle_timeout_s=0.05)
 
     assert events == [{"ok": True}]
     assert stream.closed
 
 
 @pytest.mark.anyio
-async def test_http_sse_bounds_continuously_progressing_partial_line_by_duration() -> None:
+async def test_http_sse_bounds_continuously_progressing_partial_line_by_protocol_deadline() -> None:
     stream = _DelayedChunkStream([b"x"] * 12, delay_s=0.02)
 
-    with pytest.raises(OpenAIAPIError) as captured:
-        await _stream_mock_sse(stream, stream_idle_timeout_s=0.05)
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        await _stream_mock_sse(
+            stream,
+            transport_idle_timeout_s=0.05,
+            protocol_idle_timeout_s=0.05,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
+        )
 
-    assert captured.value.retryable is True
-    assert captured.value.error_type == "SseEventTimeoutError"
-    assert isinstance(captured.value.__cause__, SseEventTimeoutError)
+    assert captured.value.retryable is False
+    assert captured.value.deadline_evidence.deadline_kind is ProviderDeadlineKind.PROTOCOL_IDLE
     assert stream.closed
 
 
@@ -1643,7 +1824,10 @@ async def test_http_sse_yields_small_event_without_waiting_for_more_bytes() -> N
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=1.0,
+            transport_idle_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
@@ -1702,7 +1886,7 @@ async def test_http_sse_byte_reader_propagates_real_task_cancellation() -> None:
     ],
 )
 @pytest.mark.anyio
-async def test_http_sse_idle_timeout_is_a_typed_retryable_provider_error(
+async def test_http_sse_transport_timeout_is_typed_and_nonretryable(
     monkeypatch: pytest.MonkeyPatch,
     transport_type: type,
     stream_method: str,
@@ -1717,14 +1901,17 @@ async def test_http_sse_idle_timeout_is_a_typed_retryable_provider_error(
         headers={},
         payload={},
         timeout_s=1.0,
-        stream_idle_timeout_s=0.001,
+        transport_idle_timeout_s=0.001,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
-    with pytest.raises(api_error_type) as captured:
+    with pytest.raises(ModelStreamDeadlineError) as captured:
         await stream.__anext__()
 
-    assert captured.value.retryable is True
-    assert captured.value.error_type == "SseIdleTimeoutError"
-    assert isinstance(captured.value.__cause__, SseIdleTimeoutError)
+    assert not isinstance(captured.value, api_error_type)
+    assert captured.value.retryable is False
+    assert captured.value.deadline_evidence.deadline_kind is ProviderDeadlineKind.TRANSPORT_IDLE
 
 
 @pytest.mark.anyio
@@ -1737,7 +1924,10 @@ async def test_http_sse_protocol_errors_remain_permanent(monkeypatch) -> None:
         headers={},
         payload={},
         timeout_s=1.0,
-        stream_idle_timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     with pytest.raises(OpenAIProtocolError):
         await stream.__anext__()
@@ -1760,7 +1950,10 @@ async def test_http_sse_event_limit_is_a_typed_nonretryable_provider_error(
         headers={},
         payload={},
         timeout_s=1.0,
-        stream_idle_timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     with pytest.raises(OpenAIAPIError) as captured:
         await stream.__anext__()
@@ -1787,7 +1980,10 @@ async def test_http_sse_event_timeout_is_a_typed_retryable_provider_error(
         headers={},
         payload={},
         timeout_s=1.0,
-        stream_idle_timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     with pytest.raises(OpenAIAPIError) as captured:
         await stream.__anext__()
@@ -1798,16 +1994,16 @@ async def test_http_sse_event_timeout_is_a_typed_retryable_provider_error(
 
 
 @pytest.mark.anyio
-async def test_sse_parser_rejects_nonpositive_idle_timeout() -> None:
+async def test_sse_parser_rejects_nonpositive_protocol_idle_timeout() -> None:
     async def lines():
         yield ""
 
-    with pytest.raises(ValueError, match="idle_timeout_s"):
+    with pytest.raises(ValueError, match="protocol_idle_timeout_s"):
         [
             event
             async for event in aiter_sse_json_events(
                 lines(),
-                idle_timeout_s=0,
+                deadline_controller=_deadline_controller(0),
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
             )
@@ -1818,8 +2014,8 @@ async def test_sse_parser_rejects_nonpositive_idle_timeout() -> None:
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
-        pytest.param("idle_timeout_s", float("nan"), id="idle-nan"),
-        pytest.param("idle_timeout_s", float("inf"), id="idle-infinity"),
+        pytest.param("protocol_idle_timeout_s", float("nan"), id="idle-nan"),
+        pytest.param("protocol_idle_timeout_s", float("inf"), id="idle-infinity"),
         pytest.param("max_event_duration_s", float("nan"), id="duration-nan"),
         pytest.param("max_event_duration_s", float("inf"), id="duration-infinity"),
     ],
@@ -1831,14 +2027,14 @@ async def test_sse_parser_rejects_non_finite_timeouts(
     async def lines():
         yield ""
 
-    idle_timeout_s = value if field_name == "idle_timeout_s" else 1.0
+    protocol_idle_timeout_s = value if field_name == "protocol_idle_timeout_s" else 1.0
     max_event_duration_s = value if field_name == "max_event_duration_s" else None
     with pytest.raises(ValueError, match=field_name):
         [
             event
             async for event in aiter_sse_json_events(
                 lines(),
-                idle_timeout_s=idle_timeout_s,
+                deadline_controller=_deadline_controller(protocol_idle_timeout_s),
                 max_event_duration_s=max_event_duration_s,
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
@@ -1851,30 +2047,39 @@ async def test_sse_parser_rejects_non_finite_timeouts(
     [
         (
             "openai",
-            lambda value: OpenAIProvider(api_key="test-key", stream_idle_timeout_s=value),
+            lambda field, value: OpenAIProvider(api_key="test-key", **{field: value}),
         ),
         (
             "anthropic",
-            lambda value: AnthropicProvider(api_key="test-key", stream_idle_timeout_s=value),
+            lambda field, value: AnthropicProvider(api_key="test-key", **{field: value}),
         ),
         (
             "chat_completions",
-            lambda value: ChatCompletionsProvider(api_key="test-key", stream_idle_timeout_s=value),
+            lambda field, value: ChatCompletionsProvider(api_key="test-key", **{field: value}),
         ),
         (
             "vertex",
-            lambda value: VertexProvider(
+            lambda field, value: VertexProvider(
                 project_id="test-project",
                 credentials=SimpleNamespace(valid=True, token="test-token"),
-                stream_idle_timeout_s=value,
+                **{field: value},
             ),
         ),
         (
             "openai_subscription",
-            lambda value: OpenAISubscriptionProvider(
-                auth=_UnusedSubscriptionAuth(), stream_idle_timeout_s=value
+            lambda field, value: OpenAISubscriptionProvider(
+                auth=_UnusedSubscriptionAuth(), **{field: value}
             ),
         ),
+    ],
+)
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "transport_idle_timeout_s",
+        "protocol_idle_timeout_s",
+        "semantic_progress_timeout_s",
+        "absolute_stream_timeout_s",
     ],
 )
 @pytest.mark.parametrize(
@@ -1886,16 +2091,84 @@ async def test_sse_parser_rejects_non_finite_timeouts(
 )
 def test_public_sse_providers_reject_non_finite_idle_timeout(
     provider_name: str,
-    provider_factory: Callable[[float], object],
+    provider_factory: Callable[[str, float], object],
+    field_name: str,
     value: float,
 ) -> None:
     del provider_name
+    with pytest.raises(ValueError, match=field_name):
+        provider_factory(field_name, value)
+
+
+@pytest.mark.parametrize(
+    "provider_factory",
+    [
+        pytest.param(
+            lambda **kwargs: OpenAIProvider(api_key="test-key", **kwargs),
+            id="openai",
+        ),
+        pytest.param(
+            lambda **kwargs: OpenAISubscriptionProvider(
+                auth=_UnusedSubscriptionAuth(),
+                **kwargs,
+            ),
+            id="openai-subscription",
+        ),
+        pytest.param(
+            lambda **kwargs: ChatCompletionsProvider(api_key="test-key", **kwargs),
+            id="chat-completions",
+        ),
+        pytest.param(
+            lambda **kwargs: AnthropicProvider(api_key="test-key", **kwargs),
+            id="anthropic",
+        ),
+        pytest.param(
+            lambda **kwargs: BedrockProvider(client=object(), **kwargs),
+            id="bedrock",
+        ),
+        pytest.param(
+            lambda **kwargs: VertexProvider(
+                project_id="test-project",
+                credentials=SimpleNamespace(valid=True, token="test-token"),
+                **kwargs,
+            ),
+            id="vertex",
+        ),
+    ],
+)
+def test_bundled_provider_constructors_preserve_stream_idle_timeout_alias(
+    provider_factory: Callable[..., Any],
+) -> None:
+    provider = provider_factory(
+        stream_idle_timeout_s=7.0,
+        absolute_stream_timeout_s=11.0,
+    )
+
+    assert provider.stream_deadlines == ProviderStreamDeadlines(
+        transport_idle_timeout_s=7.0,
+        protocol_idle_timeout_s=7.0,
+        semantic_progress_timeout_s=7.0,
+        absolute_stream_timeout_s=11.0,
+    )
+
+
+def test_stream_idle_timeout_alias_rejects_conflicting_new_idle_clock() -> None:
+    with pytest.raises(ValueError, match="stream_idle_timeout_s cannot be combined"):
+        OpenAIProvider(
+            api_key="test-key",
+            stream_idle_timeout_s=7.0,
+            semantic_progress_timeout_s=8.0,
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -1.0])
+def test_stream_idle_timeout_alias_requires_positive_finite_value(value: float) -> None:
     with pytest.raises(ValueError, match="stream_idle_timeout_s"):
-        provider_factory(value)
+        OpenAIProvider(api_key="test-key", stream_idle_timeout_s=value)
 
 
 @pytest.mark.anyio
-async def test_sse_parser_counts_every_received_line_as_idle_activity() -> None:
+async def test_sse_parser_lines_do_not_refresh_protocol_progress() -> None:
     async def lines():
         yield 'data: {"value":'
         await asyncio.sleep(0.04)
@@ -1905,24 +2178,25 @@ async def test_sse_parser_counts_every_received_line_as_idle_activity() -> None:
         await asyncio.sleep(0.04)
         yield ""
 
-    events = [
-        event
-        async for event in aiter_sse_json_events(
-            lines(),
-            idle_timeout_s=0.1,
-            provider_label="OpenAI",
-            protocol_error=OpenAIProtocolError,
-        )
-    ]
+    with pytest.raises(ProviderStreamDeadlineExceeded) as captured:
+        [
+            event
+            async for event in aiter_sse_json_events(
+                lines(),
+                deadline_controller=_deadline_controller(0.1),
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
+            )
+        ]
 
-    assert events == [{"value": 1}]
+    assert captured.value.evidence.deadline_kind is ProviderDeadlineKind.PROTOCOL_IDLE
 
 
 @pytest.mark.anyio
 async def test_sse_parser_does_not_count_downstream_processing_as_idle_time() -> None:
     stream = aiter_sse_json_events(
         _iter_lines(['data: {"value": 1}', "", 'data: {"value": 2}', ""]),
-        idle_timeout_s=0.01,
+        deadline_controller=_deadline_controller(0.01),
         provider_label="OpenAI",
         protocol_error=OpenAIProtocolError,
     )
@@ -1945,7 +2219,7 @@ async def test_sse_parser_does_not_relabel_source_timeout_as_its_idle_deadline()
             event
             async for event in aiter_sse_json_events(
                 lines(),
-                idle_timeout_s=1.0,
+                deadline_controller=_deadline_controller(1.0),
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
             )
@@ -1967,7 +2241,7 @@ async def test_sse_parser_event_duration_does_not_reset_with_activity() -> None:
             event
             async for event in aiter_sse_json_events(
                 lines(),
-                idle_timeout_s=0.03,
+                deadline_controller=_deadline_controller(1.0),
                 max_event_duration_s=0.05,
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
@@ -1984,7 +2258,7 @@ async def test_sse_parser_enforces_utf8_byte_limit_at_exact_boundary() -> None:
         event
         async for event in aiter_sse_json_events(
             _iter_lines([line, ""]),
-            idle_timeout_s=1.0,
+            deadline_controller=_deadline_controller(1.0),
             max_event_bytes=encoded_size,
             provider_label="OpenAI",
             protocol_error=OpenAIProtocolError,
@@ -1997,7 +2271,7 @@ async def test_sse_parser_enforces_utf8_byte_limit_at_exact_boundary() -> None:
             event
             async for event in aiter_sse_json_events(
                 _iter_lines([line, ""]),
-                idle_timeout_s=1.0,
+                deadline_controller=_deadline_controller(1.0),
                 max_event_bytes=encoded_size - 1,
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
@@ -2012,7 +2286,7 @@ async def test_sse_parser_enforces_event_line_limit_at_exact_boundary() -> None:
         event
         async for event in aiter_sse_json_events(
             _iter_lines(lines),
-            idle_timeout_s=1.0,
+            deadline_controller=_deadline_controller(1.0),
             max_event_lines=2,
             provider_label="OpenAI",
             protocol_error=OpenAIProtocolError,
@@ -2025,7 +2299,7 @@ async def test_sse_parser_enforces_event_line_limit_at_exact_boundary() -> None:
             event
             async for event in aiter_sse_json_events(
                 _iter_lines(["event: response", *lines]),
-                idle_timeout_s=1.0,
+                deadline_controller=_deadline_controller(1.0),
                 max_event_lines=2,
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
@@ -2051,7 +2325,7 @@ async def test_sse_parser_propagates_real_task_cancellation() -> None:
             event
             async for event in aiter_sse_json_events(
                 lines(),
-                idle_timeout_s=1.0,
+                deadline_controller=_deadline_controller(1.0),
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
             )
@@ -2079,7 +2353,7 @@ async def test_sse_parser_raises_provider_labeled_protocol_errors() -> None:
             event
             async for event in aiter_sse_json_events(
                 lines(),
-                idle_timeout_s=1.0,
+                deadline_controller=_deadline_controller(1.0),
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
             )
@@ -2093,7 +2367,7 @@ async def test_sse_parser_raises_provider_labeled_protocol_errors() -> None:
             event
             async for event in aiter_sse_json_events(
                 _iter_lines(['data: ["not-an-object"]', ""]),
-                idle_timeout_s=1.0,
+                deadline_controller=_deadline_controller(1.0),
                 provider_label="Chat Completions",
                 protocol_error=ChatCompletionsProtocolError,
             )
@@ -2106,7 +2380,7 @@ async def test_sse_parser_yields_trailing_data_without_blank_line() -> None:
         event
         async for event in aiter_sse_json_events(
             _iter_lines(['data: {"tail": 1}']),
-            idle_timeout_s=1.0,
+            deadline_controller=_deadline_controller(1.0),
             provider_label="OpenAI",
             protocol_error=OpenAIProtocolError,
         )
@@ -2120,7 +2394,7 @@ async def test_sse_parser_stops_at_done_marker() -> None:
         event
         async for event in aiter_sse_json_events(
             _iter_lines(['data: {"n": 1}', "", "data: [DONE]", "", 'data: {"n": 2}', ""]),
-            idle_timeout_s=1.0,
+            deadline_controller=_deadline_controller(1.0),
             provider_label="OpenAI",
             protocol_error=OpenAIProtocolError,
         )
@@ -2162,7 +2436,10 @@ async def _drain_stream(transport: HttpxOpenAITransport) -> list[Mapping[str, An
             headers={},
             payload={},
             timeout_s=1.0,
-            stream_idle_timeout_s=1.0,
+            transport_idle_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
         )
     ]
 

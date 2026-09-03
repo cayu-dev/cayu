@@ -43,6 +43,7 @@ from cayu.providers import (
     HttpxChatCompletionsTransport,
     ModelContextOverflowError,
     ModelFinishReason,
+    ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
@@ -74,7 +75,10 @@ class RecordingTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ):
         self.calls.append(
             {
@@ -82,7 +86,10 @@ class RecordingTransport:
                 "headers": dict(headers),
                 "payload": dict(payload),
                 "timeout_s": timeout_s,
-                "stream_idle_timeout_s": stream_idle_timeout_s,
+                "transport_idle_timeout_s": transport_idle_timeout_s,
+                "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                "absolute_stream_timeout_s": absolute_stream_timeout_s,
             }
         )
         if not self.stream_event_batches:
@@ -99,7 +106,10 @@ class BlankFailingTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ):
         raise RuntimeError()
         yield {}
@@ -892,7 +902,10 @@ async def test_http_transport_rejects_non_finite_timeout_before_client_use(
         headers={},
         payload={},
         timeout_s=timeout_s,
-        stream_idle_timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
 
     with pytest.raises(
@@ -2762,7 +2775,10 @@ async def test_provider_stream_propagates_context_overflow() -> None:
             headers: Mapping[str, str],
             payload: Mapping[str, Any],
             timeout_s: float,
-            stream_idle_timeout_s: float,
+            transport_idle_timeout_s: float,
+            protocol_idle_timeout_s: float,
+            semantic_progress_timeout_s: float,
+            absolute_stream_timeout_s: float,
         ):
             raise overflow
             yield {}
@@ -3117,7 +3133,10 @@ async def test_transport_rejects_http_unless_opted_in() -> None:
         headers={},
         payload={},
         timeout_s=1.0,
-        stream_idle_timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     with pytest.raises(ValueError, match="https"):
         await stream.__anext__()
@@ -3181,7 +3200,10 @@ async def test_chat_completions_transport_classifies_gemini_context_too_long(
         headers={},
         payload={},
         timeout_s=1,
-        stream_idle_timeout_s=1,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
     )
     with pytest.raises(ChatCompletionsContextOverflowError) as exc_info:
         await stream.__anext__()
@@ -3299,7 +3321,10 @@ async def test_chat_transport_rejects_conflicting_http_context_identity(monkeypa
         headers={},
         payload={},
         timeout_s=1,
-        stream_idle_timeout_s=1,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
     )
     with pytest.raises(ChatCompletionsAPIError) as exc_info:
         await stream.__anext__()
@@ -3363,7 +3388,10 @@ async def test_chat_completions_transport_does_not_classify_quota_exhausted(
         headers={},
         payload={},
         timeout_s=1,
-        stream_idle_timeout_s=1,
+        transport_idle_timeout_s=1,
+        protocol_idle_timeout_s=1,
+        semantic_progress_timeout_s=1,
+        absolute_stream_timeout_s=1,
     )
     with pytest.raises(ChatCompletionsAPIError) as exc_info:
         await stream.__anext__()
@@ -3441,7 +3469,7 @@ def test_payload_rejects_non_boolean_include_usage(include_usage: object) -> Non
 
 
 @pytest.mark.anyio
-async def test_sse_comment_heartbeats_refresh_idle_timer() -> None:
+async def test_sse_comment_heartbeats_do_not_refresh_protocol_progress() -> None:
     async def lines():
         # Each heartbeat arrives within one idle window (0.04 < 0.1), but their
         # cumulative time (0.2s) exceeds it — so the stream survives only if `:`
@@ -3452,16 +3480,32 @@ async def test_sse_comment_heartbeats_refresh_idle_timer() -> None:
         yield 'data: {"ok": true}'
         yield ""
 
-    events = [
-        event
-        async for event in aiter_sse_json_events(
-            lines(),
-            idle_timeout_s=0.1,
-            provider_label="Chat Completions",
-            protocol_error=ChatCompletionsProtocolError,
+    from cayu.providers.deadlines import (
+        ProviderDeadlineKind,
+        ProviderStreamDeadlineController,
+        ProviderStreamDeadlineExceeded,
+        ProviderStreamDeadlines,
+    )
+
+    controller = ProviderStreamDeadlineController(
+        ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            protocol_idle_timeout_s=0.1,
+            semantic_progress_timeout_s=1,
+            absolute_stream_timeout_s=1,
         )
-    ]
-    assert events == [{"ok": True}]
+    )
+    with pytest.raises(ProviderStreamDeadlineExceeded) as captured:
+        [
+            event
+            async for event in aiter_sse_json_events(
+                lines(),
+                deadline_controller=controller,
+                provider_label="Chat Completions",
+                protocol_error=ChatCompletionsProtocolError,
+            )
+        ]
+    assert captured.value.evidence.deadline_kind is ProviderDeadlineKind.PROTOCOL_IDLE
 
 
 def test_cayu_app_bounds_active_http_error_body_before_retry(
@@ -3535,7 +3579,10 @@ def test_cayu_app_bounds_active_http_error_body_before_retry(
         api_key="test-key",
         base_url="https://example.test/v1",
         timeout_s=0.02,
-        stream_idle_timeout_s=0.01,
+        transport_idle_timeout_s=0.01,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
     app.register_provider(provider, default=True)
@@ -3551,7 +3598,7 @@ def test_cayu_app_bounds_active_http_error_body_before_retry(
                     messages=[Message.text("user", "hi")],
                 ),
             ),
-            timeout=1.0,
+            timeout=3.0,
         )
 
     events = asyncio.run(run())
@@ -3674,7 +3721,10 @@ def test_cayu_app_resolves_in_band_error_stream_before_retry_dispatch(
     provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        stream_idle_timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
         transport=transport,
     )
     app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
@@ -3803,7 +3853,10 @@ def test_cayu_app_preserves_chat_http_completion_before_response_cleanup_failure
     provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        stream_idle_timeout_s=1.0,
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     app = CayuApp(
         session_store=store,
@@ -3914,8 +3967,10 @@ async def test_chat_completions_stream_allows_identity_bound_usage_tail() -> Non
     assert events[-1].payload["usage"]["total_tokens"] == 3
 
 
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "transparent-wrapper"])
 def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
     monkeypatch: pytest.MonkeyPatch,
+    wrapped: bool,
 ) -> None:
     body_created = asyncio.Event()
 
@@ -3992,15 +4047,46 @@ def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
         session_store=store,
         retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
     )
-    app.register_provider(
-        ChatCompletionsProvider(
-            api_key="test-key",
-            base_url="https://example.test/v1",
-            transport=HttpxChatCompletionsTransport(),
-            stream_idle_timeout_s=1.0,
-        ),
-        default=True,
+    delegate = ChatCompletionsProvider(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        transport=HttpxChatCompletionsTransport(),
+        transport_idle_timeout_s=1.0,
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
+    provider: ModelProvider = delegate
+    if wrapped:
+
+        class TransparentProvider(ModelProvider):
+            def __init__(self, wrapped_provider: ModelProvider) -> None:
+                self.delegate = wrapped_provider
+                self.name = wrapped_provider.name
+                self.billing_provider_name = wrapped_provider.billing_provider_name
+                self.usage_dialect = wrapped_provider.usage_dialect
+                self.supports_native_structured_output = (
+                    wrapped_provider.supports_native_structured_output
+                )
+
+            @property
+            def stream_deadlines(self):
+                return self.delegate.stream_deadlines
+
+            async def runtime_stream(
+                self,
+                request: ModelRequest,
+            ) -> AsyncIterator[ModelStreamEvent]:
+                async for event in self.delegate.runtime_stream(request):
+                    yield event
+
+            async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+                async for event in self.delegate.stream(request):
+                    yield event
+
+        provider = TransparentProvider(delegate)
+    app.register_provider(provider, default=True)
+
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     async def run() -> tuple[list[Event], list[Message], asyncio.Task[list[Event]]]:

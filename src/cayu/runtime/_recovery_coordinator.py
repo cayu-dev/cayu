@@ -175,6 +175,7 @@ from cayu.runtime._run_limit_accounting import (
     restore_run_limit_accounting_context,
 )
 from cayu.runtime._run_limits import (
+    BorrowedAutomaticCompactionOutcomeUnknown,
     RunLimitController,
     SessionUsageTracker,
 )
@@ -2624,6 +2625,17 @@ class RecoveryCoordinator:
         if active is not None:
             stage = active.stage
             self._validate_active_model_completion_stage(session, stage)
+            try:
+                recovery_events = tuple(
+                    await self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
+                        session=session,
+                        stage=stage,
+                    )
+                )
+            except BorrowedAutomaticCompactionOutcomeUnknown as outcome_unknown:
+                raise ModelCompletionManualRecoveryRequired(
+                    str(outcome_unknown)
+                ) from outcome_unknown
             if (
                 stage.state == "in_flight"
                 and await self._recoverable_provider_operation(
@@ -2645,13 +2657,25 @@ class RecoveryCoordinator:
                     evidence_ref_suffix="dispatch-receipt-absent",
                 )
                 recovery_context = model_completion_recovery_context_from_stage(stage)
+                budget_dispatch_id = stage.stage_id
+                if stage.purpose == "context-compaction":
+                    model_attempt_id = stage.intent.get("model_attempt_id")
+                    if type(model_attempt_id) is not str:
+                        raise ModelCompletionManualRecoveryRequired(
+                            "Receipt-less context-compaction recovery lost its budget "
+                            "dispatch identity."
+                        )
+                    budget_dispatch_id = require_clean_nonblank(
+                        model_attempt_id,
+                        "model_attempt_id",
+                    )
                 release_events = await (
                     self._run_limit_controller.release_pre_provider_dispatch_reservations(
                         reservation_ids=stage.reservation_ids,
                         recovery_contexts=(
                             () if recovery_context is None else recovery_context.budget_reservations
                         ),
-                        dispatch_id=stage.stage_id,
+                        dispatch_id=budget_dispatch_id,
                     )
                 )
                 await self._session_store.abandon_model_completion_stage(
@@ -2663,7 +2687,9 @@ class RecoveryCoordinator:
                 )
                 active = None
                 state = "prepared_abandoned"
-                recovery_events = tuple(release_events)
+                recovery_events = tuple(
+                    {event.id: event for event in (*recovery_events, *release_events)}.values()
+                )
         if active is not None:
             stage = active.stage
             if session.status in {
@@ -2762,7 +2788,9 @@ class RecoveryCoordinator:
                         registered_environment,
                         invocation_context,
                     )
-                recovery_events = recovered.events
+                recovery_events = tuple(
+                    {event.id: event for event in (*recovery_events, *recovered.events)}.values()
+                )
                 if recovered.status is ProviderOperationRecoveryStatus.PENDING:
                     transcript = await self._session_store.load_transcript(session.id)
                     return ModelCompletionBoundaryReconciliation(
@@ -2801,6 +2829,39 @@ class RecoveryCoordinator:
                     f"status ({session.status.value}); expected {stage.source_status.value}."
                 )
             else:
+                if stage.purpose == "context-compaction" and stage.reservation_ids:
+                    recovery_context = model_completion_recovery_context_from_stage(stage)
+                    pricing_provider_name = stage.intent.get("pricing_provider_name")
+                    requested_model = stage.intent.get("requested_model")
+                    model_attempt_id = stage.intent.get("model_attempt_id")
+                    if recovery_context is None or not all(
+                        type(value) is str
+                        for value in (
+                            pricing_provider_name,
+                            requested_model,
+                            model_attempt_id,
+                        )
+                    ):
+                        raise ModelCompletionManualRecoveryRequired(
+                            "Completed context-compaction recovery lost its exact budget authority."
+                        )
+                    assert isinstance(pricing_provider_name, str)
+                    assert isinstance(requested_model, str)
+                    assert isinstance(model_attempt_id, str)
+                    budget_events = await self._run_limit_controller.reconcile_completed_automatic_compaction_reservations(
+                        session=session,
+                        stage=stage,
+                        recovery_contexts=recovery_context.budget_reservations,
+                        pricing_provider_name=pricing_provider_name,
+                        model=requested_model,
+                        model_attempt_identity=ModelAttemptIdentity(
+                            model_step_id=stage.logical_step_id,
+                            model_attempt_id=model_attempt_id,
+                        ),
+                    )
+                    recovery_events = tuple(
+                        {event.id: event for event in (*recovery_events, *budget_events)}.values()
+                    )
                 await recover_context_exposure(
                     store=self._session_store,
                     session_id=session.id,
@@ -2844,6 +2905,12 @@ class RecoveryCoordinator:
             )
         if pointer is None:
             if active is not None:
+                if active.stage.purpose == "context-compaction":
+                    raise ModelCompletionManualRecoveryRequired(
+                        "The completed context compaction was promoted without a durable "
+                        "context checkpoint; its completion evidence prevents provider "
+                        "redispatch."
+                    )
                 raise RuntimeError(
                     "Promoted model completion did not publish its durable model-step pointer."
                 )
@@ -5599,11 +5666,32 @@ class RecoveryCoordinator:
             request,
             redactor=self._secret_redactor,
         )
+
+        async def prepare_resolution_mutation() -> None:
+            if before_mutation is not None:
+                await before_mutation()
+            session = await self._session_store.load(request.session_id)
+            stage = await self._session_store.load_model_completion_stage(
+                request.session_id,
+                request.stage_id,
+            )
+            if session is None or stage is None:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation resolution lost its model stage."
+                )
+            await (
+                self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
+                    session=session,
+                    stage=stage,
+                    allow_outcome_unknown=True,
+                )
+            )
+
         result = await resolve_provider_operation_stage(
             self._session_store,
             request,
             redactor=self._secret_redactor,
-            before_resolution=before_mutation,
+            before_resolution=prepare_resolution_mutation,
         )
         if not result.replayed:
             await self._event_writer.fan_out_persisted([result.event])

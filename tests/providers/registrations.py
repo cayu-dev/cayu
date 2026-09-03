@@ -17,6 +17,7 @@ from cayu.providers import (
     ChatCompletionsAPIError,
     ChatCompletionsContextOverflowError,
     ChatCompletionsProvider,
+    ModelStreamDeadlineError,
     OpenAIAPIError,
     OpenAIContextOverflowError,
     OpenAIProvider,
@@ -26,7 +27,12 @@ from cayu.providers import (
     VertexContextOverflowError,
     VertexProvider,
 )
-from cayu.providers._sse import aiter_sse_json_events
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineController,
+    ProviderStreamDeadlineExceeded,
+    ProviderStreamDeadlines,
+)
 from tests.providers.conformance import (
     CapabilityClaim,
     ProviderCapabilities,
@@ -47,25 +53,27 @@ class _AsyncTransport:
         self.closed = True
         self._release.set()
 
-    async def block(self, *, idle_timeout_s: float | None = None) -> None:
+    async def block(self, *, deadlines: ProviderStreamDeadlines | None = None) -> None:
         self.started.set()
         try:
-            if idle_timeout_s is None:
+            if deadlines is None:
                 await self._release.wait()
                 return
-
-            async def silent_lines() -> AsyncIterator[str]:
-                await self._release.wait()
-                if False:
-                    yield ""
-
-            async for _ in aiter_sse_json_events(
-                silent_lines(),
-                idle_timeout_s=idle_timeout_s,
-                provider_label="Conformance",
-                protocol_error=ValueError,
-            ):
-                pass
+            controller = ProviderStreamDeadlineController(deadlines)
+            try:
+                await controller.wait_for(
+                    self._release.wait(),
+                    kinds=(
+                        ProviderDeadlineKind.TRANSPORT_IDLE,
+                        ProviderDeadlineKind.PROTOCOL_IDLE,
+                        ProviderDeadlineKind.ABSOLUTE,
+                    ),
+                )
+            except ProviderStreamDeadlineExceeded as exc:
+                raise ModelStreamDeadlineError(
+                    provider="conformance",
+                    evidence=exc.evidence,
+                ) from None
         finally:
             self.stopped.set()
 
@@ -83,7 +91,10 @@ class _OpenAITransport(_AsyncTransport):
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         del url, headers, timeout_s
         self.calls.append(dict(payload))
@@ -91,7 +102,14 @@ class _OpenAITransport(_AsyncTransport):
             await self.block()
             return
         if self.scenario == "idle_timeout":
-            await self.block(idle_timeout_s=stream_idle_timeout_s)
+            await self.block(
+                deadlines=ProviderStreamDeadlines(
+                    transport_idle_timeout_s=transport_idle_timeout_s,
+                    protocol_idle_timeout_s=protocol_idle_timeout_s,
+                    semantic_progress_timeout_s=semantic_progress_timeout_s,
+                    absolute_stream_timeout_s=absolute_stream_timeout_s,
+                )
+            )
             return
         if self.scenario == "typed_error":
             raise OpenAIAPIError("conformance throttle", **_ERROR_FIELDS)
@@ -193,7 +211,10 @@ class _AnthropicShapeTransport(_AsyncTransport):
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         del url, headers, timeout_s
         self.calls.append(dict(payload))
@@ -201,7 +222,14 @@ class _AnthropicShapeTransport(_AsyncTransport):
             await self.block()
             return
         if self.scenario == "idle_timeout":
-            await self.block(idle_timeout_s=stream_idle_timeout_s)
+            await self.block(
+                deadlines=ProviderStreamDeadlines(
+                    transport_idle_timeout_s=transport_idle_timeout_s,
+                    protocol_idle_timeout_s=protocol_idle_timeout_s,
+                    semantic_progress_timeout_s=semantic_progress_timeout_s,
+                    absolute_stream_timeout_s=absolute_stream_timeout_s,
+                )
+            )
             return
         if self.scenario == "typed_error":
             raise self.api_error("conformance throttle", **_ERROR_FIELDS)
@@ -315,7 +343,10 @@ class _ChatCompletionsTransport(_AsyncTransport):
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         del url, headers, timeout_s
         self.calls.append(dict(payload))
@@ -323,7 +354,14 @@ class _ChatCompletionsTransport(_AsyncTransport):
             await self.block()
             return
         if self.scenario == "idle_timeout":
-            await self.block(idle_timeout_s=stream_idle_timeout_s)
+            await self.block(
+                deadlines=ProviderStreamDeadlines(
+                    transport_idle_timeout_s=transport_idle_timeout_s,
+                    protocol_idle_timeout_s=protocol_idle_timeout_s,
+                    semantic_progress_timeout_s=semantic_progress_timeout_s,
+                    absolute_stream_timeout_s=absolute_stream_timeout_s,
+                )
+            )
             return
         if self.scenario == "typed_error":
             raise ChatCompletionsAPIError("conformance throttle", **_ERROR_FIELDS)
@@ -519,7 +557,10 @@ async def _openai_factory(scenario: ProviderScenario) -> ProviderHarness:
     provider = OpenAIProvider(
         api_key="conformance-key",
         transport=transport,
-        stream_idle_timeout_s=0.02,
+        transport_idle_timeout_s=(0.02 if scenario == "idle_timeout" else 1.0),
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     return _async_transport_harness(provider, "gpt-conformance", transport)
 
@@ -539,7 +580,10 @@ async def _openai_subscription_factory(scenario: ProviderScenario) -> ProviderHa
     provider = OpenAISubscriptionProvider(
         auth=_OpenAISubscriptionAuth(),
         transport=transport,
-        stream_idle_timeout_s=0.02,
+        transport_idle_timeout_s=(0.02 if scenario == "idle_timeout" else 1.0),
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     return _async_transport_harness(provider, "gpt-conformance", transport)
 
@@ -549,7 +593,10 @@ async def _anthropic_factory(scenario: ProviderScenario) -> ProviderHarness:
     provider = AnthropicProvider(
         api_key="conformance-key",
         transport=transport,
-        stream_idle_timeout_s=0.02,
+        transport_idle_timeout_s=(0.02 if scenario == "idle_timeout" else 1.0),
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     return _async_transport_harness(provider, "claude-conformance", transport)
 
@@ -560,7 +607,10 @@ async def _chat_completions_factory(scenario: ProviderScenario) -> ProviderHarne
         api_key="conformance-key",
         name="chat_conformance",
         transport=transport,
-        stream_idle_timeout_s=0.02,
+        transport_idle_timeout_s=(0.02 if scenario == "idle_timeout" else 1.0),
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     return _async_transport_harness(provider, "chat-conformance", transport)
 
@@ -571,7 +621,10 @@ async def _vertex_factory(scenario: ProviderScenario) -> ProviderHarness:
         project_id="conformance-project",
         credentials=_VertexCredentials(),
         transport=transport,
-        stream_idle_timeout_s=0.02,
+        transport_idle_timeout_s=(0.02 if scenario == "idle_timeout" else 1.0),
+        protocol_idle_timeout_s=1.0,
+        semantic_progress_timeout_s=1.0,
+        absolute_stream_timeout_s=1.0,
     )
     return _async_transport_harness(provider, "claude-conformance", transport)
 
@@ -584,14 +637,20 @@ async def _bedrock_factory(scenario: ProviderScenario) -> ProviderHarness:
         patcher.start()
         provider = BedrockProvider(
             region_name="us-east-1",
-            stream_idle_timeout_s=0.02,
+            transport_idle_timeout_s=(0.02 if scenario == "idle_timeout" else 1.0),
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
             stream_close_timeout_s=0.2,
         )
     else:
         provider = BedrockProvider(
             client=client,
             region_name="us-east-1",
-            stream_idle_timeout_s=0.02,
+            transport_idle_timeout_s=(0.02 if scenario == "idle_timeout" else 1.0),
+            protocol_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
             stream_close_timeout_s=0.2,
         )
 
@@ -1395,7 +1454,7 @@ OPENAI_SUBSCRIPTION = ProviderConformanceRegistration(
         reasoning=CapabilityClaim.supported(),
         provider_cache_observation=CapabilityClaim.supported(),
     ),
-    error_provider="openai",
+    error_provider="openai_subscription",
 )
 
 ANTHROPIC = ProviderConformanceRegistration(

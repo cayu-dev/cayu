@@ -71,6 +71,12 @@ from cayu.providers.base import (
     ToolDiscoveryProjectionRequest,
     ToolDiscoveryProjectionResult,
 )
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineController,
+    ProviderStreamDeadlineExceeded,
+    ProviderStreamDeadlines,
+)
 from cayu.providers.openai import openai_stream_events
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
@@ -121,7 +127,10 @@ class RecordingTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ):
         self.calls.append(
             {
@@ -129,7 +138,10 @@ class RecordingTransport:
                 "headers": dict(headers),
                 "payload": dict(payload),
                 "timeout_s": timeout_s,
-                "stream_idle_timeout_s": stream_idle_timeout_s,
+                "transport_idle_timeout_s": transport_idle_timeout_s,
+                "protocol_idle_timeout_s": protocol_idle_timeout_s,
+                "semantic_progress_timeout_s": semantic_progress_timeout_s,
+                "absolute_stream_timeout_s": absolute_stream_timeout_s,
             }
         )
         if not self.stream_event_batches:
@@ -166,7 +178,10 @@ class BlankFailingTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ):
         raise RuntimeError()
         yield {}
@@ -6441,7 +6456,10 @@ async def test_openai_provider_stream_propagates_context_overflow() -> None:
             headers: Mapping[str, str],
             payload: Mapping[str, Any],
             timeout_s: float,
-            stream_idle_timeout_s: float,
+            transport_idle_timeout_s: float,
+            protocol_idle_timeout_s: float,
+            semantic_progress_timeout_s: float,
+            absolute_stream_timeout_s: float,
         ):
             raise overflow
             yield {}
@@ -6465,10 +6483,7 @@ async def test_openai_provider_stream_propagates_context_overflow() -> None:
 
 
 @pytest.mark.anyio
-async def test_openai_sse_parser_lets_keepalive_heartbeats_refresh_idle_timer() -> None:
-    # OpenAI streams parse through the shared SSE parser, so `:` keep-alive
-    # heartbeats count as stream activity (same semantics as Chat Completions;
-    # previously the two parsers had drifted apart on this).
+async def test_openai_sse_comments_do_not_refresh_protocol_progress() -> None:
     async def lines():
         for _ in range(5):
             await asyncio.sleep(0.04)
@@ -6476,16 +6491,25 @@ async def test_openai_sse_parser_lets_keepalive_heartbeats_refresh_idle_timer() 
         yield 'data: {"ok": true}'
         yield ""
 
-    events = [
-        event
-        async for event in aiter_sse_json_events(
-            lines(),
-            idle_timeout_s=0.1,
-            provider_label="OpenAI",
-            protocol_error=OpenAIProtocolError,
+    controller = ProviderStreamDeadlineController(
+        ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            protocol_idle_timeout_s=0.1,
+            semantic_progress_timeout_s=1,
+            absolute_stream_timeout_s=1,
         )
-    ]
-    assert events == [{"ok": True}]
+    )
+    with pytest.raises(ProviderStreamDeadlineExceeded) as captured:
+        [
+            event
+            async for event in aiter_sse_json_events(
+                lines(),
+                deadline_controller=controller,
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
+            )
+        ]
+    assert captured.value.evidence.deadline_kind is ProviderDeadlineKind.PROTOCOL_IDLE
 
 
 @pytest.mark.anyio
@@ -6494,16 +6518,25 @@ async def test_openai_sse_parser_times_out_a_silent_stream() -> None:
         await asyncio.sleep(0.05)
         yield ""
 
-    with pytest.raises(TimeoutError, match="OpenAI streaming response produced no SSE events"):
+    controller = ProviderStreamDeadlineController(
+        ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            protocol_idle_timeout_s=0.001,
+            semantic_progress_timeout_s=1,
+            absolute_stream_timeout_s=1,
+        )
+    )
+    with pytest.raises(ProviderStreamDeadlineExceeded) as captured:
         [
             event
             async for event in aiter_sse_json_events(
                 lines(),
-                idle_timeout_s=0.001,
+                deadline_controller=controller,
                 provider_label="OpenAI",
                 protocol_error=OpenAIProtocolError,
             )
         ]
+    assert captured.value.evidence.deadline_kind is ProviderDeadlineKind.PROTOCOL_IDLE
 
 
 def _simple_request():
@@ -7557,7 +7590,16 @@ class StaleChainRecoveryTransport:
         self._calls = 0
 
     async def stream_response_events(
-        self, *, url, headers, payload, timeout_s, stream_idle_timeout_s
+        self,
+        *,
+        url,
+        headers,
+        payload,
+        timeout_s,
+        transport_idle_timeout_s,
+        protocol_idle_timeout_s,
+        semantic_progress_timeout_s,
+        absolute_stream_timeout_s,
     ):
         self.payloads.append(payload)
         self._calls += 1
@@ -7594,7 +7636,16 @@ class NonStalePreviousResponseErrorTransport:
         self.payloads = []
 
     async def stream_response_events(
-        self, *, url, headers, payload, timeout_s, stream_idle_timeout_s
+        self,
+        *,
+        url,
+        headers,
+        payload,
+        timeout_s,
+        transport_idle_timeout_s,
+        protocol_idle_timeout_s,
+        semantic_progress_timeout_s,
+        absolute_stream_timeout_s,
     ):
         self.payloads.append(payload)
         raise OpenAIAPIError(

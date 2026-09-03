@@ -7554,7 +7554,7 @@ Once a provider has completed a request, structurally invalid `provider_state` c
 
 `BedrockProvider` adapts Amazon Bedrock `ConverseStream` to the same transcript without requiring an Anthropic API key. Install `cayu[aws]`, configure the standard AWS credential chain and region (or pass `profile_name=` for a named Boto3 profile), and pass an explicit Bedrock model ID or inference-profile ARN through the agent's `model`; Cayu never guesses a provider from the model name. The caller needs `bedrock:CountTokens` and `bedrock:InvokeModel` for `CountTokens`, plus `bedrock:InvokeModelWithResponseStream` for streaming. System messages, reasoning text and its required signature/redacted round-trip state, tools/tool results, images/PDFs, tool-strategy structured output, stop reasons, `CountTokens`, cache-aware usage (including cache-write TTL details), effective service tier, and typed AWS errors are normalized behind the provider interface. `CountTokens` availability remains model-specific: some Claude models offered only through cross-Region inference require the separate Bedrock Mantle endpoint, which this adapter does not call. `ModelRequest.options["bedrock"]` accepts copied Converse options, including `serviceTier`, but the adapter owns `modelId`, `messages`, `system`, and `toolConfig`. AWS credentials are resolved by Boto3 and are never copied into events or request metadata. Native structured output is not claimed; use Cayu's provider-neutral tool strategy. Bedrock cost and reservation accounting use one durable identity containing the exact invoked resource, actual Boto client source region, requested tier (omission is Standard/`default`), and provider-reported effective tier. Unknown combinations are unpriced; opaque application-profile ARNs require an explicit price or mapping. `ModelCatalog` is never consulted for this billing decision.
 
-`OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. It uses OpenAI Responses server-sent-event streaming by default, normalizes typed text/function-call/completed events into Cayu provider stream events, and enforces a provider-event idle timeout so a stalled stream fails the model step instead of leaving the session running indefinitely. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
+`OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. It uses OpenAI Responses server-sent-event streaming by default, normalizes typed text/function-call/completed events into Cayu provider stream events, and enforces separate transport, decoded-protocol, semantic-progress, and absolute stream deadlines so wire activity cannot disguise a semantically stalled model step. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
 
 `OpenAIWebSearch` is immutable provider-hosted execution authority registered
 through `hosted_tools`, never a Cayu `Tool` or raw provider option. Its complete
@@ -7640,17 +7640,82 @@ experimental local-testing path, not a documented OpenAI Platform API or a
 hosted multi-user authentication mechanism. See
 [`docs/openai-subscription.md`](openai-subscription.md).
 
-Configure OpenAI transport timeouts on the provider. `timeout_s` controls
-ordinary HTTP transport timeouts; `stream_idle_timeout_s` controls how long a
-streaming response may go without any received response bytes or SSE line
-before Cayu treats the model step as stalled:
+Configure OpenAI stream deadlines on the provider. `timeout_s` controls
+ordinary HTTP transport operations. The four stream clocks have independent,
+finite positive values: `transport_idle_timeout_s` observes raw response bytes,
+`protocol_idle_timeout_s` observes complete valid decoded events,
+`semantic_progress_timeout_s` observes only accepted response identity,
+reasoning, content, tool calls, hosted-tool activity, citations, usage, or
+terminal progress, and `absolute_stream_timeout_s` caps the active streaming
+dispatch until an authoritative terminal response is accepted. Their defaults
+are 120, 120, 120, and 600 seconds respectively:
 
 ```python
-OpenAIProvider(timeout_s=600, stream_idle_timeout_s=300)
+OpenAIProvider(
+    timeout_s=600,
+    transport_idle_timeout_s=120,
+    protocol_idle_timeout_s=120,
+    semantic_progress_timeout_s=120,
+    absolute_stream_timeout_s=600,
+)
 ```
 
+For provider-constructor compatibility, the six bundled providers still accept
+the former `stream_idle_timeout_s` keyword. It assigns the same finite positive
+value to the transport, protocol, and semantic idle clocks while leaving the
+absolute clock independently configurable. The alias cannot be combined with a
+non-default value for any of the three new idle-clock keywords. Exported custom
+transport protocols must migrate to the four explicit deadline keywords; Cayu
+does not adapt the former transport signature because a single legacy argument
+cannot preserve distinct raw-transport and decoded-protocol clock ownership.
+
+Comments, heartbeats, incomplete lines, empty or duplicate deltas, and unknown
+events do not count as semantic progress. Custom `ModelProvider` implementations
+receive the normalized semantic and absolute guard for their synchronous
+`stream()` hook through `runtime_stream()`; direct calls to the raw hook are not
+governed. Runtime, application, example, and conformance callers therefore use
+`runtime_stream()` for every synchronous model attempt. A custom
+`ProviderOperationAdapter` is a separate background-operation extension and
+does not pass through that hook; it owns equivalent native start and reconnect
+deadline enforcement. The bundled OpenAI background adapter supplies that
+ownership. Bundled transports additionally own the raw transport and
+decoded-protocol clocks. Bundled stream implementations carry a concrete-method
+terminal-preservation marker: when their parser observed authoritative terminal
+progress before cancellation, the normalized guard permits only the resulting
+`completed` event to cross one cooperative scheduling boundary before the
+cancellation or post-terminal failure resumes. A subclass that overrides
+`stream()` does not inherit that trust. When multiple clocks have expired at an
+observation boundary, the stable precedence is absolute, semantic, protocol,
+then transport.
+Downstream consumer time is excluded from idle clocks but never from the
+absolute deadline while the streaming dispatch remains active. Once an
+authoritative non-success HTTP status has arrived, bounded identity-body
+collection is diagnostic settlement and preserves that provider outcome rather
+than reclassifying it as an ambiguous stream deadline.
+
+A stream deadline raises content-free `ModelStreamDeadlineError` evidence and is
+not retried after dispatch because the external effect outcome is unknown. Cayu
+persists one `model.error`, leaves the exact in-flight completion stage fenced,
+and requires incomplete-session recovery plus explicit manual stage settlement;
+it does not infer failure from acknowledgement loss or replay the request.
+Deadline expiry cancels the in-flight read without trusting cancellation as
+proof that opaque provider work stopped. A read that suppresses cancellation is
+retained under process-local ownership until it settles, and any late value is
+discarded while the durable stage remains fenced. Cancellation remains
+cancellation and is never translated into a deadline. The exact deadline values
+and material versions are part of execution-profile identity, so continuation
+with changed values requires the normal explicit profile-adoption flow.
+
+Provider stream configuration also declares `max_concurrent_streams`, defaulting
+to 100 so the normal N9 evaluation capacity does not encounter a lower hidden
+ceiling. Runtime reserves both deadline-read and live cleanup ownership before
+provider entry against that process-wide limit. Operators choosing a larger
+evaluation capacity must set the provider capacity from measured downstream and
+cleanup capacity; the value is validated as a positive integer and is included
+in execution-profile identity.
+
 The bundled HTTP transports also bound one unterminated SSE event to 16 MiB,
-4,096 event lines, and four times the configured idle timeout. These are
+4,096 event lines, and four times the configured protocol-idle timeout. These are
 internal transport-safety ceilings, not provider constructor options. The byte
 ceiling is applied while consuming raw response chunks, before an unterminated
 line can accumulate without limit. Bundled transports request identity content
@@ -7797,8 +7862,8 @@ policies. Opaque values are never copied into public runtime events or logs.
 
 `AnthropicProvider` uses server-sent-event streaming and normalizes text,
 thinking, tool-call, completion, usage, and typed failure events behind the same
-provider contract. Its transport enforces a provider-event idle timeout, and
-`aclose()` releases the shared HTTP client.
+provider contract. Its transport participates in the same four-clock stream
+deadline contract, and `aclose()` releases the shared HTTP client.
 
 ## Tool
 

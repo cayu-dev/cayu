@@ -63,8 +63,20 @@ from cayu.providers.base import (
     ModelStreamEventType,
     UsageDialect,
     _preflight_provider_portable_messages,
+    _terminal_preserving_provider_stream,
     copy_usage_dialect,
     privacy_safe_provider_option_projection,
+)
+from cayu.providers.deadlines import (
+    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+    ProviderProgressKind,
+    ProviderStreamDeadlines,
+    _resolve_provider_stream_deadlines,
+    observe_provider_semantic_progress,
 )
 
 if TYPE_CHECKING:
@@ -75,7 +87,6 @@ if TYPE_CHECKING:
 # ".../v1beta/openai", Together is ".../v1", Azure is ".../deployments/<dep>".
 DEFAULT_CHAT_COMPLETIONS_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CHAT_COMPLETIONS_TIMEOUT_SECONDS = 60.0
-DEFAULT_CHAT_COMPLETIONS_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV = "OPENAI_API_KEY"
 # OpenAI/Together use `Authorization: Bearer <key>`; Azure uses `api-key: <key>`.
 DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER = "Authorization"
@@ -315,7 +326,10 @@ class ChatCompletionsTransport(Protocol):
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         """POST a streaming Chat Completions payload and yield decoded SSE data objects."""
 
@@ -344,7 +358,10 @@ class HttpxChatCompletionsTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         timeout_s = _validate_timeout_s(timeout_s)
         url = _validate_url(url, "url", allow_http=self.allow_http)
@@ -354,7 +371,10 @@ class HttpxChatCompletionsTransport:
             headers=headers,
             payload=payload,
             timeout_s=timeout_s,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
             request_label="Chat Completions API",
             response_label="Chat Completions",
             api_error=ChatCompletionsAPIError,
@@ -383,6 +403,10 @@ class ChatCompletionsProvider(ModelProvider):
 
     name = "openai_chat"
     usage_dialect = UsageDialect.OPENAI
+
+    @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        return self._stream_deadlines
 
     def preflight_portable_messages(
         self,
@@ -420,7 +444,12 @@ class ChatCompletionsProvider(ModelProvider):
         allow_http: bool = False,
         stream_include_usage: bool = True,
         timeout_s: float = DEFAULT_CHAT_COMPLETIONS_TIMEOUT_SECONDS,
-        stream_idle_timeout_s: float = DEFAULT_CHAT_COMPLETIONS_STREAM_IDLE_TIMEOUT_SECONDS,
+        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+        stream_idle_timeout_s: float | None = None,
         transport: ChatCompletionsTransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         openrouter_http_referer: str | None = None,
@@ -475,8 +504,13 @@ class ChatCompletionsProvider(ModelProvider):
                     f"{type(self).__name__}.usage_dialect",
                 )
         self.timeout_s = _validate_timeout_s(timeout_s)
-        self.stream_idle_timeout_s = positive_finite_seconds(
-            stream_idle_timeout_s, "stream_idle_timeout_s"
+        self._stream_deadlines = _resolve_provider_stream_deadlines(
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
+            max_concurrent_streams=max_concurrent_streams,
+            stream_idle_timeout_s=stream_idle_timeout_s,
         )
         # A caller-supplied transport manages its own scheme policy; the default
         # transport inherits allow_http so a local http endpoint actually connects.
@@ -548,6 +582,7 @@ class ChatCompletionsProvider(ModelProvider):
         """Close the transport's shared HTTP client, if it owns one."""
         await aclose_transport(self.transport)
 
+    @_terminal_preserving_provider_stream
     @detach_provider_stream_traceback
     async def stream(
         self,
@@ -580,7 +615,10 @@ class ChatCompletionsProvider(ModelProvider):
                 headers=self._headers(),
                 payload=payload,
                 timeout_s=self.timeout_s,
-                stream_idle_timeout_s=self.stream_idle_timeout_s,
+                transport_idle_timeout_s=self.stream_deadlines.transport_idle_timeout_s,
+                protocol_idle_timeout_s=self.stream_deadlines.protocol_idle_timeout_s,
+                semantic_progress_timeout_s=self.stream_deadlines.semantic_progress_timeout_s,
+                absolute_stream_timeout_s=self.stream_deadlines.absolute_stream_timeout_s,
             )
             events = chat_completions_stream_events(
                 raw_events,
@@ -1002,6 +1040,8 @@ async def chat_completions_stream_events(
             raise ChatCompletionsProtocolError(
                 "Chat Completions stream emitted conflicting response ids."
             )
+        if response_id is None and chunk_response_id is not None:
+            observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
         response_id = response_id or chunk_response_id
         chunk_model = _optional_string(event, "model")
         if model is not None and chunk_model not in {None, model}:
@@ -1034,6 +1074,8 @@ async def chat_completions_stream_events(
         if chunk_usage is not None:
             if not isinstance(chunk_usage, Mapping):
                 raise ChatCompletionsProtocolError("Chat Completions usage must be an object.")
+            if usage != chunk_usage:
+                observe_provider_semantic_progress(ProviderProgressKind.USAGE)
             usage = chunk_usage
 
         # Some OpenAI-compatible servers report a fault after the stream opens by
@@ -1104,7 +1146,8 @@ async def chat_completions_stream_events(
         if delta is not None:
             if not isinstance(delta, Mapping):
                 raise ChatCompletionsProtocolError("Chat Completions delta must be an object.")
-            reasoning_details.record(delta.get("reasoning_details"))
+            if reasoning_details.record(delta.get("reasoning_details")):
+                observe_provider_semantic_progress(ProviderProgressKind.REASONING)
             reasoning = delta.get("reasoning_content")
             if not (isinstance(reasoning, str) and reasoning):
                 # Fall back to `reasoning` unless reasoning_content is a non-empty
@@ -1122,7 +1165,9 @@ async def chat_completions_stream_events(
                     )
                 if content:
                     yield ModelStreamEvent.text_delta(content)
-            tool_calls.record(delta.get("tool_calls"))
+            chunk_tool_calls = delta.get("tool_calls")
+            if tool_calls.record(chunk_tool_calls):
+                observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
         choice_finish = choice.get("finish_reason")
         if choice_finish is not None:
             if not isinstance(choice_finish, str):
@@ -1137,6 +1182,7 @@ async def chat_completions_stream_events(
                 )
             if finish_reason is None:
                 finish_reason = choice_finish
+                observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
 
     # Tool calls are emitted once, after the upstream stream, before Cayu's terminal
     # completed event. Deferring normalization lets trailing usage or repeated
@@ -1373,9 +1419,9 @@ class _ReasoningDetailsAccumulator:
         self._seen = False
         self._details: list[dict[str, Any]] = []
 
-    def record(self, value: Any) -> None:
+    def record(self, value: Any) -> bool:
         if value is None:
-            return
+            return False
         self._seen = True
         if type(value) is not list:
             raise ChatCompletionsProtocolError(
@@ -1397,6 +1443,7 @@ class _ReasoningDetailsAccumulator:
                     "Chat Completions reasoning_detail must be an object."
                 )
             self._details.append(copied)
+        return bool(value)
 
     def provider_state_items(self, *, target_sha256: str | None) -> list[dict[str, Any]]:
         if not self._seen:
@@ -1447,23 +1494,31 @@ class _ToolCallAccumulator:
         self._by_id: dict[str, _PendingToolCall] = {}
         self._last_pending: _PendingToolCall | None = None
 
-    def record(self, tool_calls: Any) -> None:
+    def record(self, tool_calls: Any) -> bool:
         if tool_calls is None:
-            return
+            return False
         if not isinstance(tool_calls, list):
             raise ChatCompletionsProtocolError("Chat Completions delta tool_calls must be a list.")
+        progressed = False
         for tool_call in tool_calls:
             if not isinstance(tool_call, Mapping):
                 raise ChatCompletionsProtocolError("Chat Completions tool_call must be an object.")
             call_id = _optional_string(tool_call, "id")
-            pending = self._pending_for(tool_call, call_id)
+            pending, identity_progressed = self._pending_for(tool_call, call_id)
+            progressed |= identity_progressed
             extra_content = tool_call.get("extra_content")
             if extra_content is not None:
                 if not isinstance(extra_content, Mapping):
                     raise ChatCompletionsProtocolError(
                         "Chat Completions tool_call extra_content must be an object."
                     )
-                pending.extra_content = copy_json_value(extra_content, "tool_call.extra_content")
+                copied_extra_content = copy_json_value(
+                    extra_content,
+                    "tool_call.extra_content",
+                )
+                if copied_extra_content != pending.extra_content:
+                    pending.extra_content = copied_extra_content
+                    progressed = True
             function = tool_call.get("function")
             if function is None:
                 continue
@@ -1478,6 +1533,7 @@ class _ToolCallAccumulator:
                         "Chat Completions tool_call emitted more than one function name."
                     )
                 pending.name = name
+                progressed = True
             arguments = function.get("arguments")
             if arguments is not None:
                 if not isinstance(arguments, str):
@@ -1485,12 +1541,14 @@ class _ToolCallAccumulator:
                         "Chat Completions tool_call arguments must be a string."
                     )
                 pending.arguments_parts.append(arguments)
+                progressed |= bool(arguments)
+        return progressed
 
     def _pending_for(
         self,
         tool_call: Mapping[str, Any],
         call_id: str | None,
-    ) -> _PendingToolCall:
+    ) -> tuple[_PendingToolCall, bool]:
         index = tool_call.get("index")
         if index is not None and (type(index) is not int or index < 0):
             raise ChatCompletionsProtocolError(
@@ -1503,6 +1561,7 @@ class _ToolCallAccumulator:
                 "Chat Completions tool_call index and id identify different calls."
             )
         pending = indexed or identified
+        identity_progressed = False
         if pending is None and (
             index is None
             and call_id is None
@@ -1526,6 +1585,8 @@ class _ToolCallAccumulator:
                 raise ChatCompletionsProtocolError(
                     "Chat Completions tool_call index identifies multiple calls."
                 )
+            if pending.index is None:
+                identity_progressed = True
             pending.index = index
             self._by_index[index] = pending
         if call_id is not None:
@@ -1536,10 +1597,12 @@ class _ToolCallAccumulator:
                 raise ChatCompletionsProtocolError(
                     "Chat Completions tool_call id identifies multiple calls."
                 )
+            if pending.call_id is None:
+                identity_progressed = True
             pending.call_id = call_id
             self._by_id[call_id] = pending
         self._last_pending = pending
-        return pending
+        return pending, identity_progressed
 
     def has_pending(self) -> bool:
         return bool(self._pending)

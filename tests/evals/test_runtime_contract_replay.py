@@ -29,7 +29,7 @@ from cayu.evals.runtime_replay import (
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import trajectory_from_session
-from cayu.providers import ModelStreamEvent
+from cayu.providers import ModelStreamEvent, ProviderStreamDeadlines
 from cayu.runtime import CayuApp, RequestFootprintConfig, RunRequest
 from cayu.runtime.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
 from cayu.runtime.costs import ModelPrice, PriceBook
@@ -245,9 +245,19 @@ async def _captured_tool_round(
     tool_error: bool = False,
     run_request_options: Mapping[str, Any] | None = None,
     include_usage: bool = False,
+    stream_deadlines: ProviderStreamDeadlines | None = None,
 ) -> tuple[CayuApp, _WeatherTool, Trajectory]:
     usage = {"input_tokens": 1, "output_tokens": 1}
-    provider = ScriptedModelProvider(
+    provider_type: type[ScriptedModelProvider] = ScriptedModelProvider
+    if stream_deadlines is not None:
+
+        class _DeadlineScriptedModelProvider(ScriptedModelProvider):
+            @property
+            def stream_deadlines(self) -> ProviderStreamDeadlines:
+                return stream_deadlines
+
+        provider_type = _DeadlineScriptedModelProvider
+    provider = provider_type(
         (
             (
                 ModelStreamEvent.tool_call(
@@ -379,6 +389,25 @@ def test_runtime_contract_replay_matches_without_reinvoking_external_tool() -> N
     assert source_session_after == source_session_before
     assert source_transcript_after == source_transcript_before
     assert source_events_after == source_events_before
+
+
+def test_runtime_contract_replay_preserves_nondefault_provider_stream_deadlines() -> None:
+    deadlines = ProviderStreamDeadlines(
+        transport_idle_timeout_s=11.0,
+        protocol_idle_timeout_s=12.0,
+        semantic_progress_timeout_s=13.0,
+        absolute_stream_timeout_s=14.0,
+    )
+
+    async def scenario():
+        app, _tool, trajectory = await _captured_tool_round(stream_deadlines=deadlines)
+        return await replay_session(app, RuntimeReplayRequest(trajectory=trajectory))
+
+    report = asyncio.run(scenario())
+
+    assert report.disposition is RuntimeReplayDisposition.MATCHED
+    assert report.reason is None
+    assert report.source_execution_profile == report.candidate_execution_profile
 
 
 def test_runtime_contract_replay_substitutes_recorded_error_result() -> None:

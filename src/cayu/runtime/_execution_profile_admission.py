@@ -485,6 +485,9 @@ def resolve_execution_profile_identity(
                 slot=f"model-provider:{registered_provider.name}",
                 cayu_owned_material=safe_provider_material,
             )
+        provider_entry["stream_deadlines"] = _provider_deadline_material(
+            registered_provider.provider.stream_deadlines
+        )
         provider_application_versioned = registered_provider.execution_profile_identity is not None
     provider_request_process_local = provider_options_process_local
     if provider_options_process_local:
@@ -1705,18 +1708,39 @@ def _nested_provider_material(
 ) -> dict[str, Any]:
     identity = behavior_identities.get(id(provider))
     if identity is not None:
-        return {
+        material = {
             "kind": "application_versioned",
             **identity.model_dump(mode="json"),
         }
-    built_in = _cayu_provider_material(provider)
-    if built_in is not None:
-        return built_in
-    return _process_local_object_material(
-        provider,
-        process_identity=process_identity,
-        slot=slot,
-    )
+    else:
+        built_in = _cayu_provider_material(provider)
+        material = (
+            built_in
+            if built_in is not None
+            else _process_local_object_material(
+                provider,
+                process_identity=process_identity,
+                slot=slot,
+            )
+        )
+    deadlines = getattr(provider, "stream_deadlines", None)
+    if deadlines is not None:
+        material["stream_deadlines"] = _provider_deadline_material(deadlines)
+    return material
+
+
+def _provider_deadline_material(deadlines: object) -> dict[str, float | int]:
+    from cayu.providers.deadlines import ProviderStreamDeadlines
+
+    if type(deadlines) is not ProviderStreamDeadlines:
+        raise TypeError("Model provider stream_deadlines must be ProviderStreamDeadlines.")
+    return {
+        "transport_idle_timeout_s": deadlines.transport_idle_timeout_s,
+        "protocol_idle_timeout_s": deadlines.protocol_idle_timeout_s,
+        "semantic_progress_timeout_s": deadlines.semantic_progress_timeout_s,
+        "absolute_stream_timeout_s": deadlines.absolute_stream_timeout_s,
+        "max_concurrent_streams": deadlines.max_concurrent_streams,
+    }
 
 
 def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
@@ -1756,7 +1780,7 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             return None
         return {
             "adapter": "openai-responses",
-            "version": 5,
+            "version": 6,
             "base_url": provider.base_url,
             "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
             "reasoning_state": provider.reasoning_state,
@@ -1765,14 +1789,14 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             "client_tool_search_models": sorted(provider.client_tool_search_models),
             "hosted_tool_search_models": sorted(provider.hosted_tool_search_models),
             "timeout_s": provider.timeout_s,
-            "stream_idle_timeout_s": provider.stream_idle_timeout_s,
+            "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
         }
     if type(provider) is ChatCompletionsProvider:
         if type(provider.transport) is not HttpxChatCompletionsTransport or provider.extra_headers:
             return None
         return {
             "adapter": "chat-completions",
-            "version": 2,
+            "version": 3,
             "base_url": provider.base_url,
             "endpoint_url": provider.endpoint_url,
             "api_key_env": provider.api_key_env,
@@ -1781,7 +1805,7 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             "allow_http": provider.allow_http,
             "stream_include_usage": provider.stream_include_usage,
             "timeout_s": provider.timeout_s,
-            "stream_idle_timeout_s": provider.stream_idle_timeout_s,
+            "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
             "api_version": provider.api_version,
             "default_route": bool(
                 provider.base_url == DEFAULT_CHAT_COMPLETIONS_BASE_URL
@@ -1815,14 +1839,14 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             return None
         return {
             "adapter": "anthropic-messages",
-            "version": 1,
+            "version": 2,
             "base_url": provider.base_url,
             "default_route": provider.base_url == DEFAULT_ANTHROPIC_BASE_URL,
             "credential_mode": ("brokered" if provider.api_key_ref is not None else "direct"),
             "anthropic_version": provider.anthropic_version,
             "max_tokens": provider.max_tokens,
             "timeout_s": provider.timeout_s,
-            "stream_idle_timeout_s": provider.stream_idle_timeout_s,
+            "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
             "cache_policy": (
                 None
                 if provider.cache_policy is None
@@ -1839,12 +1863,12 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             return None
         return {
             "adapter": "bedrock-converse-stream",
-            "version": 1,
+            "version": 2,
             "region_name": provider.region_name,
             "profile_name": provider.profile_name,
             "endpoint_url": provider.endpoint_url,
             "max_tokens": provider.max_tokens,
-            "stream_idle_timeout_s": provider.stream_idle_timeout_s,
+            "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
             "stream_close_timeout_s": provider.stream_close_timeout_s,
         }
     if type(provider) is OpenAISubscriptionProvider:

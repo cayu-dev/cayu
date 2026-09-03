@@ -105,7 +105,10 @@ from cayu.providers._credential_boundary import (
     detach_credential_safe_provider_cancellation,
     provider_cancellation_failures,
 )
-from cayu.providers.base import privacy_safe_provider_option_projection
+from cayu.providers.base import (
+    ModelStreamDeadlineError,
+    privacy_safe_provider_option_projection,
+)
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
@@ -1790,6 +1793,26 @@ def _has_provider_cancellation_finalization_failure(
     )
 
 
+def _copy_authenticated_cancellation_diagnostics_for_public(
+    source: asyncio.CancelledError,
+    detached: asyncio.CancelledError,
+    *,
+    finalization_failed: bool,
+) -> None:
+    """Retain runtime-owned diagnostics after credential-safe detachment."""
+
+    notes = getattr(source, "__notes__", ())
+    if type(notes) is list:
+        for note in notes:
+            if type(note) is str:
+                detached.add_note(note)
+    if finalization_failed and not set_exception_cause(
+        detached,
+        RuntimeError("Session interruption finalization failed after provider cancellation."),
+    ):
+        raise RuntimeError("Could not retain detached provider cancellation diagnostics.")
+
+
 def _detach_provider_cancellation_for_public(
     cancellation: asyncio.CancelledError,
 ) -> asyncio.CancelledError | None:
@@ -1809,9 +1832,11 @@ def _detach_provider_cancellation_for_public(
         )
     if finalization_failed:
         _mark_provider_cancellation_finalization_failure(detached)
-        detached.__cause__ = RuntimeError(
-            "Session interruption finalization failed after provider cancellation."
-        )
+    _copy_authenticated_cancellation_diagnostics_for_public(
+        cancellation,
+        detached,
+        finalization_failed=finalization_failed,
+    )
     return detached
 
 
@@ -1829,11 +1854,14 @@ def _detach_billing_cancellation_for_public(
             detached,
             pending_cancellation_requests,
         )
-    if _has_provider_cancellation_finalization_failure(cancellation):
+    finalization_failed = _has_provider_cancellation_finalization_failure(cancellation)
+    if finalization_failed:
         _mark_provider_cancellation_finalization_failure(detached)
-        detached.__cause__ = RuntimeError(
-            "Session interruption finalization failed after provider cancellation."
-        )
+    _copy_authenticated_cancellation_diagnostics_for_public(
+        cancellation,
+        detached,
+        finalization_failed=finalization_failed,
+    )
     return detached
 
 
@@ -6365,20 +6393,47 @@ class SessionEngine:
             )
         interaction_id = stage.intent.get("interaction_id")
         provider_name = stage.intent.get("provider_name")
+        pricing_provider_name = stage.intent.get("pricing_provider_name", provider_name)
         model_attempt_id = stage.intent.get("model_attempt_id")
         if not all(
-            type(value) is str for value in (interaction_id, provider_name, model_attempt_id)
+            type(value) is str
+            for value in (
+                interaction_id,
+                provider_name,
+                pricing_provider_name,
+                model_attempt_id,
+            )
         ):
             raise SessionModelCompletionStageConflict(
                 "Manual model recovery lost its interaction, provider, or attempt identity."
             )
         assert isinstance(interaction_id, str)
         assert isinstance(provider_name, str)
+        assert isinstance(pricing_provider_name, str)
         assert isinstance(model_attempt_id, str)
+        if stage.purpose == "assistant-turn" and provider_name != session.provider_name:
+            raise SessionModelCompletionStageConflict(
+                "Assistant model recovery provider conflicts with the session provider."
+            )
         model_attempt_identity = ModelAttemptIdentity(
             model_step_id=stage.logical_step_id,
             model_attempt_id=model_attempt_id,
         )
+        budget_dispatch_id = stage.stage_id
+        budget_model = session.model
+        if stage.purpose == "context-compaction":
+            requested_model = stage.intent.get("requested_model")
+            if type(requested_model) is not str:
+                raise SessionModelCompletionStageConflict(
+                    "Context-compaction recovery lost its requested model."
+                )
+            try:
+                budget_model = require_clean_nonblank(requested_model, "requested_model")
+            except ValueError as invalid_model:
+                raise SessionModelCompletionStageConflict(
+                    "Context-compaction recovery has an invalid requested model."
+                ) from invalid_model
+            budget_dispatch_id = model_attempt_id
 
         expected_settlement = model_completion_stage_settlement_request(
             stage,
@@ -6412,7 +6467,11 @@ class SessionEngine:
         checkpoint = await self.session_store.load_checkpoint(request.session_id)
         try:
             registered_agent = self._get_registered_agent(session.agent_name)
-            registered_provider = self._get_registered_provider(provider_name)
+            # A context-compaction stage may belong to a provider other than
+            # the session's assistant provider. Invocation-profile authority
+            # remains the session provider; the staged effect provider below
+            # is used only for exact budget settlement.
+            registered_provider = self._get_registered_provider(session.provider_name)
             registered_environment = self._get_registered_environment_for_session(
                 session.environment_name
             )
@@ -6459,10 +6518,20 @@ class SessionEngine:
             budget_events = await self._run_limit_controller.recover_pending_budget_settlements(
                 session_id=request.session_id
             )
+            borrowed_budget_events = await (
+                self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
+                    session=session,
+                    stage=stage,
+                    allow_outcome_unknown=True,
+                )
+            )
+            budget_events = list(
+                {event.id: event for event in (*budget_events, *borrowed_budget_events)}.values()
+            )
             await self._run_limit_controller.require_model_completion_reservation_settlements(
                 reservation_ids=stage.reservation_ids,
                 recovery_contexts=recovery_context.budget_reservations,
-                dispatch_id=stage.stage_id,
+                dispatch_id=budget_dispatch_id,
             )
             current = await self.session_store.load(request.session_id)
             if current is None:
@@ -6509,20 +6578,32 @@ class SessionEngine:
                 "Receipt-less model completion must use automatic pre-provider recovery."
             )
 
-        budget_events = (
+        borrowed_budget_events = await (
+            self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
+                session=session,
+                stage=stage,
+                allow_outcome_unknown=True,
+            )
+        )
+        stage_budget_events = (
             await self._run_limit_controller.reconcile_manual_model_completion_reservations(
                 reservation_ids=stage.reservation_ids,
                 recovery_contexts=recovery_context.budget_reservations,
                 session=session,
-                provider_name=provider_name,
+                provider_name=pricing_provider_name,
+                model=budget_model,
                 model_attempt_identity=model_attempt_identity,
-                dispatch_id=stage.stage_id,
+                dispatch_id=budget_dispatch_id,
+                is_automatic_context_compaction=(stage.purpose == "context-compaction"),
             )
+        )
+        budget_events = list(
+            {event.id: event for event in (*borrowed_budget_events, *stage_budget_events)}.values()
         )
         await self._run_limit_controller.require_model_completion_reservation_settlements(
             reservation_ids=stage.reservation_ids,
             recovery_contexts=recovery_context.budget_reservations,
-            dispatch_id=stage.stage_id,
+            dispatch_id=budget_dispatch_id,
         )
 
         current = await self.session_store.load(request.session_id)
@@ -7415,9 +7496,27 @@ class SessionEngine:
             recovery_context = model_completion_recovery_context_from_stage(
                 active_model_completion.stage
             )
+            await (
+                self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
+                    session=session,
+                    stage=active_model_completion.stage,
+                )
+            )
             budget_recovery_contexts = (
                 () if recovery_context is None else recovery_context.budget_reservations
             )
+            budget_dispatch_id = active_model_completion.stage.stage_id
+            if active_model_completion.stage.purpose == "context-compaction":
+                model_attempt_id = active_model_completion.stage.intent.get("model_attempt_id")
+                if type(model_attempt_id) is not str:
+                    raise SessionModelCompletionStageConflict(
+                        "Receipt-less context-compaction terminalization lost its budget "
+                        "dispatch identity."
+                    )
+                budget_dispatch_id = require_clean_nonblank(
+                    model_attempt_id,
+                    "model_attempt_id",
+                )
             if interaction_id is None:
                 raise SessionModelCompletionStageConflict(
                     "An active model-completion stage has no active interaction identity."
@@ -7456,12 +7555,12 @@ class SessionEngine:
                 await self._run_limit_controller.release_pre_provider_dispatch_reservations(
                     reservation_ids=active_model_completion.stage.reservation_ids,
                     recovery_contexts=budget_recovery_contexts,
-                    dispatch_id=active_model_completion.stage.stage_id,
+                    dispatch_id=budget_dispatch_id,
                 )
             await self._run_limit_controller.require_model_completion_reservation_settlements(
                 reservation_ids=active_model_completion.stage.reservation_ids,
                 recovery_contexts=budget_recovery_contexts,
-                dispatch_id=active_model_completion.stage.stage_id,
+                dispatch_id=budget_dispatch_id,
             )
             model_completion_settlement = model_completion_stage_settlement_request(
                 active_model_completion.stage,
@@ -21785,6 +21884,15 @@ class SessionEngine:
                 # unrelated terminal session that the pending disposition cannot
                 # finish after restart.
                 raise
+            if any(
+                isinstance(candidate, ModelStreamDeadlineError)
+                for candidate in iter_exception_tree(exc)
+            ):
+                # A dispatched synchronous request has an unknown external outcome.
+                # Keep the open interaction and exact model stage fenced so only
+                # incomplete-session recovery followed by explicit stage settlement
+                # can release or replace its authority.
+                raise
             ambiguous_provider_start = is_ambiguous_provider_operation_start_error(exc)
             if not ambiguous_provider_start:
                 provider_operation = await inspect_provider_operation(
@@ -22060,7 +22168,11 @@ class SessionEngine:
                     model_completion_failure=exc,
                 )
             except ModelCompletionBudgetSettlementPending as accounting_pending:
-                raise exc from accounting_pending
+                _raise_primary_with_secondary_failure(
+                    exc,
+                    accounting_pending,
+                    group_message=("Session failure and model-completion budget recovery fence."),
+                )
             if interaction_failed_event is not None:
                 yield interaction_failed_event
             if payload is None:

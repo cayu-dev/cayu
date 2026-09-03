@@ -55,7 +55,17 @@ from cayu.providers.base import (
     ModelStreamEventType,
     UsageDialect,
     _preflight_provider_portable_messages,
+    _terminal_preserving_provider_stream,
     privacy_safe_provider_option_projection,
+)
+from cayu.providers.deadlines import (
+    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+    ProviderStreamDeadlines,
+    _resolve_provider_stream_deadlines,
 )
 
 if TYPE_CHECKING:
@@ -65,7 +75,6 @@ DEFAULT_VERTEX_REGION = "global"
 DEFAULT_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
 DEFAULT_VERTEX_MAX_TOKENS = 4096
 DEFAULT_VERTEX_TIMEOUT_SECONDS = 60.0
-DEFAULT_VERTEX_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 VERTEX_OAUTH_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
@@ -159,7 +168,10 @@ class VertexTransport(Protocol):
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         """POST a streamRawPredict payload and yield decoded SSE data objects."""
 
@@ -215,7 +227,10 @@ class HttpxVertexTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url")
         events = stream_sse_json_events(
@@ -224,7 +239,10 @@ class HttpxVertexTransport:
             headers=headers,
             payload=payload,
             timeout_s=timeout_s,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
             request_label="Vertex AI",
             response_label="Vertex",
             api_error=VertexAPIError,
@@ -282,6 +300,10 @@ class VertexProvider(ModelProvider):
     name = "vertex"
     usage_dialect = UsageDialect.ANTHROPIC
 
+    @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        return self._stream_deadlines
+
     def preflight_portable_messages(
         self,
         *,
@@ -336,7 +358,12 @@ class VertexProvider(ModelProvider):
         anthropic_version: str = DEFAULT_VERTEX_ANTHROPIC_VERSION,
         max_tokens: int = DEFAULT_VERTEX_MAX_TOKENS,
         timeout_s: float = DEFAULT_VERTEX_TIMEOUT_SECONDS,
-        stream_idle_timeout_s: float = DEFAULT_VERTEX_STREAM_IDLE_TIMEOUT_SECONDS,
+        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+        stream_idle_timeout_s: float | None = None,
         transport: VertexTransport | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
@@ -358,8 +385,13 @@ class VertexProvider(ModelProvider):
             raise ValueError("max_tokens must be greater than zero.")
         self.max_tokens = max_tokens
         self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
-        self.stream_idle_timeout_s = positive_finite_seconds(
-            stream_idle_timeout_s, "stream_idle_timeout_s"
+        self._stream_deadlines = _resolve_provider_stream_deadlines(
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
+            max_concurrent_streams=max_concurrent_streams,
+            stream_idle_timeout_s=stream_idle_timeout_s,
         )
         self.credentials = _resolve_credentials(
             credentials=credentials,
@@ -373,6 +405,7 @@ class VertexProvider(ModelProvider):
         """Close the transport's shared HTTP client, if it owns one."""
         await aclose_transport(self.transport)
 
+    @_terminal_preserving_provider_stream
     @detach_provider_stream_traceback
     async def stream(
         self,
@@ -418,7 +451,10 @@ class VertexProvider(ModelProvider):
                     headers=self._request_headers(token),
                     payload=payload,
                     timeout_s=self.timeout_s,
-                    stream_idle_timeout_s=self.stream_idle_timeout_s,
+                    transport_idle_timeout_s=self.stream_deadlines.transport_idle_timeout_s,
+                    protocol_idle_timeout_s=self.stream_deadlines.protocol_idle_timeout_s,
+                    semantic_progress_timeout_s=(self.stream_deadlines.semantic_progress_timeout_s),
+                    absolute_stream_timeout_s=self.stream_deadlines.absolute_stream_timeout_s,
                 )
                 events = anthropic_stream_events(
                     raw_events,

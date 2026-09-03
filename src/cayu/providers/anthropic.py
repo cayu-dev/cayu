@@ -71,6 +71,7 @@ from cayu.providers.base import (
     ModelStreamEventType,
     UsageDialect,
     _preflight_provider_portable_messages,
+    _terminal_preserving_provider_stream,
     privacy_safe_provider_option_projection,
 )
 from cayu.providers.cache import (
@@ -78,6 +79,17 @@ from cayu.providers.cache import (
     CachePolicy,
     RequestCacheProjection,
     resolve_cache_policy,
+)
+from cayu.providers.deadlines import (
+    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+    ProviderProgressKind,
+    ProviderStreamDeadlines,
+    _resolve_provider_stream_deadlines,
+    observe_provider_semantic_progress,
 )
 from cayu.proxies import CredentialProxy
 from cayu.vaults import SecretRef, copy_secret_ref
@@ -89,7 +101,6 @@ DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
 DEFAULT_ANTHROPIC_TIMEOUT_SECONDS = 60.0
-DEFAULT_ANTHROPIC_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 ANTHROPIC_CONTEXT_PRESSURE_IMAGE_MIN_TOKENS = 100
 ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS = 1800
 _DEFAULT_ANTHROPIC_REASONING_PROVENANCE = ReasoningStateProvenance(
@@ -207,7 +218,10 @@ class AnthropicTransport(Protocol):
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         """POST a streaming Messages API payload and yield decoded SSE data objects."""
 
@@ -263,7 +277,10 @@ class HttpxAnthropicTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-        stream_idle_timeout_s: float,
+        transport_idle_timeout_s: float,
+        protocol_idle_timeout_s: float,
+        semantic_progress_timeout_s: float,
+        absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url")
         events = stream_sse_json_events(
@@ -272,7 +289,10 @@ class HttpxAnthropicTransport:
             headers=headers,
             payload=payload,
             timeout_s=timeout_s,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
             request_label="Anthropic API",
             response_label="Anthropic",
             api_error=AnthropicAPIError,
@@ -324,6 +344,10 @@ class AnthropicProvider(ModelProvider):
 
     name = "anthropic"
     usage_dialect = UsageDialect.ANTHROPIC
+
+    @property
+    def stream_deadlines(self) -> ProviderStreamDeadlines:
+        return self._stream_deadlines
 
     def preflight_portable_messages(
         self,
@@ -449,7 +473,12 @@ class AnthropicProvider(ModelProvider):
         anthropic_version: str = DEFAULT_ANTHROPIC_VERSION,
         max_tokens: int = DEFAULT_ANTHROPIC_MAX_TOKENS,
         timeout_s: float = DEFAULT_ANTHROPIC_TIMEOUT_SECONDS,
-        stream_idle_timeout_s: float = DEFAULT_ANTHROPIC_STREAM_IDLE_TIMEOUT_SECONDS,
+        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
+        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
+        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
+        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
+        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+        stream_idle_timeout_s: float | None = None,
         transport: AnthropicTransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         cache_policy: CachePolicy | None = None,
@@ -494,8 +523,13 @@ class AnthropicProvider(ModelProvider):
             raise ValueError("max_tokens must be greater than zero.")
         self.max_tokens = max_tokens
         self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
-        self.stream_idle_timeout_s = positive_finite_seconds(
-            stream_idle_timeout_s, "stream_idle_timeout_s"
+        self._stream_deadlines = _resolve_provider_stream_deadlines(
+            transport_idle_timeout_s=transport_idle_timeout_s,
+            protocol_idle_timeout_s=protocol_idle_timeout_s,
+            semantic_progress_timeout_s=semantic_progress_timeout_s,
+            absolute_stream_timeout_s=absolute_stream_timeout_s,
+            max_concurrent_streams=max_concurrent_streams,
+            stream_idle_timeout_s=stream_idle_timeout_s,
         )
         self.transport = transport if transport is not None else HttpxAnthropicTransport()
         self.extra_headers = _copy_headers(extra_headers)
@@ -511,6 +545,7 @@ class AnthropicProvider(ModelProvider):
         """Close the transport's shared HTTP client, if it owns one."""
         await aclose_transport(self.transport)
 
+    @_terminal_preserving_provider_stream
     @detach_provider_stream_traceback
     async def stream(
         self,
@@ -558,7 +593,10 @@ class AnthropicProvider(ModelProvider):
                     headers=headers,
                     payload=payload,
                     timeout_s=self.timeout_s,
-                    stream_idle_timeout_s=self.stream_idle_timeout_s,
+                    transport_idle_timeout_s=self.stream_deadlines.transport_idle_timeout_s,
+                    protocol_idle_timeout_s=self.stream_deadlines.protocol_idle_timeout_s,
+                    semantic_progress_timeout_s=(self.stream_deadlines.semantic_progress_timeout_s),
+                    absolute_stream_timeout_s=self.stream_deadlines.absolute_stream_timeout_s,
                 )
                 events = anthropic_stream_events(
                     raw_events,
@@ -1091,6 +1129,7 @@ async def anthropic_stream_events(
     Anthropic-compatible hosts (Vertex) surface their own typed errors.
     """
     blocks: dict[int, _PendingContentBlock] = {}
+    started_block_indexes: set[int] = set()
     message_id: str | None = None
     model: str | None = None
     stop_reason: str | None = None
@@ -1168,6 +1207,7 @@ async def anthropic_stream_events(
             if isinstance(start_usage, Mapping):
                 usage = {**(usage or {}), **start_usage}
             started = True
+            observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
             continue
         if (
             event_type
@@ -1188,6 +1228,11 @@ async def anthropic_stream_events(
             raise protocol_error(f"{provider_label} {event_type} arrived before message_start.")
         if event_type == "content_block_start":
             index = block_index(event)
+            if index in started_block_indexes:
+                raise protocol_error(
+                    f"{provider_label} stream emitted duplicate content_block_start index."
+                )
+            started_block_indexes.add(index)
             content_block = event.get("content_block")
             if not isinstance(content_block, Mapping):
                 raise protocol_error(
@@ -1204,19 +1249,23 @@ async def anthropic_stream_events(
                 initial = content_block.get("thinking")
                 if isinstance(initial, str) and initial:
                     pending.thinking_parts.append(initial)
+                    observe_provider_semantic_progress(ProviderProgressKind.REASONING)
                 signature = content_block.get("signature")
                 if isinstance(signature, str) and signature:
                     pending.signature_parts.append(signature)
+                    observe_provider_semantic_progress(ProviderProgressKind.REASONING)
                 blocks[index] = pending
             elif block_type == "redacted_thinking":
                 pending = _PendingContentBlock("redacted_thinking")
                 pending.data = required_string(content_block, "data", "redacted_thinking block")
                 blocks[index] = pending
+                observe_provider_semantic_progress(ProviderProgressKind.REASONING)
             elif block_type == "tool_use":
                 pending = _PendingContentBlock("tool_use")
                 pending.tool_id = required_string(content_block, "id", "tool_use block")
                 pending.tool_name = required_string(content_block, "name", "tool_use block")
                 blocks[index] = pending
+                observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
             else:
                 raise protocol_error(
                     f"Unsupported {provider_label} content block type: {block_type!r}."
@@ -1247,6 +1296,7 @@ async def anthropic_stream_events(
                     )
                 if thinking:
                     pending.thinking_parts.append(thinking)
+                    observe_provider_semantic_progress(ProviderProgressKind.REASONING)
             elif delta_type == "signature_delta":
                 signature = delta.get("signature")
                 if not isinstance(signature, str):
@@ -1255,6 +1305,7 @@ async def anthropic_stream_events(
                     )
                 if signature:
                     pending.signature_parts.append(signature)
+                    observe_provider_semantic_progress(ProviderProgressKind.REASONING)
             elif delta_type == "input_json_delta":
                 partial_json = delta.get("partial_json")
                 if not isinstance(partial_json, str):
@@ -1263,6 +1314,7 @@ async def anthropic_stream_events(
                     )
                 if partial_json:
                     pending.json_parts.append(partial_json)
+                    observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
             else:
                 raise protocol_error(
                     f"Unsupported {provider_label} stream delta type: {delta_type!r}."
@@ -1329,7 +1381,10 @@ async def anthropic_stream_events(
             if delta_usage is not None and not isinstance(delta_usage, Mapping):
                 raise protocol_error(f"{provider_label} message_delta usage must be an object.")
             if isinstance(delta_usage, Mapping):
-                usage = {**(usage or {}), **delta_usage}
+                merged_usage = {**(usage or {}), **delta_usage}
+                if merged_usage != usage:
+                    observe_provider_semantic_progress(ProviderProgressKind.USAGE)
+                usage = merged_usage
             continue
         if event_type == "message_stop":
             if blocks:
@@ -1337,6 +1392,7 @@ async def anthropic_stream_events(
                     f"{provider_label} message_stop arrived with unfinished content blocks."
                 )
             completed = True
+            observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
             completed_payload = {
                 "id": message_id,
                 "model": model,

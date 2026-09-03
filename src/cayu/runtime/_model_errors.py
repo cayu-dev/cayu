@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from threading import Lock
 from typing import Any, cast
 from weakref import WeakKeyDictionary
@@ -31,6 +32,15 @@ from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamDeadlineError,
+    ModelStreamEvent,
+    ModelStreamEventType,
+    ModelStreamRecoveryDisposition,
+)
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderProgressKind,
+    ProviderStreamDeadlineEvidence,
 )
 from cayu.runtime.workspace_observation_recovery import (
     copy_workspace_observation_pending_cancellation_requests,
@@ -40,6 +50,25 @@ from cayu.tools._operation_boundary import (
     InvocationOperationCapacityError,
 )
 
+_PROVIDER_STREAM_DEADLINE_PAYLOAD_KEYS = frozenset(
+    {
+        "provider_deadline_kind",
+        "provider_deadline_timeout_s",
+        "provider_stream_elapsed_s",
+        "provider_last_progress_kind",
+        "provider_last_progress_elapsed_s",
+        "provider_last_progress_at",
+        "provider_effect_outcome",
+        "provider_recovery_disposition",
+        "stream_cleanup_failed",
+    }
+)
+_PROVIDER_STREAM_DEADLINE_CLAIM_KEYS = _PROVIDER_STREAM_DEADLINE_PAYLOAD_KEYS - {
+    "stream_cleanup_failed"
+}
+_PROVIDER_STREAM_DEADLINE_ERROR_CODES = frozenset(
+    f"provider_stream_{kind.value}_timeout" for kind in ProviderDeadlineKind
+)
 _PROVIDER_ERROR_PAYLOAD_KEYS = frozenset(
     {
         "status_code",
@@ -49,9 +78,12 @@ _PROVIDER_ERROR_PAYLOAD_KEYS = frozenset(
         "retryable",
         "retry_after_s",
         "context_overflow",
+        *_PROVIDER_STREAM_DEADLINE_PAYLOAD_KEYS,
     }
 )
-_PROVIDER_ERROR_TYPE_MARKERS = frozenset({"ModelProviderError", "ModelContextOverflowError"})
+_PROVIDER_ERROR_TYPE_MARKERS = frozenset(
+    {"ModelProviderError", "ModelContextOverflowError", "ModelStreamDeadlineError"}
+)
 _BILLING_IDENTITY_ERROR_MESSAGE = "Model provider billing identity resolution failed"
 _BILLING_IDENTITY_ERROR_TYPE = "BillingIdentityResolutionError"
 _BILLING_IDENTITY_ERROR_CODE = "billing_identity_resolution_failed"
@@ -809,6 +841,23 @@ def copy_model_provider_error_control(error: ModelProviderError) -> ModelProvide
             "error_code": payload.get("provider_error_code"),
             "request_id": payload.get("request_id"),
         }
+        if type(error) is ModelStreamDeadlineError:
+            evidence = error.deadline_evidence
+            if type(evidence) is not ProviderStreamDeadlineEvidence:
+                raise ValueError("Deadline errors require exact deadline evidence.")
+            return ModelStreamDeadlineError(
+                provider=payload["provider"],
+                evidence=ProviderStreamDeadlineEvidence(
+                    deadline_kind=evidence.deadline_kind,
+                    configured_timeout_s=evidence.configured_timeout_s,
+                    elapsed_s=evidence.elapsed_s,
+                    last_progress_kind=evidence.last_progress_kind,
+                    last_progress_elapsed_s=evidence.last_progress_elapsed_s,
+                    last_progress_at=evidence.last_progress_at,
+                ),
+                stream_cleanup_failed=error.stream_cleanup_failed,
+                recovery_disposition=error.recovery_disposition,
+            )
         if isinstance(error, ModelContextOverflowError):
             if payload.get("retryable") is not False:
                 raise ValueError("Context-overflow errors must not be retryable.")
@@ -917,7 +966,63 @@ def model_provider_error_from_payload(
     if not _has_provider_error_payload_fields(payload):
         return None
     message = _clean_payload_string(payload.get("error")) or fallback_message
-    provider = _clean_payload_string(payload.get("provider")) or fallback_provider
+    deadline_claimed = _payload_claims_stream_deadline(payload)
+    provider = (
+        _clean_payload_string(fallback_provider) or "unknown"
+        if deadline_claimed
+        else _clean_payload_string(payload.get("provider")) or fallback_provider
+    )
+    if deadline_claimed:
+        try:
+            cleanup_value = payload.get("stream_cleanup_failed")
+            if cleanup_value is not None and cleanup_value is not True:
+                raise ValueError("Deadline cleanup evidence is invalid.")
+            deadline_kind = ProviderDeadlineKind(payload["provider_deadline_kind"])
+            progress_kind_value = payload.get("provider_last_progress_kind")
+            progress_kind = (
+                None if progress_kind_value is None else ProviderProgressKind(progress_kind_value)
+            )
+            progress_at_value = payload.get("provider_last_progress_at")
+            progress_at = (
+                None if progress_at_value is None else datetime.fromisoformat(progress_at_value)
+            )
+            evidence = ProviderStreamDeadlineEvidence(
+                deadline_kind=deadline_kind,
+                configured_timeout_s=payload["provider_deadline_timeout_s"],
+                elapsed_s=payload["provider_stream_elapsed_s"],
+                last_progress_kind=progress_kind,
+                last_progress_elapsed_s=payload.get("provider_last_progress_elapsed_s"),
+                last_progress_at=progress_at,
+            )
+            recovery_disposition = cast(
+                "ModelStreamRecoveryDisposition",
+                payload.get("provider_recovery_disposition"),
+            )
+            reconstructed = ModelStreamDeadlineError(
+                provider=provider,
+                evidence=evidence,
+                stream_cleanup_failed=cleanup_value is True,
+                recovery_disposition=recovery_disposition,
+            )
+            expected = reconstructed.error_payload_fields()
+            if (
+                payload.get("provider_error_type") != "ModelStreamDeadlineError"
+                or payload.get("provider_error_code") != expected["provider_error_code"]
+                or payload.get("retryable") is not False
+                or payload.get("provider_effect_outcome") != "unknown"
+                or payload.get("provider_recovery_disposition")
+                != expected["provider_recovery_disposition"]
+            ):
+                raise ValueError("Deadline recovery evidence is inconsistent.")
+            return reconstructed
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return ModelProviderError(
+                "Model provider emitted invalid stream deadline evidence.",
+                provider=_clean_payload_string(fallback_provider) or "unknown",
+                error_type="ModelProviderError",
+                error_code="invalid_provider_stream_deadline_evidence",
+                retryable=False,
+            )
     if payload.get("context_overflow") is True:
         return ModelContextOverflowError(
             message,
@@ -936,6 +1041,49 @@ def model_provider_error_from_payload(
         request_id=_clean_payload_string(payload.get("request_id")),
         retryable=_payload_retryable(payload.get("retryable")),
         retry_after_s=_payload_retry_after_s(payload.get("retry_after_s")),
+    )
+
+
+def runtime_owned_model_stream_error_event(
+    event: ModelStreamEvent,
+    *,
+    fallback_provider: str,
+    fallback_message: str = "Model provider error",
+) -> tuple[ModelStreamEvent, ModelProviderError | None]:
+    """Reconstruct deadline claims before control or durable publication."""
+
+    if type(event) is not ModelStreamEvent or event.type is not ModelStreamEventType.ERROR:
+        raise TypeError("Only exact model stream error events can be reconstructed.")
+    provider_error = model_provider_error_from_payload(
+        event.payload,
+        fallback_provider=fallback_provider,
+        fallback_message=fallback_message,
+    )
+    if not _payload_claims_stream_deadline(event.payload):
+        return event, provider_error
+    if not isinstance(provider_error, ModelProviderError):  # pragma: no cover - marker owns it
+        raise AssertionError("Deadline claim did not reconstruct a provider error.")
+    return (
+        ModelStreamEvent.error(
+            str(provider_error),
+            cause=provider_error,
+            recovery_metadata=event.recovery_metadata,
+            provider_operation_status=event.provider_operation_status,
+        ),
+        provider_error,
+    )
+
+
+def _payload_claims_stream_deadline(payload: dict[str, Any]) -> bool:
+    provider_error_code = payload.get("provider_error_code")
+    return (
+        payload.get("error_type") == "ModelStreamDeadlineError"
+        or payload.get("provider_error_type") == "ModelStreamDeadlineError"
+        or (
+            type(provider_error_code) is str
+            and provider_error_code in _PROVIDER_STREAM_DEADLINE_ERROR_CODES
+        )
+        or not _PROVIDER_STREAM_DEADLINE_CLAIM_KEYS.isdisjoint(payload)
     )
 
 
