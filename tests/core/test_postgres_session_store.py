@@ -48,7 +48,7 @@ from tests.workspaces.test_durable_local_workspace_branches import (
     assert_durable_workspace_branch_store_conformance,
 )
 
-from cayu import ExecutionProfileComponentClass, LocalArtifactStore
+from cayu import CayuApp, ExecutionProfileComponentClass, LocalArtifactStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import Event, EventType, Message
 from cayu.providers import ProviderOperationStatus
@@ -74,6 +74,7 @@ from cayu.runtime import (
     SessionTopologyQuery,
     TranscriptQuery,
 )
+from cayu.runtime.checks import check_manifest
 from cayu.runtime.provider_operations import ProviderOperationResolutionAction
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
@@ -85,6 +86,14 @@ from cayu.runtime.sessions import (
     PendingActionQuery,
     _McpManifestBaselineEvidenceInvalid,
     fork_session_invocation,
+)
+from cayu.support_bundles import (
+    CollectorDisposition,
+    SupportBundleContext,
+    builtin_support_collectors,
+    collect_support_bundle,
+    encode_support_bundle,
+    validate_support_bundle_archive,
 )
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
@@ -4085,5 +4094,58 @@ def test_postgres_session_store_cursor_pagination_empty_result(postgres_dsn):
         assert page.sessions == []
         assert page.next_cursor is None
         assert page.total_count == 0
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_support_bundle_event_tail_round_trips_without_private_payload(
+    postgres_dsn: str,
+) -> None:
+    session_id = "postgres-private-session-canary"
+
+    async def ops(store) -> None:
+        await store.create(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                environment_name="local",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    id="postgres-support-event",
+                    type="custom.postgres-secret-type",
+                    session_id=session_id,
+                    payload={"transcript": "postgres-model-text-canary"},
+                )
+            ],
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        manifest = app.describe()
+        report = await collect_support_bundle(
+            SupportBundleContext(
+                app=app,
+                manifest=manifest,
+                check_report=check_manifest(manifest),
+                service_manifest=None,
+                project_id=None,
+                application_release_id=f"manifest-{manifest.fingerprint}",
+                eval_backend=None,
+                eval_source=None,
+            ),
+            builtin_support_collectors(session_selectors=(session_id,)),
+        )
+        validated = validate_support_bundle_archive(encode_support_bundle(report))
+
+        tail_result = next(item for item in validated.collectors if item.name == "session_events.1")
+        assert tail_result.disposition is CollectorDisposition.COLLECTED
+        serialized = validated.model_dump_json()
+        assert session_id not in serialized
+        assert "postgres-model-text-canary" not in serialized
+        assert "postgres-secret-type" not in serialized
 
     _run(postgres_dsn, ops)

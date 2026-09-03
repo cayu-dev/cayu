@@ -756,15 +756,19 @@ async def _run_off_thread_with_connection_ownership(
     operation: Callable[[sqlite3.Connection], _T],
     *,
     executor: Executor | None = None,
-    worker_started: asyncio.Event | None = None,
+    interrupt_on_cancellation: bool = False,
 ) -> _T:
     """Keep a SQLite connection owned until its off-thread operation terminates.
 
     Cancelling an ``asyncio.to_thread`` await does not stop the worker thread.
-    Defer caller cancellation while holding the connection lock so no subsequent
-    operation or shutdown can reuse the connection before the worker has left it
-    in a terminal transaction state.
+    For an interruptible read, request ``sqlite3_interrupt()`` after cancellation;
+    in every case defer the signal while holding the connection lock so no
+    subsequent operation or shutdown can reuse the connection before the worker
+    has left it in a terminal transaction state.
     """
+
+    if type(interrupt_on_cancellation) is not bool:
+        raise TypeError("interrupt_on_cancellation must be a bool.")
 
     async with lock:
 
@@ -781,8 +785,6 @@ async def _run_off_thread_with_connection_ownership(
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
         worker = loop.run_in_executor(executor, context.run, capture_outcome)
-        if worker_started is not None:
-            worker_started.set()
         cancellation: asyncio.CancelledError | None = None
 
         while not worker.done():
@@ -791,6 +793,8 @@ async def _run_off_thread_with_connection_ownership(
             except asyncio.CancelledError as exc:
                 if cancellation is None:
                     cancellation = exc
+                    if interrupt_on_cancellation:
+                        connection.interrupt()
             except BaseException:
                 if worker.done():
                     break
@@ -1712,11 +1716,23 @@ class SQLiteSessionStore(SessionStore):
             raise TypeError("SQLiteSessionStore path must be a string or Path.")
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
-        if not isinstance(read_only, bool):
+        if type(read_only) is not bool:
             raise TypeError("read_only must be a bool.")
+        configured_read_only = read_only
+        diagnostic_source_missing = sqlite_support.diagnostic_sqlite_source_missing(db_path)
+        if (
+            sqlite_support.current_diagnostic_store_inspection() is not None
+            and str(db_path) != ":memory:"
+        ):
+            if diagnostic_source_missing:
+                schema_mode = schema.SchemaMode.CREATE
+                read_only = False
+            else:
+                schema_mode = schema.SchemaMode.VALIDATE
+                read_only = True
         self.service_durability = (
             RuntimeStoreDurability.READ_ONLY
-            if read_only
+            if configured_read_only
             else (
                 RuntimeStoreDurability.DEVELOPMENT
                 if str(db_path) == ":memory:"
@@ -1732,17 +1748,26 @@ class SQLiteSessionStore(SessionStore):
             raise ValueError("read_only SQLite stores require schema_mode=validate.")
 
         self.path = db_path
+        self._diagnostic_source_missing = diagnostic_source_missing
         self._schema_mode = schema_mode
         self._read_only = read_only
         self._public_authority_alias_codec = public_authority_alias_codec
         self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
         self._detached_read_tasks: set[asyncio.Task[object]] = set()
-        self._connection = self._connect_read_only(db_path) if read_only else self._connect(db_path)
+        effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
+        self._connection = (
+            self._connect_read_only(effective_db_path)
+            if read_only
+            else self._connect(effective_db_path)
+        )
         try:
             self._register_public_authority_alias_sql_function(self._connection)
             self._initialize_schema()
             self._initialize_public_authority_alias_registry()
+            if diagnostic_source_missing:
+                self._connection.execute("PRAGMA query_only = ON")
+                self._read_only = True
         except BaseException:
             self._connection.close()
             raise
@@ -1751,11 +1776,11 @@ class SQLiteSessionStore(SessionStore):
         # queue behind the writer connection's transactions. In-memory
         # databases are private to their connection, so they fall back to the
         # writer connection (and its lock).
-        if read_only or str(db_path) == ":memory:":
+        if self._read_only or str(effective_db_path) == ":memory:":
             self._read_connection = self._connection
             self._read_lock = self._lock
         else:
-            self._read_connection = self._connect_read_only(db_path)
+            self._read_connection = self._connect_read_only(effective_db_path)
             self._read_lock = asyncio.Lock()
 
     @property
@@ -2071,21 +2096,19 @@ class SQLiteSessionStore(SessionStore):
             self._require_current_public_authority_configuration(connection)
             return query(connection)
 
-        worker_started = asyncio.Event()
         owner = asyncio.create_task(
             _run_off_thread_with_connection_ownership(
                 self._read_lock,
                 self._read_connection,
                 guarded,
-                worker_started=worker_started,
+                interrupt_on_cancellation=True,
             ),
             name="cayu-sqlite-read-owner",
         )
         try:
             return await asyncio.shield(owner)
         except asyncio.CancelledError:
-            if not worker_started.is_set():
-                owner.cancel()
+            owner.cancel()
             self._retain_detached_read_task(owner)
             raise
 
@@ -12859,9 +12882,7 @@ class SQLiteSessionStore(SessionStore):
         if type(max_chars) is not int:
             raise TypeError("max_chars must be an integer.")
         if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
-            raise ValueError(
-                f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}."
-            )
+            raise ValueError(f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}.")
 
         def query_latest(connection: sqlite3.Connection) -> tuple[str, bool] | None:
             row = connection.execute(
@@ -13408,6 +13429,8 @@ class SQLiteSessionStore(SessionStore):
         return sqlite_support.connect(path)
 
     def _connect_read_only(self, path: Path) -> sqlite3.Connection:
+        if sqlite_support.current_diagnostic_store_inspection() is not None:
+            return sqlite_support.connect_read_only_inspection(path)
         return sqlite_support.connect(path, read_only=True)
 
     def _initialize_schema(self) -> None:
@@ -13505,13 +13528,18 @@ class SQLiteTaskStore(TaskStore):
             raise TypeError("schema_mode must be a SchemaMode.")
 
         self.path = db_path
-        self._schema_mode = schema_mode
+        diagnostic_source_missing = sqlite_support.diagnostic_sqlite_source_missing(db_path)
+        self._diagnostic_source_missing = diagnostic_source_missing
+        self._schema_mode = schema.SchemaMode.CREATE if diagnostic_source_missing else schema_mode
         self._clock = utc_clock(clock)
         self._enable_task_admission_wakeups()
         self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
-        self._connection = self._connect(db_path)
+        effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
+        self._connection = self._connect(effective_db_path)
         self._initialize_schema()
+        if diagnostic_source_missing:
+            self._connection.execute("PRAGMA query_only = ON")
 
     def _verified_transaction_unlocked(self):
         return sqlite_support._transaction(self._connection)
@@ -16314,9 +16342,10 @@ class SQLiteTaskStore(TaskStore):
         filters = copy_task_aggregate_filter(filters)
         clauses, params = self._task_filter_clauses(task_query_from_aggregate_filter(filters))
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        async with self._lock:
-            as_of = sqlite_support.format_datetime(self._clock())
-            rows = self._connection.execute(
+
+        def query_snapshot(connection: sqlite3.Connection) -> TaskOperationalSnapshot:
+            snapshot_as_of = sqlite_support.format_datetime(self._clock())
+            rows = connection.execute(
                 f"""
                 WITH
                 snapshot(as_of) AS (
@@ -16377,7 +16406,7 @@ class SQLiteTaskStore(TaskStore):
                 CROSS JOIN pending_counts
                 LEFT JOIN status_counts ON TRUE
                 """,
-                (as_of, *params),
+                (snapshot_as_of, *params),
             ).fetchall()
             counts = {status: 0 for status in TaskStatus}
             for row in rows:
@@ -16392,6 +16421,13 @@ class SQLiteTaskStore(TaskStore):
                 scheduled_pending_count=rows[0]["scheduled_pending_count"],
                 accuracy=EXACT_AGGREGATE.model_copy(),
             )
+
+        return await _run_off_thread_with_connection_ownership(
+            self._lock,
+            self._connection,
+            query_snapshot,
+            interrupt_on_cancellation=True,
+        )
 
     async def start_task(
         self,

@@ -671,6 +671,9 @@ from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _verified_work_support as verified_work_support
 from cayu.storage import migrations as schema
+from cayu.storage._diagnostic_inspection import (
+    current_diagnostic_store_inspection,
+)
 from cayu.storage._postgres_verified_work import (
     PostgresVerifiedWorkMixin,
     _PostgresMutationConnectionOwner,
@@ -5787,7 +5790,11 @@ class _PostgresStoreBase:
             raise TypeError("schema_mode must be a SchemaMode.")
         if type(read_only) is not bool:
             raise TypeError("read_only must be a bool.")
-        if read_only and not self._supports_read_only:
+        diagnostic_inspection = current_diagnostic_store_inspection() is not None
+        if diagnostic_inspection:
+            schema_mode = schema.SchemaMode.VALIDATE
+            read_only = True
+        if read_only and not self._supports_read_only and not diagnostic_inspection:
             raise ValueError("read_only is only supported by PostgresSessionStore.")
         if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
             raise ValueError("Read-only Postgres stores require schema_mode=VALIDATE.")
@@ -36125,6 +36132,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             max_size=max_size,
             schema_mode=schema_mode,
             read_only=read_only,
+        )
+        self.service_durability = (
+            RuntimeStoreDurability.READ_ONLY if read_only else RuntimeStoreDurability.DURABLE
         )
         self._postgres_mutation_allowed_configure = (
             None if pool is not None else _configure_store_connection

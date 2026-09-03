@@ -115,6 +115,75 @@ from cayu.runtime.sessions import (
     SessionOperationalSnapshot,
 )
 from cayu.runtime.stop_policy import RunLimits
+from cayu.runtime.system_diagnostics import (
+    MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS as MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
+)
+from cayu.runtime.system_diagnostics import (
+    MAX_SYSTEM_DEPLOYMENT_NAME_CHARS as MAX_SYSTEM_DEPLOYMENT_NAME_CHARS,
+)
+from cayu.runtime.system_diagnostics import (
+    MAX_SYSTEM_PRICING_METADATA_CHARS as MAX_SYSTEM_PRICING_METADATA_CHARS,
+)
+from cayu.runtime.system_diagnostics import (
+    ArtifactStoreDiagnostic as ArtifactStoreDiagnostic,
+)
+from cayu.runtime.system_diagnostics import (
+    ArtifactStoreDiagnostics as ArtifactStoreDiagnostics,
+)
+from cayu.runtime.system_diagnostics import (
+    CapabilityOperation as CapabilityOperation,
+)
+from cayu.runtime.system_diagnostics import (
+    CapabilityUnavailableReason as CapabilityUnavailableReason,
+)
+from cayu.runtime.system_diagnostics import (
+    ConfiguredStoreRole as ConfiguredStoreRole,
+)
+from cayu.runtime.system_diagnostics import (
+    ControlPlaneCapabilities as ControlPlaneCapabilities,
+)
+from cayu.runtime.system_diagnostics import (
+    ControlPlaneMutationCapabilities as ControlPlaneMutationCapabilities,
+)
+from cayu.runtime.system_diagnostics import (
+    ControlPlaneSurfaceCapabilities as ControlPlaneSurfaceCapabilities,
+)
+from cayu.runtime.system_diagnostics import (
+    EvalsOperationReadiness as EvalsOperationReadiness,
+)
+from cayu.runtime.system_diagnostics import (
+    EvalsReadiness as EvalsReadiness,
+)
+from cayu.runtime.system_diagnostics import (
+    EvalsReadinessReasonCode as EvalsReadinessReasonCode,
+)
+from cayu.runtime.system_diagnostics import (
+    EvalsReadinessState as EvalsReadinessState,
+)
+from cayu.runtime.system_diagnostics import (
+    OptionalSurfaceCapability as OptionalSurfaceCapability,
+)
+from cayu.runtime.system_diagnostics import (
+    PricingCatalogDiagnostics as PricingCatalogDiagnostics,
+)
+from cayu.runtime.system_diagnostics import (
+    ServerContractActor as ServerContractActor,
+)
+from cayu.runtime.system_diagnostics import (
+    SystemAccessKind as SystemAccessKind,
+)
+from cayu.runtime.system_diagnostics import (
+    SystemDeploymentDiagnostics as SystemDeploymentDiagnostics,
+)
+from cayu.runtime.system_diagnostics import (
+    SystemDiagnosticsResponse as SystemDiagnosticsResponse,
+)
+from cayu.runtime.system_diagnostics import (
+    SystemDiagnosticTextStatus as SystemDiagnosticTextStatus,
+)
+from cayu.runtime.system_diagnostics import (
+    SystemVersionDiagnostics as SystemVersionDiagnostics,
+)
 from cayu.runtime.tasks import (
     TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
     TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
@@ -145,9 +214,6 @@ from cayu.storage.memory import MAX_KNOWLEDGE_REVISION
 SERVER_API_PREFIX = "/api"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_LAST_EVENT_ID_FORMAT = "session_id:cayu_event_<sequence>"
-MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64
-MAX_SYSTEM_DEPLOYMENT_NAME_CHARS = 128
-MAX_SYSTEM_PRICING_METADATA_CHARS = 256
 DEFAULT_SESSION_TOPOLOGY_RESULT_BYTES = 1024 * 1024
 MAX_SESSION_TOPOLOGY_RESULT_BYTES = 4 * 1024 * 1024
 MAX_SESSION_TOPOLOGY_REQUEST_BYTES = 256 * 1024
@@ -199,99 +265,6 @@ class ApiBaseModel(BaseModel):
 
 class HealthResponse(ApiBaseModel):
     ok: StrictBool
-
-
-SystemAccessKind = Literal["open", "authenticated"]
-SystemDiagnosticTextStatus = Literal["available", "not_provided", "omitted"]
-
-
-class SystemDeploymentDiagnostics(ApiBaseModel):
-    """Bounded resolved server identity and effective access posture."""
-
-    name: str | None = Field(default=None, max_length=MAX_SYSTEM_DEPLOYMENT_NAME_CHARS)
-    name_status: SystemDiagnosticTextStatus
-    api_access: SystemAccessKind
-    dashboard_access: SystemAccessKind | None
-    dashboard_enabled: StrictBool
-    docs_enabled: StrictBool | None
-
-    @model_validator(mode="after")
-    def validate_availability(self) -> SystemDeploymentDiagnostics:
-        if self.name_status == "available" and self.name is None:
-            raise ValueError("Available deployment names require a value.")
-        if self.name_status != "available" and self.name is not None:
-            raise ValueError("Unavailable deployment names cannot include a value.")
-        if self.dashboard_enabled and self.dashboard_access is None:
-            raise ValueError("Enabled dashboards require an access posture.")
-        if not self.dashboard_enabled and self.dashboard_access is not None:
-            raise ValueError("Disabled dashboards cannot include an access posture.")
-        return self
-
-
-class SystemVersionDiagnostics(ApiBaseModel):
-    cayu: str | None = Field(max_length=128)
-    server_contract: str = Field(max_length=32)
-
-
-class ArtifactStoreDiagnostic(ApiBaseModel):
-    """Path-safe registration identity and the required ArtifactStore contract."""
-
-    fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$", max_length=71)
-    store_contract_operations: tuple[
-        Literal["list"],
-        Literal["read"],
-        Literal["write"],
-        Literal["delete"],
-    ] = (
-        "list",
-        "read",
-        "write",
-        "delete",
-    )
-
-
-class ArtifactStoreDiagnostics(ApiBaseModel):
-    registrations: tuple[ArtifactStoreDiagnostic, ...] = Field(
-        max_length=MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS
-    )
-    total_count: StrictInt = Field(ge=0)
-    truncated: StrictBool
-
-    @model_validator(mode="after")
-    def validate_count(self) -> ArtifactStoreDiagnostics:
-        if self.total_count < len(self.registrations):
-            raise ValueError("Artifact store total cannot be smaller than registrations.")
-        if self.truncated is not (self.total_count > len(self.registrations)):
-            raise ValueError("Artifact store truncation must match the returned count.")
-        return self
-
-
-class PricingCatalogDiagnostics(ApiBaseModel):
-    configured: StrictBool
-    metadata_status: Literal["available", "not_configured", "omitted"]
-    price_book_version: str | None = Field(
-        default=None,
-        max_length=MAX_SYSTEM_PRICING_METADATA_CHARS,
-    )
-    generated_at: str | None = Field(
-        default=None,
-        max_length=MAX_SYSTEM_PRICING_METADATA_CHARS,
-    )
-
-    @model_validator(mode="after")
-    def validate_metadata(self) -> PricingCatalogDiagnostics:
-        metadata_present = self.price_book_version is not None and self.generated_at is not None
-        if self.metadata_status == "available" and not metadata_present:
-            raise ValueError("Available pricing metadata requires both identity fields.")
-        if self.metadata_status != "available" and (
-            self.price_book_version is not None or self.generated_at is not None
-        ):
-            raise ValueError("Unavailable pricing metadata cannot include identity fields.")
-        if self.configured and self.metadata_status == "not_configured":
-            raise ValueError("Configured pricing cannot be marked not configured.")
-        if not self.configured and self.metadata_status != "not_configured":
-            raise ValueError("Unconfigured pricing must be marked not configured.")
-        return self
 
 
 class OperationalSnapshotRequest(ApiBaseModel):
@@ -796,153 +769,6 @@ class ClientGenerationContract(ApiBaseModel):
     openapi_url: str | None = "/openapi.json"
     supported_targets: tuple[Literal["typescript", "python"], ...] = ("typescript", "python")
     source_of_truth: Literal["openapi"] = "openapi"
-
-
-CapabilityUnavailableReason = Literal["not_configured", "unsupported"]
-ConfiguredStoreRole = Literal["session", "task", "knowledge", "artifact"]
-EvalsReadinessState = Literal["ready", "gated", "unsupported"]
-EvalsReadinessReasonCode = Literal[
-    "evaluation_promotion_not_configured",
-    "terminal_evidence_not_supported",
-    "session_lineage_not_supported",
-    "eval_store_not_configured",
-    "eval_target_not_configured",
-    "captured_result_persistence_not_available",
-    "scenario_v2_not_available",
-]
-_GATED_EVALS_READINESS_REASONS = frozenset(
-    {
-        "evaluation_promotion_not_configured",
-        "eval_store_not_configured",
-        "eval_target_not_configured",
-    }
-)
-_UNSUPPORTED_EVALS_READINESS_REASONS = frozenset(
-    {
-        "terminal_evidence_not_supported",
-        "session_lineage_not_supported",
-        "captured_result_persistence_not_available",
-        "scenario_v2_not_available",
-    }
-)
-
-
-class CapabilityOperation(ApiBaseModel):
-    """Availability of one control-plane read or mutation operation."""
-
-    enabled: StrictBool
-    unavailable_reason: CapabilityUnavailableReason | None = None
-
-    @model_validator(mode="after")
-    def validate_reason(self) -> CapabilityOperation:
-        if self.enabled and self.unavailable_reason is not None:
-            raise ValueError("Enabled capability operations cannot have an unavailable reason.")
-        if not self.enabled and self.unavailable_reason is None:
-            raise ValueError("Disabled capability operations require an unavailable reason.")
-        return self
-
-
-class OptionalSurfaceCapability(ApiBaseModel):
-    """Configuration and operation availability for one optional surface."""
-
-    configured: StrictBool
-    read: CapabilityOperation
-    mutate: CapabilityOperation
-
-    @model_validator(mode="after")
-    def validate_configuration(self) -> OptionalSurfaceCapability:
-        if not self.configured and (self.read.enabled or self.mutate.enabled):
-            raise ValueError("Unconfigured surfaces cannot expose enabled operations.")
-        return self
-
-
-class EvalsOperationReadiness(ApiBaseModel):
-    """Discovery state for one Evals product operation.
-
-    Readiness is presentation metadata, not an authorization grant. Underlying
-    routes continue to enforce authentication, mutation policy, and runtime
-    preconditions.
-    """
-
-    state: EvalsReadinessState
-    reason_code: EvalsReadinessReasonCode | None
-
-    @model_validator(mode="after")
-    def validate_reason(self) -> EvalsOperationReadiness:
-        if self.state == "ready" and self.reason_code is not None:
-            raise ValueError("Ready Evals operations cannot have a reason code.")
-        if self.state != "ready" and self.reason_code is None:
-            raise ValueError("Unavailable Evals operations require a reason code.")
-        if self.state == "gated" and self.reason_code not in _GATED_EVALS_READINESS_REASONS:
-            raise ValueError("Gated Evals operations require a gated reason code.")
-        if (
-            self.state == "unsupported"
-            and self.reason_code not in _UNSUPPORTED_EVALS_READINESS_REASONS
-        ):
-            raise ValueError("Unsupported Evals operations require an unsupported reason code.")
-        return self
-
-
-class EvalsReadiness(ApiBaseModel):
-    """Independent availability of the Evals product workflows."""
-
-    captured_evaluation: EvalsOperationReadiness
-    catalog_read: EvalsOperationReadiness
-    catalog_write: EvalsOperationReadiness
-    captured_result_persistence: EvalsOperationReadiness
-    scenario_conversion: EvalsOperationReadiness
-    fresh_launch: EvalsOperationReadiness
-    cancellation: EvalsOperationReadiness
-    comparison: EvalsOperationReadiness
-    reports: EvalsOperationReadiness
-
-
-class ControlPlaneSurfaceCapabilities(ApiBaseModel):
-    dashboard: OptionalSurfaceCapability
-    # Added within control-plane contract v4. Keep the field optional so a
-    # dashboard can fail closed against an incomplete capability response
-    # instead of dereferencing a capability that did not exist yet.
-    workflow: OptionalSurfaceCapability | None = None
-    tasks: OptionalSurfaceCapability
-    reviewed_knowledge: OptionalSurfaceCapability
-    artifacts: OptionalSurfaceCapability
-    usage: OptionalSurfaceCapability
-    pricing: OptionalSurfaceCapability
-    evaluation_promotion: OptionalSurfaceCapability
-    evals: OptionalSurfaceCapability
-
-
-class ControlPlaneMutationCapabilities(ApiBaseModel):
-    session_execution: CapabilityOperation
-    session_interruption: CapabilityOperation
-    provider_operation_resolution: CapabilityOperation
-    pending_action_resolution: CapabilityOperation
-    session_annotations: CapabilityOperation
-    task_lifecycle: CapabilityOperation
-    knowledge_review: CapabilityOperation
-
-
-class ServerContractActor(ApiBaseModel):
-    """Bounded actor projection that deliberately excludes arbitrary claims."""
-
-    subject: str = Field(max_length=512)
-    tenant: str | None = Field(default=None, max_length=512)
-
-
-class ControlPlaneCapabilities(ApiBaseModel):
-    """Server-authoritative discovery metadata for the Cayu control plane.
-
-    This projection is presentation metadata rather than an authorization
-    token. Every underlying route continues to enforce its configured access
-    dependency and runtime preconditions.
-    """
-
-    cayu_version: str | None = Field(max_length=128)
-    configured_store_roles: tuple[ConfiguredStoreRole, ...] = Field(max_length=4)
-    actor: ServerContractActor | None
-    surfaces: ControlPlaneSurfaceCapabilities
-    mutations: ControlPlaneMutationCapabilities
-    evals_readiness: EvalsReadiness
 
 
 PromotionPortableId = Annotated[
@@ -1988,24 +1814,6 @@ class ServerContractResponse(ApiBaseModel):
     sse: SseContract = Field(default_factory=SseContract)
     client_generation: ClientGenerationContract = Field(default_factory=ClientGenerationContract)
     capabilities: ControlPlaneCapabilities
-
-
-class SystemDiagnosticsResponse(ApiBaseModel):
-    """Protected bounded Cayu configuration and registration diagnostics."""
-
-    observed_at: datetime
-    deployment: SystemDeploymentDiagnostics
-    versions: SystemVersionDiagnostics
-    capabilities: ControlPlaneCapabilities
-    artifact_stores: ArtifactStoreDiagnostics
-    pricing_catalog: PricingCatalogDiagnostics
-
-    @field_validator("observed_at")
-    @classmethod
-    def validate_observed_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("observed_at must be timezone-aware.")
-        return value.astimezone(UTC)
 
 
 class ApiEventRecord(ApiBaseModel):

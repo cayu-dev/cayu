@@ -374,6 +374,7 @@ class SQLiteEvalStore(EvalStore):
         path: str | Path,
         *,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
+        read_only: bool = False,
     ) -> None:
         if isinstance(path, Path):
             db_path = path
@@ -383,15 +384,36 @@ class SQLiteEvalStore(EvalStore):
             raise TypeError("SQLiteEvalStore path must be a nonblank string or Path.")
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a bool.")
+        diagnostic_inspection = sqlite_support.current_diagnostic_store_inspection() is not None
+        diagnostic_source_missing = sqlite_support.diagnostic_sqlite_source_missing(db_path)
+        if diagnostic_inspection:
+            if str(db_path) == ":memory:" or diagnostic_source_missing:
+                schema_mode = schema.SchemaMode.CREATE
+                read_only = False
+            else:
+                schema_mode = schema.SchemaMode.VALIDATE
+                read_only = True
+        if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
+            raise ValueError("Read-only SQLite EvalStores require schema_mode=VALIDATE.")
         self.path = db_path
+        self._diagnostic_source_missing = diagnostic_source_missing
         self._lock = asyncio.Lock()
-        self._connection = sqlite_support.connect(db_path)
+        effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
+        self._connection = (
+            sqlite_support.connect_read_only_inspection(effective_db_path)
+            if read_only
+            else sqlite_support.connect(effective_db_path)
+        )
         try:
             sqlite_support.reconcile_schema(
                 self._connection,
                 schema_mode,
                 app_min_supported=_SQLITE_EVAL_MIN_REQUIRED_REVISION,
             )
+            if diagnostic_source_missing:
+                self._connection.execute("PRAGMA query_only = ON")
         except BaseException:
             self._connection.close()
             raise

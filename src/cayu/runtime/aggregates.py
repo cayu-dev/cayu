@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Iterable
@@ -83,11 +84,18 @@ class AggregateAccuracy(BaseModel):
 
 
 EXACT_AGGREGATE = AggregateAccuracy(kind=AggregateAccuracyKind.EXACT)
+_IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL = 256
 MAX_AGGREGATE_USAGE_COUNTER = 2**63 - 1
 MAX_USAGE_PRICING_INPUT_BYTES = 8 * 1024 * 1024
 MAX_USAGE_PRICING_RAW_CANDIDATES = 5000
 MAX_USAGE_ROLLUP_SESSION_ID_BYTES = 1024
 MAX_USAGE_ROLLUP_STORE_RESULT_BYTES = 24 * 1024 * 1024
+
+
+async def _cooperate_with_in_memory_aggregate_cancellation() -> None:
+    """Yield at a bounded in-memory scan checkpoint without releasing its lock."""
+
+    await asyncio.sleep(0)
 
 
 class UsageRollupInconsistent(ValueError):

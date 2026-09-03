@@ -5,9 +5,14 @@ from contextlib import asynccontextmanager
 
 import pytest
 
+from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
+from cayu.storage.evals_postgres import PostgresEvalStore
 from cayu.storage.postgres import (
+    PostgresAgentWorkContextStore,
+    PostgresBudgetLedger,
     PostgresEventWatcherStore,
     PostgresKnowledgeStore,
+    PostgresSessionStore,
     PostgresTaskStore,
     _configure_store_connection,
     _PostgresStoreBase,
@@ -63,3 +68,52 @@ def test_read_only_connection_policy_is_transaction_scoped() -> None:
 def test_read_only_is_rejected_for_unsupported_postgres_stores(store_type: type) -> None:
     with pytest.raises(ValueError, match="only supported by PostgresSessionStore"):
         store_type("postgresql://example/cayu", read_only=True)
+
+
+def test_explicit_read_only_postgres_session_declares_read_only_durability() -> None:
+    store = PostgresSessionStore("postgresql://example/cayu", read_only=True)
+
+    assert store._read_only is True
+    assert store.service_durability.value == "read_only"
+
+    asyncio.run(store.close())
+
+
+@pytest.mark.parametrize(
+    "store_type",
+    (
+        PostgresAgentWorkContextStore,
+        PostgresBudgetLedger,
+        PostgresEvalStore,
+        PostgresEventWatcherStore,
+        PostgresKnowledgeStore,
+        PostgresTaskStore,
+    ),
+)
+def test_diagnostic_inspection_forces_builtin_postgres_stores_read_only(
+    store_type: type,
+) -> None:
+    with diagnostic_store_inspection() as inspection:
+        store = store_type("postgresql://example/cayu")
+        assert store._read_only is True
+        if isinstance(store, (PostgresSessionStore, PostgresTaskStore)):
+            assert store.service_durability.value == "durable"
+        assert store._schema_mode.value == "validate"
+        assert store._owns_pool is True
+        inspection.verify()
+
+    async def close() -> None:
+        await store.close()
+
+    asyncio.run(close())
+
+
+def test_diagnostic_inspection_rejects_a_caller_owned_postgres_pool() -> None:
+    from psycopg_pool import AsyncConnectionPool
+
+    pool = AsyncConnectionPool("", open=False)
+    with (
+        diagnostic_store_inspection(),
+        pytest.raises(ValueError, match="store-owned Postgres connection pool"),
+    ):
+        PostgresSessionStore(pool=pool)

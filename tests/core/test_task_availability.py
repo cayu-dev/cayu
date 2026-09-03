@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -355,6 +356,117 @@ def test_sqlite_persists_availability_and_claims_once_at_exact_boundary(tmp_path
             await second.close()
 
     asyncio.run(run())
+
+
+def test_sqlite_operational_snapshot_captures_time_after_lock_ownership(tmp_path) -> None:
+    class _CountingClock(_MutableClock):
+        def __init__(self, value: datetime) -> None:
+            super().__init__(value)
+            self.calls = 0
+
+        def __call__(self) -> datetime:
+            self.calls += 1
+            return super().__call__()
+
+    async def run() -> None:
+        boundary = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+        clock = _CountingClock(boundary - timedelta(microseconds=1))
+        store = SQLiteTaskStore(tmp_path / "snapshot-clock.sqlite", clock=clock)
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="crosses-boundary",
+                    type="scheduled",
+                    available_at=boundary,
+                )
+            )
+            clock.calls = 0
+
+            async with store._lock:
+                snapshot_task = asyncio.create_task(store.aggregate_operational_snapshot())
+                await asyncio.sleep(0)
+                assert snapshot_task.done() is False
+                assert clock.calls == 0
+                clock.value = boundary
+
+            snapshot = await snapshot_task
+            assert clock.calls == 1
+            assert snapshot.as_of == boundary
+            assert snapshot.claimable_pending_count == 1
+            assert snapshot.scheduled_pending_count == 0
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_operational_snapshot_captures_time_after_executor_admission(tmp_path) -> None:
+    class _CountingClock(_MutableClock):
+        def __init__(self, value: datetime) -> None:
+            super().__init__(value)
+            self.calls = 0
+
+        def __call__(self) -> datetime:
+            self.calls += 1
+            return super().__call__()
+
+    async def run(executor: ThreadPoolExecutor) -> None:
+        boundary = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+        clock = _CountingClock(boundary - timedelta(microseconds=1))
+        path = tmp_path / "executor-snapshot-clock.sqlite"
+        snapshot_store = SQLiteTaskStore(path, clock=clock)
+        concurrent_store = SQLiteTaskStore(path, clock=clock)
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        blocker = None
+        snapshot_task = None
+        try:
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(executor)
+
+            def occupy_executor() -> None:
+                worker_started.set()
+                if not release_worker.wait(timeout=5):
+                    raise TimeoutError("executor blocker was not released")
+
+            blocker = loop.run_in_executor(None, occupy_executor)
+            while not worker_started.is_set():
+                await asyncio.sleep(0)
+
+            clock.calls = 0
+            snapshot_task = asyncio.create_task(snapshot_store.aggregate_operational_snapshot())
+            await asyncio.sleep(0)
+            assert snapshot_task.done() is False
+            assert clock.calls == 0
+
+            clock.value = boundary
+            await concurrent_store.create_task(
+                TaskCreate(
+                    task_id="committed-while-snapshot-queued",
+                    type="scheduled",
+                    available_at=boundary,
+                )
+            )
+            release_worker.set()
+            await blocker
+
+            snapshot = await snapshot_task
+            assert clock.calls >= 1
+            assert snapshot.as_of == boundary
+            assert snapshot.total_count == 1
+            assert snapshot.claimable_pending_count == 1
+            assert snapshot.scheduled_pending_count == 0
+        finally:
+            release_worker.set()
+            if blocker is not None:
+                await blocker
+            if snapshot_task is not None and not snapshot_task.done():
+                await snapshot_task
+            await concurrent_store.close()
+            await snapshot_store.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        asyncio.run(run(executor))
 
 
 def test_task_query_pagination_keeps_immediate_and_future_tasks_visible(tmp_path) -> None:

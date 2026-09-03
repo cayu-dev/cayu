@@ -96,6 +96,16 @@ cayu eval run
 python run.py --message "Review this change."
 ```
 
+For a portable operator snapshot that performs no agent, tool, recovery, repair,
+or live-provider work, run `cayu doctor --bundle cayu-support.zip`. The
+command reuses maintained-service diagnostics when selected and forces
+CayuApp and project control-plane stores backed by the built-in SQLite and
+PostgreSQL implementations into diagnostic read-only validation without creating
+or migrating them. Session history is excluded unless you
+explicitly repeat `--session`. See
+[Diagnostic support bundles](https://github.com/cayu-tech/cayu/blob/main/docs/diagnostic-support-bundles.md)
+for the contents, redaction boundary, hard limits, and exit codes.
+
 The scaffold is credential-free and includes:
 
 - a composition-only `app.py` with a process-scoped `build_app()` factory;

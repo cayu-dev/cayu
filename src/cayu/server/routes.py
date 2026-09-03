@@ -361,7 +361,7 @@ from cayu.runtime.usage import (
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server._capabilities import inspect_control_plane_capabilities
-from cayu.server._diagnostics import inspect_system_diagnostics
+from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.config import EvalsConfig, EvaluationPromotionConfig, normalize_api_path
 from cayu.server.contracts import (
@@ -3946,6 +3946,7 @@ def create_router(
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
     ) = None,
     _project_context: ResolvedProjectControlPlaneContext | None = None,
+    _system_diagnostics_snapshot_sink: (Callable[[SystemDiagnosticsSnapshot], None] | None) = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -4001,6 +4002,10 @@ def create_router(
         continuation_loop_policy_provider
     ):
         raise TypeError("continuation_loop_policy_provider must be callable or None.")
+    if _system_diagnostics_snapshot_sink is not None and not callable(
+        _system_diagnostics_snapshot_sink
+    ):
+        raise TypeError("_system_diagnostics_snapshot_sink must be callable or None.")
     if (
         _project_context is not None
         and type(_project_context) is not ResolvedProjectControlPlaneContext
@@ -4177,6 +4182,8 @@ def create_router(
         pricing_configured=dashboard_pricing_configured,
         pricing_metadata=dashboard_pricing_metadata,
     )
+    if _system_diagnostics_snapshot_sink is not None:
+        _system_diagnostics_snapshot_sink(diagnostics_snapshot)
 
     # Shared dependency list for control-plane routes. FastAPI treats an empty
     # sequence like no dependencies, so `auth=None` keeps explicit open access.

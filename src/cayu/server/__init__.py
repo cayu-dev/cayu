@@ -54,7 +54,7 @@ try:
         ServiceIdentityStoreKind,
         ServiceMode,
     )
-    from cayu.server._diagnostics import dashboard_pricing_metadata
+    from cayu.server._diagnostics import SystemDiagnosticsSnapshot, dashboard_pricing_metadata
     from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
     from cayu.server.config import (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS,
@@ -461,6 +461,7 @@ def mount_cayu(
     ) = None,
     name: str = "cayu-dashboard",
     _project_context: ProjectControlPlaneContext | None = None,
+    _system_diagnostics_snapshot_sink: (Callable[[SystemDiagnosticsSnapshot], None] | None) = None,
 ) -> None:
     """Mount CAYU's control plane and dashboard into an existing FastAPI app.
 
@@ -568,6 +569,7 @@ def mount_cayu(
         evals=evals,
         continuation_loop_policy_provider=continuation_loop_policy_provider,
         _project_context=resolved_project_context,
+        _system_diagnostics_snapshot_sink=_system_diagnostics_snapshot_sink,
     )
 
     # All caller-controlled values and route construction are validated before

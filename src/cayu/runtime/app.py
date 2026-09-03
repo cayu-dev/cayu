@@ -2992,6 +2992,11 @@ class CayuApp:
 
         return bool(self._artifact_store_registrations_by_id)
 
+    def artifact_store_registration_count(self) -> int:
+        """Return the exact registration count without projecting store identities."""
+
+        return len(self._artifact_store_registrations_by_id)
+
     def artifact_store_registration_fingerprints(
         self,
         *,

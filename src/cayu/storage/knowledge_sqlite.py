@@ -255,18 +255,19 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 schema_mode,
                 app_min_supported=_SQLITE_MIN_REQUIRED_REVISION,
             )
-            self._connection.execute(
-                f"""
-                CREATE VIRTUAL TABLE temp.{_EXACT_REVISION_FTS_TABLE}
-                USING fts5(
-                    entry_id UNINDEXED,
-                    entry_revision UNINDEXED,
-                    chunk_id UNINDEXED,
-                    title,
-                    text
+            if sqlite_support.current_diagnostic_store_inspection() is None:
+                self._connection.execute(
+                    f"""
+                    CREATE VIRTUAL TABLE temp.{_EXACT_REVISION_FTS_TABLE}
+                    USING fts5(
+                        entry_id UNINDEXED,
+                        entry_revision UNINDEXED,
+                        chunk_id UNINDEXED,
+                        title,
+                        text
+                    )
+                    """
                 )
-                """
-            )
         except BaseException:
             self._connection.close()
             raise

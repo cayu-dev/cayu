@@ -81,6 +81,7 @@ from cayu.runtime.tasks import (
     task_create_with_runtime_invocation,
 )
 from cayu.runtime.usage import is_conversational_model_completion_payload
+from cayu.server._diagnostics import SystemDiagnosticsSnapshot
 from cayu.server.config import (
     AuthenticatedAccess,
     EvalsConfig,
@@ -91,6 +92,7 @@ from cayu.server.config import (
     _validate_with_redacted_errors,
     normalize_api_path,
 )
+from cayu.server.contracts import SystemDiagnosticsResponse
 from cayu.vaults import (
     REDACTED_SECRET,
     SecretRedactionCapacityError,
@@ -875,6 +877,7 @@ class CayuService:
         "_product_store",
         "_project_control_plane_context",
         "_route_signature",
+        "_system_diagnostics_snapshot",
     )
 
     def __init__(
@@ -898,6 +901,7 @@ class CayuService:
         self._project_control_plane_context = project_control_plane_context
         self._assembly_token = _assembly_token
         self._route_signature: tuple[object, ...] | None = None
+        self._system_diagnostics_snapshot: SystemDiagnosticsSnapshot | None = None
 
     @property
     def cayu_app(self) -> CayuApp:
@@ -922,6 +926,26 @@ class CayuService:
     @property
     def project_control_plane_context_attached(self) -> bool:
         return self._project_control_plane_context is not None
+
+    def _attach_system_diagnostics_snapshot(
+        self,
+        snapshot: SystemDiagnosticsSnapshot,
+    ) -> None:
+        if type(snapshot) is not SystemDiagnosticsSnapshot:
+            raise TypeError("snapshot must be a framework-owned SystemDiagnosticsSnapshot.")
+        if self._system_diagnostics_snapshot is not None:
+            raise RuntimeError("System diagnostics are already attached to this service.")
+        self._system_diagnostics_snapshot = snapshot
+
+    def _support_bundle_system_diagnostics(self) -> SystemDiagnosticsResponse:
+        snapshot = self._system_diagnostics_snapshot
+        if snapshot is None:
+            raise RuntimeError("System diagnostics are not attached to this service.")
+        return snapshot.project(
+            None,
+            artifact_store_fingerprints=(),
+            artifact_store_total_count=self._cayu_app.artifact_store_registration_count(),
+        )
 
     async def _continuation_loop_policies(
         self,
@@ -2726,6 +2750,7 @@ def create_agent_service(
         evals=evals,
         continuation_loop_policy_provider=service._continuation_loop_policies,
         _project_context=project_context,
+        _system_diagnostics_snapshot_sink=service._attach_system_diagnostics_snapshot,
     )
     server.state.cayu_public_service = service
     server.state.cayu_public_service_manifest = manifest

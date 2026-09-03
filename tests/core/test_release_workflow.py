@@ -168,6 +168,8 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     publish = _job_block(workflow, "publish")
     github_release = _job_block(workflow, "github-release")
 
+    assert package_manifest.count("scripts/smoke_built_wheel_doctor.py") == 1
+
     assert "timeout-minutes: 40" in package
 
     assert 'tags: ["v*"]' in workflow

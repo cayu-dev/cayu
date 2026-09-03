@@ -6782,6 +6782,65 @@ configured API authentication dependency and `Cache-Control: private,
 no-store`. Persisted event side-effect health is tracked separately and is not
 claimed by this snapshot.
 
+The local `cayu doctor --bundle OUTPUT` command is a separate support boundary,
+not a server diagnostics route or health probe. It discovers the production
+project/service target, constructs its `CayuApp` once inside a hard-deadline
+worker, embeds the existing structured `cayu check` report, and performs only
+typed static projections or bounded store reads. A maintained service contributes
+the exact route-owned `SystemDiagnosticsResponse` with no request actor; the
+support-bundle schema rejects actor-bearing diagnostics at reconstruction. A
+direct-app project reports that collector unavailable. Environment evidence
+reconstructs the manifest's typed workspace branch capabilities and attached
+lifecycle summary. A process-scoped diagnostic owner forces file-backed CayuApp
+and project control-plane stores backed by Cayu's built-in SQLite and PostgreSQL
+implementations through database-enforced read-only validation during
+bounded bootstrap and collection. Schema-backed built-ins expose the resulting
+typed readiness while schema-less stores report not applicable and custom stores
+report unavailable. Static SQLite files use immutable inspection and are
+revalidated before publication; active WAL databases use locking-aware read-only
+inspection so committed frames remain visible, and incomplete sidecar pairs fail
+closed. Process-private SQLite `:memory:` stores initialize only their disposable
+empty schema and remain development stores; no database file or external schema
+is changed. PostgreSQL stores supplied with caller-owned pools fail closed because
+the diagnostic owner cannot establish connection-lifecycle ownership. Arbitrary
+factory code and custom stores remain responsible for side-effect-free
+construction; this diagnostic owner is not a general process sandbox.
+It never runs an agent, provider, tool, environment lifecycle, recovery, repair,
+upload, or synthetic readiness probe. Collector failures preserve earlier
+successes with a typed disposition and fixed reason code; raw project output,
+warnings, logs, and exception text stay inside the discarded worker side
+channels.
+
+The archive contains exactly `report.json` and its derived `summary.txt`.
+The typed report records a schema version, command version, fresh bundle
+identity, monotonic per-collector and total collection durations, accepted
+evidence bytes, result counts, and completeness. Every collected projection is
+serialized and reconstructed before publication; unavailable evidence remains
+truthful, while skipped, timed-out, failed, or redacted evidence produces a
+partial bundle without discarding earlier successes. The archive passes schema,
+canonical reconstruction, empty-metadata, regular-member-permission, redaction,
+forbidden-content, and byte-limit validation before atomic mode-`0600`
+publication. The complete command has one documented deadline: the project
+worker and atomic publisher each have a narrower process deadline plus an
+independent child lifetime guard that remains armed through interpreter shutdown,
+and failed-publication staging reconciliation has a separately owned bounded
+process. SIGTERM unwinds each owned child before exit. POSIX
+publication opens every parent component directory-relative
+without following symlinks, then confirms the published regular file's mode and
+size, synchronizes the pinned directory, and rechecks its path identity before
+reporting success. Windows publication rejects junction and reparse traversal,
+pins the validated parent with a native namespace fence, creates staging files
+with a protected owner/system/administrators DACL, and uses write-through
+atomic replacement. It
+rechecks the published regular file's size and protected DACL plus the parent
+identity before reporting success.
+
+History is excluded by default. Explicit session selectors are clean and bound
+to 2,048 UTF-8 bytes before worker dispatch. Their tails use only store-native
+byte-bounded event reads and retain an explicit redacted-envelope projection,
+sequence, built-in event type, timestamp, sequence/time bounds, returned count,
+and explicit completeness or omission evidence.
+
 Authentication identity has the same explicit bound before it reaches this
 projection or durable operator provenance: `AuthContext.subject` and
 `AuthContext.tenant`, plus the `BasicAuth` `username`, `subject`, and `tenant`

@@ -49,9 +49,12 @@ _RELEASE_EXACT_PATHS = {
     "scripts/smoke_ejected_dashboard.py",
     "scripts/smoke_built_wheel_serve.py",
     "scripts/verify_release_sidecar_artifacts.sh",
+    "scripts/smoke_built_wheel_doctor.py",
     "scripts/verify_release_state.py",
     "src/cayu/_server_contract_version.py",
+    "src/cayu/runtime/system_diagnostics.py",
     "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
+    "src/cayu/support_bundles.py",
     "tests/cli/test_scaffold_docker_live.py",
     "uv.lock",
 }

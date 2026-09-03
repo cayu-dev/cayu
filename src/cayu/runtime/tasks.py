@@ -52,7 +52,13 @@ from cayu.runtime._task_admission_wakeup import (
     TaskAdmissionWakeupBroker,
 )
 from cayu.runtime._task_lease_authority import managed_task_lease_mutation
-from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy, AggregateCount
+from cayu.runtime.aggregates import (
+    _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL,
+    EXACT_AGGREGATE,
+    AggregateAccuracy,
+    AggregateCount,
+    _cooperate_with_in_memory_aggregate_cancellation,
+)
 from cayu.runtime.approvals import (
     ResolutionActor,
     copy_resolution_actor,
@@ -5677,11 +5683,23 @@ class InMemoryTaskStore(TaskStore):
         task_query = task_query_from_aggregate_filter(filters)
         async with self._lock:
             as_of = self._clock()
+            unsettled_task_ids: set[str] = set()
+            unsettled_retry_series_ids: set[str] = set()
+            for item_index, record in enumerate(
+                self._local_execution_attempts.values(),
+                start=1,
+            ):
+                if not record.retry_admissible:
+                    unsettled_task_ids.add(record.authority.task_id)
+                    if record.authority.retry_series_id is not None:
+                        unsettled_retry_series_ids.add(record.authority.retry_series_id)
+                if item_index % _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL == 0:
+                    await _cooperate_with_in_memory_aggregate_cancellation()
             counts = {status: 0 for status in TaskStatus}
             total_count = 0
             claimable_pending_count = 0
             scheduled_pending_count = 0
-            for task in self._tasks.values():
+            for item_index, task in enumerate(self._tasks.values(), start=1):
                 if _task_matches(task, task_query):
                     counts[task.status] += 1
                     total_count += 1
@@ -5690,9 +5708,15 @@ class InMemoryTaskStore(TaskStore):
                             scheduled_pending_count += 1
                         elif (
                             task.session_id is None
-                            and not self._task_has_unsettled_local_execution_attempt(task.id)
+                            and task.id not in unsettled_task_ids
+                            and (
+                                task.retry_series is None
+                                or task.retry_series.series_id not in unsettled_retry_series_ids
+                            )
                         ):
                             claimable_pending_count += 1
+                if item_index % _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL == 0:
+                    await _cooperate_with_in_memory_aggregate_cancellation()
             return TaskOperationalSnapshot(
                 as_of=as_of,
                 total_count=total_count,

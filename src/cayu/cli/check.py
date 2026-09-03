@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from cayu.cli._output import add_output_options, output_destination
@@ -31,6 +32,8 @@ from cayu.runtime.checks import (
     check_manifest,
     severity_at_least,
 )
+from cayu.runtime.manifest import AppManifest
+from cayu.runtime.service_manifest import PublicServiceManifest
 
 
 def add_check_parser(subparsers: Any) -> None:
@@ -133,34 +136,14 @@ def _run_check(args: argparse.Namespace) -> int:
                     )
                 ),
             )
-            report = check_manifest(
+            report = build_project_check_report(
+                project.root,
                 manifest,
                 service_manifest=None if service is None else service.manifest,
                 project_control_plane=check_evidence,
                 tags=requested_tags,
                 deploy_only=args.deploy,
             )
-            scaffold_diagnostics = check_declared_scaffold(
-                project.root,
-                manifest,
-                tags=requested_tags,
-                deploy_only=args.deploy,
-            )
-            if scaffold_diagnostics:
-                report = report.model_copy(
-                    update={
-                        "diagnostics": tuple(
-                            sorted(
-                                (*report.diagnostics, *scaffold_diagnostics),
-                                key=lambda item: (
-                                    item.severity.value,
-                                    item.code,
-                                    item.path,
-                                ),
-                            )
-                        )
-                    }
-                )
         finally:
             close_project_control_plane_context(control_plane_context)
     except Exception as exc:
@@ -173,6 +156,44 @@ def _run_check(args: argparse.Namespace) -> int:
         return 2
 
     return _render_report(args, report)
+
+
+def build_project_check_report(
+    project_root: Path,
+    manifest: AppManifest,
+    *,
+    service_manifest: PublicServiceManifest | None,
+    project_control_plane: ProjectControlPlaneCheckEvidence,
+    tags: frozenset[str] = frozenset(),
+    deploy_only: bool = False,
+) -> ProjectCheckReport:
+    """Build the exact structured check report shared by check and doctor."""
+
+    report = check_manifest(
+        manifest,
+        service_manifest=service_manifest,
+        project_control_plane=project_control_plane,
+        tags=tags,
+        deploy_only=deploy_only,
+    )
+    scaffold_diagnostics = check_declared_scaffold(
+        project_root,
+        manifest,
+        tags=tags,
+        deploy_only=deploy_only,
+    )
+    if not scaffold_diagnostics:
+        return report
+    return report.model_copy(
+        update={
+            "diagnostics": tuple(
+                sorted(
+                    (*report.diagnostics, *scaffold_diagnostics),
+                    key=lambda item: (item.severity.value, item.code, item.path),
+                )
+            )
+        }
+    )
 
 
 def _source_only_report(

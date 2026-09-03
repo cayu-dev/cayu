@@ -163,6 +163,7 @@ from cayu.runtime._terminal_evidence import (
     classify_current_terminal_evidence,
 )
 from cayu.runtime.aggregates import (
+    _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL,
     EXACT_AGGREGATE,
     AggregateAccuracy,
     AggregateAccuracyKind,
@@ -177,6 +178,7 @@ from cayu.runtime.aggregates import (
     UsageSessionAggregateBreakdown,
     UsageSessionAggregateGroup,
     UsageSessionAggregateRemainder,
+    _cooperate_with_in_memory_aggregate_cancellation,
     add_aggregate_usage,
     aggregate_hosted_tool_usage_metrics_from_event_payload,
     aggregate_usage_metrics_from_event_payload,
@@ -11507,9 +11509,7 @@ class SessionStore(ABC):
         if type(max_chars) is not int:
             raise TypeError("max_chars must be an integer.")
         if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
-            raise ValueError(
-                f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}."
-            )
+            raise ValueError(f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}.")
         raise NotImplementedError(
             f"{type(self).__name__} does not support bounded transcript-text reads."
         )
@@ -17987,10 +17987,12 @@ class InMemorySessionStore(SessionStore):
             as_of = self._ownership_clock()
             counts = {status: 0 for status in SessionStatus}
             total_count = 0
-            for session in self._sessions.values():
+            for item_index, session in enumerate(self._sessions.values(), start=1):
                 if _session_matches(session, session_query):
                     counts[session.status] += 1
                     total_count += 1
+                if item_index % _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL == 0:
+                    await _cooperate_with_in_memory_aggregate_cancellation()
             return SessionOperationalSnapshot(
                 as_of=as_of,
                 total_count=total_count,
@@ -18657,9 +18659,7 @@ class InMemorySessionStore(SessionStore):
         if type(max_chars) is not int:
             raise TypeError("max_chars must be an integer.")
         if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
-            raise ValueError(
-                f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}."
-            )
+            raise ValueError(f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}.")
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")

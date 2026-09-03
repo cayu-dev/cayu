@@ -10,6 +10,9 @@ from cayu import CayuApp
 from cayu.cli.project import ProjectError
 from cayu.cli.project_control_plane import build_project_control_plane_context
 from cayu.project_control_plane import resolve_project_control_plane_context
+from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
+from cayu.storage.evals_postgres import PostgresEvalStore
+from cayu.storage.migrations import SchemaMode
 from cayu.vaults import SecretRedactor
 
 
@@ -48,6 +51,75 @@ def test_project_context_normalizes_identity_and_uses_manifest_release_fallback(
         assert "data/cayu.db" not in repr(context)
     finally:
         asyncio.run(context.close())
+
+
+def test_diagnostic_project_context_does_not_mutate_existing_sqlite_eval_store(
+    tmp_path: Path,
+) -> None:
+    _project(
+        tmp_path,
+        store='\n[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"\n',
+    )
+    created = build_project_control_plane_context(
+        tmp_path,
+        mode="production",
+        environ={},
+    )
+    asyncio.run(created.close())
+
+    database = tmp_path / "data" / "cayu.db"
+    before_bytes = database.read_bytes()
+    before_stat = database.stat()
+    before_entries = tuple(sorted(path.name for path in database.parent.iterdir()))
+
+    with diagnostic_store_inspection() as inspection:
+        inspected = build_project_control_plane_context(
+            tmp_path,
+            mode="production",
+            environ={},
+        )
+        try:
+            assert inspected.eval_store_configured is True
+            inspection.verify()
+        finally:
+            asyncio.run(inspected.close())
+
+    after_stat = database.stat()
+    assert database.read_bytes() == before_bytes
+    assert (after_stat.st_size, after_stat.st_mtime_ns) == (
+        before_stat.st_size,
+        before_stat.st_mtime_ns,
+    )
+    assert tuple(sorted(path.name for path in database.parent.iterdir())) == before_entries
+
+
+def test_diagnostic_project_context_forces_postgres_eval_store_read_only(
+    tmp_path: Path,
+) -> None:
+    _project(
+        tmp_path,
+        store=('\n[tool.cayu.session_store]\nbackend = "postgres"\nenv = "PROJECT_DATABASE_URL"\n'),
+    )
+
+    with diagnostic_store_inspection() as inspection:
+        context = build_project_control_plane_context(
+            tmp_path,
+            mode="production",
+            environ={"PROJECT_DATABASE_URL": "postgresql://example/cayu"},
+        )
+        try:
+            resolved = resolve_project_control_plane_context(
+                context,
+                CayuApp(enable_logging=False),
+            )
+            assert resolved is not None
+            store = resolved.eval_store
+            assert isinstance(store, PostgresEvalStore)
+            assert store._read_only is True
+            assert store._schema_mode is SchemaMode.VALIDATE
+            inspection.verify()
+        finally:
+            asyncio.run(context.close())
 
 
 def test_project_context_uses_explicit_release_without_exposing_store_credentials(

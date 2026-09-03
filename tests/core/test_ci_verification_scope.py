@@ -81,6 +81,15 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
     assert select_pull_request_jobs(["scripts/verify_release_state.py"]) == expected
     assert select_pull_request_jobs(["scripts/smoke_built_wheel_serve.py"]) == expected
     assert select_pull_request_jobs(["scripts/verify_release_sidecar_artifacts.sh"]) == expected
+    assert select_pull_request_jobs(["scripts/smoke_built_wheel_doctor.py"]) == expected
+    assert select_pull_request_jobs(["src/cayu/support_bundles.py"]) == expected
+    assert select_pull_request_jobs(
+        ["src/cayu/runtime/system_diagnostics.py"]
+    ) == VerificationScope(
+        dashboard=True,
+        release_artifacts=True,
+        sqlite_cancellation=True,
+    )
     assert select_pull_request_jobs(["tests/cli/test_scaffold_docker_live.py"]) == expected
     assert select_pull_request_jobs(["src/cayu/guides/evals-first.md"]) == expected
     assert select_pull_request_jobs(
