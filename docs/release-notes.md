@@ -357,6 +357,32 @@ censuses count all inspected entries, including unrelated names, and fail closed
 Dashboard bundle validation, output bytes, modes, offline behavior, and the absent-or-empty
 destination policy are unchanged.
 
+### Lambda sidecar publication uses the guarded tree owner
+
+`cayu lambda-microvm sidecar export` now shares the dashboard's bounded, crash-recoverable
+whole-tree publication owner instead of importing dashboard-private cleanup helpers and carrying
+a second backup state machine. Exact retries authenticate the complete emitted sidecar tree,
+including raw manifest bytes. `--replace` atomically binds the current terminal
+receipt's exact stable identity and terminal hash so a newer packaged sidecar—or another guarded
+tree producer explicitly asked to replace that destination—can supersede it without weakening
+recovery identity. Recoverable active work from an older request is settled before the successor
+starts. A failed final rename restores the exact original directory synchronously when ownership remains
+provable; ambiguous concurrent trees are preserved and fail closed. Sidecar bytes, manifest
+semantics, modes, displayed content digest, offline operation, and successful CLI behavior are
+unchanged.
+
+### New-project scaffolds use the guarded tree owner
+
+`cayu new` now publishes its complete project root through the same durable whole-tree owner.
+Generated files and empty data directories retain their process-umask-derived modes; private
+memory-key permissions, coding Git setup, and the destination root mode also retain their successful
+behavior. If the process exits during final
+publication, the same command recovers the exact old-or-new outcome instead of leaving generated
+content without a retry owner. Recovery and the new absent-or-empty request share one locked
+publication boundary, so removing a prior project and recreating an empty destination does not make
+its historical receipt an unrelated failure. Pre-existing non-empty targets and concurrent
+replacements still fail closed and are never adopted or cleaned up.
+
 ### Semantic watches retain evidence without self-authorizing effects
 
 Applications can now explicitly evaluate one bounded observation through the existing

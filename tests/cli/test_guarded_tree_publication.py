@@ -27,6 +27,7 @@ from cayu.cli._guarded_tree_publication import (
     GuardedTreeStage,
     publish_guarded_tree,
     recover_guarded_tree,
+    replace_guarded_tree,
     validate_guarded_tree_files,
 )
 
@@ -562,6 +563,31 @@ def test_guarded_stage_writer_accepts_exact_entry_limit(
     )
 
     assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == "new\n"
+
+
+def test_guarded_stage_writer_preserves_empty_directories_and_exact_file_modes(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "published"
+
+    publish_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=_REQUEST_DIGEST,
+        policy=DestinationPolicy.ABSENT_OR_EMPTY,
+        populate=lambda stage: stage.write_tree(
+            {"data/private.key": b"secret\n", "README.md": b"hello\n"},
+            directories=("data/empty",),
+            file_modes={"data/private.key": 0o600},
+            root_mode=0o700,
+        ),
+    )
+
+    assert (destination / "data" / "empty").is_dir()
+    assert (destination / "data" / "private.key").read_bytes() == b"secret\n"
+    if os.name != "nt":
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+        assert stat.S_IMODE((destination / "data" / "private.key").stat().st_mode) == 0o600
 
 
 def test_posix_tree_sealing_stops_at_remaining_entry_budget(
@@ -1324,6 +1350,26 @@ def test_guarded_tree_publication_rejects_invalid_policy_before_allocation(
         )
 
     assert exc_info.value.code == "invalid_policy"
+    assert not _journal_path(destination).exists()
+    assert _owned_paths(tmp_path) == []
+
+
+def test_guarded_tree_publication_rejects_integer_settlement_policy_before_allocation(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "published"
+
+    with pytest.raises(GuardedTreePublicationError) as exc_info:
+        publish_guarded_tree(
+            destination,
+            consumer="test",
+            request_digest=_REQUEST_DIGEST,
+            policy=DestinationPolicy.ABSENT_OR_EMPTY,
+            populate=_populate,
+            settle_active_operation=cast("bool", 1),
+        )
+
+    assert exc_info.value.code == "invalid_recovery_policy"
     assert not _journal_path(destination).exists()
     assert _owned_paths(tmp_path) == []
 
@@ -3276,6 +3322,8 @@ def test_guarded_tree_pending_journal_preserves_caller_authored_authority(
         consumer="test",
         request_digest=_REQUEST_DIGEST,
         predecessor_request_digest=None,
+        predecessor_receipt_identity=None,
+        predecessor_receipt_sha256=None,
         token=token,
         destination_name="foreign" if conflict == "destination" else destination.name,
         policy=DestinationPolicy.ABSENT_OR_EMPTY,
@@ -3643,6 +3691,214 @@ def test_guarded_tree_publication_supersedes_terminal_receipt_with_bound_success
             ),
         )
     assert stale_successor.value.code == "publication_request_conflict"
+
+
+def test_guarded_tree_replacement_binds_current_receipt_and_replays_successor(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "published"
+    successor_digest = f"sha256:{'2' * 64}"
+
+    publish_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=_REQUEST_DIGEST,
+        policy=DestinationPolicy.ABSENT_OR_EMPTY,
+        populate=lambda staging: _populate(staging, content="first\n"),
+    )
+    replace_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=successor_digest,
+        populate=lambda staging: _populate(staging, content="second\n"),
+    )
+
+    assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == "second\n"
+    replay = replace_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=successor_digest,
+        populate=lambda _stage: pytest.fail("exact replacement replay must not repopulate"),
+    )
+    assert replay.recovered
+    record = json.loads(_receipt_path(destination).read_text(encoding="ascii").splitlines()[-1])
+    assert record["request_digest"] == successor_digest
+    assert record["predecessor_request_digest"] == _REQUEST_DIGEST
+
+
+def test_guarded_tree_replacement_supersedes_another_consumers_receipt(tmp_path: Path) -> None:
+    destination = tmp_path / "published"
+    replace_guarded_tree(
+        destination,
+        consumer="first",
+        request_digest=_REQUEST_DIGEST,
+        populate=_populate,
+    )
+
+    replace_guarded_tree(
+        destination,
+        consumer="second",
+        request_digest=f"sha256:{'2' * 64}",
+        populate=lambda stage: _populate(stage, content="second\n"),
+    )
+
+    assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == "second\n"
+    record = json.loads(_receipt_path(destination).read_text(encoding="ascii").splitlines()[-1])
+    assert record["consumer"] == "second"
+    assert record["predecessor_request_digest"] == _REQUEST_DIGEST
+    assert record["predecessor_receipt_identity"] is not None
+    assert isinstance(record["predecessor_receipt_sha256"], str)
+
+
+def test_guarded_tree_replacement_settles_prior_version_before_successor(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "published"
+    destination.mkdir()
+    (destination / "value.txt").write_text("original\n", encoding="utf-8")
+    _run_crashing_replacement_publication(
+        destination,
+        phase="tree_renamed",
+        exit_code=86,
+    )
+
+    successor_digest = f"sha256:{'2' * 64}"
+    result = replace_guarded_tree(
+        destination,
+        consumer="new-version",
+        request_digest=successor_digest,
+        populate=lambda stage: _populate(stage, content="successor\n"),
+    )
+
+    assert not result.recovered
+    assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == ("successor\n")
+    assert not (destination / "value.txt").exists()
+    assert _owned_paths(tmp_path) == []
+    record = json.loads(_receipt_path(destination).read_text(encoding="ascii").splitlines()[-1])
+    assert record["request_digest"] == successor_digest
+    assert record["predecessor_request_digest"] == _REQUEST_DIGEST
+
+
+@pytest.mark.parametrize("safe_state", ("absent", "recreated_empty"))
+def test_guarded_tree_replacement_retires_historical_receipt_for_safe_successor(
+    tmp_path: Path,
+    safe_state: str,
+) -> None:
+    destination = tmp_path / "published"
+    destination.mkdir()
+    (destination / "operator.txt").write_text("old\n", encoding="utf-8")
+    replace_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=_REQUEST_DIGEST,
+        populate=lambda stage: _populate(stage, content="first\n"),
+    )
+    shutil.rmtree(destination)
+    if safe_state == "recreated_empty":
+        destination.mkdir()
+
+    successor_digest = f"sha256:{'2' * 64}"
+    result = replace_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=successor_digest,
+        populate=lambda stage: _populate(stage, content="successor\n"),
+    )
+
+    assert not result.recovered
+    assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == ("successor\n")
+    record = json.loads(_receipt_path(destination).read_text(encoding="ascii").splitlines()[-1])
+    assert record["request_digest"] == successor_digest
+    assert record["predecessor_request_digest"] is None
+    assert _owned_paths(tmp_path) == []
+
+
+def test_guarded_tree_absent_or_empty_successor_retires_recreated_empty_receipt(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "published"
+    publish_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=_REQUEST_DIGEST,
+        policy=DestinationPolicy.ABSENT_OR_EMPTY,
+        populate=lambda stage: _populate(stage, content="first\n"),
+    )
+    shutil.rmtree(destination)
+    destination.mkdir()
+
+    successor_digest = f"sha256:{'2' * 64}"
+    result = publish_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=successor_digest,
+        policy=DestinationPolicy.ABSENT_OR_EMPTY,
+        populate=lambda stage: _populate(stage, content="successor\n"),
+    )
+
+    assert not result.recovered
+    assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == ("successor\n")
+    record = json.loads(_receipt_path(destination).read_text(encoding="ascii").splitlines()[-1])
+    assert record["request_digest"] == successor_digest
+    assert record["predecessor_request_digest"] is None
+    assert _owned_paths(tmp_path) == []
+
+
+def test_guarded_tree_replacement_rejects_substituted_predecessor_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "published"
+    replace_guarded_tree(
+        destination,
+        consumer="first",
+        request_digest=_REQUEST_DIGEST,
+        populate=lambda stage: _populate(stage, content="first\n"),
+    )
+    receipt_path = _receipt_path(destination)
+    receipt_content = receipt_path.read_bytes()
+
+    def substitute_receipt(phase: str) -> None:
+        if phase != "stage_created":
+            return
+        receipt_path.unlink()
+        receipt_path.write_bytes(receipt_content)
+
+    monkeypatch.setattr(publication, "_publication_fault", substitute_receipt)
+    with pytest.raises(GuardedTreePublicationError) as exc_info:
+        replace_guarded_tree(
+            destination,
+            consumer="second",
+            request_digest=f"sha256:{'2' * 64}",
+            populate=lambda stage: _populate(stage, content="second\n"),
+        )
+
+    assert exc_info.value.code == "publication_conflict"
+    assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == "second\n"
+    assert receipt_path.read_bytes() == receipt_content
+    assert _active_journal_path(destination).is_file()
+
+
+def test_guarded_tree_replacement_rejects_modified_exact_replay(tmp_path: Path) -> None:
+    destination = tmp_path / "published"
+    replace_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=_REQUEST_DIGEST,
+        populate=_populate,
+    )
+    (destination / "nested" / "value.txt").write_text("modified\n", encoding="utf-8")
+
+    with pytest.raises(GuardedTreePublicationError) as exc_info:
+        replace_guarded_tree(
+            destination,
+            consumer="test",
+            request_digest=_REQUEST_DIGEST,
+            populate=lambda _stage: pytest.fail("modified replay must not repopulate"),
+        )
+
+    assert exc_info.value.code == "publication_conflict"
+    assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == "modified\n"
 
 
 def test_guarded_tree_recovery_preserves_post_publish_edits(tmp_path: Path) -> None:
@@ -4386,6 +4642,8 @@ def test_guarded_tree_recovery_classifies_invalid_unicode_journal_metadata(
         consumer="\ud800",
         request_digest=_REQUEST_DIGEST,
         predecessor_request_digest=None,
+        predecessor_receipt_identity=None,
+        predecessor_receipt_sha256=None,
         token=token,
         destination_name=destination.name,
         policy=DestinationPolicy.ABSENT_OR_EMPTY,

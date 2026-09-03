@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import shutil
 import stat
 import sys
 import tempfile
-from contextlib import suppress
+from collections.abc import Callable
 from pathlib import Path
 
 from cayu._version import package_version
@@ -21,6 +22,12 @@ from cayu.cli._bounded_command import (
     BoundedCommandStartError,
     BoundedCommandTimeoutError,
     run_bounded_command,
+)
+from cayu.cli._guarded_tree_publication import (
+    DestinationPolicy,
+    GuardedTreePublicationError,
+    GuardedTreeStage,
+    publish_guarded_tree,
 )
 from cayu.cli.scaffold_convention import (
     application_guidance,
@@ -60,6 +67,37 @@ _SAFE_SCAFFOLD_ENV_KEYS = (
 
 class _ScaffoldCommandError(RuntimeError):
     """Bounded, content-safe command failure used by coding scaffolding."""
+
+
+class _ScaffoldTargetNotEmpty(_ScaffoldCommandError):
+    """The guarded publisher positively observed a non-empty target."""
+
+
+class _ScaffoldCodingPreflightError(_ScaffoldCommandError):
+    """Coding dependencies failed before stage population began."""
+
+
+def _translated_scaffold_publication_error(
+    error: GuardedTreePublicationError,
+) -> _ScaffoldCommandError:
+    """Retain bounded shared-owner diagnostics at the scaffold boundary."""
+
+    message = str(error)
+    if error.paths:
+        message += "; affected paths: " + ", ".join(repr(path) for path in error.paths)
+    translated = _ScaffoldCommandError(message)
+    for note in getattr(error, "__notes__", ()):
+        translated.add_note(note)
+    return translated
+
+
+def _scaffold_error_message(error: BaseException) -> str:
+    """Render bounded exception notes through the CLI's existing error schema."""
+
+    message = str(error)
+    for note in getattr(error, "__notes__", ()):
+        message += f"; note: {note}"
+    return message
 
 
 def _sanitized_scaffold_git_environment(*, cwd: Path) -> dict[str, str]:
@@ -175,10 +213,15 @@ def _run_scaffold_git_command(
     cwd: Path,
     env: dict[str, str],
     expected_directory_identity: tuple[int, int],
+    assert_directory_unchanged: Callable[[], object] | None = None,
 ) -> str:
+    if assert_directory_unchanged is not None:
+        assert_directory_unchanged()
     if _scaffold_directory_identity(cwd) != expected_directory_identity:
         raise _ScaffoldCommandError("scaffold target identity changed")
     output = _run_scaffold_command(argv, cwd=cwd, env=env)
+    if assert_directory_unchanged is not None:
+        assert_directory_unchanged()
     if _scaffold_directory_identity(cwd) != expected_directory_identity:
         raise _ScaffoldCommandError("scaffold target identity changed")
     return output
@@ -463,30 +506,85 @@ def _preflight_coding_commands(*, parent: Path) -> tuple[str, str]:
     return resolved["git"], resolved["rg"]
 
 
-def _publish_staged_scaffold(
+def _populate_scaffold_stage(
     *,
-    staging: Path,
-    target: Path,
-    expected_target_identity: tuple[int, int],
-    target_mode: int,
+    staging: GuardedTreeStage,
+    files: dict[str, str],
+    plan: ApplicationPlan,
+    hooks_parent: Path,
 ) -> None:
-    """Publish a complete private staging tree over the reserved empty target."""
+    """Populate one publisher-owned stage with a complete scaffold."""
 
-    if _scaffold_directory_identity(target) != expected_target_identity:
-        raise _ScaffoldCommandError("scaffold target identity changed")
-    staging.chmod(target_mode)
-    try:
-        target.rmdir()
-    except OSError:
-        raise _ScaffoldCommandError("scaffold target is no longer empty") from None
-    try:
-        staging.rename(target)
-    except OSError:
-        # Restore only the empty reservation we removed. Never remove or alter a
-        # concurrently created replacement in order to complete publication.
-        with suppress(FileExistsError):
-            target.mkdir(mode=target_mode)
-        raise _ScaffoldCommandError("could not publish completed scaffold") from None
+    coding_git: str | None = None
+    if plan.preset == "coding":
+        try:
+            LocalWorkspace.require_path_operations_supported()
+            coding_git, _ = _preflight_coding_commands(parent=hooks_parent)
+        except (RuntimeError, _ScaffoldCommandError, OSError) as exc:
+            raise _ScaffoldCodingPreflightError(f"coding preset {exc}") from None
+    contents = {relative: content.encode("utf-8") for relative, content in files.items()}
+    directories = {"data"}
+    if "artifacts" in plan.capabilities:
+        directories.add("data/artifacts")
+    file_modes: dict[str, int] = {}
+    if "memory" in plan.capabilities:
+        private_path = "data/memory-evidence.key"
+        contents[private_path] = (secrets.token_urlsafe(48) + "\n").encode("utf-8")
+        if os.name != "nt":
+            file_modes[private_path] = 0o600
+    staging.write_tree(
+        contents,
+        directories=directories,
+        file_modes=file_modes,
+        file_mode=None,
+        directory_mode=None,
+        root_mode=staging.publication_root_mode(),
+    )
+    if plan.preset != "coding":
+        return
+    assert coding_git is not None
+    stage_path = staging._specialized_path()
+    with tempfile.TemporaryDirectory(
+        prefix="cayu-scaffold-hooks-",
+        dir=hooks_parent,
+    ) as raw_hooks:
+        _initialize_coding_git(
+            staging=stage_path,
+            files=files,
+            git=coding_git,
+            hooks=Path(raw_hooks),
+            assert_staging_unchanged=staging.capture_owned_identity,
+        )
+    staging.capture_owned_identity()
+
+
+def _scaffold_publication_request_digest(
+    *,
+    files: dict[str, str],
+    plan: ApplicationPlan,
+) -> str:
+    """Bind retry identity to every deterministic scaffold-publication input."""
+
+    directories = {"data"}
+    if "artifacts" in plan.capabilities:
+        directories.add("data/artifacts")
+    directories.update(parent for path in files if (parent := str(Path(path).parent)) != ".")
+    payload = {
+        "schema_version": 1,
+        "plan": plan.as_dict(
+            files=tuple(sorted(files)),
+            directories=tuple(sorted(directories)),
+            private_files=(("data/memory-evidence.key",) if "memory" in plan.capabilities else ()),
+        ),
+        "files": [[relative, files[relative]] for relative in sorted(files)],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 GENERATED_IMPORTS_START = "# <cayu:generated-imports>"
@@ -4001,6 +4099,7 @@ def _initialize_coding_git(
     files: dict[str, str],
     git: str,
     hooks: Path,
+    assert_staging_unchanged: Callable[[], object] | None = None,
 ) -> None:
     staging_identity = _scaffold_directory_identity(staging)
     git_env = _sanitized_scaffold_git_environment(cwd=staging)
@@ -4016,12 +4115,14 @@ def _initialize_coding_git(
         cwd=staging,
         env=git_env,
         expected_directory_identity=staging_identity,
+        assert_directory_unchanged=assert_staging_unchanged,
     )
     repository_root = _run_scaffold_git_command(
         _safe_git_argv(git, "rev-parse", "--show-toplevel", hooks_dir=hooks),
         cwd=staging,
         env=git_env,
         expected_directory_identity=staging_identity,
+        assert_directory_unchanged=assert_staging_unchanged,
     ).strip()
     try:
         resolved_repository_root = Path(repository_root).resolve(strict=True)
@@ -4036,12 +4137,14 @@ def _initialize_coding_git(
         cwd=staging,
         env=git_env,
         expected_directory_identity=staging_identity,
+        assert_directory_unchanged=assert_staging_unchanged,
     )
     tracked_output = _run_scaffold_git_command(
         _safe_git_argv(git, "ls-files", "--cached", "-z", "--", hooks_dir=hooks),
         cwd=staging,
         env=git_env,
         expected_directory_identity=staging_identity,
+        assert_directory_unchanged=assert_staging_unchanged,
     )
     tracked_files = frozenset(path for path in tracked_output.split("\0") if path)
     if tracked_files != frozenset(files):
@@ -4061,6 +4164,7 @@ def _initialize_coding_git(
         cwd=staging,
         env=git_env,
         expected_directory_identity=staging_identity,
+        assert_directory_unchanged=assert_staging_unchanged,
     )
 
 
@@ -4069,57 +4173,32 @@ def _publish_new_project(
     target: Path,
     files: dict[str, str],
     plan: ApplicationPlan,
-    coding_git: str | None,
 ) -> None:
-    target_preexisted = target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
     _require_safe_scaffold_parent(target.parent)
-    target.mkdir(parents=True, exist_ok=True)
-    target_stat = target.stat(follow_symlinks=False)
-    target_identity = (target_stat.st_dev, target_stat.st_ino)
-    target_mode = stat.S_IMODE(target_stat.st_mode)
     try:
-        with tempfile.TemporaryDirectory(
-            prefix=f".{plan.name}.cayu-scaffold-",
-            dir=target.parent,
-        ) as raw_staging:
-            staging = Path(raw_staging)
-            (staging / "data").mkdir()
-            if "artifacts" in plan.capabilities:
-                (staging / "data" / "artifacts").mkdir()
-            if "memory" in plan.capabilities:
-                memory_key = staging / "data" / "memory-evidence.key"
-                memory_key.write_text(secrets.token_urlsafe(48) + "\n", encoding="utf-8")
-                if os.name != "nt":
-                    memory_key.chmod(0o600)
-            for relative, content in files.items():
-                path = staging / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
-            if plan.preset == "coding":
-                assert coding_git is not None
-                with tempfile.TemporaryDirectory(
-                    prefix="cayu-scaffold-hooks-", dir=target.parent
-                ) as raw_hooks:
-                    _initialize_coding_git(
-                        staging=staging,
-                        files=files,
-                        git=coding_git,
-                        hooks=Path(raw_hooks),
-                    )
-            _publish_staged_scaffold(
+        request_digest = _scaffold_publication_request_digest(
+            files=files,
+            plan=plan,
+        )
+        publish_guarded_tree(
+            target,
+            consumer="scaffold_new",
+            request_digest=request_digest,
+            policy=DestinationPolicy.ABSENT_OR_EMPTY,
+            settle_active_operation=True,
+            populate=lambda staging: _populate_scaffold_stage(
                 staging=staging,
-                target=target,
-                expected_target_identity=target_identity,
-                target_mode=target_mode,
-            )
-    except Exception:
-        if not target_preexisted:
-            try:
-                if _scaffold_directory_identity(target) == target_identity:
-                    target.rmdir()
-            except (OSError, _ScaffoldCommandError):
-                pass
+                files=files,
+                plan=plan,
+                hooks_parent=target.parent,
+            ),
+        )
+    except BaseException as error:
+        if isinstance(error, GuardedTreePublicationError):
+            if error.code == "destination_not_empty":
+                raise _ScaffoldTargetNotEmpty from None
+            raise _translated_scaffold_publication_error(error) from error
         raise
 
 
@@ -4238,13 +4317,12 @@ def run_new(args: argparse.Namespace) -> int:
             message=f"{target} already exists and is not a directory",
             as_json=args.json,
         )
-    if target.exists() and any(target.iterdir()):
+    if args.dry_run and target.exists() and any(target.iterdir()):
         return _new_error(
             code="TARGET_NOT_EMPTY",
             message=f"{target} already exists and is not empty",
             as_json=args.json,
         )
-
     try:
         files = project_files(
             name,
@@ -4284,30 +4362,28 @@ def run_new(args: argparse.Namespace) -> int:
                 print("  create private data/memory-evidence.key (content generated on apply)")
         return 0
 
-    coding_git: str | None = None
-    if plan.preset == "coding":
-        try:
-            LocalWorkspace.require_path_operations_supported()
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _require_safe_scaffold_parent(target.parent)
-            coding_git, _ = _preflight_coding_commands(parent=target.parent)
-        except (RuntimeError, _ScaffoldCommandError, OSError) as exc:
-            return _new_error(
-                code="CODING_PREFLIGHT_FAILED",
-                message=f"coding preset {exc}",
-                as_json=args.json,
-            )
     try:
         _publish_new_project(
             target=target,
             files=files,
             plan=plan,
-            coding_git=coding_git,
+        )
+    except _ScaffoldCodingPreflightError as exc:
+        return _new_error(
+            code="CODING_PREFLIGHT_FAILED",
+            message=_scaffold_error_message(exc),
+            as_json=args.json,
+        )
+    except _ScaffoldTargetNotEmpty:
+        return _new_error(
+            code="TARGET_NOT_EMPTY",
+            message=f"{target} already exists and is not empty",
+            as_json=args.json,
         )
     except (_ScaffoldCommandError, OSError, ValueError) as exc:
         return _new_error(
             code="SCAFFOLD_PUBLICATION_FAILED",
-            message=f"could not publish scaffold: {exc}",
+            message=f"could not publish scaffold: {_scaffold_error_message(exc)}",
             as_json=args.json,
         )
     if args.json:

@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -276,6 +277,55 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "uv run --no-sync cayu serve --dev" in output
     assert "http://127.0.0.1:8000/cayu/" in output
     assert "none selected" in output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX umask semantics")
+def test_cayu_new_preserves_restrictive_creation_umask(tmp_path: Path) -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    script = f"""
+import os
+import stat
+from pathlib import Path
+from cayu.cli import main
+
+parent = Path({str(tmp_path)!r})
+os.umask(0o077)
+if main(["new", "private-project", "--dir", str(parent), "--json"]) != 0:
+    raise SystemExit(71)
+project = parent / "private-project"
+expected = {{
+    project: 0o700,
+    project / "data": 0o700,
+    project / "data" / "artifacts": 0o700,
+    project / "app.py": 0o600,
+    project / "data" / "memory-evidence.key": 0o600,
+}}
+for path, mode in expected.items():
+    if stat.S_IMODE(path.stat().st_mode) != mode:
+        raise SystemExit(72)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": str(repository_root / "src")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX mode semantics")
+def test_cayu_new_preserves_preexisting_empty_target_mode(tmp_path: Path) -> None:
+    target = tmp_path / "existing-project"
+    target.mkdir()
+    target.chmod(0o711)
+
+    assert main(["new", target.name, "--dir", str(tmp_path), "--json"]) == 0
+
+    assert stat.S_IMODE(target.stat(follow_symlinks=False).st_mode) == 0o711
 
 
 def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
@@ -1142,7 +1192,7 @@ def test_cayu_new_coding_removes_generated_files_after_git_failure(
     original = scaffold._run_scaffold_command
 
     def fail_target_commit(argv, *, cwd, env=None, allowed_exit_codes=frozenset({0})):
-        if cwd.name.startswith(".broken-coder.cayu-scaffold-") and "commit" in argv:
+        if cwd.name.startswith(".cayu-tree-stage-") and "commit" in argv:
             raise scaffold._ScaffoldCommandError("forced commit failure")
         return original(
             argv,
@@ -1155,6 +1205,60 @@ def test_cayu_new_coding_removes_generated_files_after_git_failure(
     assert main(["new", "broken-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
     assert not (tmp_path / "broken-coder").exists()
     assert "forced commit failure" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses POSIX process-signal delivery")
+def test_scaffold_git_signal_is_not_masked_by_post_command_identity_failure(
+    tmp_path: Path,
+) -> None:
+    working_directory = tmp_path / "stage"
+    working_directory.mkdir()
+    repository_root = Path(__file__).resolve().parents[2]
+    script = f"""
+import os
+import signal
+from pathlib import Path
+from cayu.cli import scaffold
+
+working_directory = Path({str(working_directory)!r})
+checks = 0
+
+def assert_unchanged():
+    global checks
+    checks += 1
+    if checks > 1:
+        raise OSError("secondary identity failure")
+
+def interrupt_command(*args, **kwargs):
+    del args, kwargs
+    os.kill(os.getpid(), signal.SIGINT)
+    raise SystemExit(91)
+
+scaffold._run_scaffold_command = interrupt_command
+identity = scaffold._scaffold_directory_identity(working_directory)
+try:
+    scaffold._run_scaffold_git_command(
+        ["git", "status"],
+        cwd=working_directory,
+        env={{}},
+        expected_directory_identity=identity,
+        assert_directory_unchanged=assert_unchanged,
+    )
+except KeyboardInterrupt:
+    if checks != 1:
+        raise SystemExit(77)
+    raise SystemExit(75)
+raise SystemExit(76)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": str(repository_root / "src")},
+        check=False,
+    )
+
+    assert completed.returncode == 75
 
 
 def test_cayu_new_coding_preserves_preexisting_empty_target_after_git_failure(
@@ -1172,7 +1276,7 @@ def test_cayu_new_coding_preserves_preexisting_empty_target_after_git_failure(
     original = scaffold._run_scaffold_command
 
     def fail_target_commit(argv, *, cwd, env=None, allowed_exit_codes=frozenset({0})):
-        if cwd.name.startswith(".existing-coder.cayu-scaffold-") and "commit" in argv:
+        if cwd.name.startswith(".cayu-tree-stage-") and "commit" in argv:
             raise scaffold._ScaffoldCommandError("forced commit failure")
         return original(
             argv,
@@ -1207,7 +1311,7 @@ def test_cayu_new_coding_cleanup_does_not_follow_replaced_generated_directory(
     original = scaffold._run_scaffold_command
 
     def replace_agents_then_fail(argv, *, cwd, env=None, allowed_exit_codes=frozenset({0})):
-        if cwd.name.startswith(".symlink-coder.cayu-scaffold-") and "commit" in argv:
+        if cwd.name.startswith(".cayu-tree-stage-") and "commit" in argv:
             shutil.rmtree(cwd / "agents")
             (cwd / "agents").symlink_to(outside, target_is_directory=True)
             raise scaffold._ScaffoldCommandError("forced commit failure")
@@ -1230,17 +1334,18 @@ def test_cayu_new_coding_does_not_clean_replacement_target(
     capsys,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cayu.cli import scaffold
-
     _bypass_coding_dependency_preflight(monkeypatch)
 
     target = tmp_path / "replaced-coder"
-    moved = tmp_path / "original-coder"
     replacement_canary = "replacement-owned\n"
-    original = scaffold._publish_staged_scaffold
+    from cayu.cli import _guarded_tree_publication as publication
 
-    def replace_before_publish(*, staging, target, expected_target_identity, target_mode):
-        target.rename(moved)
+    original = publication._publication_fault
+
+    def replace_before_publish(phase: str) -> None:
+        if phase != "stage_created":
+            original(phase)
+            return
         target.mkdir()
         (target / ".git").mkdir()
         (target / ".git" / "replacement-owned").write_text(
@@ -1249,22 +1354,50 @@ def test_cayu_new_coding_does_not_clean_replacement_target(
         )
         (target / "pyproject.toml").write_text(replacement_canary, encoding="utf-8")
         (target / "owned.txt").write_text(replacement_canary, encoding="utf-8")
-        return original(
-            staging=staging,
-            target=target,
-            expected_target_identity=expected_target_identity,
-            target_mode=target_mode,
-        )
 
-    monkeypatch.setattr(scaffold, "_publish_staged_scaffold", replace_before_publish)
+    monkeypatch.setattr(publication, "_publication_fault", replace_before_publish)
     assert main(["new", target.name, "--composition", "coding", "--dir", str(tmp_path)]) == 1
     assert (target / "pyproject.toml").read_text(encoding="utf-8") == replacement_canary
     assert (target / "owned.txt").read_text(encoding="utf-8") == replacement_canary
     assert (target / ".git" / "replacement-owned").read_text(encoding="utf-8") == (
         replacement_canary
     )
-    assert moved.is_dir()
-    assert "target identity changed" in capsys.readouterr().err
+    assert "destination appeared" in capsys.readouterr().err
+
+
+def test_cayu_new_does_not_adopt_concurrent_empty_target(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "concurrent-empty"
+    from cayu.cli import _guarded_tree_publication as publication
+
+    original = publication._publication_fault
+    replacement_identity: tuple[int, int] | None = None
+
+    def create_empty_target_after_admission(phase: str) -> None:
+        nonlocal replacement_identity
+        if phase != "stage_created":
+            original(phase)
+            return
+        target.mkdir()
+        value = target.stat(follow_symlinks=False)
+        replacement_identity = (value.st_dev, value.st_ino)
+
+    monkeypatch.setattr(
+        publication,
+        "_publication_fault",
+        create_empty_target_after_admission,
+    )
+
+    assert main(["new", target.name, "--dir", str(tmp_path), "--json"]) == 1
+
+    current = target.stat(follow_symlinks=False)
+    assert replacement_identity is not None
+    assert (current.st_dev, current.st_ino) == replacement_identity
+    assert list(target.iterdir()) == []
+    assert "destination appeared" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

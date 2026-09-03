@@ -10,23 +10,20 @@ import os
 import re
 import stat
 import sys
-import tempfile
 import tomllib
-import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
-from cayu.cli.dashboard import (
-    DashboardSourceError,
-    _remove_directory_contents_from_fd,
-    _remove_owned_staging_directory,
-    _StagingGuard,
-    _windows_directory_namespace_fence,
+from cayu.cli._guarded_tree_publication import (
+    DestinationPolicy,
+    GuardedTreePublicationError,
+    GuardedTreeStage,
+    publish_guarded_tree,
+    replace_guarded_tree,
+    validate_guarded_tree_files,
 )
 
 _MANIFEST_NAME = "cayu-lambda-microvm-sidecar-manifest.json"
@@ -83,35 +80,6 @@ class _SidecarExportResult:
 class _SidecarResource:
     root: Traversable
     cayu_version: str
-
-
-@dataclass(frozen=True)
-class _DirectoryGuard:
-    path: Path
-    identity: os.stat_result
-
-    @classmethod
-    def capture(cls, path: Path, *, label: str) -> _DirectoryGuard:
-        _reject_link_components(path)
-        try:
-            identity = path.stat(follow_symlinks=False)
-        except OSError as exc:
-            raise _SidecarArtifactError(f"could not capture {label} identity: {path}") from exc
-        if not stat.S_ISDIR(identity.st_mode):
-            raise _SidecarArtifactError(f"{label} must be a directory: {path}")
-        return cls(path=path, identity=identity)
-
-    def assert_unchanged(self, *, label: str, path: Path | None = None) -> None:
-        candidate = self.path if path is None else path
-        try:
-            _reject_link_components(candidate)
-            current = candidate.stat(follow_symlinks=False)
-        except (OSError, _SidecarArtifactError) as exc:
-            raise _SidecarArtifactError(
-                f"{label} changed during sidecar export: {candidate}"
-            ) from exc
-        if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(self.identity, current):
-            raise _SidecarArtifactError(f"{label} changed during sidecar export: {candidate}")
 
 
 def add_lambda_microvm_parser(subparsers: Any) -> None:
@@ -185,57 +153,81 @@ def _export_sidecar(
             resource_root,
             expected_cayu_version=expected_cayu_version,
         )
-    destination = _validate_destination(destination, replace=replace)
+    try:
+        validate_guarded_tree_files(
+            artifact.contents,
+            file_mode=0o644,
+            directory_mode=0o755,
+        )
+    except GuardedTreePublicationError as exc:
+        raise _translated_publication_error(exc) from exc
+    publication_digest = _sidecar_publication_request_digest(artifact.contents)
+    destination = _validate_destination(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     _reject_link_components(destination.parent)
-    parent_guard = _DirectoryGuard.capture(destination.parent, label="destination parent")
-    with _publication_parent_namespace(parent_guard) as parent_descriptor:
-        destination_identity = _publication_entry_identity(
-            destination,
-            parent_descriptor=parent_descriptor,
+
+    def populate(staging: GuardedTreeStage) -> None:
+        staging.write_files(
+            artifact.contents,
+            file_mode=0o644,
+            directory_mode=0o755,
         )
-        staging, staging_guard = _create_staging_directory(
-            destination,
-            parent_guard=parent_guard,
-            parent_descriptor=parent_descriptor,
-        )
-        try:
-            parent_guard.assert_unchanged(label="destination parent")
-            staging_guard.assert_unchanged(label="staging directory")
-            _write_staging_tree(staging, artifact)
-            parent_guard.assert_unchanged(label="destination parent")
-            staging_guard.assert_unchanged(label="staging directory")
-            _publish_staged_tree(
-                staging,
+
+    try:
+        if replace:
+            replace_guarded_tree(
                 destination,
-                replace=replace,
-                parent_guard=parent_guard,
-                staging_guard=staging_guard,
-                destination_identity=destination_identity,
-                parent_descriptor=parent_descriptor,
+                consumer="lambda_microvm_sidecar",
+                request_digest=publication_digest,
+                populate=populate,
             )
-            if parent_descriptor is None:
-                try:
-                    parent_guard.assert_unchanged(label="destination parent")
-                except BaseException as exc:
-                    _preserve_owned_publication_after_parent_change(
-                        destination,
-                        staging_guard=staging_guard,
-                        error=exc,
-                    )
-                    raise
-        except BaseException as exc:
-            _remove_owned_tree(
-                staging_guard,
-                error=exc,
-                label="staging directory",
-                parent_descriptor=parent_descriptor,
+        else:
+            publish_guarded_tree(
+                destination,
+                consumer="lambda_microvm_sidecar",
+                request_digest=publication_digest,
+                policy=DestinationPolicy.ABSENT_OR_EMPTY,
+                populate=populate,
             )
-            raise
+    except GuardedTreePublicationError as exc:
+        raise _translated_publication_error(exc, destination=destination) from exc
     return _SidecarExportResult(
         destination=destination,
         content_digest=artifact.manifest.content_digest,
     )
+
+
+def _sidecar_publication_request_digest(contents: dict[str, bytes]) -> str:
+    files = [
+        _SidecarFile(path=path, size=len(contents[path]), sha256=_sha256(contents[path]))
+        for path in sorted(contents)
+    ]
+    canonical = [item.as_manifest_value() for item in files]
+    return _sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _translated_publication_error(
+    error: GuardedTreePublicationError,
+    *,
+    destination: Path | None = None,
+) -> _SidecarArtifactError:
+    if error.code == "destination_not_empty" and destination is not None:
+        message = f"destination is not empty; pass --replace to replace it: {destination}"
+    else:
+        message = str(error)
+    if error.paths:
+        message += "; affected paths: " + ", ".join(repr(path) for path in error.paths)
+    translated = _SidecarArtifactError(message)
+    for note in getattr(error, "__notes__", ()):
+        translated.add_note(note)
+    return translated
 
 
 def _print_cli_error(exc: BaseException) -> None:
@@ -579,7 +571,7 @@ def _sha256(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
-def _validate_destination(destination: Path, *, replace: bool) -> Path:
+def _validate_destination(destination: Path) -> Path:
     try:
         os.fspath(destination).encode("utf-8")
     except UnicodeEncodeError as exc:
@@ -608,10 +600,6 @@ def _validate_destination(destination: Path, *, replace: bool) -> Path:
         )
     if resolved.exists() and not resolved.is_dir():
         raise _SidecarArtifactError(f"destination must be a directory: {resolved}")
-    if resolved.is_dir() and not replace and next(resolved.iterdir(), None) is not None:
-        raise _SidecarArtifactError(
-            f"destination is not empty; pass --replace to replace it: {resolved}"
-        )
     return resolved
 
 
@@ -629,469 +617,3 @@ def _reject_link_components(path: Path) -> None:
             raise _SidecarArtifactError(
                 f"destination must not be a symlink or junction: {component}"
             )
-
-
-@contextmanager
-def _publication_parent_namespace(
-    parent_guard: _DirectoryGuard,
-) -> Iterator[int | None]:
-    if os.name == "nt":
-        with _windows_directory_namespace_fence(parent_guard.path):
-            parent_guard.assert_unchanged(label="destination parent")
-            yield None
-            parent_guard.assert_unchanged(label="destination parent")
-        return
-
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        descriptor = os.open(parent_guard.path, flags)
-    except OSError as exc:
-        raise _SidecarArtifactError(
-            f"destination parent changed during sidecar export: {parent_guard.path}"
-        ) from exc
-    namespace_error: BaseException | None = None
-    try:
-        identity = os.fstat(descriptor)
-        if not stat.S_ISDIR(identity.st_mode) or not os.path.samestat(
-            parent_guard.identity, identity
-        ):
-            raise _SidecarArtifactError(
-                f"destination parent changed during sidecar export: {parent_guard.path}"
-            )
-        yield descriptor
-        parent_guard.assert_unchanged(label="destination parent")
-    except BaseException as exc:
-        namespace_error = exc
-        raise
-    finally:
-        _close_descriptor(descriptor, error=namespace_error)
-
-
-def _create_staging_directory(
-    destination: Path,
-    *,
-    parent_guard: _DirectoryGuard,
-    parent_descriptor: int | None,
-) -> tuple[Path, _DirectoryGuard]:
-    if parent_descriptor is None:
-        staging = Path(
-            tempfile.mkdtemp(
-                prefix=f".{destination.name}.cayu-sidecar-",
-                dir=destination.parent,
-            )
-        )
-        guard = _DirectoryGuard.capture(staging, label="staging directory")
-        parent_guard.assert_unchanged(label="destination parent")
-        return staging, guard
-
-    created_name: str | None = None
-    try:
-        for _attempt in range(100):
-            candidate = f".{destination.name}.cayu-sidecar-{uuid.uuid4().hex}"
-            try:
-                os.mkdir(candidate, mode=0o700, dir_fd=parent_descriptor)
-            except FileExistsError:
-                continue
-            created_name = candidate
-            break
-        if created_name is None:
-            raise _SidecarArtifactError("could not allocate a private staging directory")
-        identity = os.stat(
-            created_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        _assert_safe_directory_identity(
-            identity,
-            path=destination.parent / created_name,
-            label="staging directory",
-        )
-        return destination.parent / created_name, _DirectoryGuard(
-            path=destination.parent / created_name,
-            identity=identity,
-        )
-    except BaseException as exc:
-        if created_name is not None:
-            try:
-                os.rmdir(created_name, dir_fd=parent_descriptor)
-            except OSError as cleanup_error:
-                exc.add_note(
-                    "could not remove newly created staging directory "
-                    f"{destination.parent / created_name}: {cleanup_error}"
-                )
-        raise
-
-
-def _publication_entry_identity(
-    path: Path,
-    *,
-    parent_descriptor: int | None,
-) -> os.stat_result | None:
-    try:
-        if parent_descriptor is None:
-            identity = path.stat(follow_symlinks=False)
-        else:
-            identity = os.stat(
-                path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise _SidecarArtifactError(f"could not inspect destination: {path}") from exc
-    _assert_safe_directory_identity(identity, path=path, label="destination")
-    return identity
-
-
-def _assert_safe_directory_identity(
-    identity: os.stat_result,
-    *,
-    path: Path,
-    label: str,
-) -> None:
-    if stat.S_ISLNK(identity.st_mode) or getattr(identity, "st_reparse_tag", 0):
-        raise _SidecarArtifactError(f"{label} must not be a symlink or junction: {path}")
-    if not stat.S_ISDIR(identity.st_mode):
-        raise _SidecarArtifactError(f"{label} must be a directory: {path}")
-
-
-def _rename_publication_entry(
-    source: Path,
-    destination: Path,
-    *,
-    parent_descriptor: int | None,
-) -> None:
-    if parent_descriptor is None:
-        source.rename(destination)
-        return
-    os.rename(
-        source.name,
-        destination.name,
-        src_dir_fd=parent_descriptor,
-        dst_dir_fd=parent_descriptor,
-    )
-
-
-def _close_descriptor(descriptor: int, *, error: BaseException | None = None) -> None:
-    try:
-        os.close(descriptor)
-    except OSError as close_error:
-        if error is None:
-            raise
-        error.add_note(f"could not close sidecar directory descriptor: {close_error}")
-
-
-def _write_staging_tree(
-    staging: Path,
-    artifact: _ValidatedSidecarArtifact,
-) -> None:
-    if os.name != "nt":
-        os.chmod(staging, 0o755)
-    for relative, content in sorted(artifact.contents.items()):
-        path = staging.joinpath(*PurePosixPath(relative).parts)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("xb") as output:
-            output.write(content)
-    if os.name != "nt":
-        for path in sorted(staging.rglob("*")):
-            os.chmod(path, 0o755 if path.is_dir() else 0o644)
-
-
-def _publish_staged_tree(
-    staging: Path,
-    destination: Path,
-    *,
-    replace: bool,
-    parent_guard: _DirectoryGuard,
-    staging_guard: _DirectoryGuard,
-    destination_identity: os.stat_result | None,
-    parent_descriptor: int | None,
-) -> None:
-    parent_guard.assert_unchanged(label="destination parent")
-    staging_guard.assert_unchanged(label="staging directory")
-    current_destination = _publication_entry_identity(
-        destination,
-        parent_descriptor=parent_descriptor,
-    )
-    if not _same_optional_identity(destination_identity, current_destination):
-        raise _SidecarArtifactError(f"destination changed during sidecar export: {destination}")
-    backup: Path | None = None
-    backup_guard: _DirectoryGuard | None = None
-    if destination_identity is not None:
-        backup = destination.parent / (
-            f".{destination.name}.cayu-sidecar-backup-{uuid.uuid4().hex}"
-        )
-        _rename_publication_entry(
-            destination,
-            backup,
-            parent_descriptor=parent_descriptor,
-        )
-        backup_guard = _DirectoryGuard(path=backup, identity=destination_identity)
-        moved_identity = _publication_entry_identity(
-            backup,
-            parent_descriptor=parent_descriptor,
-        )
-        if moved_identity is None or not os.path.samestat(destination_identity, moved_identity):
-            error = _SidecarArtifactError(
-                f"destination changed during backup publication: {destination}"
-            )
-            _preserve_conflicting_entry(
-                backup,
-                parent_descriptor=parent_descriptor,
-                error=error,
-            )
-            raise error
-    try:
-        parent_guard.assert_unchanged(label="destination parent")
-        staging_guard.assert_unchanged(label="staging directory")
-        _rename_publication_entry(
-            staging,
-            destination,
-            parent_descriptor=parent_descriptor,
-        )
-        published_identity = _publication_entry_identity(
-            destination,
-            parent_descriptor=parent_descriptor,
-        )
-        if published_identity is None or not os.path.samestat(
-            staging_guard.identity, published_identity
-        ):
-            raise _SidecarArtifactError(
-                f"staging directory changed during publication: {destination}"
-            )
-    except BaseException as exc:
-        current_destination = _publication_entry_identity(
-            destination,
-            parent_descriptor=parent_descriptor,
-        )
-        if current_destination is not None and not os.path.samestat(
-            staging_guard.identity, current_destination
-        ):
-            _preserve_conflicting_entry(
-                destination,
-                parent_descriptor=parent_descriptor,
-                error=exc,
-            )
-        if backup is not None:
-            exc.add_note(f"the original destination remains at {backup}")
-        raise
-
-    if backup_guard is not None:
-        cleanup_error = _SidecarArtifactError(
-            f"export completed at {destination}, but old destination cleanup failed at {backup}"
-        )
-        removed = _remove_owned_tree(
-            backup_guard,
-            error=cleanup_error,
-            label="old destination",
-            require_empty=not replace,
-            parent_descriptor=parent_descriptor,
-        )
-        if not removed:
-            raise cleanup_error
-
-
-def _same_optional_identity(
-    expected: os.stat_result | None,
-    current: os.stat_result | None,
-) -> bool:
-    if expected is None or current is None:
-        return expected is current
-    return os.path.samestat(expected, current)
-
-
-def _preserve_conflicting_entry(
-    path: Path,
-    *,
-    parent_descriptor: int | None,
-    error: BaseException,
-) -> None:
-    preserved = path.parent / f".{path.name}.cayu-sidecar-conflict-{uuid.uuid4().hex}"
-    try:
-        _rename_publication_entry(
-            path,
-            preserved,
-            parent_descriptor=parent_descriptor,
-        )
-    except OSError as preserve_error:
-        error.add_note(f"could not preserve conflicting directory at {path}: {preserve_error}")
-        return
-    error.add_note(f"preserved conflicting directory at {preserved}")
-
-
-def _preserve_owned_publication_after_parent_change(
-    destination: Path,
-    *,
-    staging_guard: _DirectoryGuard,
-    error: BaseException,
-) -> None:
-    try:
-        current = _publication_entry_identity(
-            destination,
-            parent_descriptor=None,
-        )
-    except _SidecarArtifactError as inspection_error:
-        error.add_note(
-            f"could not inspect replacement destination {destination}: {inspection_error}"
-        )
-        return
-    if current is None or not os.path.samestat(staging_guard.identity, current):
-        return
-    _preserve_conflicting_entry(
-        destination,
-        parent_descriptor=None,
-        error=error,
-    )
-
-
-def _remove_owned_tree(
-    guard: _DirectoryGuard,
-    *,
-    error: BaseException,
-    label: str,
-    parent_descriptor: int | None,
-    require_empty: bool = False,
-) -> bool:
-    isolated: Path | None = None
-    try:
-        current = _publication_entry_identity(
-            guard.path,
-            parent_descriptor=parent_descriptor,
-        )
-        if current is None:
-            return True
-        if not os.path.samestat(guard.identity, current):
-            raise _SidecarArtifactError(f"{label} changed during sidecar export: {guard.path}")
-        if require_empty and not _publication_directory_is_empty(
-            guard.path,
-            expected_identity=guard.identity,
-            parent_descriptor=parent_descriptor,
-        ):
-            raise _SidecarArtifactError(f"{label} is no longer empty: {guard.path}")
-        isolated = guard.path.parent / f".{guard.path.name}.cayu-sidecar-cleanup-{uuid.uuid4().hex}"
-        _rename_publication_entry(
-            guard.path,
-            isolated,
-            parent_descriptor=parent_descriptor,
-        )
-        isolated_identity = _publication_entry_identity(
-            isolated,
-            parent_descriptor=parent_descriptor,
-        )
-        if isolated_identity is None or not os.path.samestat(guard.identity, isolated_identity):
-            raise _SidecarArtifactError(f"{label} changed during cleanup: {isolated}")
-        _remove_owned_publication_directory(
-            isolated,
-            expected_identity=guard.identity,
-            parent_descriptor=parent_descriptor,
-        )
-        return True
-    except (DashboardSourceError, OSError, _SidecarArtifactError) as cleanup_error:
-        if isolated is not None:
-            try:
-                isolated_identity = _publication_entry_identity(
-                    isolated,
-                    parent_descriptor=parent_descriptor,
-                )
-                original_identity = _publication_entry_identity(
-                    guard.path,
-                    parent_descriptor=parent_descriptor,
-                )
-                if (
-                    isolated_identity is not None
-                    and os.path.samestat(guard.identity, isolated_identity)
-                    and original_identity is None
-                ):
-                    _rename_publication_entry(
-                        isolated,
-                        guard.path,
-                        parent_descriptor=parent_descriptor,
-                    )
-            except (OSError, _SidecarArtifactError) as restore_error:
-                error.add_note(f"could not restore preserved {label} {guard.path}: {restore_error}")
-        error.add_note(f"could not safely remove {label} {guard.path}: {cleanup_error}")
-        return False
-
-
-def _publication_directory_is_empty(
-    path: Path,
-    *,
-    expected_identity: os.stat_result,
-    parent_descriptor: int | None,
-) -> bool:
-    if parent_descriptor is None:
-        with _windows_directory_namespace_fence(path):
-            current = path.stat(follow_symlinks=False)
-            if not os.path.samestat(expected_identity, current):
-                raise _SidecarArtifactError(f"directory changed during sidecar export: {path}")
-            return next(path.iterdir(), None) is None
-
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
-    inspection_error: BaseException | None = None
-    try:
-        current = os.fstat(descriptor)
-        if not os.path.samestat(expected_identity, current):
-            raise _SidecarArtifactError(f"directory changed during sidecar export: {path}")
-        with os.scandir(descriptor) as entries:
-            return next(entries, None) is None
-    except BaseException as exc:
-        inspection_error = exc
-        raise
-    finally:
-        _close_descriptor(descriptor, error=inspection_error)
-
-
-def _remove_owned_publication_directory(
-    path: Path,
-    *,
-    expected_identity: os.stat_result,
-    parent_descriptor: int | None,
-) -> None:
-    if parent_descriptor is None:
-        staging_guard = _StagingGuard.capture(path)
-        if not os.path.samestat(expected_identity, staging_guard.identity):
-            raise _SidecarArtifactError(f"directory changed during cleanup: {path}")
-        _remove_owned_staging_directory(
-            path,
-            staging_guard=staging_guard,
-        )
-        return
-
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
-    cleanup_error: BaseException | None = None
-    try:
-        opened_identity = os.fstat(descriptor)
-        if not os.path.samestat(expected_identity, opened_identity):
-            raise _SidecarArtifactError(f"directory changed during cleanup: {path}")
-        _remove_directory_contents_from_fd(descriptor, path=path, flags=flags)
-        current = os.stat(
-            path.name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if not os.path.samestat(opened_identity, current):
-            raise _SidecarArtifactError(f"directory changed during cleanup: {path}")
-        os.rmdir(path.name, dir_fd=parent_descriptor)
-    except BaseException as exc:
-        cleanup_error = exc
-        raise
-    finally:
-        _close_descriptor(descriptor, error=cleanup_error)

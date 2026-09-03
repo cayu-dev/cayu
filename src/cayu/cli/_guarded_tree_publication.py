@@ -12,7 +12,7 @@ import secrets
 import stat
 import sys
 import unicodedata
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -29,7 +29,7 @@ from cayu._exception_groups import (
 )
 from cayu._filesystem_lock import cooperative_path_lock
 
-_JOURNAL_SCHEMA_VERSION = 2
+_JOURNAL_SCHEMA_VERSION = 3
 _JOURNAL_LIMIT_BYTES = 64 * 1024
 _PUBLICATION_METADATA_CENSUS_LIMIT = 1024
 _PARENT_DIRECTORY_CENSUS_LIMIT = 16_384
@@ -65,6 +65,9 @@ _LINUX_FS_APPEND_FL = 0x00000020
 _LINUX_FS_CASEFOLD_FL = 0x40000000
 _DARWIN_PC_CASE_SENSITIVE = 11
 _PROCESS_CONTROL_SIGNALS = (GeneratorExit, KeyboardInterrupt, SystemExit)
+_SETTLEMENT_RECOVERY_NOTE_PREFIX = (
+    "guarded publication remains recoverable; automatic settlement failed with "
+)
 _LINUX_AT_EMPTY_PATH = 0x1000
 _LINUX_AT_SYMLINK_NOFOLLOW = 0x100
 _LINUX_STATX_BTIME = 0x0800
@@ -899,6 +902,13 @@ def _windows_object_id_binding() -> Any:
 class _PreparedStageFile:
     path: PurePosixPath
     content: bytes
+    mode: int | None
+
+
+@dataclass(frozen=True)
+class _PreparedStageDirectory:
+    path: PurePosixPath
+    mode: int | None
 
 
 @dataclass(frozen=True)
@@ -907,10 +917,32 @@ class GuardedTreeStage:
 
     _path: Path
     _publication_identity: _Identity
+    _original_destination_mode: int | None
 
     @classmethod
-    def _owned(cls, path: Path, *, expected: _Identity) -> GuardedTreeStage:
-        return cls(_path=path, _publication_identity=expected)
+    def _owned(
+        cls,
+        path: Path,
+        *,
+        expected: _Identity,
+        original_destination_mode: int | None,
+    ) -> GuardedTreeStage:
+        return cls(
+            _path=path,
+            _publication_identity=expected,
+            _original_destination_mode=original_destination_mode,
+        )
+
+    def publication_root_mode(self) -> int:
+        """Return the original root mode or a safely observed creation-umask mode."""
+
+        if self._original_destination_mode is not None:
+            _validate_stage_mode(self._original_destination_mode, directory=True)
+            return self._original_destination_mode
+        return _capture_stage_default_directory_mode(
+            self._path,
+            expected=self._publication_identity,
+        )
 
     def write_files(
         self,
@@ -921,8 +953,36 @@ class GuardedTreeStage:
     ) -> None:
         """Populate an initially empty stage without reopening it by pathname."""
 
-        files = _prepare_stage_files(
+        self.write_tree(
             contents,
+            file_mode=file_mode,
+            directory_mode=directory_mode,
+        )
+
+    def write_tree(
+        self,
+        contents: Mapping[str, bytes],
+        *,
+        directories: Iterable[str] = (),
+        file_modes: Mapping[str, int] | None = None,
+        file_mode: int | None = 0o644,
+        directory_mode: int | None = 0o755,
+        root_mode: int | None = None,
+    ) -> None:
+        """Populate a complete tree; ``None`` modes retain creation-umask behavior."""
+
+        if root_mode is None and directory_mode is None:
+            raise GuardedTreePublicationError(
+                "invalid_population",
+                "guarded stage root mode must be explicit when directory modes use the umask",
+            )
+        effective_root_mode = directory_mode if root_mode is None else root_mode
+        assert effective_root_mode is not None
+        _validate_stage_mode(effective_root_mode, directory=True)
+        files, prepared_directories = _prepare_stage_files(
+            contents,
+            directories=directories,
+            file_modes=file_modes,
             file_mode=file_mode,
             directory_mode=directory_mode,
         )
@@ -930,8 +990,8 @@ class GuardedTreeStage:
             self._path,
             expected=self._publication_identity,
             files=files,
-            file_mode=file_mode,
-            directory_mode=directory_mode,
+            directories=prepared_directories,
+            root_mode=effective_root_mode,
         )
 
     def write_text(
@@ -991,6 +1051,8 @@ def validate_guarded_tree_files(
 
     _prepare_stage_files(
         contents,
+        directories=(),
+        file_modes=None,
         file_mode=file_mode,
         directory_mode=directory_mode,
     )
@@ -1092,6 +1154,8 @@ class _Record:
     consumer: str
     request_digest: str
     predecessor_request_digest: str | None
+    predecessor_receipt_identity: _Identity | None
+    predecessor_receipt_sha256: str | None
     token: str
     destination_name: str
     policy: DestinationPolicy
@@ -1115,6 +1179,12 @@ class _Record:
             "consumer": self.consumer,
             "request_digest": self.request_digest,
             "predecessor_request_digest": self.predecessor_request_digest,
+            "predecessor_receipt_identity": (
+                None
+                if self.predecessor_receipt_identity is None
+                else self.predecessor_receipt_identity.as_json()
+            ),
+            "predecessor_receipt_sha256": self.predecessor_receipt_sha256,
             "token": self.token,
             "destination_name": self.destination_name,
             "policy": self.policy.value,
@@ -1218,8 +1288,55 @@ def publish_guarded_tree(
     policy: DestinationPolicy,
     populate: Callable[[GuardedTreeStage], None],
     predecessor_request_digest: str | None = None,
+    settle_active_operation: bool = False,
 ) -> GuardedTreePublicationResult:
-    """Populate and atomically publish one tree, recovering an exact predecessor."""
+    """Populate one tree, optionally settling recoverable active work first."""
+
+    return _publish_guarded_tree(
+        destination,
+        consumer=consumer,
+        request_digest=request_digest,
+        policy=policy,
+        populate=populate,
+        predecessor_request_digest=predecessor_request_digest,
+        bind_current_replacement=False,
+        settle_active_operation=settle_active_operation,
+    )
+
+
+def replace_guarded_tree(
+    destination: Path,
+    *,
+    consumer: str,
+    request_digest: str,
+    populate: Callable[[GuardedTreeStage], None],
+) -> GuardedTreePublicationResult:
+    """Replace one tree while atomically binding its current terminal receipt."""
+
+    return _publish_guarded_tree(
+        destination,
+        consumer=consumer,
+        request_digest=request_digest,
+        policy=DestinationPolicy.REPLACE_DIRECTORY,
+        populate=populate,
+        predecessor_request_digest=None,
+        bind_current_replacement=True,
+        settle_active_operation=False,
+    )
+
+
+def _publish_guarded_tree(
+    destination: Path,
+    *,
+    consumer: str,
+    request_digest: str,
+    policy: DestinationPolicy,
+    populate: Callable[[GuardedTreeStage], None],
+    predecessor_request_digest: str | None,
+    bind_current_replacement: bool,
+    settle_active_operation: bool,
+) -> GuardedTreePublicationResult:
+    """Run one guarded publication through the shared destination owner."""
 
     destination = Path(destination)
     _validate_publication_input(
@@ -1229,6 +1346,7 @@ def publish_guarded_tree(
         policy=policy,
         populate=populate,
         predecessor_request_digest=predecessor_request_digest,
+        settle_active_operation=settle_active_operation,
     )
     parent_path = destination.parent
     expected_parent = _capture_parent(parent_path)
@@ -1243,6 +1361,14 @@ def publish_guarded_tree(
             _pinned_parent(parent_path, expected=expected_parent) as parent,
         ):
             metadata_stem = _resolve_destination_metadata_stem(parent, destination.name)
+            if bind_current_replacement:
+                predecessor_request_digest = _current_replacement_predecessor(
+                    destination,
+                    consumer=consumer,
+                    request_digest=request_digest,
+                    parent=parent,
+                    metadata_stem=metadata_stem,
+                )
             result = _publish_guarded_tree_owned(
                 destination,
                 consumer=consumer,
@@ -1250,6 +1376,7 @@ def publish_guarded_tree(
                 policy=policy,
                 populate=populate,
                 predecessor_request_digest=predecessor_request_digest,
+                settle_active_operation=settle_active_operation,
                 parent=parent,
                 metadata_stem=metadata_stem,
             )
@@ -1269,6 +1396,49 @@ def publish_guarded_tree(
     return result
 
 
+def _current_replacement_predecessor(
+    destination: Path,
+    *,
+    consumer: str,
+    request_digest: str,
+    parent: _Parent,
+    metadata_stem: str,
+) -> str | None:
+    """Resolve exact replay or successor authority while the destination is locked."""
+
+    journal_path = parent.path / f".cayu-tree-publication-{metadata_stem}.jsonl"
+    receipt_path = parent.path / (f".cayu-tree-publication-{metadata_stem}-receipt.jsonl")
+    if parent.entry_stat(journal_path.name) is not None:
+        journal = _load_journal(journal_path, parent=parent)
+        if journal.record.destination_name != destination.name:
+            raise _invalid_journal("publication journal does not belong to this destination")
+        _require_parent_namespace_mutable(parent)
+        outcome = (
+            "rolled_back"
+            if _retire_stale_settled_publication_if_safe(journal, parent=parent)
+            else _recover(journal, parent=parent)
+        )
+        if outcome == "published":
+            _promote_terminal_receipt(journal, receipt_path=receipt_path, parent=parent)
+
+    if parent.entry_stat(receipt_path.name) is None:
+        return None
+    receipt = _load_journal(receipt_path, parent=parent)
+    if receipt.record.destination_name != destination.name:
+        raise _invalid_journal("publication receipt does not belong to this destination")
+    if receipt.record.phase is not _Phase.SETTLED:
+        raise _invalid_journal("publication receipt is not terminal")
+    if _retire_stale_settled_publication_if_safe(receipt, parent=parent):
+        return None
+    if (
+        receipt.record.consumer == consumer
+        and receipt.record.request_digest == request_digest
+        and receipt.record.policy is DestinationPolicy.REPLACE_DIRECTORY
+    ):
+        return receipt.record.predecessor_request_digest
+    return receipt.record.request_digest
+
+
 def _publish_guarded_tree_owned(
     destination: Path,
     *,
@@ -1277,12 +1447,15 @@ def _publish_guarded_tree_owned(
     policy: DestinationPolicy,
     populate: Callable[[GuardedTreeStage], None],
     predecessor_request_digest: str | None,
+    settle_active_operation: bool,
     parent: _Parent,
     metadata_stem: str,
 ) -> GuardedTreePublicationResult:
     _reject_case_alias(parent, destination.name)
     journal_path = parent.path / f".cayu-tree-publication-{metadata_stem}.jsonl"
     receipt_path = parent.path / f".cayu-tree-publication-{metadata_stem}-receipt.jsonl"
+    predecessor_receipt_identity: _Identity | None = None
+    predecessor_receipt_sha256: str | None = None
     if parent.entry_stat(journal_path.name) is not None:
         journal = _load_journal(journal_path, parent=parent)
         if journal.record.destination_name != destination.name:
@@ -1293,18 +1466,15 @@ def _publish_guarded_tree_owned(
             and journal.record.predecessor_request_digest == predecessor_request_digest
             and journal.record.policy is policy
         )
-        if not same_request:
+        _require_parent_namespace_mutable(parent)
+        retired = _retire_stale_settled_publication_if_safe(journal, parent=parent)
+        if not retired and not same_request and not settle_active_operation:
             raise GuardedTreePublicationError(
                 "publication_request_conflict",
                 "an active publication belongs to a different exact request",
                 paths=(destination.name,),
             )
-        _require_parent_namespace_mutable(parent)
-        outcome = (
-            "rolled_back"
-            if _retire_stale_settled_absent_or_empty_publication(journal, parent=parent)
-            else _recover(journal, parent=parent)
-        )
+        outcome = "rolled_back" if retired else _recover(journal, parent=parent)
         if outcome == "published":
             _promote_terminal_receipt(journal, receipt_path=receipt_path, parent=parent)
 
@@ -1320,10 +1490,7 @@ def _publish_guarded_tree_owned(
             and receipt.record.predecessor_request_digest == predecessor_request_digest
             and receipt.record.policy is policy
         )
-        retired = same_request and _retire_stale_settled_absent_or_empty_publication(
-            receipt,
-            parent=parent,
-        )
+        retired = _retire_stale_settled_publication_if_safe(receipt, parent=parent)
         receipt_outcome = "rolled_back" if retired else _recover(receipt, parent=parent)
         if receipt_outcome == "published":
             if same_request:
@@ -1331,8 +1498,6 @@ def _publish_guarded_tree_owned(
                     return GuardedTreePublicationResult(destination=destination, recovered=True)
             elif not (
                 policy is DestinationPolicy.REPLACE_DIRECTORY
-                and receipt.record.policy is DestinationPolicy.REPLACE_DIRECTORY
-                and receipt.record.consumer == consumer
                 and predecessor_request_digest == receipt.record.request_digest
             ):
                 raise GuardedTreePublicationError(
@@ -1340,6 +1505,10 @@ def _publish_guarded_tree_owned(
                     "the terminal publication receipt does not authorize this successor request",
                     paths=(destination.name,),
                 )
+            else:
+                _require_record_authority(receipt, parent=parent)
+                predecessor_receipt_identity = receipt.identity
+                predecessor_receipt_sha256 = receipt.entry_sha256
         else:
             if predecessor_request_digest is not None:
                 raise GuardedTreePublicationError(
@@ -1358,6 +1527,7 @@ def _publish_guarded_tree_owned(
     original_identity = (
         None if original is None else parent.entry_identity(destination.name, value=original)
     )
+    original_destination_mode = None if original is None else stat.S_IMODE(original.st_mode)
     if original_identity is None:
         original_sha256 = None
         original_entries: tuple[_CleanupEntry, ...] = ()
@@ -1372,6 +1542,8 @@ def _publish_guarded_tree_owned(
         consumer=consumer,
         request_digest=request_digest,
         predecessor_request_digest=predecessor_request_digest,
+        predecessor_receipt_identity=predecessor_receipt_identity,
+        predecessor_receipt_sha256=predecessor_receipt_sha256,
         token=token,
         destination_name=destination.name,
         policy=policy,
@@ -1419,6 +1591,7 @@ def _publish_guarded_tree_owned(
             journal,
             parent=parent,
             populate=populate,
+            original_destination_mode=original_destination_mode,
         )
         _promote_terminal_receipt(journal, receipt_path=receipt_path, parent=parent)
         return result
@@ -1501,6 +1674,7 @@ def _execute_publication(
     *,
     parent: _Parent,
     populate: Callable[[GuardedTreeStage], None],
+    original_destination_mode: int | None,
 ) -> GuardedTreePublicationResult:
     record = journal.record
     stage = parent.path / record.stage_name
@@ -1518,7 +1692,13 @@ def _execute_publication(
         token=record.token,
     )
     _publication_fault("stage_created")
-    populate(GuardedTreeStage._owned(stage, expected=stage_identity))
+    populate(
+        GuardedTreeStage._owned(
+            stage,
+            expected=stage_identity,
+            original_destination_mode=original_destination_mode,
+        )
+    )
     stage_sha256, stage_entries = _capture_tree_authority(
         stage,
         expected=stage_identity,
@@ -1695,6 +1875,11 @@ def _recover(
                 expected=record.stage_identity,
             )
             _require_published_stage(record, parent=parent)
+            _append_journal(
+                journal,
+                replace(journal.record, phase=_Phase.PUBLISHED),
+                parent=parent,
+            )
         if backup_is_original or cleanup_is_original:
             if record.phase not in {_Phase.CLEANUP_OWNED, _Phase.CLEANUP_SEALED}:
                 if cleanup_is_original:
@@ -1903,8 +2088,7 @@ def _record_settlement_failure(error: BaseException, cleanup_error: BaseExceptio
     if paths:
         path_evidence = "; affected paths: " + ", ".join(repr(path) for path in paths)
     error.add_note(
-        "guarded publication remains recoverable; automatic settlement failed with "
-        f"{type(cleanup_error).__name__}{path_evidence}"
+        f"{_SETTLEMENT_RECOVERY_NOTE_PREFIX}{type(cleanup_error).__name__}{path_evidence}"
     )
 
 
@@ -2220,6 +2404,7 @@ def _validate_publication_input(
     policy: DestinationPolicy,
     populate: Callable[[GuardedTreeStage], None],
     predecessor_request_digest: str | None,
+    settle_active_operation: bool,
 ) -> None:
     _validate_destination_name(destination)
     if not isinstance(policy, DestinationPolicy):
@@ -2231,6 +2416,11 @@ def _validate_publication_input(
         raise GuardedTreePublicationError(
             "invalid_callback",
             "publication callbacks must be callable",
+        )
+    if type(settle_active_operation) is not bool:
+        raise GuardedTreePublicationError(
+            "invalid_recovery_policy",
+            "publication active-operation settlement policy is invalid",
         )
     try:
         consumer_size = len(consumer.encode("utf-8"))
@@ -2309,31 +2499,15 @@ def _is_unsafe_windows_component(component: str) -> bool:
 def _prepare_stage_files(
     contents: Mapping[str, bytes],
     *,
-    file_mode: int,
-    directory_mode: int,
-) -> tuple[_PreparedStageFile, ...]:
-    if (
-        type(file_mode) is not int
-        or not 0 <= file_mode <= 0o7777
-        or type(directory_mode) is not int
-        or not 0 <= directory_mode <= 0o7777
-    ):
-        raise GuardedTreePublicationError(
-            "invalid_population",
-            "guarded stage modes must be canonical nonnegative permission modes",
-        )
-    required_file_mode = stat.S_IRUSR
-    if os.name == "nt":
-        required_file_mode |= stat.S_IWUSR
-    required_directory_mode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-    if (
-        file_mode & required_file_mode != required_file_mode
-        or directory_mode & required_directory_mode != required_directory_mode
-    ):
-        raise GuardedTreePublicationError(
-            "invalid_population",
-            "guarded stage modes must retain owner access required for authentication and cleanup",
-        )
+    directories: Iterable[str],
+    file_modes: Mapping[str, int] | None,
+    file_mode: int | None,
+    directory_mode: int | None,
+) -> tuple[tuple[_PreparedStageFile, ...], tuple[_PreparedStageDirectory, ...]]:
+    if file_mode is not None:
+        _validate_stage_mode(file_mode, directory=False)
+    if directory_mode is not None:
+        _validate_stage_mode(directory_mode, directory=True)
     try:
         raw_items = tuple(contents.items())
     except (AttributeError, RuntimeError) as exc:
@@ -2341,61 +2515,73 @@ def _prepare_stage_files(
             "invalid_population",
             "guarded stage contents must be a stable mapping",
         ) from exc
+    try:
+        raw_directories = tuple(directories)
+    except (TypeError, RuntimeError) as exc:
+        raise GuardedTreePublicationError(
+            "invalid_population",
+            "guarded stage directories must be a stable iterable",
+        ) from exc
+    try:
+        raw_file_modes = () if file_modes is None else tuple(file_modes.items())
+    except (AttributeError, RuntimeError) as exc:
+        raise GuardedTreePublicationError(
+            "invalid_population",
+            "guarded stage file modes must be a stable mapping",
+        ) from exc
+    prepared_file_modes: dict[str, int] = {}
+    for relative, mode in raw_file_modes:
+        if type(relative) is not str or relative in prepared_file_modes:
+            raise GuardedTreePublicationError(
+                "invalid_population",
+                "guarded stage file modes contain an invalid path",
+            )
+        _validate_stage_mode(mode, directory=False)
+        prepared_file_modes[relative] = mode
 
     files: list[_PreparedStageFile] = []
     file_parts: set[tuple[str, ...]] = set()
-    normalized_files: dict[tuple[str, ...], str] = {}
     for relative, content in raw_items:
         if type(relative) is not str or type(content) is not bytes:
             raise GuardedTreePublicationError(
                 "invalid_population",
                 "guarded stage contents must map relative strings to bytes",
             )
-        try:
-            relative_size = len(relative.encode("utf-8"))
-        except UnicodeEncodeError as exc:
-            raise GuardedTreePublicationError(
-                "invalid_population",
-                "guarded stage contents contain an invalid relative path",
-            ) from exc
-        path = PurePosixPath(relative)
+        path = _prepare_stage_relative_path(relative)
         parts = path.parts
-        if (
-            not relative
-            or "\\" in relative
-            or "\x00" in relative
-            or path.is_absolute()
-            or path.as_posix() != relative
-            or any(part in {"", ".", ".."} for part in parts)
-            or (os.name == "nt" and any(_is_unsafe_windows_component(part) for part in parts))
-            or relative_size > 4096
-        ):
+        if parts in file_parts:
             raise GuardedTreePublicationError(
                 "invalid_population",
-                "guarded stage contents contain an unsafe relative path",
-                paths=(relative[:256],),
+                "guarded stage contents contain a duplicate file path",
+                paths=(relative,),
             )
-        if len(parts) > _TREE_DEPTH_LIMIT:
-            raise GuardedTreePublicationError(
-                "tree_limit",
-                "guarded publication tree exceeds its bounded depth limit",
-                paths=(relative[:256],),
-            )
-        normalized = tuple(_normalized_name(part) for part in parts)
-        previous = normalized_files.get(normalized)
-        if previous is not None and previous != relative:
-            raise GuardedTreePublicationError(
-                "tree_case_alias",
-                "guarded stage contents contain conflicting case or Unicode aliases",
-                paths=(previous, relative),
-            )
-        normalized_files[normalized] = relative
         file_parts.add(parts)
-        files.append(_PreparedStageFile(path=path, content=content))
+        files.append(
+            _PreparedStageFile(
+                path=path,
+                content=content,
+                mode=prepared_file_modes.pop(relative, file_mode),
+            )
+        )
+    if prepared_file_modes:
+        raise GuardedTreePublicationError(
+            "invalid_population",
+            "guarded stage file modes name files absent from the staged contents",
+            paths=(min(prepared_file_modes),),
+        )
 
-    directories: set[tuple[str, ...]] = set()
+    directory_modes: dict[tuple[str, ...], int | None] = {}
+    for relative in raw_directories:
+        if type(relative) is not str:
+            raise GuardedTreePublicationError(
+                "invalid_population",
+                "guarded stage directories must contain relative strings",
+            )
+        path = _prepare_stage_relative_path(relative)
+        directory_modes.setdefault(path.parts, directory_mode)
+    explicit_directory_parts = set(directory_modes)
     normalized_entries: dict[tuple[str, ...], tuple[str, ...]] = {}
-    for parts in file_parts:
+    for parts in (*file_parts, *explicit_directory_parts):
         for depth in range(1, len(parts) + 1):
             candidate = parts[:depth]
             normalized_candidate = tuple(_normalized_name(part) for part in candidate)
@@ -2410,6 +2596,7 @@ def _prepare_stage_files(
                     ),
                 )
             normalized_entries[normalized_candidate] = candidate
+    for parts in file_parts:
         for depth in range(1, len(parts)):
             prefix = parts[:depth]
             if prefix in file_parts:
@@ -2418,27 +2605,96 @@ def _prepare_stage_files(
                     "guarded stage contents contain a file/directory topology conflict",
                     paths=(PurePosixPath(*prefix).as_posix(), PurePosixPath(*parts).as_posix()),
                 )
-            directories.add(prefix)
-    if len(files) + len(directories) > _TREE_ENTRY_LIMIT:
+            directory_modes.setdefault(prefix, directory_mode)
+    for parts in tuple(directory_modes):
+        if parts in file_parts:
+            raise GuardedTreePublicationError(
+                "invalid_population",
+                "guarded stage contents contain a file/directory topology conflict",
+                paths=(PurePosixPath(*parts).as_posix(),),
+            )
+        for depth in range(1, len(parts)):
+            prefix = parts[:depth]
+            if prefix in file_parts:
+                raise GuardedTreePublicationError(
+                    "invalid_population",
+                    "guarded stage contents contain a file/directory topology conflict",
+                    paths=(PurePosixPath(*prefix).as_posix(), PurePosixPath(*parts).as_posix()),
+                )
+            directory_modes.setdefault(prefix, directory_mode)
+    prepared_directories = [
+        _PreparedStageDirectory(path=PurePosixPath(*parts), mode=mode)
+        for parts, mode in directory_modes.items()
+    ]
+    if len(files) + len(prepared_directories) > _TREE_ENTRY_LIMIT:
         raise GuardedTreePublicationError(
             "tree_limit",
             "guarded publication tree exceeds its bounded entry limit",
         )
     _require_population_cleanup_capacity(
         files=files,
-        directories=directories,
-        file_mode=file_mode,
-        directory_mode=directory_mode,
+        directories=prepared_directories,
     )
-    return tuple(sorted(files, key=lambda item: item.path.as_posix()))
+    return (
+        tuple(sorted(files, key=lambda item: item.path.as_posix())),
+        tuple(
+            sorted(
+                prepared_directories,
+                key=lambda item: (len(item.path.parts), item.path.as_posix()),
+            )
+        ),
+    )
+
+
+def _prepare_stage_relative_path(relative: str) -> PurePosixPath:
+    try:
+        relative_size = len(relative.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise GuardedTreePublicationError(
+            "invalid_population",
+            "guarded stage contents contain an invalid relative path",
+        ) from exc
+    path = PurePosixPath(relative)
+    parts = path.parts
+    if (
+        not relative
+        or "\\" in relative
+        or "\x00" in relative
+        or path.is_absolute()
+        or path.as_posix() != relative
+        or any(part in {"", ".", ".."} for part in parts)
+        or (os.name == "nt" and any(_is_unsafe_windows_component(part) for part in parts))
+        or relative_size > 4096
+    ):
+        raise GuardedTreePublicationError(
+            "invalid_population",
+            "guarded stage contents contain an unsafe relative path",
+            paths=(relative[:256],),
+        )
+    if len(parts) > _TREE_DEPTH_LIMIT:
+        raise GuardedTreePublicationError(
+            "tree_limit",
+            "guarded publication tree exceeds its bounded depth limit",
+            paths=(relative[:256],),
+        )
+    return path
+
+
+def _validate_stage_mode(mode: object, *, directory: bool) -> None:
+    required = stat.S_IRUSR | (stat.S_IWUSR | stat.S_IXUSR if directory else 0)
+    if os.name == "nt" and not directory:
+        required |= stat.S_IWUSR
+    if type(mode) is not int or not 0 <= mode <= 0o7777 or mode & required != required:
+        raise GuardedTreePublicationError(
+            "invalid_population",
+            "guarded stage modes must be canonical and retain required owner access",
+        )
 
 
 def _require_population_cleanup_capacity(
     *,
     files: list[_PreparedStageFile],
-    directories: set[tuple[str, ...]],
-    file_mode: int,
-    directory_mode: int,
+    directories: list[_PreparedStageDirectory],
 ) -> None:
     # Use deliberately wide platform identities so every accepted population
     # is guaranteed to fit the exact cleanup manifest produced after writing.
@@ -2449,12 +2705,12 @@ def _require_population_cleanup_capacity(
         incarnation=(1 << 256) - 1,
     )
     entries: list[dict[str, object]] = []
-    for parts in directories:
+    for item in directories:
         entries.append(
             {
-                "path": PurePosixPath(*parts).as_posix(),
+                "path": item.path.as_posix(),
                 "identity": wide_identity.as_json(),
-                "mode": directory_mode,
+                "mode": 0o7777 if item.mode is None else item.mode,
                 "size": None,
                 "content_sha256": None,
             }
@@ -2465,7 +2721,7 @@ def _require_population_cleanup_capacity(
             {
                 "path": item.path.as_posix(),
                 "identity": file_identity.as_json(),
-                "mode": file_mode,
+                "mode": 0o7777 if item.mode is None else item.mode,
                 "size": max(len(item.content), (1 << 63) - 1),
                 "content_sha256": f"sha256:{'0' * 64}",
             }
@@ -2494,28 +2750,145 @@ def _require_population_cleanup_capacity(
         )
 
 
+def _capture_stage_default_directory_mode(path: Path, *, expected: _Identity) -> int:
+    """Observe directory creation mode inside the already owned private stage."""
+
+    probe_name = ".cayu-tree-directory-mode-probe"
+    if os.name == "nt":
+        with _windows_directory_namespace_fence(path):
+            current = path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or _capture_stable_identity(current, path=path) != expected
+            ):
+                raise GuardedTreePublicationError(
+                    "staging_changed",
+                    "publication staging directory changed before mode observation",
+                    paths=(path.name,),
+                )
+            probe = path / probe_name
+            try:
+                probe.mkdir(mode=0o777)
+            except FileExistsError as exc:
+                raise GuardedTreePublicationError(
+                    "staging_changed",
+                    "publication staging directory acquired unexpected content",
+                    paths=(probe_name,),
+                ) from exc
+            probe_value = probe.stat(follow_symlinks=False)
+            _require_plain_directory(
+                probe_value,
+                label="directory mode probe",
+                path=probe_name,
+            )
+            probe_identity = _capture_stable_identity(probe_value, path=probe)
+            mode = stat.S_IMODE(probe_value.st_mode)
+            _delete_windows_entry_by_handle(probe, expected=probe_identity)
+            after = path.stat(follow_symlinks=False)
+            if _capture_stable_identity(after, path=path) != expected:
+                raise GuardedTreePublicationError(
+                    "staging_changed",
+                    "publication staging directory changed during mode observation",
+                    paths=(path.name,),
+                )
+    else:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            root = os.open(path, flags)
+        except OSError as exc:
+            raise GuardedTreePublicationError(
+                "staging_changed",
+                "publication staging directory changed before mode observation",
+                paths=(path.name,),
+            ) from exc
+        try:
+            current = os.fstat(root)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or _capture_stable_identity(current, descriptor=root) != expected
+            ):
+                raise GuardedTreePublicationError(
+                    "staging_changed",
+                    "publication staging directory changed before mode observation",
+                    paths=(path.name,),
+                )
+            try:
+                os.mkdir(probe_name, mode=0o777, dir_fd=root)
+            except FileExistsError as exc:
+                raise GuardedTreePublicationError(
+                    "staging_changed",
+                    "publication staging directory acquired unexpected content",
+                    paths=(probe_name,),
+                ) from exc
+            probe = os.open(probe_name, flags, dir_fd=root)
+            try:
+                probe_value = os.fstat(probe)
+                if not stat.S_ISDIR(probe_value.st_mode):
+                    raise GuardedTreePublicationError(
+                        "staging_changed",
+                        "publication directory mode probe changed type",
+                        paths=(probe_name,),
+                    )
+                probe_identity = _capture_stable_identity(probe_value, descriptor=probe)
+                mode = stat.S_IMODE(probe_value.st_mode)
+            finally:
+                _close_descriptor(probe)
+            current_probe = os.stat(probe_name, dir_fd=root, follow_symlinks=False)
+            if (
+                _capture_stable_identity(
+                    current_probe,
+                    dir_fd=root,
+                    name=probe_name,
+                )
+                != probe_identity
+            ):
+                raise GuardedTreePublicationError(
+                    "staging_changed",
+                    "publication directory mode probe changed before cleanup",
+                    paths=(probe_name,),
+                )
+            os.rmdir(probe_name, dir_fd=root)
+            after = os.fstat(root)
+            if _capture_stable_identity(after, descriptor=root) != expected:
+                raise GuardedTreePublicationError(
+                    "staging_changed",
+                    "publication staging directory changed during mode observation",
+                    paths=(path.name,),
+                )
+        finally:
+            _close_descriptor(root)
+    _validate_stage_mode(mode, directory=True)
+    return mode
+
+
 def _write_stage_files(
     path: Path,
     *,
     expected: _Identity,
     files: tuple[_PreparedStageFile, ...],
-    file_mode: int,
-    directory_mode: int,
+    directories: tuple[_PreparedStageDirectory, ...],
+    root_mode: int,
 ) -> None:
     if os.name == "nt":
         _write_stage_files_on_windows(
             path,
             expected=expected,
             files=files,
-            file_mode=file_mode,
+            directories=directories,
+            root_mode=root_mode,
         )
         return
     _write_stage_files_from_fd(
         path,
         expected=expected,
         files=files,
-        file_mode=file_mode,
-        directory_mode=directory_mode,
+        directories=directories,
+        root_mode=root_mode,
     )
 
 
@@ -2524,8 +2897,8 @@ def _write_stage_files_from_fd(
     *,
     expected: _Identity,
     files: tuple[_PreparedStageFile, ...],
-    file_mode: int,
-    directory_mode: int,
+    directories: tuple[_PreparedStageDirectory, ...],
+    root_mode: int,
 ) -> None:
     flags = (
         os.O_RDONLY
@@ -2562,6 +2935,14 @@ def _write_stage_files_from_fd(
         directory_identities: dict[tuple[str, ...], _Identity] = {
             (): _capture_stable_identity(root_identity, descriptor=root)
         }
+        for item in directories:
+            _create_stage_directory_from_fd(
+                root,
+                root_path=path,
+                item=item,
+                directory_flags=flags,
+                directory_identities=directory_identities,
+            )
         for item in files:
             _write_stage_file_from_fd(
                 root,
@@ -2569,12 +2950,63 @@ def _write_stage_files_from_fd(
                 item=item,
                 directory_flags=flags,
                 directory_identities=directory_identities,
-                file_mode=file_mode,
-                directory_mode=directory_mode,
             )
-        os.fchmod(root, directory_mode)
+        os.fchmod(root, root_mode)
     finally:
         _close_descriptor(root)
+
+
+def _create_stage_directory_from_fd(
+    root: int,
+    *,
+    root_path: Path,
+    item: _PreparedStageDirectory,
+    directory_flags: int,
+    directory_identities: dict[tuple[str, ...], _Identity],
+) -> None:
+    descriptor = os.dup(root)
+    prefix: tuple[str, ...] = ()
+    try:
+        for component in item.path.parts:
+            prefix = (*prefix, component)
+            expected = directory_identities.get(prefix)
+            if expected is None:
+                try:
+                    os.mkdir(
+                        component,
+                        mode=(0o777 if item.mode is None else 0o700),
+                        dir_fd=descriptor,
+                    )
+                except FileExistsError as exc:
+                    raise GuardedTreePublicationError(
+                        "staging_changed",
+                        "publication staging directory acquired unexpected content",
+                        paths=(PurePosixPath(*prefix).as_posix(),),
+                    ) from exc
+            child = os.open(component, directory_flags, dir_fd=descriptor)
+            try:
+                current = os.fstat(child)
+                current_identity = _capture_stable_identity(current, descriptor=child)
+                if not stat.S_ISDIR(current.st_mode) or (
+                    expected is not None and current_identity != expected
+                ):
+                    raise GuardedTreePublicationError(
+                        "staging_changed",
+                        "publication staging directory changed during population",
+                        paths=(PurePosixPath(*prefix).as_posix(),),
+                    )
+                if expected is None:
+                    directory_identities[prefix] = current_identity
+                if prefix == item.path.parts and item.mode is not None:
+                    os.fchmod(child, item.mode)
+            except BaseException:
+                _close_descriptor(child)
+                raise
+            previous = descriptor
+            descriptor = child
+            _close_descriptor(previous)
+    finally:
+        _close_descriptor(descriptor)
 
 
 def _write_stage_file_from_fd(
@@ -2584,8 +3016,6 @@ def _write_stage_file_from_fd(
     item: _PreparedStageFile,
     directory_flags: int,
     directory_identities: dict[tuple[str, ...], _Identity],
-    file_mode: int,
-    directory_mode: int,
 ) -> None:
     descriptor = os.dup(root)
     prefix: tuple[str, ...] = ()
@@ -2594,14 +3024,11 @@ def _write_stage_file_from_fd(
             prefix = (*prefix, component)
             expected = directory_identities.get(prefix)
             if expected is None:
-                try:
-                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
-                except FileExistsError as exc:
-                    raise GuardedTreePublicationError(
-                        "staging_changed",
-                        "publication staging directory acquired unexpected content",
-                        paths=(root_path.joinpath(*prefix).name,),
-                    ) from exc
+                raise GuardedTreePublicationError(
+                    "staging_changed",
+                    "publication staging directory lost prepared parent authority",
+                    paths=(root_path.joinpath(*prefix).name,),
+                )
             child = os.open(component, directory_flags, dir_fd=descriptor)
             try:
                 current = os.fstat(child)
@@ -2614,12 +3041,6 @@ def _write_stage_file_from_fd(
                         "publication staging directory changed during population",
                         paths=(PurePosixPath(*prefix).as_posix(),),
                     )
-                if expected is None:
-                    directory_identities[prefix] = _capture_stable_identity(
-                        current,
-                        descriptor=child,
-                    )
-                os.fchmod(child, directory_mode)
             except BaseException:
                 _close_descriptor(child)
                 raise
@@ -2635,7 +3056,12 @@ def _write_stage_file_from_fd(
             | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            output = os.open(item.path.name, file_flags, 0o600, dir_fd=descriptor)
+            output = os.open(
+                item.path.name,
+                file_flags,
+                0o666 if item.mode is None else 0o600,
+                dir_fd=descriptor,
+            )
         except FileExistsError as exc:
             raise GuardedTreePublicationError(
                 "staging_changed",
@@ -2644,7 +3070,8 @@ def _write_stage_file_from_fd(
             ) from exc
         try:
             _write_all(output, item.content)
-            os.fchmod(output, file_mode)
+            if item.mode is not None:
+                os.fchmod(output, item.mode)
         finally:
             _close_descriptor(output)
     finally:
@@ -2656,7 +3083,8 @@ def _write_stage_files_on_windows(
     *,
     expected: _Identity,
     files: tuple[_PreparedStageFile, ...],
-    file_mode: int,
+    directories: tuple[_PreparedStageDirectory, ...],
+    root_mode: int,
 ) -> None:
     with ExitStack() as fences:
         fences.enter_context(_windows_directory_namespace_fence(path))
@@ -2679,10 +3107,10 @@ def _write_stage_files_on_windows(
                 paths=(path.name,),
             )
         directory_identities: dict[tuple[str, ...], _Identity] = {(): expected}
-        for item in files:
+        for item in directories:
             directory = path
             prefix: tuple[str, ...] = ()
-            for component in item.path.parts[:-1]:
+            for component in item.path.parts:
                 prefix = (*prefix, component)
                 directory /= component
                 expected_directory = directory_identities.get(prefix)
@@ -2714,17 +3142,41 @@ def _write_stage_files_on_windows(
                             "publication staging directory changed during population",
                             paths=(PurePosixPath(*prefix).as_posix(),),
                         )
+                if prefix == item.path.parts and item.mode is not None:
+                    directory.chmod(item.mode)
+        for item in files:
+            directory = path
+            prefix = ()
+            for component in item.path.parts[:-1]:
+                prefix = (*prefix, component)
+                directory /= component
+                expected_directory = directory_identities.get(prefix)
+                if expected_directory is None:
+                    raise GuardedTreePublicationError(
+                        "staging_changed",
+                        "publication staging directory lost prepared parent authority",
+                        paths=(PurePosixPath(*prefix).as_posix(),),
+                    )
+                identity = directory.stat(follow_symlinks=False)
+                if _capture_stable_identity(identity, path=directory) != expected_directory:
+                    raise GuardedTreePublicationError(
+                        "staging_changed",
+                        "publication staging directory changed during population",
+                        paths=(PurePosixPath(*prefix).as_posix(),),
+                    )
             target = directory / item.path.name
             try:
                 with target.open("xb") as output:
                     output.write(item.content)
-                target.chmod(file_mode)
+                if item.mode is not None:
+                    target.chmod(item.mode)
             except FileExistsError as exc:
                 raise GuardedTreePublicationError(
                     "staging_changed",
                     "publication staging directory acquired unexpected content",
                     paths=(item.path.as_posix(),),
                 ) from exc
+        path.chmod(root_mode)
         after = path.stat(follow_symlinks=False)
         if _capture_stable_identity(after, path=path) != expected:
             raise GuardedTreePublicationError(
@@ -3698,15 +4150,15 @@ def _reuse_or_retire_exact_receipt(receipt: _Journal, *, parent: _Parent) -> boo
     return False
 
 
-def _retire_stale_settled_absent_or_empty_publication(
+def _retire_stale_settled_publication_if_safe(
     journal: _Journal,
     *,
     parent: _Parent,
 ) -> bool:
-    """Retire terminal history only when no published or private owner remains."""
+    """Retire terminal history only when no current or private owner remains."""
 
     record = journal.record
-    if record.phase is not _Phase.SETTLED or record.policy is not DestinationPolicy.ABSENT_OR_EMPTY:
+    if record.phase is not _Phase.SETTLED:
         return False
     _require_record_authority(journal, parent=parent)
     if record.parent_identity != parent.identity:
@@ -3719,7 +4171,10 @@ def _retire_stale_settled_absent_or_empty_publication(
             path=record.destination_name,
         )
         current_identity = parent.entry_identity(record.destination_name, value=current)
-        if current_identity == record.stage_identity:
+        if current_identity == record.stage_identity and _published_stage_matches(
+            record,
+            parent=parent,
+        ):
             return False
         if not _directory_is_empty(
             parent,
@@ -4095,9 +4550,12 @@ def _promote_terminal_receipt(
         if (
             previous.record.phase is not _Phase.SETTLED
             or journal.record.predecessor_request_digest is None
-            or previous.record.consumer != journal.record.consumer
-            or previous.record.policy is not journal.record.policy
+            or journal.record.predecessor_receipt_identity is None
+            or journal.record.predecessor_receipt_sha256 is None
+            or journal.record.policy is not DestinationPolicy.REPLACE_DIRECTORY
             or previous.record.request_digest != journal.record.predecessor_request_digest
+            or previous.identity != journal.record.predecessor_receipt_identity
+            or previous.entry_sha256 != journal.record.predecessor_receipt_sha256
         ):
             raise _conflict(
                 journal.record,
@@ -4156,6 +4614,8 @@ def _parse_journal_entry(
         "consumer",
         "request_digest",
         "predecessor_request_digest",
+        "predecessor_receipt_identity",
+        "predecessor_receipt_sha256",
         "token",
         "destination_name",
         "policy",
@@ -4224,6 +4684,19 @@ def _parse_journal_entry(
     if predecessor_raw is not None and not isinstance(predecessor_raw, str):
         raise _invalid_journal("publication journal contains an invalid predecessor digest")
     predecessor_request_digest = cast("str | None", predecessor_raw)
+    predecessor_receipt_raw = value["predecessor_receipt_identity"]
+    predecessor_receipt_identity = (
+        None
+        if predecessor_receipt_raw is None
+        else _Identity.from_json(predecessor_receipt_raw, field="predecessor receipt")
+    )
+    predecessor_receipt_sha256 = value["predecessor_receipt_sha256"]
+    if predecessor_receipt_sha256 is not None and (
+        not isinstance(predecessor_receipt_sha256, str)
+        or len(predecessor_receipt_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in predecessor_receipt_sha256)
+    ):
+        raise _invalid_journal("publication journal contains an invalid predecessor receipt digest")
     stage_sha256 = value["stage_sha256"]
     if stage_sha256 is not None and not _is_sha256(stage_sha256):
         raise _invalid_journal("publication journal contains an invalid stage digest")
@@ -4240,6 +4713,8 @@ def _parse_journal_entry(
         consumer=strings["consumer"],
         request_digest=strings["request_digest"],
         predecessor_request_digest=predecessor_request_digest,
+        predecessor_receipt_identity=predecessor_receipt_identity,
+        predecessor_receipt_sha256=predecessor_receipt_sha256,
         token=strings["token"],
         destination_name=strings["destination_name"],
         policy=policy,
@@ -4266,6 +4741,8 @@ def _require_record_successor(previous: _Record, record: _Record) -> None:
         record.consumer,
         record.request_digest,
         record.predecessor_request_digest,
+        record.predecessor_receipt_identity,
+        record.predecessor_receipt_sha256,
         record.token,
         record.destination_name,
         record.policy,
@@ -4278,6 +4755,8 @@ def _require_record_successor(previous: _Record, record: _Record) -> None:
         previous.consumer,
         previous.request_digest,
         previous.predecessor_request_digest,
+        previous.predecessor_receipt_identity,
+        previous.predecessor_receipt_sha256,
         previous.token,
         previous.destination_name,
         previous.policy,
@@ -4329,6 +4808,10 @@ def _validate_record(record: _Record) -> None:
             record.predecessor_request_digest is not None
             and record.policy is not DestinationPolicy.REPLACE_DIRECTORY
         )
+        or (
+            record.predecessor_receipt_identity is not None
+            and record.predecessor_receipt_identity.kind != stat.S_IFREG
+        )
         or len(record.token) != 32
         or any(character not in "0123456789abcdef" for character in record.token)
         or destination_size is None
@@ -4358,6 +4841,12 @@ def _validate_record(record: _Record) -> None:
         raise _invalid_journal("publication journal identity is invalid")
     if (record.original_identity is None) != (record.original_sha256 is None):
         raise _invalid_journal("publication journal original authority is incomplete")
+    if not (
+        (record.predecessor_request_digest is None)
+        == (record.predecessor_receipt_identity is None)
+        == (record.predecessor_receipt_sha256 is None)
+    ):
+        raise _invalid_journal("publication journal predecessor authority is incomplete")
     if (record.cleanup_manifest_identity is None) != (record.cleanup_manifest_sha256 is None):
         raise _invalid_journal("publication journal cleanup manifest authority is incomplete")
     if record.sequence == 0 and (

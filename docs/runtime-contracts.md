@@ -3948,8 +3948,9 @@ that receipt. Under the absent-or-empty policy, a changed nonempty destination i
 and fails closed, while an absent or proven-empty destination retires the stale receipt and starts a
 new publication. Read-only recovery continues to report the historical committed outcome without
 removing post-publication operator edits. A later
-replacement may supersede that receipt only when it names the exact prior request digest under the
-same consumer and replacement policy; stale or unrelated requests remain conflicts. Owned
+replacement may supersede that receipt only when its explicit replacement entrance atomically
+authenticates and binds the current receipt's request digest, stable identity, and terminal hash;
+ordinary stale or unrelated requests remain conflicts. Owned
 trees are moved into an identity-checked cleanup claim before recursive deletion. A bounded durable
 per-entry manifest binds every descendant's relative path, device, inode, type, stable filesystem
 incarnation, mode, and regular-file content. Regular-file hashing compares size, mode, modification
@@ -9415,17 +9416,43 @@ The installed distribution provides the matching guest build context through
 `cayu lambda-microvm sidecar export DESTINATION`. Export is local and credential-free; it does
 not require `cayu[aws]` or perform AWS discovery. Its versioned manifest binds an exact,
 sorted file inventory to the Cayu version, artifact version, protocol version, per-file hashes,
-and one aggregate SHA-256 digest. The exporter validates all resources before destination
-mutation and stages replacement of non-empty directories behind explicit `--replace`, which
-deletes all existing destination contents. The staged tree is renamed into place. If publication
-fails after the previous directory has been renamed aside, Cayu preserves it at the backup path
-reported by the CLI for operator recovery; it does not attempt a second destructive rollback.
-The exporter pins the destination parent, original destination, private staging
-tree, and backup directory to captured filesystem identities. It rejects
-symbolic-link or junction traversal and revalidates those identities before
-publication and recursive cleanup. A concurrent replacement is never adopted
-as the export target or cleanup authority; conflicting operator content is
-preserved and the export fails with a bounded diagnostic.
+and one aggregate SHA-256 digest. The exporter validates all resources and the bounded output
+tree before destination mutation. It publishes through the shared guarded-tree owner with a
+request digest covering the complete emitted tree, including the raw manifest bytes. A terminal
+receipt makes an identical invocation an exact replay, while a later `--replace` invocation binds
+the current terminal receipt as its predecessor before publishing a different sidecar tree. The
+binding includes the predecessor receipt's stable filesystem identity and terminal journal hash,
+not only its request digest. A replacement first settles any recoverable active operation written
+by the current publication schema and then binds the resulting current receipt;
+it cannot silently discard or overwrite ambiguous active state.
+Without `--replace`, the destination must be absent or empty; with it, the complete existing
+directory is replaced.
+
+The guarded owner pins the destination parent and exact original, staging, backup, and published
+trees, records bounded durable transition evidence, and rechecks their identities and sealed
+contents at every destructive transition. If the original has been renamed to backup and final
+publication fails, it restores that exact object synchronously whenever the namespace remains
+owned. Interrupted publication and cleanup converge on exact retry or read-only recovery. A
+concurrent replacement, malformed receipt, changed published tree, symbolic link, junction,
+reparse point, case alias, or unsupported filesystem identity fails closed; ambiguous trees are
+preserved and reported through bounded path evidence rather than adopted or deleted.
+
+`cayu new` uses the same owner for its atomically replaceable project root. Ordinary template files
+and directories retain their conventional process-umask-derived creation modes, while the private
+runtime key keeps its explicit mode. The final root keeps the exact mode of a pre-existing empty
+destination or, for an absent destination, the conventional directory mode produced by the process
+umask inside the already owned private stage. Its publication entrance settles recoverable active
+work and applies the new absent-or-empty request within one destination-ownership boundary; it does
+not run read-only recovery as a separate preflight.
+All are populated through the identity-pinned stage writer. Coding-scaffold Git initialization remains
+a domain-specific preparation step inside that owned stage and rechecks the exact stage identity around
+every subprocess. The
+request digest binds the normalized application plan and deterministic rendered files, while the
+original-destination authority and sealed stage bind the resulting root mode;
+once the complete stage is sealed, an identical invocation can therefore finish interrupted
+publication without regenerating private material or reporting a completed project as an unrelated
+non-empty target. An ordinary pre-existing
+non-empty target remains rejected.
 Filesystem roots, the current working directory and its ancestors, and the user's home directory
 and its ancestors are protected export targets.
 Artifact metadata is provenance, not a substitute for the authenticated runtime handshake.

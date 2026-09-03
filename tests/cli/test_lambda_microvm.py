@@ -4,7 +4,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import textwrap
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -43,25 +46,7 @@ def _stable_identity_unavailable(*_args: object, **_kwargs: object) -> object:
     )
 
 
-def test_lambda_descriptorless_cleanup_does_not_require_guarded_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    expected = staging.stat(follow_symlinks=False)
-    monkeypatch.setattr(publication, "_capture_stable_identity", _stable_identity_unavailable)
-
-    sidecar_cli._remove_owned_publication_directory(
-        staging,
-        expected_identity=expected,
-        parent_descriptor=None,
-    )
-
-    assert not staging.exists()
-
-
-def test_lambda_export_retains_pre_migration_identity_contract(
+def test_lambda_export_uses_guarded_stable_identity_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -71,12 +56,12 @@ def test_lambda_export_retains_pre_migration_identity_contract(
 
     monkeypatch.setattr(publication, "_capture_stable_identity", _stable_identity_unavailable)
 
-    result = sidecar_cli._export_sidecar(destination, replace=True)
+    with pytest.raises(sidecar_cli._SidecarArtifactError) as exc_info:
+        sidecar_cli._export_sidecar(destination, replace=True)
 
-    assert result.destination == destination
-    assert (destination / _MANIFEST).is_file()
-    assert not (destination / "old.txt").exists()
-    assert list(tmp_path.glob(".sidecar.cayu-sidecar-backup-*")) == []
+    assert isinstance(exc_info.value.__cause__, publication.GuardedTreePublicationError)
+    assert exc_info.value.__cause__.code == "stable_identity_unavailable"
+    assert _tree_contents(destination) == {"old.txt": b"old\n"}
 
 
 def test_lambda_microvm_sidecar_export_is_reproducible(
@@ -137,6 +122,33 @@ def test_lambda_microvm_sidecar_export_requires_replace_for_nonempty_destination
     capsys.readouterr()
     assert not sentinel.exists()
     assert (destination / _MANIFEST).is_file()
+
+
+def test_lambda_microvm_replace_supersedes_dashboard_publication(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    destination = tmp_path / "shared-destination"
+    assert main(["dashboard", "eject", str(destination)]) == 0
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "lambda-microvm",
+                "sidecar",
+                "export",
+                str(destination),
+                "--replace",
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert (destination / _MANIFEST).is_file()
+    assert not (destination / "package.json").exists()
 
 
 def test_lambda_microvm_sidecar_export_accepts_existing_empty_destination(
@@ -244,7 +256,7 @@ def test_lambda_microvm_sidecar_export_rejects_corrupt_resources_before_mutation
             expected_cayu_version=_project_version(),
         )
     assert _tree_contents(destination) == {"operator-owned.txt": b"keep"}
-    assert list(tmp_path.glob(".destination.cayu-sidecar-*")) == []
+    assert list(tmp_path.glob(".cayu-tree-*")) == []
 
 
 def test_lambda_microvm_sidecar_export_rejects_linked_resource_root(
@@ -376,20 +388,23 @@ def test_lambda_microvm_sidecar_export_cleans_partial_staging_without_touching_d
     sentinel = destination / "operator-owned.txt"
     sentinel.write_text("keep", encoding="utf-8")
 
+    original_write = publication.GuardedTreeStage.write_files
+
     def fail_after_partial_write(
-        staging: Path,
-        artifact: sidecar_cli._ValidatedSidecarArtifact,
+        stage: publication.GuardedTreeStage,
+        _contents: Mapping[str, bytes],
+        **_kwargs: object,
     ) -> None:
-        del artifact
-        (staging / "partial").write_text("partial", encoding="utf-8")
+        original_write(stage, {"partial": b"partial"})
         raise OSError("injected write failure")
 
-    monkeypatch.setattr(sidecar_cli, "_write_staging_tree", fail_after_partial_write)
+    monkeypatch.setattr(publication.GuardedTreeStage, "write_files", fail_after_partial_write)
 
     with pytest.raises(OSError, match="injected write failure"):
         sidecar_cli._export_sidecar(destination, replace=True)
     assert _tree_contents(destination) == {"operator-owned.txt": b"keep"}
-    assert list(tmp_path.glob(".destination.cayu-sidecar-*")) == []
+    assert list(tmp_path.glob(".cayu-tree-stage-*")) == []
+    assert list(tmp_path.glob(".cayu-tree-backup-*")) == []
 
 
 def test_lambda_microvm_sidecar_export_preserves_interruption_and_cleans_staging(
@@ -399,24 +414,27 @@ def test_lambda_microvm_sidecar_export_preserves_interruption_and_cleans_staging
     destination = tmp_path / "destination"
     interruption = KeyboardInterrupt("injected interruption")
 
+    original_write = publication.GuardedTreeStage.write_files
+
     def interrupt_after_partial_write(
-        staging: Path,
-        artifact: sidecar_cli._ValidatedSidecarArtifact,
+        stage: publication.GuardedTreeStage,
+        _contents: Mapping[str, bytes],
+        **_kwargs: object,
     ) -> None:
-        del artifact
-        (staging / "partial").write_text("partial", encoding="utf-8")
+        original_write(stage, {"partial": b"partial"})
         raise interruption
 
-    monkeypatch.setattr(sidecar_cli, "_write_staging_tree", interrupt_after_partial_write)
+    monkeypatch.setattr(publication.GuardedTreeStage, "write_files", interrupt_after_partial_write)
 
     with pytest.raises(KeyboardInterrupt) as raised:
         sidecar_cli._export_sidecar(destination, replace=False)
     assert raised.value is interruption
     assert not destination.exists()
-    assert list(tmp_path.glob(".destination.cayu-sidecar-*")) == []
+    assert list(tmp_path.glob(".cayu-tree-stage-*")) == []
+    assert list(tmp_path.glob(".cayu-tree-backup-*")) == []
 
 
-def test_lambda_microvm_sidecar_export_preserves_backup_and_reports_it_when_publish_fails(
+def test_lambda_microvm_sidecar_export_restores_destination_when_publish_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -425,314 +443,229 @@ def test_lambda_microvm_sidecar_export_preserves_backup_and_reports_it_when_publ
     destination.mkdir()
     sentinel = destination / "operator-owned.txt"
     sentinel.write_text("keep", encoding="utf-8")
-    original_rename = sidecar_cli._rename_publication_entry
 
-    def fail_staging_publish(
-        path: Path,
-        target: Path,
-        *,
-        parent_descriptor: int | None,
-    ) -> None:
-        if (
-            path.name.startswith(".destination.cayu-sidecar-")
-            and "backup" not in path.name
-            and Path(target) == destination
-        ):
+    def fail_after_backup(phase: str) -> None:
+        if phase == "original_backed_up":
             raise OSError("injected publish failure")
-        original_rename(path, target, parent_descriptor=parent_descriptor)
 
-    monkeypatch.setattr(sidecar_cli, "_rename_publication_entry", fail_staging_publish)
+    monkeypatch.setattr(publication, "_publication_fault", fail_after_backup)
 
     assert main(["lambda-microvm", "sidecar", "export", str(destination), "--replace"]) == 1
     output = capsys.readouterr()
-    backups = list(tmp_path.glob(".destination.cayu-sidecar-backup-*"))
     assert output.out == ""
     assert "error: injected publish failure" in output.err
-    assert len(backups) == 1
-    assert f"note: the original destination remains at {backups[0]}" in output.err
-    assert _tree_contents(backups[0]) == {"operator-owned.txt": b"keep"}
-    assert not destination.exists()
-    assert list(tmp_path.glob(".destination.cayu-sidecar-*")) == backups
-
-
-def test_lambda_microvm_sidecar_export_reports_old_destination_cleanup_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    destination = tmp_path / "destination"
-    destination.mkdir()
-    sentinel = destination / "operator-owned.txt"
-    sentinel.write_text("keep", encoding="utf-8")
-    original_cleanup = sidecar_cli._remove_owned_publication_directory
-
-    def fail_backup_cleanup(path: Path, **kwargs: object) -> None:
-        if "cayu-sidecar-backup" in Path(path).name:
-            raise OSError("injected cleanup failure")
-        original_cleanup(path, **kwargs)
-
-    monkeypatch.setattr(sidecar_cli, "_remove_owned_publication_directory", fail_backup_cleanup)
-
-    assert main(["lambda-microvm", "sidecar", "export", str(destination), "--replace"]) == 1
-    output = capsys.readouterr()
-    backups = list(tmp_path.glob(".destination.cayu-sidecar-backup-*"))
-    assert (destination / _MANIFEST).is_file()
-    assert len(backups) == 1
-    assert _tree_contents(backups[0]) == {"operator-owned.txt": b"keep"}
-    assert f"old destination cleanup failed at {backups[0]}" in output.err
-
-
-@pytest.mark.skipif(os.name == "nt", reason="exercises descriptor-relative POSIX publication")
-def test_lambda_microvm_sidecar_export_rejects_parent_replacement(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    parent = tmp_path / "publication"
-    parent.mkdir()
-    destination = parent / "sidecar"
-    displaced = tmp_path / "displaced-publication"
-    original_write = sidecar_cli._write_staging_tree
-
-    def replace_parent(staging: Path, artifact: sidecar_cli._ValidatedSidecarArtifact) -> None:
-        original_write(staging, artifact)
-        parent.rename(displaced)
-        parent.mkdir()
-        (parent / "operator-owned.txt").write_text("keep", encoding="utf-8")
-
-    monkeypatch.setattr(sidecar_cli, "_write_staging_tree", replace_parent)
-    with pytest.raises(sidecar_cli._SidecarArtifactError, match="destination parent changed"):
-        sidecar_cli._export_sidecar(destination, replace=False)
-    assert (parent / "operator-owned.txt").read_text(encoding="utf-8") == "keep"
-
-
-@pytest.mark.skipif(os.name != "nt", reason="exercises Windows publication fencing")
-@pytest.mark.parametrize("replace", [False, True])
-def test_lambda_microvm_sidecar_export_removes_publication_from_replaced_windows_parent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    replace: bool,
-) -> None:
-    parent = tmp_path / "publication"
-    parent.mkdir()
-    destination = parent / "sidecar"
-    if replace:
-        destination.mkdir()
-        (destination / "original.txt").write_text("original", encoding="utf-8")
-    displaced = tmp_path / "validated-publication"
-    original_rename = sidecar_cli._rename_publication_entry
-    swapped = False
-
-    def replace_parent_at_final_rename(
-        source: Path,
-        target: Path,
-        *,
-        parent_descriptor: int | None,
-    ) -> None:
-        nonlocal swapped
-        if not swapped and target == destination and "backup" not in source.name:
-            swapped = True
-            parent.rename(displaced)
-            parent.mkdir()
-            (displaced / source.name).rename(parent / source.name)
-        original_rename(source, target, parent_descriptor=parent_descriptor)
-
-    monkeypatch.setattr(
-        sidecar_cli,
-        "_rename_publication_entry",
-        replace_parent_at_final_rename,
-    )
-
-    with pytest.raises(sidecar_cli._SidecarArtifactError, match="destination parent changed"):
-        sidecar_cli._export_sidecar(destination, replace=replace)
-
-    assert swapped
-    assert not destination.exists()
-    conflict = next(parent.glob(".sidecar.cayu-sidecar-conflict-*"))
-    assert (conflict / _MANIFEST).is_file()
-    if replace:
-        backup = next(displaced.glob(".sidecar.cayu-sidecar-backup-*"))
-        assert _tree_contents(backup) == {"original.txt": b"original"}
-
-
-@pytest.mark.skipif(os.name == "nt", reason="exercises descriptor-relative POSIX publication")
-@pytest.mark.parametrize("replace", [False, True])
-def test_lambda_microvm_sidecar_export_anchors_final_rename_to_validated_parent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    replace: bool,
-) -> None:
-    parent = tmp_path / "publication"
-    parent.mkdir()
-    destination = parent / "sidecar"
-    if replace:
-        destination.mkdir()
-        (destination / "original.txt").write_text("original", encoding="utf-8")
-    displaced_parent = tmp_path / "validated-publication"
-    original_rename = sidecar_cli._rename_publication_entry
-    swapped = False
-
-    def replace_parent_at_final_rename(
-        source: Path,
-        target: Path,
-        *,
-        parent_descriptor: int | None,
-    ) -> None:
-        nonlocal swapped
-        if not swapped and target == destination and "backup" not in source.name:
-            swapped = True
-            parent.rename(displaced_parent)
-            parent.mkdir()
-            replacement_destination = parent / destination.name
-            replacement_destination.mkdir()
-            (replacement_destination / "operator-owned.txt").write_text("keep", encoding="utf-8")
-            (displaced_parent / source.name).rename(parent / source.name)
-        original_rename(source, target, parent_descriptor=parent_descriptor)
-
-    monkeypatch.setattr(
-        sidecar_cli,
-        "_rename_publication_entry",
-        replace_parent_at_final_rename,
-    )
-
-    with pytest.raises(OSError):
-        sidecar_cli._export_sidecar(destination, replace=replace)
-
-    assert swapped
     assert _tree_contents(destination) == {"operator-owned.txt": b"keep"}
-    moved_staging = next(parent.glob(".sidecar.cayu-sidecar-*"))
-    assert (moved_staging / _MANIFEST).is_file()
-    if replace:
-        backup = next(displaced_parent.glob(".sidecar.cayu-sidecar-backup-*"))
-        assert _tree_contents(backup) == {"original.txt": b"original"}
+    assert list(tmp_path.glob(".cayu-tree-stage-*")) == []
+    assert list(tmp_path.glob(".cayu-tree-backup-*")) == []
 
 
-@pytest.mark.skipif(os.name == "nt", reason="exercises descriptor-relative POSIX publication")
-def test_lambda_microvm_sidecar_export_preserves_staging_replaced_at_final_rename(
+@pytest.mark.parametrize(
+    ("phase", "published_after_crash"),
+    [("original_backed_up", False), ("cleanup_owned", True)],
+)
+def test_lambda_microvm_sidecar_export_recovers_process_death(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    destination = tmp_path / "destination"
-    validated_staging = tmp_path / "validated-staging"
-    original_rename = sidecar_cli._rename_publication_entry
-    replaced = False
-
-    def replace_staging_at_final_rename(
-        source: Path,
-        target: Path,
-        *,
-        parent_descriptor: int | None,
-    ) -> None:
-        nonlocal replaced
-        if not replaced and target == destination and "backup" not in source.name:
-            replaced = True
-            source.rename(validated_staging)
-            source.mkdir()
-            (source / "operator-owned.txt").write_text("keep", encoding="utf-8")
-        original_rename(source, target, parent_descriptor=parent_descriptor)
-
-    monkeypatch.setattr(
-        sidecar_cli,
-        "_rename_publication_entry",
-        replace_staging_at_final_rename,
-    )
-
-    with pytest.raises(sidecar_cli._SidecarArtifactError, match="staging directory changed"):
-        sidecar_cli._export_sidecar(destination, replace=False)
-
-    assert replaced
-    assert (validated_staging / _MANIFEST).is_file()
-    conflict = next(tmp_path.glob(".destination.cayu-sidecar-conflict-*"))
-    assert _tree_contents(conflict) == {"operator-owned.txt": b"keep"}
-    assert not destination.exists()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="exercises descriptor-relative POSIX publication")
-def test_lambda_microvm_sidecar_export_preserves_destination_replaced_before_backup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    published_after_crash: bool,
 ) -> None:
     destination = tmp_path / "destination"
     destination.mkdir()
-    (destination / "original.txt").write_text("original", encoding="utf-8")
-    displaced_destination = tmp_path / "validated-destination"
-    original_rename = sidecar_cli._rename_publication_entry
+    (destination / "operator-owned.txt").write_text("keep", encoding="utf-8")
+    repository_root = Path(__file__).resolve().parents[2]
+    script = textwrap.dedent(
+        f"""
+        import os
+        from pathlib import Path
+        from cayu.cli import _guarded_tree_publication as publication
+        from cayu.cli import lambda_microvm
 
-    def replace_destination_at_backup(
-        source: Path,
-        target: Path,
-        *,
-        parent_descriptor: int | None,
-    ) -> None:
-        if source == destination and "backup" in target.name:
-            source.rename(displaced_destination)
-            source.mkdir()
-            (source / "operator-owned.txt").write_text("keep", encoding="utf-8")
-        original_rename(source, target, parent_descriptor=parent_descriptor)
+        def fault(current_phase):
+            if current_phase == {phase!r}:
+                os._exit(87)
 
-    monkeypatch.setattr(
-        sidecar_cli,
-        "_rename_publication_entry",
-        replace_destination_at_backup,
+        publication._publication_fault = fault
+        lambda_microvm._export_sidecar(
+            Path({str(destination)!r}),
+            replace=True,
+            resource_root=Path({str(_SOURCE)!r}),
+            expected_cayu_version={_project_version()!r},
+        )
+        """
     )
 
-    with pytest.raises(sidecar_cli._SidecarArtifactError, match="changed during backup"):
+    crashed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": str(repository_root / "src")},
+        check=False,
+    )
+
+    assert crashed.returncode == 87
+    assert destination.exists() is published_after_crash
+    assert len(list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))) == 1
+    sidecar_cli._export_sidecar(
+        destination,
+        replace=True,
+        resource_root=_SOURCE,
+        expected_cayu_version=_project_version(),
+    )
+    assert (destination / _MANIFEST).is_file()
+    assert not list(tmp_path.glob(".cayu-tree-stage-*"))
+    assert not list(tmp_path.glob(".cayu-tree-backup-*"))
+    assert not [
+        path
+        for path in tmp_path.glob(".cayu-tree-publication-*.jsonl")
+        if not path.name.endswith("-receipt.jsonl")
+    ]
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_lambda_microvm_sidecar_export_exact_retry_does_not_repopulate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace: bool,
+) -> None:
+    destination = tmp_path / "destination"
+    first = sidecar_cli._export_sidecar(destination, replace=replace)
+    first_contents = _tree_contents(destination)
+
+    def reject_population(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("exact retry must not populate another stage")
+
+    monkeypatch.setattr(publication.GuardedTreeStage, "write_files", reject_population)
+    replay = sidecar_cli._export_sidecar(destination, replace=replace)
+
+    assert replay == first
+    assert _tree_contents(destination) == first_contents
+
+
+def test_lambda_microvm_sidecar_export_replaces_bound_prior_version(tmp_path: Path) -> None:
+    destination = tmp_path / "destination"
+    first_resource = _copy_source(tmp_path / "first")
+    second_resource = _copy_source(tmp_path / "second")
+    readme = second_resource / "README.md"
+    readme.write_bytes(readme.read_bytes() + b"\nupdated sidecar\n")
+    second_contents = sidecar_cli._collect_resource_files(second_resource)
+    second_contents.pop(_MANIFEST)
+    (second_resource / _MANIFEST).write_bytes(
+        sidecar_cli._render_manifest(
+            second_contents,
+            cayu_version=_project_version(),
+            protocol_version="2",
+        )
+    )
+
+    sidecar_cli._export_sidecar(
+        destination,
+        replace=False,
+        resource_root=first_resource,
+        expected_cayu_version=_project_version(),
+    )
+    result = sidecar_cli._export_sidecar(
+        destination,
+        replace=True,
+        resource_root=second_resource,
+        expected_cayu_version=_project_version(),
+    )
+
+    assert (
+        result.content_digest
+        == json.loads((second_resource / _MANIFEST).read_text(encoding="utf-8"))["content_digest"]
+    )
+    assert _tree_contents(destination) == sidecar_cli._collect_resource_files(second_resource)
+
+
+@pytest.mark.parametrize("safe_state", ("absent", "recreated_empty"))
+def test_lambda_microvm_sidecar_export_retires_safe_historical_receipt(
+    tmp_path: Path,
+    safe_state: str,
+) -> None:
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    (destination / "operator-owned.txt").write_text("old\n", encoding="utf-8")
+    first_resource = _copy_source(tmp_path / "first")
+    second_resource = _copy_source(tmp_path / "second")
+    readme = second_resource / "README.md"
+    readme.write_bytes(readme.read_bytes() + b"\nupdated sidecar\n")
+    second_contents = sidecar_cli._collect_resource_files(second_resource)
+    second_contents.pop(_MANIFEST)
+    (second_resource / _MANIFEST).write_bytes(
+        sidecar_cli._render_manifest(
+            second_contents,
+            cayu_version=_project_version(),
+            protocol_version="2",
+        )
+    )
+    sidecar_cli._export_sidecar(
+        destination,
+        replace=True,
+        resource_root=first_resource,
+        expected_cayu_version=_project_version(),
+    )
+    shutil.rmtree(destination)
+    if safe_state == "recreated_empty":
+        destination.mkdir()
+
+    result = sidecar_cli._export_sidecar(
+        destination,
+        replace=True,
+        resource_root=second_resource,
+        expected_cayu_version=_project_version(),
+    )
+
+    assert (
+        result.content_digest
+        == json.loads((second_resource / _MANIFEST).read_text(encoding="utf-8"))["content_digest"]
+    )
+    assert _tree_contents(destination) == sidecar_cli._collect_resource_files(second_resource)
+
+
+def test_lambda_microvm_publication_identity_includes_raw_manifest_bytes(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "destination"
+    first_resource = _copy_source(tmp_path / "first")
+    second_resource = _copy_source(tmp_path / "second")
+    manifest_path = second_resource / _MANIFEST
+    compact_manifest = (
+        json.dumps(
+            json.loads(manifest_path.read_text(encoding="utf-8")),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    assert compact_manifest != manifest_path.read_bytes()
+    manifest_path.write_bytes(compact_manifest)
+
+    sidecar_cli._export_sidecar(
+        destination,
+        replace=True,
+        resource_root=first_resource,
+        expected_cayu_version=_project_version(),
+    )
+    sidecar_cli._export_sidecar(
+        destination,
+        replace=True,
+        resource_root=second_resource,
+        expected_cayu_version=_project_version(),
+    )
+
+    assert (destination / _MANIFEST).read_bytes() == compact_manifest
+
+
+def test_lambda_microvm_exact_retry_rejects_modified_published_tree(tmp_path: Path) -> None:
+    destination = tmp_path / "destination"
+    sidecar_cli._export_sidecar(destination, replace=True)
+    changed = destination / "README.md"
+    changed.write_text("operator edit\n", encoding="utf-8")
+
+    with pytest.raises(sidecar_cli._SidecarArtifactError) as exc_info:
         sidecar_cli._export_sidecar(destination, replace=True)
 
-    assert _tree_contents(displaced_destination) == {"original.txt": b"original"}
-    conflict = next(tmp_path.glob(".*backup-*.cayu-sidecar-conflict-*"))
-    assert _tree_contents(conflict) == {"operator-owned.txt": b"keep"}
-
-
-@pytest.mark.skipif(os.name == "nt", reason="exercises descriptor-relative POSIX cleanup")
-@pytest.mark.parametrize("replace", [False, True])
-def test_lambda_microvm_sidecar_export_preserves_backup_replaced_before_cleanup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    replace: bool,
-) -> None:
-    destination = tmp_path / "destination"
-    destination.mkdir()
-    if replace:
-        (destination / "original.txt").write_text("original", encoding="utf-8")
-    displaced_backup = tmp_path / "validated-backup"
-    original_rename = sidecar_cli._rename_publication_entry
-    replaced = False
-
-    def replace_backup_at_cleanup(
-        source: Path,
-        target: Path,
-        *,
-        parent_descriptor: int | None,
-    ) -> None:
-        nonlocal replaced
-        if not replaced and "backup" in source.name and "cleanup" in target.name:
-            replaced = True
-            source.rename(displaced_backup)
-            source.mkdir()
-            (source / "operator-owned.txt").write_text("keep", encoding="utf-8")
-        original_rename(source, target, parent_descriptor=parent_descriptor)
-
-    monkeypatch.setattr(
-        sidecar_cli,
-        "_rename_publication_entry",
-        replace_backup_at_cleanup,
-    )
-
-    with pytest.raises(sidecar_cli._SidecarArtifactError, match="cleanup failed") as exc_info:
-        sidecar_cli._export_sidecar(destination, replace=replace)
-
-    assert replaced
-    assert (destination / _MANIFEST).is_file()
-    if replace:
-        assert _tree_contents(displaced_backup) == {"original.txt": b"original"}
-    else:
-        assert _tree_contents(displaced_backup) == {}
-    replacement = next(tmp_path.glob(".*backup-*.cayu-sidecar-cleanup-*"))
-    assert _tree_contents(replacement) == {"operator-owned.txt": b"keep"}
-    assert any(
-        "could not safely remove old destination" in note
-        for note in getattr(exc_info.value, "__notes__", ())
-    )
+    assert isinstance(exc_info.value.__cause__, publication.GuardedTreePublicationError)
+    assert exc_info.value.__cause__.code == "publication_conflict"
+    assert changed.read_text(encoding="utf-8") == "operator edit\n"
 
 
 def test_lambda_microvm_sidecar_export_rejects_destination_replacement(
@@ -743,43 +676,30 @@ def test_lambda_microvm_sidecar_export_rejects_destination_replacement(
     destination.mkdir()
     (destination / "original.txt").write_text("original", encoding="utf-8")
     displaced = tmp_path / "displaced-destination"
-    original_write = sidecar_cli._write_staging_tree
+    original_write = publication.GuardedTreeStage.write_files
 
-    def replace_destination(staging: Path, artifact: sidecar_cli._ValidatedSidecarArtifact) -> None:
-        original_write(staging, artifact)
+    def replace_destination(
+        stage: publication.GuardedTreeStage,
+        contents: Mapping[str, bytes],
+        *,
+        file_mode: int = 0o644,
+        directory_mode: int = 0o755,
+    ) -> None:
+        original_write(
+            stage,
+            contents,
+            file_mode=file_mode,
+            directory_mode=directory_mode,
+        )
         destination.rename(displaced)
         destination.mkdir()
         (destination / "operator-owned.txt").write_text("keep", encoding="utf-8")
 
-    monkeypatch.setattr(sidecar_cli, "_write_staging_tree", replace_destination)
-    with pytest.raises(sidecar_cli._SidecarArtifactError, match="destination changed"):
+    monkeypatch.setattr(publication.GuardedTreeStage, "write_files", replace_destination)
+    with pytest.raises(sidecar_cli._SidecarArtifactError, match="destination"):
         sidecar_cli._export_sidecar(destination, replace=True)
     assert (destination / "operator-owned.txt").read_text(encoding="utf-8") == "keep"
     assert (displaced / "original.txt").read_text(encoding="utf-8") == "original"
-
-
-def test_lambda_microvm_sidecar_export_preserves_replacement_staging_tree(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    destination = tmp_path / "destination"
-    displaced: Path | None = None
-    original_write = sidecar_cli._write_staging_tree
-
-    def replace_staging(staging: Path, artifact: sidecar_cli._ValidatedSidecarArtifact) -> None:
-        nonlocal displaced
-        original_write(staging, artifact)
-        displaced = tmp_path / "validated-staging"
-        staging.rename(displaced)
-        staging.mkdir()
-        (staging / "operator-owned.txt").write_text("keep", encoding="utf-8")
-
-    monkeypatch.setattr(sidecar_cli, "_write_staging_tree", replace_staging)
-    with pytest.raises(sidecar_cli._SidecarArtifactError, match="staging directory changed"):
-        sidecar_cli._export_sidecar(destination, replace=False)
-    replacement = next(tmp_path.glob(".destination.cayu-sidecar-*"))
-    assert (replacement / "operator-owned.txt").read_text(encoding="utf-8") == "keep"
-    assert displaced is not None and (displaced / _MANIFEST).is_file()
 
 
 def test_lambda_microvm_sidecar_cli_reports_expanduser_errors_cleanly(

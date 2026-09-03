@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -67,6 +71,35 @@ def test_dry_run_and_apply_use_the_same_normalized_plan(
     assert expected_reference in instructions
     assert "installed, exactly pinned Cayu version" in instructions
     assert "project-local uv cache" in instructions
+
+
+def test_dry_run_rejects_the_same_nonempty_target_as_apply(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "occupied"
+    target.mkdir()
+    existing = target / "existing.txt"
+    existing.write_text("user-owned\n", encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "new",
+                target.name,
+                "--dir",
+                str(tmp_path),
+                "--dry-run",
+                "--json",
+            ]
+        )
+        == 1
+    )
+
+    payload = _json_output(capsys)
+    assert payload["status"] == "error"
+    assert payload["error"]["code"] == "TARGET_NOT_EMPTY"
+    assert existing.read_text(encoding="utf-8") == "user-owned\n"
 
 
 def test_default_agent_plan_is_the_complete_safe_local_profile() -> None:
@@ -548,11 +581,278 @@ def test_non_coding_publication_failure_leaves_no_new_target(
 ) -> None:
     from cayu.cli import scaffold
 
-    def fail_publish(**kwargs: object) -> None:
-        del kwargs
+    def fail_publish(*args: object, **kwargs: object) -> None:
+        del args, kwargs
         raise OSError("forced publication failure")
 
-    monkeypatch.setattr(scaffold, "_publish_staged_scaffold", fail_publish)
+    monkeypatch.setattr(scaffold, "publish_guarded_tree", fail_publish)
     assert main(["new", "atomic", "--dir", str(tmp_path), "--json"]) == 1
     assert _json_output(capsys)["error"]["code"] == "SCAFFOLD_PUBLICATION_FAILED"
     assert not (tmp_path / "atomic").exists()
+
+
+def test_non_coding_publication_preserves_bounded_recovery_diagnostics(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+    from cayu.cli._guarded_tree_publication import GuardedTreePublicationError
+
+    cleanup_failure = OSError("retained cleanup owner")
+    publication_failure = GuardedTreePublicationError(
+        "publication_conflict",
+        "publication ownership changed",
+        paths=(".cayu-tree-stage-owned",),
+    )
+    publication_failure.add_note("guarded publication remains recoverable by exact retry")
+
+    def fail_publish(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise publication_failure from cleanup_failure
+
+    monkeypatch.setattr(scaffold, "publish_guarded_tree", fail_publish)
+    assert main(["new", "diagnostic", "--dir", str(tmp_path), "--json"]) == 1
+
+    payload = _json_output(capsys)
+    message = payload["error"]["message"]
+    assert payload["error"]["code"] == "SCAFFOLD_PUBLICATION_FAILED"
+    assert "affected paths: '.cayu-tree-stage-owned'" in message
+    assert "guarded publication remains recoverable by exact retry" in message
+    assert not (tmp_path / "diagnostic").exists()
+
+
+def test_scaffold_publication_translation_retains_ordered_failure_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+    from cayu.cli._guarded_tree_publication import GuardedTreePublicationError
+
+    cleanup_failure = OSError("retained cleanup owner")
+    publication_failure = GuardedTreePublicationError(
+        "publication_conflict",
+        "publication ownership changed",
+        paths=(".cayu-tree-stage-owned",),
+    )
+    publication_failure.add_note("guarded publication remains recoverable by exact retry")
+
+    def fail_publish(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise publication_failure from cleanup_failure
+
+    monkeypatch.setattr(scaffold, "publish_guarded_tree", fail_publish)
+    plan = normalize_application_plan(name="diagnostic", agent_name="diagnostic")
+
+    with pytest.raises(scaffold._ScaffoldCommandError) as raised:
+        scaffold._publish_new_project(
+            target=tmp_path / "diagnostic",
+            files={"app.py": "# generated\n"},
+            plan=plan,
+        )
+
+    assert raised.value.__cause__ is publication_failure
+    assert publication_failure.__cause__ is cleanup_failure
+    assert raised.value.__notes__ == publication_failure.__notes__
+    assert "affected paths: '.cayu-tree-stage-owned'" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "destination_state",
+    ("unchanged", "modified", "empty", "absent", "recreated_empty"),
+)
+def test_non_coding_scaffold_retry_authenticates_published_destination(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    destination_state: str,
+) -> None:
+    command = ["new", "retryable", "--dir", str(tmp_path), "--json"]
+    target = tmp_path / "retryable"
+
+    assert main(command) == 0
+    _json_output(capsys)
+    original_private_key = (target / "data" / "memory-evidence.key").read_bytes()
+
+    if destination_state == "modified":
+        (target / "operator-owned.txt").write_text("keep\n", encoding="utf-8")
+    elif destination_state == "empty":
+        for child in target.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    elif destination_state in {"absent", "recreated_empty"}:
+        shutil.rmtree(target)
+        if destination_state == "recreated_empty":
+            target.mkdir()
+
+    result = main(command)
+    payload = _json_output(capsys)
+
+    if destination_state == "modified":
+        assert result == 1
+        assert payload["error"]["code"] == "TARGET_NOT_EMPTY"
+        assert (target / "operator-owned.txt").read_text(encoding="utf-8") == "keep\n"
+        return
+
+    assert result == 0
+    assert payload["status"] == "created"
+    assert (target / "app.py").is_file()
+    if destination_state == "unchanged":
+        assert (target / "data" / "memory-evidence.key").read_bytes() == original_private_key
+
+
+def test_coding_preflight_failure_retains_recoverable_settlement_diagnostic(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import _guarded_tree_publication as publication
+    from cayu.cli import scaffold
+
+    git = shutil.which("git")
+    assert git is not None
+    monkeypatch.setattr(
+        scaffold.LocalWorkspace,
+        "require_path_operations_supported",
+        staticmethod(lambda: None),
+    )
+    preflight_calls = 0
+
+    def fail_once_preflight(*, parent: Path) -> tuple[str, str]:
+        nonlocal preflight_calls
+        del parent
+        preflight_calls += 1
+        if preflight_calls == 1:
+            raise scaffold._ScaffoldCommandError("dependency probe failed")
+        return git, "test-owned-rg"
+
+    monkeypatch.setattr(scaffold, "_preflight_coding_commands", fail_once_preflight)
+    original_rollback = publication._rollback_before_publication
+    rollback_calls = 0
+
+    def fail_once_rollback(journal: Any, *, parent: Any) -> str:
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_calls == 1:
+            raise OSError("retained cleanup owner")
+        return original_rollback(journal, parent=parent)
+
+    monkeypatch.setattr(publication, "_rollback_before_publication", fail_once_rollback)
+    command = [
+        "new",
+        "recoverable-coder",
+        "--composition",
+        "coding",
+        "--dir",
+        str(tmp_path),
+        "--json",
+    ]
+
+    assert main(command) == 1
+    failure = _json_output(capsys)
+    assert failure["error"]["code"] == "CODING_PREFLIGHT_FAILED"
+    assert "dependency probe failed" in failure["error"]["message"]
+    assert "guarded publication remains recoverable" in failure["error"]["message"]
+    target = tmp_path / "recoverable-coder"
+    assert not target.exists()
+    assert list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))
+
+    assert main(command) == 0
+    _json_output(capsys)
+    assert (target / "app.py").is_file()
+    assert not [
+        path
+        for path in tmp_path.glob(".cayu-tree-publication-*.jsonl")
+        if not path.name.endswith("-receipt.jsonl")
+    ]
+
+
+@pytest.mark.parametrize("crash_phase", ("original_backed_up", "tree_renamed"))
+def test_non_coding_scaffold_recovers_publication_after_process_death(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    crash_phase: str,
+) -> None:
+    project = tmp_path / "recoverable"
+    if crash_phase == "original_backed_up":
+        project.mkdir()
+    repository_root = Path(__file__).resolve().parents[2]
+    script = f"""
+import os
+from cayu.cli import main
+from cayu.cli import _guarded_tree_publication as publication
+
+def fault(phase):
+    if phase == {crash_phase!r}:
+        os._exit(83)
+
+publication._publication_fault = fault
+main(["new", "recoverable", "--dir", {str(tmp_path)!r}])
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": str(repository_root / "src")},
+        check=False,
+    )
+    assert completed.returncode == 83
+    private_key = (
+        (project / "data" / "memory-evidence.key").read_bytes()
+        if crash_phase == "tree_renamed"
+        else None
+    )
+
+    assert main(["new", "recoverable", "--dir", str(tmp_path), "--json"]) == 0
+
+    assert _json_output(capsys)["status"] == "created"
+    recovered_private_key = (project / "data" / "memory-evidence.key").read_bytes()
+    if private_key is not None:
+        assert recovered_private_key == private_key
+    assert not list(tmp_path.glob(".cayu-tree-stage-*"))
+    assert not list(tmp_path.glob(".cayu-tree-backup-*"))
+    active_journals = [
+        path
+        for path in tmp_path.glob(".cayu-tree-publication-*.jsonl")
+        if not path.name.endswith("-receipt.jsonl")
+    ]
+    assert active_journals == []
+
+
+def test_non_coding_scaffold_settles_different_active_request_before_publication(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "recoverable"
+    project.mkdir()
+    repository_root = Path(__file__).resolve().parents[2]
+    script = f"""
+import os
+from cayu.cli import main
+from cayu.cli import _guarded_tree_publication as publication
+
+def fault(phase):
+    if phase == "original_backed_up":
+        os._exit(84)
+
+publication._publication_fault = fault
+main(["new", "recoverable", "--minimal", "--dir", {str(tmp_path)!r}])
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": str(repository_root / "src")},
+        check=False,
+    )
+    assert completed.returncode == 84
+    assert list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))
+
+    assert main(["new", "recoverable", "--dir", str(tmp_path), "--json"]) == 0
+
+    assert _json_output(capsys)["status"] == "created"
+    assert (project / "data" / "memory-evidence.key").is_file()
+    assert not [
+        path
+        for path in tmp_path.glob(".cayu-tree-publication-*.jsonl")
+        if not path.name.endswith("-receipt.jsonl")
+    ]
