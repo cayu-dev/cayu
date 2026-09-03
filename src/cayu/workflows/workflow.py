@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
 from datetime import datetime
 from enum import Enum
@@ -57,11 +58,14 @@ from cayu.runtime.budgets import copy_request_budget_limits
 from cayu.runtime.invocation import SessionExecutionSource
 from cayu.runtime.retry_policy import copy_retry_policy
 from cayu.runtime.sessions import (
+    RuntimeSessionCreateClaimAuthenticationDisposition,
+    RuntimeSessionCreateClaimReference,
+    RuntimeSessionCreateClaimReferenceKey,
+    authenticate_runtime_session_create_claim_reference,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
-    run_request_with_runtime_session_create_claim,
-    session_matches_reconstructed_runtime_create_claim,
-    session_matches_runtime_create_claim,
+    run_request_with_runtime_session_create_claim_reference,
+    runtime_session_create_claim_reference,
 )
 from cayu.runtime.stop_policy import copy_run_limits
 from cayu.runtime.structured_output import (
@@ -284,6 +288,10 @@ class WorkflowContext:
         self.session_id = require_clean_nonblank(session_id, "session_id")
         self.journal = journal
         self.attempt_id = uuid4().hex
+        self._session_create_reference_key = RuntimeSessionCreateClaimReferenceKey(
+            key_id="workflow-attempt",
+            secret=secrets.token_bytes(32),
+        )
         self._auto_loop_name_used = False
         self._gated_loop_names: set[str] = set()
         self._claimed_step_ids: set[str] = set()
@@ -800,12 +808,20 @@ async def _run_step(
         source=SessionExecutionSource.WORKFLOW_STEP,
     )
     session_create_claim: object | None = None
+    session_create_reference: RuntimeSessionCreateClaimReference | None = None
     if generated_child_ownership.is_generated:
         if generated_child_claim_id is None:  # pragma: no cover - state invariant
             raise AssertionError("Generated workflow child is missing its durable claim id.")
-        request, session_create_claim = run_request_with_runtime_session_create_claim(
+        session_create_reference = runtime_session_create_claim_reference(
             request,
-            claim_id=generated_child_claim_id,
+            operation_id=generated_child_claim_id,
+            key=ctx._session_create_reference_key,
+        )
+        request, session_create_claim = run_request_with_runtime_session_create_claim_reference(
+            request,
+            session_create_reference,
+            operation_id=generated_child_claim_id,
+            key=ctx._session_create_reference_key,
         )
         # Compute the exact redacted request fingerprint for pre-create
         # reconstruction without exposing runtime-owned metadata to adapters
@@ -822,12 +838,22 @@ async def _run_step(
             deferred_input = await ctx.app.session_store.load_deferred_interaction_input(
                 child_session_id
             )
-            if not session_matches_reconstructed_runtime_create_claim(
-                existing_child,
-                deferred_input,
-                session_create_claim,
-                request=request,
-                parent_session=anchor if parent_session_id is not None else None,
+            if (
+                session_create_reference is None
+                or generated_child_claim_id is None
+                or (
+                    authenticate_runtime_session_create_claim_reference(
+                        existing_child,
+                        deferred_input,
+                        session_create_claim,
+                        session_create_reference,
+                        request=request,
+                        operation_id=generated_child_claim_id,
+                        parent_session=anchor if parent_session_id is not None else None,
+                        key=ctx._session_create_reference_key,
+                    ).disposition
+                    is not RuntimeSessionCreateClaimAuthenticationDisposition.MATCHING_SESSION
+                )
             ):
                 raise StepError(
                     f"generated child session identity collision: {child_session_id!r}",
@@ -911,18 +937,26 @@ async def _run_step(
         if (
             generated_child_ownership is not _GeneratedChildOwnership.UNCREATED
             or session_create_claim is None
+            or session_create_reference is None
+            or generated_child_claim_id is None
         ):
             return False
         created = await ctx.app.session_store.load(child_session_id)
         deferred_input = await ctx.app.session_store.load_deferred_interaction_input(
             child_session_id
         )
-        if not session_matches_runtime_create_claim(
-            created,
-            deferred_input,
-            session_create_claim,
-            request=request,
-            parent_session=anchor if parent_session_id is not None else None,
+        if (
+            authenticate_runtime_session_create_claim_reference(
+                created,
+                deferred_input,
+                session_create_claim,
+                session_create_reference,
+                request=request,
+                operation_id=generated_child_claim_id,
+                parent_session=anchor if parent_session_id is not None else None,
+                key=ctx._session_create_reference_key,
+            ).disposition
+            is not RuntimeSessionCreateClaimAuthenticationDisposition.MATCHING_SESSION
         ):
             return False
         generated_child_ownership = _GeneratedChildOwnership.CREATED_UNATTACHED

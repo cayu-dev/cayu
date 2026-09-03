@@ -9,9 +9,11 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from multiprocessing.connection import Connection
+from typing import Literal
 
 import pytest
 
+import cayu.memory_intervention_execution as memory_intervention_execution_module
 from cayu.agent_snapshots import (
     AgentSnapshot,
     AgentSnapshotAuthorityRef,
@@ -80,6 +82,9 @@ from cayu.memory_evidence import (
     RecallItemSelectionReason,
 )
 from cayu.memory_intervention_execution import (
+    MEMORY_INTERVENTION_RUNTIME_HEARTBEAT_SECONDS,
+    MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+    MEMORY_INTERVENTION_RUNTIME_OWNERSHIP_WAIT_SECONDS,
     CayuMemoryInterventionRuntimeRunner,
     InMemoryMemoryInterventionExecutionStore,
     MemoryInterventionEvaluator,
@@ -93,6 +98,7 @@ from cayu.memory_intervention_execution import (
     MemoryInterventionOverlayProvider,
     MemoryInterventionRequestFingerprintKey,
     MemoryInterventionRuntimeApplicationFactory,
+    MemoryInterventionRuntimeOwnershipResult,
     MemoryInterventionRuntimeResult,
     MemoryInterventionRuntimeRunner,
     MemoryInterventionRuntimeView,
@@ -120,6 +126,12 @@ from cayu.retrieval import (
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     WeightedReciprocalRankFusionConfig,
 )
+from cayu.runtime._durable_operation_ownership import (
+    DurableOperationOwnershipAction,
+    DurableOperationOwnershipDisposition,
+    DurableOperationOwnershipResult,
+    DurableOperationOwnershipTransition,
+)
 from cayu.runtime.app import CayuApp
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.invocation import (
@@ -135,6 +147,7 @@ from cayu.runtime.request_footprints import RequestFootprintConfig
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
     RunRequest,
+    RuntimeSessionCreateClaimReference,
     SessionStatus,
     SessionStore,
     TerminalSessionEvidence,
@@ -563,6 +576,26 @@ def _prepared_record(request: MemoryInterventionTrialRequest) -> MemoryIntervent
     )
 
 
+def test_request_key_derives_a_stable_restricted_runtime_reference_key() -> None:
+    key = MemoryInterventionRequestFingerprintKey(
+        key_id="test-key",
+        secret=b"k" * 32,
+    )
+    derived = key.runtime_session_create_reference_key()
+
+    assert derived.key_id == key.key_id
+    assert derived.secret != key.secret
+    assert derived == key.runtime_session_create_reference_key()
+    assert (
+        derived
+        != MemoryInterventionRequestFingerprintKey(
+            key_id="test-key",
+            secret=b"r" * 32,
+        ).runtime_session_create_reference_key()
+    )
+    assert key.secret.hex() not in repr(derived)
+
+
 def _record_successor(
     record: MemoryInterventionExecutionRecord,
     *,
@@ -579,6 +612,39 @@ def _record_successor(
         }
     )
     return MemoryInterventionExecutionRecord.model_validate(values)
+
+
+async def _stored_session_bound_record(
+    store: MemoryInterventionExecutionStore,
+) -> MemoryInterventionExecutionRecord:
+    prepared = await store.begin(_prepared_record(_request(_spec(_snapshot()))))
+    trial_bound = _record_successor(
+        prepared,
+        phase=MemoryInterventionExecutionPhase.TRIAL_BOUND,
+        materialization_fingerprint=_digest("ownership-materialization"),
+        trial_binding_fingerprint=_digest("ownership-trial"),
+        operation_fingerprint=_digest("ownership-operation"),
+    )
+    trial_bound = await store.compare_and_set(prepared, trial_bound)
+    effect_resolved = _record_successor(
+        trial_bound,
+        phase=MemoryInterventionExecutionPhase.EFFECT_RESOLVED,
+        receipt_fingerprint=_digest("ownership-receipt"),
+    )
+    effect_resolved = await store.compare_and_set(trial_bound, effect_resolved)
+    session_bound = _record_successor(
+        effect_resolved,
+        phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        runtime_session_create_claim=RuntimeSessionCreateClaimReference(
+            session_id=effect_resolved.session_id,
+            operation_id=effect_resolved.execution_id,
+            request_authority_key_id="test-key",
+            request_authority_hmac_sha256=_digest("ownership-request"),
+            claim_id=_digest("ownership-session-claim"),
+        ),
+        runtime_deadline_at=datetime(2026, 9, 3, 1, tzinfo=UTC),
+    )
+    return await store.compare_and_set(effect_resolved, session_bound)
 
 
 def _empty_attribution() -> MemoryAttribution:
@@ -1452,6 +1518,62 @@ async def _canonical_execution_harness(
     return executor, executions, request, snapshot
 
 
+@_async_test
+async def test_concrete_runner_rejects_wrong_reference_key_before_factory_creation(
+    tmp_path,
+) -> None:
+    provider = ScriptedModelProvider(
+        (
+            ModelStreamEvent.text_delta("Friday"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        )
+    )
+    executor, _, request, snapshot = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix="wrong-reference-key",
+    )
+    outcome = await executor.execute_trial(request)
+    runner = executor.runtime_runner
+    assert type(runner) is CayuMemoryInterventionRuntimeRunner
+    factory = runner.factory
+    assert type(factory) is _CanonicalRuntimeApplicationFactory
+    materialization, trial, operation, _ = await executor._trial_lineage(
+        request,
+        outcome.execution,
+        snapshot,
+    )
+    view = await executor._open_view(
+        request,
+        outcome.execution,
+        materialization,
+        trial,
+        operation,
+        apply=False,
+    )
+    created_apps = len(factory.created_apps)
+    wrong_key = MemoryInterventionRequestFingerprintKey(
+        key_id="test-key",
+        secret=b"w" * 32,
+    ).runtime_session_create_reference_key()
+
+    with pytest.raises(
+        MemoryInterventionExecutionConflict,
+        match="claim reference conflicts",
+    ):
+        await runner.recover(
+            request=request,
+            execution=outcome.execution,
+            starting_execution_profile=snapshot.execution_profile,
+            trial=trial,
+            operation=operation,
+            view=view,
+            reference_key=wrong_key,
+        )
+
+    assert len(factory.created_apps) == created_apps
+
+
 class _RuntimeRunner(MemoryInterventionRuntimeRunner):
     execution_profile_fingerprint = _digest("runtime-runner:v1")
 
@@ -1486,6 +1608,7 @@ class _RuntimeRunner(MemoryInterventionRuntimeRunner):
         trial: AgentSnapshotTrialBinding,
         operation: MemoryInterventionOperation,
         view: MemoryInterventionRuntimeView,
+        reference_key,
     ) -> MemoryInterventionRuntimeResult:
         self.run_calls += 1
         if self.raise_child_cancellation:
@@ -1533,6 +1656,7 @@ class _RuntimeRunner(MemoryInterventionRuntimeRunner):
         trial: AgentSnapshotTrialBinding,
         operation: MemoryInterventionOperation,
         view: MemoryInterventionRuntimeView,
+        reference_key,
     ) -> MemoryInterventionRuntimeResult:
         self.recover_calls += 1
         value = self.results.get(operation.operation_id)
@@ -1544,6 +1668,7 @@ class _RuntimeRunner(MemoryInterventionRuntimeRunner):
                 trial=trial,
                 operation=operation,
                 view=view,
+                reference_key=reference_key,
             )
             self.run_calls -= 1
         return value
@@ -1777,6 +1902,12 @@ class _CommitThenFailExecutionStore(MemoryInterventionExecutionStore):
             raise ConnectionError("test acknowledgement lost after exact commit")
         return committed
 
+    async def transition_runtime_dispatch_ownership(self, execution_id, request):
+        return await self.delegate.transition_runtime_dispatch_ownership(
+            execution_id,
+            request,
+        )
+
 
 class _PausingCancellationAuthorityStore(MemoryInterventionExecutionStore):
     def __init__(self, delegate: MemoryInterventionExecutionStore) -> None:
@@ -1802,6 +1933,112 @@ class _PausingCancellationAuthorityStore(MemoryInterventionExecutionStore):
             self.publication_started.set()
             await self.allow_publication.wait()
         return await self.delegate.compare_and_set(expected, desired)
+
+    async def transition_runtime_dispatch_ownership(self, execution_id, request):
+        return await self.delegate.transition_runtime_dispatch_ownership(
+            execution_id,
+            request,
+        )
+
+
+class _OwnershipTransitionFaultStore(MemoryInterventionExecutionStore):
+    def __init__(
+        self,
+        delegate: MemoryInterventionExecutionStore,
+        *,
+        failure: str,
+    ) -> None:
+        self.delegate = delegate
+        self.failure = failure
+        self.failed = False
+        self.requests: list[DurableOperationOwnershipTransition] = []
+
+    async def begin(
+        self,
+        record: MemoryInterventionExecutionRecord,
+    ) -> MemoryInterventionExecutionRecord:
+        return await self.delegate.begin(record)
+
+    async def load(self, execution_id: str) -> MemoryInterventionExecutionRecord | None:
+        return await self.delegate.load(execution_id)
+
+    async def compare_and_set(
+        self,
+        expected: MemoryInterventionExecutionRecord,
+        desired: MemoryInterventionExecutionRecord,
+    ) -> MemoryInterventionExecutionRecord:
+        return await self.delegate.compare_and_set(expected, desired)
+
+    async def transition_runtime_dispatch_ownership(self, execution_id, request):
+        self.requests.append(request)
+        if self.failed:
+            return await self.delegate.transition_runtime_dispatch_ownership(
+                execution_id,
+                request,
+            )
+        self.failed = True
+        if self.failure == "precommit":
+            raise ConnectionError("test ownership failed before commit")
+        if self.failure == "commit-before-error":
+            await self.delegate.transition_runtime_dispatch_ownership(
+                execution_id,
+                request,
+            )
+            raise ConnectionError("test ownership acknowledgement was lost")
+        if self.failure != "indeterminate":
+            raise AssertionError(f"Unknown ownership failure mode: {self.failure}")
+        current = await self.delegate.load(execution_id)
+        assert current is not None
+        return MemoryInterventionRuntimeOwnershipResult(
+            execution=current,
+            ownership=DurableOperationOwnershipResult(
+                disposition=DurableOperationOwnershipDisposition.INDETERMINATE,
+                observed_at=current.updated_at,
+            ),
+        )
+
+
+class _ExpireBeforeRuntimePublicationStore(MemoryInterventionExecutionStore):
+    def __init__(
+        self,
+        delegate: MemoryInterventionExecutionStore,
+        store_now: list[datetime],
+    ) -> None:
+        self.delegate = delegate
+        self.store_now = store_now
+        self.expired = False
+
+    async def begin(
+        self,
+        record: MemoryInterventionExecutionRecord,
+    ) -> MemoryInterventionExecutionRecord:
+        return await self.delegate.begin(record)
+
+    async def load(self, execution_id: str) -> MemoryInterventionExecutionRecord | None:
+        return await self.delegate.load(execution_id)
+
+    async def compare_and_set(
+        self,
+        expected: MemoryInterventionExecutionRecord,
+        desired: MemoryInterventionExecutionRecord,
+    ) -> MemoryInterventionExecutionRecord:
+        if (
+            not self.expired
+            and expected.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+            and desired.phase is MemoryInterventionExecutionPhase.RUNTIME_TERMINAL
+        ):
+            ownership = expected.runtime_dispatch_ownership
+            assert ownership is not None
+            assert ownership.lease_expires_at is not None
+            self.expired = True
+            self.store_now[0] = ownership.lease_expires_at
+        return await self.delegate.compare_and_set(expected, desired)
+
+    async def transition_runtime_dispatch_ownership(self, execution_id, request):
+        return await self.delegate.transition_runtime_dispatch_ownership(
+            execution_id,
+            request,
+        )
 
 
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
@@ -1848,6 +2085,606 @@ async def test_execution_stores_reject_phase_skips_and_committed_evidence_rewrit
 
     with pytest.raises(MemoryInterventionExecutionConflict, match="cannot change"):
         await store.compare_and_set(trial_bound, rewritten)
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@_async_test
+async def test_execution_stores_share_authoritative_runtime_ownership_semantics(
+    tmp_path,
+    backend: str,
+) -> None:
+    store_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+    store: MemoryInterventionExecutionStore
+    if backend == "memory":
+        store = InMemoryMemoryInterventionExecutionStore(ownership_clock=lambda: store_now[0])
+    else:
+        store = SQLiteMemoryInterventionExecutionStore(
+            tmp_path / "ownership-executions.db",
+            ownership_clock=lambda: store_now[0],
+        )
+    session_bound = await _stored_session_bound_record(store)
+    first_claim = DurableOperationOwnershipTransition(
+        operation_id=session_bound.execution_id,
+        claim_id="claim-1",
+        owner_id="worker-1",
+        action=DurableOperationOwnershipAction.CLAIM,
+        lease_seconds=30,
+    )
+
+    acquired = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        first_claim,
+    )
+    assert acquired.ownership.disposition is DurableOperationOwnershipDisposition.ACQUIRED
+    assert acquired.ownership.observed_at == store_now[0]
+    assert acquired.ownership.ownership is not None
+    assert acquired.execution.revision == session_bound.revision + 1
+
+    store_now[0] += timedelta(seconds=29)
+    second_claim = DurableOperationOwnershipTransition(
+        operation_id=session_bound.execution_id,
+        claim_id="claim-2",
+        owner_id="worker-2",
+        action=DurableOperationOwnershipAction.CLAIM,
+        lease_seconds=30,
+    )
+    live_owner = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        second_claim,
+    )
+    assert live_owner.ownership.disposition is DurableOperationOwnershipDisposition.FENCED
+    assert live_owner.execution == acquired.execution
+
+    store_now[0] += timedelta(seconds=1)
+    taken_over = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        second_claim,
+    )
+    assert taken_over.ownership.disposition is (
+        DurableOperationOwnershipDisposition.EXPIRED_TAKEN_OVER
+    )
+    assert taken_over.ownership.ownership is not None
+    assert taken_over.ownership.ownership.generation == 2
+
+    stale_renewal = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=session_bound.execution_id,
+            claim_id="claim-1",
+            owner_id="worker-1",
+            generation=1,
+            action=DurableOperationOwnershipAction.RENEW,
+            lease_seconds=30,
+        ),
+    )
+    assert stale_renewal.ownership.disposition is (DurableOperationOwnershipDisposition.FENCED)
+    assert stale_renewal.execution == taken_over.execution
+
+    terminal = _record_successor(
+        taken_over.execution,
+        phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        status=MemoryInterventionExecutionStatus.CONFLICTING,
+        failure_code="intervention_conflicting",
+    )
+    terminal = await store.compare_and_set(taken_over.execution, terminal)
+    advanced = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=session_bound.execution_id,
+            claim_id="claim-3",
+            owner_id="worker-3",
+            action=DurableOperationOwnershipAction.CLAIM,
+            lease_seconds=30,
+        ),
+    )
+    assert advanced.ownership.disposition is (
+        DurableOperationOwnershipDisposition.OPERATION_ADVANCED
+    )
+    assert advanced.execution == terminal
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@_async_test
+async def test_worker_timestamp_skew_cannot_block_store_time_ownership_or_publication(
+    tmp_path,
+    backend: str,
+) -> None:
+    store_now = [datetime(2026, 8, 24, tzinfo=UTC)]
+    store: MemoryInterventionExecutionStore
+    if backend == "memory":
+        store = InMemoryMemoryInterventionExecutionStore(ownership_clock=lambda: store_now[0])
+    else:
+        store = SQLiteMemoryInterventionExecutionStore(
+            tmp_path / "ownership-worker-clock-skew.db",
+            ownership_clock=lambda: store_now[0],
+        )
+    session_bound = await _stored_session_bound_record(store)
+    assert session_bound.updated_at > store_now[0]
+
+    acquired = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=session_bound.execution_id,
+            claim_id="clock-skew-claim",
+            owner_id="clock-skew-worker",
+            action=DurableOperationOwnershipAction.CLAIM,
+            lease_seconds=MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+        ),
+    )
+
+    assert acquired.ownership.disposition is DurableOperationOwnershipDisposition.ACQUIRED
+    assert acquired.ownership.ownership is not None
+    assert acquired.ownership.ownership.acquired_at == store_now[0]
+    assert acquired.execution.updated_at == session_bound.updated_at
+
+    snapshot = _snapshot()
+    executor, _, _, _ = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=store,
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    published, won = await executor._publish_runtime_control_authority(
+        acquired.execution,
+        control="timeout",
+    )
+
+    assert won is True
+    assert published.runtime_timeout_observed is True
+    assert published.runtime_dispatch_ownership == acquired.execution.runtime_dispatch_ownership
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@_async_test
+async def test_execution_stores_reject_runtime_ownership_rewrites_outside_transition(
+    tmp_path,
+    backend: str,
+) -> None:
+    store_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+    store: MemoryInterventionExecutionStore
+    if backend == "memory":
+        store = InMemoryMemoryInterventionExecutionStore(ownership_clock=lambda: store_now[0])
+    else:
+        store = SQLiteMemoryInterventionExecutionStore(
+            tmp_path / "ownership-rewrite.db",
+            ownership_clock=lambda: store_now[0],
+        )
+    session_bound = await _stored_session_bound_record(store)
+    acquired = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=session_bound.execution_id,
+            claim_id="claim-1",
+            owner_id="worker-1",
+            action=DurableOperationOwnershipAction.CLAIM,
+            lease_seconds=30,
+        ),
+    )
+    ownership = acquired.ownership.ownership
+    assert ownership is not None
+    forged = ownership.model_copy(update={"owner_id": "forged-worker"})
+    desired = _record_successor(
+        acquired.execution,
+        phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        runtime_dispatch_ownership=forged,
+    )
+
+    with pytest.raises(MemoryInterventionExecutionConflict, match="atomic ownership transition"):
+        await store.compare_and_set(acquired.execution, desired)
+
+    assert await store.load(session_bound.execution_id) == acquired.execution
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("control", ("cancellation", "timeout"))
+@_async_test
+async def test_expired_or_transferred_runtime_owner_cannot_publish_control_authority(
+    tmp_path,
+    backend: str,
+    control: Literal["cancellation", "timeout"],
+) -> None:
+    store_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+    if backend == "memory":
+        first_store: MemoryInterventionExecutionStore = InMemoryMemoryInterventionExecutionStore(
+            ownership_clock=lambda: store_now[0]
+        )
+        second_store = first_store
+    else:
+        path = tmp_path / f"stale-{control}-publication.db"
+        first_store = SQLiteMemoryInterventionExecutionStore(
+            path,
+            ownership_clock=lambda: store_now[0],
+        )
+        second_store = SQLiteMemoryInterventionExecutionStore(
+            path,
+            ownership_clock=lambda: store_now[0],
+        )
+    session_bound = await _stored_session_bound_record(first_store)
+    acquired = await first_store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=session_bound.execution_id,
+            claim_id="claim-1",
+            owner_id="worker-1",
+            action=DurableOperationOwnershipAction.CLAIM,
+            lease_seconds=MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+        ),
+    )
+    original = acquired.ownership.ownership
+    assert original is not None
+    assert original.lease_expires_at is not None
+    snapshot = _snapshot()
+    executor, _, _, _ = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=first_store,
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    store_now[0] = original.lease_expires_at
+
+    with pytest.raises(MemoryInterventionExecutionConflict, match="live dispatch ownership"):
+        await executor._publish_runtime_control_authority(
+            acquired.execution,
+            control=control,
+        )
+
+    takeover = await second_store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=session_bound.execution_id,
+            claim_id="claim-2",
+            owner_id="worker-2",
+            action=DurableOperationOwnershipAction.CLAIM,
+            lease_seconds=MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+        ),
+    )
+    assert takeover.ownership.disposition is (
+        DurableOperationOwnershipDisposition.EXPIRED_TAKEN_OVER
+    )
+
+    with pytest.raises(MemoryInterventionExecutionConflict, match="live dispatch ownership"):
+        await executor._publish_runtime_control_authority(
+            acquired.execution,
+            control=control,
+        )
+
+    persisted = await first_store.load(session_bound.execution_id)
+    assert persisted == takeover.execution
+    assert persisted is not None
+    assert persisted.runtime_cancellation_observed is False
+    assert persisted.runtime_timeout_observed is False
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@_async_test
+async def test_execution_store_two_worker_barrier_fences_live_and_stale_owners(
+    tmp_path,
+    backend: str,
+) -> None:
+    store_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+    if backend == "memory":
+        first_store: MemoryInterventionExecutionStore = InMemoryMemoryInterventionExecutionStore(
+            ownership_clock=lambda: store_now[0]
+        )
+        second_store = first_store
+    else:
+        path = tmp_path / "ownership-barrier.db"
+        first_store = SQLiteMemoryInterventionExecutionStore(
+            path,
+            ownership_clock=lambda: store_now[0],
+        )
+        second_store = SQLiteMemoryInterventionExecutionStore(
+            path,
+            ownership_clock=lambda: store_now[0],
+        )
+    session_bound = await _stored_session_bound_record(first_store)
+
+    async def contend(
+        store: MemoryInterventionExecutionStore,
+        claim_id: str,
+        owner_id: str,
+        barrier: asyncio.Event,
+    ):
+        await barrier.wait()
+        return await store.transition_runtime_dispatch_ownership(
+            session_bound.execution_id,
+            DurableOperationOwnershipTransition(
+                operation_id=session_bound.execution_id,
+                claim_id=claim_id,
+                owner_id=owner_id,
+                action=DurableOperationOwnershipAction.CLAIM,
+                lease_seconds=30,
+            ),
+        )
+
+    first_barrier = asyncio.Event()
+    first_tasks = (
+        asyncio.create_task(contend(first_store, "claim-1", "worker-1", first_barrier)),
+        asyncio.create_task(contend(second_store, "claim-2", "worker-2", first_barrier)),
+    )
+    first_barrier.set()
+    first_results = await asyncio.gather(*first_tasks)
+    assert {result.ownership.disposition for result in first_results} == {
+        DurableOperationOwnershipDisposition.ACQUIRED,
+        DurableOperationOwnershipDisposition.FENCED,
+    }
+    acquired = next(
+        result
+        for result in first_results
+        if result.ownership.disposition is DurableOperationOwnershipDisposition.ACQUIRED
+    )
+    assert acquired.ownership.ownership is not None
+    original = acquired.ownership.ownership
+    assert original.lease_expires_at is not None
+
+    store_now[0] = original.lease_expires_at
+    takeover_barrier = asyncio.Event()
+    takeover_tasks = (
+        asyncio.create_task(contend(first_store, "claim-3", "worker-3", takeover_barrier)),
+        asyncio.create_task(contend(second_store, "claim-4", "worker-4", takeover_barrier)),
+    )
+    takeover_barrier.set()
+    takeover_results = await asyncio.gather(*takeover_tasks)
+    assert {result.ownership.disposition for result in takeover_results} == {
+        DurableOperationOwnershipDisposition.EXPIRED_TAKEN_OVER,
+        DurableOperationOwnershipDisposition.FENCED,
+    }
+    taken_over = next(
+        result
+        for result in takeover_results
+        if result.ownership.disposition is DurableOperationOwnershipDisposition.EXPIRED_TAKEN_OVER
+    )
+    assert taken_over.ownership.ownership is not None
+    assert taken_over.ownership.ownership.generation == original.generation + 1
+
+    stale_settlement = await first_store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=original.operation_id,
+            claim_id=original.claim_id,
+            owner_id=original.owner_id,
+            generation=original.generation,
+            action=DurableOperationOwnershipAction.SETTLE,
+        ),
+    )
+    assert stale_settlement.ownership.disposition is (DurableOperationOwnershipDisposition.FENCED)
+    assert stale_settlement.execution == taken_over.execution
+
+
+@pytest.mark.parametrize("failure", ("precommit", "commit-before-error"))
+@_async_test
+async def test_runtime_ownership_acknowledgement_recovery_uses_the_exact_claim(
+    failure: str,
+) -> None:
+    snapshot = _snapshot()
+    durable_store = InMemoryMemoryInterventionExecutionStore()
+    fault_store = _OwnershipTransitionFaultStore(durable_store, failure=failure)
+    executor, overlay, runner, evaluator = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=fault_store,
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    request = _request(_spec(snapshot), trial_id=f"ownership-{failure}")
+
+    with pytest.raises(ConnectionError, match="ownership"):
+        await executor.execute_trial(request)
+
+    interrupted = await durable_store.load(request.execution_id)
+    assert interrupted is not None
+    assert interrupted.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+    assert (interrupted.runtime_dispatch_ownership is not None) is (
+        failure == "commit-before-error"
+    )
+
+    recovered = await executor.execute_trial(request)
+
+    assert recovered.execution.status is MemoryInterventionExecutionStatus.COMPLETED
+    assert len(fault_store.requests) == 3
+    assert fault_store.requests[0].claim_id == fault_store.requests[1].claim_id
+    assert all(
+        ownership_request.action is DurableOperationOwnershipAction.CLAIM
+        for ownership_request in fault_store.requests[:2]
+    )
+    assert fault_store.requests[2].action is DurableOperationOwnershipAction.RENEW
+    assert fault_store.requests[2].claim_id == fault_store.requests[1].claim_id
+    assert fault_store.requests[2].owner_id == fault_store.requests[1].owner_id
+    assert fault_store.requests[2].generation == 1
+    assert overlay.apply_calls == 1
+    assert overlay.recover_calls == 1
+    assert runner.run_calls == 0
+    assert runner.recover_calls == 1
+    assert evaluator.evaluate_calls == 1
+
+
+@_async_test
+async def test_indeterminate_runtime_ownership_fails_before_dispatch() -> None:
+    snapshot = _snapshot()
+    durable_store = InMemoryMemoryInterventionExecutionStore()
+    fault_store = _OwnershipTransitionFaultStore(
+        durable_store,
+        failure="indeterminate",
+    )
+    executor, _, runner, evaluator = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=fault_store,
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    request = _request(_spec(snapshot), trial_id="ownership-indeterminate")
+
+    with pytest.raises(MemoryInterventionExecutionConflict, match="indeterminate"):
+        await executor.execute_trial(request)
+
+    interrupted = await durable_store.load(request.execution_id)
+    assert interrupted is not None
+    assert interrupted.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+    assert interrupted.runtime_dispatch_ownership is None
+    assert runner.run_calls == 0
+    assert runner.recover_calls == 0
+    assert evaluator.evaluate_calls == 0
+
+
+@_async_test
+async def test_runtime_ownership_wait_is_bounded_to_four_store_reads_per_second(
+    monkeypatch,
+) -> None:
+    store_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+    store = InMemoryMemoryInterventionExecutionStore(ownership_clock=lambda: store_now[0])
+    session_bound = await _stored_session_bound_record(store)
+    first = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=session_bound.execution_id,
+            claim_id="blocking-claim",
+            owner_id="blocking-worker",
+            action=DurableOperationOwnershipAction.CLAIM,
+            lease_seconds=1,
+        ),
+    )
+    assert first.ownership.ownership is not None
+    snapshot = _snapshot()
+    executor, _, _, _ = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=store,
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    waits: list[float] = []
+
+    async def advance_store_time(seconds: float) -> None:
+        waits.append(seconds)
+        store_now[0] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(
+        memory_intervention_execution_module.asyncio,
+        "sleep",
+        advance_store_time,
+    )
+
+    claimed, run_fresh, ownership = await executor._claim_runtime_dispatch(
+        first.execution,
+        fresh_if_acquired=False,
+    )
+
+    assert waits == [MEMORY_INTERVENTION_RUNTIME_OWNERSHIP_WAIT_SECONDS] * 4
+    assert ownership is not None
+    assert ownership.generation == 2
+    assert run_fresh is False
+    assert claimed.runtime_dispatch_ownership == ownership
+
+
+@_async_test
+async def test_runtime_heartbeat_writes_once_per_interval(monkeypatch) -> None:
+    store_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+    store = InMemoryMemoryInterventionExecutionStore(ownership_clock=lambda: store_now[0])
+    session_bound = await _stored_session_bound_record(store)
+    acquired = await store.transition_runtime_dispatch_ownership(
+        session_bound.execution_id,
+        DurableOperationOwnershipTransition(
+            operation_id=session_bound.execution_id,
+            claim_id="heartbeat-claim",
+            owner_id="heartbeat-worker",
+            action=DurableOperationOwnershipAction.CLAIM,
+            lease_seconds=MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+        ),
+    )
+    assert acquired.ownership.ownership is not None
+    snapshot = _snapshot()
+    executor, _, _, _ = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=store,
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    wait_cycles = 0
+
+    async def drive_heartbeat(awaitable, timeout: float):
+        nonlocal wait_cycles
+        awaitable.close()
+        wait_cycles += 1
+        assert timeout == MEMORY_INTERVENTION_RUNTIME_HEARTBEAT_SECONDS
+        if wait_cycles <= 3:
+            store_now[0] += timedelta(seconds=timeout)
+            raise TimeoutError
+        return True
+
+    monkeypatch.setattr(
+        memory_intervention_execution_module.asyncio,
+        "wait_for",
+        drive_heartbeat,
+    )
+    stop = asyncio.Event()
+
+    await executor._heartbeat_runtime_dispatch(
+        session_bound.execution_id,
+        acquired.ownership.ownership,
+        stop,
+    )
+
+    updated = await store.load(session_bound.execution_id)
+    assert updated is not None
+    assert wait_cycles == 4
+    assert updated.revision == acquired.execution.revision + 3
+    assert updated.runtime_dispatch_ownership is not None
+    assert updated.runtime_dispatch_ownership.renewed_at == store_now[0]
+    assert MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS >= (
+        3 * MEMORY_INTERVENTION_RUNTIME_HEARTBEAT_SECONDS
+    )
+
+
+@_async_test
+async def test_runtime_result_publication_is_fenced_at_the_store_write_boundary() -> None:
+    store_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+    durable_store = InMemoryMemoryInterventionExecutionStore(ownership_clock=lambda: store_now[0])
+    execution_store = _ExpireBeforeRuntimePublicationStore(durable_store, store_now)
+    snapshot = _snapshot()
+    executor, _, runner, evaluator = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=execution_store,
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    request = _request(_spec(snapshot), trial_id="expiry-at-runtime-publication")
+
+    with pytest.raises(
+        MemoryInterventionExecutionConflict,
+        match="live store-authoritative dispatch ownership",
+    ):
+        await executor.execute_trial(request)
+
+    persisted = await durable_store.load(request.execution_id)
+    assert execution_store.expired is True
+    assert persisted is not None
+    assert persisted.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+    assert persisted.runtime_evidence_fingerprint is None
+    assert persisted.runtime_result_fingerprint is None
+    assert persisted.runtime_result_payload is None
+    assert runner.run_calls == 1
+    assert runner.recover_calls == 0
+    assert evaluator.evaluate_calls == 0
+    assert evaluator.recover_calls == 0
 
 
 @_async_test
@@ -2363,6 +3200,11 @@ async def test_recorded_timeout_with_missing_session_never_redispatches(tmp_path
     bound = await executions.load(request.execution_id)
     assert bound is not None
     executor.executions = executions
+    bound, _, ownership = await executor._claim_runtime_dispatch(
+        bound,
+        fresh_if_acquired=False,
+    )
+    assert ownership is not None
     timed_out = await executor._record_runtime_timeout(bound)
     assert timed_out.runtime_timeout_observed is True
 

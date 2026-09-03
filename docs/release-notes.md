@@ -89,6 +89,59 @@ guard.
 
 ## Unreleased
 
+### Durable dispatch ownership now uses store time and reusable fencing
+
+Cayu now has a small internal durable-operation ownership component for
+feature-owned journals. Strict bounded records retain the logical operation,
+claim, owner, fencing generation, and store-stamped lease evidence; typed
+transitions distinguish acquisition, exact acknowledgement replay, renewal,
+expired takeover, release, settlement, fencing, phase advancement, identity
+conflict, and indeterminate acknowledgement. The consuming store performs the
+comparison and timestamping atomically. Workers can request a bounded duration
+but cannot supply `now` or an expiry cutoff. Deterministic in-memory and SQLite
+tests and transactional PostgreSQL conformance cover concurrent claim and
+takeover races, stale settlement, clock behavior, and pre-commit versus
+commit-before-error recovery. Exact committed release and settlement retries
+return their original acknowledgement even after the feature phase advances;
+foreign operation identities still fail before phase classification. A skewed
+worker-authored feature timestamp cannot delay a store-time claim, takeover, or
+live-owner publication.
+
+Memory-intervention runtime dispatch is the first production consumer. Its
+execution journal advances to schema version 2 and replaces feature-local owner
+and lease fields with the shared fenced value. There is no version-1 ownership
+reader or dual-write path: old prerelease execution records are rejected rather
+than reinterpreted as unowned. Exact retries in one worker reuse their logical
+claim, heartbeat writes are limited to one per 10 seconds under a 30-second
+lease, foreign-owner polling is capped at four reads per second, and stale
+generations cannot publish control or terminal evidence. Those publications
+renew the exact generation and then recheck lease liveness using store time
+inside the final compare-and-set, so exact expiry without takeover is also
+fenced. Ordinary phase compare-and-set cannot rewrite ownership. Custom
+execution stores must implement both store-time boundaries; the base class
+provides no lossy CAS fallback.
+
+Runtime-generated session creation also has a bounded, secret-free durable
+claim reference. A purpose-separated HMAC and explicit key identity bind the
+exact request without giving durable-storage readers an offline oracle for
+guessed prompts or secrets; key material is never serialized. Memory
+interventions derive a restricted subkey from their rotated restart-stable
+request key, while generated workflow children use attempt-local random keys
+and a claim identity that remains stable across fresh attempts. Trusted helpers
+reconstruct the opaque process-local claim only for the exact request, session,
+invocation provenance, logical operation, and key. One typed authentication
+boundary verifies running sessions with transient input and terminal sessions
+after that input has been cleaned up, including the final prepared-message
+digest, while distinguishing missing, foreign, incomplete, malformed, and
+tampered evidence. Both memory interventions and generated workflow children
+use this boundary. Task, provider-operation,
+compaction, and independent-fork ownership were audited but intentionally not
+migrated because their receipts, post-dispatch quiescence, or checkpoint/run-epoch
+fences are materially different from a transferable renewable lease.
+Custom memory-intervention runtime runners must accept the new restricted
+reference-key argument and keep it ephemeral; it cannot mint the durable parent
+request fingerprint.
+
 ### A credential-free campaign exercises causal memory end to end
 
 The checked causal-memory reference corpus now runs repeated `as_declared`,

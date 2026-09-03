@@ -1182,6 +1182,118 @@ Streaming consumers should buffer assistant text deltas when structured output i
 
 Creates sessions, stores events, stores provider-neutral transcripts, and checkpoints runtime state.
 
+### Durable operation ownership and reconstructed session-create claims
+
+Runtime workflows that need a renewable dispatch fence may embed the internal
+`DurableOperationOwnership` value in their own durable record. The value is a
+strict, versioned, bounded authority tuple: logical operation ID, logical claim
+ID, owner ID, monotonically increasing generation, active/released/settled
+state, and store-stamped acquisition, renewal, expiry, release, or settlement
+times. It contains no request payload, prompt, message, credential, private
+runtime token, or feature result. It is not an operation journal: the consuming
+feature continues to own its phases, terminal classifications, evidence, and
+record schema.
+
+`transition_durable_operation_ownership(...)` is a pure decision table used
+inside a consuming store's atomic write boundary. The store must lock or
+compare the feature record, sample its authoritative time, pass that exact
+sample to the reducer, and persist the returned ownership with the feature
+revision in the same transaction. A worker cannot submit `now` or an expiry
+timestamp. In-memory and SQLite memory-intervention stores sample their
+injected store clock while holding their write lock or `BEGIN IMMEDIATE`;
+PostgreSQL consumers use database time after taking the row lock. Shared
+conformance exercises the reducer inside
+`PostgresSessionStore.transform_checkpoint_with_store_time(...)`, including
+two concurrent claimants and two concurrent expired-claim contenders.
+
+The typed results distinguish acquisition, exact live-owner observation,
+renewal, expired takeover, release, settlement, foreign/stale fencing,
+feature-phase advancement, identity conflict, and an indeterminate store
+acknowledgement. Takeover always advances the generation. Renew, release,
+settle, and feature evidence publication require the exact claim, owner, and
+generation; an expired or transferred generation cannot act. An exact retry
+after commit-before-error observes the unchanged live owner, release, or
+settlement acknowledgement, even when the feature phase has already advanced.
+Operation identity is validated before that phase classification. A pre-commit
+failure leaves no authority, while an ambiguous custom-store result remains
+`indeterminate` and never authorizes dispatch. Lease renewal never moves durable
+time evidence backward if a store clock regresses. Feature-record timestamps
+remain monotonic bookkeeping only: a worker timestamp ahead of store time cannot
+block claim, renewal, takeover, or live-owner publication decisions.
+
+Memory-intervention control markers and runtime results have a second mandatory
+store boundary: the compare-and-set that publishes them samples authoritative
+time while holding the same write lock and rejects an expired lease, including
+at exact expiry. The executor first renews the original claim, owner, and
+generation, then publishes against the store-returned revision. Consequently a
+takeover changes the revision and an expiry without takeover still fences the
+write. Ordinary phase compare-and-set cannot install or rewrite dispatch
+ownership; only the typed atomic ownership transition may do so.
+
+`MemoryInterventionExecutionStore.transition_runtime_dispatch_ownership(...)`
+is the first production store seam. Custom implementations must perform the
+same load, store-time sample, reduction, feature revision, and write atomically.
+Their `compare_and_set(...)` implementation must likewise sample store time
+inside its atomic boundary when publishing session-bound control authority or a
+runtime result, and require the embedded ownership lease to remain live.
+The base method has no CAS fallback and raises `NotImplementedError` before
+runtime dispatch, allowing an existing custom store class to be instantiated
+and upgraded without silently weakening ownership. The memory-intervention
+execution journal is schema version 2; version-1 records are rejected rather
+than treated as unowned. Its runtime lease is 30 seconds, heartbeats occur at
+most once per 10 seconds, and a live foreign-owner wait polls at most four
+times per second. Exact live-owner observation and fencing are read-only, so
+they do not amplify journal revisions.
+
+The second reusable boundary is `RuntimeSessionCreateClaimReference`. This
+secret-free record binds one runtime-generated session ID and logical operation
+ID to a fixed-size, purpose-separated HMAC of the exact request authority, its
+non-secret key ID, and a stable claim digest. The HMAC prevents a feature-journal
+reader from testing guessed prompts, metadata, or low-entropy secrets against
+the durable record. Memory intervention derives a restricted reference key from
+its restart-stable, rotated request key; the derived key cannot mint the parent
+request fingerprint. Generated workflow children use an attempt-local random
+key because their reference never crosses the attempt boundary. Claim identity
+depends only on the stable generated session and operation identities, so a
+fresh workflow attempt or memory-key rotation can still authenticate an existing
+session through its final prepared-request evidence.
+
+The internal `MemoryInterventionRuntimeRunner.run(...)` and `recover(...)`
+entrances receive that restricted reference key explicitly. Custom runners must
+accept the argument, retain it only for the call lifetime, and must not serialize,
+log, or return it. It cannot authenticate or forge the parent intervention
+request fingerprint.
+
+Trusted runtime helpers create the reference before admission and reconstruct a
+fresh process-local opaque claim only from the exact `RunRequest` and matching
+key. Changing the session, operation, messages, metadata, invocation provenance,
+parent, task, causal budget, key identity, or key material fails closed. Private
+claim tokens, raw request material, and HMAC keys never enter the feature
+journal.
+
+`authenticate_runtime_session_create_claim_reference(...)` is the single
+proof boundary for adopting an existing deterministic session. It returns
+typed missing, matching, foreign, incomplete, malformed, tampered, or
+identity-conflict dispositions. A running session must retain matching transient input.
+A cleaned-up terminal session is authenticated from final create-claim
+evidence plus the reconstructed prepared-request and message digests, exact
+session identity, and invocation provenance, so cleanup does not weaken recovery
+to ID equality or accept a rewritten final message digest. Memory-intervention
+execution and generated workflow children both use this reference,
+reconstruction, and authentication boundary.
+
+The ownership migration audit intentionally stopped after memory intervention.
+Independent fork dispatch uses an immutable fork-bound pre-admission and
+first-invocation receipt, not a transferable renewable lease. Explicit
+compaction couples its claim to checkpoint, run-epoch, provider-completion, and
+cancellation evidence. Task claims also govern retry-series admission,
+post-dispatch quiescence, cancellation, and terminalization; an expired
+dispatched task is deliberately not ordinary takeover authority. Provider
+operations use pre-dispatch stages and insert-only completion winners rather
+than owner leases. Hiding those different proofs behind the generic reducer
+would erase feature invariants, so none is migrated merely to manufacture a
+second ownership consumer.
+
 Session identifiers accepted for new durable sessions are limited to 2,048
 UTF-8 bytes. `list_sessions(...)` keyset cursors are opaque, versioned values
 limited to 4,096 UTF-8 bytes; custom stores must return and accept cursors within
@@ -5608,16 +5720,20 @@ cannot therefore interleave between the fence and insert, and concurrent
 reservation retains one winner before child execution.
 Generated workflow children derive their session id from the workflow run,
 workflow name, and logical step id, then defer the step reservation until the
-session create is known durable. Their create request carries an opaque,
-deterministic runtime-owned claim materialized only after caller metadata has
-crossed the public preparation boundary. If cancellation, an operational error,
-or process reconstruction follows a committed create whose acknowledgement was
-lost, the workflow recomputes that identity, authenticates the exact stored
-claim and deferred input, publishes its `workflow.step.started` reservation,
-and recovers the child. A missing or conflicting claim is not attached, loaded
-as step output, or recovered, so a concurrent foreign identity winner remains
-untouched. Session stores must preserve runtime-owned session metadata on create
-and user-metadata replacement for this readback boundary.
+session create is known durable. Their journal-independent, secret-free durable
+claim reference binds the exact generated session, logical step operation, and
+prepared request. A trusted runtime helper reconstructs its opaque process-local
+claim only after caller metadata has crossed the public preparation boundary.
+If cancellation, an operational error, or process reconstruction follows a
+committed create whose acknowledgement was lost, the workflow recomputes the
+request, uses the shared typed authentication boundary to verify the stored
+claim and invocation provenance, publishes its `workflow.step.started`
+reservation, and recovers the child. Live sessions additionally require exact
+deferred input; a cleaned-up terminal child uses its final create evidence. A
+missing, partial, malformed, tampered, or conflicting claim is not attached,
+loaded as step output, or recovered, so a concurrent foreign identity winner
+remains untouched. Session stores must preserve runtime-owned session metadata
+on create and user-metadata replacement for this readback boundary.
 
 `gated_loop` journal identities use the fixed-size `gated-loop:v2:` form derived
 from the canonical `(loop_name, item_key)` tuple. Delimiters, Unicode, and long
@@ -12175,10 +12291,13 @@ failure, and unknown outcomes after restart. They reject phase skips, evidence
 rewrites, stale revisions, and a SQLite indexed revision that disagrees with
 its validated record. A lost acknowledgement is therefore resolved by loading
 the exact phase rather than repeating or reinterpreting the logical trial.
-The session-bound revision also persists the runtime-owned session-create
-claim, absolute deadline, dispatch owner, and renewable lease. A competing
-worker waits while that lease is live and may enter recovery only after durable
-lease expiry; losing the phase CAS is not abandonment evidence.
+The session-bound revision also persists the bounded runtime session-create
+claim reference, absolute deadline, and embedded durable dispatch ownership.
+The execution store samples lease time atomically and returns the shared typed
+ownership outcomes; workers neither calculate an expiry cutoff nor infer
+abandonment from a phase-CAS loss. A competing worker waits while the foreign
+lease is live and may enter recovery only after a store-authoritative takeover
+advances the fencing generation.
 
 `MemoryInterventionOverlayProvider.recover()` must use the precommitted
 operation id as its idempotency authority. Recovery can begin after the claim
@@ -12209,11 +12328,14 @@ interrupted status. The canonical runner enforces the absolute runtime deadline
 recorded at the session-bound revision. Expiry before session creation records
 timeout evidence without dispatch, and a failed, cancelled, or restarted
 evidence read recovers the same timed-out classification instead of granting a
-fresh timeout. The runtime-owned create claim binds the exact prepared request,
-causal budget, trial metadata, and execution profile; recovery rejects a
-foreign session even when it occupies the deterministic session id. Concurrent
-deliveries of one exact execution identity share the durable lease through
-runtime dispatch rather than racing recovery or fencing a live owner;
+fresh timeout. The durable create-claim reference binds the exact prepared
+request, logical execution, causal budget, trial metadata, and invocation
+provenance while the opaque runtime token remains process-local. The shared
+authentication helper verifies both live sessions with transient input and
+terminal sessions after that input is cleaned up; recovery rejects a foreign
+session even when it occupies the deterministic session id. Concurrent
+deliveries of one exact execution identity share the store-owned durable lease
+through runtime dispatch rather than racing recovery or fencing a live owner;
 evaluation recovery uses the full execution identity.
 
 Every executable view carries an exact

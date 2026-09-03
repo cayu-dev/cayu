@@ -74,6 +74,14 @@ from cayu.runtime import (
     SessionTopologyQuery,
     TranscriptQuery,
 )
+from cayu.runtime._durable_operation_ownership import (
+    DurableOperationOwnership,
+    DurableOperationOwnershipAction,
+    DurableOperationOwnershipDisposition,
+    DurableOperationOwnershipResult,
+    DurableOperationOwnershipTransition,
+    transition_durable_operation_ownership,
+)
 from cayu.runtime.checks import check_manifest
 from cayu.runtime.provider_operations import ProviderOperationResolutionAction
 from cayu.runtime.public_authority import (
@@ -2333,6 +2341,124 @@ def test_postgres_store_time_session_operation_samples_database_commit_time(post
         assert await store.load_session_operation(session.id, operation_key) == {
             "observed_at": transform_times[0].isoformat()
         }
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_store_time_atomically_fences_durable_operation_ownership(postgres_dsn):
+    async def ops(store):
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_pg_durable_operation_ownership",
+                messages=[Message.text("user", "database time owns the lease")],
+            ),
+            identity=_identity(),
+        )
+        checkpoint_key = "test_durable_operation_ownership"
+
+        async def transition(
+            request: DurableOperationOwnershipTransition,
+        ) -> DurableOperationOwnershipResult:
+            observed: list[DurableOperationOwnershipResult] = []
+
+            def apply(_session, checkpoint, store_now):
+                current_payload = None if checkpoint is None else checkpoint.get(checkpoint_key)
+                current = (
+                    None
+                    if current_payload is None
+                    else DurableOperationOwnership.model_validate(current_payload)
+                )
+                result = transition_durable_operation_ownership(
+                    current,
+                    request,
+                    store_now=store_now,
+                    operation_active=True,
+                )
+                observed.append(result)
+                if result.ownership == current:
+                    return None
+                assert result.ownership is not None
+                return {
+                    **({} if checkpoint is None else checkpoint),
+                    checkpoint_key: result.ownership.model_dump(mode="json"),
+                }
+
+            await store.transform_checkpoint_with_store_time(session.id, apply)
+            assert len(observed) == 1
+            return observed[0]
+
+        def claim(claim_id: str, owner_id: str) -> DurableOperationOwnershipTransition:
+            return DurableOperationOwnershipTransition(
+                operation_id="postgres-operation-1",
+                claim_id=claim_id,
+                owner_id=owner_id,
+                action=DurableOperationOwnershipAction.CLAIM,
+                lease_seconds=30,
+            )
+
+        acquired, fenced = await asyncio.gather(
+            transition(claim("claim-1", "worker-1")),
+            transition(claim("claim-2", "worker-2")),
+        )
+        if acquired.disposition is DurableOperationOwnershipDisposition.FENCED:
+            acquired, fenced = fenced, acquired
+        assert acquired.disposition is DurableOperationOwnershipDisposition.ACQUIRED
+        assert fenced.disposition is DurableOperationOwnershipDisposition.FENCED
+        assert acquired.ownership is not None
+        assert acquired.ownership.acquired_at == acquired.observed_at
+        assert acquired.ownership.renewed_at == acquired.observed_at
+        assert fenced.ownership == acquired.ownership
+
+        seeded_times: list[datetime] = []
+
+        def expire_with_database_time(_session, checkpoint, store_now):
+            assert checkpoint is not None
+            seeded_times.append(store_now)
+            expired = DurableOperationOwnership.model_validate(
+                {
+                    **acquired.ownership.model_dump(mode="python"),
+                    "acquired_at": store_now - timedelta(seconds=60),
+                    "renewed_at": store_now - timedelta(seconds=60),
+                    "lease_expires_at": store_now - timedelta(seconds=1),
+                }
+            )
+            return {
+                **checkpoint,
+                checkpoint_key: expired.model_dump(mode="json"),
+            }
+
+        await store.transform_checkpoint_with_store_time(session.id, expire_with_database_time)
+        assert len(seeded_times) == 1
+
+        takeover_results = await asyncio.gather(
+            transition(claim("claim-3", "worker-3")),
+            transition(claim("claim-4", "worker-4")),
+        )
+        assert {result.disposition for result in takeover_results} == {
+            DurableOperationOwnershipDisposition.EXPIRED_TAKEN_OVER,
+            DurableOperationOwnershipDisposition.FENCED,
+        }
+        taken_over = next(
+            result
+            for result in takeover_results
+            if result.disposition is DurableOperationOwnershipDisposition.EXPIRED_TAKEN_OVER
+        )
+        assert taken_over.ownership is not None
+        assert taken_over.ownership.generation == acquired.ownership.generation + 1
+        assert taken_over.ownership.acquired_at == taken_over.observed_at
+
+        stale = await transition(
+            DurableOperationOwnershipTransition(
+                operation_id=acquired.ownership.operation_id,
+                claim_id=acquired.ownership.claim_id,
+                owner_id=acquired.ownership.owner_id,
+                generation=acquired.ownership.generation,
+                action=DurableOperationOwnershipAction.SETTLE,
+            )
+        )
+        assert stale.disposition is DurableOperationOwnershipDisposition.FENCED
+        assert stale.ownership == taken_over.ownership
 
     _run(postgres_dsn, ops)
 

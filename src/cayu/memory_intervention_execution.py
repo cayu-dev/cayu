@@ -36,6 +36,7 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._clock import utc_clock
 from cayu._exception_groups import (
     exception_cause,
     exception_tree_contains,
@@ -99,6 +100,15 @@ from cayu.memory_interventions import (
     MemoryInterventionTrialBinding,
     memory_attribution_fingerprint,
 )
+from cayu.runtime._durable_operation_ownership import (
+    DurableOperationOwnership,
+    DurableOperationOwnershipAction,
+    DurableOperationOwnershipDisposition,
+    DurableOperationOwnershipResult,
+    DurableOperationOwnershipState,
+    DurableOperationOwnershipTransition,
+    transition_durable_operation_ownership,
+)
 from cayu.runtime._memory_attribution import (
     MemoryAttributionCaptureBudget,
     project_memory_attribution,
@@ -112,18 +122,21 @@ from cayu.runtime.sessions import (
     IncompleteSessionRecoveryRequest,
     RunnerObservedEventIdentity,
     RunRequest,
+    RuntimeSessionCreateClaimAuthenticationDisposition,
+    RuntimeSessionCreateClaimReference,
+    RuntimeSessionCreateClaimReferenceKey,
     Session,
     SessionStatus,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
+    authenticate_runtime_session_create_claim_reference,
     copy_run_request,
     copy_session,
     copy_terminal_session_evidence,
     run_request_with_runtime_generated_authority,
-    run_request_with_runtime_session_create_claim,
-    session_has_runtime_create_claim,
-    session_invocation_matches_run_request,
+    run_request_with_runtime_session_create_claim_reference,
+    runtime_session_create_claim_reference,
 )
 from cayu.storage.memory import (
     KnowledgeAccessScope,
@@ -132,11 +145,13 @@ from cayu.storage.memory import (
 )
 
 MEMORY_INTERVENTION_EXECUTION_SCHEMA_VERSION = 1
+MEMORY_INTERVENTION_EXECUTION_RECORD_SCHEMA_VERSION = 2
 MEMORY_INTERVENTION_EXECUTION_MAX_TIMEOUT_SECONDS = 3_600
 MEMORY_INTERVENTION_EXECUTION_MAX_RECORD_BYTES = 1 << 20
 MEMORY_INTERVENTION_ATTRIBUTION_MAX_PROJECTION_BYTES = 1 << 19
-MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS = 1.0
-MEMORY_INTERVENTION_RUNTIME_HEARTBEAT_SECONDS = 0.25
+MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS = 30
+MEMORY_INTERVENTION_RUNTIME_HEARTBEAT_SECONDS = 10.0
+MEMORY_INTERVENTION_RUNTIME_OWNERSHIP_WAIT_SECONDS = 0.25
 
 _HMAC_CONTEXT = b"cayu.memory-intervention-execution-request.v1\x00"
 _SHA256_HEX = frozenset("0123456789abcdef")
@@ -414,6 +429,18 @@ class MemoryInterventionRequestFingerprintKey:
             hashlib.sha256,
         ).hexdigest()
 
+    def runtime_session_create_reference_key(self) -> RuntimeSessionCreateClaimReferenceKey:
+        """Derive a restricted runtime-reference key from this rotated root key."""
+
+        return RuntimeSessionCreateClaimReferenceKey(
+            key_id=self.key_id,
+            secret=hmac.digest(
+                self.secret,
+                b"cayu.memory-intervention.runtime-session-create-reference-key.v1",
+                "sha256",
+            ),
+        )
+
 
 class MemoryInterventionExecutionRecord(_ExecutionModel):
     """One CAS-owned durable execution journal row."""
@@ -421,7 +448,7 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
     record_type: Literal["cayu.memory-intervention-execution"] = (
         "cayu.memory-intervention-execution"
     )
-    schema_version: Literal[1] = MEMORY_INTERVENTION_EXECUTION_SCHEMA_VERSION
+    schema_version: Literal[2] = MEMORY_INTERVENTION_EXECUTION_RECORD_SCHEMA_VERSION
     execution_id: StrictStr
     request_key_id: StrictStr = Field(max_length=_MAX_ID_CHARS)
     request_fingerprint: StrictStr
@@ -443,10 +470,9 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
     revision: StrictInt = Field(ge=0)
     runtime_cancellation_observed: bool = False
     runtime_timeout_observed: bool = False
-    runtime_session_claim_id: StrictStr | None = None
+    runtime_session_create_claim: RuntimeSessionCreateClaimReference | None = None
     runtime_deadline_at: datetime | None = None
-    runtime_dispatch_owner_id: StrictStr | None = Field(default=None, max_length=128)
-    runtime_dispatch_lease_expires_at: datetime | None = None
+    runtime_dispatch_ownership: DurableOperationOwnership | None = None
     created_at: datetime
     updated_at: datetime
     materialization_fingerprint: StrictStr | None = None
@@ -498,7 +524,6 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
         "overlay_provider_fingerprint",
         "runtime_runner_fingerprint",
         "evaluator_fingerprint",
-        "runtime_session_claim_id",
         "materialization_fingerprint",
         "trial_binding_fingerprint",
         "operation_fingerprint",
@@ -535,7 +560,6 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
         "case_id",
         "session_id",
         "causal_budget_id",
-        "runtime_dispatch_owner_id",
     )
     @classmethod
     def validate_text(cls, value: str | None, info) -> str | None:
@@ -544,20 +568,27 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
         return _clean(
             value,
             info.field_name,
-            max_chars=(
-                512
-                if info.field_name in {"session_id", "causal_budget_id"}
-                else 128
-                if info.field_name == "runtime_dispatch_owner_id"
-                else 256
-            ),
+            max_chars=(512 if info.field_name in {"session_id", "causal_budget_id"} else 256),
         )
+
+    @field_validator("runtime_dispatch_ownership", mode="before")
+    @classmethod
+    def copy_runtime_dispatch_ownership(cls, value: object) -> object:
+        if value is None:
+            return None
+        return revalidate_model_input(value, DurableOperationOwnership)
+
+    @field_validator("runtime_session_create_claim", mode="before")
+    @classmethod
+    def copy_runtime_session_create_claim(cls, value: object) -> object:
+        if value is None:
+            return None
+        return revalidate_model_input(value, RuntimeSessionCreateClaimReference)
 
     @field_validator(
         "created_at",
         "updated_at",
         "runtime_deadline_at",
-        "runtime_dispatch_lease_expires_at",
     )
     @classmethod
     def validate_timestamps(cls, value: datetime | None, info) -> datetime | None:
@@ -577,12 +608,11 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
             ),
             MemoryInterventionExecutionPhase.EFFECT_RESOLVED: ("receipt_fingerprint",),
             MemoryInterventionExecutionPhase.SESSION_BOUND: (
-                "runtime_session_claim_id",
+                "runtime_session_create_claim",
                 "runtime_deadline_at",
-                "runtime_dispatch_owner_id",
-                "runtime_dispatch_lease_expires_at",
             ),
             MemoryInterventionExecutionPhase.RUNTIME_TERMINAL: (
+                "runtime_dispatch_ownership",
                 "runtime_evidence_fingerprint",
                 "runtime_result_fingerprint",
                 "runtime_result_payload",
@@ -605,10 +635,9 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
             "trial_binding_fingerprint": MemoryInterventionExecutionPhase.TRIAL_BOUND,
             "operation_fingerprint": MemoryInterventionExecutionPhase.TRIAL_BOUND,
             "receipt_fingerprint": MemoryInterventionExecutionPhase.EFFECT_RESOLVED,
-            "runtime_session_claim_id": MemoryInterventionExecutionPhase.SESSION_BOUND,
+            "runtime_session_create_claim": MemoryInterventionExecutionPhase.SESSION_BOUND,
             "runtime_deadline_at": MemoryInterventionExecutionPhase.SESSION_BOUND,
-            "runtime_dispatch_owner_id": MemoryInterventionExecutionPhase.SESSION_BOUND,
-            "runtime_dispatch_lease_expires_at": MemoryInterventionExecutionPhase.SESSION_BOUND,
+            "runtime_dispatch_ownership": MemoryInterventionExecutionPhase.SESSION_BOUND,
             "runtime_evidence_fingerprint": MemoryInterventionExecutionPhase.RUNTIME_TERMINAL,
             "runtime_result_fingerprint": MemoryInterventionExecutionPhase.RUNTIME_TERMINAL,
             "runtime_result_payload": MemoryInterventionExecutionPhase.RUNTIME_TERMINAL,
@@ -632,6 +661,16 @@ class MemoryInterventionExecutionRecord(_ExecutionModel):
             raise ValueError(
                 "Runtime terminal-control authority cannot precede the durable session claim."
             )
+        if (
+            self.runtime_dispatch_ownership is not None
+            and self.runtime_dispatch_ownership.operation_id != self.execution_id
+        ):
+            raise ValueError("Runtime dispatch ownership conflicts with execution identity.")
+        if self.runtime_session_create_claim is not None and (
+            self.runtime_session_create_claim.session_id != self.session_id
+            or self.runtime_session_create_claim.operation_id != self.execution_id
+        ):
+            raise ValueError("Runtime session create reference conflicts with execution identity.")
         if self.runtime_result_payload is not None:
             runtime_result = MemoryInterventionRuntimeResult.model_validate(
                 self.runtime_result_payload
@@ -824,6 +863,92 @@ class MemoryInterventionExecutionConflict(RuntimeError):
     pass
 
 
+class MemoryInterventionRuntimeOwnershipResult(_ExecutionModel):
+    """One store-authenticated runtime-dispatch ownership observation."""
+
+    execution: MemoryInterventionExecutionRecord
+    ownership: DurableOperationOwnershipResult
+
+    @field_validator("execution", mode="before")
+    @classmethod
+    def copy_execution(cls, value: object) -> object:
+        return revalidate_model_input(value, MemoryInterventionExecutionRecord)
+
+    @field_validator("ownership", mode="before")
+    @classmethod
+    def copy_ownership(cls, value: object) -> object:
+        return revalidate_model_input(value, DurableOperationOwnershipResult)
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> Self:
+        if (
+            self.ownership.disposition is not DurableOperationOwnershipDisposition.INDETERMINATE
+            and self.execution.runtime_dispatch_ownership != self.ownership.ownership
+        ):
+            raise ValueError("Ownership result conflicts with the execution record.")
+        return self
+
+
+def _transition_runtime_dispatch_ownership(
+    current: MemoryInterventionExecutionRecord,
+    request: DurableOperationOwnershipTransition,
+    *,
+    store_now: datetime,
+) -> MemoryInterventionRuntimeOwnershipResult:
+    outcome = transition_durable_operation_ownership(
+        current.runtime_dispatch_ownership,
+        request,
+        store_now=store_now,
+        operation_active=(
+            current.status is MemoryInterventionExecutionStatus.ACTIVE
+            and current.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+        ),
+    )
+    desired = current
+    if outcome.ownership != current.runtime_dispatch_ownership:
+        desired = MemoryInterventionExecutionRecord.model_validate(
+            {
+                **current.model_dump(mode="python"),
+                "revision": current.revision + 1,
+                # Feature timestamps remain monotonic bookkeeping, not lease
+                # authority. A skewed worker timestamp must not stop the store
+                # from deciding ownership with its own transaction time.
+                "updated_at": max(current.updated_at, outcome.observed_at),
+                "runtime_dispatch_ownership": outcome.ownership,
+            }
+        )
+        _validate_transition(
+            current,
+            desired,
+            runtime_ownership_transition=True,
+        )
+    return MemoryInterventionRuntimeOwnershipResult(
+        execution=desired,
+        ownership=outcome,
+    )
+
+
+def _runtime_dispatch_ownership_matches(
+    actual: DurableOperationOwnership | None,
+    expected: DurableOperationOwnership | DurableOperationOwnershipTransition,
+) -> bool:
+    """Match the exact logical claim while allowing a store-stamped lease."""
+
+    return (
+        type(actual) is DurableOperationOwnership
+        and type(expected)
+        in {
+            DurableOperationOwnership,
+            DurableOperationOwnershipTransition,
+        }
+        and actual.state is DurableOperationOwnershipState.ACTIVE
+        and actual.operation_id == expected.operation_id
+        and actual.claim_id == expected.claim_id
+        and actual.owner_id == expected.owner_id
+        and (expected.generation is None or actual.generation == expected.generation)
+    )
+
+
 class _MemoryInterventionRuntimeTimeoutObserved(Exception):
     """In-process handoff that durably records timeout before evidence reads."""
 
@@ -856,7 +981,29 @@ class MemoryInterventionExecutionStore(ABC):
         expected: MemoryInterventionExecutionRecord,
         desired: MemoryInterventionExecutionRecord,
     ) -> MemoryInterventionExecutionRecord:
-        """Advance one exact execution revision atomically."""
+        """Advance one exact execution revision atomically.
+
+        A session-bound control or runtime-result publication must also verify
+        that the embedded dispatch ownership is live using time sampled inside
+        this same write boundary.
+        """
+
+    async def transition_runtime_dispatch_ownership(
+        self,
+        execution_id: str,
+        request: DurableOperationOwnershipTransition,
+    ) -> MemoryInterventionRuntimeOwnershipResult:
+        """Apply one ownership transition using time sampled by this store.
+
+        Custom stores must compare and persist the embedded ownership in the
+        same transaction that samples ``store_now``.  There is deliberately no
+        lossy compare-and-set fallback: an unported store fails before runtime
+        dispatch while remaining constructible for an orderly upgrade.
+        """
+
+        raise NotImplementedError(
+            "The execution store does not implement atomic runtime ownership."
+        )
 
 
 def _copy_record(record: MemoryInterventionExecutionRecord) -> MemoryInterventionExecutionRecord:
@@ -881,6 +1028,8 @@ def _validated_store_record(
 def _validate_transition(
     expected: MemoryInterventionExecutionRecord,
     desired: MemoryInterventionExecutionRecord,
+    *,
+    runtime_ownership_transition: bool = False,
 ) -> None:
     if expected.execution_id != desired.execution_id:
         raise MemoryInterventionExecutionConflict("Execution identity changed.")
@@ -907,15 +1056,22 @@ def _validate_transition(
         and not expected.runtime_timeout_observed
         and desired.runtime_timeout_observed
     )
+    dispatch_ownership_changed = (
+        desired.runtime_dispatch_ownership != expected.runtime_dispatch_ownership
+    )
     dispatch_authority_advanced = (
         expected.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
         and desired.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
-        and (
-            desired.runtime_dispatch_owner_id != expected.runtime_dispatch_owner_id
-            or desired.runtime_dispatch_lease_expires_at
-            != expected.runtime_dispatch_lease_expires_at
-        )
+        and dispatch_ownership_changed
     )
+    if dispatch_ownership_changed and not runtime_ownership_transition:
+        raise MemoryInterventionExecutionConflict(
+            "Runtime dispatch ownership must use the atomic ownership transition."
+        )
+    if phase_delta == 1 and dispatch_ownership_changed:
+        raise MemoryInterventionExecutionConflict(
+            "Runtime dispatch ownership cannot change while execution phase advances."
+        )
     if (
         phase_delta == 0
         and desired.status is MemoryInterventionExecutionStatus.ACTIVE
@@ -933,14 +1089,6 @@ def _validate_transition(
     if expected.runtime_timeout_observed and not desired.runtime_timeout_observed:
         raise MemoryInterventionExecutionConflict(
             "Durable runtime timeout authority cannot be removed."
-        )
-    if (
-        expected.runtime_dispatch_lease_expires_at is not None
-        and desired.runtime_dispatch_lease_expires_at is not None
-        and desired.runtime_dispatch_lease_expires_at < expected.runtime_dispatch_lease_expires_at
-    ):
-        raise MemoryInterventionExecutionConflict(
-            "Durable runtime dispatch lease cannot move backward."
         )
     if (
         not expected.runtime_cancellation_observed
@@ -970,7 +1118,7 @@ def _validate_transition(
         "trial_binding_fingerprint",
         "operation_fingerprint",
         "receipt_fingerprint",
-        "runtime_session_claim_id",
+        "runtime_session_create_claim",
         "runtime_deadline_at",
         "runtime_evidence_fingerprint",
         "runtime_result_fingerprint",
@@ -988,10 +1136,52 @@ def _validate_transition(
         )
 
 
+def _is_runtime_dispatch_publication(
+    expected: MemoryInterventionExecutionRecord,
+    desired: MemoryInterventionExecutionRecord,
+) -> bool:
+    publishes_control_authority = (
+        expected.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+        and desired.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+        and (
+            desired.runtime_cancellation_observed != expected.runtime_cancellation_observed
+            or desired.runtime_timeout_observed != expected.runtime_timeout_observed
+        )
+    )
+    publishes_runtime_result = (
+        expected.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+        and desired.phase is MemoryInterventionExecutionPhase.RUNTIME_TERMINAL
+    )
+    return publishes_control_authority or publishes_runtime_result
+
+
+def _validate_runtime_dispatch_publication(
+    expected: MemoryInterventionExecutionRecord,
+    desired: MemoryInterventionExecutionRecord,
+    *,
+    store_now: datetime,
+) -> None:
+    """Fence owner-authored evidence at the store's atomic write boundary."""
+
+    if not _is_runtime_dispatch_publication(expected, desired):
+        return
+    ownership = expected.runtime_dispatch_ownership
+    if (
+        ownership is None
+        or ownership.state is not DurableOperationOwnershipState.ACTIVE
+        or ownership.lease_expires_at is None
+        or store_now >= ownership.lease_expires_at
+    ):
+        raise MemoryInterventionExecutionConflict(
+            "Runtime publication requires live store-authoritative dispatch ownership."
+        )
+
+
 class InMemoryMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
-    def __init__(self) -> None:
+    def __init__(self, *, ownership_clock: Callable[[], datetime] | None = None) -> None:
         self._records: dict[str, MemoryInterventionExecutionRecord] = {}
         self._lock = asyncio.Lock()
+        self._ownership_clock = utc_clock(ownership_clock)
 
     async def begin(
         self,
@@ -1027,17 +1217,52 @@ class InMemoryMemoryInterventionExecutionStore(MemoryInterventionExecutionStore)
             existing = self._records.get(expected.execution_id)
             if existing is None or existing != expected:
                 raise MemoryInterventionExecutionConflict("Execution revision changed.")
+            if _is_runtime_dispatch_publication(expected, desired):
+                _validate_runtime_dispatch_publication(
+                    expected,
+                    desired,
+                    store_now=self._ownership_clock(),
+                )
             self._records[expected.execution_id] = desired
             return _copy_record(desired)
+
+    async def transition_runtime_dispatch_ownership(
+        self,
+        execution_id: str,
+        request: DurableOperationOwnershipTransition,
+    ) -> MemoryInterventionRuntimeOwnershipResult:
+        execution_id = _sha256(execution_id, "execution_id")
+        if type(request) is not DurableOperationOwnershipTransition:
+            raise TypeError("request must be a DurableOperationOwnershipTransition.")
+        async with self._lock:
+            current = self._records.get(execution_id)
+            if current is None:
+                raise MemoryInterventionExecutionConflict("Execution is unavailable.")
+            result = _transition_runtime_dispatch_ownership(
+                current,
+                request,
+                store_now=self._ownership_clock(),
+            )
+            if result.execution != current:
+                self._records[execution_id] = result.execution
+            return MemoryInterventionRuntimeOwnershipResult.model_validate(
+                result.model_dump(mode="python")
+            )
 
 
 class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
     """SQLite execution journal using one exact JSON document per CAS revision."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        ownership_clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.path = Path(path)
         self._schema_lock = threading.Lock()
         self._schema_ready = False
+        self._ownership_clock = utc_clock(ownership_clock)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -1152,6 +1377,12 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
             existing = MemoryInterventionExecutionRecord.model_validate_json(row[1])
             if row[0] != expected.revision or existing != expected:
                 raise MemoryInterventionExecutionConflict("Execution revision changed.")
+            if _is_runtime_dispatch_publication(expected, desired):
+                _validate_runtime_dispatch_publication(
+                    expected,
+                    desired,
+                    store_now=self._ownership_clock(),
+                )
             updated = connection.execute(
                 "UPDATE cayu_memory_intervention_executions "
                 "SET revision = ?, document = ? "
@@ -1166,6 +1397,61 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
             if updated.rowcount != 1:
                 raise MemoryInterventionExecutionConflict("Execution revision changed.")
         return desired
+
+    async def transition_runtime_dispatch_ownership(
+        self,
+        execution_id: str,
+        request: DurableOperationOwnershipTransition,
+    ) -> MemoryInterventionRuntimeOwnershipResult:
+        execution_id = _sha256(execution_id, "execution_id")
+        if type(request) is not DurableOperationOwnershipTransition:
+            raise TypeError("request must be a DurableOperationOwnershipTransition.")
+        return await asyncio.to_thread(
+            self._transition_runtime_dispatch_ownership_sync,
+            execution_id,
+            request,
+        )
+
+    def _transition_runtime_dispatch_ownership_sync(
+        self,
+        execution_id: str,
+        request: DurableOperationOwnershipTransition,
+    ) -> MemoryInterventionRuntimeOwnershipResult:
+        self._ensure_schema()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT revision, document FROM cayu_memory_intervention_executions "
+                "WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+            if row is None:
+                raise MemoryInterventionExecutionConflict("Execution is unavailable.")
+            current = MemoryInterventionExecutionRecord.model_validate_json(row[1])
+            if row[0] != current.revision:
+                raise MemoryInterventionExecutionConflict(
+                    "Stored execution revision conflicts with its durable document."
+                )
+            result = _transition_runtime_dispatch_ownership(
+                current,
+                request,
+                store_now=self._ownership_clock(),
+            )
+            if result.execution != current:
+                updated = connection.execute(
+                    "UPDATE cayu_memory_intervention_executions "
+                    "SET revision = ?, document = ? "
+                    "WHERE execution_id = ? AND revision = ?",
+                    (
+                        result.execution.revision,
+                        result.execution.model_dump_json(),
+                        execution_id,
+                        current.revision,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise MemoryInterventionExecutionConflict("Execution revision changed.")
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -1260,7 +1546,11 @@ class MemoryInterventionOverlayProvider(ABC):
 
 
 class MemoryInterventionRuntimeRunner(ABC):
-    """Typed internal runtime entrance; caller metadata cannot construct it."""
+    """Typed internal runtime entrance; caller metadata cannot construct it.
+
+    The executor supplies only a domain-derived session-reference key. A runner
+    never receives the root key that authenticates the durable trial request.
+    """
 
     execution_profile_fingerprint: str
 
@@ -1282,6 +1572,7 @@ class MemoryInterventionRuntimeRunner(ABC):
         trial: AgentSnapshotTrialBinding,
         operation: MemoryInterventionOperation,
         view: MemoryInterventionRuntimeView,
+        reference_key: RuntimeSessionCreateClaimReferenceKey,
     ) -> MemoryInterventionRuntimeResult:
         pass
 
@@ -1295,6 +1586,7 @@ class MemoryInterventionRuntimeRunner(ABC):
         trial: AgentSnapshotTrialBinding,
         operation: MemoryInterventionOperation,
         view: MemoryInterventionRuntimeView,
+        reference_key: RuntimeSessionCreateClaimReferenceKey,
     ) -> MemoryInterventionRuntimeResult:
         """Complete or reconcile the exact precommitted runtime session.
 
@@ -1390,6 +1682,29 @@ def _interrupted_runtime_disposition(
     return AgentSnapshotTerminalDisposition.OUTCOME_UNKNOWN
 
 
+def _memory_intervention_runtime_request(
+    request: MemoryInterventionTrialRequest,
+    execution: MemoryInterventionExecutionRecord,
+    trial: AgentSnapshotTrialBinding,
+) -> RunRequest:
+    """Rebuild the exact runtime-owned request represented by the journal."""
+
+    metadata = dict(request.run_request.metadata)
+    metadata.update(trial.session_metadata())
+    runtime_request = copy_run_request(request.run_request).model_copy(
+        update={
+            "session_id": execution.session_id,
+            "causal_budget_id": execution.causal_budget_id,
+            "metadata": metadata,
+        }
+    )
+    return run_request_with_runtime_generated_authority(
+        runtime_request,
+        "session_id",
+        "causal_budget_id",
+    )
+
+
 class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
     """Run a fixed intervention through Cayu's ordinary runtime pipeline."""
 
@@ -1428,7 +1743,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         self.execution_profile_fingerprint = _content_sha256(
             {
                 "kind": "cayu_memory_intervention_runtime",
-                "version": 1,
+                "version": 2,
                 "factory_id": self._factory_id,
                 "factory_fingerprint": self._factory_fingerprint,
                 "attribution_bounds": self._attribution_bounds.model_dump(mode="json"),
@@ -1454,6 +1769,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         trial: AgentSnapshotTrialBinding,
         operation: MemoryInterventionOperation,
         view: MemoryInterventionRuntimeView,
+        reference_key: RuntimeSessionCreateClaimReferenceKey,
     ) -> MemoryInterventionRuntimeResult:
         (
             app,
@@ -1469,6 +1785,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             trial=trial,
             operation=operation,
             view=view,
+            reference_key=reference_key,
         )
         return await self._execute(
             app=app,
@@ -1479,6 +1796,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             expected_context_policy=policy,
             session_create_claim=session_create_claim,
             execution=execution,
+            reference_key=reference_key,
         )
 
     async def recover(
@@ -1490,6 +1808,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         trial: AgentSnapshotTrialBinding,
         operation: MemoryInterventionOperation,
         view: MemoryInterventionRuntimeView,
+        reference_key: RuntimeSessionCreateClaimReferenceKey,
     ) -> MemoryInterventionRuntimeResult:
         (
             app,
@@ -1505,6 +1824,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             trial=trial,
             operation=operation,
             view=view,
+            reference_key=reference_key,
         )
         session = await app.session_store.load(execution.session_id)
         if session is None:
@@ -1526,15 +1846,17 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 expected_context_policy=policy,
                 session_create_claim=session_create_claim,
                 execution=execution,
+                reference_key=reference_key,
             )
-        if not _session_matches_intervention_create_claim(
+        session = await _authenticate_intervention_session(
+            app,
             session,
             session_create_claim,
+            reference=execution.runtime_session_create_claim,
             request=runtime_request,
-        ):
-            raise MemoryInterventionExecutionConflict(
-                "Canonical runtime session does not match its intervention create claim."
-            )
+            operation_id=execution.execution_id,
+            reference_key=reference_key,
+        )
         if session.status not in {
             SessionStatus.COMPLETED,
             SessionStatus.FAILED,
@@ -1551,12 +1873,15 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 )
             )
             session = await app.session_store.load(execution.session_id)
-            if session is None or not _session_matches_intervention_create_claim(
-                session, session_create_claim, request=runtime_request
-            ):
-                raise MemoryInterventionExecutionConflict(
-                    "Canonical runtime session does not match its intervention create claim."
-                )
+            session = await _authenticate_intervention_session(
+                app,
+                session,
+                session_create_claim,
+                reference=execution.runtime_session_create_claim,
+                request=runtime_request,
+                operation_id=execution.execution_id,
+                reference_key=reference_key,
+            )
         return await self._collect_result(
             app=app,
             expected_session=session,
@@ -1574,10 +1899,17 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         trial: AgentSnapshotTrialBinding,
         operation: MemoryInterventionOperation,
         view: MemoryInterventionRuntimeView,
+        reference_key: RuntimeSessionCreateClaimReferenceKey,
     ):
         from cayu.runtime.app import CayuApp
         from cayu.runtime.memory_context import AutomaticRecallContextPolicy
 
+        if type(reference_key) is not RuntimeSessionCreateClaimReferenceKey:
+            raise TypeError("reference_key must be a RuntimeSessionCreateClaimReferenceKey.")
+        if reference_key.key_id != execution.request_key_id:
+            raise MemoryInterventionExecutionConflict(
+                "Runtime session reference key conflicts with execution authority."
+            )
         if (
             _clean(self.factory.factory_id, "factory.factory_id") != self._factory_id
             or _sha256(
@@ -1589,6 +1921,29 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             raise MemoryInterventionExecutionConflict(
                 "Memory intervention runtime factory identity changed."
             )
+        runtime_request = _memory_intervention_runtime_request(
+            request,
+            execution,
+            trial,
+        )
+        session_create_reference = execution.runtime_session_create_claim
+        if session_create_reference is None:
+            raise MemoryInterventionExecutionConflict(
+                "Runtime execution is missing its durable session claim reference."
+            )
+        try:
+            runtime_request, session_create_claim = (
+                run_request_with_runtime_session_create_claim_reference(
+                    runtime_request,
+                    session_create_reference,
+                    operation_id=execution.execution_id,
+                    key=reference_key,
+                )
+            )
+        except ValueError:
+            raise MemoryInterventionExecutionConflict(
+                "Runtime session claim reference conflicts with execution authority."
+            ) from None
         value = await self.factory.create(
             request=request,
             execution=execution,
@@ -1625,28 +1980,6 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             raise MemoryInterventionExecutionConflict(
                 "Memory intervention runtime did not install the exact canonical recall policy."
             )
-        metadata = dict(request.run_request.metadata)
-        metadata.update(trial.session_metadata())
-        runtime_request = copy_run_request(request.run_request).model_copy(
-            update={
-                "session_id": execution.session_id,
-                "causal_budget_id": execution.causal_budget_id,
-                "metadata": metadata,
-            }
-        )
-        runtime_request = run_request_with_runtime_generated_authority(
-            runtime_request,
-            "session_id",
-            "causal_budget_id",
-        )
-        if execution.runtime_session_claim_id is None:
-            raise MemoryInterventionExecutionConflict(
-                "Runtime execution is missing its durable session claim."
-            )
-        runtime_request, session_create_claim = run_request_with_runtime_session_create_claim(
-            runtime_request,
-            claim_id=execution.runtime_session_claim_id,
-        )
         expected_profile = _sha256(
             self.factory.expected_execution_profile_fingerprint(request.spec),
             "factory expected execution profile",
@@ -1700,6 +2033,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         expected_context_policy,
         session_create_claim,
         execution: MemoryInterventionExecutionRecord,
+        reference_key: RuntimeSessionCreateClaimReferenceKey,
     ) -> MemoryInterventionRuntimeResult:
         observed: list[RunnerObservedEventIdentity] = []
         remaining_timeout = _remaining_runtime_timeout(request, execution)
@@ -1737,15 +2071,19 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                     runtime_request=runtime_request,
                     session_create_claim=session_create_claim,
                     observed_events=observed_events,
+                    reference_key=reference_key,
                 )
             ) from None
         session = await app.session_store.load(execution.session_id)
-        if session is None or not _session_matches_intervention_create_claim(
-            session, session_create_claim, request=runtime_request
-        ):
-            raise MemoryInterventionExecutionConflict(
-                "Canonical runtime session does not match its intervention create claim."
-            )
+        session = await _authenticate_intervention_session(
+            app,
+            session,
+            session_create_claim,
+            reference=execution.runtime_session_create_claim,
+            request=runtime_request,
+            operation_id=execution.execution_id,
+            reference_key=reference_key,
+        )
         return await self._collect_result(
             app=app,
             expected_session=session,
@@ -1762,6 +2100,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         runtime_request: RunRequest,
         session_create_claim: object,
         observed_events: tuple[RunnerObservedEventIdentity, ...],
+        reference_key: RuntimeSessionCreateClaimReferenceKey,
     ) -> MemoryInterventionRuntimeResult:
         session = await app.session_store.load(execution.session_id)
         if session is None:
@@ -1773,14 +2112,15 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                     execution.session_id,
                 ),
             )
-        if not _session_matches_intervention_create_claim(
+        session = await _authenticate_intervention_session(
+            app,
             session,
             session_create_claim,
+            reference=execution.runtime_session_create_claim,
             request=runtime_request,
-        ):
-            raise MemoryInterventionExecutionConflict(
-                "Canonical runtime session does not match its intervention create claim."
-            )
+            operation_id=execution.execution_id,
+            reference_key=reference_key,
+        )
         return await self._collect_result(
             app=app,
             expected_session=session,
@@ -2003,22 +2343,46 @@ def _validated_memory_intervention_terminal_evidence(
         ) from None
 
 
-def _session_matches_intervention_create_claim(
+async def _authenticate_intervention_session(
+    app,
     session: Session | None,
     claim: object,
     *,
+    reference: RuntimeSessionCreateClaimReference | None,
     request: RunRequest,
-) -> bool:
-    """Authenticate a claimed session even after transient input cleanup."""
+    operation_id: str,
+    reference_key: RuntimeSessionCreateClaimReferenceKey,
+) -> Session:
+    """Translate the shared typed proof into this feature's fixed failure."""
 
-    if not session_has_runtime_create_claim(session, claim):
-        return False
-    assert isinstance(session, Session)
-    return session_invocation_matches_run_request(
-        session,
-        request=request,
-        parent_session=None,
+    if reference is None:
+        raise MemoryInterventionExecutionConflict(
+            "Canonical runtime session claim reference is unavailable."
+        )
+    deferred_input = (
+        None
+        if session is None
+        else await app.session_store.load_deferred_interaction_input(session.id)
     )
+    authentication = authenticate_runtime_session_create_claim_reference(
+        session,
+        deferred_input,
+        claim,
+        reference,
+        request=request,
+        operation_id=operation_id,
+        parent_session=None,
+        key=reference_key,
+    )
+    if (
+        authentication.disposition
+        is not RuntimeSessionCreateClaimAuthenticationDisposition.MATCHING_SESSION
+        or session is None
+    ):
+        raise MemoryInterventionExecutionConflict(
+            "Canonical runtime session does not match its intervention create claim."
+        )
+    return session
 
 
 def _remaining_runtime_timeout(
@@ -2059,7 +2423,11 @@ def _runtime_timeout_before_session_result(
                     if execution.runtime_deadline_at is None
                     else execution.runtime_deadline_at.isoformat()
                 ),
-                "runtime_session_claim_id": execution.runtime_session_claim_id,
+                "runtime_session_create_claim_id": (
+                    None
+                    if execution.runtime_session_create_claim is None
+                    else execution.runtime_session_create_claim.claim_id
+                ),
             },
             "memory intervention pre-session timeout evidence",
         ),
@@ -2403,33 +2771,41 @@ class MemoryInterventionExecutor:
         just_bound_session = False
         if record.phase is MemoryInterventionExecutionPhase.EFFECT_RESOLVED:
             deadline_started_at = self._runtime_clock()
+            runtime_request = _memory_intervention_runtime_request(
+                request,
+                record,
+                trial,
+            )
+            reference_key = memory_intervention_request_key(
+                self._request_keys,
+                record.request_key_id,
+            ).runtime_session_create_reference_key()
             desired = self._successor(
                 record,
                 phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
-                runtime_session_claim_id=_content_sha256(
-                    {
-                        "kind": "memory_intervention_runtime_session_claim",
-                        "version": 1,
-                        "execution_id": record.execution_id,
-                        "request_fingerprint": record.request_fingerprint,
-                        "operation_fingerprint": operation.fingerprint,
-                    },
-                    "memory intervention runtime session claim",
+                runtime_session_create_claim=runtime_session_create_claim_reference(
+                    runtime_request,
+                    operation_id=record.execution_id,
+                    key=reference_key,
                 ),
                 runtime_deadline_at=(
                     deadline_started_at + timedelta(seconds=request.timeout_seconds)
                 ),
-                runtime_dispatch_owner_id=self._runtime_dispatch_owner_id,
-                runtime_dispatch_lease_expires_at=self._new_runtime_lease_expiration(),
             )
             record, just_bound_session = await self._advance(record, desired)
+        run_runtime = False
+        runtime_dispatch_ownership: DurableOperationOwnership | None = None
         just_recorded_runtime = False
         if record.phase is MemoryInterventionExecutionPhase.SESSION_BOUND:
-            record, run_runtime = await self._claim_runtime_dispatch(
+            record, run_runtime, runtime_dispatch_ownership = await self._claim_runtime_dispatch(
                 record,
-                run_if_owned=just_bound_session,
+                fresh_if_acquired=just_bound_session,
             )
         if record.phase is MemoryInterventionExecutionPhase.SESSION_BOUND:
+            if runtime_dispatch_ownership is None:
+                raise MemoryInterventionExecutionConflict(
+                    "Runtime dispatch ownership disappeared before execution."
+                )
             if self._runtime_deadline_expired(record):
                 record = await self._record_runtime_timeout(record)
             current_task = asyncio.current_task()
@@ -2445,6 +2821,7 @@ class MemoryInterventionExecutor:
                     operation,
                     view,
                     run=run_runtime,
+                    ownership=runtime_dispatch_ownership,
                 )
             except BaseException as runtime_failure:
                 cancellation = next(
@@ -2593,15 +2970,6 @@ class MemoryInterventionExecutor:
             binding=binding,
         )
 
-    @staticmethod
-    def _runtime_lease_now() -> datetime:
-        return datetime.now(UTC)
-
-    def _new_runtime_lease_expiration(self) -> datetime:
-        return self._runtime_lease_now() + timedelta(
-            seconds=MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS
-        )
-
     def _runtime_deadline_expired(self, record: MemoryInterventionExecutionRecord) -> bool:
         deadline = record.runtime_deadline_at
         if deadline is None:
@@ -2614,55 +2982,95 @@ class MemoryInterventionExecutor:
         self,
         record: MemoryInterventionExecutionRecord,
         *,
-        run_if_owned: bool,
-    ) -> tuple[MemoryInterventionExecutionRecord, bool]:
-        """Wait for a live owner or take over only after its durable lease expires."""
+        fresh_if_acquired: bool,
+    ) -> tuple[
+        MemoryInterventionExecutionRecord,
+        bool,
+        DurableOperationOwnership | None,
+    ]:
+        """Claim through store time, waiting without interpreting a worker clock."""
 
         current = record
+        claim_id = "memory-intervention-runtime-claim:" + _content_sha256(
+            {
+                "execution_id": record.execution_id,
+                "owner_id": self._runtime_dispatch_owner_id,
+            },
+            "memory intervention runtime claim",
+        )
+        request = DurableOperationOwnershipTransition(
+            operation_id=record.execution_id,
+            claim_id=claim_id,
+            owner_id=self._runtime_dispatch_owner_id,
+            action=DurableOperationOwnershipAction.CLAIM,
+            lease_seconds=MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+        )
         while current.phase is MemoryInterventionExecutionPhase.SESSION_BOUND:
-            if current.runtime_dispatch_owner_id == self._runtime_dispatch_owner_id:
-                return current, run_if_owned
-            lease_expires_at = current.runtime_dispatch_lease_expires_at
-            if lease_expires_at is None:
+            raw_result = await self.executions.transition_runtime_dispatch_ownership(
+                current.execution_id,
+                request,
+            )
+            if type(raw_result) is not MemoryInterventionRuntimeOwnershipResult:
                 raise MemoryInterventionExecutionConflict(
-                    "Runtime execution is missing its durable dispatch lease."
+                    "Execution store returned invalid runtime ownership evidence."
                 )
-            if lease_expires_at <= self._runtime_lease_now():
-                desired = self._successor(
-                    current,
-                    phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
-                    runtime_dispatch_owner_id=self._runtime_dispatch_owner_id,
-                    runtime_dispatch_lease_expires_at=self._new_runtime_lease_expiration(),
-                )
-                current, claimed = await self._advance(current, desired)
-                if claimed:
-                    return current, False
-                continue
-            await asyncio.sleep(
-                min(
-                    MEMORY_INTERVENTION_RUNTIME_HEARTBEAT_SECONDS,
-                    max(
-                        0.01,
-                        (lease_expires_at - self._runtime_lease_now()).total_seconds(),
-                    ),
-                )
+            result = MemoryInterventionRuntimeOwnershipResult.model_validate(
+                raw_result.model_dump(mode="python")
             )
-            loaded = _validated_store_record(
-                await self.executions.load(current.execution_id),
-                operation="runtime dispatch ownership wait",
-            )
-            if loaded is None or loaded.immutable_identity() != current.immutable_identity():
+            current = result.execution
+            if current.immutable_identity() != record.immutable_identity():
                 raise MemoryInterventionExecutionConflict(
                     "Runtime dispatch ownership lost its execution identity."
                 )
-            current = loaded
-        return current, False
+            disposition = result.ownership.disposition
+            ownership = result.ownership.ownership
+            if disposition in {
+                DurableOperationOwnershipDisposition.ACQUIRED,
+                DurableOperationOwnershipDisposition.EQUIVALENT_LIVE_OWNER,
+                DurableOperationOwnershipDisposition.EXPIRED_TAKEN_OVER,
+            }:
+                if not _runtime_dispatch_ownership_matches(ownership, request):
+                    raise MemoryInterventionExecutionConflict(
+                        "Execution store substituted runtime ownership authority."
+                    )
+                return (
+                    current,
+                    fresh_if_acquired
+                    and disposition
+                    in {
+                        DurableOperationOwnershipDisposition.ACQUIRED,
+                        DurableOperationOwnershipDisposition.EQUIVALENT_LIVE_OWNER,
+                    },
+                    ownership,
+                )
+            if disposition is DurableOperationOwnershipDisposition.OPERATION_ADVANCED:
+                return current, False, None
+            if disposition is DurableOperationOwnershipDisposition.INDETERMINATE:
+                raise MemoryInterventionExecutionConflict(
+                    "Runtime dispatch ownership outcome is indeterminate."
+                )
+            if disposition is DurableOperationOwnershipDisposition.IDENTITY_CONFLICT:
+                raise MemoryInterventionExecutionConflict(
+                    "Runtime dispatch ownership conflicts with execution identity."
+                )
+            if (
+                disposition is not DurableOperationOwnershipDisposition.FENCED
+                or ownership is None
+                or ownership.lease_expires_at is None
+            ):
+                raise MemoryInterventionExecutionConflict(
+                    "Execution store returned contradictory runtime ownership evidence."
+                )
+            await asyncio.sleep(MEMORY_INTERVENTION_RUNTIME_OWNERSHIP_WAIT_SECONDS)
+        return current, False, None
 
     async def _heartbeat_runtime_dispatch(
         self,
         execution_id: str,
+        ownership: DurableOperationOwnership,
         stop: asyncio.Event,
     ) -> None:
+        current_ownership = ownership
         while True:
             try:
                 await asyncio.wait_for(
@@ -2672,38 +3080,70 @@ class MemoryInterventionExecutor:
                 return
             except TimeoutError:
                 pass
-            current = _validated_store_record(
-                await self.executions.load(execution_id),
-                operation="runtime dispatch heartbeat",
+            result = await self.executions.transition_runtime_dispatch_ownership(
+                execution_id,
+                DurableOperationOwnershipTransition(
+                    operation_id=current_ownership.operation_id,
+                    claim_id=current_ownership.claim_id,
+                    owner_id=current_ownership.owner_id,
+                    generation=current_ownership.generation,
+                    action=DurableOperationOwnershipAction.RENEW,
+                    lease_seconds=MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+                ),
             )
-            if (
-                current is None
-                or current.phase is not MemoryInterventionExecutionPhase.SESSION_BOUND
-            ):
-                return
-            if current.runtime_dispatch_owner_id != self._runtime_dispatch_owner_id:
+            if type(result) is not MemoryInterventionRuntimeOwnershipResult:
                 raise MemoryInterventionExecutionConflict(
-                    "Runtime dispatch ownership changed while the owner was live."
+                    "Execution store returned invalid heartbeat ownership evidence."
                 )
-            lease_expires_at = self._new_runtime_lease_expiration()
+            disposition = result.ownership.disposition
+            renewed = result.ownership.ownership
             if (
-                current.runtime_dispatch_lease_expires_at is not None
-                and lease_expires_at <= current.runtime_dispatch_lease_expires_at
+                disposition is not DurableOperationOwnershipDisposition.RENEWED
+                or not _runtime_dispatch_ownership_matches(renewed, current_ownership)
             ):
-                continue
-            desired = self._successor(
-                current,
-                phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
-                runtime_dispatch_lease_expires_at=lease_expires_at,
+                raise MemoryInterventionExecutionConflict(
+                    "Runtime dispatch ownership changed during heartbeat publication."
+                )
+            assert renewed is not None
+            current_ownership = renewed
+
+    async def _request_runtime_dispatch_renewal(
+        self,
+        record: MemoryInterventionExecutionRecord,
+        ownership: DurableOperationOwnership,
+        *,
+        operation: str,
+    ) -> MemoryInterventionRuntimeOwnershipResult:
+        """Revalidate one exact generation using store time before publication."""
+
+        if not _runtime_dispatch_ownership_matches(
+            record.runtime_dispatch_ownership,
+            ownership,
+        ):
+            raise MemoryInterventionExecutionConflict(
+                f"{operation} has no exact runtime dispatch ownership."
             )
-            advanced, won = await self._advance(current, desired)
-            if not won:
-                if advanced.phase is not MemoryInterventionExecutionPhase.SESSION_BOUND:
-                    return
-                if advanced.runtime_dispatch_owner_id != self._runtime_dispatch_owner_id:
-                    raise MemoryInterventionExecutionConflict(
-                        "Runtime dispatch ownership changed during heartbeat publication."
-                    )
+        raw_result = await self.executions.transition_runtime_dispatch_ownership(
+            record.execution_id,
+            DurableOperationOwnershipTransition(
+                operation_id=ownership.operation_id,
+                claim_id=ownership.claim_id,
+                owner_id=ownership.owner_id,
+                generation=ownership.generation,
+                action=DurableOperationOwnershipAction.RENEW,
+                lease_seconds=MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+            ),
+        )
+        if type(raw_result) is not MemoryInterventionRuntimeOwnershipResult:
+            raise MemoryInterventionExecutionConflict(
+                f"Execution store returned invalid {operation} ownership evidence."
+            )
+        result = MemoryInterventionRuntimeOwnershipResult.model_validate(
+            raw_result.model_dump(mode="python")
+        )
+        if result.execution.immutable_identity() != record.immutable_identity():
+            raise MemoryInterventionExecutionConflict(f"{operation} lost its execution identity.")
+        return result
 
     async def _record_runtime_cancellation(
         self,
@@ -2841,19 +3281,39 @@ class MemoryInterventionExecutor:
         control: Literal["cancellation", "timeout"],
     ) -> tuple[MemoryInterventionExecutionRecord, bool]:
         field_name = f"runtime_{control}_observed"
-        current = _validated_store_record(
-            await self.executions.load(record.execution_id),
-            operation=f"runtime {control} authority readback",
-        )
-        if current is None or current.immutable_identity() != record.immutable_identity():
+        ownership = record.runtime_dispatch_ownership
+        if ownership is None:
             raise MemoryInterventionExecutionConflict(
-                f"Runtime {control} authority lost its execution identity."
+                f"Runtime {control} authority has no dispatch ownership."
             )
-        if getattr(current, field_name):
+        renewal = await self._request_runtime_dispatch_renewal(
+            record,
+            ownership,
+            operation=f"runtime {control} authority",
+        )
+        current = renewal.execution
+        exact_current_ownership = _runtime_dispatch_ownership_matches(
+            current.runtime_dispatch_ownership,
+            ownership,
+        )
+        if (
+            getattr(current, field_name)
+            and exact_current_ownership
+            and renewal.ownership.disposition
+            in {
+                DurableOperationOwnershipDisposition.RENEWED,
+                DurableOperationOwnershipDisposition.FENCED,
+                DurableOperationOwnershipDisposition.OPERATION_ADVANCED,
+            }
+        ):
             return current, False
-        if current.phase is not MemoryInterventionExecutionPhase.SESSION_BOUND:
+        if (
+            renewal.ownership.disposition is not DurableOperationOwnershipDisposition.RENEWED
+            or not exact_current_ownership
+            or current.phase is not MemoryInterventionExecutionPhase.SESSION_BOUND
+        ):
             raise MemoryInterventionExecutionConflict(
-                f"Runtime {control} authority lost its durable session boundary."
+                f"Runtime {control} authority lost its live dispatch ownership."
             )
         desired = (
             self._successor(
@@ -3081,6 +3541,7 @@ class MemoryInterventionExecutor:
         view: MemoryInterventionRuntimeView,
         *,
         run: bool,
+        ownership: DurableOperationOwnership,
     ) -> tuple[MemoryInterventionRuntimeResult, MemoryInterventionExecutionRecord]:
         self._validate_live_owners()
         method = self.runtime_runner.run if run else self.runtime_runner.recover
@@ -3094,11 +3555,19 @@ class MemoryInterventionExecutor:
                 trial=trial,
                 operation=operation,
                 view=view,
+                reference_key=memory_intervention_request_key(
+                    self._request_keys,
+                    record.request_key_id,
+                ).runtime_session_create_reference_key(),
             ),
             name=f"cayu-memory-intervention-runtime:{record.execution_id[:12]}",
         )
         heartbeat_task = asyncio.create_task(
-            self._heartbeat_runtime_dispatch(record.execution_id, stop_heartbeat),
+            self._heartbeat_runtime_dispatch(
+                record.execution_id,
+                ownership,
+                stop_heartbeat,
+            ),
             name=f"cayu-memory-intervention-heartbeat:{record.execution_id[:12]}",
         )
         try:
@@ -3127,18 +3596,17 @@ class MemoryInterventionExecutor:
         else:
             stop_heartbeat.set()
             await heartbeat_task
-        loaded = _validated_store_record(
-            await self.executions.load(record.execution_id),
+        renewal = await self._request_runtime_dispatch_renewal(
+            record,
+            ownership,
             operation="runtime dispatch completion",
         )
-        if loaded is None or loaded.immutable_identity() != record.immutable_identity():
-            raise MemoryInterventionExecutionConflict(
-                "Runtime dispatch completion lost its execution identity."
-            )
-        current = loaded
+        current = renewal.execution
+        renewed_ownership = renewal.ownership.ownership
         if (
-            current.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
-            and current.runtime_dispatch_owner_id != self._runtime_dispatch_owner_id
+            renewal.ownership.disposition is not DurableOperationOwnershipDisposition.RENEWED
+            or current.phase is not MemoryInterventionExecutionPhase.SESSION_BOUND
+            or not _runtime_dispatch_ownership_matches(renewed_ownership, ownership)
         ):
             raise MemoryInterventionExecutionConflict(
                 "Runtime dispatch completed without its durable ownership."
@@ -3294,7 +3762,7 @@ class MemoryInterventionExecutor:
                 "trial_binding_fingerprint",
                 "operation_fingerprint",
                 "receipt_fingerprint",
-                "runtime_session_claim_id",
+                "runtime_session_create_claim",
                 "runtime_deadline_at",
                 "runtime_evidence_fingerprint",
                 "runtime_result_fingerprint",
@@ -3376,6 +3844,7 @@ def memory_intervention_request_key(
 __all__ = [
     "MEMORY_INTERVENTION_EXECUTION_MAX_RECORD_BYTES",
     "MEMORY_INTERVENTION_EXECUTION_MAX_TIMEOUT_SECONDS",
+    "MEMORY_INTERVENTION_EXECUTION_RECORD_SCHEMA_VERSION",
     "MEMORY_INTERVENTION_EXECUTION_SCHEMA_VERSION",
     "CayuMemoryInterventionRuntimeRunner",
     "InMemoryMemoryInterventionExecutionStore",
