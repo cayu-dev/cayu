@@ -21,7 +21,14 @@ import cayu.runtime._session_engine as session_engine_module
 from cayu import ScriptedModelProvider, Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.artifacts import FileAttachmentKind, file_attachment
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    Message,
+    ToolCallPart,
+    ToolResultPart,
+)
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.providers import (
     ModelProvider,
@@ -2706,6 +2713,11 @@ def test_size_based_compaction_fails_closed_and_checkpoints_oversized_summary() 
             return CompactionResult(
                 summary="z" * 5_000,
                 covered_message_count=len(request.messages),
+                represented_existing_summary_sha256=(
+                    hashlib.sha256(request.existing_summary.encode("utf-8")).hexdigest()
+                    if request.existing_summary is not None
+                    else None
+                ),
             )
 
     async def run() -> None:
@@ -2746,7 +2758,7 @@ def test_size_based_compaction_fails_closed_and_checkpoints_oversized_summary() 
         assert len(first_compactor.requests) == 1
 
         restarted_compactor = OversizedSummaryCompactor()
-        with pytest.raises(ContextBuildError, match="configured size bounds"):
+        with pytest.raises(ContextBuildError, match="configured size bounds") as restarted_error:
             await CheckpointCompactionContextPolicy(
                 compactor=restarted_compactor,
                 compact_after_estimated_context_tokens=1_000,
@@ -2756,7 +2768,26 @@ def test_size_based_compaction_fails_closed_and_checkpoints_oversized_summary() 
                 request.model_copy(update={"force_bounded_compaction": True}),
                 checkpoint=checkpoint,
             )
-        assert restarted_compactor.requests == []
+        assert len(restarted_compactor.requests) == 1
+        assert restarted_compactor.requests[0].existing_summary == "z" * 5_000
+        exhausted_checkpoint = restarted_error.value.checkpoint
+        assert exhausted_checkpoint is not None
+        assert exhausted_checkpoint["context_compaction"]["compacted_transcript_cursor"] == len(
+            messages
+        )
+
+        exhausted_compactor = OversizedSummaryCompactor()
+        with pytest.raises(ContextBuildError, match="configured size bounds"):
+            await CheckpointCompactionContextPolicy(
+                compactor=exhausted_compactor,
+                compact_after_estimated_context_tokens=1_000,
+                max_recent_context_tokens=800,
+                reserved_output_tokens=100,
+            ).build_with_checkpoint(
+                request.model_copy(update={"force_bounded_compaction": True}),
+                checkpoint=exhausted_checkpoint,
+            )
+        assert exhausted_compactor.requests == []
 
     asyncio.run(run())
 
@@ -2851,6 +2882,72 @@ def test_size_based_compaction_keeps_the_only_recent_tool_round_visible() -> Non
         assert [message.model_dump(mode="json") for message in result.messages] == [
             message.model_dump(mode="json") for message in messages
         ]
+
+    asyncio.run(run())
+
+
+def test_size_based_compaction_compacts_an_oversized_latest_tool_round_atomically() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="size-based-oversized-latest-tool-round",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        compactor = RecordingCompactor()
+        calls = [
+            ToolCallPart(
+                tool_call_id=f"inspect-{index}",
+                tool_name="product_inspect",
+                arguments={"candidate_id": f"candidate-{index}"},
+            )
+            for index in range(12)
+        ]
+        results = [
+            ToolResultPart(
+                tool_call_id=f"inspect-{index}",
+                tool_name="product_inspect",
+                content=f"candidate-{index}-evidence:" + "x" * 12_000,
+            )
+            for index in range(12)
+        ]
+        messages = [
+            Message.text("user", "ORIGINAL_TASK"),
+            Message.tool_call(calls=calls),
+            Message.tool_result(results=results),
+        ]
+
+        result = await CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            compact_after_estimated_context_tokens=10_000,
+            max_recent_context_tokens=8_000,
+            reserved_output_tokens=1_000,
+        ).build_with_checkpoint(
+            ContextRequest(
+                session=session,
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=None,
+        )
+
+        assert len(compactor.requests) == 1
+        compacted = compactor.requests[0].messages
+        assert [message.model_dump(mode="json") for message in compacted] == [
+            message.model_dump(mode="json") for message in messages[1:]
+        ]
+        assert result.checkpoint is not None
+        assert result.checkpoint["context_compaction"]["compacted_transcript_cursor"] == len(
+            messages
+        )
+        projected = json.dumps([message.model_dump(mode="json") for message in result.messages])
+        assert "ORIGINAL_TASK" in projected
+        assert "durable compact summary" in projected
+        assert "candidate-0-evidence" not in projected
 
     asyncio.run(run())
 
@@ -2986,6 +3083,33 @@ class _LongToolLoopProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class _WideToolRoundProvider(ModelProvider):
+    name = "wide-tool-round"
+    execution_profile_identity = ExecutionProfileBehaviorIdentity(
+        name="tests.wide-tool-round-provider",
+        behavior_version="1",
+        implementation_version="1",
+    )
+
+    def __init__(self, tool_calls: int) -> None:
+        self.tool_calls = tool_calls
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            for index in range(self.tool_calls):
+                yield ModelStreamEvent.tool_call(
+                    id=f"evidence-call-{index}",
+                    name="collect_evidence",
+                    arguments={"index": index},
+                )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("continued after compacting the wide tool round")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
 def test_size_based_compaction_runs_through_a_real_long_tool_loop() -> None:
     async def run() -> None:
         original_task = "ORIGINAL-LONG-TOOL-TASK:" + " preserve-me" * 80
@@ -3028,6 +3152,59 @@ def test_size_based_compaction_runs_through_a_real_long_tool_loop() -> None:
                 [message.model_dump(mode="json") for message in request.messages]
             )
             assert original_task in projected
+
+    asyncio.run(run())
+
+
+def test_size_based_compaction_continues_after_a_wide_oversized_tool_round() -> None:
+    async def run() -> None:
+        original_task = "ORIGINAL-WIDE-TOOL-TASK"
+        provider = _WideToolRoundProvider(tool_calls=12)
+        compactor = RecordingCompactor()
+        app = CayuApp(enable_logging=False, max_parallel_tool_calls=12)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                workflow_tool_names=("collect_evidence",),
+            ),
+            tools=[_LongLoopEvidenceTool()],
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=compactor,
+                compact_after_estimated_context_tokens=5_000,
+                max_recent_context_tokens=3_000,
+                reserved_output_tokens=500,
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="wide-tool-round-compaction",
+                    messages=[Message.text("user", original_task)],
+                    max_steps=4,
+                )
+            )
+        ]
+
+        assert events[-1].type == EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 2
+        assert len(compactor.requests) == 1
+        assert len(compactor.requests[0].messages) == 2
+        compacted_round = json.dumps(
+            [message.model_dump(mode="json") for message in compactor.requests[0].messages]
+        )
+        assert compacted_round.count('"type": "tool_call"') == 12
+        assert compacted_round.count('"type": "tool_result"') == 12
+        continued_projection = json.dumps(
+            [message.model_dump(mode="json") for message in provider.requests[1].messages]
+        )
+        assert original_task in continued_projection
+        assert "durable compact summary" in continued_projection
+        assert "evidence-0:" not in continued_projection
 
     asyncio.run(run())
 

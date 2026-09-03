@@ -6432,10 +6432,19 @@ def _split_recent_context_by_size(
     projected_summary = previous_summary or "Compacted prior context."
     best_candidate: tuple[list[Message], list[Message], int] | None = None
     best_candidate_tokens: int | None = None
-    # Keep the newest protocol-atomic unit verbatim. The size target controls
-    # how much older context remains, but it must not authorize summarizing the
-    # only/latest tool round or user follow-up merely to satisfy the target.
-    for compactable_cursor in range(previous_cursor + 1, len(messages)):
+    # Keep the newest protocol-atomic unit verbatim whenever that can satisfy
+    # the configured bounds. If no valid projection retaining that unit can
+    # fit, the terminal boundary is the only safe smaller projection: compact
+    # the whole unit rather than split an assistant tool call from its results.
+    current_projection_exceeds_bounds = (
+        pressure.estimated_context_input_tokens > max_recent_context_tokens
+        or pressure.estimated_context_window_tokens >= compact_after_estimated_context_tokens
+    )
+    include_terminal_boundary = messages[-1].role != MessageRole.USER and (
+        request.force_bounded_compaction or current_projection_exceeds_bounds
+    )
+    candidate_stop = len(messages) + (1 if include_terminal_boundary else 0)
+    for compactable_cursor in range(previous_cursor + 1, candidate_stop):
         if not _is_compaction_boundary(messages, compactable_cursor):
             continue
         candidate_projection = strip_old_file_attachments(

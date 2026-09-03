@@ -482,17 +482,21 @@ estimated context-window pressure and retain the largest recent suffix that fits
 target. Size selection includes system context, tool schemas and results, provider
 options, attachment estimates, and reserved generation headroom. It advances only at
 validated assistant/tool-round boundaries, so one long user turn can compact safely
-without producing an orphaned tool call or result, and it always leaves the newest
-protocol-atomic unit verbatim. The effective checkpoint projection, not the immutable full
-transcript, is measured after the first compaction so a stable summary does not cause
-repeated compactor calls. The original user task remains verbatim outside the compacted
-prefix, and the same checkpoint remains valid when later user turns are appended.
-Selection uses the policy's configured attachment-retention count. If fixed
-provider-visible overhead or the mandatory recent suffix makes the retained-context target
-impossible, the policy chooses the lowest-pressure valid boundary and proceeds only when
-that best-effort projection falls below the proactive trigger. The actual returned summary
-is remeasured before provider dispatch; an unexpectedly oversized projection fails closed
-while preserving the completed checkpoint and compactor accounting evidence.
+without producing an orphaned tool call or result. It leaves the newest protocol-atomic
+unit verbatim whenever a projection retaining it fits the configured bound. If no such
+projection can fit, the policy may compact that whole completed unit and retain an empty
+recent suffix; it never splits an assistant tool call from its results. The effective
+checkpoint projection, not the immutable full transcript, is measured after the first
+compaction so a stable summary does not cause repeated compactor calls. The original user
+task remains verbatim outside the compacted prefix, and the same checkpoint remains valid
+when later user turns are appended.
+Selection uses the policy's configured attachment-retention count. A pending user follow-up
+always remains verbatim. If fixed provider-visible overhead, the preserved original task,
+or the projected summary makes the retained-context target impossible, the policy chooses
+the lowest-pressure valid boundary and proceeds only when that best-effort projection falls
+below the proactive trigger. The actual returned summary is remeasured before provider
+dispatch; an unexpectedly oversized projection fails closed while preserving the completed
+checkpoint and compactor accounting evidence.
 
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. A compactor may advance this cursor only across a contiguous source prefix represented in the returned summary; omitted history remains eligible for a later compaction and is included verbatim between the synthetic summary and recent turns in every model-facing projection. Coverage boundaries may not split an assistant tool call from its matching tool result. A custom provider-backed prompt must cover at least one source message. When recompacting an existing checkpoint, every positive-coverage `CompactionResult` must set `represented_existing_summary_sha256` to the lowercase SHA-256 digest of the exact UTF-8 `CompactionRequest.existing_summary` it represents. A zero-coverage result instead must return that existing summary byte-for-byte unchanged. These checks prevent a valid old cursor from outliving the summary that represents its source range. A result may report zero coverage only as validated `progress_exhausted` state for the current compactor configuration; an ordinary zero-coverage success is rejected so it cannot trigger recurring paid work without cursor progress. Version-1 compaction checkpoints predate explicit source coverage and are invalidated on read; the next eligible compaction rebuilds them from the authoritative transcript as version 2. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. The authoritative transcript remains immutable and complete, while the checkpoint controls only the model-facing projection. Compaction lifecycle events report requested and represented source ranges, coverage mode, source chunk count/mode, bounded-input state, and failure state through allowlisted scalar fields; they do not include summary, transcript, attachment, provider-state, or instruction content.
 
