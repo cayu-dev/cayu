@@ -28,7 +28,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
@@ -61,6 +61,7 @@ from cayu.runtime._durable_worker_loop import (
     DurableWorkerMetrics,
     DurableWorkerPollerGroup,
     DurableWorkerStep,
+    record_task_admission_to_claim_latency,
     run_durable_lease_heartbeat,
     run_durable_worker_loop,
     validate_worker_interval,
@@ -593,6 +594,11 @@ async def run_task_worker(
                 next_wake_at=min(wake_deadlines) if wake_deadlines else None,
                 activity=meaningful_activity,
             )
+        record_task_admission_to_claim_latency(
+            poller.metrics,
+            admitted_at=task.created_at,
+            claimed_at=datetime.now(UTC),
+        )
         task = copy_task(task)
         if task.work_contract is not None:
             task_id = task.id

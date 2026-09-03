@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import process_time
 
 import pytest
 
 from cayu import (
     CayuApp,
+    DurableWorkerMetrics,
     InMemoryTaskStore,
     SQLiteTaskStore,
     Task,
@@ -27,6 +29,32 @@ class _ObservedInMemoryTaskStore(InMemoryTaskStore):
 
     def __init__(self) -> None:
         super().__init__()
+        self.empty_claim = asyncio.Event()
+        self.claim_calls = 0
+
+    async def claim_task(
+        self,
+        worker_id: str,
+        query: TaskQuery | None = None,
+        *,
+        lease_seconds: int = 300,
+    ) -> Task | None:
+        self.claim_calls += 1
+        claimed = await super().claim_task(
+            worker_id,
+            query,
+            lease_seconds=lease_seconds,
+        )
+        if claimed is None:
+            self.empty_claim.set()
+        return claimed
+
+
+class _ObservedSQLiteTaskStore(SQLiteTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
         self.empty_claim = asyncio.Event()
         self.claim_calls = 0
 
@@ -104,6 +132,7 @@ async def test_matching_admission_wakes_idle_task_worker_before_long_poll() -> N
     store = _ObservedInMemoryTaskStore()
     app = CayuApp(task_store=store, enable_logging=False)
     handled = asyncio.Event()
+    metrics = DurableWorkerMetrics()
 
     async def handler(app: CayuApp, task: Task, worker_id: str) -> None:
         await _complete_handler(app, task, worker_id)
@@ -117,6 +146,7 @@ async def test_matching_admission_wakes_idle_task_worker_before_long_poll() -> N
             worker_id="wake-worker",
             query=TaskQuery(type="job"),
             poll_interval_s=10.0,
+            metrics=metrics,
             reclaim=False,
             recover_interrupted_handoffs=False,
             max_tasks=1,
@@ -130,15 +160,30 @@ async def test_matching_admission_wakes_idle_task_worker_before_long_poll() -> N
 
     assert asyncio.get_running_loop().time() - started_at < 0.5
     assert await worker == 1
+    snapshot = metrics.snapshot()
+    assert snapshot.wake_hints_followed_by_successful_claims == 1
+    assert snapshot.admission_to_claim_latency_samples == 1
+    assert snapshot.admission_to_claim_latency_max_s < 0.5
     assert store._task_admission_wakeup_broker.subscriber_count == 0
 
 
 @pytest.mark.anyio
-async def test_hundred_idle_task_workers_share_bounded_store_polling() -> None:
-    store = _ObservedInMemoryTaskStore()
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+async def test_hundred_idle_task_workers_meet_economics_budget(
+    store_kind: str,
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "hundred-worker-economics.sqlite"
+    store = (
+        _ObservedInMemoryTaskStore()
+        if store_kind == "memory"
+        else _ObservedSQLiteTaskStore(database)
+    )
+    producer = store if store_kind == "memory" else SQLiteTaskStore(database)
     app = CayuApp(task_store=store, enable_logging=False)
     stop = asyncio.Event()
     handled = asyncio.Event()
+    metrics = DurableWorkerMetrics(configured_handler_capacity=100)
 
     async def handler(app: CayuApp, task: Task, worker_id: str) -> None:
         await _complete_handler(app, task, worker_id)
@@ -152,9 +197,11 @@ async def test_hundred_idle_task_workers_share_bounded_store_polling() -> None:
                 handler,
                 worker_id=f"pooled-worker-{index}",
                 query=TaskQuery(type="job"),
-                poll_interval_s=0.05,
+                poll_interval_s=0.5,
                 minimum_idle_delay_s=0.01,
+                maximum_idle_delay_s=0.05,
                 idle_jitter_ratio=0.0,
+                metrics=metrics,
                 reclaim=False,
                 recover_interrupted_handoffs=False,
                 stop=stop,
@@ -166,17 +213,41 @@ async def test_hundred_idle_task_workers_share_bounded_store_polling() -> None:
     try:
         await _wait_for_subscribers(store, 100)
         await asyncio.wait_for(store.empty_claim.wait(), timeout=1)
+        cpu_started = process_time()
         await asyncio.sleep(0.15)
+        idle_cpu_s = process_time() - cpu_started
 
         assert 2 <= store.claim_calls <= 10
+        assert idle_cpu_s <= 0.10
 
-        await store.create_task(TaskCreate(task_id="pooled-job", type="job"))
+        await producer.create_task(TaskCreate(task_id="pooled-job", type="job"))
         await asyncio.wait_for(handled.wait(), timeout=0.5)
     finally:
         stop.set()
         handled_counts = await asyncio.gather(*workers)
+        if producer is not store:
+            await producer.close()
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
 
     assert sum(handled_counts) == 1
+    snapshot = metrics.snapshot()
+    assert snapshot.configured_handler_capacity == 100
+    assert snapshot.maximum_active_pollers == 1
+    assert snapshot.maximum_active_handlers == 1
+    assert snapshot.claim_attempts == store.claim_calls
+    assert snapshot.successful_claims == 1
+    assert snapshot.admission_to_claim_latency_samples == 1
+    assert snapshot.admission_to_claim_latency_max_s <= 0.5
+    if store_kind == "memory":
+        assert snapshot.wake_hints_received == 1
+        assert snapshot.wake_hints_accepted == 1
+        assert snapshot.wake_hints_ignored == 0
+        assert snapshot.wake_hints_followed_by_successful_claims == 1
+    else:
+        assert snapshot.wake_hints_received == 0
+        assert snapshot.fallback_poll_activations >= 1
     assert store._task_admission_wakeup_broker.subscriber_count == 0
     groups = store._durable_worker_poller_groups
     assert groups == {}

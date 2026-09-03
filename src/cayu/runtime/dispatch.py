@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any, Literal, Protocol, cast
@@ -52,6 +52,7 @@ from cayu.runtime._durable_worker_loop import (
     DurableWorkerMetrics,
     DurableWorkerPoller,
     DurableWorkerStep,
+    record_task_admission_to_claim_latency,
     run_durable_lease_heartbeat,
     run_durable_worker_loop,
     validate_worker_interval,
@@ -129,6 +130,10 @@ _RUN_WORKER_RECONCILIATION_DISPATCHER: ContextVar[object | None] = ContextVar(
 )
 _RUN_WORKER_DEMAND_POLLER: ContextVar[tuple[object, DurableWorkerPoller] | None] = ContextVar(
     "cayu_dispatch_worker_demand_poller",
+    default=None,
+)
+_RUN_WORKER_METRICS: ContextVar[DurableWorkerMetrics | None] = ContextVar(
+    "cayu_dispatch_worker_metrics",
     default=None,
 )
 _PROCESS_CONTROL_SIGNALS = (GeneratorExit, KeyboardInterrupt, SystemExit)
@@ -1132,12 +1137,21 @@ class TaskStoreDispatcher(Dispatcher):
         claim_task_types = self._claim_task_types()
         loop = asyncio.get_running_loop()
         poller_context = _RUN_WORKER_DEMAND_POLLER.get()
+        demand_poller = (
+            poller_context[1] if poller_context is not None and poller_context[0] is self else None
+        )
+        claim_type_limit = (
+            len(claim_task_types) if demand_poller is None or demand_poller.has_pending_hint else 1
+        )
 
         async def claim_next_task() -> tuple[Task, str, _DispatchLeaseAuthority, float] | None:
-            for offset in range(len(claim_task_types)):
-                candidate_index = (self._next_claim_task_type_index + offset) % len(
-                    claim_task_types
-                )
+            claim_start_index = (
+                self._next_claim_task_type_index
+                if demand_poller is None
+                else demand_poller.reserve_claim_query_index(len(claim_task_types))
+            )
+            for offset in range(claim_type_limit):
+                candidate_index = (claim_start_index + offset) % len(claim_task_types)
                 candidate_task_type = claim_task_types[candidate_index]
                 claim_started_monotonic = loop.time()
                 candidate = await self._tasks.claim_task(
@@ -1148,6 +1162,15 @@ class TaskStoreDispatcher(Dispatcher):
                     lease_seconds=self._lease_seconds,
                 )
                 if candidate is None:
+                    if demand_poller is None and claim_type_limit == 1:
+                        self._next_claim_task_type_index = (candidate_index + 1) % len(
+                            claim_task_types
+                        )
+                    elif demand_poller is not None and offset + 1 < claim_type_limit:
+                        # The poller records the final empty or successful store call.
+                        # Preserve each earlier authoritative operation in a hinted
+                        # full-union audit so metrics remain operation-exact.
+                        demand_poller.metrics.claim_completed(claimed=False)
                     continue
                 if candidate.lease_expires_at is None:  # pragma: no cover - claim contract
                     raise TaskClaimLost("Queued dispatch claim has no worker lease.")
@@ -1164,7 +1187,8 @@ class TaskStoreDispatcher(Dispatcher):
                             lease_authority,
                         )
                     return None
-                self._next_claim_task_type_index = (candidate_index + 1) % len(claim_task_types)
+                if demand_poller is None:
+                    self._next_claim_task_type_index = (candidate_index + 1) % len(claim_task_types)
                 return (
                     candidate,
                     candidate_task_type,
@@ -1173,8 +1197,8 @@ class TaskStoreDispatcher(Dispatcher):
                 )
             return None
 
-        if poller_context is not None and poller_context[0] is self:
-            claim = await poller_context[1].claim(
+        if demand_poller is not None:
+            claim = await demand_poller.claim(
                 claim_next_task,
                 maximum_active_s=self._lease_seconds,
             )
@@ -1183,9 +1207,15 @@ class TaskStoreDispatcher(Dispatcher):
             claimed = await claim_next_task()
         if claimed is None:
             return None
-        if poller_context is not None and poller_context[0] is self:
-            poller_context[1].metrics.handler_started()
+        if demand_poller is not None:
+            demand_poller.metrics.handler_started()
         task, claimed_task_type, lease_authority, claim_deadline_monotonic = claimed
+        if demand_poller is not None:
+            record_task_admission_to_claim_latency(
+                demand_poller.metrics,
+                admitted_at=task.created_at,
+                claimed_at=datetime.now(UTC),
+            )
         # Fail malformed or unauthenticated queue authority terminally rather than letting
         # the task be reclaimed and re-run forever. Only the immutable task row is consulted
         # in this phase: store-backed session authority remains operational and retryable.
@@ -2492,7 +2522,7 @@ class TaskStoreDispatcher(Dispatcher):
         validate_worker_interval(poll_interval_s, "poll_interval_s")
         if metrics is not None and not isinstance(metrics, DurableWorkerMetrics):
             raise TypeError("metrics must be a DurableWorkerMetrics instance.")
-        demand_policy = DurableWorkerDemandPolicy(
+        configured_demand_policy = DurableWorkerDemandPolicy(
             dispatch_latency_s=poll_interval_s,
             minimum_idle_delay_s=minimum_idle_delay_s,
             maximum_idle_delay_s=maximum_idle_delay_s,
@@ -2507,7 +2537,36 @@ class TaskStoreDispatcher(Dispatcher):
         validate_worker_interval(reclaim_every_s, "reclaim_every_s")
         durable_runtime = _require_profiled_dispatch_runtime(runtime)
         loop = asyncio.get_running_loop()
-        claim_queries = tuple(TaskQuery(type=task_type) for task_type in self._claim_task_types())
+        process_next = self.process_next
+        uses_base_claim_boundary = (
+            getattr(process_next, "__self__", None) is self
+            and getattr(process_next, "__func__", None) is TaskStoreDispatcher.process_next
+        )
+        claim_task_types = self._claim_task_types()
+        claim_queries = tuple(TaskQuery(type=task_type) for task_type in claim_task_types)
+        if not claim_queries:
+            raise ValueError("Queued dispatch workers require at least one task namespace.")
+        demand_policy = configured_demand_policy
+        if uses_base_claim_boundary and len(claim_queries) > 1:
+            per_namespace_maximum_s = poll_interval_s / len(claim_queries)
+            if minimum_idle_delay_s is not None and minimum_idle_delay_s > per_namespace_maximum_s:
+                raise ValueError(
+                    "minimum_idle_delay_s must not exceed poll_interval_s divided by "
+                    "the dispatcher task-namespace count."
+                )
+            demand_policy = DurableWorkerDemandPolicy(
+                dispatch_latency_s=poll_interval_s,
+                minimum_idle_delay_s=min(
+                    configured_demand_policy.minimum_idle_delay_s,
+                    per_namespace_maximum_s,
+                ),
+                maximum_idle_delay_s=min(
+                    configured_demand_policy.maximum_idle_delay_s,
+                    per_namespace_maximum_s,
+                ),
+                backoff_multiplier=configured_demand_policy.backoff_multiplier,
+                jitter_ratio=configured_demand_policy.jitter_ratio,
+            )
         poller = self._tasks._durable_worker_poller(
             claim_queries,
             demand_policy,
@@ -2521,6 +2580,7 @@ class TaskStoreDispatcher(Dispatcher):
         async def reconcile() -> bool:
             settled_before = self._terminal_receipt_reconciliation_settled_count
             reconciliation_generation = self._terminal_receipt_reconciliation_generation
+            metrics_token = _RUN_WORKER_METRICS.set(poller.metrics)
             try:
                 reconciliation_complete = await self._reconcile_terminal_acknowledgements(
                     durable_runtime
@@ -2530,11 +2590,14 @@ class TaskStoreDispatcher(Dispatcher):
                     or reconciliation_generation != self._terminal_receipt_reconciliation_generation
                 )
             except Exception as exc:
+                poller.metrics.store_failure()
                 logger.warning(
                     "dispatch terminal acknowledgement discovery failed: error_type=%s error=%s",
                     type(exc).__name__,
                     _safe_runtime_text(durable_runtime, str(exc)),
                 )
+            finally:
+                _RUN_WORKER_METRICS.reset(metrics_token)
             return self._terminal_receipt_reconciliation_settled_count > settled_before
 
         async def reclaim() -> bool:
@@ -2544,6 +2607,7 @@ class TaskStoreDispatcher(Dispatcher):
                     reclaimed = await self._tasks.reclaim_expired(query=TaskQuery(type=task_type))
                     reclaimed_any = reclaimed_any or bool(reclaimed)
                 except Exception as exc:
+                    poller.metrics.store_failure()
                     logger.warning(
                         "dispatch reclaim_expired failed: task_type=%s error_type=%s error=%s",
                         task_type,
@@ -2576,11 +2640,6 @@ class TaskStoreDispatcher(Dispatcher):
                 return DurableWorkerStep(stop=True, activity=meaningful_activity)
             reconciliation_generation_before_process = (
                 self._terminal_receipt_reconciliation_generation
-            )
-            process_next = self.process_next
-            uses_base_claim_boundary = (
-                getattr(process_next, "__self__", None) is self
-                and getattr(process_next, "__func__", None) is TaskStoreDispatcher.process_next
             )
             suppression_token = _RUN_WORKER_RECONCILIATION_DISPATCHER.set(self)
             poller_token = (
@@ -2878,6 +2937,9 @@ class TaskStoreDispatcher(Dispatcher):
                     self._terminal_receipt_reconciliation_settled_count += 1
                 except Exception as exc:
                     all_receipts_settled = False
+                    worker_metrics = _RUN_WORKER_METRICS.get()
+                    if worker_metrics is not None:
+                        worker_metrics.store_failure()
                     logger.warning(
                         "queued dispatch task %s restart acknowledgement failed: "
                         "error_type=%s error=%s",

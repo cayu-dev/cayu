@@ -6393,21 +6393,84 @@ def test_run_worker_wakes_for_matching_submission_before_long_poll(
     asyncio.run(scenario())
 
 
-def test_hundred_idle_dispatch_workers_share_bounded_store_polling(
+def test_run_worker_hint_audits_full_dispatch_namespace_union(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("first answer"), _batch("dispatch answer")])
+    _create_resumable_session(h.app, "metrics-hint-union")
+    stop = asyncio.Event()
+    first_empty_claim = asyncio.Event()
+    metrics = DurableWorkerMetrics()
+    claim_types: list[str | None] = []
+    original_claim = h.tasks.claim_task
+
+    async def observe_claim(worker_id, query=None, *, lease_seconds=300):
+        claimed = await original_claim(
+            worker_id,
+            query,
+            lease_seconds=lease_seconds,
+        )
+        claim_types.append(None if query is None else query.type)
+        if claimed is None:
+            first_empty_claim.set()
+        else:
+            stop.set()
+        return claimed
+
+    monkeypatch.setattr(h.tasks, "claim_task", observe_claim)
+
+    async def scenario() -> None:
+        worker = asyncio.create_task(
+            h.dispatcher.run_worker(
+                h.app,
+                worker_id="metrics-hint-union-worker",
+                stop=stop,
+                poll_interval_s=10.0,
+                metrics=metrics,
+                reconcile_terminal_receipts=False,
+                reclaim_expired_leases=False,
+            )
+        )
+        await asyncio.wait_for(first_empty_claim.wait(), timeout=1)
+        handle = await h.app.dispatch(
+            _dispatch_request("metrics-hint-union", "metrics-hint-union-dispatch")
+        )
+        await asyncio.wait_for(worker, timeout=5)
+        task = await h.tasks.load_task(handle.metadata["queue_task_id"])
+        assert task is not None and task.status is TaskStatus.COMPLETED
+
+    asyncio.run(scenario())
+    assert claim_types == list(h.dispatcher._claim_task_types())
+    snapshot = metrics.snapshot()
+    assert snapshot.claim_attempts == len(claim_types)
+    assert snapshot.empty_claims == len(claim_types) - 1
+    assert snapshot.successful_claims == 1
+    assert snapshot.wake_hints_received == 1
+    assert snapshot.wake_hints_accepted == 1
+    assert snapshot.wake_hints_ignored == 0
+    assert snapshot.wake_hints_followed_by_successful_claims == 1
+
+
+def test_hundred_idle_dispatch_workers_meet_claim_operation_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h = _build([_batch("unused")])
+    empty_claim = asyncio.Event()
     claim_calls = 0
+    metrics = DurableWorkerMetrics(configured_handler_capacity=100)
     original_claim = h.tasks.claim_task
 
     async def count_claims(worker_id, query=None, *, lease_seconds=300):
         nonlocal claim_calls
         claim_calls += 1
-        return await original_claim(
+        claimed = await original_claim(
             worker_id,
             query,
             lease_seconds=lease_seconds,
         )
+        if claimed is None:
+            empty_claim.set()
+        return claimed
 
     monkeypatch.setattr(h.tasks, "claim_task", count_claims)
 
@@ -6419,9 +6482,11 @@ def test_hundred_idle_dispatch_workers_share_bounded_store_polling(
                     h.app,
                     worker_id=f"pooled-dispatch-worker-{index}",
                     stop=stop,
-                    poll_interval_s=0.05,
+                    poll_interval_s=0.5,
                     minimum_idle_delay_s=0.01,
+                    maximum_idle_delay_s=0.05,
                     idle_jitter_ratio=0.0,
+                    metrics=metrics,
                     reconcile_terminal_receipts=False,
                     reclaim_expired_leases=False,
                 )
@@ -6432,8 +6497,9 @@ def test_hundred_idle_dispatch_workers_share_bounded_store_polling(
             async with asyncio.timeout(1):
                 while h.tasks._task_admission_wakeup_broker.subscriber_count != 100:
                     await asyncio.sleep(0)
+            await asyncio.wait_for(empty_claim.wait(), timeout=1)
             await asyncio.sleep(0.15)
-            assert 8 <= claim_calls <= 40
+            assert 2 <= claim_calls <= 10
         finally:
             stop.set()
             await asyncio.gather(*workers)
@@ -6443,6 +6509,169 @@ def test_hundred_idle_dispatch_workers_share_bounded_store_polling(
         assert groups == {}
 
     asyncio.run(scenario())
+    snapshot = metrics.snapshot()
+    assert snapshot.configured_handler_capacity == 100
+    assert snapshot.maximum_active_pollers == 1
+    assert snapshot.claim_attempts == claim_calls
+    assert snapshot.empty_claims == claim_calls
+
+
+def test_dispatcher_instances_share_claim_namespace_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("first answer"), _batch("dispatch answer")])
+    session_id = "sess_shared_dispatch_namespace_rotation"
+    _create_resumable_session(h.app, session_id)
+    submitted = asyncio.run(
+        h.app.dispatch(_dispatch_request(session_id, "d_shared_dispatch_namespace_rotation"))
+    )
+    dispatchers = [TaskStoreDispatcher(h.tasks, task_type=_DISPATCH_TASK_TYPE) for _ in range(4)]
+    release_claim = asyncio.Event()
+    task_claimed = asyncio.Event()
+    stop = asyncio.Event()
+    metrics = DurableWorkerMetrics(configured_handler_capacity=len(dispatchers))
+    claim_types: list[str | None] = []
+    original_claim = h.tasks.claim_task
+
+    async def observe_claim(worker_id, query=None, *, lease_seconds=300):
+        await release_claim.wait()
+        candidate = await original_claim(
+            worker_id,
+            query,
+            lease_seconds=lease_seconds,
+        )
+        claim_types.append(None if query is None else query.type)
+        if candidate is not None:
+            task_claimed.set()
+            stop.set()
+        return candidate
+
+    monkeypatch.setattr(h.tasks, "claim_task", observe_claim)
+
+    async def scenario() -> None:
+        workers = [
+            asyncio.create_task(
+                dispatcher.run_worker(
+                    h.app,
+                    worker_id=f"shared-rotation-worker-{index}",
+                    stop=stop,
+                    poll_interval_s=0.08,
+                    minimum_idle_delay_s=0.01,
+                    maximum_idle_delay_s=0.02,
+                    idle_jitter_ratio=0.0,
+                    metrics=metrics,
+                    reconcile_terminal_receipts=False,
+                    reclaim_expired_leases=False,
+                )
+            )
+            for index, dispatcher in enumerate(dispatchers)
+        ]
+        try:
+            async with asyncio.timeout(1):
+                while h.tasks._task_admission_wakeup_broker.subscriber_count != len(dispatchers):
+                    await asyncio.sleep(0)
+            release_claim.set()
+            await asyncio.wait_for(task_claimed.wait(), timeout=1)
+        finally:
+            stop.set()
+            release_claim.set()
+            await asyncio.gather(*workers)
+        task = await h.tasks.load_task(submitted.metadata["queue_task_id"])
+        assert task is not None and task.status is TaskStatus.COMPLETED
+
+    asyncio.run(scenario())
+    assert claim_types == list(dispatchers[0]._claim_task_types())
+    snapshot = metrics.snapshot()
+    assert snapshot.maximum_active_pollers == 1
+    assert snapshot.claim_attempts == len(claim_types)
+    assert snapshot.empty_claims == len(claim_types) - 1
+    assert snapshot.successful_claims == 1
+
+
+def test_run_worker_metrics_count_each_reclaim_store_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("unused")])
+    stop = asyncio.Event()
+    metrics = DurableWorkerMetrics()
+    expected_failures = len(h.dispatcher._claim_task_types())
+    reclaim_failures = 0
+
+    async def fail_reclaim(*, query=None, max_reclaims=100):
+        del query, max_reclaims
+        nonlocal reclaim_failures
+        reclaim_failures += 1
+        if reclaim_failures == expected_failures:
+            stop.set()
+        raise RuntimeError("reclaim store unavailable")
+
+    monkeypatch.setattr(h.tasks, "reclaim_expired", fail_reclaim)
+
+    async def scenario() -> None:
+        await h.dispatcher.run_worker(
+            h.app,
+            worker_id="reclaim-failure-metrics-worker",
+            stop=stop,
+            poll_interval_s=1.0,
+            metrics=metrics,
+            reconcile_terminal_receipts=False,
+            reclaim_expired_leases=True,
+        )
+
+    asyncio.run(scenario())
+    snapshot = metrics.snapshot()
+    assert reclaim_failures == expected_failures
+    assert snapshot.store_failures == expected_failures
+    assert snapshot.reclaim_operations == 1
+
+
+def test_run_worker_metrics_count_reconciliation_store_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("first answer"), _batch("dispatch answer")])
+    session_id = "sess_reconciliation_failure_metrics"
+    _create_resumable_session(h.app, session_id)
+    asyncio.run(h.app.dispatch(_dispatch_request(session_id, "d_reconciliation_failure_metrics")))
+    stop = asyncio.Event()
+    metrics = DurableWorkerMetrics()
+    acknowledgement_attempts = 0
+
+    async def fail_acknowledgement(
+        envelope: _QueuedDispatchEnvelope,
+        *,
+        dispatch_status: DispatchStatus,
+        receipt: QueuedDispatchTerminalReceipt | None = None,
+    ) -> None:
+        del envelope, dispatch_status, receipt
+        nonlocal acknowledgement_attempts
+        acknowledgement_attempts += 1
+        if acknowledgement_attempts == 2:
+            stop.set()
+        raise ConnectionError("terminal acknowledgement unavailable")
+
+    monkeypatch.setattr(h.app, "_acknowledge_queued_dispatch", fail_acknowledgement)
+
+    async def scenario() -> None:
+        with pytest.raises(ConnectionError, match="terminal acknowledgement unavailable"):
+            await h.dispatcher.process_next(
+                h.app,
+                worker_id="reconciliation-failure-producer",
+            )
+        await h.dispatcher.run_worker(
+            h.app,
+            worker_id="reconciliation-failure-metrics-worker",
+            stop=stop,
+            poll_interval_s=1.0,
+            metrics=metrics,
+            reconcile_terminal_receipts=True,
+            reclaim_expired_leases=False,
+        )
+
+    asyncio.run(scenario())
+    snapshot = metrics.snapshot()
+    assert acknowledgement_attempts == 2
+    assert snapshot.store_failures == 1
+    assert snapshot.recovery_operations == 1
 
 
 def test_run_worker_does_not_count_an_empty_claim_as_an_active_handler(
@@ -6522,6 +6751,9 @@ def test_run_worker_counts_only_claimed_dispatch_execution_as_an_active_handler(
         snapshot = metrics.snapshot()
         assert snapshot.active_handlers == 1
         assert snapshot.active_pollers == 0
+        assert snapshot.maximum_active_handlers == 1
+        assert snapshot.maximum_active_pollers == 1
+        assert snapshot.admission_to_claim_latency_samples == 1
         stop.set()
         release_dispatch.set()
         await asyncio.wait_for(worker, timeout=5)
@@ -6771,6 +7003,11 @@ def test_run_worker_suppression_is_scoped_to_its_dispatcher(
     (
         ({"poll_interval_s": float("nan")}, ValueError, "poll_interval_s"),
         ({"minimum_idle_delay_s": 0.0}, ValueError, "minimum_idle_delay_s"),
+        (
+            {"poll_interval_s": 0.08, "minimum_idle_delay_s": 0.03},
+            ValueError,
+            "namespace count",
+        ),
         ({"maximum_idle_delay_s": 2.0}, ValueError, "maximum_idle_delay_s"),
         ({"idle_backoff_multiplier": 0.5}, ValueError, "backoff_multiplier"),
         ({"idle_jitter_ratio": 1.1}, ValueError, "jitter_ratio"),

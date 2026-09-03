@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from math import isfinite
 from random import random
@@ -30,7 +31,9 @@ class DurableWorkerMetricsSnapshot:
 
     configured_handler_capacity: int
     active_handlers: int
+    maximum_active_handlers: int
     active_pollers: int
+    maximum_active_pollers: int
     claim_attempts: int
     empty_claims: int
     successful_claims: int
@@ -38,6 +41,8 @@ class DurableWorkerMetricsSnapshot:
     cancelled_claims: int
     wake_hints_received: int
     wake_hints_accepted: int
+    wake_hints_ignored: int
+    wake_hints_followed_by_successful_claims: int
     fallback_poll_activations: int
     reclaim_operations: int
     recovery_operations: int
@@ -45,6 +50,9 @@ class DurableWorkerMetricsSnapshot:
     hint_to_claim_latency_samples: int
     hint_to_claim_latency_total_s: float
     hint_to_claim_latency_max_s: float
+    admission_to_claim_latency_samples: int
+    admission_to_claim_latency_total_s: float
+    admission_to_claim_latency_max_s: float
     current_idle_backoff_s: float
     maximum_idle_backoff_s: float
 
@@ -58,7 +66,9 @@ class DurableWorkerMetrics:
         self._lock = Lock()
         self._configured_handler_capacity = configured_handler_capacity
         self._active_handlers = 0
+        self._maximum_active_handlers = 0
         self._active_pollers = 0
+        self._maximum_active_pollers = 0
         self._claim_attempts = 0
         self._empty_claims = 0
         self._successful_claims = 0
@@ -66,6 +76,8 @@ class DurableWorkerMetrics:
         self._cancelled_claims = 0
         self._wake_hints_received = 0
         self._wake_hints_accepted = 0
+        self._wake_hints_ignored = 0
+        self._wake_hints_followed_by_successful_claims = 0
         self._fallback_poll_activations = 0
         self._reclaim_operations = 0
         self._recovery_operations = 0
@@ -73,6 +85,9 @@ class DurableWorkerMetrics:
         self._hint_to_claim_latency_samples = 0
         self._hint_to_claim_latency_total_s = 0.0
         self._hint_to_claim_latency_max_s = 0.0
+        self._admission_to_claim_latency_samples = 0
+        self._admission_to_claim_latency_total_s = 0.0
+        self._admission_to_claim_latency_max_s = 0.0
         self._current_idle_backoff_s = 0.0
         self._maximum_idle_backoff_s = 0.0
 
@@ -83,7 +98,9 @@ class DurableWorkerMetrics:
             return DurableWorkerMetricsSnapshot(
                 configured_handler_capacity=self._configured_handler_capacity,
                 active_handlers=self._active_handlers,
+                maximum_active_handlers=self._maximum_active_handlers,
                 active_pollers=self._active_pollers if active_pollers is None else active_pollers,
+                maximum_active_pollers=self._maximum_active_pollers,
                 claim_attempts=self._claim_attempts,
                 empty_claims=self._empty_claims,
                 successful_claims=self._successful_claims,
@@ -91,6 +108,10 @@ class DurableWorkerMetrics:
                 cancelled_claims=self._cancelled_claims,
                 wake_hints_received=self._wake_hints_received,
                 wake_hints_accepted=self._wake_hints_accepted,
+                wake_hints_ignored=self._wake_hints_ignored,
+                wake_hints_followed_by_successful_claims=(
+                    self._wake_hints_followed_by_successful_claims
+                ),
                 fallback_poll_activations=self._fallback_poll_activations,
                 reclaim_operations=self._reclaim_operations,
                 recovery_operations=self._recovery_operations,
@@ -98,6 +119,9 @@ class DurableWorkerMetrics:
                 hint_to_claim_latency_samples=self._hint_to_claim_latency_samples,
                 hint_to_claim_latency_total_s=self._hint_to_claim_latency_total_s,
                 hint_to_claim_latency_max_s=self._hint_to_claim_latency_max_s,
+                admission_to_claim_latency_samples=self._admission_to_claim_latency_samples,
+                admission_to_claim_latency_total_s=self._admission_to_claim_latency_total_s,
+                admission_to_claim_latency_max_s=self._admission_to_claim_latency_max_s,
                 current_idle_backoff_s=self._current_idle_backoff_s,
                 maximum_idle_backoff_s=self._maximum_idle_backoff_s,
             )
@@ -105,6 +129,10 @@ class DurableWorkerMetrics:
     def handler_started(self) -> None:
         with self._lock:
             self._active_handlers += 1
+            self._maximum_active_handlers = max(
+                self._maximum_active_handlers,
+                self._active_handlers,
+            )
 
     def handler_finished(self) -> None:
         with self._lock:
@@ -129,11 +157,32 @@ class DurableWorkerMetrics:
             self._claim_attempts += 1
             self._cancelled_claims += 1
 
-    def wake_hint(self, *, accepted: bool) -> None:
+    def wake_hint_received(self) -> None:
         with self._lock:
             self._wake_hints_received += 1
-            if accepted:
-                self._wake_hints_accepted += 1
+
+    def wake_hint_accepted(self) -> None:
+        with self._lock:
+            self._wake_hints_accepted += 1
+
+    def wake_hint_ignored(self) -> None:
+        with self._lock:
+            self._wake_hints_ignored += 1
+
+    def wake_hint_followed_by_successful_claim(self) -> None:
+        with self._lock:
+            self._wake_hints_followed_by_successful_claims += 1
+
+    def wake_hint(self, *, accepted: bool) -> None:
+        """Record one externally classified hint for API compatibility."""
+
+        if type(accepted) is not bool:
+            raise TypeError("accepted must be a bool.")
+        self.wake_hint_received()
+        if accepted:
+            self.wake_hint_accepted()
+        else:
+            self.wake_hint_ignored()
 
     def fallback_poll(self) -> None:
         with self._lock:
@@ -159,6 +208,17 @@ class DurableWorkerMetrics:
                 seconds,
             )
 
+    def admission_to_claim_latency(self, seconds: float) -> None:
+        if not isfinite(seconds) or seconds < 0:
+            return
+        with self._lock:
+            self._admission_to_claim_latency_samples += 1
+            self._admission_to_claim_latency_total_s += seconds
+            self._admission_to_claim_latency_max_s = max(
+                self._admission_to_claim_latency_max_s,
+                seconds,
+            )
+
     def idle_backoff(self, seconds: float) -> None:
         if not isfinite(seconds) or seconds < 0:
             return
@@ -171,6 +231,29 @@ class DurableWorkerMetrics:
             raise ValueError("active pollers must be a non-negative integer.")
         with self._lock:
             self._active_pollers = count
+            self._maximum_active_pollers = max(self._maximum_active_pollers, count)
+
+
+def record_task_admission_to_claim_latency(
+    metrics: DurableWorkerMetrics,
+    *,
+    admitted_at: datetime,
+    claimed_at: datetime,
+) -> None:
+    """Record one content-free persisted-admission-to-claim interval."""
+
+    if not isinstance(metrics, DurableWorkerMetrics):
+        raise TypeError("metrics must be a DurableWorkerMetrics instance.")
+    if not isinstance(admitted_at, datetime) or not isinstance(claimed_at, datetime):
+        raise TypeError("admitted_at and claimed_at must be datetimes.")
+    try:
+        seconds = (claimed_at - admitted_at).total_seconds()
+    except (TypeError, ValueError):
+        return
+    # A backend clock slightly ahead of the worker clock must not produce a
+    # negative operational aggregate. The durable task timestamp remains the
+    # evidence source; this clamp is only for the process-local measurement.
+    metrics.admission_to_claim_latency(max(seconds, 0.0))
 
 
 class DurableWorkerWaitResult(StrEnum):
@@ -266,9 +349,9 @@ class DurableWorkerPollerGroup:
         self._active_until: float | None = None
         self._metrics = DurableWorkerMetrics()
         self._metrics_explicit = False
-        self._last_consumed_hint_at: float | None = None
         self._next_poll_at = 0.0
         self._next_empty_delay_s = 0.0
+        self._claim_query_cursor = 0
 
     @property
     def subscriber_count(self) -> int:
@@ -316,6 +399,7 @@ class DurableWorkerPollerGroup:
                 self._active_until = None
                 self._next_poll_at = 0.0
                 self._next_empty_delay_s = policy.minimum_idle_delay_s
+                self._claim_query_cursor = 0
             token = self._next_token
             self._next_token += 1
             self._tokens.append(token)
@@ -327,6 +411,14 @@ class DurableWorkerPollerGroup:
             clock=clock,
             random_source=random_source,
         )
+
+    def _reserve_claim_query_index(self, query_count: int) -> int:
+        if type(query_count) is not int or query_count <= 0:
+            raise ValueError("query_count must be a positive integer.")
+        with self._lock:
+            index = self._claim_query_cursor % query_count
+            self._claim_query_cursor = (index + 1) % query_count
+            return index
 
     def _begin(
         self,
@@ -374,9 +466,6 @@ class DurableWorkerPollerGroup:
             self._active_until = None
             self._metrics.active_pollers(0)
             self._preferred_token = self._successor_token(token)
-            if claimed and self._last_consumed_hint_at is not None:
-                self._metrics.hint_to_claim_latency(max(now - self._last_consumed_hint_at, 0.0))
-                self._last_consumed_hint_at = None
             policy = self._required_policy()
             if claimed:
                 self._next_empty_delay_s = policy.minimum_idle_delay_s
@@ -454,6 +543,7 @@ class DurableWorkerPollerGroup:
                 self._active_until = None
                 self._next_poll_at = 0.0
                 self._next_empty_delay_s = 0.0
+                self._claim_query_cursor = 0
                 became_empty = True
         if became_empty and self._on_empty is not None:
             self._on_empty(self)
@@ -492,6 +582,8 @@ class DurableWorkerPoller:
         self._closed = False
         self._last_attempted = False
         self._last_claimed = False
+        self._pending_hint = False
+        self._pending_hint_received_at: float | None = None
 
     @property
     def last_attempted(self) -> bool:
@@ -504,6 +596,17 @@ class DurableWorkerPoller:
     @property
     def metrics(self) -> DurableWorkerMetrics:
         return self._group.metrics
+
+    @property
+    def has_pending_hint(self) -> bool:
+        """Return whether this worker owes a claim audit for one consumed hint."""
+
+        return self._pending_hint
+
+    def reserve_claim_query_index(self, query_count: int) -> int:
+        """Reserve the next query position shared by this compatible cohort."""
+
+        return self._group._reserve_claim_query_index(query_count)
 
     def begin_step(self) -> None:
         self._last_attempted = False
@@ -523,6 +626,8 @@ class DurableWorkerPoller:
         if type(store_failure_on_exception) is not bool:
             raise TypeError("store_failure_on_exception must be a bool.")
         now = self._clock()
+        accepted_hint = self._pending_hint
+        hint_received_at = self._pending_hint_received_at
         if not self._group._begin(
             self._token,
             now=now,
@@ -531,10 +636,16 @@ class DurableWorkerPoller:
         ):
             return DurableWorkerClaim(attempted=False)
         self._forced = False
+        if accepted_hint:
+            self._pending_hint = False
+            self._pending_hint_received_at = None
+            self._group.metrics.wake_hint_accepted()
         self._last_attempted = True
         try:
             value = await action()
         except asyncio.CancelledError:
+            if accepted_hint:
+                self._group.metrics.wake_hint_ignored()
             self._group.metrics.claim_cancelled()
             self._group._finish(
                 self._token,
@@ -544,6 +655,8 @@ class DurableWorkerPoller:
             )
             raise
         except BaseException as exc:
+            if accepted_hint:
+                self._group.metrics.wake_hint_ignored()
             self._group.metrics.claim_failed(
                 store_failure=store_failure_on_exception and isinstance(exc, Exception)
             )
@@ -556,6 +669,15 @@ class DurableWorkerPoller:
             raise
         self._last_claimed = value is not None
         self._group.metrics.claim_completed(claimed=self._last_claimed)
+        if accepted_hint:
+            if self._last_claimed:
+                self._group.metrics.wake_hint_followed_by_successful_claim()
+                if hint_received_at is not None:
+                    self._group.metrics.hint_to_claim_latency(
+                        max(self._clock() - hint_received_at, 0.0)
+                    )
+            else:
+                self._group.metrics.wake_hint_ignored()
         self._group._finish(
             self._token,
             now=self._clock(),
@@ -565,9 +687,13 @@ class DurableWorkerPoller:
         return DurableWorkerClaim(attempted=True, value=value)
 
     def note_hint(self) -> None:
+        self._group.metrics.wake_hint_received()
+        if self._pending_hint:
+            self._group.metrics.wake_hint_ignored()
+            return
         self._forced = True
-        self._group.metrics.wake_hint(accepted=True)
-        self._group._last_consumed_hint_at = self._clock()
+        self._pending_hint = True
+        self._pending_hint_received_at = self._clock()
         self._group._reset(
             self._token,
             now=self._clock(),

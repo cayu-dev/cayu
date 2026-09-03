@@ -3013,17 +3013,57 @@ timeouts do not. A compatible content-free admission hint resets the delay and
 makes its selected worker immediately eligible, but that worker must still win
 the ordinary atomic store claim.
 
+The base queued dispatcher rotates one protocol namespace after every ordinary
+empty audit instead of querying all namespaces in one poller turn. Its
+per-namespace maximum delay is capped at the dispatch-latency objective divided
+by the namespace count, so a missed hint still receives one complete
+authoritative audit within the public objective. An explicit minimum idle delay
+above that derived ceiling is rejected. A consumed admission hint
+immediately audits the full compatible union because the content-free edge does
+not reveal which namespace matched. Each store call in that hinted audit is
+counted separately. Custom `process_next(...)` overrides retain one aggregate
+poller turn because Runtime cannot observe their internal claim boundary.
+
 Applications may pass a shared `DurableWorkerMetrics` instance to
 `run_task_worker(...)` or `TaskStoreDispatcher.run_worker(...)`. Its immutable
 `snapshot()` exposes only bounded counts and timing aggregates for configured
-capacity, active handlers/pollers, claim outcomes, hints, fallback polling,
-maintenance, store failures, idle backoff, and hint-consumption-to-claim
-latency. Failed and cancelled claims remain distinct from successful empty
-claims. It never records task IDs, payloads, prompts, secrets, private session
-identities, or raw query values. Metrics are process-local diagnostics; durable
-claims and leases remain authoritative. True task-admission-to-claim latency
-requires backend-aware admission evidence and is not inferred from the time a
-worker coroutine consumes a hint.
+capacity, current and peak active handlers/pollers, claim outcomes, hints,
+fallback polling, maintenance, store failures, idle backoff, persisted
+task-admission-to-claim latency, and the narrower hint-consumption-to-claim
+interval. Failed and cancelled claims remain distinct from successful empty
+claims. A received hint becomes accepted only when it obtains a cohort-gated
+authoritative claim attempt. That attempt is counted as ignored if it fails,
+is cancelled, or returns no task, and as followed by a successful claim only
+when store authority is actually obtained. Thus coalesced, stale, and
+productive hints are distinguishable without making any hint authoritative.
+Caught dispatcher reclaim and terminal-receipt reconciliation failures each
+advance `store_failures`; the maintenance attempt remains separately visible.
+
+Admission latency starts at the claimed task's durable `created_at` timestamp
+and ends immediately after the store-atomic claim returns. This backend-aware
+evidence includes queueing and scheduler delay, works for local and remote
+notifications, and is separate from the process-monotonic hint interval. A
+small negative interval caused by database/worker clock skew is clamped to zero
+rather than exported as a false negative duration. The metrics never record
+task IDs, payloads, prompts, secrets, private session identities, or raw query
+values. They remain process-local diagnostics; durable claims and leases remain
+authoritative.
+
+The maintained idle-economics regression uses the following explicit
+production-shaped budget. It starts 100 workers before creating a control task,
+uses a 500-millisecond dispatch objective with 10-to-50-millisecond adaptive
+idle delays, and observes the pool for 150 milliseconds after its first empty
+claim. In-memory, SQLite, and PostgreSQL cohorts must use at most one active
+poller, consume no more than 10 task-store claim operations, and use no more
+than 0.10 process-CPU seconds in that window. The subsequently admitted control
+task must be claimed within the 500-millisecond objective. SQLite admission is
+performed through a separate store instance so the proof exercises bounded
+polling without a process-local hint. The PostgreSQL proof disables the live
+listener before admission and requires a recorded fallback-poll activation,
+demonstrating that notification disconnect does not strand work. These are
+stable regression budgets at the task-store operation boundary, not promises
+about a particular database's internal SQL statement count or host-wide CPU
+utilization.
 
 Runtime-owned worker cadences keep claim polling, expired-lease reclaim,
 interrupted-task recovery, terminal-receipt reconciliation, and lease heartbeat

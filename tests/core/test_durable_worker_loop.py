@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -12,6 +13,7 @@ from cayu.runtime._durable_worker_loop import (
     DurableWorkerStep,
     DurableWorkerWaitResult,
     lease_heartbeat_interval,
+    record_task_admission_to_claim_latency,
     run_durable_lease_heartbeat,
     run_durable_worker_loop,
 )
@@ -280,7 +282,9 @@ def test_worker_metrics_snapshot_is_content_free_and_bounded() -> None:
         poller.close()
     assert snapshot.configured_handler_capacity == 1
     assert snapshot.active_handlers == 0
+    assert snapshot.maximum_active_handlers == 0
     assert snapshot.active_pollers == 0
+    assert snapshot.maximum_active_pollers == 1
     assert snapshot.claim_attempts == 2
     assert snapshot.empty_claims == 1
     assert snapshot.successful_claims == 1
@@ -288,9 +292,83 @@ def test_worker_metrics_snapshot_is_content_free_and_bounded() -> None:
     assert snapshot.cancelled_claims == 0
     assert snapshot.wake_hints_received == 1
     assert snapshot.wake_hints_accepted == 1
+    assert snapshot.wake_hints_ignored == 0
+    assert snapshot.wake_hints_followed_by_successful_claims == 1
     assert snapshot.hint_to_claim_latency_samples == 1
     assert snapshot.hint_to_claim_latency_total_s == pytest.approx(0.25)
     assert snapshot.hint_to_claim_latency_max_s == pytest.approx(0.25)
+    assert snapshot.admission_to_claim_latency_samples == 0
+
+
+def test_worker_metrics_distinguish_pending_stale_and_productive_hints() -> None:
+    now = 0.0
+    metrics = DurableWorkerMetrics()
+    poller = DurableWorkerPollerGroup().subscribe(
+        DurableWorkerDemandPolicy(
+            dispatch_latency_s=1.0,
+            minimum_idle_delay_s=0.1,
+            jitter_ratio=0.0,
+        ),
+        clock=lambda: now,
+    )
+    poller.set_metrics(metrics)
+
+    async def scenario() -> None:
+        nonlocal now
+
+        async def empty() -> None:
+            return None
+
+        async def task() -> str:
+            return "task-a"
+
+        poller.note_hint()
+        pending = metrics.snapshot()
+        assert pending.wake_hints_received == 1
+        assert pending.wake_hints_accepted == 0
+
+        now = 0.1
+        poller.begin_step()
+        await poller.claim(empty)
+
+        now = 0.2
+        poller.note_hint()
+        now = 0.35
+        poller.begin_step()
+        await poller.claim(task)
+
+    try:
+        asyncio.run(scenario())
+        snapshot = metrics.snapshot()
+    finally:
+        poller.close()
+    assert snapshot.wake_hints_received == 2
+    assert snapshot.wake_hints_accepted == 2
+    assert snapshot.wake_hints_ignored == 1
+    assert snapshot.wake_hints_followed_by_successful_claims == 1
+    assert snapshot.hint_to_claim_latency_samples == 1
+    assert snapshot.hint_to_claim_latency_max_s == pytest.approx(0.15)
+
+
+def test_worker_metrics_record_persisted_admission_to_claim_latency() -> None:
+    metrics = DurableWorkerMetrics()
+    admitted_at = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+
+    record_task_admission_to_claim_latency(
+        metrics,
+        admitted_at=admitted_at,
+        claimed_at=admitted_at + timedelta(seconds=0.75),
+    )
+    record_task_admission_to_claim_latency(
+        metrics,
+        admitted_at=admitted_at,
+        claimed_at=admitted_at - timedelta(seconds=1),
+    )
+
+    snapshot = metrics.snapshot()
+    assert snapshot.admission_to_claim_latency_samples == 2
+    assert snapshot.admission_to_claim_latency_total_s == pytest.approx(0.75)
+    assert snapshot.admission_to_claim_latency_max_s == pytest.approx(0.75)
 
 
 def test_worker_metrics_keep_failed_and_cancelled_claims_out_of_empty_claims() -> None:
@@ -315,10 +393,12 @@ def test_worker_metrics_keep_failed_and_cancelled_claims_out_of_empty_claims() -
         async def cancelled_claim() -> None:
             raise asyncio.CancelledError
 
+        poller.note_hint()
         poller.begin_step()
         with pytest.raises(RuntimeError, match="store unavailable"):
             await poller.claim(failed_claim)
         now = 0.1
+        poller.note_hint()
         poller.begin_step()
         with pytest.raises(asyncio.CancelledError):
             await poller.claim(cancelled_claim)
@@ -334,6 +414,10 @@ def test_worker_metrics_keep_failed_and_cancelled_claims_out_of_empty_claims() -
     assert snapshot.failed_claims == 1
     assert snapshot.cancelled_claims == 1
     assert snapshot.store_failures == 1
+    assert snapshot.wake_hints_received == 2
+    assert snapshot.wake_hints_accepted == 2
+    assert snapshot.wake_hints_ignored == 2
+    assert snapshot.wake_hints_followed_by_successful_claims == 0
 
 
 @pytest.mark.parametrize(

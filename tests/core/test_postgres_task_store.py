@@ -13,6 +13,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from time import process_time
 from types import MethodType
 from typing import Literal
 from uuid import uuid4
@@ -80,6 +81,7 @@ from cayu import (
     CompletionVerifierRequest,
     CompletionVerifierUnavailable,
     DeterministicCompletionVerifier,
+    DurableWorkerMetrics,
     ExecutionProfileAuthorityDecision,
     ExecutionProfileBehaviorIdentity,
     InvocationOrigin,
@@ -133,6 +135,7 @@ from cayu import (
     WorkCompletionConflict,
     build_local_execution_attempt_authority,
     interrupted_task_handoff_request,
+    run_task_worker,
     task_create_with_execution_source,
     terminalize_task_with_retry,
 )
@@ -5956,6 +5959,99 @@ def test_postgres_lost_notification_converges_at_bounded_poll(postgres_dsn):
                 wakeup.close()
             await producer.close()
             await consumer.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        producer = _new_store(postgres_dsn)
+        consumer = _new_store(postgres_dsn)
+        app = CayuApp(task_store=consumer, enable_logging=False)
+        stop = asyncio.Event()
+        handled = asyncio.Event()
+        metrics = DurableWorkerMetrics(configured_handler_capacity=100)
+
+        async def handler(app: CayuApp, task: Task, worker_id: str) -> None:
+            assert app.task_store is consumer
+            assert task.lease_expires_at is not None
+            await consumer.complete_task(
+                task.id,
+                {"ok": True},
+                worker_id=worker_id,
+                lease_expires_at=task.lease_expires_at,
+            )
+            handled.set()
+
+        workers = [
+            asyncio.create_task(
+                run_task_worker(
+                    app,
+                    consumer,
+                    handler,
+                    worker_id=f"postgres-economics-worker-{index}",
+                    query=TaskQuery(type="postgres-economics-control"),
+                    poll_interval_s=0.5,
+                    minimum_idle_delay_s=0.01,
+                    maximum_idle_delay_s=0.05,
+                    idle_jitter_ratio=0.0,
+                    metrics=metrics,
+                    reclaim=False,
+                    recover_interrupted_handoffs=False,
+                    stop=stop,
+                    max_tasks=1,
+                )
+            )
+            for index in range(100)
+        ]
+        try:
+            async with asyncio.timeout(3):
+                while consumer._task_admission_wakeup_broker.subscriber_count != 100:
+                    await asyncio.sleep(0)
+            first_attempt = consumer._task_admission_listener_first_attempt
+            assert first_attempt is not None
+            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            async with asyncio.timeout(2):
+                while metrics.snapshot().empty_claims == 0:
+                    await asyncio.sleep(0)
+
+            listener = consumer._task_admission_listener_task
+            assert listener is not None
+            listener.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await listener
+
+            cpu_started = process_time()
+            await asyncio.sleep(0.15)
+            idle_cpu_s = process_time() - cpu_started
+            idle_snapshot = metrics.snapshot()
+            assert 2 <= idle_snapshot.claim_attempts <= 10
+            assert idle_cpu_s <= 0.10
+
+            await producer.create_task(
+                TaskCreate(
+                    task_id="postgres-economics-control",
+                    type="postgres-economics-control",
+                )
+            )
+            await asyncio.wait_for(handled.wait(), timeout=0.5)
+        finally:
+            stop.set()
+            handled_counts = await asyncio.gather(*workers)
+            await producer.close()
+            await consumer.close()
+
+        assert sum(handled_counts) == 1
+        snapshot = metrics.snapshot()
+        assert snapshot.configured_handler_capacity == 100
+        assert snapshot.maximum_active_pollers == 1
+        assert snapshot.maximum_active_handlers == 1
+        assert snapshot.successful_claims == 1
+        assert snapshot.wake_hints_received == 0
+        assert snapshot.fallback_poll_activations >= 1
+        assert snapshot.admission_to_claim_latency_samples == 1
+        assert snapshot.admission_to_claim_latency_max_s <= 0.5
 
     asyncio.run(run())
 
