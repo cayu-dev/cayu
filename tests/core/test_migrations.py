@@ -19,6 +19,32 @@ def test_pending_returns_revisions_after_current():
     assert m.pending(0) == m.REVISIONS  # a fresh DB has every revision pending
 
 
+def test_validate_migration_input_returns_exact_ordered_path() -> None:
+    state = m.SchemaState(
+        revision=m.LATEST_REVISION - 2,
+        compatible_from=m.revision(m.LATEST_REVISION - 2).compatible_from,
+    )
+
+    assert m.validate_migration_input(state) == m.REVISIONS[-2:]
+
+
+def test_validate_migration_input_rejects_unknown_or_forged_state() -> None:
+    with pytest.raises(m.SchemaError, match="unknown schema revision"):
+        m.validate_migration_input(
+            m.SchemaState(
+                revision=m.LATEST_REVISION + 1,
+                compatible_from=m.MIN_SUPPORTED_REVISION,
+            )
+        )
+    with pytest.raises(m.SchemaError, match="records compatible_from"):
+        m.validate_migration_input(
+            m.SchemaState(
+                revision=m.LATEST_REVISION,
+                compatible_from=m.MIN_SUPPORTED_REVISION - 1,
+            )
+        )
+
+
 def test_validate_rejects_uninitialized():
     with pytest.raises(m.SchemaUninitialized):
         m.validate(m.SchemaState(revision=m.UNINITIALIZED, compatible_from=0))

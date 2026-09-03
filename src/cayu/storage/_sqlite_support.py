@@ -4586,6 +4586,47 @@ def _reject_populated_pre_task_invocation_database(
         )
 
 
+_EMPTY_RECALL_RESET_TABLES = (
+    "cayu_agent_recall_delivery_states",
+    "cayu_agent_recall_delivery_releases",
+    "cayu_agent_recall_delivery_claims",
+    "cayu_agent_recall_deliveries",
+    "cayu_agent_recall_checkpoint_heads",
+    "cayu_agent_recall_checkpoints",
+)
+
+
+def preflight_empty_recall_state_reset(connection: sqlite3.Connection) -> None:
+    """Prove the prerelease recall tables can be rebuilt without losing rows."""
+
+    for table in _EMPTY_RECALL_RESET_TABLES:
+        registered = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if registered is None:
+            continue
+        if connection.execute(f"SELECT EXISTS(SELECT 1 FROM {table})").fetchone()[0]:
+            raise schema.SchemaTooOld(
+                "Storage revision 73 can rebuild prerelease recall state only when all "
+                f"six checkpoint/delivery tables are empty; {table!r} is populated."
+            )
+
+
+def reset_empty_recall_state(connection: sqlite3.Connection) -> None:
+    """Rebuild empty revision-69/71 recall tables from this Runtime's DDL."""
+
+    preflight_empty_recall_state_reset(connection)
+    with _transaction(connection):
+        for table in _EMPTY_RECALL_RESET_TABLES:
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
+        for revision in (69, 71):
+            for statement in _iter_statements(_MIGRATION_STEPS[revision]):
+                connection.execute(statement)
+        _validate_revision_69_work_context_schema(connection)
+        _validate_revision_71_recall_delivery_schema(connection)
+
+
 def _reject_populated_pre_recall_subscription_database(
     connection: sqlite3.Connection,
 ) -> None:
@@ -6001,47 +6042,14 @@ def reconcile_schema(
     if current_diagnostic_store_inspection() is not None and not _is_in_memory(connection):
         schema_mode = schema.SchemaMode.VALIDATE
     state = read_schema_state(connection)
-    if (
-        schema_mode is not schema.SchemaMode.VALIDATE
-        and state.revision < 42
-        and any(revision.revision == 42 for revision in schema.pending(state.revision))
-    ):
-        # This check intentionally precedes even bookkeeping-table DDL. A
-        # populated unversioned/partially versioned knowledge schema is not a
-        # fresh database and must remain recoverable for an explicit reset.
-        _reject_populated_pre_knowledge_revision_database(connection)
-    if (
-        schema_mode is not schema.SchemaMode.VALIDATE
-        and state.revision < 60
-        and any(revision.revision == 60 for revision in schema.pending(state.revision))
-    ):
-        _reject_populated_pre_knowledge_relation_database(connection)
-    if (
-        schema_mode is not schema.SchemaMode.VALIDATE
-        and state.revision < 63
-        and any(revision.revision == 63 for revision in schema.pending(state.revision))
-    ):
-        _reject_populated_pre_knowledge_maintenance_database(connection)
-    if (
-        schema_mode is not schema.SchemaMode.VALIDATE
-        and state.revision < 65
-        and any(revision.revision == 65 for revision in schema.pending(state.revision))
-    ):
-        _reject_populated_pre_bounded_knowledge_entry_database(connection)
-    if (
-        schema_mode is not schema.SchemaMode.VALIDATE
-        and state.revision == schema.UNINITIALIZED
-        and any(revision.revision == 46 for revision in schema.pending(state.revision))
-    ):
-        # Refuse before even creating migration bookkeeping in an unversioned
-        # database. The old transcript remains untouched for an explicit reset.
-        _reject_populated_pre_transcript_search_database(connection)
-    if (
-        schema_mode is not schema.SchemaMode.VALIDATE
-        and state.revision < 59
-        and any(revision.revision == 59 for revision in schema.pending(state.revision))
-    ):
-        _reject_populated_pre_result_resolver_database(connection)
+    if schema_mode is schema.SchemaMode.MIGRATE:
+        schema.validate_migration_input(state)
+        # Freeze every clean-break decision before even migration-bookkeeping
+        # DDL. Individual revision transactions repeat the relevant checks to
+        # close races with legacy writers.
+        preflight_migration(connection, state)
+    elif schema_mode is schema.SchemaMode.CREATE:
+        _preflight_creation(connection, state)
     if schema_mode is not schema.SchemaMode.VALIDATE:
         connection.execute(_MIGRATIONS_TABLE_DDL)
         connection.commit()
@@ -10355,6 +10363,25 @@ def _apply_baseline(connection: sqlite3.Connection) -> None:
 
 
 def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) -> None:
+    preflight_migration(connection, state)
+    _apply_pending_after_preflight(connection, state)
+
+
+def preflight_migration(
+    connection: sqlite3.Connection,
+    state: schema.SchemaState | None = None,
+    *,
+    allow_empty_recall_reset: bool = False,
+) -> schema.SchemaState:
+    """Validate every SQLite clean break without performing schema DDL.
+
+    The CLI invokes this on a read-only connection before it prepares or
+    publishes a migration. The migration engine repeats it so direct store
+    users retain the same fail-before-bookkeeping contract.
+    """
+
+    if state is None:
+        state = read_schema_state(connection)
     current = state.revision
     if (
         current != schema.UNINITIALIZED
@@ -10397,6 +10424,10 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         _reject_unprofiled_verified_work_records(connection)
     if current < 59 and any(revision.revision == 59 for revision in schema.pending(current)):
         _reject_populated_pre_result_resolver_database(connection)
+    if current < 60 and any(revision.revision == 60 for revision in schema.pending(current)):
+        _reject_populated_pre_knowledge_relation_database(connection)
+    if current < 63 and any(revision.revision == 63 for revision in schema.pending(current)):
+        _reject_populated_pre_knowledge_maintenance_database(connection)
     if current < 65 and any(revision.revision == 65 for revision in schema.pending(current)):
         _reject_populated_pre_bounded_knowledge_entry_database(connection)
     if (
@@ -10404,13 +10435,46 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         and current < 73
         and any(revision.revision == 73 for revision in schema.pending(current))
     ):
-        _reject_populated_pre_recall_subscription_database(connection)
+        if allow_empty_recall_reset:
+            preflight_empty_recall_state_reset(connection)
+        else:
+            _reject_populated_pre_recall_subscription_database(connection)
     if (
         current != schema.UNINITIALIZED
         and current < 75
         and any(revision.revision == 75 for revision in schema.pending(current))
     ):
         _reject_populated_pre_knowledge_activation_database(connection)
+    return state
+
+
+def _preflight_creation(
+    connection: sqlite3.Connection,
+    state: schema.SchemaState,
+) -> None:
+    """Preserve create-mode's narrower legacy checks without planning a migration."""
+
+    current = state.revision
+    planned = schema.pending(current)
+    if current < 42 and any(revision.revision == 42 for revision in planned):
+        _reject_populated_pre_knowledge_revision_database(connection)
+    if current < 60 and any(revision.revision == 60 for revision in planned):
+        _reject_populated_pre_knowledge_relation_database(connection)
+    if current < 63 and any(revision.revision == 63 for revision in planned):
+        _reject_populated_pre_knowledge_maintenance_database(connection)
+    if current < 65 and any(revision.revision == 65 for revision in planned):
+        _reject_populated_pre_bounded_knowledge_entry_database(connection)
+    if current == schema.UNINITIALIZED and any(revision.revision == 46 for revision in planned):
+        _reject_populated_pre_transcript_search_database(connection)
+    if current < 59 and any(revision.revision == 59 for revision in planned):
+        _reject_populated_pre_result_resolver_database(connection)
+
+
+def _apply_pending_after_preflight(
+    connection: sqlite3.Connection,
+    state: schema.SchemaState,
+) -> None:
+    current = state.revision
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION

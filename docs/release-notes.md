@@ -157,6 +157,39 @@ of being survivor-filtered. The published result claims only a measured output
 change under the declared intervention, not hidden model use or universal
 causality.
 
+### Storage migration preflights authority before schema writes
+
+`cayu storage migrate` now fixes the exact input revision and ordered migration
+path, validates every clean-break condition, and checks the configured public-
+authority alias keyring before schema mutation. Migrations from an initialized
+database must acknowledge each exact pending breaking revision with repeated
+`--acknowledge-breaking REVISION` arguments. The revision-73 prerelease recall
+boundary additionally accepts `--reset-empty-recall-state`: the preflight proves
+all six checkpoint/delivery tables are empty, then rebuilds only those tables
+from the selected Runtime's migration definitions. Populated state still fails
+closed.
+
+SQLite migration now creates an application-consistent retained backup by
+default, migrates and validates a backup-derived staging database, and atomically
+publishes it only after alias reconciliation, `PRAGMA integrity_check`, and
+`PRAGMA foreign_key_check` succeed. `--backup PATH` selects the retained backup;
+`--waive-backup` is the explicit no-retained-backup escape hatch. PostgreSQL
+migrations require either an operator-attested `--backup-sha256 SHA256` or
+`--waive-backup`; their already revision-resumable execution remains under the
+schema advisory lock.
+
+Successful migrations emit a versioned receipt containing the backup digest,
+input and output revisions, complete step list, breaking acknowledgements,
+secret-free authority fingerprint, exact runtime-build provenance, migration
+identity, execution mode, and backend validation checks. Alias keys and database
+credentials are never included. SQLite serializes receipt recovery with atomic
+publication and rejects output paths that alias its database, sidecars, receipts,
+or retained backup, rejects symbolic-link targets, and reuses an authenticated
+retained backup after a pre-publication retry only when a fresh locked snapshot
+proves that the live input is unchanged. PostgreSQL commits the pending receipt
+with revision progress and replays the original evidence when final delivery is
+retried.
+
 ### Recovery cleanup now has shared finite deadlines
 
 `CayuApp` now supervises recovery cleanup through a shared

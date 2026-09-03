@@ -26,6 +26,8 @@ from cayu import (
     TaskTerminalKind,
     interrupted_task_handoff_request,
 )
+from cayu.cli import main
+from cayu.cli import storage as storage_cli
 from cayu.core import Event, EventType, Message
 from cayu.runtime import EventOrder, EventQuery, RunRequest, SessionIdentity
 from cayu.runtime.sessions import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
@@ -920,6 +922,7 @@ def _request(agent_name: str) -> RunRequest:
 
 
 _TABLES = (
+    "cayu_schema_migration_receipts",
     "cayu_knowledge_embeddings",
     "cayu_knowledge_index_readiness_current",
     "cayu_knowledge_index_readiness_events",
@@ -1021,6 +1024,219 @@ async def _recorded_revisions(dsn: str) -> list[tuple[int, str, int]]:
             "ORDER BY revision ASC"
         )
         return [tuple(row) for row in await cur.fetchall()]
+
+
+def test_cli_migrate_rejects_foreign_progress_after_preflight(
+    postgres_dsn: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def prepare() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            await conn.execute("DELETE FROM cayu_schema_migrations WHERE revision = 79")
+            await conn.commit()
+
+    asyncio.run(prepare())
+    real_asyncio_run = asyncio.run
+    run_calls = 0
+
+    def interleave_after_preflight(coroutine):
+        nonlocal run_calls
+        run_calls += 1
+        result = real_asyncio_run(coroutine)
+        if run_calls != 2:
+            return result
+
+        input_state, _planned = result
+
+        async def advance_with_foreign_operation() -> None:
+            foreign = PostgresSessionStore(
+                postgres_dsn,
+                schema_mode=SchemaMode.MIGRATE,
+                migration_expected_input_state=input_state,
+                migration_operation_sha256="b" * 64,
+            )
+            try:
+                await foreign.ensure_schema()
+            finally:
+                await foreign.close()
+
+        real_asyncio_run(advance_with_foreign_operation())
+        return result
+
+    monkeypatch.setattr(storage_cli.asyncio, "run", interleave_after_preflight)
+    assert (
+        main(
+            [
+                "storage",
+                "migrate",
+                "--postgres",
+                postgres_dsn,
+                "--waive-backup",
+                "--acknowledge-breaking",
+                "79",
+            ]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["code"] == "STORAGE_COMMAND_FAILED"
+    assert "progress belongs to another migration operation" in payload["error"]["message"]
+    assert "migration_receipt" not in payload
+
+
+def test_cli_migrate_records_postgres_operation_identity(
+    postgres_dsn: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def prepare() -> None:
+        await _drop_all(postgres_dsn)
+
+    asyncio.run(prepare())
+    assert (
+        main(
+            [
+                "storage",
+                "migrate",
+                "--postgres",
+                postgres_dsn,
+                "--waive-backup",
+            ]
+        )
+        == 0
+    )
+    receipt = json.loads(capsys.readouterr().out)["migration_receipt"]
+    operation_sha256 = receipt["runtime"]["operation_sha256"]
+
+    async def recorded_checksums() -> tuple[str | None, ...]:
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            rows = await (
+                await conn.execute("SELECT checksum FROM cayu_schema_migrations ORDER BY revision")
+            ).fetchall()
+            return tuple(row[0] for row in rows)
+
+    assert len(operation_sha256) == 64
+    assert receipt["input_revision"] == schema.UNINITIALIZED
+    assert receipt["migration_steps"] == [revision.revision for revision in schema.REVISIONS]
+    assert asyncio.run(recorded_checksums()) == (operation_sha256,) * len(schema.REVISIONS)
+
+
+def test_cli_migrate_recovers_postgres_receipt_after_delivery_failure(
+    postgres_dsn: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def prepare() -> None:
+        await _drop_all(postgres_dsn)
+
+    asyncio.run(prepare())
+    original_render = storage_cli._render_migration
+
+    def fail_delivery(*_args, **_kwargs) -> None:
+        raise OSError("injected Postgres receipt delivery failure")
+
+    monkeypatch.setattr(storage_cli, "_render_migration", fail_delivery)
+    arguments = [
+        "storage",
+        "migrate",
+        "--postgres",
+        postgres_dsn,
+        "--waive-backup",
+    ]
+    assert main(arguments) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "injected Postgres receipt delivery failure" in error["message"]
+
+    async def pending_receipt() -> tuple[int, int, dict[str, object]]:
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            state = await postgres_storage.read_schema_state(conn.cursor())
+            row = await (
+                await conn.execute(
+                    "SELECT operation_sha256, receipt_json "
+                    "FROM cayu_schema_migration_receipts WHERE singleton = TRUE"
+                )
+            ).fetchone()
+            assert row is not None
+            return state.revision, state.compatible_from, dict(row[1])
+
+    revision, compatible_from, persisted = asyncio.run(pending_receipt())
+    assert revision == schema.LATEST_REVISION
+    assert compatible_from == schema.revision(schema.LATEST_REVISION).compatible_from
+    assert persisted["input_revision"] == schema.UNINITIALIZED
+
+    monkeypatch.setattr(storage_cli, "_render_migration", original_render)
+    assert main(arguments) == 0
+    recovered = json.loads(capsys.readouterr().out)["migration_receipt"]
+    assert recovered["receipt_sha256"] == persisted["receipt_sha256"]
+    assert recovered["migration_steps"] == [revision.revision for revision in schema.REVISIONS]
+
+    async def receipt_count() -> int:
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            row = await (
+                await conn.execute("SELECT COUNT(*) FROM cayu_schema_migration_receipts")
+            ).fetchone()
+            assert row is not None
+            return int(row[0])
+
+    assert asyncio.run(receipt_count()) == 0
+
+
+def test_cli_migrate_invalid_output_fails_before_postgres_schema_write(
+    postgres_dsn: str,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def prepare() -> None:
+        await _drop_all(postgres_dsn)
+
+    asyncio.run(prepare())
+    assert (
+        main(
+            [
+                "storage",
+                "migrate",
+                "--postgres",
+                postgres_dsn,
+                "--waive-backup",
+                "--output",
+                str(tmp_path / "missing" / "receipt.json"),
+            ]
+        )
+        == 1
+    )
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "STORAGE_COMMAND_FAILED"
+
+    async def schema_objects() -> tuple[int, object, object]:
+        import psycopg
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            state = await postgres_storage.read_schema_state(cur)
+            await cur.execute(
+                "SELECT to_regclass('cayu_schema_migrations'), "
+                "to_regclass('cayu_schema_migration_receipts')"
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            return state.revision, row[0], row[1]
+
+    assert asyncio.run(schema_objects()) == (schema.UNINITIALIZED, None, None)
 
 
 def test_validate_mode_fails_fast_on_uninitialized(postgres_dsn: str) -> None:

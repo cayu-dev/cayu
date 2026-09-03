@@ -670,6 +670,7 @@ from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _verified_work_support as verified_work_support
+from cayu.storage import migration_authority
 from cayu.storage import migrations as schema
 from cayu.storage._diagnostic_inspection import (
     current_diagnostic_store_inspection,
@@ -5406,6 +5407,115 @@ async def read_schema_state(cur: Any) -> schema.SchemaState:
     return schema.SchemaState(revision=latest[0], compatible_from=latest[1])
 
 
+async def read_pending_migration_receipt(cur: Any) -> tuple[str, dict[str, object]] | None:
+    """Read the one undelivered CLI migration receipt without applying DDL."""
+
+    await cur.execute("SELECT to_regclass('cayu_schema_migration_receipts')")
+    registered = await cur.fetchone()
+    if registered is None or registered[0] is None:
+        return None
+    await cur.execute(
+        "SELECT operation_sha256, receipt_json "
+        "FROM cayu_schema_migration_receipts WHERE singleton = TRUE"
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    value = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+    if not isinstance(value, dict):
+        raise RuntimeError("Postgres durable migration receipt is invalid.")
+    return str(row[0]), dict(value)
+
+
+async def discard_pending_migration_receipt(cur: Any, operation_sha256: str) -> None:
+    """Forget a CLI receipt only after its final rendering completed."""
+
+    await cur.execute(
+        "DELETE FROM cayu_schema_migration_receipts "
+        "WHERE singleton = TRUE AND operation_sha256 = %s",
+        (operation_sha256,),
+    )
+
+
+async def preflight_migration(
+    cur: Any,
+    state: schema.SchemaState | None = None,
+    *,
+    allow_empty_recall_reset: bool = False,
+) -> schema.SchemaState:
+    """Validate every Postgres clean break before migration bookkeeping DDL."""
+
+    if state is None:
+        state = await read_schema_state(cur)
+    schema.validate_migration_input(state)
+    current = state.revision
+    planned = schema.pending(current)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 26
+        and any(revision.revision == 26 for revision in planned)
+    ):
+        await _reject_populated_pre_interaction_database(cur)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 36
+        and any(revision.revision == 36 for revision in planned)
+    ):
+        await _reject_populated_pre_invocation_database(cur)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 39
+        and any(revision.revision == 39 for revision in planned)
+    ):
+        await _reject_populated_pre_task_invocation_database(cur)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 41
+        and any(revision.revision == 41 for revision in planned)
+    ):
+        await _reject_populated_pre_knowledge_access_snapshot_database(cur)
+    if current < 42 and any(revision.revision == 42 for revision in planned):
+        await _reject_populated_pre_knowledge_revision_database(cur)
+    if current < 46 and any(revision.revision == 46 for revision in planned):
+        await _reject_populated_pre_transcript_search_database(cur)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 52
+        and any(revision.revision == 52 for revision in planned)
+    ):
+        await _reject_populated_pre_targeted_tool_grant_database(cur)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 58
+        and any(revision.revision == 58 for revision in planned)
+    ):
+        await _reject_populated_pre_verifier_profile_database(cur)
+    if current < 59 and any(revision.revision == 59 for revision in planned):
+        await _reject_populated_pre_result_resolver_database(cur)
+    if current < 60 and any(revision.revision == 60 for revision in planned):
+        await _reject_populated_pre_knowledge_relation_database(cur)
+    if current < 63 and any(revision.revision == 63 for revision in planned):
+        await _reject_populated_pre_knowledge_maintenance_database(cur)
+    if current < 65 and any(revision.revision == 65 for revision in planned):
+        await _reject_populated_pre_bounded_knowledge_entry_database(cur)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 73
+        and any(revision.revision == 73 for revision in planned)
+    ):
+        if allow_empty_recall_reset:
+            await preflight_empty_recall_state_reset(cur)
+        else:
+            await _reject_populated_pre_recall_subscription_database(cur)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 75
+        and any(revision.revision == 75 for revision in planned)
+    ):
+        await _reject_populated_pre_knowledge_activation_database(cur)
+    return state
+
+
 async def _reject_populated_pre_interaction_database(cur: Any) -> None:
     await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions)")
     row = await cur.fetchone()
@@ -5448,6 +5558,52 @@ async def _reject_populated_pre_task_invocation_database(cur: Any) -> None:
             "cannot migrate a populated Cayu task database. Recreate the Cayu "
             "database before starting this build."
         )
+
+
+_EMPTY_RECALL_RESET_TABLES = (
+    "cayu_agent_recall_delivery_states",
+    "cayu_agent_recall_delivery_releases",
+    "cayu_agent_recall_delivery_claims",
+    "cayu_agent_recall_deliveries",
+    "cayu_agent_recall_checkpoint_heads",
+    "cayu_agent_recall_checkpoints",
+)
+
+
+async def preflight_empty_recall_state_reset(cur: Any) -> None:
+    """Lock and prove the prerelease recall tables contain no durable rows."""
+
+    existing: list[str] = []
+    for table in _EMPTY_RECALL_RESET_TABLES:
+        await cur.execute("SELECT to_regclass(%s)", (table,))
+        registered = await cur.fetchone()
+        if registered is not None and registered[0] is not None:
+            existing.append(table)
+    if existing:
+        await cur.execute(
+            sql.SQL("LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE").format(
+                sql.SQL(", ").join(sql.Identifier(table) for table in existing)
+            )
+        )
+    for table in existing:
+        await cur.execute(sql.SQL("SELECT EXISTS(SELECT 1 FROM {})").format(sql.Identifier(table)))
+        row = await cur.fetchone()
+        if row is not None and row[0] is True:
+            raise schema.SchemaTooOld(
+                "Storage revision 73 can rebuild prerelease recall state only when all "
+                f"six checkpoint/delivery tables are empty; {table!r} is populated."
+            )
+
+
+async def reset_empty_recall_state(cur: Any) -> None:
+    """Rebuild empty revision-69/71 recall tables from this Runtime's DDL."""
+
+    await preflight_empty_recall_state_reset(cur)
+    for table in _EMPTY_RECALL_RESET_TABLES:
+        await cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(table)))
+    for revision in (69, 71):
+        for statement in _MIGRATION_STEPS[revision]:
+            await cur.execute(cast("LiteralString", statement))
 
 
 async def _reject_populated_pre_recall_subscription_database(cur: Any) -> None:
@@ -5785,6 +5941,10 @@ class _PostgresStoreBase:
         max_size: int = 8,
         schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
         read_only: bool = False,
+        migration_reset_empty_recall_state: bool = False,
+        migration_expected_input_state: schema.SchemaState | None = None,
+        migration_operation_sha256: str | None = None,
+        migration_receipt_json: str | None = None,
     ) -> None:
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
@@ -5794,12 +5954,51 @@ class _PostgresStoreBase:
         if diagnostic_inspection:
             schema_mode = schema.SchemaMode.VALIDATE
             read_only = True
+        if type(migration_reset_empty_recall_state) is not bool:
+            raise TypeError("migration_reset_empty_recall_state must be a bool.")
+        if migration_reset_empty_recall_state and schema_mode is not schema.SchemaMode.MIGRATE:
+            raise ValueError("migration_reset_empty_recall_state requires schema_mode=MIGRATE.")
+        if (migration_expected_input_state is None) != (migration_operation_sha256 is None):
+            raise ValueError(
+                "migration_expected_input_state and migration_operation_sha256 "
+                "must be provided together."
+            )
+        if migration_expected_input_state is not None:
+            if not isinstance(migration_expected_input_state, schema.SchemaState):
+                raise TypeError("migration_expected_input_state must be a SchemaState.")
+            if schema_mode is not schema.SchemaMode.MIGRATE:
+                raise ValueError("migration_expected_input_state requires schema_mode=MIGRATE.")
+        if (
+            migration_operation_sha256 is not None
+            and re.fullmatch(r"[0-9a-f]{64}", migration_operation_sha256) is None
+        ):
+            raise ValueError("migration_operation_sha256 must be a lowercase SHA-256 digest.")
+        if migration_receipt_json is not None:
+            if type(migration_receipt_json) is not str:
+                raise TypeError("migration_receipt_json must be a string.")
+            if migration_operation_sha256 is None:
+                raise ValueError("migration_receipt_json requires migration_operation_sha256.")
+            try:
+                decoded_receipt = json.loads(migration_receipt_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError("migration_receipt_json must be valid JSON.") from exc
+            if not isinstance(decoded_receipt, dict):
+                raise ValueError("migration_receipt_json must encode a JSON object.")
+            migration_receipt_json = json.dumps(
+                decoded_receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         if read_only and not self._supports_read_only and not diagnostic_inspection:
             raise ValueError("read_only is only supported by PostgresSessionStore.")
         if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
             raise ValueError("Read-only Postgres stores require schema_mode=VALIDATE.")
         self._schema_mode = schema_mode
         self._read_only = read_only
+        self._migration_reset_empty_recall_state = migration_reset_empty_recall_state
+        self._migration_expected_input_state = migration_expected_input_state
+        self._migration_operation_sha256 = migration_operation_sha256
+        self._migration_receipt_json = migration_receipt_json
         if pool is not None:
             if read_only:
                 raise ValueError("read_only requires a store-owned Postgres connection pool.")
@@ -5907,6 +6106,7 @@ class _PostgresStoreBase:
         maintenance_preflight_complete = False
         bounded_entry_preflight_complete = False
         activation_preflight_complete = False
+        empty_recall_reset_complete = False
         while True:
             concurrent_revision: schema.Revision | None = None
             concurrent_indexes: tuple[_ConcurrentIndexMigration, ...] = ()
@@ -5914,9 +6114,27 @@ class _PostgresStoreBase:
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await _acquire_schema_transaction_lock(conn, cur)
+                    # Resolve the exact input and every clean-break refusal
+                    # before even creating migration bookkeeping. Revision
+                    # transactions repeat the checks that need a writer fence.
+                    await preflight_migration(
+                        cur,
+                        allow_empty_recall_reset=(self._migration_reset_empty_recall_state),
+                    )
+                    await self._preflight_migration_authority(cur)
                     await cur.execute(pg_support.MIGRATIONS_TABLE_DDL)
                     state = await self._read_schema_state(cur)
+                    await self._validate_migration_operation_progress(cur, state)
+                    await self._persist_migration_receipt(cur)
                     current = state.revision
+                    if (
+                        self._migration_reset_empty_recall_state
+                        and not empty_recall_reset_complete
+                        and 69 <= current < 73
+                        and any(revision.revision == 73 for revision in schema.pending(current))
+                    ):
+                        await reset_empty_recall_state(cur)
+                        empty_recall_reset_complete = True
                     if (
                         current != schema.UNINITIALIZED
                         and current < 26
@@ -6159,7 +6377,9 @@ class _PostgresStoreBase:
             # built or waited for the same index, so re-read under the xact lock.
             async with self._pool.connection() as conn, conn.cursor() as cur:
                 await _acquire_schema_transaction_lock(conn, cur)
+                await self._preflight_migration_authority(cur)
                 state = await self._read_schema_state(cur)
+                await self._validate_migration_operation_progress(cur, state)
                 if state.revision < concurrent_revision.revision:
                     await self._validate_revision_schema_objects(cur, concurrent_revision)
                     if concurrent_revision.revision == 23:
@@ -6170,6 +6390,77 @@ class _PostgresStoreBase:
                         )
                     await self._record_revision(cur, concurrent_revision)
                 await conn.commit()
+
+    async def _preflight_migration_authority(self, cur: Any) -> None:
+        """Validate backend-specific migration authority under the schema fence."""
+
+    async def _persist_migration_receipt(self, cur: Any) -> None:
+        receipt_json = self._migration_receipt_json
+        operation_sha256 = self._migration_operation_sha256
+        if receipt_json is None or operation_sha256 is None:
+            return
+        await cur.execute(pg_support.MIGRATION_RECEIPTS_TABLE_DDL)
+        await cur.execute(
+            "INSERT INTO cayu_schema_migration_receipts "
+            "(singleton, operation_sha256, receipt_json) "
+            "VALUES (TRUE, %s, %s::jsonb) ON CONFLICT (singleton) DO NOTHING",
+            (operation_sha256, receipt_json),
+        )
+        await cur.execute(
+            "SELECT operation_sha256, receipt_json "
+            "FROM cayu_schema_migration_receipts WHERE singleton = TRUE"
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("Postgres durable migration receipt was not persisted.")
+        observed = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+        observed_json = json.dumps(observed, sort_keys=True, separators=(",", ":"))
+        if not hmac.compare_digest(str(row[0]), operation_sha256) or not hmac.compare_digest(
+            observed_json,
+            receipt_json,
+        ):
+            raise RuntimeError(
+                "Postgres has an undelivered receipt for another migration operation; "
+                "recover that receipt before starting a new migration."
+            )
+
+    async def _validate_migration_operation_progress(
+        self,
+        cur: Any,
+        state: schema.SchemaState,
+    ) -> None:
+        expected = self._migration_expected_input_state
+        operation_sha256 = self._migration_operation_sha256
+        if expected is None or operation_sha256 is None:
+            return
+        if state.revision < expected.revision or (
+            state.revision == expected.revision
+            and state.compatible_from != expected.compatible_from
+        ):
+            raise RuntimeError(
+                "Postgres migration input changed after preflight; retry from the new revision."
+            )
+        if state.revision == expected.revision:
+            return
+
+        expected_revisions = tuple(
+            revision.revision
+            for revision in schema.pending(expected.revision)
+            if revision.revision <= state.revision
+        )
+        await cur.execute(
+            "SELECT revision, checksum FROM cayu_schema_migrations "
+            "WHERE revision > %s AND revision <= %s ORDER BY revision",
+            (expected.revision, state.revision),
+        )
+        observed = tuple((int(row[0]), row[1]) for row in await cur.fetchall())
+        if tuple(revision for revision, _checksum in observed) != expected_revisions or any(
+            checksum != operation_sha256 for _revision, checksum in observed
+        ):
+            raise RuntimeError(
+                "Postgres migration input changed after preflight: committed revision "
+                "progress belongs to another migration operation. Retry from the new revision."
+            )
 
     async def _backfill_revision_seventeen(self) -> None:
         await self._run_resumable_checkpoint_backfill(
@@ -6992,8 +7283,7 @@ class _PostgresStoreBase:
             )
             or "where" not in indexes.get("idx_cayu_events_child_lifecycle", "")
             or not all(
-                fragment
-                in indexes.get("idx_cayu_transcript_messages_session_role_order", "")
+                fragment in indexes.get("idx_cayu_transcript_messages_session_role_order", "")
                 for fragment in (
                     "session_id",
                     "message ->> 'role'::text",
@@ -12126,7 +12416,13 @@ class _PostgresStoreBase:
             "INSERT INTO cayu_schema_migrations "
             "(revision, kind, compatible_from, checksum, applied_at) "
             "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (revision) DO NOTHING",
-            (rev.revision, str(rev.kind), rev.compatible_from, None, datetime.now(UTC)),
+            (
+                rev.revision,
+                str(rev.kind),
+                rev.compatible_from,
+                self._migration_operation_sha256,
+                datetime.now(UTC),
+            ),
         )
 
     async def close(self) -> None:
@@ -24212,6 +24508,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
         read_only: bool = False,
         public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+        migration_reset_empty_recall_state: bool = False,
+        migration_expected_input_state: schema.SchemaState | None = None,
+        migration_operation_sha256: str | None = None,
+        migration_receipt_json: str | None = None,
     ) -> None:
         if public_authority_alias_codec is not None and not isinstance(
             public_authority_alias_codec,
@@ -24225,6 +24525,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             max_size=max_size,
             schema_mode=schema_mode,
             read_only=read_only,
+            migration_reset_empty_recall_state=migration_reset_empty_recall_state,
+            migration_expected_input_state=migration_expected_input_state,
+            migration_operation_sha256=migration_operation_sha256,
+            migration_receipt_json=migration_receipt_json,
         )
         self.service_durability = (
             RuntimeStoreDurability.READ_ONLY if read_only else RuntimeStoreDurability.DURABLE
@@ -24238,6 +24542,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         """Return the immutable codec configured for durable alias registration."""
 
         return self._public_authority_alias_codec
+
+    async def _preflight_migration_authority(self, cur: Any) -> None:
+        await migration_authority.preflight_postgres_public_authority(
+            cur,
+            self.public_authority_alias_codec,
+        )
 
     @staticmethod
     async def _session_store_now(cur: Any) -> datetime:
@@ -35434,9 +35744,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if type(max_chars) is not int:
             raise TypeError("max_chars must be an integer.")
         if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
-            raise ValueError(
-                f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}."
-            )
+            raise ValueError(f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}.")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(

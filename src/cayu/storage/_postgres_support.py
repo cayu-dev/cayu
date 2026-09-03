@@ -632,6 +632,19 @@ MIGRATIONS_TABLE_DDL = """
     )
 """
 
+# One active CLI migration receipt is retained beside the revision ledger until
+# its final rendering succeeds.  The singleton row makes a different invocation
+# fail closed instead of overwriting evidence for resumable committed progress.
+MIGRATION_RECEIPTS_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS cayu_schema_migration_receipts (
+        singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+        operation_sha256 TEXT NOT NULL UNIQUE
+            CHECK (operation_sha256 ~ '^[0-9a-f]{64}$'),
+        receipt_json JSONB NOT NULL
+            CHECK (jsonb_typeof(receipt_json) = 'object')
+    )
+"""
+
 
 def to_utc(value: datetime) -> datetime:
     if value.tzinfo is None:

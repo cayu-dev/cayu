@@ -468,6 +468,37 @@ class SchemaState:
     compatible_from: int
 
 
+def validate_migration_input(state: SchemaState) -> tuple[Revision, ...]:
+    """Return the exact forward path after validating the recorded input state.
+
+    Migration must not interpret an unknown revision or a forged compatibility
+    floor as an ordinary no-op.  Callers use this before acquiring mutation
+    authority so the complete ordered path is fixed before any schema write.
+    """
+
+    if state.revision == UNINITIALIZED:
+        if state.compatible_from != 0:
+            raise SchemaError(
+                "Uninitialized Cayu schema has a nonzero compatibility floor; "
+                "restore a known-good database before migrating."
+            )
+        return REVISIONS
+    try:
+        recorded = revision(state.revision)
+    except ValueError:
+        raise SchemaError(
+            f"Database records unknown schema revision {state.revision}; this build "
+            f"supports an exact migration path only through revision {LATEST_REVISION}."
+        ) from None
+    if state.compatible_from != recorded.compatible_from:
+        raise SchemaError(
+            f"Database schema revision {state.revision} records compatible_from "
+            f"{state.compatible_from}, expected {recorded.compatible_from}; restore a "
+            "known-good database before migrating."
+        )
+    return pending(state.revision)
+
+
 def revision(number: int) -> Revision:
     """Look up a known revision by number."""
     for rev in REVISIONS:
@@ -529,4 +560,5 @@ __all__ = [
     "pending",
     "revision",
     "validate",
+    "validate_migration_input",
 ]
