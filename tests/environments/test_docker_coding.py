@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.docker_toolchain import docker_toolchain_profile
 
 import cayu.environments.docker_coding as docker_coding_module
 from cayu import (
@@ -366,6 +367,8 @@ def test_strict_docker_runner_uses_typed_restrictions_and_exact_live_evidence(
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         del kwargs
         calls.append(command.argv)
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
         docker_args = command.argv[1:]
         if docker_args[0] == "run":
             return ExecResult(stdout=_CONTAINER_ID + "\n")
@@ -433,6 +436,8 @@ def test_weakened_docker_restrictions_do_not_claim_privilege_evidence(
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         del kwargs
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
         docker_args = command.argv[1:]
         if docker_args[0] == "run":
             return ExecResult(stdout=_CONTAINER_ID + "\n")
@@ -659,7 +664,7 @@ def test_docker_coding_factory_rejects_untrusted_before_docker_allocation(
 ) -> None:
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
     )
     request = EnvironmentFactoryRequest(
         session_id="session",
@@ -721,7 +726,7 @@ def test_docker_coding_factory_publicly_constructs_request_bound_binding(
     )
     factory = DockerCodingEnvironmentFactory(
         source_workspace=source,
-        image_identity=_image_identity(),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
     )
     runner = _LocalDockerRunner(target_root)
     target = RunnerWorkspace(
@@ -833,8 +838,9 @@ def test_docker_coding_factory_declares_bounded_tools_and_immutable_identity(
 ) -> None:
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
-        required_executables=("ruff",),
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=_image_identity(), required_executables=("ruff",)
+        ),
         transfer_limits=DockerWorkspaceTransferLimits(max_files=42),
     )
     candidate = factory.construction_admission_candidate()
@@ -844,10 +850,10 @@ def test_docker_coding_factory_declares_bounded_tools_and_immutable_identity(
     assert candidate.evidence.image_fingerprint == _image_identity().fingerprint
     assert candidate.evidence.tool_requirements is not None
     assert [item.executable for item in candidate.evidence.tool_requirements.executables] == [
+        "/usr/bin/ruff",
         "git",
         "python3",
         "rm",
-        "ruff",
         "sh",
         "sleep",
     ]
@@ -857,7 +863,7 @@ def test_docker_coding_factory_declares_bounded_tools_and_immutable_identity(
     assert factory.execution_profile_identity.implementation_version.startswith("sha256:")
     default_factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
         transfer_limits=DockerWorkspaceTransferLimits(max_files=42),
     )
     assert (
@@ -885,14 +891,14 @@ def test_docker_coding_factory_binds_immutable_projection_identity(
     store = ImmutableInputStore(tmp_path / "managed")
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(workspace_root),
-        image_identity=_image_identity(),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
         immutable_inputs=(immutable_input,),
         immutable_input_store=store,
         immutable_input_runtime_compatibility_fingerprint=runtime_compatibility,
     )
     default_factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(workspace_root),
-        image_identity=_image_identity(),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
     )
     claim = factory.construction_admission_candidate().evidence.claim_for("read_only_host_inputs")
 
@@ -913,7 +919,7 @@ def test_docker_coding_factory_binds_immutable_projection_identity(
     first = asyncio.run(factory._attach_immutable_inputs(request))
     recovered_factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(workspace_root),
-        image_identity=_image_identity(),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
         immutable_inputs=(immutable_input,),
         immutable_input_store=ImmutableInputStore(store.root),
         immutable_input_runtime_compatibility_fingerprint=runtime_compatibility,
@@ -928,7 +934,7 @@ def test_docker_coding_factory_binds_immutable_projection_identity(
     with pytest.raises(ValueError, match="runtime compatibility"):
         DockerCodingEnvironmentFactory(
             source_workspace=LocalWorkspace(workspace_root),
-            image_identity=_image_identity(),
+            toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
             immutable_inputs=(immutable_input,),
             immutable_input_store=store,
             immutable_input_runtime_compatibility_fingerprint="sha256:" + ("e" * 64),
@@ -1067,11 +1073,11 @@ def test_docker_coding_factory_refuses_weakened_privilege_restrictions(
 ) -> None:
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
-        restrictions=DockerWorkloadRestrictions(
-            read_only_root=False,
-            no_new_privileges=False,
-            capability_add=("SYS_ADMIN",),
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=_image_identity(),
+            restrictions=DockerWorkloadRestrictions(
+                read_only_root=False, no_new_privileges=False, capability_add=("SYS_ADMIN",)
+            ),
         ),
     )
     candidate = factory.construction_admission_candidate()
@@ -1102,6 +1108,8 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         del kwargs
         calls.append(command.argv)
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
         docker_args = command.argv[1:]
         if docker_args[0] == "run":
             return ExecResult(stdout=_CONTAINER_ID)
@@ -1114,8 +1122,9 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
-        restrictions=restrictions,
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=_image_identity(), restrictions=restrictions
+        ),
         docker_path="/usr/bin/docker",
     )
     request = EnvironmentFactoryRequest(
@@ -1181,6 +1190,8 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         nonlocal mount_source
         del kwargs
         calls.append(command.argv)
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
         docker_args = command.argv[1:]
         if docker_args[0] == "run":
             mount_argument = docker_args[docker_args.index("--mount") + 1]
@@ -1206,8 +1217,9 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(workspace_root),
-        image_identity=image_identity,
-        restrictions=restrictions,
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=image_identity, restrictions=restrictions
+        ),
         docker_path="/usr/bin/docker",
         immutable_inputs=(immutable_input,),
         immutable_input_store=store,
@@ -1269,6 +1281,8 @@ def test_docker_coding_same_create_request_recovers_one_named_container(
         nonlocal container_exists
         del kwargs
         calls.append(command.argv)
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
         docker_args = command.argv[1:]
         if docker_args[:2] == ["container", "ls"]:
             return ExecResult(stdout=(_CONTAINER_ID + "\n") if container_exists else "")
@@ -1286,8 +1300,9 @@ def test_docker_coding_same_create_request_recovers_one_named_container(
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
-        restrictions=restrictions,
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=_image_identity(), restrictions=restrictions
+        ),
         docker_path="/usr/bin/docker",
     )
     request = EnvironmentFactoryRequest(
@@ -1327,6 +1342,8 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
         nonlocal container_exists
         del kwargs
         calls.append(command.argv)
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
         docker_args = command.argv[1:]
         if docker_args[:2] == ["container", "ls"]:
             return ExecResult(stdout=(_CONTAINER_ID + "\n") if container_exists else "")
@@ -1344,8 +1361,9 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
-        restrictions=restrictions,
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=_image_identity(), restrictions=restrictions
+        ),
         docker_path="/usr/bin/docker",
     )
     request = EnvironmentFactoryRequest(
@@ -1409,7 +1427,7 @@ def test_docker_coding_reconnect_releases_interrupted_finalize_reference(
     store = ImmutableInputStore(tmp_path / "managed")
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(workspace_root),
-        image_identity=image_identity,
+        toolchain_profile=docker_toolchain_profile(image_identity=image_identity),
         docker_path="/usr/bin/docker",
         immutable_inputs=(immutable_input,),
         immutable_input_store=store,
@@ -1442,6 +1460,8 @@ def test_docker_coding_reconnect_releases_interrupted_finalize_reference(
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         del kwargs
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
         docker_args = command.argv[1:]
         assert docker_args[:2] == ["container", "ls"]
         return ExecResult(stdout="")
@@ -1464,6 +1484,8 @@ def test_docker_coding_factory_structurally_refuses_a_missing_final_executable(
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         del kwargs
         calls.append(command.argv)
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
         docker_args = command.argv[1:]
         if docker_args[0] == "run":
             return ExecResult(stdout=_CONTAINER_ID)
@@ -1478,8 +1500,9 @@ def test_docker_coding_factory_structurally_refuses_a_missing_final_executable(
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
-        restrictions=restrictions,
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=_image_identity(), restrictions=restrictions
+        ),
         docker_path="/usr/bin/docker",
     )
     request = EnvironmentFactoryRequest(

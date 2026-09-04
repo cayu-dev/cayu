@@ -599,274 +599,6 @@ GENERATED_AGENT_CONFIG_START = "# <cayu:generated-agent-config>"
 GENERATED_AGENT_CONFIG_END = "# </cayu:generated-agent-config>"
 PROVIDER_OVERRIDE_AGENT_HELPER = "_agent_for_provider_override"
 
-_APP_PY = '''"""Application factory for __PROJECT_NAME__.
-
-Every process calls ``build_app()`` and owns the returned CayuApp. Durable
-stores, not this Python object, coordinate state between processes.
-"""
-
-import os
-
-from cayu import (
-    AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
-    AnthropicProvider,
-    CayuApp,
-    ChatCompletionsProvider,
-    ModelProvider,
-    OpenAIProvider,
-    OpenAISubscriptionProvider,
-    ScriptedModelProvider,
-    SessionStore,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    public_authority_alias_codec_from_environment,
-    TaskStore,
-)
-
-from agents.agent import AGENT
-from configuration import configured_provider_choice
-
-# Generated tool-backed slices add their imports and registrations here.
-# <cayu:generated-imports>
-# </cayu:generated-imports>
-
-
-class _ScaffoldPlaceholderProvider(ScriptedModelProvider):
-    """Credential-free placeholder rejected by every runtime entry point."""
-
-    def __init__(self, *, name: str, setup_error: str) -> None:
-        super().__init__([], name=name)
-        self._setup_error = setup_error
-
-    def preflight_model_target(self, *, model: str) -> None:
-        del model
-        raise RuntimeError(self._setup_error)
-
-
-def configured_provider() -> ModelProvider:
-    """Construct only the explicitly selected provider.
-
-    Credential variables authenticate the selected provider; they never choose
-    one. A same-name scripted placeholder keeps inspection and hermetic proof
-    credential-free while ``run.py`` rejects it before live execution.
-    """
-
-    choice = configured_provider_choice()
-    if choice is None:
-        return _ScaffoldPlaceholderProvider(
-            name="unconfigured",
-            setup_error=(
-                "no provider is selected; set CAYU_PROVIDER to openai, anthropic, "
-                "openrouter, or openai-subscription (credentials do not select a provider)"
-            ),
-        )
-    if choice == "openai-subscription":
-        return OpenAISubscriptionProvider()
-    if choice == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY")
-        return (
-            OpenAIProvider(api_key=api_key)
-            if api_key
-            else _ScaffoldPlaceholderProvider(
-                name="openai",
-                setup_error="provider 'openai' is selected but OPENAI_API_KEY is not set",
-            )
-        )
-    if choice == "openrouter":
-        router_metadata_enabled = _openrouter_router_metadata_enabled()
-        model = (os.environ.get("CAYU_MODEL") or "").strip()
-        if not model:
-            return _ScaffoldPlaceholderProvider(
-                name="openrouter",
-                setup_error="provider 'openrouter' requires an explicit CAYU_MODEL model slug",
-            )
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        return (
-            ChatCompletionsProvider(
-                name="openrouter",
-                api_key=api_key,
-                api_key_env="OPENROUTER_API_KEY",
-                base_url="https://openrouter.ai/api/v1",
-                openrouter_http_referer=os.environ.get("OPENROUTER_HTTP_REFERER"),
-                openrouter_app_title=os.environ.get("OPENROUTER_APP_TITLE"),
-                openrouter_router_metadata=router_metadata_enabled,
-            )
-            if api_key
-            else _ScaffoldPlaceholderProvider(
-                name="openrouter",
-                setup_error=(
-                    "provider 'openrouter' is selected but OPENROUTER_API_KEY is not set"
-                ),
-            )
-        )
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    return (
-        AnthropicProvider(api_key=api_key)
-        if api_key
-        else _ScaffoldPlaceholderProvider(
-            name="anthropic",
-            setup_error="provider 'anthropic' is selected but ANTHROPIC_API_KEY is not set",
-        )
-    )
-
-
-def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
-    """Run the same target preflight used by every runtime entry point."""
-
-    manifest_agent = next(
-        agent for agent in app.describe().agents if agent.name == agent_name
-    )
-    if manifest_agent.resolved_provider is None:
-        raise RuntimeError(
-            f"agent {agent_name!r} does not resolve to exactly one model provider"
-        )
-    provider = app.get_provider(manifest_agent.resolved_provider)
-    provider.preflight_model_target(model=manifest_agent.model)
-
-
-def _openrouter_router_metadata_enabled() -> bool:
-    value = os.environ.get("OPENROUTER_ROUTER_METADATA")
-    if value is None or value.lower() == "disabled":
-        return False
-    if value.lower() == "enabled":
-        return True
-    raise RuntimeError(
-        "OPENROUTER_ROUTER_METADATA must be 'enabled' or 'disabled' when set"
-    )
-
-
-def _agent_for_provider_override(
-    agent: AgentSpec, provider: ModelProvider | None
-) -> AgentSpec:
-    """Route an agent through an explicitly injected test/eval provider."""
-
-    if provider is None:
-        return agent
-    return agent.model_copy(update={"provider_name": provider.name})
-
-
-def build_app(
-    *,
-    provider: ModelProvider | None = None,
-    session_store: SessionStore | None = None,
-    task_store: TaskStore | None = None,
-) -> CayuApp:
-    """Construct a fresh process-scoped application graph.
-
-    Injected stores and providers are public test seams. Inspection can call
-    ``build_app()`` without live-provider credentials.
-    """
-
-    app = CayuApp(
-        session_store=(
-            session_store
-            if session_store is not None
-            else SQLiteSessionStore(
-                "data/cayu.db",
-                public_authority_alias_codec=public_authority_alias_codec_from_environment(),
-            )
-        ),
-        task_store=(
-            task_store if task_store is not None else SQLiteTaskStore("data/cayu.db")
-        ),
-    )
-    selected_provider = provider
-    if selected_provider is None:
-        selected_provider = configured_provider()
-    app.register_provider(selected_provider, default=True)
-    starter_tools = []
-    starter_external_tool_names = []
-    # <cayu:generated-starter-tools>
-    # </cayu:generated-starter-tools>
-    app.register_agent(
-        _agent_for_provider_override(AGENT, provider),
-        tools=starter_tools,
-        tool_policy=(
-            AlwaysRequireApprovalToolPolicy(tools=starter_external_tool_names)
-            if starter_external_tool_names
-            else None
-        ),
-    )
-    # <cayu:generated-registrations>
-    # </cayu:generated-registrations>
-    return app
-'''
-
-_CONFIGURATION_PY = '''"""Explicit provider and compatible model selection for this application."""
-
-import os
-
-_SCAFFOLDED_PROVIDER = __PROVIDER_LITERAL__
-_SUPPORTED_PROVIDERS = {"openai", "anthropic", "openrouter", "openai-subscription"}
-_PROVIDER_NAMES = {
-    "openai": "openai",
-    "anthropic": "anthropic",
-    "openrouter": "openrouter",
-    "openai-subscription": "openai_subscription",
-}
-_DEFAULT_MODELS = {
-    "openai": "gpt-5.6-luna",
-    "anthropic": "claude-sonnet-4-6",
-    "openai-subscription": "gpt-5.4",
-}
-
-
-def configured_provider_choice() -> str | None:
-    """Return explicit project/env selection without inspecting credentials."""
-
-    selected = os.environ.get("CAYU_PROVIDER", _SCAFFOLDED_PROVIDER)
-    if selected is None:
-        return None
-    if selected not in _SUPPORTED_PROVIDERS:
-        choices = ", ".join(sorted(_SUPPORTED_PROVIDERS))
-        raise RuntimeError(f"CAYU_PROVIDER must be one of: {choices}")
-    return selected
-
-
-def configured_provider_name() -> str | None:
-    selected = configured_provider_choice()
-    return None if selected is None else _PROVIDER_NAMES[selected]
-
-
-def configured_model() -> str:
-    override = (os.environ.get("CAYU_MODEL") or "").strip()
-    if override:
-        return override
-    selected = configured_provider_choice()
-    if selected == "openrouter":
-        # Inspection and hermetic tests remain credential-free. Live run.py
-        # validation rejects this sentinel until CAYU_MODEL is explicit.
-        return "openrouter-model-unconfigured"
-    return (
-        "provider-model-unconfigured" if selected is None else _DEFAULT_MODELS[selected]
-    )
-'''
-
-_AGENT_PY = """from cayu import AgentSpec
-
-from configuration import configured_model, configured_provider_name
-
-# Generated first-tool imports and agent contract additions live in these regions.
-# <cayu:generated-agent-imports>
-# </cayu:generated-agent-imports>
-
-_SYSTEM_PROMPT_PARTS: list[str] = []
-_WORKFLOW_TOOL_NAMES: list[str] = []
-_AUTHORING_STATE: str | None = None
-
-# <cayu:generated-agent-config>
-# </cayu:generated-agent-config>
-
-AGENT = AgentSpec(
-    name="__AGENT_NAME__",
-    model=configured_model(),
-    provider_name=configured_provider_name(),
-    system_prompt="\\n".join(_SYSTEM_PROMPT_PARTS) or None,
-    workflow_tool_names=tuple(_WORKFLOW_TOOL_NAMES),
-    authoring_state=_AUTHORING_STATE,
-)
-"""
 
 _TEST_PY = """from __future__ import annotations
 
@@ -991,9 +723,7 @@ and other compatible endpoints work through Cayu's generic adapter. Run
 
 _README = """# __PROJECT_NAME__
 
-A model-only Cayu agent scaffold. It starts with one agent, one deterministic
-runtime test, and one output eval. Its registered agent identity is
-`__AGENT_NAME__`. Add capabilities only when the job needs them.
+__PRESET_OVERVIEW__
 
 ## Application structure
 
@@ -1132,12 +862,7 @@ if __name__ == "__main__":
 
 _AGENTS_MD = """# Coding-agent instructions
 
-The registered agent identity is `__AGENT_NAME__`.
-
-Edit the existing agent, test, and eval to implement the user's first requested
-job. Do not retain the starter and add a second agent. Tools are optional: add
-one only for a real capability outside the model, such as reading a repository
-or calling an API. Do not create echo, pass-through, or placeholder tools.
+__AGENT_OWNERSHIP__
 
 Use the Cayu Map to choose only the concepts the job needs:
 `uv run --no-sync cayu guide authoring#cayu-map`. If the job observes, proposes, authorizes,
@@ -1151,7 +876,7 @@ __PROVIDER_GUIDE_POINTER__
 
 This scaffold is for local development. Deployment is a separate task.
 If the requested application is public or multi-user, regenerate with
-`cayu new NAME --template service` or adopt Cayu's maintained service contract;
+`cayu new NAME --preset service` or adopt Cayu's maintained service contract;
 do not improvise product authorization around raw Cayu routes.
 
 ## Project commands
@@ -3564,11 +3289,6 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Disable an optional preset capability while retaining its ownership home.",
     )
     parser.add_argument(
-        "--minimal",
-        action="store_true",
-        help="Generate the smallest supported model-agent project instead of the convention.",
-    )
-    parser.add_argument(
         "--interactive",
         action="store_true",
         help="Prompt for omitted choices when attached to a terminal.",
@@ -3599,28 +3319,6 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Explain one package-shipped capability without creating a project.",
     )
     parser.add_argument(
-        "--template",
-        choices=("agent", "service"),
-        help=("Compatibility alias: --template service maps to --preset service."),
-    )
-    parser.add_argument(
-        "--composition",
-        choices=("coding",),
-        help=(
-            "Opt in to an explicit maintained starter composition. "
-            "The coding composition requires git and rg."
-        ),
-    )
-    parser.add_argument(
-        "--coding-execution",
-        choices=("docker",),
-        help=(
-            "Explicit execution backend for --composition coding. Omit to keep "
-            "the bounded no-command composition; docker adds trusted-repository "
-            "named checks in an admitted Docker environment."
-        ),
-    )
-    parser.add_argument(
         "--coding-toolchain",
         choices=("python",),
         help=(
@@ -3648,9 +3346,6 @@ def project_files(
     *,
     agent_name: str | None = None,
     provider: str | None = None,
-    template: str = "agent",
-    composition: str | None = None,
-    coding_execution: str | None = None,
     coding_toolchain: str | None = None,
     coding_command_authority: str | None = None,
     preset: str | None = None,
@@ -3658,42 +3353,25 @@ def project_files(
     execution: str | None = None,
     with_capabilities: tuple[str, ...] = (),
     without_capabilities: tuple[str, ...] = (),
-    minimal: bool = False,
     application_plan: ApplicationPlan | None = None,
 ) -> dict[str, str]:
     resolved_agent_name = name if agent_name is None else agent_name
     if application_plan is None:
-        resolved_preset = preset
-        if resolved_preset is None:
-            resolved_preset = "coding" if composition == "coding" else template
-        elif template != "agent" and template != resolved_preset:
-            raise ValueError("preset conflicts with template compatibility alias.")
-        if composition is not None and resolved_preset != composition:
-            raise ValueError("preset conflicts with composition compatibility alias.")
-        resolved_execution = execution
-        if resolved_execution is None:
-            resolved_execution = coding_execution or "none"
-        elif coding_execution is not None and resolved_execution != coding_execution:
-            raise ValueError("execution conflicts with coding_execution compatibility alias.")
         application_plan = normalize_application_plan(
             name=name,
             agent_name=resolved_agent_name,
-            preset=resolved_preset,
+            preset=preset or "agent",
             database=database,
             provider=provider or "neutral",
-            execution=resolved_execution,
+            execution=execution or "none",
             coding_toolchain=coding_toolchain,
             coding_command_authority=coding_command_authority,
             with_capabilities=with_capabilities,
             without_capabilities=without_capabilities,
-            minimal=minimal,
         )
     plan = application_plan
     resolved_agent_name = plan.agent_name
     provider = plan.provider_alias
-    template = plan.template_alias
-    composition = plan.composition_alias
-    coding_execution = plan.execution_alias
     if coding_toolchain is not None and coding_toolchain != plan.coding_toolchain:
         raise ValueError("coding_toolchain conflicts with the normalized plan.")
     if (
@@ -3766,6 +3444,20 @@ def project_files(
             )
         replacements = {
             "__PROJECT_NAME__": name,
+            "__PRESET_OVERVIEW__": (
+                "A maintained two-agent coding composition for a trusted Git repository. Its primary\nagent and bounded reviewer use generated repository tools, policy, knowledge,\ndelegation, and human-input seams that are part of this preset rather than optional\nadditions to a model-only starter."
+                if plan.preset == "coding"
+                else "A Cayu application with the standard capability layout. Its registered agent\nidentity is `__AGENT_NAME__`. The scaffold profile records its selected capabilities.".replace(
+                    "__AGENT_NAME__", resolved_agent_name
+                )
+            ),
+            "__AGENT_OWNERSHIP__": (
+                "This preset registers a primary coding agent and a bounded reviewer. Extend the\nprimary through the canonical generated regions in `agents/agent.py` and\n`agents/registration.py`. Keep the reviewer tool-free unless a reviewed composition\nchange intentionally expands its role.\nDo not create echo, pass-through, or placeholder tools."
+                if plan.preset == "coding"
+                else "The registered agent identity is `__AGENT_NAME__`.\n\nEdit the existing agent, test, and eval to implement the user's first requested\njob. Do not retain the starter and add a second agent. Tools are registered in\n`agents/registration.py`; change their policies deliberately. Do not create echo,\npass-through, or placeholder tools.".replace(
+                    "__AGENT_NAME__", resolved_agent_name
+                )
+            ),
             "__AGENT_NAME__": resolved_agent_name,
             "__REVIEWER_NAME__": reviewer_name,
             "__CAYU_VERSION__": _installed_cayu_version(),
@@ -3789,11 +3481,8 @@ def project_files(
         )
 
     files = {
-        "app.py": render(_APP_PY),
-        "configuration.py": render(_CONFIGURATION_PY),
         "run.py": _RUN_PY,
         "agents/__init__.py": "",
-        "agents/agent.py": render(_AGENT_PY),
         "tests/test_agent.py": render(_TEST_PY),
         "evals/__init__.py": "",
         "evals/agent.py": render(_EVAL_PY),
@@ -3802,72 +3491,40 @@ def project_files(
         "AGENTS.md": render(_AGENTS_MD),
         ".gitignore": _GITIGNORE,
     }
-    if not plan.minimal:
-        files.pop("configuration.py")
-        files.update(convention_files(plan, render=render))
-        if "knowledge" in plan.capabilities:
-            for relative in ("tests/test_agent.py", "evals/agent.py"):
-                files[relative] = (
-                    files[relative]
-                    .replace(
-                        "    InMemorySessionStore,\n",
-                        "    InMemoryKnowledgeStore,\n    InMemorySessionStore,\n",
-                    )
-                    .replace(
-                        "        task_store=InMemoryTaskStore(),\n",
-                        "        task_store=InMemoryTaskStore(),\n"
-                        "        knowledge_store=InMemoryKnowledgeStore(),\n",
-                    )
+    files.update(convention_files(plan, render=render))
+    if "knowledge" in plan.capabilities:
+        for relative in ("tests/test_agent.py", "evals/agent.py"):
+            files[relative] = (
+                files[relative]
+                .replace(
+                    "    InMemorySessionStore,\n",
+                    "    InMemoryKnowledgeStore,\n    InMemorySessionStore,\n",
                 )
-        files["pyproject.toml"] += scaffold_contract(plan)
-        files["README.md"] += application_guidance(plan)
-        files["AGENTS.md"] += application_guidance(plan)
-        if "evals" not in plan.capabilities:
-            files.pop("evals/agent.py", None)
-            files["pyproject.toml"] = files["pyproject.toml"].replace(
-                'eval_target = "evals.agent:build_eval"\n',
-                "",
-            )
-            for guidance_name in ("README.md", "AGENTS.md"):
-                files[guidance_name] = files[guidance_name].replace(
-                    "uv run --no-sync cayu eval run",
-                    "evals are not configured in this profile",
+                .replace(
+                    "        task_store=InMemoryTaskStore(),\n",
+                    "        task_store=InMemoryTaskStore(),\n"
+                    "        knowledge_store=InMemoryKnowledgeStore(),\n",
                 )
-        if plan.preset == "agent":
-            selected_capabilities = ", ".join(plan.capabilities)
-            files["README.md"] = files["README.md"].replace(
-                "A model-only Cayu agent scaffold. It starts with one agent, one deterministic\n"
-                "runtime test, and one output eval. Its registered agent identity is\n"
-                "`__AGENT_NAME__`. Add capabilities only when the job needs them.".replace(
-                    "__AGENT_NAME__", resolved_agent_name
-                ),
-                "A batteries-included local Cayu agent scaffold. Its registered agent identity "
-                f"is\n`{resolved_agent_name}`. The normalized profile explicitly configures: "
-                f"{selected_capabilities}.\nUse `--minimal` when a model-only application is "
-                "intentional.",
             )
-            files["AGENTS.md"] = files["AGENTS.md"].replace(
-                "job. Do not retain the starter and add a second agent. Tools are optional: add\n"
-                "one only for a real capability outside the model, such as reading a repository\n"
-                "or calling an API. Do not create echo, pass-through, or placeholder tools.",
-                "job. Do not retain the starter and add a second agent. The safe local tools are\n"
-                "explicitly registered and exposed in `agents/registration.py`; change those\n"
-                "policies deliberately. Do not create echo, pass-through, or placeholder tools.",
+    files["pyproject.toml"] += scaffold_contract(plan)
+    files["README.md"] += application_guidance(plan)
+    files["AGENTS.md"] += application_guidance(plan)
+    if "evals" not in plan.capabilities:
+        files.pop("evals/agent.py", None)
+        files["pyproject.toml"] = files["pyproject.toml"].replace(
+            'eval_target = "evals.agent:build_eval"\n',
+            "",
+        )
+        for guidance_name in ("README.md", "AGENTS.md"):
+            files[guidance_name] = files[guidance_name].replace(
+                "uv run --no-sync cayu eval run",
+                "evals are not configured in this profile",
             )
-    elif plan.minimal:
-        files.update(convention_files(plan, render=render))
-        files["pyproject.toml"] += scaffold_contract(plan)
     if plan.database == "postgres":
         files["pyproject.toml"] = files["pyproject.toml"].replace(
             '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"',
             '[tool.cayu.session_store]\nbackend = "postgres"\nenv = "CAYU_DATABASE_URL"',
         )
-    if coding_execution is not None and composition != "coding":
-        raise ValueError("coding_execution requires composition='coding'.")
-    if coding_toolchain is not None and coding_execution != "docker":
-        raise ValueError("coding_toolchain requires coding_execution='docker'.")
-    if coding_command_authority is not None and coding_execution != "docker":
-        raise ValueError("coding_command_authority requires coding_execution='docker'.")
     if plan.database == "postgres":
         files["pyproject.toml"] = (
             files["pyproject.toml"]
@@ -3880,18 +3537,14 @@ def project_files(
                 f"cayu[postgres,server]=={_installed_cayu_version()}",
             )
         )
-    if composition is not None:
-        if composition != "coding":
-            raise ValueError("composition must be 'coding'.")
-        if template != "agent":
-            raise ValueError("the coding composition cannot be combined with a service template.")
+    if plan.preset == "coding":
         from cayu.cli.coding_composition import coding_project_files
 
         files.update(
             coding_project_files(
                 files=files,
                 render=render,
-                execution=coding_execution,
+                execution=None if plan.execution == "none" else plan.execution,
                 toolchain=coding_toolchain,
                 command_authority=coding_command_authority,
                 database=plan.database,
@@ -3899,10 +3552,8 @@ def project_files(
             )
         )
         return files
-    if template == "agent":
+    if plan.preset == "agent":
         return files
-    if template != "service":
-        raise ValueError("template must be 'agent' or 'service'.")
     version = _installed_cayu_version()
     selected_extra = "postgres" if plan.database == "postgres" else None
     current_dependency = (
@@ -4017,36 +3668,8 @@ def _run_new_discovery(args: argparse.Namespace) -> int | None:
 
 
 def _resolve_new_plan(args: argparse.Namespace, *, name: str) -> ApplicationPlan:
-    preset = args.preset
-    template = args.template
-    composition = args.composition
-    if preset is None:
-        preset = "coding" if composition == "coding" else template or "agent"
-    if template is not None and template != ("agent" if preset == "coding" else preset):
-        raise ScaffoldPlanError(
-            "preset_alias_conflict",
-            f"--template {template} conflicts with --preset {preset}",
-        )
-    if composition is not None and preset != composition:
-        raise ScaffoldPlanError(
-            "preset_alias_conflict",
-            f"--composition {composition} conflicts with --preset {preset}",
-        )
-    execution = args.execution or args.coding_execution or "none"
-    if (
-        args.execution is not None
-        and args.coding_execution is not None
-        and args.execution != args.coding_execution
-    ):
-        raise ScaffoldPlanError(
-            "execution_alias_conflict",
-            "--execution conflicts with --coding-execution",
-        )
-    if args.coding_execution is not None and preset != "coding":
-        raise ScaffoldPlanError(
-            "coding_execution_requires_coding",
-            "--coding-execution requires --preset coding or --composition coding",
-        )
+    preset = args.preset or "agent"
+    execution = args.execution or "none"
     if args.coding_toolchain is not None and execution != "docker":
         raise ScaffoldPlanError(
             "coding_toolchain_requires_docker",
@@ -4069,7 +3692,6 @@ def _resolve_new_plan(args: argparse.Namespace, *, name: str) -> ApplicationPlan
         coding_command_authority=args.coding_command_authority,
         with_capabilities=tuple(args.with_capabilities),
         without_capabilities=tuple(args.without_capabilities),
-        minimal=args.minimal,
     )
 
 

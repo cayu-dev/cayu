@@ -79,10 +79,8 @@ The reference is comparison material, not an automatic migration. Review the
 owning-file diff and update the existing source plus `[tool.cayu.scaffold]`
 explicitly. `cayu new`, `cayu check`, and `cayu inspect` never migrate a project.
 
-Compatibility forms such as `--template service`, `--composition coding`, and
-`--coding-execution docker` normalize to the same canonical plans. `--minimal`
-is the explicit small model-agent escape hatch and is not used by maintained
-service or coding presets.
+All presets use the same application convention. Use `--preset` and `--execution`
+to select the application and execution environment.
 
 ## Generator compatibility
 

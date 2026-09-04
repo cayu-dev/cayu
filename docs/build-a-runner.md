@@ -72,7 +72,8 @@ class Runner(ABC):
 
   ```python
   from cayu.runners import Runner
-  from cayu import ExecCommand, ExecResult, RunnerCancelledError, DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
+  from cayu import ExecCommand, ExecResult, DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
+  from cayu.runners import attach_cancellation_artifacts
   ```
 
 ### `ExecCommand` — what you receive
@@ -115,9 +116,9 @@ evidence confirms that the execution environment cannot accept more commands.
 
 ### Cancellation
 
-On `asyncio.CancelledError`, stop the running command, then raise
-`RunnerCancelledError` (a subclass of `asyncio.CancelledError` that carries
-optional cleanup `artifacts`). Do not swallow it.
+On `asyncio.CancelledError`, stop the running command, attach cleanup diagnostics
+with `attach_cancellation_artifacts(exc, artifacts)`, and re-raise the original
+exception. Do not swallow or replace it.
 
 Cleanup evidence uses the canonical `cayu.runner_cleanup.v1` status values.
 Use `status="completed"` only after the selected `kill_command` or
@@ -185,7 +186,7 @@ Follow [`examples/modal_runner.py`](../examples/modal_runner.py).
    kills the command and `wait()` returns `-1` with the partial output still readable,
    which the example maps to `ExecResult(timed_out=True, exit_code=-9, ...)` (keeping the
    partial output) **without** tearing down the sandbox. On `asyncio.CancelledError`,
-   **raise** `RunnerCancelledError`; *there*
+   **re-raise the original cancellation**; *there*
    the example does terminate the sandbox, because Modal has no per-command kill
    (`ContainerProcess` has no `terminate`) — and it **bounds** that cleanup so a
    hung terminate can't make cancellation hang, attaching a `cayu.runner_cleanup.v1`
@@ -272,7 +273,7 @@ assert result.stdout == "abc" and result.stdout_truncated is True
 
 Assert: command translation (argv/workdir/env recorded by the fake), output
 truncation, the no-host-env-leak rule (a host env var you set is absent from the
-forwarded env), timeout → `timed_out=True`, and cancellation → `RunnerCancelledError`.
+forwarded env), timeout → `timed_out=True`, and cancellation → the original `asyncio.CancelledError`.
 The built-in tests are full worked examples: `tests/runners/test_microsandbox.py`,
 `tests/runners/test_e2b.py`.
 
@@ -314,7 +315,7 @@ commands through your runner.
 - [ ] Translate `process` (argv) and `shell` (script) commands.
 - [ ] Enforce `timeout_s` → return `ExecResult(timed_out=True, exit_code=-9)` (the
       built-in sandbox runners' timeout convention).
-- [ ] On `asyncio.CancelledError`, terminate the command and raise `RunnerCancelledError`.
+- [ ] On `asyncio.CancelledError`, terminate the command, attach diagnostics, and re-raise the original exception.
 - [ ] Truncate stdout/stderr to `output_limit_bytes`; set the `*_truncated` flags.
 - [ ] For OS-pipe backends, read stdout/stderr concurrently and buffer incrementally
       (preserves partial output on timeout; avoids pipe deadlock).

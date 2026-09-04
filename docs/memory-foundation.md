@@ -314,7 +314,7 @@ conformance, concurrency, migration, reopen, and cancellation tests.
 
 `RecallEngine` runs registered `RecallSource` adapters concurrently under
 per-source and overall deadlines, validates their independently ranked lanes,
-and fuses them with a caller-versioned `RetrievalFusionStrategy`. The built-in
+and fuses them with weighted reciprocal-rank fusion. The built-in
 `KnowledgeRecallSource` contributes separate lexical and semantic lanes;
 `TranscriptRecallSource` contributes a narrative transcript lane. Every source,
 channel, candidate list, record representation, and combined result has an
@@ -1873,11 +1873,7 @@ availability. Inputs that omit a configured channel, add an unconfigured channel
 exceed a budget, duplicate a rank, or disagree on canonical feature values fail
 closed.
 
-A replacement `RetrievalFusionStrategy` must preserve these invariants even if
-its ranking method differs: hard filtering occurs before its inputs, all work is
-bounded, canonical revision identity is retained, output is deterministic for
-recorded inputs/configuration, diagnostics reproduce the decision, and raw
-payload text from rejected candidates is not required in model-facing output.
+
 
 ## Reproducible baselines
 

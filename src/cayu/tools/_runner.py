@@ -39,7 +39,6 @@ from cayu.runners import (
     ExecResult,
     LocalRunner,
     Runner,
-    RunnerCancelledError,
     RunnerExecutionError,
     RunnerUnavailableError,
     RunnerWorkloadAuthority,
@@ -213,19 +212,16 @@ class InvocationRunnerHandle:
             preflight_failure.__traceback__ = None
             caller_cancellation = await await_invocation_cancellation_checkpoint()
             if caller_cancellation is not None:
-                cancellation_type, cancellation_args, cancellation_artifacts = (
-                    _detached_runner_cancellation_state(
-                        caller_cancellation,
-                        redactor=_current_runner_redactor(
-                            self.__redactor_snapshot_provider,
-                        ),
-                        caller_cancelled=True,
-                    )
+                cancellation_args, cancellation_artifacts = _detached_runner_cancellation_state(
+                    caller_cancellation,
+                    redactor=_current_runner_redactor(
+                        self.__redactor_snapshot_provider,
+                    ),
+                    caller_cancelled=True,
                 )
                 cancellation_cause = preflight_failure
                 del caller_cancellation, preflight_failure, self
                 _raise_clean_runner_cancellation(
-                    cancellation_type,
                     cancellation_args,
                     cancellation_artifacts,
                     cause=cancellation_cause,
@@ -378,19 +374,16 @@ class InvocationRunnerHandle:
             preflight_failure.__traceback__ = None
             caller_cancellation = await await_invocation_cancellation_checkpoint()
             if caller_cancellation is not None:
-                cancellation_type, cancellation_args, cancellation_artifacts = (
-                    _detached_runner_cancellation_state(
-                        caller_cancellation,
-                        redactor=_current_runner_redactor(
-                            self.__redactor_snapshot_provider,
-                        ),
-                        caller_cancelled=True,
-                    )
+                cancellation_args, cancellation_artifacts = _detached_runner_cancellation_state(
+                    caller_cancellation,
+                    redactor=_current_runner_redactor(
+                        self.__redactor_snapshot_provider,
+                    ),
+                    caller_cancelled=True,
                 )
                 cancellation_cause = preflight_failure
                 del caller_cancellation, preflight_failure, self
                 _raise_clean_runner_cancellation(
-                    cancellation_type,
                     cancellation_args,
                     cancellation_artifacts,
                     cause=cancellation_cause,
@@ -417,7 +410,6 @@ class InvocationRunnerHandle:
         cancellation_cause: BaseException | None = None
         cancellation: (
             tuple[
-                type[asyncio.CancelledError],
                 tuple[object, ...],
                 list[dict[str, Any]],
             ]
@@ -631,10 +623,9 @@ class InvocationRunnerHandle:
                             raise AssertionError("Caller cancellation state was not captured.")
                         cancellation = (
                             cancellation[0],
-                            cancellation[1],
                             sanitize_runner_artifacts(
                                 [
-                                    *cancellation[2],
+                                    *cancellation[1],
                                     *child_cancellation_artifacts,
                                 ]
                             ),
@@ -657,8 +648,7 @@ class InvocationRunnerHandle:
                     raise AssertionError("Caller cancellation state was not captured.")
                 cancellation = (
                     cancellation[0],
-                    cancellation[1],
-                    sanitize_runner_artifacts([*cancellation[2], *child_cancellation[2]]),
+                    sanitize_runner_artifacts([*cancellation[1], *child_cancellation[1]]),
                 )
         elif isinstance(raw_error, RunnerUnavailableError):
             safe_failure = _safe_runner_unavailable_error(self.__runner, raw_error)
@@ -712,7 +702,7 @@ class InvocationRunnerHandle:
         if cancellation is not None:
             # Do not leave an object path from the public traceback back into
             # adapter/SDK state that may still retain the transferred request.
-            cancellation_type, cancellation_args, cancellation_artifacts = cancellation
+            cancellation_args, cancellation_artifacts = cancellation
             safe_cause = cancellation_cause
             del (
                 cancellation,
@@ -723,7 +713,6 @@ class InvocationRunnerHandle:
                 grouped_failure,
             )
             _raise_clean_runner_cancellation(
-                cancellation_type,
                 cancellation_args,
                 cancellation_artifacts,
                 cause=safe_cause,
@@ -1410,7 +1399,6 @@ async def _settle_invocation_runner_mutation(
 
 
 def _raise_clean_runner_cancellation(
-    cancellation_type: type[asyncio.CancelledError],
     args: tuple[object, ...],
     artifacts: list[dict[str, Any]],
     *,
@@ -1424,7 +1412,7 @@ def _raise_clean_runner_cancellation(
     boundary, after the complete tool failure tree is available.
     """
 
-    cancellation = _clean_runner_cancellation(cancellation_type, args, artifacts)
+    cancellation = _clean_runner_cancellation(args, artifacts)
     if cause is not None:
         attach_runner_cancellation_failure(cancellation, cause)
     current_task = asyncio.current_task()
@@ -1456,17 +1444,10 @@ def _raise_clean_runner_settlement_signal(signal: BaseException) -> NoReturn:
 
 
 def _clean_runner_cancellation(
-    cancellation_type: type[asyncio.CancelledError],
     args: tuple[object, ...],
     artifacts: list[dict[str, Any]],
 ) -> asyncio.CancelledError:
-    if cancellation_type is RunnerCancelledError:
-        cancellation = RunnerCancelledError(
-            artifacts=artifacts,
-        )
-        BaseException.__dict__["args"].__set__(cancellation, args)
-    else:
-        cancellation = asyncio.CancelledError(*args)
+    cancellation = asyncio.CancelledError(*args)
     if artifacts:
         namespace = BaseException.__dict__["__dict__"].__get__(
             cancellation,
@@ -1483,21 +1464,14 @@ def _detached_runner_cancellation_state(
     redactor: SecretRedactor | None,
     caller_cancelled: bool,
 ) -> tuple[
-    type[asyncio.CancelledError],
     tuple[object, ...],
     list[dict[str, Any]],
 ]:
     """Capture only cancellation state safe to carry across the runner boundary."""
 
-    cancellation_type = _safe_runner_cancellation_type(
-        cancellation,
-        redactor=redactor,
-        caller_cancelled=caller_cancelled,
-    )
     args = _safe_runner_cancellation_args(
         (_SAFE_RUNNER_CANCELLATION_MESSAGE,),
         redactor=redactor,
-        cancellation_type=cancellation_type,
     )
     if caller_cancelled and redactor is not None:
         try:
@@ -1510,42 +1484,17 @@ def _detached_runner_cancellation_state(
         args = _safe_runner_cancellation_args(
             source_args,
             redactor=redactor,
-            cancellation_type=cancellation_type,
         )
     return (
-        cancellation_type,
         args,
         sanitize_runner_artifacts(_base_exception_namespace_value(cancellation, "artifacts")),
     )
-
-
-def _safe_runner_cancellation_type(
-    cancellation: asyncio.CancelledError,
-    *,
-    redactor: SecretRedactor | None,
-    caller_cancelled: bool,
-) -> type[asyncio.CancelledError]:
-    """Preserve a legacy subtype only when it is runner-owned and safe to render."""
-
-    if (
-        caller_cancelled
-        or not isinstance(cancellation, RunnerCancelledError)
-        or redactor is None
-        or not _runner_cancellation_rendering_is_safe(
-            (),
-            redactor=redactor,
-            cancellation_type=RunnerCancelledError,
-        )
-    ):
-        return asyncio.CancelledError
-    return RunnerCancelledError
 
 
 def _safe_runner_cancellation_args(
     source_args: object,
     *,
     redactor: SecretRedactor | None,
-    cancellation_type: type[asyncio.CancelledError],
 ) -> tuple[object, ...]:
     """Project one ordinary reason and validate the complete exception rendering."""
 
@@ -1585,7 +1534,6 @@ def _safe_runner_cancellation_args(
         if redactor is None or _runner_cancellation_rendering_is_safe(
             candidate_args,
             redactor=redactor,
-            cancellation_type=cancellation_type,
         ):
             return candidate_args
     return ()
@@ -1595,14 +1543,9 @@ def _runner_cancellation_rendering_is_safe(
     args: tuple[object, ...],
     *,
     redactor: SecretRedactor,
-    cancellation_type: type[asyncio.CancelledError],
 ) -> bool:
     try:
-        if cancellation_type is RunnerCancelledError:
-            candidate = RunnerCancelledError()
-            BaseException.__dict__["args"].__set__(candidate, args)
-        else:
-            candidate = asyncio.CancelledError(*args)
+        candidate = asyncio.CancelledError(*args)
         rendered = (str(candidate), repr(candidate))
     except BaseException:
         return False

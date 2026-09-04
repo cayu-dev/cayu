@@ -321,9 +321,9 @@ def test_legacy_coding_flags_normalize_to_the_canonical_plan(
         "coder",
         "--dir",
         str(tmp_path),
-        "--composition",
+        "--preset",
         "coding",
-        "--coding-execution",
+        "--execution",
         "docker",
         "--dry-run",
         "--json",
@@ -393,45 +393,6 @@ def test_postgres_service_plan_is_rejected_before_writes(
         "message": "database 'postgres' is not supported by preset 'service'",
     }
     assert not target.exists()
-
-
-def test_minimal_is_recorded_and_omits_the_complete_convention(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert main(["new", "tiny", "--minimal", "--dir", str(tmp_path), "--json"]) == 0
-    payload = _json_output(capsys)
-    project = tmp_path / "tiny"
-
-    assert payload["plan"]["minimal"] is True
-    assert payload["plan"]["capabilities"] == []
-    assert payload["plan"]["private_files"] == []
-    assert (project / "configuration.py").is_file()
-    assert not (project / "configuration").exists()
-    assert not (project / "workflows").exists()
-    assert (project / "data").is_dir()
-    assert not (project / "data" / "memory-evidence.key").exists()
-    assert not (project / "data" / "artifacts").exists()
-    assert "minimal = true" in (project / "pyproject.toml").read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize(
-    ("arguments", "code"),
-    [
-        (("--database", "postgres"), "MINIMAL_DATABASE_UNSUPPORTED"),
-        (("--with", "observability"), "MINIMAL_CAPABILITY_UNSUPPORTED"),
-    ],
-)
-def test_minimal_rejects_unimplemented_combinations_before_writes(
-    arguments: tuple[str, ...],
-    code: str,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert main(["new", "tiny", "--minimal", *arguments, "--dir", str(tmp_path), "--json"]) == 1
-
-    assert _json_output(capsys)["error"]["code"] == code
-    assert not (tmp_path / "tiny").exists()
 
 
 def test_service_plan_declares_and_supplies_non_secret_auth_proof_environment() -> None:
@@ -742,7 +703,7 @@ def test_coding_preflight_failure_retains_recoverable_settlement_diagnostic(
     command = [
         "new",
         "recoverable-coder",
-        "--composition",
+        "--preset",
         "coding",
         "--dir",
         str(tmp_path),
@@ -836,7 +797,7 @@ def fault(phase):
         os._exit(84)
 
 publication._publication_fault = fault
-main(["new", "recoverable", "--minimal", "--dir", {str(tmp_path)!r}])
+main(["new", "recoverable", "--dir", {str(tmp_path)!r}])
 """
     completed = subprocess.run(
         [sys.executable, "-c", script],

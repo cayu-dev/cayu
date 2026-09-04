@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from hashlib import sha256
 from math import fsum
-from typing import Any, ClassVar, Self
+from typing import Any, Self
 
 from pydantic import (
     BaseModel,
@@ -348,21 +347,7 @@ class RetrievalFusionResult(BaseModel):
     diagnostics: RetrievalFusionDiagnostics
 
 
-class RetrievalFusionStrategy(ABC):
-    """Typed replacement seam for bounded, diagnostic-preserving fusion."""
-
-    strategy_version: ClassVar[str]
-
-    @abstractmethod
-    def fuse(
-        self,
-        channels: tuple[RankedRetrievalChannel, ...],
-        config: WeightedReciprocalRankFusionConfig,
-    ) -> RetrievalFusionResult:
-        """Fuse bounded ranked channels without comparing their raw scores."""
-
-
-class WeightedReciprocalRankFusion(RetrievalFusionStrategy):
+class WeightedReciprocalRankFusion:
     """Deterministic weighted reciprocal-rank fusion reference strategy."""
 
     strategy_version = WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION
@@ -635,7 +620,6 @@ __all__ = [
     "RetrievalChannelDiagnostics",
     "RetrievalFusionDiagnostics",
     "RetrievalFusionResult",
-    "RetrievalFusionStrategy",
     "WeightedReciprocalRankFusion",
     "WeightedReciprocalRankFusionConfig",
 ]

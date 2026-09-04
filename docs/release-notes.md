@@ -1360,7 +1360,7 @@ older claimers do not consult the attempt fence.
 
 ### Generated projects can opt in to an explicit coding composition
 
-`cayu new NAME --composition coding` now generates one runnable, ordinary-Python
+`cayu new NAME --preset coding` now generates one runnable, ordinary-Python
 composition for repository work. It assembles existing bounded file/search/Git
 tools, local artifacts, durable reviewed knowledge, background reviewer
 delegation with result recovery, and human-input pause/resume. The generated

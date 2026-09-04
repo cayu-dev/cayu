@@ -13,7 +13,6 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
-    RunnerCancelledError,
     attach_cancellation_artifacts,
     is_same_or_child,
 )
@@ -179,15 +178,6 @@ def test_attach_cancellation_artifacts_sets_and_appends():
     second = _artifact("kill_sandbox", "completed")
     attach_cancellation_artifacts(exc, [second])
     assert exc.artifacts == [first, second]
-
-
-def test_runner_cancelled_error_stays_compatible():
-    # Third-party runners may still raise the subclass; the runtime reads the
-    # same out-of-band `artifacts` attribute in both cases.
-    artifact = _artifact("kill_command", "completed")
-    error = RunnerCancelledError(artifacts=[artifact])
-    assert isinstance(error, asyncio.CancelledError)
-    assert getattr(error, "artifacts", None) == [artifact]
 
 
 def test_exec_result_exposes_nonnegative_total_output_bytes():

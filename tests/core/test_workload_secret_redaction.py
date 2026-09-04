@@ -19,6 +19,7 @@ from tests.core._workload_secret_support import (
     collect_resume_events,
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
+from tests.runner_cancellation import cancelled_error_with_artifacts
 
 import cayu.runtime._invocation_secrets as invocation_secrets_module
 import cayu.runtime.execution_profiles as execution_profiles_module
@@ -57,7 +58,6 @@ from cayu.runners import (
     ExecCommand,
     ExecResult,
     Runner,
-    RunnerCancelledError,
     RunnerExecutionError,
     attach_cancellation_artifacts,
 )
@@ -4060,7 +4060,7 @@ def test_parallel_generic_cancellation_preserves_caller_signal_without_secret_ev
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError as exc:
-                cancellation = RunnerCancelledError(
+                cancellation = cancelled_error_with_artifacts(
                     f"tool cancelled near {raw_secret}",
                     artifacts=[
                         {
@@ -4393,7 +4393,7 @@ def test_runtime_sanitizes_grouped_runner_failure_from_real_caller_cancellation(
 
 
 def test_caller_cancellation_cannot_spoof_runtime_cleanup_artifacts() -> None:
-    cancellation = RunnerCancelledError(
+    cancellation = cancelled_error_with_artifacts(
         "caller cancellation",
         artifacts=[{"type": "caller-controlled", "value": "not runtime evidence"}],
     )
@@ -4432,7 +4432,7 @@ def test_operator_interrupt_redacts_secret_resolved_during_cancelled_tool() -> N
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError as exc:
-                raise RunnerCancelledError(
+                raise cancelled_error_with_artifacts(
                     artifacts=[
                         {
                             "type": "cayu.runner_cleanup.v1",
@@ -5590,7 +5590,7 @@ def test_parallel_operator_interrupt_keeps_each_invocation_secret_scope() -> Non
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError as exc:
-                raise RunnerCancelledError(
+                raise cancelled_error_with_artifacts(
                     artifacts=[
                         {
                             "type": "cayu.runner_cleanup.v1",

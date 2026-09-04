@@ -111,7 +111,7 @@ def test_generate_service_context_migrates_the_previous_generated_factory(
     monkeypatch,
     capsys,
 ) -> None:
-    assert main(["new", "service", "--template", "service", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "service", "--preset", "service", "--dir", str(tmp_path)]) == 0
     capsys.readouterr()
     project = tmp_path / "service"
     service_path = project / "service.py"
@@ -163,7 +163,7 @@ def test_generate_service_context_fails_closed_for_a_customized_factory(
     monkeypatch,
     capsys,
 ) -> None:
-    assert main(["new", "service", "--template", "service", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "service", "--preset", "service", "--dir", str(tmp_path)]) == 0
     capsys.readouterr()
     project = tmp_path / "service"
     service_path = project / "service.py"
@@ -558,34 +558,6 @@ def test_coding_tool_plan_pins_app_wiring_precondition(
         apply_slice_plan(plan)
 
     assert _stable_files(project) == before
-
-
-@pytest.mark.parametrize("command", ["tool", "slice"])
-def test_minimal_scaffold_generators_use_the_legacy_app_seam(
-    command: str,
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
-) -> None:
-    assert main(["new", "tiny", "--minimal", "--dir", str(tmp_path)]) == 0
-    capsys.readouterr()
-    project = tmp_path / "tiny"
-    before = _files(project)
-    monkeypatch.chdir(project)
-
-    arguments = (
-        ["generate", "tool", "probe", "--agent", "tiny", "--effect", "none"]
-        if command == "tool"
-        else ["generate", "slice", "analyst", "--tool", "probe", "--effect", "none"]
-    )
-
-    assert main([*arguments, "--dry-run", "--json"]) == 0
-    plan = json.loads(capsys.readouterr().out)
-    assert plan["status"] == "ready"
-    edited_paths = {edit["path"] for edit in plan["edits"]}
-    assert "app.py" in edited_paths
-    assert "agents/registration.py" not in edited_paths
-    assert _files(project) == before
 
 
 def test_generate_tool_requires_intact_starter_markers_without_writes(

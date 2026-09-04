@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import NoReturn
 
 import pytest
+from tests.docker_toolchain import docker_toolchain_profile
 
 from cayu import (
     AgentSpec,
@@ -135,7 +136,13 @@ def test_concurrent_workflow_eval_trials_use_isolated_docker_resources_and_remov
         app = _app()
         created = await DockerCodingEnvironmentFactory(
             source_workspace=LocalWorkspace(source_root),
-            image_identity=DockerImageIdentity(reference=image, content_digest=image_id),
+            toolchain_profile=docker_toolchain_profile(
+                image_identity=DockerImageIdentity(reference=image, content_digest=image_id),
+                platform_architecture=subprocess.check_output(
+                    [docker_path, "image", "inspect", "--format", "{{.Architecture}}", image],
+                    text=True,
+                ).strip(),
+            ),
             docker_path=docker_path,
         ).create(
             EnvironmentFactoryRequest(

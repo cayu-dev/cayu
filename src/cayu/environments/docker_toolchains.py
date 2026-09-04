@@ -983,39 +983,6 @@ def _read_local_dependency_input(
         os.close(active_fd)
 
 
-def legacy_docker_coding_toolchain_profile(
-    *,
-    image_identity: DockerImageIdentity,
-    restrictions: DockerWorkloadRestrictions,
-    required_executables: tuple[str, ...],
-    platform_architecture: Literal["amd64", "arm64"] = "amd64",
-) -> DockerCodingToolchainProfile:
-    """Construct the explicit compatibility profile for pre-profile factory callers."""
-
-    authorities = tuple(
-        DockerCodingCommandAuthority(
-            selector=f"legacy-{index:02d}",
-            revision="1",
-            description="Compatibility-only executable admission; not model exposed.",
-            exposure="named_check",
-            executable=(executable if executable.startswith("/") else f"/usr/bin/{executable}"),
-            max_arguments=0,
-        )
-        for index, executable in enumerate(sorted(set(required_executables)))
-    )
-    return DockerCodingToolchainProfile(
-        profile_id="cayu-legacy-docker-coding",
-        revision="1",
-        image_identity=image_identity,
-        platform_architecture=platform_architecture,
-        runtime_user=restrictions.user,
-        restrictions=restrictions,
-        command_authorities=authorities,
-        dependency_inputs=(),
-        admission_probes=(),
-    )
-
-
 def _validated_owned_argv(
     value: tuple[str, ...],
     *,
@@ -1104,7 +1071,6 @@ __all__ = [
     "DockerCodingToolchainError",
     "DockerCodingToolchainProfile",
     "docker_coding_toolchain_runner_admission_failure",
-    "legacy_docker_coding_toolchain_profile",
     "verify_docker_coding_toolchain_dependencies",
     "verify_local_docker_coding_toolchain_dependencies",
 ]

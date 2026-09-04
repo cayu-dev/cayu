@@ -84,7 +84,6 @@ _TRUSTED_RUNNER_ERROR_TYPE_NAMES = frozenset(
         "RecursionError",
         "ReferenceError",
         "ResourceWarning",
-        "RunnerCancelledError",
         "RunnerExecutionError",
         "RunnerUnavailableError",
         "RuntimeError",

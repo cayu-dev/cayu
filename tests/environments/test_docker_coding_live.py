@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.docker_toolchain import docker_toolchain_profile
 
 from cayu import (
     DockerCodingEnvironmentFactory,
@@ -73,7 +74,12 @@ def test_real_docker_coding_round_trip_is_bounded_and_excludes_host_git(
     source = LocalWorkspace(tmp_path, workspace_id="live-docker-source")
     factory = DockerCodingEnvironmentFactory(
         source_workspace=source,
-        image_identity=DockerImageIdentity(reference=image, content_digest=image_id),
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=DockerImageIdentity(reference=image, content_digest=image_id),
+            platform_architecture=subprocess.check_output(
+                [docker_path, "image", "inspect", "--format", "{{.Architecture}}", image], text=True
+            ).strip(),
+        ),
         docker_path=docker_path,
     )
     request = EnvironmentFactoryRequest(
@@ -193,7 +199,12 @@ def test_100_real_docker_environments_share_one_immutable_input(
     store = ImmutableInputStore(tmp_path / "managed")
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(workspace_root),
-        image_identity=image_identity,
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=image_identity,
+            platform_architecture=subprocess.check_output(
+                [docker_path, "image", "inspect", "--format", "{{.Architecture}}", image], text=True
+            ).strip(),
+        ),
         immutable_inputs=(immutable_input,),
         immutable_input_store=store,
         immutable_input_runtime_compatibility_fingerprint=runtime_compatibility,

@@ -196,7 +196,6 @@ from cayu.runtime.completion_verifiers import (
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
     CompactionPrompt,
-    CompactionPromptBuilder,
     CompactionRequest,
     CompactionResult,
     ContextCompactor,
@@ -1254,7 +1253,6 @@ __all__ = [
     "ChildSessionResultUnavailable",
     "CompactSessionRequest",
     "CompactionPrompt",
-    "CompactionPromptBuilder",
     "CompactionRequest",
     "CompactionResult",
     "ComparableGenerationSettings",

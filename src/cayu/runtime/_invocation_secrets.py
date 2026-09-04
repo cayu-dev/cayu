@@ -22,7 +22,6 @@ from cayu.proxies import (
     ProxyAuthorizationResult,
     copy_proxy_authorization_result,
 )
-from cayu.runners import RunnerCancelledError
 from cayu.runners._cleanup import pop_runner_cancellation_failure
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.tools._redaction import InvocationRedactorSnapshot
@@ -740,8 +739,6 @@ def cancellation_artifacts(
 ) -> list[dict[str, Any]]:
     if _cancellation_evidence(cancellation) is None:
         return []
-    if isinstance(cancellation, RunnerCancelledError):
-        return copy_json_value(cancellation.artifacts, "artifacts")
     artifacts = getattr(cancellation, "artifacts", None)
     if artifacts is not None:
         return copy_json_value(artifacts, "artifacts")

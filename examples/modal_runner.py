@@ -41,9 +41,11 @@ from cayu import (
     EnvironmentSpec,
     ExecCommand,
     ExecResult,
-    RunnerCancelledError,
 )
-from cayu.runners import Runner  # the base ABC is exported from cayu.runners, not top-level cayu
+from cayu.runners import (
+    Runner,  # the base ABC is exported from cayu.runners, not top-level cayu
+    attach_cancellation_artifacts,
+)
 
 DEFAULT_MODAL_CWD = "/workspace"
 # Best-effort cancellation cleanup is bounded so a hung terminate can't make
@@ -202,9 +204,8 @@ class ModalRunner(Runner):
             # hang, and attach a cleanup diagnostic in the core shape (built-in runners
             # do this via cayu.runners._cleanup.cleanup_runner_command_with_diagnostic).
             terminated = await _terminate_bounded(self._sandbox)
-            raise RunnerCancelledError(
-                artifacts=[_cleanup_artifact(self.isolation, terminated)]
-            ) from exc
+            attach_cancellation_artifacts(exc, [_cleanup_artifact(self.isolation, terminated)])
+            raise
 
     def preflight_exec(
         self,

@@ -1578,7 +1578,6 @@ def _cayu_compactor_material(
         ModelCompactor,
         PromptCacheCompactor,
         TranscriptDigestCompactor,
-        default_compaction_prompt,
     )
 
     if type(compactor) is TranscriptDigestCompactor:
@@ -1610,25 +1609,13 @@ def _cayu_compactor_material(
             "max_hierarchy_calls": compactor.max_hierarchy_calls,
             "retry_policy": compactor.retry_policy.model_dump(mode="json"),
         }
-        if (
-            compactor.system_prompt != default_prompt
-            or compactor.options
-            or compactor.prompt_builder not in (None, default_compaction_prompt)
-        ):
+        if compactor.system_prompt != default_prompt or compactor.options:
             material["private_configuration"] = {
                 "kind": "process_local_private_configuration",
                 "configuration_hmac_sha256": _process_local_configuration_commitment(
                     {
                         "system_prompt": compactor.system_prompt,
                         "options": compactor.options,
-                        "prompt_builder": (
-                            None
-                            if compactor.prompt_builder is None
-                            else {
-                                "component": _qualified_type_name(compactor.prompt_builder),
-                                "object_id": str(id(compactor.prompt_builder)),
-                            }
-                        ),
                     },
                     process_identity=process_identity,
                     field_name="model_compactor_private_configuration",

@@ -2227,8 +2227,6 @@ class CompactionPrompt(BaseModel):
         return require_durable_nonblank(value, "prompt")
 
 
-CompactionPromptBuilder = Callable[[CompactionRequest], CompactionPrompt]
-
 _COMPACTION_PROMPT_FIELDS = frozenset({"prompt", "covered_message_count"})
 _COMPACTION_RESULT_FIELDS = frozenset(
     {
@@ -2811,7 +2809,6 @@ class ModelCompactor(ContextCompactor):
         options: dict[str, Any] | None = None,
         max_input_chars: int | None = 120_000,
         max_hierarchy_calls: int = 64,
-        prompt_builder: CompactionPromptBuilder | None = None,
         retry_policy: RetryPolicy | None = None,
         _usage_dialect: UsageDialect | None = None,
         _provider_snapshot: _CompactionProviderSnapshot | None = None,
@@ -2863,9 +2860,6 @@ class ModelCompactor(ContextCompactor):
         self.options = copy_json_value({} if options is None else options, "options")
         self.max_input_chars = max_input_chars
         self.max_hierarchy_calls = max_hierarchy_calls
-        if prompt_builder is not None and not callable(prompt_builder):
-            raise TypeError("prompt_builder must be callable.")
-        self.prompt_builder = prompt_builder
         # `None` selects the shared default retry policy.
         self.retry_policy = copy_retry_policy(retry_policy)
 
@@ -2972,56 +2966,26 @@ class ModelCompactor(ContextCompactor):
         max_input_chars = identity.max_input_chars
         max_hierarchy_calls = identity.max_hierarchy_calls
         del identity
-        prompt_builder = self.prompt_builder
-        if prompt_builder is None or prompt_builder is default_compaction_prompt:
-            bounded_prompt, input_truncated, covered_message_count = (
-                _bounded_default_compaction_prompt(
-                    request,
-                    max_chars=max_input_chars,
-                )
+        bounded_prompt, input_truncated, covered_message_count = _bounded_default_compaction_prompt(
+            request,
+            max_chars=max_input_chars,
+        )
+        if bounded_prompt is None:
+            with _compaction_dispatch_counter_scope(max_hierarchy_calls) as dispatch_counter:
+                result = await self._compact_oversized_atomic_unit(request)
+            metadata = copy_json_value(result.metadata, "metadata")
+            metadata["hierarchy_dispatch_count"] = dispatch_counter.count
+            return result.model_copy(
+                update={
+                    "metadata": metadata,
+                    "represented_existing_summary_sha256": (
+                        _compaction_summary_sha256(request.existing_summary)
+                        if request.existing_summary is not None
+                        else None
+                    ),
+                },
+                deep=True,
             )
-            if bounded_prompt is None:
-                with _compaction_dispatch_counter_scope(max_hierarchy_calls) as dispatch_counter:
-                    result = await self._compact_oversized_atomic_unit(request)
-                metadata = copy_json_value(result.metadata, "metadata")
-                metadata["hierarchy_dispatch_count"] = dispatch_counter.count
-                return result.model_copy(
-                    update={
-                        "metadata": metadata,
-                        "represented_existing_summary_sha256": (
-                            _compaction_summary_sha256(request.existing_summary)
-                            if request.existing_summary is not None
-                            else None
-                        ),
-                    },
-                    deep=True,
-                )
-        else:
-            custom_prompt = _detach_compaction_prompt(prompt_builder(request))
-            user_prompt = custom_prompt.prompt
-            if request.existing_summary is not None:
-                user_prompt = (
-                    "Existing summary that the replacement summary must continue to "
-                    "represent:\n"
-                    f"{request.existing_summary}\n\n"
-                    "Custom compaction prompt:\n"
-                    f"{user_prompt}"
-                )
-            covered_message_count = custom_prompt.covered_message_count
-            _validate_compaction_result_coverage(
-                messages=request.messages,
-                previous_cursor=0,
-                compactable_cursor=len(request.messages),
-                covered_message_count=covered_message_count,
-            )
-            bounded_prompt, input_truncated = _bounded_prompt_text(
-                user_prompt,
-                max_chars=max_input_chars,
-            )
-            if input_truncated:
-                raise ValueError(
-                    "Custom compaction prompts must fit max_input_chars without truncation."
-                )
         result = await self._compact_prompt_once(
             bounded_prompt,
             covered_message_count=covered_message_count,

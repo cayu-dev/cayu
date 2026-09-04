@@ -1267,10 +1267,6 @@ def convention_files(
 ) -> dict[str, str]:
     """Return the complete architecture overlay for one normalized plan."""
 
-    if plan.minimal:
-        return {
-            "CLAUDE.md": _CLAUDE_MD,
-        }
     selected = set(plan.capabilities)
     public_app_factories = (
         '["build_app", "build_coding_product_application"]'
@@ -1411,7 +1407,6 @@ def scaffold_contract(plan: ApplicationPlan) -> str:
     """Render the normalized source-controlled scaffold contract."""
 
     capabilities = ", ".join(f'"{name}"' for name in plan.capabilities)
-    minimal = "true" if plan.minimal else "false"
     return (
         "\n[tool.cayu.scaffold]\n"
         f"convention = {plan.convention}\n"
@@ -1430,7 +1425,6 @@ def scaffold_contract(plan: ApplicationPlan) -> str:
             else (f'coding_command_authority = "{plan.coding_command_authority}"\n')
         )
         + f"capabilities = [{capabilities}]\n"
-        + f"minimal = {minimal}\n"
     )
 
 
@@ -1509,7 +1503,5 @@ def _creation_command(plan: ApplicationPlan, *, name: str) -> str:
                 arguments.extend(("--with", capability.name))
         elif capability.name in defaults - selected:
             arguments.extend(("--without", capability.name))
-    if plan.minimal:
-        arguments.append("--minimal")
     arguments.append("--json")
     return " ".join(arguments)

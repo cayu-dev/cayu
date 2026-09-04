@@ -89,7 +89,7 @@ process exit keeps its status.
 
 ## Serve a maintained public-agent service
 
-Projects generated with `cayu new NAME --template service` also declare:
+Projects generated with `cayu new NAME --preset service` also declare:
 
 ```toml
 [tool.cayu]

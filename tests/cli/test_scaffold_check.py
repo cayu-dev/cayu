@@ -29,21 +29,6 @@ def test_complete_generated_project_has_no_scaffold_findings(
     assert check_declared_scaffold(project, _generated_manifest(project)) == ()
 
 
-def test_minimal_generated_project_passes_strict_scaffold_check(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assert main(["new", "tiny", "--minimal", "--dir", str(tmp_path)]) == 0
-    capsys.readouterr()
-    project = tmp_path / "tiny"
-    monkeypatch.chdir(project)
-
-    assert main(["check", "--fail-on", "warning", "--json"]) == 0
-    report = json.loads(capsys.readouterr().out)
-    assert report["diagnostics"] == []
-
-
 @pytest.mark.parametrize(
     "exclusions",
     (
@@ -66,25 +51,6 @@ def test_supported_capability_opt_outs_pass_strict_scaffold_check(
 
     assert main(["check", "--fail-on", "warning", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["diagnostics"] == []
-
-
-def test_minimal_scaffold_still_requires_the_application_factory(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert main(["new", "tiny", "--minimal", "--dir", str(tmp_path)]) == 0
-    capsys.readouterr()
-    project = tmp_path / "tiny"
-    manifest = _generated_manifest(project)
-    app_path = project / "app.py"
-    app_path.write_text(
-        app_path.read_text(encoding="utf-8").replace("def build_app(\n", "def assemble(\n"),
-        encoding="utf-8",
-    )
-
-    findings = check_declared_scaffold(project, manifest)
-
-    assert {item.code for item in findings} == {"SCAFFOLD_APP_FACTORY_MISSING"}
 
 
 def test_declared_layout_reports_missing_home_and_composition_collapse(

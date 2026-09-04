@@ -38,9 +38,6 @@ from cayu.retrieval import (
     RankedRetrievalChannel,
     RankedRetrievalHit,
     RetrievalCandidateIdentity,
-    RetrievalFusionResult,
-    RetrievalFusionStrategy,
-    WeightedReciprocalRankFusion,
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.runtime.sessions import (
@@ -334,128 +331,6 @@ def test_recall_engine_reports_optional_failure_and_fails_closed_when_required()
         )
     assert caught.value.source == "required"
     assert caught.value.code == "failed"
-
-
-def test_recall_engine_rejects_custom_fusion_that_alters_source_provenance() -> None:
-    class TamperingFusion(RetrievalFusionStrategy):
-        strategy_version = "test.tampering.v1"
-
-        def fuse(
-            self,
-            channels: tuple[RankedRetrievalChannel, ...],
-            config: WeightedReciprocalRankFusionConfig,
-        ) -> RetrievalFusionResult:
-            reference_config = config.model_copy(
-                update={"strategy_version": WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION}
-            )
-            valid = WeightedReciprocalRankFusion().fuse(channels, reference_config)
-            diagnostics = valid.diagnostics.model_copy(
-                update={
-                    "strategy_version": config.strategy_version,
-                    "configuration_sha256": config.fingerprint(),
-                }
-            )
-            candidate = valid.candidates[0]
-            tampered_match = candidate.matches[0].model_copy(update={"content_hash": "0" * 64})
-            tampered_candidate = candidate.model_copy(update={"matches": (tampered_match,)})
-            return valid.model_copy(
-                update={
-                    "candidates": (tampered_candidate,),
-                    "diagnostics": diagnostics,
-                }
-            )
-
-    source = _StaticRecallSource(
-        name="source",
-        channel="source.lexical",
-        record_id="record",
-    )
-    engine = RecallEngine(
-        (source,),
-        fusion_config=_fusion_config(
-            "source.lexical",
-            strategy_version=TamperingFusion.strategy_version,
-        ),
-        fusion_strategy=TamperingFusion(),
-    )
-
-    with pytest.raises(ValueError, match="match provenance"):
-        asyncio.run(engine.recall(_situation()))
-
-
-def test_recall_engine_records_and_accepts_honest_custom_fusion_identity() -> None:
-    class ReverseFusion(RetrievalFusionStrategy):
-        strategy_version = "test.reverse.v1"
-
-        def fuse(
-            self,
-            channels: tuple[RankedRetrievalChannel, ...],
-            config: WeightedReciprocalRankFusionConfig,
-        ) -> RetrievalFusionResult:
-            reference_config = config.model_copy(
-                update={"strategy_version": WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION}
-            )
-            valid = WeightedReciprocalRankFusion().fuse(channels, reference_config)
-            return valid.model_copy(
-                update={
-                    "candidates": tuple(reversed(valid.candidates)),
-                    "diagnostics": valid.diagnostics.model_copy(
-                        update={
-                            "strategy_version": config.strategy_version,
-                            "configuration_sha256": config.fingerprint(),
-                        }
-                    ),
-                }
-            )
-
-    sources = (
-        _StaticRecallSource(name="alpha", channel="alpha.lexical", record_id="a"),
-        _StaticRecallSource(name="beta", channel="beta.lexical", record_id="b"),
-    )
-    config = _fusion_config(
-        "alpha.lexical",
-        "beta.lexical",
-        strategy_version=ReverseFusion.strategy_version,
-    )
-
-    result = asyncio.run(
-        RecallEngine(
-            sources,
-            fusion_config=config,
-            fusion_strategy=ReverseFusion(),
-        ).recall(_situation())
-    )
-
-    assert [candidate.record.identity.record_id for candidate in result.candidates] == [
-        "b",
-        "a",
-    ]
-    assert result.fusion.strategy_version == ReverseFusion.strategy_version
-    assert result.fusion.configuration_sha256 == config.fingerprint()
-
-
-def test_recall_engine_rejects_fusion_identity_mismatch_at_registration() -> None:
-    class CustomFusion(RetrievalFusionStrategy):
-        strategy_version = "test.custom.v1"
-
-        def fuse(
-            self,
-            channels: tuple[RankedRetrievalChannel, ...],
-            config: WeightedReciprocalRankFusionConfig,
-        ) -> RetrievalFusionResult:  # pragma: no cover - registration rejects first
-            raise AssertionError((channels, config))
-
-    source = _StaticRecallSource(
-        name="source",
-        channel="source.lexical",
-        record_id="record",
-    )
-    with pytest.raises(ValueError, match="identity must match"):
-        RecallEngine(
-            (source,),
-            fusion_config=_fusion_config("source.lexical"),
-            fusion_strategy=CustomFusion(),
-        )
 
 
 def test_recall_engine_cancels_outstanding_source_work_at_global_timeout() -> None:

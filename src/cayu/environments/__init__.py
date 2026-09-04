@@ -70,7 +70,6 @@ from cayu.environments.docker_toolchains import (
     DockerCodingFixedEnvironmentVariable,
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
-    legacy_docker_coding_toolchain_profile,
     verify_docker_coding_toolchain_dependencies,
     verify_local_docker_coding_toolchain_dependencies,
 )
@@ -235,7 +234,6 @@ __all__ = [
     "environment_lifecycle_progress_from_event",
     "evaluate_execution_admission",
     "inspect_local_immutable_input",
-    "legacy_docker_coding_toolchain_profile",
     "load_workspace_instructions",
     "require_immutable_input_projection",
     "verify_docker_coding_toolchain_dependencies",

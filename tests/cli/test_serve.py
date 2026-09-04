@@ -60,7 +60,7 @@ def test_serve_uses_the_maintained_service_factory_for_explicit_local_developmen
     monkeypatch,
     capsys,
 ) -> None:
-    for relative, content in project_files("service", template="service").items():
+    for relative, content in project_files("service", preset="service").items():
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -156,7 +156,7 @@ def test_serve_refuses_unsafe_production_service_before_starting_listener(
     monkeypatch,
     capsys,
 ) -> None:
-    for relative, content in project_files("service", template="service").items():
+    for relative, content in project_files("service", preset="service").items():
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -179,7 +179,7 @@ def test_serve_starts_supported_production_service_on_one_listener(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    for relative, content in project_files("service", template="service").items():
+    for relative, content in project_files("service", preset="service").items():
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")

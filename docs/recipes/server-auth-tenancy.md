@@ -40,7 +40,7 @@ lookup.
 For new services, generate the maintained tracer bullet first:
 
 ```bash
-cayu new my-service --template service
+cayu new my-service --preset service
 ```
 
 Its `build_service(*, mode=...)` factory is shared by `cayu serve`,

@@ -78,20 +78,6 @@ _COMPLETE_REQUIRED_PATHS = (
     "tests/test_architecture.py",
     "data",
 )
-_MINIMAL_REQUIRED_PATHS = (
-    "AGENTS.md",
-    "CLAUDE.md",
-    "README.md",
-    "app.py",
-    "run.py",
-    "configuration.py",
-    "agents/__init__.py",
-    "agents/agent.py",
-    "evals/__init__.py",
-    "evals/agent.py",
-    "tests/test_agent.py",
-    "data",
-)
 _REQUIRED_DIRECTORY_PATHS = frozenset({"data", "knowledge/seeds"})
 _APPLICATION_SOURCE_DIRECTORIES = (
     "configuration",
@@ -132,9 +118,9 @@ def check_declared_scaffold(
 ) -> tuple[ProjectDiagnostic, ...]:
     """Return convention findings, or nothing for a freeform project."""
 
-    source_diagnostics, minimal = _source_diagnostics(root)
+    source_diagnostics, declared = _source_diagnostics(root)
     diagnostics = list(source_diagnostics)
-    if minimal is False:
+    if declared:
         diagnostics.extend(_check_registration_provenance(manifest))
     return _filter(tuple(diagnostics), tags=tags, deploy_only=deploy_only)
 
@@ -142,7 +128,7 @@ def check_declared_scaffold(
 def _source_diagnostics(
     root: Path,
 ) -> tuple[tuple[ProjectDiagnostic, ...], bool | None]:
-    """Return source-only findings and the declared minimal-mode selection."""
+    """Return source-only findings and the presence of a valid convention."""
 
     pyproject = root / "pyproject.toml"
     if not pyproject.is_file():
@@ -187,16 +173,11 @@ def _source_diagnostics(
             )
         )
         return tuple(diagnostics), None
-    minimal = plan.minimal
 
-    required = (
-        _MINIMAL_REQUIRED_PATHS
-        if minimal
-        else tuple(
-            relative
-            for relative in _COMPLETE_REQUIRED_PATHS
-            if relative != "evals/agent.py" or "evals" in plan.capabilities
-        )
+    required = tuple(
+        relative
+        for relative in _COMPLETE_REQUIRED_PATHS
+        if relative != "evals/agent.py" or "evals" in plan.capabilities
     )
     for relative in required:
         if not _required_path_is_present(root, relative):
@@ -219,9 +200,9 @@ def _source_diagnostics(
             )
 
     diagnostics.extend(_check_selected_plan_source(root, document, plan))
-    diagnostics.extend(_check_composition_root(root, complete=not minimal))
+    diagnostics.extend(_check_composition_root(root, complete=True))
     diagnostics.extend(_check_import_inertness(root))
-    return tuple(diagnostics), minimal
+    return tuple(diagnostics), True
 
 
 def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan:
@@ -229,9 +210,6 @@ def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan
     for field in required_strings:
         if type(contract.get(field)) is not str:
             raise ScaffoldPlanError("invalid_" + field, f"{field} must be a string")
-    minimal = contract.get("minimal")
-    if type(minimal) is not bool:
-        raise ScaffoldPlanError("invalid_minimal", "minimal must be a boolean")
     capabilities = contract.get("capabilities")
     if not isinstance(capabilities, list) or any(type(item) is not str for item in capabilities):
         raise ScaffoldPlanError(
@@ -242,7 +220,7 @@ def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan
     preset = cast("str", contract["preset"])
     selected_preset = preset_spec(preset)
     recorded = cast("list[str]", capabilities)
-    defaults = set(() if minimal else selected_preset.default_capabilities)
+    defaults = set(selected_preset.default_capabilities)
     selected = set(recorded)
     plan = normalize_application_plan(
         name="declared-scaffold",
@@ -253,7 +231,6 @@ def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan
         execution=cast("str", contract["execution"]),
         with_capabilities=tuple(sorted(selected - defaults)),
         without_capabilities=tuple(sorted(defaults - selected)),
-        minimal=minimal,
     )
     if tuple(recorded) != plan.capabilities:
         raise ScaffoldPlanError(
@@ -301,40 +278,34 @@ def _check_selected_plan_source(
     )
     drift("database", plan.database, backend, "pyproject.toml:[tool.cayu.session_store].backend")
 
-    configuration_path = "configuration.py" if plan.minimal else "configuration/settings.py"
+    configuration_path = "configuration/settings.py"
     provider = _static_assignment(root / configuration_path, "_SCAFFOLDED_PROVIDER")
     expected_provider = None if plan.provider == "neutral" else plan.provider
     drift("provider", expected_provider, provider, configuration_path)
 
-    if not plan.minimal:
-        database = _static_assignment(root / "configuration/settings.py", "SCAFFOLDED_DATABASE")
-        drift("database", plan.database, database, "configuration/settings.py")
-        storage_relative = (
-            "configuration/coding_storage.py"
-            if plan.preset == "coding"
-            else "configuration/storage.py"
+    database = _static_assignment(root / "configuration/settings.py", "SCAFFOLDED_DATABASE")
+    drift("database", plan.database, database, "configuration/settings.py")
+    storage_relative = (
+        "configuration/coding_storage.py" if plan.preset == "coding" else "configuration/storage.py"
+    )
+    storage = root / storage_relative
+    if plan.preset == "coding":
+        storage_profile = _static_assignment(storage, "GENERATED_STORE_PROFILE")
+        drift("database", plan.database, storage_profile, storage_relative)
+    else:
+        expected_store = (
+            "PostgresSessionStore" if plan.database == "postgres" else "SQLiteSessionStore"
         )
-        storage = root / storage_relative
-        if plan.preset == "coding":
-            storage_profile = _static_assignment(storage, "GENERATED_STORE_PROFILE")
-            drift("database", plan.database, storage_profile, storage_relative)
-        else:
-            expected_store = (
-                "PostgresSessionStore" if plan.database == "postgres" else "SQLiteSessionStore"
-            )
-            observed_store = (
-                expected_store if _source_contains_name(storage, expected_store) else None
-            )
-            drift("database", expected_store, observed_store, storage_relative)
+        observed_store = expected_store if _source_contains_name(storage, expected_store) else None
+        drift("database", expected_store, observed_store, storage_relative)
 
-        logging = _runtime_logging_value(root / "configuration/runtime.py")
-        expected_logging = "observability" in plan.capabilities
-        drift("capabilities", expected_logging, logging, "configuration/runtime.py")
+    logging = _runtime_logging_value(root / "configuration/runtime.py")
+    expected_logging = "observability" in plan.capabilities
+    drift("capabilities", expected_logging, logging, "configuration/runtime.py")
 
     service_factory = cayu.get("service_factory")
     service_files = ("service.py", "product_store.py", "tests/test_public_service_security.py")
     coding_files = (
-        "composition.py",
         "configuration/coding_storage.py",
         "operations/coding.py",
         "agents/reviewer.py",
@@ -357,7 +328,7 @@ def _check_selected_plan_source(
             "build_coding_app" if _source_contains_name(app_path, "build_coding_app") else None
         )
         drift("preset", "build_coding_app", observed_factory, "app.py")
-    elif plan.preset == "agent" and not plan.minimal:
+    elif plan.preset == "agent":
         observed_factory = (
             "register_agents" if _source_contains_name(app_path, "register_agents") else None
         )

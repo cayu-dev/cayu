@@ -15,6 +15,7 @@ from tests.provider_traceback_assertions import (
     assert_cayu_traceback_does_not_retain,
     is_cayu_source_filename,
 )
+from tests.runner_cancellation import cancelled_error_with_artifacts
 
 import cayu.runners.local as local_runner_module
 import cayu.runtime._invocation_secrets as invocation_secrets_module
@@ -38,7 +39,6 @@ from cayu.runners import (
     ExecResult,
     LocalRunner,
     Runner,
-    RunnerCancelledError,
     RunnerExecutionError,
     RunnerUnavailableError,
     attach_cancellation_artifacts,
@@ -370,11 +370,11 @@ class _SynchronousFailureRunner(Runner):
         raise RuntimeError("workload-secret-canary-ABCDEFGHIJKLMNOP")
 
 
-class _LegacyCancelledRunner(Runner):
+class _DiagnosticCancelledRunner(Runner):
     async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
         del command, kwargs
-        raise RunnerCancelledError(
-            "legacy runner cancellation",
+        raise cancelled_error_with_artifacts(
+            "runner cancellation with diagnostics",
             artifacts=[
                 {
                     "type": "cayu.runner_cleanup.v1",
@@ -396,7 +396,7 @@ class _TimeoutLegacyCancellationRunner(_BlockingRunner):
         try:
             return await super().exec(command, **kwargs)
         except asyncio.CancelledError:
-            raise RunnerCancelledError("legacy timeout cancellation") from None
+            raise cancelled_error_with_artifacts("runner timeout cancellation") from None
 
 
 class _RewritingCancellationRunner(_BlockingRunner):
@@ -2492,55 +2492,7 @@ def test_invocation_runner_handle_rejects_reason_that_reconstructs_secret() -> N
     assert secret not in repr(cancellation)
 
 
-def test_invocation_runner_handle_preserves_legacy_cancellation_subtype() -> None:
-    handle = InvocationRunnerHandle(
-        _LegacyCancelledRunner(),
-        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
-            revision=0,
-            redactor=SecretRedactor(),
-        ),
-    )
-
-    async def scenario() -> tuple[RunnerCancelledError, bool]:
-        task = asyncio.create_task(handle.exec(ExecCommand.process("cancel")))
-        with pytest.raises(RunnerCancelledError) as exc_info:
-            await task
-        return exc_info.value, task.cancelled()
-
-    cancellation, cancelled = asyncio.run(scenario())
-
-    assert type(cancellation) is RunnerCancelledError
-    assert cancellation.args == ("Runner command was cancelled.",)
-    assert cancellation.artifacts == [
-        {
-            "type": "cayu.runner_cleanup.v1",
-            "adapter": "microsandbox",
-            "action": "kill_command",
-            "status": "completed",
-            "timeout_s": 5.0,
-        }
-    ]
-    assert cancelled is True
-
-
-def test_invocation_runner_handle_downgrades_unsafe_legacy_cancellation_type() -> None:
-    handle = InvocationRunnerHandle(
-        _LegacyCancelledRunner(),
-        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
-            revision=0,
-            redactor=SecretRedactor("RunnerCancelledError"),
-        ),
-    )
-
-    with pytest.raises(asyncio.CancelledError) as exc_info:
-        asyncio.run(handle.exec(ExecCommand.process("cancel")))
-
-    cancellation = exc_info.value
-    assert type(cancellation) is asyncio.CancelledError
-    assert "RunnerCancelledError" not in repr(cancellation)
-
-
-def test_caller_cancellation_downgrades_legacy_runner_replacement() -> None:
+def test_caller_cancellation_preserves_reason_with_runner_diagnostics() -> None:
     runner = _TimeoutLegacyCancellationRunner()
     handle = InvocationRunnerHandle(
         runner,
@@ -2946,7 +2898,7 @@ def test_clean_runner_cancellation_remains_compatible_with_asyncio_timeout(
     assert runner.cancelled is True
 
 
-def test_legacy_runner_cancellation_remains_compatible_with_asyncio_timeout() -> None:
+def test_runner_cancellation_with_diagnostics_preserves_asyncio_timeout() -> None:
     runner = _TimeoutLegacyCancellationRunner()
     handle = InvocationRunnerHandle(
         runner,
@@ -2958,8 +2910,8 @@ def test_legacy_runner_cancellation_remains_compatible_with_asyncio_timeout() ->
 
     class BlockingTool(Tool):
         spec = ToolSpec(
-            name="blocking_legacy_cancellation",
-            description="Block in a legacy runner command.",
+            name="blocking_diagnostic_cancellation",
+            description="Block in a runner command with cleanup diagnostics.",
             input_schema={"type": "object", "properties": {}},
         )
 

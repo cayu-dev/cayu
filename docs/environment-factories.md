@@ -418,6 +418,7 @@ from hashlib import sha256
 
 from cayu import (
     DockerCodingEnvironmentFactory,
+    DockerCodingToolchainProfile,
     DockerImageIdentity,
     ImmutableInputStore,
     LocalWorkspace,
@@ -443,7 +444,10 @@ runtime_input = inspect_local_immutable_input(
 store = ImmutableInputStore("/var/lib/cayu/immutable-inputs")
 factory = DockerCodingEnvironmentFactory(
     source_workspace=LocalWorkspace("/srv/cayu/workspace"),
-    image_identity=image,
+    toolchain_profile=DockerCodingToolchainProfile(
+        profile_id="coding", revision="1", image_identity=image,
+        platform_architecture="amd64",
+    ),
     immutable_inputs=(runtime_input,),
     immutable_input_store=store,
     immutable_input_runtime_compatibility_fingerprint=runtime_compatibility,

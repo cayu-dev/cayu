@@ -503,13 +503,12 @@ def _service_context_contract_present(source: str) -> bool:
 
 
 def _registration_target(root: Path) -> tuple[str, Path]:
-    """Select the declared convention seam while preserving legacy scaffolds."""
+    """Select the declared convention seam or the explicit factory of a freeform project."""
 
     convention_relative = "agents/registration.py"
     convention_path = _generated_path(root, convention_relative)
     pyproject = _generated_path(root, "pyproject.toml")
     declared_convention = False
-    minimal_convention = False
     if pyproject.is_file():
         try:
             document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
@@ -517,11 +516,10 @@ def _registration_target(root: Path) -> tuple[str, Path]:
             document = {}
         scaffold = document.get("tool", {}).get("cayu", {}).get("scaffold", {})
         declared_convention = scaffold.get("convention") == 1
-        minimal_convention = scaffold.get("minimal") is True
-    if declared_convention and not minimal_convention:
+    if declared_convention:
         return convention_relative, convention_path
-    legacy_relative = "app.py"
-    return legacy_relative, _generated_path(root, legacy_relative)
+    factory_relative = "app.py"
+    return factory_relative, _generated_path(root, factory_relative)
 
 
 @_guarded_generator_plan

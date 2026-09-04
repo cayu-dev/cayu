@@ -145,10 +145,8 @@ run requires a clean committed Git source baseline. It also requires `git`,
 `LocalWorkspace` path operations. Unsupported hosts fail during generation or
 application construction. Its local workspace and runner are trusted-host
 development adapters, not a hostile-code sandbox. The default scaffold is the
-complete Cayu application convention; use `--minimal` only for the explicit
-small-model-agent escape hatch. Coding cannot be combined with the service
-preset. The compatibility forms `--composition coding` and `--template service`
-remain supported.
+complete Cayu application convention. Select `--preset agent`, `--preset service`,
+or `--preset coding`; optional capabilities share the same application layout.
 
 Discover or review the Rails-style generation plan before writing:
 
@@ -549,7 +547,7 @@ Cayu makes safety boundaries explicit, but configuration still matters:
 - Public or multi-user product routes need a separate customer authorization
   boundary; operator authentication does not make the raw Cayu surface
   tenant-scoped. Start new services with
-  `cayu new NAME --template service`, then require both
+  `cayu new NAME --preset service`, then require both
   `cayu check --deploy --fail-on warning --json` and the generated
   `tests/test_public_service_security.py`. Cayu reports arbitrary host-owned
   ASGI routes outside that maintained factory as unverified.

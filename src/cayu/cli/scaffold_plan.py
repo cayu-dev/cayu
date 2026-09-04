@@ -327,24 +327,11 @@ class ApplicationPlan:
     capabilities: tuple[str, ...]
     coding_toolchain: CodingToolchainName | None = None
     coding_command_authority: CodingCommandAuthorityName | None = None
-    minimal: bool = False
     convention: int = SCAFFOLD_CONVENTION_VERSION
-
-    @property
-    def template_alias(self) -> str:
-        return "service" if self.preset == "service" else "agent"
-
-    @property
-    def composition_alias(self) -> str | None:
-        return "coding" if self.preset == "coding" else None
 
     @property
     def provider_alias(self) -> str | None:
         return None if self.provider == "neutral" else self.provider
-
-    @property
-    def execution_alias(self) -> str | None:
-        return None if self.execution == "none" else self.execution
 
     def verification_commands(self) -> tuple[str, ...]:
         check = (
@@ -415,7 +402,6 @@ class ApplicationPlan:
                 "command_authority": self.coding_command_authority,
             },
             "capabilities": list(self.capabilities),
-            "minimal": self.minimal,
             "files": list(files),
             "directories": list(directories),
             "private_files": list(private_files),
@@ -468,7 +454,6 @@ def normalize_application_plan(
     coding_command_authority: str | None = None,
     with_capabilities: tuple[str, ...] = (),
     without_capabilities: tuple[str, ...] = (),
-    minimal: bool = False,
 ) -> ApplicationPlan:
     """Resolve and validate every generator choice before rendering or writing."""
 
@@ -482,11 +467,6 @@ def normalize_application_plan(
                 "unsupported_adapter",
                 f"{adapter.kind} {adapter.name!r} is not supported by preset {preset!r}",
             )
-    if minimal and preset != "agent":
-        raise ScaffoldPlanError(
-            "minimal_requires_agent",
-            "--minimal is supported only by the agent preset",
-        )
     if preset != "coding" and (
         coding_toolchain is not None or coding_command_authority is not None
     ):
@@ -515,20 +495,9 @@ def normalize_application_plan(
     resolved_coding_command_authority = (
         "structured" if preset == "coding" and execution == "docker" else None
     )
-    if minimal and database != "sqlite":
-        raise ScaffoldPlanError(
-            "minimal_database_unsupported",
-            "--minimal supports only --database sqlite; use the complete convention "
-            "for maintained Postgres composition",
-        )
 
     requested = _expand_capability_arguments(with_capabilities)
     excluded = _expand_capability_arguments(without_capabilities)
-    if minimal and requested:
-        raise ScaffoldPlanError(
-            "minimal_capability_unsupported",
-            "--minimal cannot activate capability slices; use the complete convention",
-        )
     overlap = sorted(set(requested) & set(excluded))
     if overlap:
         raise ScaffoldPlanError(
@@ -536,7 +505,7 @@ def normalize_application_plan(
             "capabilities cannot be both included and excluded: " + ", ".join(overlap),
         )
 
-    capabilities = set(() if minimal else selected_preset.default_capabilities)
+    capabilities = set(selected_preset.default_capabilities)
     for name_value in requested:
         spec = capability_spec(name_value)
         if name_value not in selected_preset.default_capabilities and spec.status != "selectable":
@@ -594,7 +563,6 @@ def normalize_application_plan(
         capabilities=tuple(sorted(capabilities)),
         coding_toolchain=resolved_coding_toolchain,
         coding_command_authority=resolved_coding_command_authority,
-        minimal=minimal,
     )
 
 

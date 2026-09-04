@@ -86,9 +86,9 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
             [
                 "new",
                 "live-docker-coder",
-                "--composition",
+                "--preset",
                 "coding",
-                "--coding-execution",
+                "--execution",
                 "docker",
                 "--dir",
                 str(project_parent),

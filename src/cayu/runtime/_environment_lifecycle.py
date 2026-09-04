@@ -763,11 +763,7 @@ class EnvironmentLifecycle:
         return tuple(
             (event, progress)
             for _sequence, event, progress in sorted(
-                (
-                    item
-                    for item in latest_by_operation.values()
-                    if not item[2].operation_terminal
-                ),
+                (item for item in latest_by_operation.values() if not item[2].operation_terminal),
                 key=lambda item: item[0],
             )
         )

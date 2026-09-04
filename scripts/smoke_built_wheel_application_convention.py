@@ -161,25 +161,6 @@ def _verify_agent(
         )
 
 
-def _verify_minimal(
-    *,
-    cayu: Path,
-    python: Path,
-    project: Path,
-    environment: dict[str, str],
-) -> None:
-    assert not (project / "configuration").exists()
-    assert "minimal = true" in (project / "pyproject.toml").read_text(encoding="utf-8")
-    _run([str(cayu), "inspect", "--json"], cwd=project, environment=environment)
-    _run(
-        [str(cayu), "check", "--fail-on", "warning", "--json"],
-        cwd=project,
-        environment=environment,
-    )
-    _run([str(python), "-m", "pytest", "-q"], cwd=project, environment=environment)
-    _run([str(cayu), "eval", "run"], cwd=project, environment=environment)
-
-
 def _verify_coding(
     *,
     cayu: Path,
@@ -189,11 +170,6 @@ def _verify_coding(
     docker: bool = False,
 ) -> None:
     assert (project / "operations/coding.py").is_file()
-    compatibility_facade = (project / "composition.py").read_text(encoding="utf-8")
-    assert "from operations.coding import" in compatibility_facade
-    assert ("build_coding_composition" if docker else "build_coding_app") in compatibility_facade
-    assert "class " not in compatibility_facade
-    assert "def " not in compatibility_facade
     if docker:
         assert (project / "Dockerfile.coding").is_file()
         assert (project / "docker-coding-image.json").is_file()
@@ -331,14 +307,6 @@ def main(argv: list[str] | None = None) -> int:
                 project=selected,
                 environment=environment,
             )
-
-        minimal = _create(cayu, root, "minimal", "--minimal", environment=environment)
-        _verify_minimal(
-            cayu=cayu,
-            python=python,
-            project=minimal,
-            environment=environment,
-        )
 
         postgres = _create(
             cayu,

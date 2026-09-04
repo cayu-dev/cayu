@@ -35,14 +35,12 @@ from cayu._validation import (
 )
 from cayu._validation import require_durable_nonblank as require_nonblank
 from cayu.retrieval import (
-    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     FusedRetrievalCandidate,
     RankedRetrievalChannel,
     RankedRetrievalHit,
     RetrievalCandidateIdentity,
     RetrievalFusionDiagnostics,
     RetrievalFusionResult,
-    RetrievalFusionStrategy,
     WeightedReciprocalRankFusion,
     WeightedReciprocalRankFusionConfig,
 )
@@ -943,7 +941,6 @@ class RecallEngine:
         sources: Sequence[RecallSource],
         *,
         fusion_config: WeightedReciprocalRankFusionConfig,
-        fusion_strategy: RetrievalFusionStrategy | None = None,
         config: RecallEngineConfig | None = None,
     ) -> None:
         if isinstance(sources, RecallSource):
@@ -1042,19 +1039,8 @@ class RecallEngine:
         ):
             raise ValueError("A recall source candidate limit exceeds the fusion ceiling.")
         self._sources = tuple(sorted(registrations, key=lambda item: item.name))
-        self._fusion_strategy = fusion_strategy or WeightedReciprocalRankFusion()
-        if not isinstance(self._fusion_strategy, RetrievalFusionStrategy):
-            raise TypeError("fusion_strategy must be a RetrievalFusionStrategy.")
-        raw_strategy_version = getattr(self._fusion_strategy, "strategy_version", None)
-        if type(raw_strategy_version) is not str:
-            raise TypeError("RetrievalFusionStrategy.strategy_version must be a string.")
-        strategy_version = require_clean_nonblank(
-            raw_strategy_version,
-            "RetrievalFusionStrategy.strategy_version",
-        )
-        if len(strategy_version.encode("utf-8")) > _RECALL_MAX_NAME_BYTES:
-            raise ValueError("RetrievalFusionStrategy.strategy_version exceeds its byte bound.")
-        if strategy_version != self._fusion_config.strategy_version:
+        self._fusion_strategy = WeightedReciprocalRankFusion()
+        if self._fusion_config.strategy_version != self._fusion_strategy.strategy_version:
             raise ValueError(
                 "The fusion strategy identity must match fusion_config.strategy_version."
             )
@@ -1224,15 +1210,7 @@ class RecallEngine:
             )
 
         raw_fusion = self._fusion_strategy.fuse(tuple(channels), self._fusion_config)
-        if type(raw_fusion) is not RetrievalFusionResult:
-            raise TypeError("RetrievalFusionStrategy must return a RetrievalFusionResult.")
         fusion = RetrievalFusionResult.model_validate(raw_fusion.model_dump(mode="python"))
-        if type(self._fusion_strategy) is not WeightedReciprocalRankFusion:
-            _validate_custom_fusion_result(
-                fusion,
-                channels=tuple(channels),
-                config=self._fusion_config,
-            )
         fused_candidates: list[RecallCandidate] = []
         for fused in fusion.candidates:
             record = records_by_identity.get(fused.identity.sort_key())
@@ -2091,87 +2069,6 @@ def _knowledge_coverage_version(coverage: Sequence[KnowledgeIndexCoverage]) -> s
         "sha256:"
         + sha256(canonical_durable_json_bytes(payload, "knowledge semantic coverage")).hexdigest()
     )
-
-
-def _validate_custom_fusion_result(
-    result: RetrievalFusionResult,
-    *,
-    channels: tuple[RankedRetrievalChannel, ...],
-    config: WeightedReciprocalRankFusionConfig,
-) -> None:
-    """Reject custom rankings that alter validated evidence or coverage facts."""
-
-    reference_config = config.model_copy(
-        update={"strategy_version": WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION}
-    )
-    reference = WeightedReciprocalRankFusion().fuse(channels, reference_config)
-    expected_diagnostics_payload = reference.diagnostics.model_dump(mode="python")
-    expected_diagnostics_payload.update(
-        {
-            "strategy_version": config.strategy_version,
-            "configuration_version": config.configuration_version,
-            "configuration_sha256": config.fingerprint(),
-        }
-    )
-    expected_diagnostics = RetrievalFusionDiagnostics.model_validate(expected_diagnostics_payload)
-    if result.diagnostics != expected_diagnostics:
-        raise ValueError("Custom recall fusion returned inconsistent diagnostics.")
-    identities = [candidate.identity.sort_key() for candidate in result.candidates]
-    if len(identities) != len(set(identities)):
-        raise ValueError("Custom recall fusion repeated a candidate identity.")
-
-    hits_by_identity: dict[
-        tuple[str, str, str],
-        list[tuple[RankedRetrievalChannel, RankedRetrievalHit]],
-    ] = {}
-    for channel in channels:
-        for hit in channel.hits:
-            hits_by_identity.setdefault(hit.identity.sort_key(), []).append((channel, hit))
-    for candidate in result.candidates:
-        matches = hits_by_identity.get(candidate.identity.sort_key())
-        if not matches:
-            raise ValueError("Custom recall fusion returned an unknown candidate identity.")
-        expected_features = matches[0][1].features
-        if any(hit.features != expected_features for _, hit in matches):
-            raise ValueError("Recall channels disagree on canonical candidate features.")
-        if candidate.features != expected_features:
-            raise ValueError("Custom recall fusion altered canonical candidate features.")
-        if candidate.best_rank != min(hit.rank for _, hit in matches) or (
-            candidate.channel_count != len({channel.channel for channel, _ in matches})
-        ):
-            raise ValueError("Custom recall fusion altered candidate rank provenance.")
-        expected_matches = sorted(
-            (
-                channel.channel,
-                channel.index_version,
-                hit.rank,
-                hit.representation,
-                hit.content_hash,
-                hit.explanations,
-                hit.raw_score,
-            )
-            for channel, hit in matches
-        )
-        actual_matches = sorted(
-            (
-                match.channel,
-                match.index_version,
-                match.rank,
-                match.representation,
-                match.content_hash,
-                match.explanations,
-                match.raw_score,
-            )
-            for match in candidate.matches
-        )
-        if actual_matches != expected_matches:
-            raise ValueError("Custom recall fusion altered candidate match provenance.")
-        require_finite(candidate.score, "custom fused candidate score")
-        require_finite(
-            candidate.reciprocal_rank_score,
-            "custom fused reciprocal-rank score",
-        )
-        require_finite(candidate.feature_adjustment, "custom fused feature adjustment")
 
 
 __all__ = [

@@ -1537,36 +1537,6 @@ def register_coding_agents(
 '''
 
 
-_CODING_COMPOSITION_COMPAT_PY = '''"""Compatibility import for older coding-scaffold references.
-
-New code extends the owning canonical modules and imports the composition from
-``operations.coding``. This wrapper contains no application implementation.
-"""
-
-from operations.coding import build_coding_app, configured_workspace_root
-
-__all__ = ["build_coding_app", "configured_workspace_root"]
-'''
-
-
-_DOCKER_CODING_COMPOSITION_COMPAT_PY = '''"""Compatibility imports for coding."""
-
-from operations.coding import (
-    CodingComposition,
-    build_coding_app,
-    build_coding_composition,
-    configured_workspace_root,
-)
-
-__all__ = [
-    "CodingComposition",
-    "build_coding_app",
-    "build_coding_composition",
-    "configured_workspace_root",
-]
-'''
-
-
 _CODING_TOOLS_PY = '''"""Maintained coding tool inventory and placement contract."""
 
 from collections.abc import Sequence
@@ -1850,8 +1820,7 @@ _README_APPEND = """
 This project opts in to Cayu's explicit coding starter. The implementation lives
 in its canonical homes: `tools/coding.py`, `policies/coding.py`,
 `environments/coding.py`, `operations/coding.py`, `knowledge/coding.py`,
-`prompts/coding.py`, and `agents/registration.py`. The root `composition.py` is
-only a compatibility import. Together these modules register bounded repository
+`prompts/coding.py`, and `agents/registration.py`. Together these modules register bounded repository
 file tools, Git review, local artifacts, __CODING_DATABASE_SUMMARY__, a background
 reviewer subagent with result recovery, and human input. These are existing Cayu APIs;
 there is no hidden agent kind, registry, permission grant, or post-start mutation.
@@ -1931,8 +1900,7 @@ _AGENTS_APPEND = """
 
 ## Maintained coding composition
 
-Keep the canonical coding modules explicit. `composition.py` remains only a
-compatibility import; do not move implementation back into it or replace the
+Keep the canonical coding modules explicit. Do not replace the
 owning modules with an agent-type switch,
 plugin registry, implicit permission grant, or runtime mutation. Preserve the
 Git-root validation, `git`/`rg` compatibility preflight, minimal-environment local
@@ -4206,6 +4174,7 @@ def _live_candidate(
         "host_filesystem_isolation": "supported",
         "confirmed_cancellation": "supported",
         "confirmed_cleanup": "supported",
+        "reconnect": "supported",
     }
     environment_fingerprint = evidence.environment_fingerprint
     assert environment_fingerprint is not None
@@ -4397,6 +4366,8 @@ def _install_fake_docker_factory(
             release=release,
         )
 
+    # This fixture creates a local runner, not an external provider allocation.
+    monkeypatch.setattr(DockerCodingEnvironmentFactory, "allocation_scope", lambda self, request: None)
     monkeypatch.setattr(DockerCodingEnvironmentFactory, "create", fake_create)
 
 
@@ -5785,39 +5756,6 @@ def _docker_coding_app_source(source: str) -> str:
     return rendered
 
 
-def _coding_readme_source(source: str) -> str:
-    start = "A model-only Cayu agent scaffold."
-    end = "Add capabilities only when the job needs them."
-    coding = (
-        "A maintained two-agent coding composition for a trusted Git repository. Its primary\n"
-        "agent and bounded reviewer use generated repository tools, policy, knowledge,\n"
-        "delegation, and human-input seams that are part of this preset rather than optional\n"
-        "additions to a model-only starter."
-    )
-    if source.count(start) != 1 or source.count(end) != 1:
-        raise ValueError("coding README starter guidance is missing or duplicated")
-    prefix, remainder = source.split(start, 1)
-    _, suffix = remainder.split(end, 1)
-    return prefix + coding + suffix
-
-
-def _coding_agents_source(source: str) -> str:
-    start = "The registered agent identity is"
-    end = "Do not create echo, pass-through, or placeholder tools."
-    coding = (
-        "This preset registers a primary coding agent and a bounded reviewer. Extend the\n"
-        "primary through the canonical generated regions in `agents/agent.py` and\n"
-        "`agents/registration.py`. Keep the reviewer tool-free unless a reviewed composition\n"
-        "change intentionally expands its role.\n"
-        "Do not create echo, pass-through, or placeholder tools."
-    )
-    if source.count(start) != 1 or source.count(end) != 1:
-        raise ValueError("coding agent starter guidance is missing or duplicated")
-    prefix, remainder = source.split(start, 1)
-    _, suffix = remainder.split(end, 1)
-    return prefix + coding + suffix
-
-
 def coding_project_files(
     *,
     files: dict[str, str],
@@ -5910,7 +5848,6 @@ def coding_project_files(
         return {
             ".gitignore": files[".gitignore"],
             "app.py": _coding_app_source(files["app.py"]),
-            "composition.py": _CODING_COMPOSITION_COMPAT_PY,
             "configuration/coding_storage.py": coding_storage,
             "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
             "environments/coding.py": _CODING_ENVIRONMENT_PY,
@@ -5926,8 +5863,8 @@ def coding_project_files(
             "tests/test_coding_composition.py": coding_render(
                 _SMOKE_TEST_PY if "knowledge" in selected else _REDUCED_SMOKE_TEST_PY
             ),
-            "README.md": _coding_readme_source(files["README.md"]) + coding_render(_README_APPEND),
-            "AGENTS.md": _coding_agents_source(files["AGENTS.md"]) + coding_render(_AGENTS_APPEND),
+            "README.md": files["README.md"] + coding_render(_README_APPEND),
+            "AGENTS.md": files["AGENTS.md"] + coding_render(_AGENTS_APPEND),
         }
 
     pyproject = files["pyproject.toml"].replace(
@@ -5949,7 +5886,6 @@ def coding_project_files(
         "docker-coding-image.json": coding_render(_DOCKER_IMAGE_CONFIG),
         "build_coding_image.py": coding_render(_DOCKER_BUILD_IMAGE_PY),
         "app.py": _docker_coding_app_source(files["app.py"]),
-        "composition.py": _DOCKER_CODING_COMPOSITION_COMPAT_PY,
         "configuration/coding_storage.py": coding_storage,
         "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
         "environments/coding.py": _CODING_ENVIRONMENT_PY,
@@ -5970,12 +5906,12 @@ def coding_project_files(
         "tests/test_project.py": _DOCKER_PROJECT_TEST_PY,
         "pyproject.toml": pyproject,
         "README.md": (
-            _coding_readme_source(files["README.md"])
+            files["README.md"]
             + coding_render(_README_APPEND)
             + coding_render(_DOCKER_README_APPEND)
         ),
         "AGENTS.md": (
-            _coding_agents_source(files["AGENTS.md"])
+            files["AGENTS.md"]
             + coding_render(_AGENTS_APPEND)
             + coding_render(_DOCKER_AGENTS_APPEND)
         ),

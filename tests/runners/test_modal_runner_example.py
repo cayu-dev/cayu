@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from cayu import ExecCommand, RunnerCancelledError
+from cayu import ExecCommand
 from cayu.runners.base import runner_workspace_mutation_settlement
 
 _EXAMPLE_PATH = Path(__file__).resolve().parents[2] / "examples" / "modal_runner.py"
@@ -420,7 +420,7 @@ def test_exec_cancellation_terminates_sandbox_with_diagnostic() -> None:
     async def run():
         await mod.ModalRunner(sandbox).exec(ExecCommand.process("x"))
 
-    with pytest.raises(RunnerCancelledError) as excinfo:
+    with pytest.raises(asyncio.CancelledError) as excinfo:
         asyncio.run(run())
     assert sandbox.terminated is True
     artifact = excinfo.value.artifacts[0]
@@ -440,7 +440,7 @@ def test_exec_cancellation_without_termination_capability_remains_uncertain() ->
     async def run():
         await mod.ModalRunner(sandbox).exec(ExecCommand.process("x"))
 
-    with pytest.raises(RunnerCancelledError) as excinfo:
+    with pytest.raises(asyncio.CancelledError) as excinfo:
         asyncio.run(run())
     artifact = excinfo.value.artifacts[0]
     assert artifact["status"] == "failed"

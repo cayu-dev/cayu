@@ -326,7 +326,7 @@ steps:
       PY
       coding_root="$(mktemp -d "$RUNNER_TEMP/coding.XXXXXX")"
       "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-coding \
-        --composition coding --dir "$coding_root"
+        --preset coding --dir "$coding_root"
       cd "$coding_root/proof-coding"
       unset CAYU_PROVIDER CAYU_MODEL OPENAI_API_KEY ANTHROPIC_API_KEY \
         OPENROUTER_API_KEY
@@ -363,7 +363,7 @@ steps:
         -m pytest -q tests/test_coding_composition.py
       docker_coding_root="$(mktemp -d "$RUNNER_TEMP/docker-coding.XXXXXX")"
       "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-docker-coding \
-        --composition coding --coding-execution docker \
+        --preset coding --execution docker \
         --dir "$docker_coding_root"
       cd "$docker_coding_root/proof-docker-coding"
       unset CAYU_PROVIDER CAYU_MODEL OPENAI_API_KEY ANTHROPIC_API_KEY \
@@ -401,7 +401,7 @@ steps:
       uv pip install --python .release-server-venv/bin/python pytest 'ruff>=0.15.15,<0.16'
       service_root="$(mktemp -d "$RUNNER_TEMP/service.XXXXXX")"
       .release-server-venv/bin/cayu new proof-service \
-        --template service --dir "$service_root"
+        --preset service --dir "$service_root"
       cd "$service_root/proof-service"
       unset PYTHONPATH
       export PRODUCT_AUTH_TOKENS_JSON='{"customer-token":{"tenant_id":"tenant-a","subject_id":"alice"}}'

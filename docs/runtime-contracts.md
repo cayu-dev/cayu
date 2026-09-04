@@ -410,11 +410,6 @@ candidates, so a continuation never skips an omitted hit. Optional semantic
 knowledge lookup has a separate deadline and degrades that lane to honest
 partial coverage while preserving a successful lexical lane.
 
-A custom `RetrievalFusionStrategy` declares an immutable strategy version which
-must match its configuration and diagnostics. It may choose a different ranking
-but cannot identify itself as WRRF or change validated source evidence and
-coverage facts.
-
 Caller cancellation and recall timeouts stop waiting for SQLite session-store
 reads promptly. An already-dispatched worker retains ownership of its physical
 connection and lock in an observed background task until it settles, preventing
@@ -9406,7 +9401,7 @@ arguments, lifecycle state, cancellation behavior, and `exec_system()`
 dispatch. Trusted execution is not exposed through agent tools or
 `RunnerWorkspace`.
 
-Remote runner command cleanup is bounded. `DockerRunner`, `E2BRunner`, and `MicrosandboxRunner` expose `cancel_timeout_s`, defaulting to 5 seconds, `cancellation_cleanup`, defaulting to `"command"`, and `timeout_cleanup`, defaulting to `"command"`. Built-in runners re-raise the original `asyncio.CancelledError` with cleanup diagnostics attached so asyncio's cancellation bookkeeping is preserved; the runtime accepts the legacy `RunnerCancelledError` subclass from third-party runners as well. E2B delayed-start cleanup may continue briefly in the background after the foreground interruption or timeout cleanup wait; if it cannot resolve the command start, the runner exec path is closed while the sandbox is preserved. Command timeouts return `ExecResult(timed_out=True)`.
+Remote runner command cleanup is bounded. `DockerRunner`, `E2BRunner`, and `MicrosandboxRunner` expose `cancel_timeout_s`, defaulting to 5 seconds, `cancellation_cleanup`, defaulting to `"command"`, and `timeout_cleanup`, defaulting to `"command"`. Built-in runners re-raise the original `asyncio.CancelledError` with cleanup diagnostics attached so asyncio's cancellation bookkeeping is preserved. E2B delayed-start cleanup may continue briefly in the background after the foreground interruption or timeout cleanup wait; if it cannot resolve the command start, the runner exec path is closed while the sandbox is preserved. Command timeouts return `ExecResult(timed_out=True)`.
 
 Both cleanup fields accept the same three modes:
 

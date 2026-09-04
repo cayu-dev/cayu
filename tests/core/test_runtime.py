@@ -48,6 +48,7 @@ from tests.core._session_operation_fault_harness import (
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 from tests.provider_traceback_assertions import is_cayu_source_filename
+from tests.runner_cancellation import cancelled_error_with_artifacts
 
 import cayu.providers._credential_boundary as credential_boundary_module
 import cayu.providers.deadlines as provider_deadlines_module
@@ -149,7 +150,6 @@ from cayu.runners import (
     ExecCommand,
     ExecResult,
     Runner,
-    RunnerCancelledError,
 )
 from cayu.runtime import (
     EXECUTION_PROFILE_FINGERPRINT_FIELD,
@@ -288,7 +288,6 @@ from cayu.runtime import (
     UsageTriggeredContextPolicy,
     UserInputResponse,
     business_approval_audit,
-    default_compaction_prompt,
     session_prompt_anatomy_transition,
     strip_old_file_attachments,
     system_prompt_messages_sha256,
@@ -45919,236 +45918,6 @@ def test_model_compactor_bounds_large_compaction_input():
     assert result.metadata["max_input_chars"] == 1000
 
 
-def test_model_compactor_rejects_legacy_string_prompt_builder_before_dispatch():
-    provider = FakeProvider(
-        [
-            ModelStreamEvent.text_delta("custom summary"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-    )
-    seen_requests: list[CompactionRequest] = []
-
-    def prompt_builder(request: CompactionRequest) -> str:
-        seen_requests.append(request)
-        return f"custom prompt for {request.session.id}"
-
-    compactor = ModelCompactor(
-        provider=provider,
-        model="summary-model",
-        prompt_builder=prompt_builder,
-    )
-
-    with pytest.raises(TypeError, match="must return CompactionPrompt"):
-        asyncio.run(
-            compactor.compact(
-                CompactionRequest(
-                    session=_test_session(),
-                    agent=AgentSpec(name="assistant", model="fake-model"),
-                    messages=[Message.text("user", "old request")],
-                )
-            )
-        )
-
-    assert len(seen_requests) == 1
-    assert provider.requests == []
-
-
-def test_legacy_prompt_builder_cannot_replace_seeded_checkpoint_summary() -> None:
-    provider = FakeProvider([ModelStreamEvent.completed({})])
-    seen_requests: list[CompactionRequest] = []
-
-    def legacy_builder(request: CompactionRequest) -> str:
-        seen_requests.append(request)
-        return "summary that omits the existing checkpoint"
-
-    policy = CheckpointCompactionContextPolicy(
-        compactor=ModelCompactor(
-            provider=provider,
-            model="summary-model",
-            prompt_builder=legacy_builder,
-        ),
-        max_user_turns=1,
-        compact_after_messages=1,
-    )
-    checkpoint = {
-        "context_compaction": {
-            "version": 2,
-            "summary": "OLD_HISTORY_FACT",
-            "compacted_transcript_cursor": 2,
-            "metadata": {"source": "seeded"},
-        }
-    }
-    messages = [
-        Message.text("user", "already covered request"),
-        Message.text("assistant", "already covered answer"),
-        Message.text("user", "new compactable request"),
-        Message.text("assistant", "new compactable answer"),
-        Message.text("user", "current"),
-    ]
-
-    with pytest.raises(ContextBuildError, match="must return CompactionPrompt") as exc_info:
-        asyncio.run(
-            policy.build_with_checkpoint(
-                ContextRequest(
-                    session=_test_session(),
-                    agent=AgentSpec(name="assistant", model="fake-model"),
-                    messages=messages,
-                    step=1,
-                    force_compaction=True,
-                ),
-                checkpoint=checkpoint,
-            )
-        )
-
-    assert isinstance(exc_info.value.cause, TypeError)
-    assert len(seen_requests) == 1
-    assert seen_requests[0].existing_summary == "OLD_HISTORY_FACT"
-    assert provider.requests == []
-    assert checkpoint == {
-        "context_compaction": {
-            "version": 2,
-            "summary": "OLD_HISTORY_FACT",
-            "compacted_transcript_cursor": 2,
-            "metadata": {"source": "seeded"},
-        }
-    }
-
-
-def test_model_compactor_custom_prompt_reports_partial_coverage():
-    provider = FakeProvider(
-        [
-            ModelStreamEvent.text_delta("custom summary"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-    )
-    compactor = ModelCompactor(
-        provider=provider,
-        model="summary-model",
-        prompt_builder=lambda request: CompactionPrompt(
-            prompt=f"first: {request.messages[0].content[0].text}",
-            covered_message_count=1,
-        ),
-    )
-
-    result = asyncio.run(
-        compactor.compact(
-            CompactionRequest(
-                session=_test_session(),
-                agent=AgentSpec(name="assistant", model="fake-model"),
-                messages=[
-                    Message.text("user", "first"),
-                    Message.text("user", "omitted"),
-                ],
-            )
-        )
-    )
-
-    assert result.covered_message_count == 1
-
-
-def test_model_compactor_custom_prompt_recompaction_includes_existing_summary():
-    provider = FakeProvider(
-        [
-            ModelStreamEvent.text_delta("OLD_HISTORY_FACT plus new context"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-    )
-    policy = CheckpointCompactionContextPolicy(
-        compactor=ModelCompactor(
-            provider=provider,
-            model="summary-model",
-            prompt_builder=lambda request: CompactionPrompt(
-                prompt=f"custom source: {request.messages[0].content[0].text}",
-                covered_message_count=1,
-            ),
-        ),
-        max_user_turns=1,
-        compact_after_messages=1,
-    )
-    checkpoint = {
-        "context_compaction": {
-            "version": 2,
-            "summary": "OLD_HISTORY_FACT",
-            "compacted_transcript_cursor": 2,
-            "metadata": {"source": "seeded"},
-        }
-    }
-
-    result = asyncio.run(
-        policy.build_with_checkpoint(
-            ContextRequest(
-                session=_test_session(),
-                agent=AgentSpec(name="assistant", model="fake-model"),
-                messages=[
-                    Message.text("user", "already covered request"),
-                    Message.text("assistant", "already covered answer"),
-                    Message.text("user", "new compactable request"),
-                    Message.text("assistant", "new compactable answer"),
-                    Message.text("user", "current"),
-                ],
-                step=1,
-                force_compaction=True,
-            ),
-            checkpoint=checkpoint,
-        )
-    )
-
-    provider_prompt = provider.requests[0].messages[-1].content[0].text
-    assert "OLD_HISTORY_FACT" in provider_prompt
-    assert "custom source: new compactable request" in provider_prompt
-    assert result.checkpoint is not None
-    assert result.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 3
-
-
-def test_model_compactor_rejects_invalid_custom_prompt_coverage():
-    provider = FakeProvider([])
-    compactor = ModelCompactor(
-        provider=provider,
-        model="summary-model",
-        prompt_builder=lambda request: CompactionPrompt(
-            prompt="custom prompt",
-            covered_message_count=len(request.messages) + 1,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="coverage beyond"):
-        asyncio.run(
-            compactor.compact(
-                CompactionRequest(
-                    session=_test_session(),
-                    agent=AgentSpec(name="assistant", model="fake-model"),
-                    messages=[Message.text("user", "only message")],
-                )
-            )
-        )
-    assert provider.requests == []
-
-
-def test_model_compactor_rejects_zero_coverage_custom_prompt_before_dispatch():
-    provider = FakeProvider([])
-    compactor = ModelCompactor(
-        provider=provider,
-        model="summary-model",
-        prompt_builder=lambda _request: CompactionPrompt(
-            prompt="custom prompt",
-            covered_message_count=0,
-        ),
-    )
-
-    with pytest.raises(ValueError):
-        asyncio.run(
-            compactor.compact(
-                CompactionRequest(
-                    session=_test_session(),
-                    agent=AgentSpec(name="assistant", model="fake-model"),
-                    messages=[Message.text("user", "only message")],
-                )
-            )
-        )
-
-    assert provider.requests == []
-
-
 def test_checkpoint_policy_rejects_unmarked_zero_coverage_result():
     class ZeroCoverageCompactor(ContextCompactor):
         async def compact(self, request: CompactionRequest) -> CompactionResult:
@@ -46308,65 +46077,6 @@ def test_checkpoint_policy_rejects_unbound_existing_summary_replacement(
         )
 
     assert isinstance(exc_info.value.cause, ValueError)
-
-
-def test_model_compactor_rejects_custom_prompt_coverage_that_splits_tool_round():
-    provider = FakeProvider([])
-    compactor = ModelCompactor(
-        provider=provider,
-        model="summary-model",
-        prompt_builder=lambda request: CompactionPrompt(
-            prompt="custom prompt",
-            covered_message_count=1,
-        ),
-    )
-    tool_round = [
-        Message.tool_call(
-            tool_call_id="call_custom_boundary",
-            tool_name="inspect",
-            arguments={"query": "status"},
-        ),
-        Message.tool_result(
-            tool_call_id="call_custom_boundary",
-            tool_name="inspect",
-            content="done",
-        ),
-    ]
-
-    with pytest.raises(ValueError, match="splits an assistant/tool round"):
-        asyncio.run(
-            compactor.compact(
-                CompactionRequest(
-                    session=_test_session(),
-                    agent=AgentSpec(name="assistant", model="fake-model"),
-                    messages=tool_round,
-                )
-            )
-        )
-
-    assert provider.requests == []
-
-
-def test_model_compactor_rejects_truncated_string_custom_prompt_before_dispatch():
-    provider = FakeProvider([])
-    compactor = ModelCompactor(
-        provider=provider,
-        model="summary-model",
-        max_input_chars=1000,
-        prompt_builder=lambda request: "x" * 2000,
-    )
-
-    with pytest.raises(TypeError, match="must return CompactionPrompt"):
-        asyncio.run(
-            compactor.compact(
-                CompactionRequest(
-                    session=_test_session(),
-                    agent=AgentSpec(name="assistant", model="fake-model"),
-                    messages=[Message.text("user", "message")],
-                )
-            )
-        )
-    assert provider.requests == []
 
 
 def test_model_compactor_bounds_by_complete_message_prefix_and_reports_coverage():
@@ -49258,7 +48968,7 @@ def test_hierarchical_failure_reports_completed_chunks_without_checkpoint():
     assert failure["bounded_input"] is True
 
 
-def test_model_compactor_accepts_exported_default_prompt_builder():
+def test_model_compactor_uses_bounded_default_prompt():
     provider = FakeProvider(
         [
             ModelStreamEvent.text_delta("default summary"),
@@ -49268,7 +48978,6 @@ def test_model_compactor_accepts_exported_default_prompt_builder():
     compactor = ModelCompactor(
         provider=provider,
         model="summary-model",
-        prompt_builder=default_compaction_prompt,
         max_input_chars=1000,
     )
 
@@ -51025,13 +50734,17 @@ def test_cayu_app_automatic_compaction_failure_charges_reserved_amount() -> None
     assert events[-1].type == EventType.SESSION_FAILED
 
 
-def test_automatic_compaction_predispatch_failure_does_not_charge_budget() -> None:
+def test_automatic_compaction_predispatch_failure_does_not_charge_budget(monkeypatch) -> None:
     compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
     runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
 
-    def fail_before_request(request: CompactionRequest) -> str:
-        del request
+    def fail_before_request(request: CompactionRequest, **kwargs) -> str:
+        del request, kwargs
         raise ValueError("prompt construction failed")
+
+    monkeypatch.setattr(
+        "cayu.runtime.context._bounded_default_compaction_prompt", fail_before_request
+    )
 
     app = CayuApp(
         budget_policy=BudgetPolicy(
@@ -51052,7 +50765,6 @@ def test_automatic_compaction_predispatch_failure_does_not_charge_budget() -> No
             compactor=ModelCompactor(
                 provider=compactor_provider,
                 model="summary-model",
-                prompt_builder=fail_before_request,
             ),
             max_user_turns=1,
             compact_after_messages=2,
@@ -61196,7 +60908,7 @@ def test_cancelled_runner_cleanup_diagnostics_are_preserved_in_tool_result():
             try:
                 await self.never_complete.wait()
             except asyncio.CancelledError as exc:
-                raise RunnerCancelledError(artifacts=[cleanup_artifact]) from exc
+                raise cancelled_error_with_artifacts(artifacts=[cleanup_artifact]) from exc
             return ToolResult(content="unexpected")
 
     tool = CleanupDiagnosticTool()
@@ -61293,7 +61005,7 @@ def test_cancelled_runner_cleanup_diagnostics_are_redacted_in_tool_result():
             try:
                 await self.never_complete.wait()
             except asyncio.CancelledError as exc:
-                raise RunnerCancelledError(artifacts=[cleanup_artifact]) from exc
+                raise cancelled_error_with_artifacts(artifacts=[cleanup_artifact]) from exc
             return ToolResult(content="unexpected")
 
     tool = CleanupDiagnosticTool()
@@ -61390,7 +61102,7 @@ def test_cancelled_runner_cleanup_diagnostics_are_attached_only_to_active_tool()
             try:
                 await self.never_complete.wait()
             except asyncio.CancelledError as exc:
-                raise RunnerCancelledError(artifacts=[cleanup_artifact]) from exc
+                raise cancelled_error_with_artifacts(artifacts=[cleanup_artifact]) from exc
             return ToolResult(content="unexpected")
 
     tool = CleanupDiagnosticTool()

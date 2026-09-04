@@ -269,7 +269,6 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "uv run --no-sync cayu guide authoring#cayu-map" in readme
     assert "github.com" not in readme
     assert 'uv run --no-sync python run.py --message "YOUR REQUEST"' in readme
-    assert "model-only" in readme
     assert "cayu generate slice" not in readme
     output = capsys.readouterr().out
     assert "uv sync --extra dev" in output
@@ -334,7 +333,7 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _bypass_coding_dependency_preflight(monkeypatch)
-    assert main(["new", "coder", "--composition", "coding", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "coder", "--preset", "coding", "--dir", str(tmp_path)]) == 0
     project = tmp_path / "coder"
 
     for filename in (
@@ -345,7 +344,6 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
         "policies/coding.py",
         "prompts/coding.py",
         "tools/coding.py",
-        "composition.py",
         "agents/reviewer.py",
         "tests/test_coding_composition.py",
     ):
@@ -372,12 +370,9 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
     )
 
     composition = (project / "operations/coding.py").read_text(encoding="utf-8")
-    compatibility_composition = (project / "composition.py").read_text(encoding="utf-8")
     command_probe = (project / "environments/command_probe.py").read_text(encoding="utf-8")
     assert (project / ".gitignore").read_text(encoding="utf-8").startswith(".cayu/\n")
     assert "from environments.command_probe import" in composition
-    assert "from operations.coding import build_coding_app" in compatibility_composition
-    assert len(compatibility_composition.splitlines()) < 10
     assert "cayu.cli._bounded_command" not in composition
     assert "run_bounded_command" in command_probe
     for public_surface in (
@@ -486,9 +481,9 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
             [
                 "new",
                 "docker-coder",
-                "--composition",
+                "--preset",
                 "coding",
-                "--coding-execution",
+                "--execution",
                 "docker",
                 "--coding-toolchain",
                 "python",
@@ -708,9 +703,9 @@ def test_generated_docker_builder_uses_one_immutable_input_snapshot(
             [
                 "new",
                 "snapshot-builder",
-                "--composition",
+                "--preset",
                 "coding",
-                "--coding-execution",
+                "--execution",
                 "docker",
                 "--coding-toolchain",
                 "python",
@@ -857,7 +852,7 @@ def test_coding_execution_requires_the_coding_composition(
             [
                 "new",
                 "invalid-docker",
-                "--coding-execution",
+                "--execution",
                 "docker",
                 "--dir",
                 str(tmp_path),
@@ -866,7 +861,7 @@ def test_coding_execution_requires_the_coding_composition(
         == 1
     )
     assert not (tmp_path / "invalid-docker").exists()
-    assert "requires --preset coding or --composition coding" in capsys.readouterr().err
+    assert "execution" in capsys.readouterr().err
 
 
 def test_coding_toolchain_requires_docker_execution(
@@ -878,7 +873,7 @@ def test_coding_toolchain_requires_docker_execution(
             [
                 "new",
                 "invalid-toolchain",
-                "--composition",
+                "--preset",
                 "coding",
                 "--coding-toolchain",
                 "python",
@@ -908,7 +903,7 @@ def test_cayu_new_coding_rejects_unsupported_local_workspace_before_creation(
         staticmethod(unsupported),
     )
 
-    assert main(["new", "coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert main(["new", "coder", "--preset", "coding", "--dir", str(tmp_path)]) == 1
 
     assert not (tmp_path / "coder").exists()
     assert "requires POSIX descriptor-relative filesystem primitives" in capsys.readouterr().err
@@ -919,35 +914,17 @@ def test_cayu_new_coding_rejects_native_windows_workspace_before_creation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert main(["new", "coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert main(["new", "coder", "--preset", "coding", "--dir", str(tmp_path)]) == 1
 
     assert not (tmp_path / "coder").exists()
     assert "requires POSIX descriptor-relative filesystem primitives" in capsys.readouterr().err
 
 
-def test_cayu_new_coding_rejects_service_and_missing_dependencies(
+def test_cayu_new_coding_rejects_missing_dependencies(
     tmp_path: Path,
     capsys,
     monkeypatch,
 ) -> None:
-    assert (
-        main(
-            [
-                "new",
-                "service-coder",
-                "--composition",
-                "coding",
-                "--template",
-                "service",
-                "--dir",
-                str(tmp_path),
-            ]
-        )
-        == 1
-    )
-    assert not (tmp_path / "service-coder").exists()
-    assert "conflicts with --preset coding" in capsys.readouterr().err
-
     from cayu.cli import scaffold
 
     real_which = scaffold.shutil.which
@@ -956,7 +933,7 @@ def test_cayu_new_coding_rejects_service_and_missing_dependencies(
         "which",
         lambda command: None if command == "rg" else real_which(command),
     )
-    assert main(["new", "missing-rg", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert main(["new", "missing-rg", "--preset", "coding", "--dir", str(tmp_path)]) == 1
     assert not (tmp_path / "missing-rg").exists()
     assert "requires these commands on PATH: rg" in capsys.readouterr().err
 
@@ -1003,7 +980,7 @@ def test_cayu_new_coding_rejects_incompatible_runtime_command_dialects(
             [
                 "new",
                 project_name,
-                "--composition",
+                "--preset",
                 "coding",
                 "--dir",
                 str(tmp_path),
@@ -1050,7 +1027,7 @@ def test_cayu_new_coding_rejects_false_success_dependency_shims(
             [
                 "new",
                 project_name,
-                "--composition",
+                "--preset",
                 "coding",
                 "--dir",
                 str(tmp_path),
@@ -1135,7 +1112,7 @@ def test_cayu_new_coding_confines_git_authority_and_ignores_global_hooks(
     monkeypatch.setenv("GIT_WORK_TREE", str(canary))
     monkeypatch.setenv("GIT_INDEX_FILE", str(ambient_index))
 
-    assert main(["new", "safe-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "safe-coder", "--preset", "coding", "--dir", str(tmp_path)]) == 0
     assert ambient_index.read_bytes() == before
     assert not hook_marker.exists()
     project = tmp_path / "safe-coder"
@@ -1153,7 +1130,7 @@ def test_cayu_new_coding_confines_git_authority_and_ignores_global_hooks(
         env=scaffold._sanitized_scaffold_git_environment(cwd=project),
     )
     assert {path for path in tracked_output.split("\0") if path} == set(
-        scaffold.project_files("safe-coder", composition="coding")
+        scaffold.project_files("safe-coder", preset="coding")
     )
     assert "Scaffolded" in capsys.readouterr().out
 
@@ -1167,7 +1144,7 @@ def test_cayu_new_coding_rejects_nonsticky_shared_parent(
     shared.mkdir()
     shared.chmod(0o777)
 
-    assert main(["new", "unsafe-coder", "--composition", "coding", "--dir", str(shared)]) == 1
+    assert main(["new", "unsafe-coder", "--preset", "coding", "--dir", str(shared)]) == 1
     assert not (shared / "unsafe-coder").exists()
     assert "group/world-writable unless it is sticky" in capsys.readouterr().err
 
@@ -1202,7 +1179,7 @@ def test_cayu_new_coding_removes_generated_files_after_git_failure(
         )
 
     monkeypatch.setattr(scaffold, "_run_scaffold_command", fail_target_commit)
-    assert main(["new", "broken-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert main(["new", "broken-coder", "--preset", "coding", "--dir", str(tmp_path)]) == 1
     assert not (tmp_path / "broken-coder").exists()
     assert "forced commit failure" in capsys.readouterr().err
 
@@ -1286,7 +1263,7 @@ def test_cayu_new_coding_preserves_preexisting_empty_target_after_git_failure(
         )
 
     monkeypatch.setattr(scaffold, "_run_scaffold_command", fail_target_commit)
-    assert main(["new", target.name, "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert main(["new", target.name, "--preset", "coding", "--dir", str(tmp_path)]) == 1
     after = target.stat()
     assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
     assert after.st_mode == before.st_mode
@@ -1323,7 +1300,7 @@ def test_cayu_new_coding_cleanup_does_not_follow_replaced_generated_directory(
         )
 
     monkeypatch.setattr(scaffold, "_run_scaffold_command", replace_agents_then_fail)
-    assert main(["new", "symlink-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert main(["new", "symlink-coder", "--preset", "coding", "--dir", str(tmp_path)]) == 1
     assert canary.read_text(encoding="utf-8") == "outside-owned\n"
     assert not (tmp_path / "symlink-coder").exists()
     assert "forced commit failure" in capsys.readouterr().err
@@ -1356,7 +1333,7 @@ def test_cayu_new_coding_does_not_clean_replacement_target(
         (target / "owned.txt").write_text(replacement_canary, encoding="utf-8")
 
     monkeypatch.setattr(publication, "_publication_fault", replace_before_publish)
-    assert main(["new", target.name, "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert main(["new", target.name, "--preset", "coding", "--dir", str(tmp_path)]) == 1
     assert (target / "pyproject.toml").read_text(encoding="utf-8") == replacement_canary
     assert (target / "owned.txt").read_text(encoding="utf-8") == replacement_canary
     assert (target / ".git" / "replacement-owned").read_text(encoding="utf-8") == (
@@ -1457,7 +1434,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     tmp_path: Path,
     capsys,
 ) -> None:
-    assert main(["new", "myservice", "--template", "service", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "myservice", "--preset", "service", "--dir", str(tmp_path)]) == 0
     project = tmp_path / "myservice"
 
     for filename in (
@@ -1536,7 +1513,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
 def test_scaffolded_service_replacement_recovery_uses_profiled_admission(
     tmp_path: Path,
 ) -> None:
-    assert main(["new", "myservice", "--template", "service", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "myservice", "--preset", "service", "--dir", str(tmp_path)]) == 0
     project = tmp_path / "myservice"
     environment = os.environ.copy()
     for name in ("CAYU_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
@@ -1568,7 +1545,7 @@ def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_au
     monkeypatch,
     capsys,
 ) -> None:
-    assert main(["new", "service", "--template", "service", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "service", "--preset", "service", "--dir", str(tmp_path)]) == 0
     project = tmp_path / "service"
     capsys.readouterr()
     monkeypatch.chdir(project)
@@ -2158,8 +2135,6 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "Client-IP and forwarded-header checks are not authentication" in instructions
     assert "cayu eval run evals.agent:build_eval" not in instructions
     assert "Edit the existing agent, test, and eval" in instructions
-    assert "safe local tools are" in instructions
-    assert "explicitly registered and exposed" in instructions
     assert "uv run --no-sync cayu guide authoring#cayu-map" in instructions
     assert "uv run --no-sync cayu guide references" in instructions
     assert "github.com" not in instructions

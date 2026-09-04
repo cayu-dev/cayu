@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import posixpath
 import secrets
 import threading
@@ -578,27 +577,6 @@ def _base_exception_namespace_value(error: BaseException, name: str) -> object:
     except BaseException:
         return None
     return dict.get(namespace, name) if type(namespace) is dict else None
-
-
-class RunnerCancelledError(asyncio.CancelledError):
-    """Cancelled runner execution with optional cleanup diagnostics.
-
-    Retained for backward compatibility with third-party runners. Built-in
-    runners no longer raise this subclass: they re-raise the original plain
-    ``asyncio.CancelledError`` (preserving asyncio's cancellation bookkeeping)
-    with diagnostics attached out-of-band via
-    :func:`attach_cancellation_artifacts`. The runtime reads diagnostics from
-    the exception's ``artifacts`` attribute either way.
-    """
-
-    def __init__(
-        self,
-        message: str = "Runner command was cancelled.",
-        *,
-        artifacts: list[dict[str, Any]] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.artifacts = copy_json_value([] if artifacts is None else artifacts, "artifacts")
 
 
 def attach_cancellation_artifacts(

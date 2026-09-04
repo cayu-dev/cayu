@@ -79,7 +79,7 @@ installer or falls back to the host.
 The generated built-in Python path is selected explicitly with:
 
 ```console
-cayu new NAME --composition coding --coding-execution docker --coding-toolchain python
+cayu new NAME --preset coding --execution docker --coding-toolchain python
 ```
 
 Its trusted image-build script is a separate operator lifecycle. The runtime
