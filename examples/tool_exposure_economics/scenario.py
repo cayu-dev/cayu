@@ -202,7 +202,6 @@ async def _run_side(
             fingerprint_key_id="tool-exposure-fixture",
             fingerprint_key=SecretStr("fixture-tool-exposure-key-material-0001"),
         ),
-        retry_policy=None,
         enable_logging=False,
     )
     app.register_provider(provider, default=True)

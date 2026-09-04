@@ -14,9 +14,11 @@ import cayu.evals.runner as runner_module
 from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
+    CayuConfig,
     ContextExposurePage,
     Environment,
     EnvironmentSpec,
+    EvalConfig,
     EvalExecutionCapacity,
     EvalOutcome,
     EvalTrialDiagnosticCode,
@@ -194,8 +196,9 @@ def _target(
     limits: CorpusExecutionLimits | None = None,
     application_release_id: str = "release-2026-08-06",
     secret_redactor: SecretRedactor | None = None,
+    config: CayuConfig | None = None,
 ) -> CorpusTarget:
-    app = CayuApp(enable_logging=False, secret_redactor=secret_redactor)
+    app = CayuApp(config=config, enable_logging=False, secret_redactor=secret_redactor)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="agent", model="fixture-model"))
     return CorpusTarget(
@@ -1728,7 +1731,8 @@ def test_corpus_execution_distinguishes_safe_evidence_preparation_failures(monke
     assert "secret evidence failure" not in result.model_dump_json()
 
 
-def test_concurrent_corpus_execution_keeps_output_projection_bound_to_each_case():
+@pytest.mark.parametrize("concurrency", [None, 1, 2])
+def test_concurrent_corpus_execution_keeps_output_projection_bound_to_each_case(concurrency):
     corpus = _corpus(
         trials=1,
         input_text="alpha output",
@@ -1765,10 +1769,10 @@ def test_concurrent_corpus_execution_keeps_output_projection_bound_to_each_case(
 
     result = asyncio.run(
         run_corpus_suite(
-            _target(_EchoProvider()),
+            _target(_EchoProvider(), config=CayuConfig(evals=EvalConfig(max_concurrency=100))),
             corpus,
             "refund-regressions",
-            max_concurrency=2,
+            max_concurrency=concurrency,
         )
     )
 
@@ -2415,3 +2419,16 @@ def test_corpus_target_rejects_oversized_trusted_request_base():
             request_base=request,
             application_release_id="release",
         )
+
+
+def test_legacy_corpus_policy_does_not_inherit_new_application_concurrency():
+    target = _target(_provider(), config=CayuConfig(evals=EvalConfig(max_concurrency=100)))
+    result = asyncio.run(
+        run_eval_plan(
+            EvalPlan(corpus_target=target),
+            corpus=_corpus(),
+            suite_id="refund-regressions",
+        )
+    )
+    assert result.run.status == "passed"
+    assert result.run.trial_policy.max_concurrency == 1

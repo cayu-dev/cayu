@@ -16,11 +16,13 @@ from cayu import (
     CacheBreakpoint,
     CachePolicy,
     CayuApp,
+    CayuConfig,
     EventType,
     FileAttachmentKind,
     Message,
     RecentTurnsContextPolicy,
     RetryPolicy,
+    RunDefaults,
     RunRequest,
     file_attachment,
 )
@@ -37,6 +39,7 @@ from cayu.providers import (
     ModelContextOverflowError,
     ModelRequest,
     ModelStreamEventType,
+    ProviderStreamDeadlines,
     anthropic_response_events,
     anthropic_stream_events,
     build_anthropic_payload,
@@ -1328,7 +1331,9 @@ async def test_runtime_does_not_recover_from_conflicting_anthropic_413(
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", client_factory)
     app = CayuApp(
         enable_logging=False,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(
         AnthropicProvider(api_key="test-key", transport=HttpxAnthropicTransport()),
@@ -2355,9 +2360,14 @@ async def test_anthropic_stream_events_rejects_unordered_deltas() -> None:
 
 def test_anthropic_provider_rejects_invalid_transport_idle_timeout() -> None:
     with pytest.raises(ValueError, match="transport_idle_timeout_s"):
-        AnthropicProvider(api_key="test-key", transport_idle_timeout_s=0)
+        AnthropicProvider(
+            api_key="test-key", stream_deadlines=ProviderStreamDeadlines(transport_idle_timeout_s=0)
+        )
     with pytest.raises(TypeError, match="transport_idle_timeout_s"):
-        AnthropicProvider(api_key="test-key", transport_idle_timeout_s="60")  # type: ignore[arg-type]
+        AnthropicProvider(
+            api_key="test-key",
+            stream_deadlines=ProviderStreamDeadlines(transport_idle_timeout_s="60"),
+        )  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf"), 10**1000])

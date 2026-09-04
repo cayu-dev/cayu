@@ -61,6 +61,8 @@ from cayu import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
     ResumeRequest,
+    RetryPolicy,
+    RunLimits,
     RunRequest,
     SessionIdentity,
     SessionStore,
@@ -587,6 +589,9 @@ def test_refreshable_mcp_sources_require_unique_application_connection_identitie
 def test_complete_mcp_source_registration_changes_execution_profile_identity() -> None:
     def resolve(app: CayuApp):
         return execution_profile_admission.resolve_execution_profile_identity(
+            finalization=execution_profile_admission.model_finalization_material(
+                max_steps=64, limits=RunLimits(), retry_policy=RetryPolicy()
+            ),
             registered_agent=app._agents["assistant"],
             provider_name="fake",
             model="fake-model",

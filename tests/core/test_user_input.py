@@ -4233,3 +4233,90 @@ def test_recorded_round_outcomes_anchors_from_recovered_interrupted_event() -> N
 
 async def _drain(stream: AsyncIterator[Event]) -> list[Event]:
     return [event async for event in stream]
+
+
+@pytest.mark.parametrize("missing_recorded_steps", [False, True])
+def test_sqlite_input_recovery_uses_recorded_config_after_restart(tmp_path, missing_recorded_steps):
+    from cayu import CayuConfig, ExecutionProfileBehaviorIdentity, RunDefaults, SQLiteSessionStore
+
+    identity = ExecutionProfileBehaviorIdentity(
+        name="tests:configured-input",
+        behavior_version="1",
+        implementation_version="1",
+    )
+
+    class Provider(_RunConfigProvider):
+        @property
+        def execution_profile_identity(self):
+            return identity
+
+    class Echo(_EchoTool):
+        spec = _EchoTool.spec.model_copy(update={"execution_profile_identity": identity})
+
+    async def exercise():
+        database = tmp_path / "configured-input.sqlite3"
+        store = SQLiteSessionStore(database)
+        provider = Provider()
+        app = CayuApp(
+            config=CayuConfig(run=RunDefaults(max_steps=16)),
+            session_store=store,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool(), Echo()]
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="configured-input",
+                messages=[Message.text("user", "go")],
+                limits=RunLimits(max_tool_calls=1, scope="session"),
+            ),
+        )
+        input_id = next(
+            e for e in paused if e.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        checkpoint = await store.load_checkpoint("configured-input")
+        assert checkpoint["pending_user_input"]["max_steps"] == 16
+        if missing_recorded_steps:
+
+            def corrupt(_session, value):
+                value["pending_user_input"].pop("max_steps")
+                return value
+
+            await store.transform_checkpoint("configured-input", corrupt)
+        await store.close()
+
+        restarted_store = SQLiteSessionStore(database)
+        resumed_provider = Provider()
+        resumed_provider.requests = list(provider.requests)
+        echo = Echo()
+        restarted = CayuApp(
+            config=CayuConfig(run=RunDefaults(max_steps=1)),
+            session_store=restarted_store,
+            enable_logging=False,
+        )
+        restarted.register_provider(resumed_provider, default=True)
+        restarted.register_agent(
+            AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool(), echo]
+        )
+        response = UserInputResponse(session_id="configured-input", input_id=input_id, answer="yes")
+        try:
+            if missing_recorded_steps:
+                with pytest.raises(ValueError, match="no exact durable opening receipt"):
+                    await _drain(restarted.resolve_user_input(response))
+                assert len(resumed_provider.requests) == 1
+            else:
+                events = await _drain(restarted.resolve_user_input(response))
+                assert len(resumed_provider.requests) == 2
+                assert any(
+                    e.type == EventType.SESSION_LIMIT_REACHED and e.payload["limit"] == "tool_calls"
+                    for e in events
+                )
+            assert echo.metadata_by_text == {}
+        finally:
+            await restarted_store.close()
+
+    asyncio.run(exercise())

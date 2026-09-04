@@ -19,6 +19,7 @@ import cayu.runtime.tasks as tasks_runtime
 import cayu.support_bundles as support_bundles
 from cayu import (
     CayuApp,
+    CayuConfig,
     Environment,
     EnvironmentLifecycleOperation,
     EnvironmentLifecyclePhase,
@@ -31,6 +32,7 @@ from cayu import (
     LocalArtifactStore,
     McpManifestPolicy,
     McpServerSpec,
+    OperationsConfig,
     RecoveryCleanupDeadlineScope,
     RecoveryCleanupPolicy,
     RecoveryCleanupRetainedTaskSnapshot,
@@ -1287,7 +1289,10 @@ def test_recovery_cleanup_collector_bounds_and_reconstructs_typed_status(
         overall_timeout_seconds=4,
         max_supervised_tasks=7,
     )
-    app = CayuApp(recovery_cleanup_policy=policy, enable_logging=False)
+    app = CayuApp(
+        config=CayuConfig(operations=OperationsConfig(recovery_cleanup_policy=policy)),
+        enable_logging=False,
+    )
     snapshot = RecoveryCleanupSupervisorSnapshot(
         active_tasks=2,
         retained_tasks=3,

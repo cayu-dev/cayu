@@ -16,6 +16,7 @@ from tests.runners.lambda_microvm_harness import (
     SupervisorTransport,
 )
 
+from cayu import CayuConfig, OperationsConfig
 from cayu._exception_groups import iter_exception_tree
 from cayu.artifacts import LocalArtifactStore
 from cayu.core import (
@@ -4287,7 +4288,7 @@ def test_app_retains_failed_unadopted_cleanup_until_later_retry_succeeds() -> No
         app = CayuApp(
             session_store=store,
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         app.register_provider(provider, default=True)
         app.register_environment_factory(

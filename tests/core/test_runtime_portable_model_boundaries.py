@@ -15,6 +15,7 @@ from tests.core.test_runtime import (
     collect_events,
 )
 
+from cayu import CayuConfig, RunDefaults
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
 from cayu.core import (
     AgentSpec,
@@ -146,7 +147,11 @@ def test_cayu_app_rejects_non_portable_request_billing_error_before_dispatch():
             raise RuntimeError(secret)
 
     provider = NonPortableRequestBillingProvider([ModelStreamEvent.completed({})])
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -202,7 +207,9 @@ def test_cayu_app_terminalizes_non_portable_completion_with_fail_closed_usage(
     budget_store = InMemoryBudgetStore()
     app = CayuApp(
         budget_store=budget_store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -300,7 +307,9 @@ def test_cayu_app_preserves_completed_usage_when_provider_state_is_structurally_
     )
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -362,7 +371,11 @@ def test_cayu_app_does_not_invoke_hostile_completion_key_equality_or_redispatch(
         completion=None,
     )
     provider = FakeProvider([invalid_completion])
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -454,7 +467,11 @@ def test_cayu_app_does_not_redispatch_when_derived_usage_exceeds_portable_range(
             )
         ]
     )
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -553,7 +570,11 @@ def test_cayu_app_retains_safe_usage_evidence_when_malformed_usage_aggregate_ove
     )
     provider = FakeProvider([invalid_completion])
     provider.usage_dialect = usage_dialect
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -610,7 +631,9 @@ def test_cayu_app_terminalizes_nonportable_model_stream_values_without_retry_or_
     provider = NonPortableStreamProvider()
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -694,7 +717,11 @@ def test_cayu_app_terminalizes_nonportable_raised_provider_error_without_retry_o
             yield
 
     provider = NonPortableErrorProvider()
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -775,7 +802,11 @@ def test_cayu_app_validates_raised_provider_error_control_fields_before_retry(
             yield
 
     provider = MutatedProviderErrorProvider()
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -834,7 +865,11 @@ def test_cayu_app_uses_one_detached_provider_error_snapshot_per_attempt(
             yield
 
     provider = FlippingErrorProvider()
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -880,7 +915,11 @@ def test_cayu_app_does_not_publish_forged_durable_value_diagnostics():
             raise error
             yield
 
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(ForgedDiagnosticProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -921,7 +960,9 @@ def test_cayu_app_detaches_nested_message_payloads_between_provider_attempts():
 
     provider = MutatingTimeoutProvider()
     app = CayuApp(
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))

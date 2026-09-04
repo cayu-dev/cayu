@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 
 import cayu.runtime.budgets as budgets_module
+from cayu import CayuConfig, RunDefaults
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
@@ -745,7 +746,9 @@ def test_runtime_rejects_reservation_id_reuse_across_retry_dispatches() -> None:
 
     provider = RetryOnceProvider()
     app = CayuApp(
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
         budget_policy=BudgetPolicy(limits=(_reservation_limit(),)),
         budget_ledger=ReusingReservationIdLedger(),
         enable_logging=False,

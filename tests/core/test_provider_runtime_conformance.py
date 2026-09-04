@@ -6,7 +6,17 @@ from typing import Any
 import httpx
 import pytest
 
-from cayu import AgentSpec, CayuApp, Event, EventType, Message, RetryPolicy, RunRequest
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    CayuConfig,
+    Event,
+    EventType,
+    Message,
+    RetryPolicy,
+    RunDefaults,
+    RunRequest,
+)
 from cayu.providers import (
     AnthropicProvider,
     ChatCompletionsProvider,
@@ -72,7 +82,11 @@ def test_cayu_app_does_not_retry_conflicting_buffered_provider_identity(
         provider = AnthropicProvider(api_key="test-key")
     else:
         provider = ChatCompletionsProvider(api_key="test-key")
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="test-model"))
 

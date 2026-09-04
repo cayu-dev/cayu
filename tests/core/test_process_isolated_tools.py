@@ -19,11 +19,13 @@ import pytest
 from pydantic import SecretStr
 
 from cayu import (
+    CayuConfig,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
+    ToolExecutionConfig,
 )
 from cayu._validation import DurableValueError, copy_bounded_durable_json_value
 from cayu.core import (
@@ -1618,7 +1620,10 @@ def test_manifest_distinguishes_unbounded_and_cooperative_ordinary_tools() -> No
     observed = []
     descriptor_versions: list[str] = []
     for timeout in (None, 1.0):
-        app = CayuApp(enable_logging=False, tool_timeout_seconds=timeout)
+        app = CayuApp(
+            enable_logging=False,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=timeout)),
+        )
         app.register_agent(
             AgentSpec(name="assistant", model="test-model"),
             tools=[OrdinaryTool()],
@@ -3837,7 +3842,9 @@ def _public_app(
     app = CayuApp(
         session_store=session_store,
         enable_logging=False,
-        tool_timeout_seconds=tool_timeout_seconds,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(tool_timeout_seconds=tool_timeout_seconds)
+        ),
         secret_redactor=secret_redactor,
         public_authority_alias_keyring=public_authority_alias_keyring,
     )
@@ -5068,7 +5075,10 @@ def test_parallel_isolated_process_groups_settle_independently(tmp_path: Path) -
             [ModelStreamEvent.completed({"finish_reason": "stop"})],
         ]
     )
-    app = CayuApp(enable_logging=False, max_parallel_tool_calls=2)
+    app = CayuApp(
+        enable_logging=False,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=2)),
+    )
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="test-model"),

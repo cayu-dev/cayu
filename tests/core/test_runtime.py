@@ -66,6 +66,7 @@ import cayu.runtime.context as runtime_context_module
 import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.execution_units as execution_units_module
 import cayu.runtime.sessions as sessions_module
+from cayu import CayuConfig, OperationsConfig, RunDefaults, ToolExecutionConfig
 from cayu._exception_groups import (
     exception_cause,
     exception_context,
@@ -2392,7 +2393,9 @@ def test_request_footprint_retry_keeps_shape_identity_and_changes_attempt_identi
             fingerprint_key_id="test-key",
             fingerprint_key=SecretStr("k" * 32),
         ),
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
         enable_logging=False,
     )
     app.register_provider(provider, default=True)
@@ -4968,16 +4971,24 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
         CayuApp(secret_redactor="not a redactor")  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="max_file_attachment_bytes"):
-        CayuApp(max_file_attachment_bytes=1.5)  # type: ignore[arg-type]
+        CayuApp(
+            config=CayuConfig(tool_execution=ToolExecutionConfig(max_file_attachment_bytes=1.5))
+        )  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match="max_file_attachment_bytes"):
-        CayuApp(max_file_attachment_bytes=0)
+        CayuApp(config=CayuConfig(tool_execution=ToolExecutionConfig(max_file_attachment_bytes=0)))
 
     with pytest.raises(ValueError, match="max_total_file_attachment_bytes"):
-        CayuApp(max_total_file_attachment_bytes=0)
+        CayuApp(
+            config=CayuConfig(tool_execution=ToolExecutionConfig(max_total_file_attachment_bytes=0))
+        )
 
     with pytest.raises(ValueError, match="max_file_attachments_per_request"):
-        CayuApp(max_file_attachments_per_request=0)
+        CayuApp(
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(max_file_attachments_per_request=0)
+            )
+        )
 
 
 def test_cayu_app_preserves_falsey_session_store_instance():
@@ -7993,7 +8004,7 @@ def test_binding_failure_retains_timed_out_factory_release_owner(tmp_path):
         )
         app = CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         app.register_provider(
             FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
@@ -10077,7 +10088,10 @@ def test_cayu_app_elapsed_limit_stops_between_tool_calls(monkeypatch):
         ]
     )
     # Mid-round elapsed re-checks between tool calls are sequential-mode behavior.
-    app = CayuApp(session_store=store, max_parallel_tool_calls=1)
+    app = CayuApp(
+        session_store=store,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=1)),
+    )
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -12300,7 +12314,9 @@ def test_cayu_app_accounts_for_each_dispatched_retry(
 
     provider = RetriedBudgetProvider()
     app = CayuApp(
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
         budget_policy=BudgetPolicy(
             limits=(
                 BudgetLimit(
@@ -12374,7 +12390,9 @@ def test_cayu_app_retry_accounting_failure_does_not_mask_provider_failure(
     provider = RetriedBudgetProvider()
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
         budget_policy=BudgetPolicy(
             limits=(
                 BudgetLimit(
@@ -12467,7 +12485,9 @@ def test_cayu_app_releases_partial_retry_reservations_when_later_reserve_raises(
         pricing = fake_budget_limit("10").pricing
         app = CayuApp(
             session_store=store,
-            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            config=CayuConfig(
+                run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+            ),
             budget_policy=BudgetPolicy(
                 limits=(
                     BudgetLimit(
@@ -16221,7 +16241,9 @@ def test_cayu_app_retries_only_unsettled_limit_after_partial_reconciliation() ->
         pricing = fake_budget_limit("10").pricing
         app = CayuApp(
             session_store=store,
-            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            config=CayuConfig(
+                run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+            ),
             budget_policy=BudgetPolicy(
                 limits=(
                     BudgetLimit(
@@ -16310,7 +16332,9 @@ def test_cayu_app_does_not_dispatch_retry_without_an_additional_reservation() ->
 
     provider = RetriedBudgetProvider()
     app = CayuApp(
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
         budget_policy=BudgetPolicy(
             limits=(
                 BudgetLimit(
@@ -16382,7 +16406,9 @@ def test_cayu_app_pauses_budget_heartbeat_during_retry_reconciliation() -> None:
 
     provider = RetriedBudgetProvider()
     app = CayuApp(
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
         budget_policy=BudgetPolicy(
             limits=(
                 BudgetLimit(
@@ -27008,7 +27034,9 @@ def test_cayu_app_retries_provider_exception_and_keeps_transcript_clean():
     provider = TimeoutThenSuccessProvider()
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -27101,7 +27129,9 @@ def test_cayu_app_does_not_redispatch_after_established_openai_sse_reset(
         base_url="https://example.test",
     )
     app = CayuApp(
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
         enable_logging=False,
     )
     app.register_provider(provider, default=True)
@@ -27167,7 +27197,9 @@ def _run_until_semantic_deadline_process_exit(database: str, marker: str) -> Non
         provider = ProcessLossSemanticDeadlineProvider(marker)
         app = CayuApp(
             session_store=store,
-            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            config=CayuConfig(
+                run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+            ),
             enable_logging=False,
         )
         app.register_provider(provider, default=True)
@@ -27348,14 +27380,18 @@ def test_cayu_app_fences_typed_semantic_stream_deadline_until_manual_settlement(
     provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        transport_idle_timeout_s=1.0,
-        protocol_idle_timeout_s=1.0,
-        semantic_progress_timeout_s=0.05,
-        absolute_stream_timeout_s=1.0,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=0.05,
+            protocol_idle_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
+        ),
     )
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -27456,10 +27492,12 @@ def test_cayu_app_fences_typed_semantic_stream_deadline_until_manual_settlement(
     restarted_provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        transport_idle_timeout_s=1.0,
-        protocol_idle_timeout_s=1.0,
-        semantic_progress_timeout_s=0.05,
-        absolute_stream_timeout_s=1.0,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=0.05,
+            protocol_idle_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
+        ),
     )
     restarted = CayuApp(session_store=reopened_store, enable_logging=False)
     restarted.register_provider(restarted_provider, default=True)
@@ -27541,7 +27579,9 @@ def test_cayu_app_preserves_stream_deadline_when_model_error_acknowledgement_is_
         provider = BlockingDeadlineProvider()
         app = CayuApp(
             session_store=store,
-            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            config=CayuConfig(
+                run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+            ),
             enable_logging=False,
         )
         app.register_provider(provider, default=True)
@@ -27676,7 +27716,9 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
 
     provider = AlwaysTimeoutProvider()
     app = CayuApp(
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -27844,7 +27886,11 @@ def test_cayu_app_does_not_emit_model_error_for_non_retryable_contract_failure()
             )
         ]
     )
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -56243,6 +56289,78 @@ def test_cayu_app_interrupts_session_when_max_steps_exhausted_by_tool_work():
     assert session.status == SessionStatus.INTERRUPTED
 
 
+def test_default_run_completes_more_than_sixteen_tool_driven_model_rounds():
+    def looping_provider(rounds: int) -> FakeProvider:
+        responses = [
+            [
+                ModelStreamEvent.tool_call(
+                    id=f"call_{index}",
+                    name="echo",
+                    arguments={"text": str(index)},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+            for index in range(rounds)
+        ]
+        responses.append(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        return FakeProvider(responses)
+
+    default_store = InMemorySessionStore()
+    default_provider = looping_provider(17)
+    default_app = CayuApp(session_store=default_store, enable_logging=False)
+    default_app.register_provider(default_provider, default=True)
+    default_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+    default_events = asyncio.run(
+        collect_events(
+            default_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_default_more_than_sixteen",
+                messages=[Message.text("user", "keep using the tool")],
+            ),
+        )
+    )
+
+    constrained_store = InMemorySessionStore()
+    constrained_provider = looping_provider(17)
+    constrained_app = CayuApp(session_store=constrained_store, enable_logging=False)
+    constrained_app.register_provider(constrained_provider, default=True)
+    constrained_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+    constrained_events = asyncio.run(
+        collect_events(
+            constrained_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_explicit_sixteen",
+                messages=[Message.text("user", "keep using the tool")],
+                max_steps=16,
+            ),
+        )
+    )
+
+    assert len(default_provider.requests) == 18
+    assert default_events[-1].type is EventType.SESSION_COMPLETED
+    assert len(constrained_provider.requests) == 16
+    assert constrained_events[-1].type is EventType.SESSION_INTERRUPTED
+    assert_model_step_limit_interruption(
+        constrained_events,
+        maximum=16,
+        actual=16,
+        cumulative_model_steps=16,
+    )
+
+
 def test_cayu_app_bounds_repeated_end_turn_false_by_max_steps():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -56753,7 +56871,9 @@ def test_cayu_app_reconstructs_markerless_deadline_claim_before_publication() ->
     )
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=3, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=3, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -61122,7 +61242,7 @@ def test_cancelled_runner_cleanup_diagnostics_are_attached_only_to_active_tool()
         ]
     )
     # A "not yet started" trailing tool call requires sequential execution.
-    app = CayuApp(max_parallel_tool_calls=1)
+    app = CayuApp(config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=1)))
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -63207,7 +63327,10 @@ def test_tool_call_times_out_and_session_continues():
             ],
         ]
     )
-    app = CayuApp(session_store=store, tool_timeout_seconds=0.05)
+    app = CayuApp(
+        session_store=store,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.05)),
+    )
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -63465,7 +63588,11 @@ def test_parallel_tool_policy_denials_emit_one_canonical_block_per_call():
             [ModelStreamEvent.completed({"finish_reason": "stop"})],
         ]
     )
-    app = CayuApp(session_store=store, enable_logging=False, max_parallel_tool_calls=2)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=2)),
+    )
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -63732,7 +63859,7 @@ def test_parallel_tool_round_concurrency_is_capped_by_semaphore():
             ],
         ]
     )
-    app = CayuApp(max_parallel_tool_calls=2)
+    app = CayuApp(config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=2)))
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -63792,7 +63919,7 @@ def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
             ],
         ]
     )
-    app = CayuApp(tool_timeout_seconds=0.05)
+    app = CayuApp(config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.05)))
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -63833,33 +63960,17 @@ def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "error_type", "error"),
+    "kwargs",
     [
-        (
-            {"tool_timeout_seconds": 0},
-            ValueError,
-            "tool_timeout_seconds must be greater than zero.",
-        ),
-        (
-            {"tool_timeout_seconds": "5"},
-            TypeError,
-            "tool_timeout_seconds must be a number or None.",
-        ),
-        (
-            {"max_parallel_tool_calls": 0},
-            ValueError,
-            "max_parallel_tool_calls must be greater than zero.",
-        ),
-        (
-            {"max_parallel_tool_calls": 2.5},
-            TypeError,
-            "max_parallel_tool_calls must be an integer.",
-        ),
+        {"tool_timeout_seconds": 0},
+        {"tool_timeout_seconds": "5"},
+        {"max_parallel_tool_calls": 0},
+        {"max_parallel_tool_calls": 2.5},
     ],
 )
-def test_cayu_app_validates_tool_execution_settings(kwargs, error_type, error):
-    with pytest.raises(error_type, match=error):
-        CayuApp(**kwargs)
+def test_cayu_config_validates_tool_execution_settings(kwargs):
+    with pytest.raises(ValueError):
+        ToolExecutionConfig(**kwargs)
 
 
 # --------------------------------------------------------------------------- #

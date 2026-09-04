@@ -1441,17 +1441,21 @@ async def run_corpus_suite(
     corpus: EvalCorpusDocument,
     suite_id: str,
     *,
-    max_concurrency: int = 1,
+    max_concurrency: int | None = None,
     execution_capacity: EvalExecutionCapacity | None = None,
 ) -> CorpusExecutionResult:
     """Execute one corpus suite through Cayu's existing runner and publish it safely."""
 
     validated_target = _copy_corpus_target(target)
-    _validate_corpus_concurrency(validated_target, max_concurrency)
     compiled = _compile_prepared_corpus_suite(
         _prepare_corpus_with_validated_target(corpus, validated_target),
         suite_id,
     )
+    if max_concurrency is None:
+        # Portable suites already bind a policy, including the legacy serial
+        # fallback. Never reinterpret that identity using process defaults.
+        max_concurrency = compiled.run_contract.trial_policy.max_concurrency
+    _validate_corpus_concurrency(validated_target, max_concurrency)
     return await _run_compiled_corpus_suite(
         validated_target,
         compiled,

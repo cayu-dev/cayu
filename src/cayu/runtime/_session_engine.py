@@ -371,6 +371,7 @@ from cayu.runtime.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
+from cayu.runtime.config import RunDefaults
 from cayu.runtime.context import (
     _COMPACTION_ATTEMPT_ID_KEY,
     CheckpointCompactionContextPolicy,
@@ -3329,13 +3330,15 @@ def _execution_profile_identity(
     causal_budget_id: str | None = None,
     structured_output: StructuredOutputSpec | None = None,
     thinking: ThinkingConfig | None = None,
-    max_steps: int = 16,
+    max_steps: int | None = None,
     limits: RunLimits | None = None,
     retry_policy: RetryPolicy | None = None,
     finalization_material: dict[str, Any] | None = None,
     tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     runtime_identity: SessionRuntimeIdentity | None = None,
 ) -> ExecutionProfileIdentity:
+    if finalization_material is None and max_steps is None:
+        raise ValueError("Execution profile requires resolved invocation max_steps.")
     runtime_identity = (
         SessionRuntimeIdentity(
             runtime_name="cayu",
@@ -3406,7 +3409,7 @@ def _execution_profile_identity(
         structured_output=_execution_profile_structured_output(structured_output),
         finalization=(
             execution_profile_admission.model_finalization_material(
-                max_steps=max_steps,
+                max_steps=cast("int", max_steps),
                 limits=copy_run_limits(limits),
                 retry_policy=copy_retry_policy(retry_policy),
             )
@@ -5009,6 +5012,7 @@ class SessionEngine:
             [str | None], runtime_records.RegisteredEnvironment | None
         ],
         effective_retry_policy: Callable[[RetryPolicy | None], RetryPolicy],
+        application_run_defaults: RunDefaults,
         execution_profile_policy: ExecutionProfilePolicy | None,
         execution_profile_policy_identity: str | None,
         execution_profile_process_identity: str,
@@ -5055,6 +5059,9 @@ class SessionEngine:
         self._get_registered_environment = get_registered_environment
         self._get_registered_environment_for_session = get_registered_environment_for_session
         self._effective_retry_policy = effective_retry_policy
+        if type(application_run_defaults) is not RunDefaults:
+            raise TypeError("application_run_defaults must be a RunDefaults.")
+        self._application_run_defaults = application_run_defaults
         self._execution_profile_policy = execution_profile_policy
         self._execution_profile_policy_identity = execution_profile_policy_identity
         self._egress_authority_adoption_handler = egress_authority_adoption_handler
@@ -5363,7 +5370,7 @@ class SessionEngine:
         request_budget_limits: tuple[BudgetLimit, ...] = (),
         structured_output: StructuredOutputSpec | None = None,
         thinking: ThinkingConfig | None = None,
-        max_steps: int = 16,
+        max_steps: int | None = None,
         limits: RunLimits | None = None,
         retry_policy: RetryPolicy | None = None,
         invocation_semantics_available: bool = False,
@@ -5374,6 +5381,8 @@ class SessionEngine:
     ) -> ActiveInvocationExecutionProfile:
         """Resolve a recovery continuation against its durable invocation profile."""
 
+        if invocation_semantics_available and max_steps is None:
+            raise ValueError("Recovery requires recorded invocation max_steps.")
         active_model_completion = await self.session_store.load_active_model_completion_stage(
             session.id
         )
@@ -5461,10 +5470,14 @@ class SessionEngine:
             app_budget_limit_ids=app_limit_ids,
             request_budget_limit_ids=request_limit_ids,
             structured_output=_execution_profile_structured_output(structured_output),
-            finalization=execution_profile_admission.model_finalization_material(
-                max_steps=max_steps,
-                limits=copy_run_limits(limits),
-                retry_policy=copy_retry_policy(retry_policy),
+            finalization=(
+                execution_profile_admission.model_finalization_material(
+                    max_steps=cast("int", max_steps),
+                    limits=copy_run_limits(limits),
+                    retry_policy=copy_retry_policy(retry_policy),
+                )
+                if invocation_semantics_available
+                else None
             ),
             invocation_semantics_available=invocation_semantics_available,
             tool_capability_ceiling=_session_tool_capability_ceiling(
@@ -10752,7 +10765,7 @@ class SessionEngine:
             or request.target is not None
             or request.tool_capability_ceiling is not None
             or request.metadata
-            or request.max_steps != 16
+            or "max_steps" in request.model_fields_set
             or request.limits != RunLimits()
             or request.budget_limits
             or request.retry_policy is not None
@@ -18052,47 +18065,58 @@ class SessionEngine:
                 runtime_version=_runtime_version(),
                 runtime_build_provenance=current_runtime_build_provenance(),
             )
-            candidate_execution_profile = _execution_profile_identity(
-                registered_agent=registered_agent,
-                provider_name=registered_provider.name,
-                registered_provider=registered_provider,
-                model=(
-                    requested_target.model
-                    if target_changed and requested_target is not None
-                    else loaded_session.model
-                ),
-                durable_system_prompt=None,
-                redactor=self._secret_redactor,
-                registered_environment=registered_environment,
-                process_identity=self._execution_profile_process_identity,
-                runtime_hooks=self._runtime_hooks,
-                loop_policies=self._loop_policies,
-                loop_policy_execution_profile_identities=(
-                    self._loop_policy_execution_profile_identities
-                ),
-                request_loop_policies=request.loop_policies,
-                request_loop_policy_instance_identities=(
-                    self._request_loop_policy_instance_identities(request.loop_policies)
-                ),
-                budget_policy=budget_policy,
-                request_budget_limits=request.budget_limits,
-                causal_budget_id=loaded_session.causal_budget_id,
-                structured_output=request.structured_output,
-                thinking=request.thinking,
-                max_steps=request.max_steps,
-                limits=request.limits,
-                retry_policy=self._effective_retry_policy(request.retry_policy),
-                tool_capability_ceiling=effective_tool_capability_ceiling,
-                runtime_identity=candidate_runtime_identity,
-            )
             expected_execution_profile = stored_execution_profile
-            # A resumed session executes the already-durable system projection.
-            # The current AgentSpec prompt is not re-injected on resume.
-            candidate_execution_profile = execution_profile_with_component(
-                candidate_execution_profile,
-                expected_execution_profile.component(
-                    ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
-                ),
+            candidate_model = (
+                requested_target.model
+                if target_changed and requested_target is not None
+                else loaded_session.model
+            )
+
+            def ordinary_resume_profile(
+                max_steps: int,
+                candidate_provider: runtime_records.RegisteredProvider,
+            ) -> ExecutionProfileIdentity:
+                candidate = _execution_profile_identity(
+                    registered_agent=registered_agent,
+                    provider_name=candidate_provider.name,
+                    registered_provider=candidate_provider,
+                    model=candidate_model,
+                    durable_system_prompt=None,
+                    redactor=self._secret_redactor,
+                    registered_environment=registered_environment,
+                    process_identity=self._execution_profile_process_identity,
+                    runtime_hooks=self._runtime_hooks,
+                    loop_policies=self._loop_policies,
+                    loop_policy_execution_profile_identities=(
+                        self._loop_policy_execution_profile_identities
+                    ),
+                    request_loop_policies=request.loop_policies,
+                    request_loop_policy_instance_identities=(
+                        self._request_loop_policy_instance_identities(request.loop_policies)
+                    ),
+                    budget_policy=budget_policy,
+                    request_budget_limits=request.budget_limits,
+                    causal_budget_id=loaded_session.causal_budget_id,
+                    structured_output=request.structured_output,
+                    thinking=request.thinking,
+                    max_steps=max_steps,
+                    limits=request.limits,
+                    retry_policy=self._effective_retry_policy(request.retry_policy),
+                    tool_capability_ceiling=effective_tool_capability_ceiling,
+                    runtime_identity=candidate_runtime_identity,
+                )
+                # A resumed session executes the already-durable system
+                # projection. The current AgentSpec prompt is not re-injected.
+                return execution_profile_with_component(
+                    candidate,
+                    expected_execution_profile.component(
+                        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                    ),
+                )
+
+            candidate_execution_profile = ordinary_resume_profile(
+                request.max_steps,
+                registered_provider,
             )
             built_in_model_target_transition = False
             if target_changed:
@@ -19518,8 +19542,16 @@ class SessionEngine:
                     None if initial_invocation is None else initial_invocation.structured_output
                 ),
                 thinking=(None if initial_invocation is None else initial_invocation.thinking),
-                max_steps=(16 if initial_invocation is None else initial_invocation.max_steps),
-                limits=(None if initial_invocation is None else initial_invocation.limits),
+                max_steps=(
+                    self._application_run_defaults.max_steps
+                    if initial_invocation is None
+                    else initial_invocation.max_steps
+                ),
+                limits=(
+                    self._application_run_defaults.copy_limits()
+                    if initial_invocation is None
+                    else initial_invocation.limits
+                ),
                 retry_policy=(
                     self._effective_retry_policy(None)
                     if initial_invocation is None

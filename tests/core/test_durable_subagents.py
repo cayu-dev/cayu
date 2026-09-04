@@ -14,6 +14,7 @@ from tests.core._execution_profile_fixtures import versioned_test_provider_ident
 
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime.app as runtime_app_module
+from cayu import CayuConfig, ToolExecutionConfig
 from cayu.core import (
     AgentSpec,
     Event,
@@ -4937,7 +4938,9 @@ def test_parent_task_cancellation_waits_for_durable_submission_settlement(
             session_store=sessions,
             task_store=tasks,
             dispatcher=dispatcher,
-            tool_timeout_seconds=tool_timeout_seconds,
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(tool_timeout_seconds=tool_timeout_seconds)
+            ),
             enable_logging=False,
         )
         app.register_provider(_DurableSubagentProvider(), default=True)
@@ -4993,7 +4996,7 @@ def test_tool_timeout_reports_queued_child_when_durable_submission_commits_late(
             session_store=sessions,
             task_store=tasks,
             dispatcher=TaskStoreDispatcher(tasks),
-            tool_timeout_seconds=0.01,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.01)),
             enable_logging=False,
         )
         app.register_provider(_DurableSubagentProvider(), default=True)
@@ -5054,7 +5057,7 @@ def test_tool_timeout_preserves_unsettled_submission_for_exact_recovery() -> Non
             session_store=sessions,
             task_store=tasks,
             dispatcher=dispatcher,
-            tool_timeout_seconds=0.01,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.01)),
             enable_logging=False,
         )
         app.register_provider(provider, default=True)
@@ -5096,7 +5099,7 @@ def test_tool_timeout_preserves_unsettled_submission_for_exact_recovery() -> Non
             session_store=sessions,
             task_store=tasks,
             dispatcher=restarted_dispatcher,
-            tool_timeout_seconds=0.01,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.01)),
             enable_logging=False,
         )
         restarted_app.register_provider(provider, default=True)
@@ -5154,7 +5157,9 @@ def test_external_cancellation_remains_authoritative_over_unsettled_timeout(
             session_store=sessions,
             task_store=tasks,
             dispatcher=TaskStoreDispatcher(tasks),
-            tool_timeout_seconds=tool_timeout_seconds,
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(tool_timeout_seconds=tool_timeout_seconds)
+            ),
             enable_logging=False,
         )
         app.register_provider(_DurableSubagentProvider(), default=True)
@@ -5212,7 +5217,7 @@ def test_external_cancellation_wins_when_durable_submission_outlasts_tool_timeou
             session_store=sessions,
             task_store=tasks,
             dispatcher=TaskStoreDispatcher(tasks),
-            tool_timeout_seconds=0.02,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.02)),
             enable_logging=False,
         )
         app.register_provider(_DurableSubagentProvider(), default=True)

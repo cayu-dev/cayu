@@ -25,6 +25,7 @@ import cayu.runtime._invocation_secrets as invocation_secrets_module
 import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.sessions as sessions_module
 from cayu import (
+    CayuConfig,
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeIndexer,
@@ -34,6 +35,7 @@ from cayu import (
     LocalWorkspace,
     ReadFileTool,
     SearchKnowledgeTool,
+    ToolExecutionConfig,
 )
 from cayu.core import (
     AgentSpec,
@@ -4079,7 +4081,10 @@ def test_parallel_generic_cancellation_preserves_caller_signal_without_secret_ev
             return ToolResult(content="unexpected")
 
     tool = DynamicSecretBlockingTool()
-    app = CayuApp(enable_logging=False, max_parallel_tool_calls=2)
+    app = CayuApp(
+        enable_logging=False,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=2)),
+    )
     app.register_provider(
         FakeProvider(
             [
@@ -5606,7 +5611,7 @@ def test_parallel_operator_interrupt_keeps_each_invocation_secret_scope() -> Non
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        max_parallel_tool_calls=2,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=2)),
     )
     app.register_provider(
         FakeProvider(

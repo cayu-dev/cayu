@@ -12,6 +12,7 @@ from tests.core._execution_profile_fixtures import create_admitted_session
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
+from cayu import CayuConfig, OperationsConfig
 from cayu._exception_groups import iter_exception_tree
 from cayu._workspace_mutation import WorkspaceMutationSettlementError
 from cayu.core import AgentSpec, Event, EventType, Message
@@ -1968,7 +1969,7 @@ def test_environment_owner_capacity_fails_before_binding_mutation() -> None:
         binding = RecordingBinding()
         app = CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         app.register_provider(
             _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
@@ -2005,7 +2006,7 @@ def test_environment_owner_capacity_deduplicates_one_transferred_session() -> No
 
     app = CayuApp(
         enable_logging=False,
-        max_environment_lifecycle_owners=2,
+        config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=2)),
     )
     lifecycle = app._environment_lifecycle
     lifecycle._active_environment_setups["transferred"] = RetainedOwner()  # type: ignore[assignment]
@@ -2059,7 +2060,7 @@ def test_deferred_factory_failure_retains_capacity_until_cleanup_settles() -> No
         factory = DeferredFailureFactory()
         app = CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         app.register_provider(
             _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
@@ -2167,7 +2168,7 @@ def test_explicit_drain_retries_same_failed_factory_cleanup_owner() -> None:
         factory = RecoverableCleanupFactory()
         app = CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         app.register_provider(
             _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
@@ -2291,7 +2292,7 @@ def test_grouped_factory_leaf_cleanups_retain_capacity_until_all_settle() -> Non
         factory = GroupedCleanupFactory()
         app = CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         app.register_provider(
             _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
@@ -3173,7 +3174,7 @@ def test_timed_out_factory_release_adopts_late_cleanup_settlement() -> None:
         factory = LateSettlementFactory()
         app = CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         app.register_provider(
             _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
@@ -3274,7 +3275,7 @@ def test_timed_out_factory_release_retains_cyclic_cleanup_handoff() -> None:
         factory = CyclicReleaseFactory()
         app = CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         app.register_provider(
             _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
@@ -3336,7 +3337,7 @@ def test_cayu_app_rejects_invalid_environment_owner_capacity(value: Any) -> None
     with pytest.raises((TypeError, ValueError), match="max_environment_lifecycle_owners"):
         CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=value,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=value)),
         )
 
 
@@ -3388,7 +3389,7 @@ def test_abandoned_started_boundary_releases_unmutated_capacity_admission() -> N
     async def run() -> set[str]:
         app = CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=1,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
         )
         lifecycle = app._environment_lifecycle
         lifecycle._reserve_environment_owner_admission("abandoned-before-mutation")

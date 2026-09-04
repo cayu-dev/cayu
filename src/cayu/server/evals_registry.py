@@ -164,7 +164,9 @@ def target_for_eval_invocation(
         raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     if type(invocation) is not EvalRunInvocation:
         raise TypeError("invocation must be an exact EvalRunInvocation.")
-    request = copy_run_request(target.request_base)
+    request = target.app._with_application_run_defaults(
+        copy_run_request(target.request_base),
+    )
     if (
         invocation.source is SessionExecutionSource.HTTP_RUN
         and request.invocation_origin is not None
@@ -286,7 +288,10 @@ class EvalTargetRegistration:
             self.catalog_entry.max_trials != policy.max_trials
             or self.catalog_entry.max_concurrency != policy.max_concurrency
             or self.catalog_entry.max_timeout_seconds != self.target.limits.max_timeout_seconds
-            or self.catalog_entry.max_steps != self.target.request_base.max_steps
+            or self.catalog_entry.max_steps
+            != self.target.app._with_application_run_defaults(
+                copy_run_request(self.target.request_base),
+            ).max_steps
         ):
             raise ValueError("Eval target catalog limits do not match its execution authority.")
         if self.manifest_project_root is not None and (
@@ -600,10 +605,13 @@ def generated_eval_target_registry(
             agent_name=agent_name,
             profile_id=DEFAULT_EVAL_PROFILE_ID,
         )
+        request_base = app._with_application_run_defaults(
+            RunRequest(agent_name=agent_name, messages=[]),
+        )
         target = CorpusTarget(
             key=target_key,
             app=app,
-            request_base=RunRequest(agent_name=agent_name, messages=[]),
+            request_base=request_base,
             application_release_id=application_release_id,
             price_book=price_book,
             model_judges=model_judges,
@@ -765,7 +773,9 @@ def explicit_eval_target_registry(
         max_trials=policy.max_trials,
         max_concurrency=policy.max_concurrency,
         max_timeout_seconds=target.limits.max_timeout_seconds,
-        max_steps=target.request_base.max_steps,
+        max_steps=target.app._with_application_run_defaults(
+            copy_run_request(target.request_base),
+        ).max_steps,
         cost_budget_available=bool(cost_budget_currencies),
         cost_budget_currencies=cost_budget_currencies,
         judge_profiles=judge_profiles,

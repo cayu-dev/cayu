@@ -13,6 +13,7 @@ from cayu import (
     AppManifest,
     ArtifactExternalizingToolResultPolicy,
     CayuApp,
+    CayuConfig,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
@@ -24,6 +25,7 @@ from cayu import (
     ExecutionRequirements,
     LocalWorkspace,
     OpenAIWebSearch,
+    OperationsConfig,
     ProcessCommandPolicy,
     RecoveryCleanupPolicy,
     RequestFootprintConfig,
@@ -188,11 +190,11 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
 def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:
     first = CayuApp(
         enable_logging=False,
-        max_environment_lifecycle_owners=1,
+        config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
     ).describe()
     second = CayuApp(
         enable_logging=False,
-        max_environment_lifecycle_owners=2,
+        config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=2)),
     ).describe()
 
     assert first.runtime.max_environment_lifecycle_owners == 1
@@ -230,11 +232,19 @@ def test_environment_lifecycle_policy_is_manifested_and_fingerprinted() -> None:
 def test_recovery_cleanup_policy_is_manifested_and_fingerprinted() -> None:
     first = CayuApp(
         enable_logging=False,
-        recovery_cleanup_policy=RecoveryCleanupPolicy(step_timeout_seconds=1),
+        config=CayuConfig(
+            operations=OperationsConfig(
+                recovery_cleanup_policy=RecoveryCleanupPolicy(step_timeout_seconds=1)
+            )
+        ),
     ).describe()
     second = CayuApp(
         enable_logging=False,
-        recovery_cleanup_policy=RecoveryCleanupPolicy(step_timeout_seconds=2),
+        config=CayuConfig(
+            operations=OperationsConfig(
+                recovery_cleanup_policy=RecoveryCleanupPolicy(step_timeout_seconds=2)
+            )
+        ),
     ).describe()
 
     assert first.runtime.recovery_cleanup_policy.step_timeout_seconds == 1

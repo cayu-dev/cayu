@@ -405,8 +405,11 @@ class _ScenarioTrialDriver:
                 )
         if self.expected_execution_profile is None:
             return
-        prepared = await self.target.app._session_engine._prepare_initial_run(
+        request = self.target.app._with_application_run_defaults(
             copy_run_request(self.target.request_base),
+        )
+        prepared = await self.target.app._session_engine._prepare_initial_run(
+            request,
             admit_session=False,
         )
         if prepared is None or prepared.execution_profile != self.expected_execution_profile:

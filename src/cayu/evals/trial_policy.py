@@ -19,13 +19,13 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._eval_limits import EVAL_SUITE_MAX_CONCURRENCY
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
 
 EVAL_SUITE_TRIAL_POLICY_SCHEMA_VERSION = 1
 EVAL_SUITE_RUN_EXPOSURE_SCHEMA_VERSION = 1
 EVAL_SUITE_MAX_TRIALS = 100
-EVAL_SUITE_MAX_CONCURRENCY = 64
 
 _EVAL_SUITE_TRIAL_POLICY_DOMAIN = "eval suite trial policy"
 _EVAL_SUITE_RUN_EXPOSURE_DOMAIN = "eval suite run exposure"

@@ -234,6 +234,7 @@ from cayu.runtime.checkpoints import (
     WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
     decode_runtime_checkpoint,
 )
+from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
@@ -1648,7 +1649,7 @@ class RunRequest(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     invocation_origin: InvocationOriginClaim | None = None
-    max_steps: StrictInt = Field(default=16, ge=1, le=256)
+    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -1905,7 +1906,7 @@ class ResumeRequest(BaseModel):
     tool_grants: tuple[TargetedToolGrant, ...] = ()
     profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    max_steps: StrictInt = Field(default=16, ge=1, le=256)
+    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -20271,14 +20272,32 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
         invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
-        max_steps=request.max_steps,
-        limits=copy_run_limits(request.limits),
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
-        thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
+    copied = copied.model_copy(
+        update={
+            "max_steps": request.max_steps,
+            "limits": copy_run_limits(request.limits),
+            "thinking": (
+                None
+                if request.thinking is None
+                else ThinkingConfig(
+                    enabled=request.thinking.enabled,
+                    effort=request.thinking.effort,
+                    max_tokens=request.thinking.max_tokens,
+                    include_in_transcript=request.thinking.include_in_transcript,
+                )
+            ),
+        }
+    )
+    copied_fields_set = set(copied.model_fields_set)
+    for field_name in ("max_steps", "limits", "thinking"):
+        if field_name not in request.model_fields_set:
+            copied_fields_set.discard(field_name)
+    object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)
     copied._runtime_generated_authority = request._runtime_generated_authority
     create_claim = request._runtime_session_create_claim
     copied._runtime_session_create_claim = (
@@ -21611,23 +21630,32 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
             else copy_execution_profile_adoption_intent(request.profile_adoption)
         ),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
-        max_steps=request.max_steps,
-        limits=copy_run_limits(request.limits),
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
-        thinking=(
-            None
-            if request.thinking is None
-            else ThinkingConfig(
-                enabled=request.thinking.enabled,
-                effort=request.thinking.effort,
-                max_tokens=request.thinking.max_tokens,
-                include_in_transcript=request.thinking.include_in_transcript,
-            )
-        ),
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
+    copied = copied.model_copy(
+        update={
+            "max_steps": request.max_steps,
+            "limits": copy_run_limits(request.limits),
+            "thinking": (
+                None
+                if request.thinking is None
+                else ThinkingConfig(
+                    enabled=request.thinking.enabled,
+                    effort=request.thinking.effort,
+                    max_tokens=request.thinking.max_tokens,
+                    include_in_transcript=request.thinking.include_in_transcript,
+                )
+            ),
+        }
+    )
+    copied_fields_set = set(copied.model_fields_set)
+    for field_name in ("max_steps", "limits", "thinking"):
+        if field_name not in request.model_fields_set:
+            copied_fields_set.discard(field_name)
+    object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)
     authority = request._runtime_transport_metadata_authority
     if (
         type(authority) is _RuntimeResumeTransportMetadataAuthority

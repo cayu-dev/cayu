@@ -20,6 +20,7 @@ from tests.core.test_runtime import (
 )
 
 import cayu.runtime._tool_results as tool_results_module
+from cayu import CayuConfig, RunDefaults
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
 from cayu.core import (
     AgentSpec,
@@ -323,7 +324,11 @@ def test_cayu_app_accounts_for_completion_before_non_portable_billing_hook_failu
             raise RuntimeError(secret)
 
     provider = NonPortableCompletionBillingProvider()
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -403,7 +408,11 @@ def test_cayu_app_does_not_redispatch_valid_completion_after_retryable_billing_h
             )
 
     provider = FailingCompletionBillingProvider()
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -472,7 +481,11 @@ def test_cayu_app_does_not_publish_forged_billing_hook_diagnostics(phase: str):
             yield ModelStreamEvent.completed({"usage": {"input_tokens": 3, "output_tokens": 1}})
 
     provider = ForgedBillingErrorProvider()
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -531,7 +544,11 @@ def test_cayu_app_terminalizes_hostile_durable_billing_hook_error(phase: str):
             yield ModelStreamEvent.completed({"usage": {"input_tokens": 3, "output_tokens": 1}})
 
     provider = HostileBillingErrorProvider()
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 

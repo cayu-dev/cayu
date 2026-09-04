@@ -202,7 +202,7 @@ def resolve_execution_profile_identity(
     app_budget_limit_ids: tuple[str, ...] = (),
     request_budget_limit_ids: tuple[str, ...] = (),
     structured_output: Mapping[str, Any] | None = None,
-    finalization: Mapping[str, Any] | None = None,
+    finalization: Mapping[str, Any],
     tool_capability_ceiling: tuple[str, ...] | None = None,
 ) -> ExecutionProfileIdentity:
     """Resolve one registered runtime body into its durable profile identity."""
@@ -697,15 +697,7 @@ def resolve_execution_profile_identity(
         structured_output=(
             {"kind": "none", "version": 1} if structured_output is None else structured_output
         ),
-        finalization=(
-            model_finalization_material(
-                max_steps=16,
-                limits=RunLimits(),
-                retry_policy=RetryPolicy(),
-            )
-            if finalization is None
-            else finalization
-        ),
+        finalization=finalization,
     )
 
 
@@ -740,6 +732,8 @@ def prepare_execution_profile_continuation(
 ) -> ExecutionProfileContinuationPlan:
     """Reconstruct a pending invocation and fail closed on invalid authority."""
 
+    if invocation_semantics_available and finalization is None:
+        raise ValueError("Recovery requires recorded invocation finalization.")
     if invocation_loop_policies is None and (
         invocation_loop_policy_identities or invocation_loop_policy_instance_identities
     ):
@@ -751,6 +745,8 @@ def prepare_execution_profile_continuation(
         raise RuntimeError(
             "Pending recovery state has no durable active invocation execution profile."
         )
+    if snapshot.profile.schema_version < 4:
+        raise ValueError("Recovery requires a profile with recorded invocation semantics.")
     if not active_invocation_execution_profile_matches_session_epoch(
         snapshot,
         session_id=session.id,
@@ -817,7 +813,9 @@ def prepare_execution_profile_continuation(
             app_budget_limit_ids=app_budget_limit_ids,
             request_budget_limit_ids=request_budget_limit_ids,
             structured_output=structured_output,
-            finalization=finalization,
+            # When only authenticating a stored invocation, its authoritative
+            # components replace these temporary construction inputs below.
+            finalization={} if finalization is None else finalization,
             tool_capability_ceiling=tool_capability_ceiling,
         )
     elif type(frozen_candidate_profile) is not ExecutionProfileIdentity:

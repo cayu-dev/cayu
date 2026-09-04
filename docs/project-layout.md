@@ -104,6 +104,16 @@ drift checks; it is never runtime authority. Projects without that declaration
 remain freeform. `AGENTS.md` is the compact authoring and proof contract, while
 `CLAUDE.md` imports that same contract without duplicating it.
 
+Within a generated project, `configuration/settings.py` is the sole ambient
+environment-variable reader. It validates deployment inputs such as provider,
+model and storage; the other
+configuration modules consume those typed or validated results.
+`configuration/runtime.py` owns construction of the application's immutable
+`CayuConfig` directly, and `app.py` passes that object to `CayuApp`. Per-run and
+workflow-role overrides remain at the invocation boundary rather than becoming
+more process-wide environment switches. Effective non-secret values and their
+owners and sources are visible through `cayu inspect --json`.
+
 `cayu new NAME --preset coding` is the maintained opt-in starter for a
 repository-coding application. It populates `tools/coding.py`,
 `policies/coding.py`, `environments/coding.py`, `operations/coding.py`,

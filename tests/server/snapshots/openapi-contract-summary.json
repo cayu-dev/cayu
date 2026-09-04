@@ -6738,7 +6738,7 @@
           "$ref": "#/components/schemas/RunLimits"
         },
         "max_steps": {
-          "default": 20,
+          "default": 64,
           "maximum": 256.0,
           "minimum": 1.0,
           "title": "Max Steps",
@@ -6946,7 +6946,7 @@
           "$ref": "#/components/schemas/RunLimits"
         },
         "max_steps": {
-          "default": 20,
+          "default": 64,
           "maximum": 256.0,
           "minimum": 1.0,
           "title": "Max Steps",

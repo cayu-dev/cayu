@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 
+import cayu.entrypoint as entrypoint_module
 from cayu import ModelStreamEvent, ScriptedModelProvider, run_project_entrypoint
 from cayu.cli import _build_parser
 from cayu.cli import main as cayu_main
@@ -108,6 +109,12 @@ def test_generated_command_runs_the_only_registered_agent(tmp_path: Path, capsys
     assert captured.out == "Review result.\n"
     assert captured.err == ""
     assert provider.requests[0].messages[-1].content[0].text == "Review this change."
+
+
+def test_entrypoint_leaves_the_app_owned_step_default_unset() -> None:
+    args = entrypoint_module._parser().parse_args(["--message", "Review this change."])
+
+    assert args.max_steps is None
 
 
 def test_generated_command_auto_selects_a_renamed_starter(tmp_path: Path, capsys) -> None:

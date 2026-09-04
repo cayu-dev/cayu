@@ -250,6 +250,7 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.checkpoints import CheckpointCompatibilityError
+from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     PriceBook,
@@ -1097,11 +1098,6 @@ MutationIdHeader = Annotated[
     ),
 ]
 ArtifactIdPath = Annotated[str, StringConstraints(min_length=1)]
-# Server-entrypoint step budget. The default preserves the historical value while the
-# ceiling matches the runtime's own ``max_steps`` bound (RunRequest/ResumeRequest and the
-# tool-approval bodies all cap at 256) so a request cannot ask for an unbounded run.
-_DEFAULT_RUN_MAX_STEPS = 20
-_MAX_RUN_STEPS = 256
 _EVAL_ADMISSION_REQUEST_REVISION_DOMAIN = b"cayu-eval-admission-request-v1\0"
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
@@ -1785,7 +1781,7 @@ class RunBody(_BoundedControlPlanePromptBody):
     target: ModelTarget | None = None
     causal_budget_id: NonBlankString | None = None
     labels: dict[str, str] = Field(default_factory=dict)
-    max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
+    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -1826,7 +1822,7 @@ class ResumeBody(_BoundedControlPlanePromptBody):
     task_handoff_id: NonBlankString | None = None
     prompt: NonBlankString
     profile_adoption: ExecutionProfileAdoptionBody | None = None
-    max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
+    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -2023,7 +2019,7 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
@@ -2092,7 +2088,7 @@ class ToolApprovalRecoveryBody(_BoundedControlPlaneMetadataBody):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
@@ -2134,7 +2130,7 @@ class ToolRoundRecoveryBody(_BoundedControlPlaneMetadataBody):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
@@ -2173,7 +2169,7 @@ class UserInputResolveBody(_BoundedControlPlaneMetadataBody):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
@@ -2216,7 +2212,7 @@ class UserInputRecoveryBody(_BoundedControlPlaneMetadataBody):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
@@ -8963,14 +8959,20 @@ def create_router(
             task_id=task_id,
             labels=body.labels,
             messages=[Message.text("user", body.prompt)],
-            max_steps=body.max_steps,
-            limits=body.limits,
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             metadata=trace_metadata,
-            thinking=body.thinking,
         )
+        run_default_overrides: dict[str, object] = {}
+        if "max_steps" in body.model_fields_set:
+            run_default_overrides["max_steps"] = body.max_steps
+        if "limits" in body.model_fields_set:
+            run_default_overrides["limits"] = body.limits
+        if "thinking" in body.model_fields_set:
+            run_default_overrides["thinking"] = body.thinking
+        if run_default_overrides:
+            request = request.model_copy(update=run_default_overrides)
         runtime_authority_fields = tuple(
             field_name
             for field_name, generated in (
@@ -9067,15 +9069,21 @@ def create_router(
             task_handoff_id=body.task_handoff_id,
             messages=[Message.text("user", body.prompt)],
             profile_adoption=profile_adoption,
-            max_steps=body.max_steps,
-            limits=body.limits,
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             metadata=trace_metadata,
-            thinking=body.thinking,
             loop_policies=await _continuation_loop_policies(session_id),
         )
+        run_default_overrides: dict[str, object] = {}
+        if "max_steps" in body.model_fields_set:
+            run_default_overrides["max_steps"] = body.max_steps
+        if "limits" in body.model_fields_set:
+            run_default_overrides["limits"] = body.limits
+        if "thinking" in body.model_fields_set:
+            run_default_overrides["thinking"] = body.thinking
+        if run_default_overrides:
+            request = request.model_copy(update=run_default_overrides)
         request = _with_runtime_resume_transport_metadata(request, trace_metadata)
 
         return await _accepted_event_stream_response(

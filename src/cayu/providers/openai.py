@@ -105,11 +105,6 @@ from cayu.providers.base import (
     targeted_tool_native_cache_anchor_name,
 )
 from cayu.providers.deadlines import (
-    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
-    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
-    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
-    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
-    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
     ProviderDeadlineKind,
     ProviderProgressKind,
     ProviderStreamDeadlineController,
@@ -1100,12 +1095,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         name: str = "openai",
         base_url: str = DEFAULT_OPENAI_BASE_URL,
         timeout_s: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
-        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
-        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
-        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
-        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
-        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
-        stream_idle_timeout_s: float | None = None,
+        stream_deadlines: ProviderStreamDeadlines | None = None,
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         reasoning_state: str = "inline",
@@ -1157,12 +1147,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         self.background = background
         self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
         self._stream_deadlines = _resolve_provider_stream_deadlines(
-            transport_idle_timeout_s=transport_idle_timeout_s,
-            protocol_idle_timeout_s=protocol_idle_timeout_s,
-            semantic_progress_timeout_s=semantic_progress_timeout_s,
-            absolute_stream_timeout_s=absolute_stream_timeout_s,
-            max_concurrent_streams=max_concurrent_streams,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            stream_deadlines=stream_deadlines,
         )
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         if self.background:

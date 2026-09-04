@@ -9,6 +9,7 @@ import pytest
 from cayu import (
     AgentSpec,
     CayuApp,
+    CayuConfig,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
@@ -24,6 +25,7 @@ from cayu import (
     ExecutionRequirements,
     LocalRunner,
     Message,
+    OperationsConfig,
     ResumeRequest,
     RunRequest,
     Workspace,
@@ -329,7 +331,11 @@ def _bound_factory_app(
         if max_environment_lifecycle_owners is None
         else CayuApp(
             enable_logging=False,
-            max_environment_lifecycle_owners=max_environment_lifecycle_owners,
+            config=CayuConfig(
+                operations=OperationsConfig(
+                    max_environment_lifecycle_owners=max_environment_lifecycle_owners
+                )
+            ),
         )
     )
     app.register_provider(_RecordingProvider(), default=True)

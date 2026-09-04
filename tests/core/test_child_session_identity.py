@@ -12,6 +12,7 @@ from cayu.core.tools import ToolContext
 from cayu.providers import ModelStreamEvent
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
 from cayu.runtime.app import CayuApp
+from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
 from cayu.tools.subagents import (
     BackgroundSubagentTaskRegistry,
@@ -171,6 +172,8 @@ def test_every_subagent_mode_builds_the_parent_scoped_tool_identity(mode) -> Non
     assert all(
         request.metadata["subagent"]["idempotency_key"] == "spawn-key" for request in requests
     )
+    assert all(request.max_steps == DEFAULT_MAX_STEPS for request in requests)
+    assert all("max_steps" not in request.model_fields_set for request in requests)
 
 
 @pytest.mark.parametrize(

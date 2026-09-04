@@ -7,6 +7,7 @@ from typing import Literal
 import pytest
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
+from cayu import CayuConfig, ToolExecutionConfig
 from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
 from cayu.core.messages import ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
@@ -189,7 +190,9 @@ def _runtime(
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        max_parallel_tool_calls=max_parallel_tool_calls,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(

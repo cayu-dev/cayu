@@ -52,6 +52,7 @@ from cayu.evals.scenario import (
 from cayu.evals.scenario_authoring import replace_eval_scenario_artifact_requirement
 from cayu.evals.store import EvalRunCostBudget
 from cayu.runtime.budgets import budget_pricing_preflight_error
+from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.vaults import Vault, VaultError, copy_secret_ref
 
@@ -187,7 +188,7 @@ class ScenarioLaunchSettingsV2(_ScenarioPreflightModel):
         ge=1,
         le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     )
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
     artifact_references: dict[StrictStr, StrictStr] = Field(
@@ -279,7 +280,7 @@ class ScenarioLaunchBindingV2(_ScenarioPreflightModel):
     trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     max_concurrency: StrictInt = Field(ge=1, le=EVAL_MAX_CONCURRENCY)
     timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
-    max_steps: StrictInt = Field(ge=1, le=256)
+    max_steps: StrictInt = Field(ge=1, le=MAX_STEPS)
     target_limits: RunLimits
     operator_run_limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None

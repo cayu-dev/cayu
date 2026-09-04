@@ -77,45 +77,13 @@ class ProviderStreamDeadlines:
 
 def _resolve_provider_stream_deadlines(
     *,
-    transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
-    protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
-    semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
-    absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
-    max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
-    stream_idle_timeout_s: float | None = None,
+    stream_deadlines: ProviderStreamDeadlines | None = None,
 ) -> ProviderStreamDeadlines:
-    """Resolve the temporary pre-four-clock provider constructor alias."""
-
-    resolved = ProviderStreamDeadlines(
-        transport_idle_timeout_s=transport_idle_timeout_s,
-        protocol_idle_timeout_s=protocol_idle_timeout_s,
-        semantic_progress_timeout_s=semantic_progress_timeout_s,
-        absolute_stream_timeout_s=absolute_stream_timeout_s,
-        max_concurrent_streams=max_concurrent_streams,
-    )
-    if stream_idle_timeout_s is None:
-        return resolved
-    legacy_idle_timeout_s = _positive_finite_seconds(
-        stream_idle_timeout_s,
-        "stream_idle_timeout_s",
-    )
-    defaults = ProviderStreamDeadlines()
-    if (
-        resolved.transport_idle_timeout_s != defaults.transport_idle_timeout_s
-        or resolved.protocol_idle_timeout_s != defaults.protocol_idle_timeout_s
-        or resolved.semantic_progress_timeout_s != defaults.semantic_progress_timeout_s
-    ):
-        raise ValueError(
-            "stream_idle_timeout_s cannot be combined with non-default transport, "
-            "protocol, or semantic idle timeouts."
-        )
-    return ProviderStreamDeadlines(
-        transport_idle_timeout_s=legacy_idle_timeout_s,
-        protocol_idle_timeout_s=legacy_idle_timeout_s,
-        semantic_progress_timeout_s=legacy_idle_timeout_s,
-        absolute_stream_timeout_s=resolved.absolute_stream_timeout_s,
-        max_concurrent_streams=resolved.max_concurrent_streams,
-    )
+    if stream_deadlines is None:
+        return ProviderStreamDeadlines()
+    if type(stream_deadlines) is not ProviderStreamDeadlines:
+        raise TypeError("stream_deadlines must be ProviderStreamDeadlines or None.")
+    return stream_deadlines
 
 
 class ProviderDeadlineKind(StrEnum):

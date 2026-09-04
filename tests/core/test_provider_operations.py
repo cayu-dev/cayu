@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from cayu import CayuConfig, RunDefaults
 from cayu._exception_groups import exception_cause, set_exception_cause
 from cayu.core import (
     AgentSpec,
@@ -53,6 +54,7 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.runtime._model_step_executor import (
+    _MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
     MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS,
     MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
     MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES,
@@ -1058,7 +1060,10 @@ def test_invalid_started_connection_is_closed_before_failure_publication() -> No
     provider = _ReconnectableProvider(background=True)
     adapter = _InvalidStartConnectionAdapter()
     provider.adapter = adapter
-    app = CayuApp(enable_logging=False, retry_policy=_two_attempt_retry_policy())
+    app = CayuApp(
+        enable_logging=False,
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -1114,7 +1119,10 @@ def test_background_cleanup_failure_preserves_non_turn_completion_and_usage() ->
         provider = _ReconnectableProvider(background=True)
         adapter = _TerminalBlockingStartAdapter(close_error=RuntimeError("provider close failed"))
         provider.adapter = adapter
-        app = CayuApp(enable_logging=False, retry_policy=_two_attempt_retry_policy())
+        app = CayuApp(
+            enable_logging=False,
+            config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
+        )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -1146,7 +1154,10 @@ def test_invalid_terminal_cursor_preserves_non_turn_completion_and_usage() -> No
         provider = _ReconnectableProvider(background=True)
         adapter = _TerminalCursorGapAdapter()
         provider.adapter = adapter
-        app = CayuApp(enable_logging=False, retry_policy=_two_attempt_retry_policy())
+        app = CayuApp(
+            enable_logging=False,
+            config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
+        )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         session_id = "background_invalid_terminal_cursor"
@@ -1254,6 +1265,11 @@ def test_background_dispatch_rejects_unrecoverable_secret_semantics_before_start
 
 
 def test_offline_recovery_context_is_bounded_before_stage_storage() -> None:
+    assert (
+        ModelCompletionRecoveryContext().max_steps
+        == _MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS
+        == 16
+    )
     with pytest.raises(ValidationError, match="interaction_id.*cannot be blank"):
         ModelCompletionRecoveryContext(interaction_id=" ")
     with pytest.raises(ValidationError, match="less than or equal to 256"):
@@ -1446,7 +1462,7 @@ def test_ambiguous_provider_operation_start_is_never_retried() -> None:
     )
     app = CayuApp(
         enable_logging=False,
-        retry_policy=_two_attempt_retry_policy(),
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -1482,7 +1498,10 @@ def test_started_provider_operation_stream_failure_is_never_retried(adapter_type
     provider = _ReconnectableProvider(background=True)
     adapter = adapter_type()
     provider.adapter = adapter
-    app = CayuApp(enable_logging=False, retry_policy=_two_attempt_retry_policy())
+    app = CayuApp(
+        enable_logging=False,
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -1514,7 +1533,10 @@ def test_started_provider_operation_overflow_does_not_dispatch_recovery_attempt(
     provider = _ReconnectableProvider(background=True)
     adapter = _OverflowingOperationStreamAdapter()
     provider.adapter = adapter
-    app = CayuApp(enable_logging=False, retry_policy=_two_attempt_retry_policy())
+    app = CayuApp(
+        enable_logging=False,
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
+    )
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -1542,7 +1564,10 @@ def test_cursor_bearing_overflow_error_is_committed_once_before_terminal_failure
         provider = _ReconnectableProvider(background=True)
         adapter = _CursorOverflowErrorAdapter()
         provider.adapter = adapter
-        app = CayuApp(enable_logging=False, retry_policy=_two_attempt_retry_policy())
+        app = CayuApp(
+            enable_logging=False,
+            config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
+        )
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
@@ -2150,7 +2175,7 @@ def test_started_identity_timeout_without_commit_cleans_up_and_never_retries() -
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        retry_policy=_two_attempt_retry_policy(),
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -2184,7 +2209,7 @@ def test_synchronous_cleanup_failure_never_retries_provider_start() -> None:
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        retry_policy=_two_attempt_retry_policy(),
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -2240,7 +2265,7 @@ def test_post_commit_delivery_failure_leaves_operation_recoverable_without_retry
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        retry_policy=_two_attempt_retry_policy(),
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -2274,7 +2299,7 @@ def test_unavailable_started_identity_readback_never_cancels_or_retries() -> Non
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        retry_policy=_two_attempt_retry_policy(),
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -2301,7 +2326,7 @@ def test_store_cancellation_during_started_identity_readback_fails_closed() -> N
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        retry_policy=_two_attempt_retry_policy(),
+        config=CayuConfig(run=RunDefaults(retry_policy=_two_attempt_retry_policy())),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))

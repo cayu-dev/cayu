@@ -31,7 +31,7 @@ from cayu import (
     StructuredOutputSpec,
     runtime_evidence,
 )
-from cayu.providers import ModelProvider, ModelStreamEvent
+from cayu.providers import ModelProvider, ModelStreamEvent, ProviderStreamDeadlines
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -341,10 +341,12 @@ def live_provider(provider_name: str | None = None) -> tuple[ModelProvider, str]
                 base_url=GEMINI_BASE_URL,
                 document_encoding="image_url",
                 timeout_s=60,
-                transport_idle_timeout_s=30,
-                protocol_idle_timeout_s=30,
-                semantic_progress_timeout_s=30,
-                absolute_stream_timeout_s=300,
+                stream_deadlines=ProviderStreamDeadlines(
+                    transport_idle_timeout_s=30,
+                    absolute_stream_timeout_s=300,
+                    semantic_progress_timeout_s=30,
+                    protocol_idle_timeout_s=30,
+                ),
             ),
             os.environ.get("CAYU_GEMINI_MODEL", "gemini-3.1-flash-lite"),
         )

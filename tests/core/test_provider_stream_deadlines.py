@@ -183,10 +183,12 @@ async def test_duplicate_metadata_empty_deltas_and_unknown_events_do_not_refresh
     provider = OpenAIProvider(
         api_key="test-key",
         transport=NoopMetadataTransport(),
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.03,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            semantic_progress_timeout_s=0.03,
+            protocol_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+        ),
     )
 
     with pytest.raises(ModelStreamDeadlineError) as captured:
@@ -356,10 +358,12 @@ async def test_openai_hosted_tool_search_output_refreshes_runtime_semantic_deadl
         api_key="test-key",
         transport=HostedToolSearchTransport(),
         hosted_tool_search_models=("gpt-test",),
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.2,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.2,
+            protocol_idle_timeout_s=1,
+        ),
     )
     request = ModelRequest(
         model="gpt-test",
@@ -1038,10 +1042,12 @@ async def test_repeated_chat_tool_identity_metadata_does_not_refresh_semantic_pr
     provider = ChatCompletionsProvider(
         api_key="test-key",
         transport=RepeatedToolIdentityTransport(),
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.03,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            semantic_progress_timeout_s=0.03,
+            protocol_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+        ),
     )
 
     with pytest.raises(ModelStreamDeadlineError) as captured:

@@ -91,6 +91,7 @@ from cayu.runtime.aggregates import (
     UsageSessionCostBreakdown,
 )
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
+from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     CostLineItem,
@@ -890,7 +891,7 @@ class EvalTargetCatalogEntry(ApiBaseModel):
     max_trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     max_concurrency: StrictInt = Field(ge=1, le=EVAL_MAX_CONCURRENCY)
     max_timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
-    max_steps: StrictInt = Field(ge=1, le=256)
+    max_steps: StrictInt = Field(ge=1, le=MAX_STEPS)
     cost_budget_available: StrictBool
     cost_budget_currencies: tuple[StrictStr, ...] = Field(max_length=32)
     judge_profiles: tuple[JudgeProfileIdentityV1, ...] = Field(default=(), max_length=32)
@@ -1053,7 +1054,7 @@ class EvalRunCreateRequest(ApiBaseModel):
     suite_id: PromotionPortableId
     expected_execution_profile_revision: EvalRevision
     max_concurrency: StrictInt = Field(default=1, ge=1, le=EVAL_MAX_CONCURRENCY)
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
 
@@ -1333,7 +1334,7 @@ class CapturedEvaluationLaunchRequest(CapturedEvaluationSaveRequest):
     trial_request: TrialRequestSpec = Field(default_factory=TrialRequestSpec)
     expected_execution_profile_revision: EvalRevision
     max_concurrency: StrictInt = Field(default=1, ge=1, le=EVAL_MAX_CONCURRENCY)
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
 

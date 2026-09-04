@@ -584,7 +584,6 @@ def _app(provider: ModelProvider) -> CayuApp:
             fingerprint_key_id="tool-discovery-validation-fixture",
             fingerprint_key=SecretStr("fixture-tool-discovery-key-material-0001"),
         ),
-        retry_policy=None,
         enable_logging=False,
     )
     app.register_provider(provider, default=True)

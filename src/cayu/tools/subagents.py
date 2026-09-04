@@ -44,6 +44,7 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_receipt_matches_intent,
     require_durable_subagent_receipt_matches_seed,
 )
+from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.invocation import (
     SessionExecutionSource,
@@ -228,7 +229,7 @@ class SubagentSpec(BaseModel):
     description: str = ""
     context_mode: SubagentContextMode = SubagentContextMode.TASK_ONLY
     mode: SubagentExecutionMode = SubagentExecutionMode.FOREGROUND
-    max_steps: StrictInt = Field(default=16, ge=1, le=256)
+    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     result_max_chars: StrictInt = Field(
         default=DEFAULT_SUBAGENT_RESULT_MAX_CHARS,
         ge=1,
@@ -441,9 +442,14 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             environment_name=ctx.environment_name,
             messages=[Message.text("user", task)],
             metadata=child_metadata,
-            max_steps=spec.max_steps,
-            limits=spec.limits,
         )
+        run_default_overrides: dict[str, object] = {}
+        if "max_steps" in spec.model_fields_set:
+            run_default_overrides["max_steps"] = spec.max_steps
+        if "limits" in spec.model_fields_set:
+            run_default_overrides["limits"] = spec.limits
+        if run_default_overrides:
+            request = request.model_copy(update=run_default_overrides)
         request = run_request_with_runtime_generated_authority(
             request,
             "session_id",

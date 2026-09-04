@@ -19,6 +19,7 @@ from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
+    CayuConfig,
     Event,
     EventType,
     ExecutionProfileBehaviorIdentity,
@@ -35,6 +36,7 @@ from cayu import (
     RecentTurnsContextPolicy,
     ResumeRequest,
     RetryPolicy,
+    RunDefaults,
     RunRequest,
     SessionRunFenced,
     StaticToolExposurePolicy,
@@ -1473,7 +1475,13 @@ async def _assert_openai_native_routes_canonical_identity(
     policy = _RecordingPolicy()
     app = CayuApp(
         session_store=targeted_store,
-        retry_policy=(RetryPolicy(max_attempts=2, initial_delay_s=0.0) if retry_first else None),
+        config=CayuConfig(
+            run=RunDefaults(
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0)
+                if retry_first
+                else None
+            )
+        ),
         enable_logging=False,
     )
     app.register_provider(provider, default=True)
@@ -2900,7 +2908,9 @@ def test_provider_retry_reuses_one_prepared_targeted_grant_snapshot(targeted_sto
         provider = _RetryProvider()
         app = CayuApp(
             session_store=targeted_store,
-            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            config=CayuConfig(
+                run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+            ),
             enable_logging=False,
         )
         app.register_provider(provider, default=True)

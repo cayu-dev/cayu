@@ -79,6 +79,7 @@ from cayu.runtime import (
 from cayu.runtime._workflow_structured_output_handoff import (
     WorkflowStructuredOutputHandoff,
 )
+from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -2353,6 +2354,17 @@ def test_step_run_options_defensively_copy_mutable_fields():
     assert opts.limits.max_total_tokens == 100
     assert opts.budget_limits[0].currency == "USD"
     assert opts.budget_limits[0] is not limit
+
+
+def test_step_preserves_an_omitted_app_owned_step_budget():
+    app = RecordingApp()
+    ctx = TinyWorkflow(app).context("wf-default-options")
+
+    asyncio.run(step(ctx, agent="assistant", step_id="s1", prompt="go"))
+
+    request = app.run_requests[-1]
+    assert request.max_steps == DEFAULT_MAX_STEPS
+    assert "max_steps" not in request.model_fields_set
 
 
 def test_step_forwards_run_options_and_preserves_owned_lineage():

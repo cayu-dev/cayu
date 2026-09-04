@@ -17,6 +17,8 @@ from cayu import (
     CayuApp,
     ExecutionProfileBehaviorIdentity,
     RegisteredToolCapability,
+    RetryPolicy,
+    RunLimits,
     SearchTextTool,
     StaticToolExposurePolicy,
     ToolCapabilityCeiling,
@@ -640,6 +642,9 @@ def test_execution_profile_reuses_registration_time_capability_summaries(
     )
 
     execution_profile_admission.resolve_execution_profile_identity(
+        finalization=execution_profile_admission.model_finalization_material(
+            max_steps=64, limits=RunLimits(), retry_policy=RetryPolicy()
+        ),
         registered_agent=registered_agent,
         provider_name="fake",
         model="fake-model",
@@ -654,6 +659,9 @@ def test_execution_profile_reuses_registration_time_capability_summaries(
 def test_execution_profile_preserves_default_identity_and_binds_static_exposure() -> None:
     def profile(app: CayuApp):
         return execution_profile_admission.resolve_execution_profile_identity(
+            finalization=execution_profile_admission.model_finalization_material(
+                max_steps=64, limits=RunLimits(), retry_policy=RetryPolicy()
+            ),
             registered_agent=app._agents["assistant"],
             provider_name="fake",
             model="fake-model",

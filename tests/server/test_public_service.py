@@ -66,6 +66,7 @@ from cayu.project_control_plane import (
     ProjectControlPlaneAccess,
     _create_project_control_plane_context,
 )
+from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.sessions import run_request_with_task_invocation
 from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.server import (
@@ -2452,7 +2453,7 @@ def test_maintained_service_uses_the_same_generated_eval_target_registry(tmp_pat
                     "max_trials": 1,
                     "max_concurrency": 1,
                     "max_timeout_seconds": 3600,
-                    "max_steps": 16,
+                    "max_steps": DEFAULT_MAX_STEPS,
                     "cost_budget_available": False,
                     "cost_budget_currencies": [],
                     "judge_profiles": [],

@@ -276,6 +276,8 @@ from configuration.coding_storage import (
     GENERATED_STORE_PROFILE,
     build_coding_stores,
 )
+from configuration.runtime import build_runtime_options
+from configuration.settings import configured_coding_command_environment
 from environments.coding import workspace_candidate
 from environments.command_probe import (
     BoundedCommandOutputOverflowError,
@@ -328,21 +330,6 @@ _COMMAND_TIMEOUT_S = 10.0
 _COMMAND_OUTPUT_LIMIT_BYTES = 64 * 1024
 _GIT_AUTHORITY_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024
 _KNOWLEDGE_ENABLED = __CODING_KNOWLEDGE_ENABLED__
-_SAFE_LOCAL_ENV_KEYS = (
-    "PATH",
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TMPDIR",
-    "TZ",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "COMSPEC",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-)
 # These declarations authenticate editable application behavior across process
 # reconstruction. Advance the named identity whenever the associated behavior
 # changes; the generated README and AGENTS.md contain the complete mapping.
@@ -417,7 +404,7 @@ def _subagent_tool_identity(
 
 
 def _command_environment() -> dict[str, str]:
-    return {key: os.environ[key] for key in _SAFE_LOCAL_ENV_KEYS if key in os.environ}
+    return configured_coding_command_environment()
 
 
 def _git_command_environment(root: Path) -> dict[str, str]:
@@ -1299,6 +1286,7 @@ def build_coding_app(
     )
 
     app = CayuApp(
+        config=build_runtime_options().config,
         session_store=selected_session_store,
         task_store=selected_task_store,
         knowledge_store=selected_knowledge_store,
@@ -1606,20 +1594,58 @@ def require_coding_tool_policy(policy: ToolPolicy) -> ToolPolicy:
 '''
 
 
+_CODING_SETTINGS_APPEND = '''
+
+
+_CODING_COMMAND_ENVIRONMENT_KEYS = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TZ",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+)
+
+
+def configured_coding_workspace_root() -> str:
+    """Return the project-relative or absolute coding workspace selection."""
+
+    return os.environ.get("CAYU_WORKSPACE_ROOT", ".")
+
+
+def configured_coding_command_environment() -> dict[str, str]:
+    """Project the explicit host variables admitted to trusted local commands."""
+
+    return {
+        key: os.environ[key]
+        for key in _CODING_COMMAND_ENVIRONMENT_KEYS
+        if key in os.environ
+    }
+'''
+
+
 _CODING_ENVIRONMENT_PY = '''"""Trusted coding-workspace selection before environment registration."""
 
-import os
 from pathlib import Path
+
+from configuration.settings import configured_coding_workspace_root
 
 
 def workspace_candidate(
     project_root: Path,
-    override: str | os.PathLike[str] | None = None,
+    override: str | Path | None = None,
 ) -> Path:
     """Resolve the configured candidate; semantic Git checks remain in composition."""
 
     selected = (
-        override if override is not None else os.environ.get("CAYU_WORKSPACE_ROOT", ".")
+        override if override is not None else configured_coding_workspace_root()
     )
     candidate = Path(selected).expanduser()
     return candidate if candidate.is_absolute() else project_root / candidate
@@ -1663,8 +1689,9 @@ from cayu import (
     SQLiteSessionStore,
     SQLiteTaskStore,
     TaskStore,
-    public_authority_alias_codec_from_environment,
 )
+
+from configuration.settings import configured_public_authority_alias_codec
 
 GENERATED_KNOWLEDGE_STORE_TYPE = SQLiteKnowledgeStore
 GENERATED_STORE_PROFILE = "sqlite"
@@ -1696,7 +1723,7 @@ def build_coding_stores(
             if session_store is not None
             else SQLiteSessionStore(
                 database,
-                public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+                public_authority_alias_codec=configured_public_authority_alias_codec(),
             )
         ),
         task_store=(
@@ -1719,7 +1746,6 @@ def build_coding_stores(
 
 _POSTGRES_CODING_STORAGE_PY = '''"""Postgres stores active in the maintained coding preset."""
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1731,7 +1757,11 @@ from cayu import (
     PostgresTaskStore,
     SessionStore,
     TaskStore,
-    public_authority_alias_codec_from_environment,
+)
+
+from configuration.settings import (
+    configured_database_url,
+    configured_public_authority_alias_codec,
 )
 
 GENERATED_KNOWLEDGE_STORE_TYPE = PostgresKnowledgeStore
@@ -1759,14 +1789,14 @@ def build_coding_stores(
     """Construct lazy Postgres stores without connecting during import or inspect."""
 
     del state_root
-    conninfo = os.environ.get("CAYU_DATABASE_URL") or _INSPECTION_DSN
+    conninfo = configured_database_url() or _INSPECTION_DSN
     return CodingStores(
         session_store=(
             session_store
             if session_store is not None
             else PostgresSessionStore(
                 conninfo,
-                public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+                public_authority_alias_codec=configured_public_authority_alias_codec(),
             )
         ),
         task_store=(
@@ -3334,6 +3364,7 @@ def build_coding_composition(
     )
 
     app = CayuApp(
+        config=build_runtime_options().config,
         session_store=selected_session_store,
         task_store=selected_task_store,
         knowledge_store=selected_knowledge_store,
@@ -5611,46 +5642,21 @@ def test_coding_dependency_probe_has_a_bounded_detached_pipe_failure(
 
 
 def _coding_app_source(source: str, *, app_build: str = _APP_BUILD) -> str:
-    if "from agents.registration import register_agents\n" in source:
-        source = source.replace(
-            "from agents.registration import register_agents\n",
-            (
-                "from agents.agent import AGENT\n"
-                "from agents.registration import _agent_for_provider_override\n"
-                "from agents.reviewer import (\n"
-                "    REVIEWER,\n"
-                "    REVIEWER_EXECUTION_PROFILE_IDENTITY,\n"
-                ")\n"
-                "from operations.coding import build_coding_app\n"
-            ),
-            1,
-        )
-        source = source.replace("from configuration.storage import build_stores\n", "", 1)
-        source = source.replace("from configuration.runtime import build_runtime_options\n", "", 1)
-        start = source.index("def build_app(")
-        end_marker = "\n    return app\n"
-        end = source.index(end_marker, start) + len(end_marker)
-        return source[:start] + app_build + source[end:]
-    for unused_import in (
-        "    AlwaysRequireApprovalToolPolicy,\n",
-        "    SQLiteSessionStore,\n",
-        "    SQLiteTaskStore,\n",
-        "    public_authority_alias_codec_from_environment,\n",
-    ):
-        source = source.replace(unused_import, "", 1)
-    import_marker = "from agents.agent import AGENT\n"
     source = source.replace(
-        import_marker,
-        import_marker
-        + (
+        "from agents.registration import register_agents\n",
+        (
+            "from agents.agent import AGENT\n"
+            "from agents.registration import _agent_for_provider_override\n"
             "from agents.reviewer import (\n"
             "    REVIEWER,\n"
             "    REVIEWER_EXECUTION_PROFILE_IDENTITY,\n"
             ")\n"
-        )
-        + "from operations.coding import build_coding_app\n",
+            "from operations.coding import build_coding_app\n"
+        ),
         1,
     )
+    source = source.replace("from configuration.storage import build_stores\n", "", 1)
+    source = source.replace("from configuration.runtime import build_runtime_options\n", "", 1)
     start = source.index("def build_app(")
     end_marker = "\n    return app\n"
     end = source.index(end_marker, start) + len(end_marker)
@@ -5848,6 +5854,9 @@ def coding_project_files(
         return {
             ".gitignore": files[".gitignore"],
             "app.py": _coding_app_source(files["app.py"]),
+            "configuration/settings.py": (
+                files["configuration/settings.py"] + _CODING_SETTINGS_APPEND
+            ),
             "configuration/coding_storage.py": coding_storage,
             "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
             "environments/coding.py": _CODING_ENVIRONMENT_PY,
@@ -5886,6 +5895,7 @@ def coding_project_files(
         "docker-coding-image.json": coding_render(_DOCKER_IMAGE_CONFIG),
         "build_coding_image.py": coding_render(_DOCKER_BUILD_IMAGE_PY),
         "app.py": _docker_coding_app_source(files["app.py"]),
+        "configuration/settings.py": (files["configuration/settings.py"] + _CODING_SETTINGS_APPEND),
         "configuration/coding_storage.py": coding_storage,
         "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
         "environments/coding.py": _CODING_ENVIRONMENT_PY,

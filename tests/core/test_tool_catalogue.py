@@ -9,6 +9,8 @@ from cayu import (
     AgentSpec,
     CayuApp,
     ExecutionProfileBehaviorIdentity,
+    RetryPolicy,
+    RunLimits,
     Tool,
     ToolCatalogSnapshot,
     ToolDescriptor,
@@ -77,6 +79,9 @@ class _DeclaredTool(Tool):
 
 def _profile(app: CayuApp):
     return execution_profile_admission.resolve_execution_profile_identity(
+        finalization=execution_profile_admission.model_finalization_material(
+            max_steps=64, limits=RunLimits(), retry_policy=RetryPolicy()
+        ),
         registered_agent=app._agents["assistant"],
         provider_name="fake",
         model="fake-model",

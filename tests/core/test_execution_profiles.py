@@ -110,6 +110,7 @@ from cayu import (
     ResolutionActorSource,
     ResumeRequest,
     RetryPolicy,
+    RunDefaults,
     RunLimits,
     Runner,
     RunRequest,
@@ -131,6 +132,7 @@ from cayu import (
     Tool,
     ToolCallHookContext,
     ToolContext,
+    ToolExecutionConfig,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -177,6 +179,7 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
+from cayu.runtime.config import CayuConfig
 from cayu.runtime.egress_authority_transitions import (
     EGRESS_AUTHORITY_TRANSITION_CHECKPOINT_KEY,
     _build_transition_record,
@@ -228,11 +231,13 @@ def test_builtin_provider_deadlines_are_exact_execution_profile_material() -> No
     material = execution_profile_admission._cayu_provider_material(
         OpenAIProvider(
             api_key="test-key",
-            transport_idle_timeout_s=11,
-            protocol_idle_timeout_s=12,
-            semantic_progress_timeout_s=13,
-            absolute_stream_timeout_s=14,
-            max_concurrent_streams=128,
+            stream_deadlines=ProviderStreamDeadlines(
+                max_concurrent_streams=128,
+                semantic_progress_timeout_s=13,
+                protocol_idle_timeout_s=12,
+                transport_idle_timeout_s=11,
+                absolute_stream_timeout_s=14,
+            ),
         )
     )
 
@@ -1649,6 +1654,7 @@ def test_application_versioned_provider_still_binds_exact_stream_deadlines() -> 
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="deadline-model"))
         return session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name=provider.name,
             registered_provider=app._providers[provider.name],
@@ -1687,6 +1693,9 @@ def test_profile_strengths_report_identity_provenance() -> None:
         request_loop_policies: tuple[LoopPolicy, ...] = (),
     ) -> ExecutionProfileIdentity:
         return execution_profile_admission.resolve_execution_profile_identity(
+            finalization=execution_profile_admission.model_finalization_material(
+                max_steps=64, limits=RunLimits(), retry_policy=RetryPolicy()
+            ),
             registered_agent=app._agents["assistant"],
             provider_name="fake",
             model="fake-model",
@@ -1939,6 +1948,7 @@ def test_nested_compactor_identity_is_copied_at_agent_registration() -> None:
     )
 
     first_profile = session_engine_module._execution_profile_identity(
+        max_steps=64,
         registered_agent=first_app._agents["assistant"],
         provider_name="fake",
         registered_provider=first_app._providers["fake"],
@@ -1949,6 +1959,7 @@ def test_nested_compactor_identity_is_copied_at_agent_registration() -> None:
     )
     compactor.behavior_version = "2"
     repeated_profile = session_engine_module._execution_profile_identity(
+        max_steps=64,
         registered_agent=first_app._agents["assistant"],
         provider_name="fake",
         registered_provider=first_app._providers["fake"],
@@ -1965,6 +1976,7 @@ def test_nested_compactor_identity_is_copied_at_agent_registration() -> None:
         context_policy=policy,
     )
     replacement_profile = session_engine_module._execution_profile_identity(
+        max_steps=64,
         registered_agent=second_app._agents["assistant"],
         provider_name="fake",
         registered_provider=second_app._providers["fake"],
@@ -1999,6 +2011,7 @@ def test_nested_model_compactor_provider_identity_is_copied_at_agent_registratio
             context_policy=policy,
         )
         return session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
             registered_provider=app._providers["fake"],
@@ -2012,6 +2025,7 @@ def test_nested_model_compactor_provider_identity_is_copied_at_agent_registratio
     first_profile = registered_profile(first_app)
     provider._behavior_version = "2"
     repeated_profile = session_engine_module._execution_profile_identity(
+        max_steps=64,
         registered_agent=first_app._agents["assistant"],
         provider_name="fake",
         registered_provider=first_app._providers["fake"],
@@ -2095,6 +2109,7 @@ def test_model_compactor_binds_its_snapshotted_provider_identity() -> None:
 
 def _registered_context_profile(app: CayuApp) -> ExecutionProfileIdentity:
     return session_engine_module._execution_profile_identity(
+        max_steps=64,
         registered_agent=app._agents["assistant"],
         provider_name="fake",
         registered_provider=app._providers["fake"],
@@ -2121,6 +2136,7 @@ def test_private_automatic_recall_configuration_is_secret_safe_and_distinct() ->
             context_policy=_automatic_recall_context(namespace=namespace),
         )
         return session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
             registered_provider=app._providers["fake"],
@@ -2372,6 +2388,7 @@ def test_opaque_provider_options_are_secret_safe_and_content_bound_within_proces
 
     profiles = [
         session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents[agent_name],
             provider_name="fake",
             registered_provider=app._providers["fake"],
@@ -2422,6 +2439,7 @@ def test_runtime_owned_private_option_commitments_survive_secret_collision() -> 
 
     components = [
         session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents[name],
             provider_name="fake",
             registered_provider=app._providers["fake"],
@@ -2470,6 +2488,7 @@ def test_provider_request_profile_uses_only_selected_adapter_effective_options()
 
     components = {
         name: session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents[name],
             provider_name="openai",
             registered_provider=app._providers["openai"],
@@ -2604,6 +2623,7 @@ def test_anthropic_cache_override_changes_effective_provider_request_profile() -
 
     components = [
         session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents[name],
             provider_name="anthropic",
             registered_provider=app._providers["anthropic"],
@@ -2642,6 +2662,7 @@ def test_custom_provider_cache_options_are_private_process_local_material() -> N
 
     components = [
         session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents[name],
             provider_name="unversioned",
             registered_provider=app._providers["unversioned"],
@@ -2763,6 +2784,7 @@ def test_runtime_owned_private_context_commitments_survive_secret_collision() ->
 
     components = [
         session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents[name],
             provider_name="fake",
             registered_provider=app._providers["fake"],
@@ -4022,6 +4044,7 @@ def test_redactor_known_builtin_material_is_process_local(
     for _ in range(2):
         app = configured_app()
         profile = session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
             model="fake-model",
@@ -4055,6 +4078,7 @@ def test_remember_knowledge_application_policy_is_process_local_and_secret_safe(
             ],
         )
         profile = session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
             model="fake-model",
@@ -4080,6 +4104,7 @@ def test_remember_knowledge_default_policy_retains_structural_identity() -> None
     )
 
     profile = session_engine_module._execution_profile_identity(
+        max_steps=64,
         registered_agent=app._agents["assistant"],
         provider_name="fake",
         model="fake-model",
@@ -4117,6 +4142,7 @@ def test_declared_remember_knowledge_policy_identity_is_portable() -> None:
             ],
         )
         profile = session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=app._agents["assistant"],
             provider_name="fake",
             model="fake-model",
@@ -4149,7 +4175,9 @@ def test_ordinary_tool_timeout_drift_changes_direct_tool_recovery_authority() ->
             provider = _completed_provider()
             app = CayuApp(
                 session_store=store,
-                tool_timeout_seconds=timeout_seconds,
+                config=CayuConfig(
+                    tool_execution=ToolExecutionConfig(tool_timeout_seconds=timeout_seconds)
+                ),
                 enable_logging=False,
             )
             app.register_provider(provider, default=True)
@@ -6002,6 +6030,82 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
         finally:
             if isinstance(store, SQLiteSessionStore):
                 await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_current_child_fork_uses_configured_finalization_for_omitted_resume() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(_completed_provider(), default=True)
+        source_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="configured-finalization-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+        source = await store.load("configured-finalization-source")
+        assert source is not None
+        source_profile = execution_profile_from_session_metadata(source.metadata)
+
+        policy = RecordingExecutionProfilePolicy(
+            ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="Adopt the configured child finalization.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+        )
+        child_provider = _completed_provider()
+        child_app = CayuApp(
+            config=CayuConfig(run=RunDefaults(max_steps=128)),
+            session_store=store,
+            execution_profile_policy=policy,
+            enable_logging=False,
+        )
+        child_app.register_provider(child_provider, default=True)
+        child_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            child_app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="configured-finalization-child",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="configured-finalization-child",
+                        reason="Use the long-horizon child finalization.",
+                        requested_by=ResolutionActor(
+                            subject="maintainer",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        child = await store.load("configured-finalization-child")
+        assert child is not None
+        child_profile = execution_profile_from_session_metadata(child.metadata)
+        assert child_profile.component(ExecutionProfileComponentClass.FINALIZATION) != (
+            source_profile.component(ExecutionProfileComponentClass.FINALIZATION)
+        )
+        assert len(policy.requests) == 1
+
+        events = await _collect(
+            child_app.resume(
+                ResumeRequest(
+                    session_id=child.id,
+                    messages=[Message.text("user", "continue with inherited defaults")],
+                )
+            )
+        )
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(policy.requests) == 1
+        assert len(child_provider.requests) == 1
 
     asyncio.run(exercise())
 
@@ -8927,6 +9031,7 @@ def test_runtime_generated_model_profile_survives_exact_workload_secret_collisio
         baseline_app.register_provider(_completed_provider(), default=True)
         baseline_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         baseline_profile = session_engine_module._execution_profile_identity(
+            max_steps=64,
             registered_agent=baseline_app._agents["assistant"],
             provider_name="fake",
             registered_provider=baseline_app._providers["fake"],

@@ -55,6 +55,7 @@ from cayu.runtime._child_session_identity import (
 )
 from cayu.runtime._session_request_boundary import prepare_run_request
 from cayu.runtime.budgets import copy_request_budget_limits
+from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.runtime.invocation import SessionExecutionSource
 from cayu.runtime.retry_policy import copy_retry_policy
 from cayu.runtime.sessions import (
@@ -134,7 +135,7 @@ class StepRunOptions(BaseModel):
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    max_steps: StrictInt = Field(default=16, ge=1, le=256)
+    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -775,22 +776,28 @@ async def _run_step(
         agent_name=agent,
         session_id=child_session_id,
         messages=run_messages,
-        max_steps=opts.max_steps,
         structured_output=spec,
         target=opts.target,
         environment_name=opts.environment_name,
         labels=opts.labels,
         metadata=opts.metadata,
-        limits=opts.limits,
         budget_limits=opts.budget_limits,
         retry_policy=opts.retry_policy,
-        thinking=opts.thinking,
         task_id=opts.task_id,
         task_worker_id=opts.task_worker_id,
         task_lease_expires_at=opts.task_lease_expires_at,
         parent_session_id=parent_session_id,
         causal_budget_id=causal_budget_id,
     )
+    run_default_overrides: dict[str, object] = {}
+    if "max_steps" in opts.model_fields_set:
+        run_default_overrides["max_steps"] = opts.max_steps
+    if "limits" in opts.model_fields_set:
+        run_default_overrides["limits"] = opts.limits
+    if "thinking" in opts.model_fields_set:
+        run_default_overrides["thinking"] = opts.thinking
+    if run_default_overrides:
+        request = request.model_copy(update=run_default_overrides)
     request_authority: list[str] = []
     if child_session_has_runtime_authority:
         request_authority.append("session_id")

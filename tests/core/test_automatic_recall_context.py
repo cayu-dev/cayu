@@ -13,6 +13,7 @@ from cayu import (
     BeforeStopContext,
     BeforeStopDecision,
     CayuApp,
+    CayuConfig,
     Environment,
     EnvironmentSpec,
     EventType,
@@ -22,6 +23,7 @@ from cayu import (
     LoopPolicy,
     ModelStreamEvent,
     ResumeRequest,
+    RunDefaults,
     ScriptedModelProvider,
     StructuredOutputSpec,
 )
@@ -1755,7 +1757,9 @@ def test_runtime_records_distinct_exposures_for_automatic_recall_retry() -> None
         )
         app = CayuApp(
             session_store=sessions,
-            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            config=CayuConfig(
+                run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+            ),
             request_footprint=RequestFootprintConfig(
                 fingerprint_key_id="test-memory-key",
                 fingerprint_key="automatic-recall-test-key-material",
@@ -1872,7 +1876,9 @@ def test_runtime_records_stream_deadline_exposure_as_indeterminate() -> None:
         )
         app = CayuApp(
             session_store=sessions,
-            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            config=CayuConfig(
+                run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+            ),
             request_footprint=RequestFootprintConfig(
                 fingerprint_key_id="test-memory-key",
                 fingerprint_key="automatic-recall-test-key-material",
@@ -1977,7 +1983,9 @@ def test_runtime_preserves_stream_deadline_when_exposure_terminalization_fails()
         session_id = "automatic-recall-deadline-terminalization-failure"
         app = CayuApp(
             session_store=sessions,
-            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            config=CayuConfig(
+                run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+            ),
             request_footprint=RequestFootprintConfig(
                 fingerprint_key_id="test-memory-key",
                 fingerprint_key="automatic-recall-test-key-material",

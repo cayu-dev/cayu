@@ -43,6 +43,14 @@ def test_trial_policy_is_content_addressed_and_bounded() -> None:
         EvalSuiteTrialPolicyV1.model_validate(forged)
 
 
+def test_trial_policy_supports_one_hundred_way_execution() -> None:
+    policy = EvalSuiteTrialPolicyV1.create(max_concurrency=100)
+
+    assert policy.max_concurrency == 100
+    with pytest.raises(ValidationError, match="less than or equal to 100"):
+        EvalSuiteTrialPolicyV1.create(max_concurrency=101)
+
+
 def test_maximum_cost_and_work_exposure_require_canonical_pricing_identity() -> None:
     total = EvalMaximumCostTotalV1.from_decimal(
         currency="USD",

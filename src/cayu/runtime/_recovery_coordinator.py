@@ -437,7 +437,6 @@ _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
-_DEFAULT_APPROVAL_MAX_STEPS = 16
 _ABANDONED_RUN_REASON = "event_stream_closed"
 _ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY = "abandoned_unreplayable_tool_round"
 _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
@@ -1704,7 +1703,7 @@ class ExecutionProfileContinuationValidator(Protocol):
         request_budget_limits: tuple[BudgetLimit, ...] = (),
         structured_output: StructuredOutputSpec | None = None,
         thinking: ThinkingConfig | None = None,
-        max_steps: int = 16,
+        max_steps: int | None = None,
         limits: RunLimits | None = None,
         retry_policy: RetryPolicy | None = None,
         invocation_semantics_available: bool = False,
@@ -6323,11 +6322,7 @@ class RecoveryCoordinator:
                 None if recovery_context is None else recovery_context.structured_output
             ),
             thinking=None if recovery_context is None else recovery_context.thinking,
-            max_steps=(
-                _DEFAULT_APPROVAL_MAX_STEPS
-                if recovery_context is None
-                else recovery_context.max_steps
-            ),
+            max_steps=None if recovery_context is None else recovery_context.max_steps,
             limits=None if recovery_context is None else recovery_context.limits,
             retry_policy=(None if recovery_context is None else recovery_context.retry_policy),
             invocation_semantics_available=recovery_context is not None,
@@ -21188,11 +21183,12 @@ def _effective_tool_round_invocation_semantics(
         raise TypeError("Tool-round recovery requires a ToolRoundRecoveryRequest.")
     if type(pending_round) is not tool_round_recovery.PendingToolRound:
         raise TypeError("Pending tool round must be a PendingToolRound.")
+    _require_recovery_max_steps(pending_round.max_steps)
     return _RecoveryInvocationSemantics(
         max_steps=(
             request.max_steps
             if request.max_steps is not None
-            else pending_round.max_steps or _DEFAULT_APPROVAL_MAX_STEPS
+            else _require_recovery_max_steps(pending_round.max_steps)
         ),
         limits=copy_run_limits(
             request.limits if request.limits is not None else pending_round.limits or RunLimits()
@@ -21215,16 +21211,11 @@ def _effective_user_input_max_steps(
     max_steps: int | None,
     pending: PendingUserInput,
 ) -> int:
-    # Restore the original run's max_steps on a user-input continuation. Pending
-    # states written before run config was checkpointed fall back to the historical
-    # request default; profile admission decides whether an explicit value is valid.
+    # Restore recorded invocation settings; profile admission validates overrides.
     if type(pending) is not PendingUserInput:
         raise TypeError("Pending user input must be a PendingUserInput.")
-    if max_steps is not None:
-        return max_steps
-    if pending.max_steps is not None:
-        return pending.max_steps
-    return _DEFAULT_APPROVAL_MAX_STEPS
+    recorded = _require_recovery_max_steps(pending.max_steps)
+    return recorded if max_steps is None else max_steps
 
 
 def _effective_user_input_run_limits(
@@ -21332,16 +21323,11 @@ def _effective_approval_max_steps(
     max_steps: int | None,
     pending_approval: PendingToolApproval,
 ) -> int:
-    # Restore the original run's max_steps on an approval continuation. Approvals
-    # persisted before run config was checkpointed fall back to the historical
-    # request default; profile admission validates explicit values.
+    # Restore recorded invocation settings; profile admission validates overrides.
     if type(pending_approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
-    if max_steps is not None:
-        return max_steps
-    if pending_approval.max_steps is not None:
-        return pending_approval.max_steps
-    return _DEFAULT_APPROVAL_MAX_STEPS
+    recorded = _require_recovery_max_steps(pending_approval.max_steps)
+    return recorded if max_steps is None else max_steps
 
 
 def _effective_approval_run_limits(
@@ -21459,3 +21445,9 @@ def _environment_name(
 
 def _has_run_budget_limit(limits: tuple[BudgetLimit, ...]) -> bool:
     return any(limit.scope == "run" for limit in limits)
+
+
+def _require_recovery_max_steps(value: int | None) -> int:
+    if value is None:
+        raise ValueError("Recovery requires recorded invocation max_steps.")
+    return value

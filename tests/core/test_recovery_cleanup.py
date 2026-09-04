@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from cayu import CayuApp
+from cayu import CayuApp, CayuConfig, OperationsConfig
 from cayu.core.messages import Message
 from cayu.runtime._recovery_coordinator import _run_recovery_cleanup_steps
 from cayu.runtime.recovery_cleanup import (
@@ -985,7 +985,10 @@ def test_cayu_app_uses_one_configured_recovery_cleanup_supervisor() -> None:
         overall_timeout_seconds=4.0,
         max_supervised_tasks=7,
     )
-    app = CayuApp(recovery_cleanup_policy=policy, enable_logging=False)
+    app = CayuApp(
+        config=CayuConfig(operations=OperationsConfig(recovery_cleanup_policy=policy)),
+        enable_logging=False,
+    )
 
     assert app._recovery_cleanup_policy == policy
     assert (
@@ -1042,7 +1045,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
         )
         original_app = CayuApp(
             session_store=store,
-            recovery_cleanup_policy=policy,
+            config=CayuConfig(operations=OperationsConfig(recovery_cleanup_policy=policy)),
             clock=clock,
             enable_logging=False,
         )
@@ -1067,7 +1070,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
         assert current is not None
         replacement_app = CayuApp(
             session_store=store,
-            recovery_cleanup_policy=policy,
+            config=CayuConfig(operations=OperationsConfig(recovery_cleanup_policy=policy)),
             clock=clock,
             enable_logging=False,
         )

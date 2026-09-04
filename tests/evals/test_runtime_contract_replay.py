@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
+from cayu import CayuConfig, ToolExecutionConfig
 from cayu.core.agents import AgentSpec
 from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.core.events import EventType
@@ -206,7 +207,7 @@ async def _captured_multi_tool_round(
             fingerprint_key_id="test-key",
             fingerprint_key=SecretStr("x" * 32),
         ),
-        max_parallel_tool_calls=4,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=4)),
         enable_logging=False,
     )
     app.register_provider(provider, default=True)

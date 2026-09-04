@@ -103,6 +103,7 @@ from cayu.evals.suite_authoring import (
     validate_expected_eval_suite_revision,
 )
 from cayu.evals.trial_policy import EVAL_SUITE_MAX_CONCURRENCY, EvalSuiteRunExposureV1
+from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
@@ -1692,7 +1693,7 @@ class EvalRunInvocation(_EvalStoreModel):
     schema_version: Literal[1] = 1
     source: SessionExecutionSource = SessionExecutionSource.SDK_RUN
     origin: InvocationOrigin | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
     execution_profile: EvalExecutionProfileBindingV1 | None = Field(

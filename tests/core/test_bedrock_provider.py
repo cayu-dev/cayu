@@ -1126,10 +1126,12 @@ async def test_bedrock_real_cancellation_during_deadline_worker_settlement_wins(
     stream = SettlementBlockingBedrockStream()
     provider = BedrockProvider(
         client=BlockingBedrockClient(stream),
-        transport_idle_timeout_s=0.01,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=1,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.01,
+            semantic_progress_timeout_s=1,
+            protocol_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+        ),
         stream_close_timeout_s=1,
     )
     request = ModelRequest(
@@ -1215,10 +1217,12 @@ async def test_bedrock_provider_excludes_consumer_pause_from_idle_deadlines() ->
                 {"messageStop": {"stopReason": "end_turn"}},
             ]
         ),
-        transport_idle_timeout_s=0.1,
-        protocol_idle_timeout_s=0.1,
-        semantic_progress_timeout_s=1,
-        absolute_stream_timeout_s=2,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.1,
+            semantic_progress_timeout_s=1,
+            protocol_idle_timeout_s=0.1,
+            absolute_stream_timeout_s=2,
+        ),
     )
     request = ModelRequest(
         model="anthropic.claude-test",
@@ -1307,10 +1311,12 @@ async def test_bedrock_provider_reports_idle_stream_timeout_and_closes_stream() 
     stream = BlockingBedrockStream()
     provider = BedrockProvider(
         client=BlockingBedrockClient(stream),
-        transport_idle_timeout_s=0.01,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=1,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.01,
+            semantic_progress_timeout_s=1,
+            protocol_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+        ),
         stream_close_timeout_s=1,
     )
     request = ModelRequest(model="anthropic.claude-test", messages=[Message.text("user", "Hello")])
@@ -1367,11 +1373,13 @@ async def test_bedrock_nonsettling_workers_hold_deadline_capacity_until_settleme
     first_client = NonsettlingBedrockClient(stream)
     first = BedrockProvider(
         client=first_client,
-        transport_idle_timeout_s=0.01,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=1,
-        absolute_stream_timeout_s=1,
-        max_concurrent_streams=capacity,
+        stream_deadlines=ProviderStreamDeadlines(
+            max_concurrent_streams=capacity,
+            semantic_progress_timeout_s=1,
+            protocol_idle_timeout_s=1,
+            transport_idle_timeout_s=0.01,
+            absolute_stream_timeout_s=1,
+        ),
         stream_close_timeout_s=0.01,
     )
     request = ModelRequest(
@@ -1394,7 +1402,7 @@ async def test_bedrock_nonsettling_workers_hold_deadline_capacity_until_settleme
         rejected_client = FakeBedrockClient([{"messageStop": {"stopReason": "end_turn"}}])
         rejected = BedrockProvider(
             client=rejected_client,
-            max_concurrent_streams=capacity,
+            stream_deadlines=ProviderStreamDeadlines(max_concurrent_streams=capacity),
         )
         with pytest.raises(RuntimeError, match="deadline-read capacity is exhausted"):
             await anext(rejected.runtime_stream(request))
@@ -1416,7 +1424,7 @@ async def test_bedrock_nonsettling_workers_hold_deadline_capacity_until_settleme
         admitted_client = FakeBedrockClient([{"messageStop": {"stopReason": "end_turn"}}])
         admitted = BedrockProvider(
             client=admitted_client,
-            max_concurrent_streams=capacity,
+            stream_deadlines=ProviderStreamDeadlines(max_concurrent_streams=capacity),
         )
         admitted_events = [event async for event in admitted.runtime_stream(request)]
         assert [event.type for event in admitted_events] == [ModelStreamEventType.COMPLETED]
@@ -1439,10 +1447,12 @@ async def test_bedrock_deadline_preserves_bounded_close_failure_diagnostic() -> 
     stream = FailingCloseBedrockStream()
     provider = BedrockProvider(
         client=BlockingBedrockClient(stream),
-        transport_idle_timeout_s=0.01,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=1,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.01,
+            semantic_progress_timeout_s=1,
+            protocol_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+        ),
         stream_close_timeout_s=1,
     )
     request = ModelRequest(
@@ -1686,10 +1696,12 @@ async def test_bedrock_runtime_persists_completion_before_stalled_metadata_tail_
     stream = TerminalMetadataBlockingStream()
     provider = BedrockProvider(
         client=BlockingBedrockClient(stream),
-        transport_idle_timeout_s=0.02,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=1,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.02,
+            semantic_progress_timeout_s=1,
+            protocol_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+        ),
         stream_close_timeout_s=1,
     )
     app = CayuApp(enable_logging=False)
@@ -1740,10 +1752,12 @@ async def test_bedrock_runtime_persists_message_stop_before_stalled_optional_tai
     stream = TerminalBlockingStream()
     provider = BedrockProvider(
         client=BlockingBedrockClient(stream),
-        transport_idle_timeout_s=0.02,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=1,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.02,
+            semantic_progress_timeout_s=1,
+            protocol_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+        ),
         stream_close_timeout_s=1,
     )
     app = CayuApp(enable_logging=False)

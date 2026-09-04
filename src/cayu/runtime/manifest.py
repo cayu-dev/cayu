@@ -28,6 +28,7 @@ from cayu._validation import (
 from cayu.core.agents import AgentAuthoringState
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.environments import ExecutionRequirements
+from cayu.runtime.config import CayuConfigSource
 from cayu.runtime.request_footprints import (
     REQUEST_FOOTPRINT_CANONICALIZATION_VERSION,
     REQUEST_FOOTPRINT_SCHEMA_VERSION,
@@ -371,7 +372,21 @@ class RecoveryCleanupPolicyManifest(_ManifestModel):
     max_supervised_tasks: int
 
 
+class ConfigurationFieldProvenanceManifest(_ManifestModel):
+    path: str
+    owner: str
+    source: CayuConfigSource
+
+
+class RuntimeConfigurationManifest(_ManifestModel):
+    """Redacted values and ownership for supported application tunables."""
+
+    values: FrozenJsonObject
+    provenance: tuple[ConfigurationFieldProvenanceManifest, ...]
+
+
 class RuntimeManifest(_ManifestModel):
+    configuration: RuntimeConfigurationManifest
     dispatcher: str
     retry_policy: str | None
     budget_policy: str | None
@@ -471,6 +486,20 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         environment=app._default_environment_name,
     )
     runtime = RuntimeManifest(
+        configuration=RuntimeConfigurationManifest(
+            values=app._config.model_dump(
+                mode="json",
+                warnings=False,
+            ),
+            provenance=tuple(
+                ConfigurationFieldProvenanceManifest(
+                    path=path,
+                    owner=app._config_owners[path],
+                    source=source,
+                )
+                for path, source in sorted(app._config_sources.items())
+            ),
+        ),
         dispatcher=_type_name(app.dispatcher),
         retry_policy=_optional_type_name(app._default_retry_policy),
         budget_policy=_optional_type_name(app.budget_policy),

@@ -19,7 +19,6 @@ from cayu.runtime import _recovery_coordinator as recovery_coordinator
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import sessions as sessions_module
 from cayu.runtime._recovery_coordinator import (
-    _DEFAULT_APPROVAL_MAX_STEPS,
     _effective_approval_budget_limits,
     _effective_approval_max_steps,
     _effective_approval_retry_policy,
@@ -103,7 +102,7 @@ def test_abandoned_opaque_tool_round_history_is_idempotent_and_lossless() -> Non
     assert abandoned["prior_tool_rounds"] == [first]
 
 
-def test_effective_approval_run_config_prefers_override_then_pending_then_default() -> None:
+def test_effective_approval_run_config_prefers_override_then_recorded_settings() -> None:
     persisted = _pending_approval(
         max_steps=9,
         limits=RunLimits(max_tool_calls=2, scope="session"),
@@ -147,19 +146,9 @@ def test_effective_approval_run_config_prefers_override_then_pending_then_defaul
         pending_approval=persisted,
     ) == RetryPolicy(max_attempts=4)
 
-    assert (
-        _effective_approval_max_steps(max_steps=None, pending_approval=legacy)
-        == _DEFAULT_APPROVAL_MAX_STEPS
-    )
-    assert _effective_approval_run_limits(limits=None, pending_approval=legacy) == RunLimits()
-    assert _effective_approval_budget_limits(budget_limits=None, pending_approval=legacy) == ()
-    assert (
-        _effective_approval_retry_policy(
-            retry_policy=None,
-            pending_approval=legacy,
-        )
-        is None
-    )
+    for override in (None, 16, 64):
+        with pytest.raises(ValueError, match="requires recorded invocation max_steps"):
+            _effective_approval_max_steps(max_steps=override, pending_approval=legacy)
 
 
 def test_effective_approval_thinking_restores_pending_run_config() -> None:

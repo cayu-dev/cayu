@@ -135,6 +135,7 @@ def _profiled_identity_for_app(
     registered_agent = app._agents["assistant"]
     registered_provider = app._providers["fake"]
     profile = session_engine_module._execution_profile_identity(
+        max_steps=64,
         registered_agent=registered_agent,
         provider_name=registered_provider.name,
         registered_provider=registered_provider,

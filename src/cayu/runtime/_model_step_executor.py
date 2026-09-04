@@ -239,6 +239,7 @@ from cayu.runtime.budgets import (
     copy_request_budget_limits,
     has_deferred_contextual_price,
 )
+from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.context import (
     _COMPACTION_ATTEMPT_ID_KEY,
     CompactionRequest,
@@ -534,6 +535,9 @@ class HostedToolDiscoveryRecoveryAuthority(BaseModel):
         return cast("tuple[str, ...]", copied)
 
 
+_MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS = 16
+
+
 class ModelCompletionRecoveryContext(BaseModel):
     """Secret-free run semantics required to publish an offline completion."""
 
@@ -553,7 +557,13 @@ class ModelCompletionRecoveryContext(BaseModel):
     request_metadata: dict[str, Any] = Field(default_factory=dict)
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
-    max_steps: StrictInt = Field(default=16, ge=1, le=256)
+    # A missing field can be a persisted schema-v1 payload, so changing this
+    # default would rewrite historical run semantics during recovery.
+    max_steps: StrictInt = Field(
+        default=_MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
+        ge=1,
+        le=MAX_STEPS,
+    )
     limits: RunLimits = Field(default_factory=RunLimits)
     run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] = ()

@@ -25,6 +25,7 @@ import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime._tool_round_recovery as tool_round_recovery_module
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._runner as runner_module
+from cayu import CayuConfig, ToolExecutionConfig
 from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu._exception_state import set_exception_state
 from cayu._validation import canonical_durable_json_bytes
@@ -4117,7 +4118,7 @@ def test_timed_out_runner_mutation_returns_promptly_and_fences_reuse(
         app = CayuApp(
             session_store=store,
             enable_logging=False,
-            tool_timeout_seconds=0.01,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.01)),
         )
         app.register_provider(provider, default=True)
         app.register_environment(
@@ -9333,7 +9334,7 @@ def test_workspace_receipt_waits_for_cancellation_opaque_mutation_after_timeout(
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        tool_timeout_seconds=0.05,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.05)),
     )
     app.register_provider(
         _SingleToolProvider(tool_name="blocking_workspace_mutation", arguments={}),

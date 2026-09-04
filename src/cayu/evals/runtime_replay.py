@@ -1450,20 +1450,14 @@ def _isolated_app(
 ) -> CayuApp:
     store = InMemorySessionStore(public_authority_alias_codec=app._public_authority_alias_codec)
     isolated = CayuApp(
+        config=app.config,
         session_store=store,
         budget_policy=app.budget_policy,
-        retry_policy=app._default_retry_policy,
         loop_policies=(),
         context_counting=app._context_counting,
         request_footprint=app._request_footprint,
         enable_logging=False,
         secret_redactor=app._secret_redactor,
-        max_file_attachment_bytes=app._max_file_attachment_bytes,
-        max_total_file_attachment_bytes=app._max_total_file_attachment_bytes,
-        max_file_attachments_per_request=app._max_file_attachments_per_request,
-        tool_timeout_seconds=app._tool_timeout_seconds,
-        max_parallel_tool_calls=app._max_parallel_tool_calls,
-        max_environment_lifecycle_owners=app._max_environment_lifecycle_owners,
         clock=_runtime_replay_clock(clock_instant),
     )
     isolated._execution_profile_process_identity = app._execution_profile_process_identity
@@ -1561,13 +1555,16 @@ async def _candidate_profile(
         tool_tracker=None,
         clock_instant=evidence.replay_instant,
     )
-    prepared = await isolated._session_engine._prepare_initial_run(
+    request = isolated._with_application_run_defaults(
         _run_request(
             evidence,
             agent_name=agent_name,
             session_id=f"replay-profile-{uuid4()}",
             tool_capability_ceiling=tool_capability_ceiling,
-        ),
+        )
+    )
+    prepared = await isolated._session_engine._prepare_initial_run(
+        request,
         admit_session=False,
         store_resolved_existing_session_id=None,
     )

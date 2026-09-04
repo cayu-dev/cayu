@@ -18,7 +18,16 @@ from tests.core._execution_profile_fixtures import (
 )
 
 import cayu.runtime._session_engine as session_engine_module
-from cayu import ScriptedModelProvider, Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu import (
+    CayuConfig,
+    ScriptedModelProvider,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolExecutionConfig,
+    ToolResult,
+    ToolSpec,
+)
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.artifacts import FileAttachmentKind, file_attachment
 from cayu.core import (
@@ -3161,7 +3170,10 @@ def test_size_based_compaction_continues_after_a_wide_oversized_tool_round() -> 
         original_task = "ORIGINAL-WIDE-TOOL-TASK"
         provider = _WideToolRoundProvider(tool_calls=12)
         compactor = RecordingCompactor()
-        app = CayuApp(enable_logging=False, max_parallel_tool_calls=12)
+        app = CayuApp(
+            enable_logging=False,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=12)),
+        )
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(

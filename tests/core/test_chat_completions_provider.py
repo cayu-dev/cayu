@@ -14,6 +14,7 @@ from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
     CayuApp,
+    CayuConfig,
     ChatCompletionsProvider,
     Event,
     EventType,
@@ -31,6 +32,7 @@ from cayu import (
     ResolutionActorSource,
     ResumeRequest,
     RetryPolicy,
+    RunDefaults,
     RunRequest,
     file_attachment,
 )
@@ -47,6 +49,7 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    ProviderStreamDeadlines,
     UsageDialect,
     build_chat_completions_payload,
 )
@@ -3579,12 +3582,18 @@ def test_cayu_app_bounds_active_http_error_body_before_retry(
         api_key="test-key",
         base_url="https://example.test/v1",
         timeout_s=0.02,
-        transport_idle_timeout_s=0.01,
-        protocol_idle_timeout_s=1.0,
-        semantic_progress_timeout_s=1.0,
-        absolute_stream_timeout_s=1.0,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.01,
+            absolute_stream_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+        ),
     )
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -3721,13 +3730,19 @@ def test_cayu_app_resolves_in_band_error_stream_before_retry_dispatch(
     provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        transport_idle_timeout_s=1.0,
-        protocol_idle_timeout_s=1.0,
-        semantic_progress_timeout_s=1.0,
-        absolute_stream_timeout_s=1.0,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+        ),
         transport=transport,
     )
-    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app = CayuApp(
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -3853,14 +3868,18 @@ def test_cayu_app_preserves_chat_http_completion_before_response_cleanup_failure
     provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        transport_idle_timeout_s=1.0,
-        protocol_idle_timeout_s=1.0,
-        semantic_progress_timeout_s=1.0,
-        absolute_stream_timeout_s=1.0,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
+        ),
     )
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -4045,16 +4064,20 @@ def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
     store = InMemorySessionStore()
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     delegate = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
         transport=HttpxChatCompletionsTransport(),
-        transport_idle_timeout_s=1.0,
-        protocol_idle_timeout_s=1.0,
-        semantic_progress_timeout_s=1.0,
-        absolute_stream_timeout_s=1.0,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+        ),
     )
     provider: ModelProvider = delegate
     if wrapped:

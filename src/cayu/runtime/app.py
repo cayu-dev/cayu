@@ -16,7 +16,7 @@ from itertools import islice
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from uuid import uuid4
 
 from cayu._exception_groups import (
@@ -35,9 +35,6 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.artifacts import (
-    DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
-    DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
-    DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
     ArtifactScope,
     ArtifactStore,
     FileAttachmentKind,
@@ -118,11 +115,7 @@ from cayu.runtime._durable_subagents import (
     DurableSubagentSubmissionIntent,
     durable_subagent_worker_incompatible,
 )
-from cayu.runtime._environment_lifecycle import (
-    DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
-    EnvironmentLifecycle,
-    render_initial_system_prompt,
-)
+from cayu.runtime._environment_lifecycle import EnvironmentLifecycle, render_initial_system_prompt
 from cayu.runtime._event_projection import (
     PUBLIC_EVENT_ID_PREFIX,
     private_event_linkage_value,
@@ -257,6 +250,12 @@ from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionRequest,
     DeterministicCompletionVerifier,
 )
+from cayu.runtime.config import (
+    CayuConfig,
+    CayuConfigSource,
+    copy_cayu_config,
+)
+from cayu.runtime.config_inspection import EffectiveRunConfiguration
 from cayu.runtime.context import (
     ContextPolicy,
     DefaultContextPolicy,
@@ -358,7 +357,6 @@ from cayu.runtime.public_authority import (
     public_authority_alias_is_reserved,
 )
 from cayu.runtime.recovery_cleanup import (
-    RecoveryCleanupPolicy,
     RecoveryCleanupSupervisor,
     RecoveryCleanupSupervisorSnapshot,
     copy_recovery_cleanup_policy,
@@ -582,6 +580,13 @@ from cayu.vaults import (
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
 
+_RunConfigurationRequest = TypeVar(
+    "_RunConfigurationRequest",
+    RunRequest,
+    ResumeRequest,
+    DispatchRequest,
+)
+
 
 def _work_attempt_recovery_session_snapshot_sha256(session: Session) -> str:
     return sha256(
@@ -605,9 +610,6 @@ def _work_attempt_recovery_checkpoint_snapshot_sha256(
 
 if TYPE_CHECKING:
     from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
-
-
-DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
 
 
 def _clear_untrusted_exception_traceback(error: BaseException) -> None:
@@ -1036,12 +1038,44 @@ async def _close_delegated_event_stream(
                     current_task.cancel()
 
 
+_CAYU_CONFIG_FIELD_OWNERS = {
+    "evals.max_concurrency": "cayu.runtime.config.EvalConfig",
+    "run.max_steps": "cayu.runtime.config.RunDefaults",
+    "run.limits": "cayu.runtime.stop_policy.RunLimits",
+    "run.retry_policy": "cayu.runtime.retry_policy.RetryPolicy",
+    "run.thinking": "cayu.core.thinking.ThinkingConfig",
+    "tool_execution.max_file_attachment_bytes": "cayu.runtime.config.ToolExecutionConfig",
+    "tool_execution.max_total_file_attachment_bytes": ("cayu.runtime.config.ToolExecutionConfig"),
+    "tool_execution.max_file_attachments_per_request": ("cayu.runtime.config.ToolExecutionConfig"),
+    "tool_execution.tool_timeout_seconds": "cayu.runtime.config.ToolExecutionConfig",
+    "tool_execution.max_parallel_tool_calls": "cayu.runtime.config.ToolExecutionConfig",
+    "operations.max_environment_lifecycle_owners": "cayu.runtime.config.OperationsConfig",
+    "operations.recovery_cleanup_policy": ("cayu.runtime.recovery_cleanup.RecoveryCleanupPolicy"),
+}
+
+
+def _resolve_cayu_app_config(
+    config: CayuConfig | None,
+) -> tuple[CayuConfig, dict[str, CayuConfigSource]]:
+    resolved = copy_cayu_config(config)
+    sources: dict[str, CayuConfigSource] = {path: "framework" for path in _CAYU_CONFIG_FIELD_OWNERS}
+    if config is not None:
+        for section_name in config.model_fields_set:
+            section = getattr(config, section_name)
+            for field_name in section.model_fields_set:
+                path = f"{section_name}.{field_name}"
+                if path in sources:
+                    sources[path] = "application"
+    return resolved, sources
+
+
 class CayuApp:
     """Application runtime for registered agents, providers, and session state."""
 
     def __init__(
         self,
         *,
+        config: CayuConfig | None = None,
         session_store: SessionStore | None = None,
         task_store: TaskStore | None = None,
         knowledge_store: KnowledgeStore | None = None,
@@ -1053,7 +1087,6 @@ class CayuApp:
         budget_store: BudgetStore | None = None,
         budget_ledger: BudgetLedger | None = None,
         event_watcher_store: EventWatcherStore | None = None,
-        retry_policy: RetryPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
         mcp_manifest_policy: McpManifestPolicy | None = None,
@@ -1067,18 +1100,18 @@ class CayuApp:
         enable_logging: bool = True,
         secret_redactor: SecretRedactor | None = None,
         public_authority_alias_keyring: PublicAuthorityAliasKeyring | None = None,
-        max_file_attachment_bytes: int = DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
-        max_total_file_attachment_bytes: int = DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
-        max_file_attachments_per_request: int = DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
-        tool_timeout_seconds: float | None = None,
-        max_parallel_tool_calls: int = DEFAULT_MAX_PARALLEL_TOOL_CALLS,
-        max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
-        recovery_cleanup_policy: RecoveryCleanupPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         # Resolve once at application startup. Strict deployments fail here,
         # before any session or provider authority can be admitted.
         current_runtime_build_provenance()
+        resolved_config, config_sources = _resolve_cayu_app_config(config)
+        self._config = resolved_config
+        self._config_sources = cast(
+            "Mapping[str, CayuConfigSource]",
+            MappingProxyType(dict(config_sources)),
+        )
+        self._config_owners = MappingProxyType(dict(_CAYU_CONFIG_FIELD_OWNERS))
         if session_store is not None and not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
         if task_store is not None and not isinstance(task_store, TaskStore):
@@ -1214,31 +1247,17 @@ class CayuApp:
             from cayu.observability.logging import LoggingEventSink
 
             sinks.insert(0, LoggingEventSink(redactor=resolved_secret_redactor))
-        self._max_file_attachment_bytes = _validate_positive_int(
-            max_file_attachment_bytes,
-            "max_file_attachment_bytes",
+        tool_execution = resolved_config.tool_execution
+        operations = resolved_config.operations
+        self._max_file_attachment_bytes = tool_execution.max_file_attachment_bytes
+        self._max_total_file_attachment_bytes = tool_execution.max_total_file_attachment_bytes
+        self._max_file_attachments_per_request = tool_execution.max_file_attachments_per_request
+        self._tool_timeout_seconds = tool_execution.tool_timeout_seconds
+        self._max_parallel_tool_calls = tool_execution.max_parallel_tool_calls
+        self._max_environment_lifecycle_owners = operations.max_environment_lifecycle_owners
+        self._recovery_cleanup_policy = copy_recovery_cleanup_policy(
+            operations.recovery_cleanup_policy
         )
-        self._max_total_file_attachment_bytes = _validate_positive_int(
-            max_total_file_attachment_bytes,
-            "max_total_file_attachment_bytes",
-        )
-        self._max_file_attachments_per_request = _validate_positive_int(
-            max_file_attachments_per_request,
-            "max_file_attachments_per_request",
-        )
-        self._tool_timeout_seconds = _validate_optional_positive_seconds(
-            tool_timeout_seconds,
-            "tool_timeout_seconds",
-        )
-        self._max_parallel_tool_calls = _validate_positive_int(
-            max_parallel_tool_calls,
-            "max_parallel_tool_calls",
-        )
-        self._max_environment_lifecycle_owners = _validate_positive_int(
-            max_environment_lifecycle_owners,
-            "max_environment_lifecycle_owners",
-        )
-        self._recovery_cleanup_policy = copy_recovery_cleanup_policy(recovery_cleanup_policy)
         self._recovery_cleanup_supervisor = RecoveryCleanupSupervisor(self._recovery_cleanup_policy)
         self.session_store = (
             session_store
@@ -1299,7 +1318,7 @@ class CayuApp:
                 secret_redactor=self._secret_redactor,
             )
         )
-        self._default_retry_policy = copy_retry_policy(retry_policy)
+        self._default_retry_policy = copy_retry_policy(resolved_config.run.retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
         self._loop_policy_execution_profile_identities = policy_execution_profile_identities
@@ -1337,6 +1356,7 @@ class CayuApp:
             clock=self._clock,
         )
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
+        self._agent_thinking_sources: dict[str, CayuConfigSource] = {}
         self._mcp_refresh_owner = object()
         self._mcp_publication_lock = asyncio.Lock()
         self._refreshable_mcp_toolsets: dict[int, McpToolset] = {}
@@ -1483,6 +1503,7 @@ class CayuApp:
             get_registered_environment=self._get_registered_environment,
             get_registered_environment_for_session=(self._get_registered_environment_for_session),
             effective_retry_policy=self._effective_retry_policy,
+            application_run_defaults=resolved_config.run,
             execution_profile_policy=execution_profile_policy,
             execution_profile_policy_identity=execution_profile_policy_identity,
             egress_authority_adoption_handler=egress_authority_adoption_handler,
@@ -2325,6 +2346,21 @@ class CayuApp:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
         stored_spec = _validate_agent_spec(spec)
+        thinking_source: CayuConfigSource = (
+            "explicit" if stored_spec.thinking is not None else self._config_sources["run.thinking"]
+        )
+        if stored_spec.thinking is None and self._config.run.thinking is not None:
+            stored_spec = stored_spec.model_copy(
+                update={
+                    "thinking": ThinkingConfig.model_validate(
+                        self._config.run.thinking.model_dump(
+                            mode="python",
+                            warnings=False,
+                        )
+                    )
+                },
+                deep=True,
+            )
         if stored_spec.name in self._agents:
             raise ValueError(f"Agent already registered: {stored_spec.name}")
         if context_policy is None:
@@ -2632,6 +2668,7 @@ class CayuApp:
                 toolset._refresh_source.release_static_owner(self._mcp_refresh_owner)
             raise
         self._agents[stored_spec.name] = registered_agent
+        self._agent_thinking_sources[stored_spec.name] = thinking_source
         for toolset in stored_mcp_toolsets:
             self._refreshable_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
         return spec
@@ -2992,8 +3029,25 @@ class CayuApp:
         fingerprint before exposing an advanced execution surface.
         """
 
+        return (
+            await self.inspect_effective_run_configuration(request)
+        ).execution_profile.fingerprint
+
+    async def inspect_effective_run_configuration(
+        self,
+        request: RunRequest,
+    ) -> EffectiveRunConfiguration:
+        """Return redacted effective run controls and their durable profile identity.
+
+        Inspection performs the ordinary bounded, read-only initial-run preflight.
+        It creates no session and dispatches no provider, tool, hook, or environment
+        factory work.
+        """
+
         if type(request) is not RunRequest:
-            raise TypeError("Execution-profile inspection requires a RunRequest.")
+            raise TypeError("Effective-configuration inspection requires a RunRequest.")
+        explicit_fields = frozenset(request.model_fields_set)
+        request = self._with_application_run_defaults(request)
         prepared = await self._session_engine._prepare_initial_run(
             request,
             admit_session=False,
@@ -3003,7 +3057,58 @@ class CayuApp:
             raise TaskCompletionDecisionRequired(
                 "Contracted tasks require the verifier-aware execution entrance."
             ) from None
-        return prepared.execution_profile.fingerprint
+        effective_request = prepared.request
+        effective_thinking = (
+            effective_request.thinking
+            if effective_request.thinking is not None
+            else prepared.registered_agent.spec.thinking
+        )
+        thinking_source: CayuConfigSource
+        if effective_request.thinking is not None:
+            thinking_source = "explicit"
+        else:
+            thinking_source = self._agent_thinking_sources[prepared.registered_agent.spec.name]
+        retry_policy = self._effective_retry_policy(effective_request.retry_policy)
+        return EffectiveRunConfiguration.model_validate(
+            {
+                "max_steps": {
+                    "value": effective_request.max_steps,
+                    "owner": self._config_owners["run.max_steps"],
+                    "source": (
+                        "explicit"
+                        if "max_steps" in explicit_fields
+                        else self._config_sources["run.max_steps"]
+                    ),
+                },
+                "limits": {
+                    "value": effective_request.limits.model_dump(
+                        mode="python",
+                        warnings=False,
+                    ),
+                    "owner": self._config_owners["run.limits"],
+                    "source": (
+                        "explicit"
+                        if "limits" in explicit_fields
+                        else self._config_sources["run.limits"]
+                    ),
+                },
+                "retry_policy": {
+                    "value": retry_policy,
+                    "owner": self._config_owners["run.retry_policy"],
+                    "source": (
+                        "explicit"
+                        if effective_request.retry_policy is not None
+                        else self._config_sources["run.retry_policy"]
+                    ),
+                },
+                "thinking": {
+                    "value": effective_thinking,
+                    "owner": self._config_owners["run.thinking"],
+                    "source": thinking_source,
+                },
+                "execution_profile": prepared.execution_profile,
+            }
+        )
 
     async def current_prompt_anatomy_sha256(
         self,
@@ -3438,6 +3543,35 @@ class CayuApp:
             return copy_retry_policy(request_policy)
         return copy_retry_policy(self._default_retry_policy)
 
+    @property
+    def config(self) -> CayuConfig:
+        """Return the immutable effective application configuration."""
+
+        return copy_cayu_config(self._config)
+
+    def _with_application_run_defaults(
+        self,
+        request: _RunConfigurationRequest,
+    ) -> _RunConfigurationRequest:
+        """Resolve omitted run controls once before admission or dispatch."""
+
+        updates: dict[str, object] = {}
+        fields_set = request.model_fields_set
+        if "max_steps" not in fields_set:
+            updates["max_steps"] = self._config.run.max_steps
+        if "limits" not in fields_set:
+            updates["limits"] = self._config.run.copy_limits()
+        if not updates:
+            return request
+        # Loop policies and other request collaborators can hold runtime
+        # objects that are intentionally not deepcopy-safe. The resolved
+        # configuration values above are already detached copies. Preserve the
+        # caller's explicit-field set so durable continuation can distinguish
+        # an inherited value from an explicit override.
+        resolved = request.model_copy(update=updates)
+        object.__setattr__(resolved, "__pydantic_fields_set__", set(fields_set))
+        return resolved
+
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
         stream = self._run_with_public_projection(request)
         del request
@@ -3535,6 +3669,7 @@ class CayuApp:
             )
         owner = self._current_work_attempt_execution_owner_id()
         if type(prepared_request) is RunRequest:
+            prepared_request = self._with_application_run_defaults(prepared_request)
             if prepared_request.task_id is None:
                 raise ValueError("Initial work-attempt admission requires RunRequest.task_id.")
             if prepared_request.session_id is None:
@@ -4625,6 +4760,7 @@ class CayuApp:
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
+        request = self._with_application_run_defaults(request)
         request = _validate_run_request(request)
         stream = self._session_engine.run(
             request=request,
@@ -4662,6 +4798,7 @@ class CayuApp:
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
+        request = self._with_application_run_defaults(request)
         request = _validate_resume_request(request)
         stream = self._session_engine.resume(
             request=request,
@@ -4910,6 +5047,7 @@ class CayuApp:
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
         if type(request) is not DispatchRequest:
             raise TypeError("Runtime dispatch requires a DispatchRequest.")
+        request = self._with_application_run_defaults(request)
         request = copy_dispatch_request(request)
         if request.task_id is not None and self.task_store is None:
             raise RuntimeError("task_store is required when DispatchRequest.task_id is set.")
@@ -4959,6 +5097,7 @@ class CayuApp:
         self,
         request: RunRequest,
     ) -> DurableSubagentPreparedRun:
+        request = self._with_application_run_defaults(request)
         preparation = self._session_engine._prepare_initial_run(request)
         del request
         prepared = await preparation
@@ -5027,6 +5166,7 @@ class CayuApp:
     async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
         if type(request) is not DispatchRequest:
             raise TypeError("Inline dispatch requires a DispatchRequest.")
+        request = self._with_application_run_defaults(request)
         session_id, store_resolved_session_id = await self._resolve_public_session_authority(
             request.session_id
         )
@@ -6991,7 +7131,7 @@ class CayuApp:
         request_budget_limits: tuple[BudgetLimit, ...] = (),
         structured_output: StructuredOutputSpec | None = None,
         thinking: ThinkingConfig | None = None,
-        max_steps: int = 16,
+        max_steps: int | None = None,
         limits: RunLimits | None = None,
         retry_policy: RetryPolicy | None = None,
         invocation_semantics_available: bool = False,
@@ -8163,24 +8303,6 @@ def _registration_site() -> tuple[str | None, str | None]:
     finally:
         del frame
         del caller
-
-
-def _validate_positive_int(value: int, field_name: str) -> int:
-    if type(value) is not int:
-        raise TypeError(f"{field_name} must be an integer.")
-    if value <= 0:
-        raise ValueError(f"{field_name} must be greater than zero.")
-    return value
-
-
-def _validate_optional_positive_seconds(value: float | None, field_name: str) -> float | None:
-    if value is None:
-        return None
-    if type(value) not in {int, float}:
-        raise TypeError(f"{field_name} must be a number or None.")
-    if not isfinite(value) or value <= 0:
-        raise ValueError(f"{field_name} must be greater than zero.")
-    return float(value)
 
 
 def _snapshot_context_behavior_execution_profile_identities(

@@ -94,6 +94,7 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.runtime.config import CayuConfig, RunDefaults
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -1055,6 +1056,247 @@ async def _configured_public_initial_admission(
             lease_seconds=300,
         ),
     )
+
+
+def test_public_initial_admission_applies_configured_max_steps_unless_overridden(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        app = CayuApp(
+            config=CayuConfig(run=RunDefaults(max_steps=128)),
+            session_store=sessions,
+            task_store=tasks,
+            enable_logging=False,
+        )
+        app.register_provider(_RecordingProvider(), default=True)
+        app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        contract = _contract(contract_id="configured-admission-max-steps")
+        await tasks.publish_work_contract(contract)
+        task_records = [
+            await tasks.create_task(
+                TaskCreate(
+                    task_id=f"configured-admission-task-{index}",
+                    type="verified-work",
+                    work_contract=contract.reference(),
+                )
+            )
+            for index in range(2)
+        ]
+
+        observed_max_steps: dict[str, int] = {}
+        engine_type = type(app._session_engine)
+        original = engine_type.admit_initial_work_attempt
+
+        async def capture_resolved_request(engine, request, *, authority):
+            observed_max_steps[request.session_id] = request.max_steps
+            return await original(engine, request, authority=authority)
+
+        monkeypatch.setattr(
+            engine_type,
+            "admit_initial_work_attempt",
+            capture_resolved_request,
+        )
+
+        async def admit(index: int, *, max_steps: int | None = None) -> WorkAttemptAdmission:
+            request_kwargs: dict[str, Any] = {}
+            if max_steps is not None:
+                request_kwargs["max_steps"] = max_steps
+            return await app.admit_work_attempt(
+                RunRequest(
+                    agent_name="worker",
+                    task_id=task_records[index].id,
+                    session_id=f"configured-admission-session-{index}",
+                    messages=[Message.text("user", f"Perform governed attempt {index}.")],
+                    **request_kwargs,
+                ),
+                execution=WorkAttemptExecutionRequest(
+                    admission_id=f"configured-admission-{index}",
+                    claim_id=f"configured-admission-claim-{index}",
+                    attempt_id=f"configured-admission-attempt-{index}",
+                    interaction_id=f"configured-admission-interaction-{index}",
+                    worker_id=f"configured-admission-worker-{index}",
+                    generation=1,
+                    lease_seconds=300,
+                ),
+            )
+
+        inherited = await admit(0)
+        overridden = await admit(1, max_steps=80)
+
+        assert observed_max_steps == {
+            "configured-admission-session-0": 128,
+            "configured-admission-session-1": 80,
+        }
+        assert inherited.source_execution_profile_fingerprint != (
+            overridden.source_execution_profile_fingerprint
+        )
+
+    asyncio.run(scenario())
+
+
+def test_continuation_admission_reuses_source_profile_across_app_defaults() -> None:
+    async def scenario() -> None:
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        source_app = CayuApp(
+            config=CayuConfig(run=RunDefaults(max_steps=128)),
+            session_store=sessions,
+            task_store=tasks,
+            enable_logging=False,
+        )
+        source_app.register_provider(_RecordingProvider(), default=True)
+        source_app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        contract = _contract(contract_id="configured-continuation-profile")
+        await tasks.publish_work_contract(contract)
+        task = await tasks.create_task(
+            TaskCreate(
+                task_id="configured-continuation-task",
+                type="verified-work",
+                work_contract=contract.reference(),
+            )
+        )
+        first = await source_app.admit_work_attempt(
+            RunRequest(
+                agent_name="worker",
+                task_id=task.id,
+                session_id="configured-continuation-session",
+                messages=[Message.text("user", "Produce the first governed result.")],
+            ),
+            execution=WorkAttemptExecutionRequest(
+                admission_id="configured-continuation-admission-1",
+                claim_id="configured-continuation-claim-1",
+                attempt_id="configured-continuation-attempt-1",
+                interaction_id="configured-continuation-interaction-1",
+                worker_id="configured-continuation-worker-1",
+                generation=1,
+                lease_seconds=300,
+            ),
+        )
+        deferred = await sessions.load_deferred_interaction_input(first.session_id)
+        assert deferred is not None
+        await sessions.replace_initial_transcript_messages(
+            first.session_id,
+            deferred.source_messages,
+            deferred.source_messages,
+            interaction_id=first.interaction_id,
+        )
+        proposal = await source_app.submit_work_attempt_proposal(
+            WorkAttemptProposalRequest(
+                admission_id=first.admission_id,
+                claim_id=first.claim.claim_id,
+                generation=first.claim.generation,
+                proposal=CompletionProposalCreate(
+                    proposal_id="configured-continuation-proposal-1",
+                    attempt_id=first.attempt_id,
+                    result=_result_reference(),
+                    evidence_references=(_artifact_evidence(),),
+                ),
+            )
+        )
+        first_session = await sessions.load(first.session_id)
+        first_checkpoint = await sessions.load_checkpoint(first.session_id)
+        first_active_profile = active_invocation_execution_profile_from_checkpoint(first_checkpoint)
+        assert first_session is not None
+        assert first_active_profile is not None
+        settlement = InteractionTransitionSpec(
+            event=event_with_runtime_envelope_authority(
+                Event(
+                    type=EventType.INTERACTION_COMPLETED,
+                    session_id=first.session_id,
+                    interaction_id=first.interaction_id,
+                    agent_name="worker",
+                ),
+                "session_id",
+                "interaction_id",
+            ),
+            from_statuses=(SessionStatus.RUNNING,),
+            to_status=SessionStatus.COMPLETED,
+        )
+        await source_app._runtime_session_store.apply_invocation_lifecycle_command(
+            SettleInvocationCommand(
+                session_id=first.session_id,
+                expected_session_instance_id=first_session.instance_id,
+                expected_run_epoch=first_session.run_epoch,
+                expected_active_profile=first_active_profile,
+                transition=settlement,
+            )
+        )
+        await source_app._runtime_session_store.apply_invocation_lifecycle_command(
+            _release_invocation_command_with_cleanup_authority(
+                ReleaseInvocationCommand(
+                    session_id=first.session_id,
+                    expected_session_instance_id=first_session.instance_id,
+                    expected_run_epoch=first_session.run_epoch,
+                    expected_active_profile=first_active_profile,
+                    settlement_transition=settlement,
+                )
+            )
+        )
+        verifier_claim = await _claim_completion_verification(
+            tasks,
+            CompletionVerificationClaimRequest(
+                claim_id="configured-continuation-verifier-claim",
+                proposal_id=proposal.proposal_id,
+                worker_id="configured-continuation-verifier-worker",
+                verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
+        )
+        decision = await tasks.record_completion_decision(
+            _rejected_decision(
+                proposal_id=proposal.proposal_id,
+                claim_id=verifier_claim.claim_id,
+                worker_id=verifier_claim.worker_id,
+                decision_id="configured-continuation-rejected-decision",
+            )
+        )
+        await tasks.apply_completion_decision(
+            CompletionDecisionApplicationRequest(
+                task_id=task.id,
+                decision_id=decision.decision_id,
+                idempotency_key="configured-continuation-decision-application",
+            )
+        )
+
+        replacement_app = CayuApp(
+            config=CayuConfig(run=RunDefaults(max_steps=96)),
+            session_store=sessions,
+            task_store=tasks,
+            enable_logging=False,
+        )
+        replacement_app.register_provider(_RecordingProvider(), default=True)
+        replacement_app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        second = await replacement_app.admit_work_attempt(
+            ResumeRequest(
+                session_id=first.session_id,
+                messages=[Message.text("user", "Address the verifier gaps.")],
+            ),
+            execution=WorkAttemptExecutionRequest(
+                admission_id="configured-continuation-admission-2",
+                claim_id="configured-continuation-claim-2",
+                attempt_id="configured-continuation-attempt-2",
+                interaction_id="configured-continuation-interaction-2",
+                worker_id="configured-continuation-worker-2",
+                task_id=task.id,
+                predecessor_admission_id=first.admission_id,
+                generation=1,
+                lease_seconds=300,
+            ),
+        )
+
+        assert second.state is WorkAttemptAdmissionState.ACTIVE
+        assert second.source_execution_profile_fingerprint == (
+            first.source_execution_profile_fingerprint
+        )
+        second_profile = active_invocation_execution_profile_from_checkpoint(
+            await sessions.load_checkpoint(second.session_id)
+        )
+        assert second_profile is not None
+        assert second_profile.profile == first_active_profile.profile
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

@@ -9,8 +9,7 @@ from collections.abc import Callable
 
 from cayu.core import Message
 from cayu.runtime import CayuApp, RunRequest, run_to_completion
-
-_MAX_STEPS = 256
+from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
 
 
 def run_project_entrypoint(
@@ -25,11 +24,11 @@ def run_project_entrypoint(
     if not args.message.strip():
         print("setup error: --message must not be blank", file=sys.stderr)
         return 2
-    if args.max_steps < 1:
+    if args.max_steps is not None and args.max_steps < 1:
         print("setup error: --max-steps must be at least 1", file=sys.stderr)
         return 2
-    if args.max_steps > _MAX_STEPS:
-        print(f"setup error: --max-steps must be at most {_MAX_STEPS}", file=sys.stderr)
+    if args.max_steps is not None and args.max_steps > MAX_STEPS:
+        print(f"setup error: --max-steps must be at most {MAX_STEPS}", file=sys.stderr)
         return 2
 
     try:
@@ -43,16 +42,13 @@ def run_project_entrypoint(
         print(f"setup error: {error}", file=sys.stderr)
         return 2
 
-    outcome = asyncio.run(
-        run_to_completion(
-            app,
-            RunRequest(
-                agent_name=agent_name,
-                messages=[Message.text("user", args.message)],
-                max_steps=args.max_steps,
-            ),
-        )
+    run_request = RunRequest(
+        agent_name=agent_name,
+        messages=[Message.text("user", args.message)],
     )
+    if args.max_steps is not None:
+        run_request = run_request.model_copy(update={"max_steps": args.max_steps})
+    outcome = asyncio.run(run_to_completion(app, run_request))
     if outcome.ok:
         print(outcome.final_text)
         return 0
@@ -69,7 +65,12 @@ def _parser() -> argparse.ArgumentParser:
         help="Registered agent name; optional when the project has only one.",
     )
     parser.add_argument("--message", required=True, help="User message text.")
-    parser.add_argument("--max-steps", type=int, default=12)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help=f"Model-step ceiling; defaults to the app setting ({DEFAULT_MAX_STEPS} normally).",
+    )
     return parser
 
 

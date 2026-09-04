@@ -1232,10 +1232,12 @@ async def test_byte_active_heartbeat_only_sse_crosses_semantic_deadline(
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
     provider = ChatCompletionsProvider(
         api_key="test-key",
-        transport_idle_timeout_s=0.1,
-        protocol_idle_timeout_s=1.0,
-        semantic_progress_timeout_s=0.03,
-        absolute_stream_timeout_s=1.0,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.1,
+            semantic_progress_timeout_s=0.03,
+            protocol_idle_timeout_s=1.0,
+            absolute_stream_timeout_s=1.0,
+        ),
     )
 
     with pytest.raises(ModelStreamDeadlineError) as captured:
@@ -1270,10 +1272,12 @@ async def test_semantically_active_real_sse_is_bounded_by_absolute_lifetime(
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
     provider = OpenAIProvider(
         api_key="test-key",
-        transport_idle_timeout_s=0.15,
-        protocol_idle_timeout_s=0.2,
-        semantic_progress_timeout_s=0.2,
-        absolute_stream_timeout_s=0.55,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.15,
+            semantic_progress_timeout_s=0.2,
+            protocol_idle_timeout_s=0.2,
+            absolute_stream_timeout_s=0.55,
+        ),
     )
 
     with pytest.raises(ModelStreamDeadlineError) as captured:
@@ -2047,28 +2051,35 @@ async def test_sse_parser_rejects_non_finite_timeouts(
     [
         (
             "openai",
-            lambda field, value: OpenAIProvider(api_key="test-key", **{field: value}),
+            lambda field, value: OpenAIProvider(
+                api_key="test-key", stream_deadlines=ProviderStreamDeadlines(**{field: value})
+            ),
         ),
         (
             "anthropic",
-            lambda field, value: AnthropicProvider(api_key="test-key", **{field: value}),
+            lambda field, value: AnthropicProvider(
+                api_key="test-key", stream_deadlines=ProviderStreamDeadlines(**{field: value})
+            ),
         ),
         (
             "chat_completions",
-            lambda field, value: ChatCompletionsProvider(api_key="test-key", **{field: value}),
+            lambda field, value: ChatCompletionsProvider(
+                api_key="test-key", stream_deadlines=ProviderStreamDeadlines(**{field: value})
+            ),
         ),
         (
             "vertex",
             lambda field, value: VertexProvider(
                 project_id="test-project",
                 credentials=SimpleNamespace(valid=True, token="test-token"),
-                **{field: value},
+                stream_deadlines=ProviderStreamDeadlines(**{field: value}),
             ),
         ),
         (
             "openai_subscription",
             lambda field, value: OpenAISubscriptionProvider(
-                auth=_UnusedSubscriptionAuth(), **{field: value}
+                auth=_UnusedSubscriptionAuth(),
+                stream_deadlines=ProviderStreamDeadlines(**{field: value}),
             ),
         ),
     ],
@@ -2136,35 +2147,28 @@ def test_public_sse_providers_reject_non_finite_idle_timeout(
         ),
     ],
 )
-def test_bundled_provider_constructors_preserve_stream_idle_timeout_alias(
+def test_bundled_provider_constructors_accept_cohesive_stream_deadlines(
     provider_factory: Callable[..., Any],
 ) -> None:
-    provider = provider_factory(
-        stream_idle_timeout_s=7.0,
-        absolute_stream_timeout_s=11.0,
+    deadlines = ProviderStreamDeadlines(
+        transport_idle_timeout_s=11.0,
+        protocol_idle_timeout_s=12.0,
+        semantic_progress_timeout_s=13.0,
+        absolute_stream_timeout_s=14.0,
+        max_concurrent_streams=15,
     )
 
-    assert provider.stream_deadlines == ProviderStreamDeadlines(
-        transport_idle_timeout_s=7.0,
-        protocol_idle_timeout_s=7.0,
-        semantic_progress_timeout_s=7.0,
-        absolute_stream_timeout_s=11.0,
-    )
+    provider = provider_factory(stream_deadlines=deadlines)
+
+    assert provider.stream_deadlines is deadlines
 
 
-def test_stream_idle_timeout_alias_rejects_conflicting_new_idle_clock() -> None:
-    with pytest.raises(ValueError, match="stream_idle_timeout_s cannot be combined"):
+def test_cohesive_stream_deadlines_require_typed_policy() -> None:
+    with pytest.raises(TypeError, match="stream_deadlines must be ProviderStreamDeadlines"):
         OpenAIProvider(
             api_key="test-key",
-            stream_idle_timeout_s=7.0,
-            semantic_progress_timeout_s=8.0,
+            stream_deadlines=object(),  # type: ignore[invalid-argument-type]
         )
-
-
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -1.0])
-def test_stream_idle_timeout_alias_requires_positive_finite_value(value: float) -> None:
-    with pytest.raises(ValueError, match="stream_idle_timeout_s"):
-        OpenAIProvider(api_key="test-key", stream_idle_timeout_s=value)
 
 
 @pytest.mark.anyio

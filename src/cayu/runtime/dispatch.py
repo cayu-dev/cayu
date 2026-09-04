@@ -64,6 +64,7 @@ from cayu.runtime._task_store_operation_boundary import (
 )
 from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionIntent,
     ExecutionProfileIdentity,
@@ -270,7 +271,7 @@ class DispatchRequest(BaseModel):
     tool_grants: tuple[TargetedToolGrant, ...] = ()
     profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    max_steps: StrictInt = Field(default=16, ge=1, le=256)
+    max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -2996,7 +2997,7 @@ class TaskStoreDispatcher(Dispatcher):
 def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
     if type(request) is not DispatchRequest:
         raise TypeError("Dispatch requires a DispatchRequest.")
-    return DispatchRequest(
+    copied = DispatchRequest(
         session_id=request.session_id,
         messages=[detach_message(message) for message in request.messages],
         dispatch_id=request.dispatch_id,
@@ -3021,14 +3022,33 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
             else copy_execution_profile_adoption_intent(request.profile_adoption)
         ),
         metadata=copy_durable_json_value(request.metadata, "metadata"),
-        max_steps=request.max_steps,
-        limits=copy_run_limits(request.limits),
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
-        thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
+    copied = copied.model_copy(
+        update={
+            "max_steps": request.max_steps,
+            "limits": copy_run_limits(request.limits),
+            "thinking": (
+                None
+                if request.thinking is None
+                else ThinkingConfig(
+                    enabled=request.thinking.enabled,
+                    effort=request.thinking.effort,
+                    max_tokens=request.thinking.max_tokens,
+                    include_in_transcript=request.thinking.include_in_transcript,
+                )
+            ),
+        }
+    )
+    copied_fields_set = set(copied.model_fields_set)
+    for field_name in ("max_steps", "limits", "thinking"):
+        if field_name not in request.model_fields_set:
+            copied_fields_set.discard(field_name)
+    object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)
+    return copied
 
 
 async def _load_dispatch_session_invocation(

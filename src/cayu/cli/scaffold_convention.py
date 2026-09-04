@@ -64,6 +64,7 @@ def build_app(
     )
     runtime = build_runtime_options()
     app = CayuApp(
+        config=runtime.config,
         session_store=stores.session_store,
         task_store=stores.task_store,
         knowledge_store=stores.knowledge_store,
@@ -112,8 +113,6 @@ __all__ = [
 
 _PROVIDERS_PY = '''"""Explicit provider construction for this application."""
 
-import os
-
 from cayu import (
     AnthropicProvider,
     CayuApp,
@@ -126,6 +125,14 @@ from cayu import (
 
 from configuration.settings import (
     SCAFFOLDED_DATABASE,
+    configured_anthropic_api_key,
+    configured_database_url,
+    configured_model_override,
+    configured_openai_api_key,
+    configured_openrouter_api_key,
+    configured_openrouter_app_title,
+    configured_openrouter_http_referer,
+    configured_openrouter_router_metadata_enabled,
     configured_provider_choice,
 )
 
@@ -157,7 +164,7 @@ def configured_provider() -> ModelProvider:
     if choice == "openai-subscription":
         return OpenAISubscriptionProvider()
     if choice == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY")
+        api_key = configured_openai_api_key()
         return (
             OpenAIProvider(api_key=api_key)
             if api_key
@@ -167,22 +174,22 @@ def configured_provider() -> ModelProvider:
             )
         )
     if choice == "openrouter":
-        router_metadata_enabled = _openrouter_router_metadata_enabled()
-        model = (os.environ.get("CAYU_MODEL") or "").strip()
+        router_metadata_enabled = configured_openrouter_router_metadata_enabled()
+        model = configured_model_override()
         if not model:
             return _ScaffoldPlaceholderProvider(
                 name="openrouter",
                 setup_error="provider 'openrouter' requires an explicit CAYU_MODEL model slug",
             )
-        api_key = os.environ.get("OPENROUTER_API_KEY")
+        api_key = configured_openrouter_api_key()
         return (
             ChatCompletionsProvider(
                 name="openrouter",
                 api_key=api_key,
                 api_key_env="OPENROUTER_API_KEY",
                 base_url="https://openrouter.ai/api/v1",
-                openrouter_http_referer=os.environ.get("OPENROUTER_HTTP_REFERER"),
-                openrouter_app_title=os.environ.get("OPENROUTER_APP_TITLE"),
+                openrouter_http_referer=configured_openrouter_http_referer(),
+                openrouter_app_title=configured_openrouter_app_title(),
                 openrouter_router_metadata=router_metadata_enabled,
             )
             if api_key
@@ -193,7 +200,7 @@ def configured_provider() -> ModelProvider:
                 ),
             )
         )
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = configured_anthropic_api_key()
     return (
         AnthropicProvider(api_key=api_key)
         if api_key
@@ -207,7 +214,7 @@ def configured_provider() -> ModelProvider:
 def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
     """Run the target and adapter preflight used by live entry points."""
 
-    if SCAFFOLDED_DATABASE == "postgres" and not os.environ.get("CAYU_DATABASE_URL"):
+    if SCAFFOLDED_DATABASE == "postgres" and not configured_database_url():
         raise RuntimeError(
             "database 'postgres' is selected but CAYU_DATABASE_URL is not set"
         )
@@ -220,23 +227,17 @@ def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
         )
     provider = app.get_provider(manifest_agent.resolved_provider)
     provider.preflight_model_target(model=manifest_agent.model)
-
-
-def _openrouter_router_metadata_enabled() -> bool:
-    value = os.environ.get("OPENROUTER_ROUTER_METADATA")
-    if value is None or value.lower() == "disabled":
-        return False
-    if value.lower() == "enabled":
-        return True
-    raise RuntimeError(
-        "OPENROUTER_ROUTER_METADATA must be 'enabled' or 'disabled' when set"
-    )
 '''
 
 _SETTINGS_PY = '''"""Validated source-controlled defaults and environment overrides."""
 
 import os
+from pathlib import Path
 
+from cayu import PublicAuthorityAliasCodec, public_authority_alias_codec_from_environment
+
+_PROJECT_ROOT = Path(__file__).parents[1]
+_LOCAL_MEMORY_KEY = _PROJECT_ROOT / "data" / "memory-evidence.key"
 SCAFFOLDED_DATABASE = "__DATABASE__"
 _SCAFFOLDED_PROVIDER = __PROVIDER_LITERAL__
 _SUPPORTED_PROVIDERS = {"openai", "anthropic", "openrouter", "openai-subscription"}
@@ -271,7 +272,7 @@ def configured_provider_name() -> str | None:
 
 
 def configured_model() -> str:
-    override = (os.environ.get("CAYU_MODEL") or "").strip()
+    override = configured_model_override()
     if override:
         return override
     selected = configured_provider_choice()
@@ -280,6 +281,65 @@ def configured_model() -> str:
     return (
         "provider-model-unconfigured" if selected is None else _DEFAULT_MODELS[selected]
     )
+
+
+def configured_model_override() -> str:
+    return (os.environ.get("CAYU_MODEL") or "").strip()
+
+
+
+def configured_openai_api_key() -> str | None:
+    return os.environ.get("OPENAI_API_KEY")
+
+
+def configured_anthropic_api_key() -> str | None:
+    return os.environ.get("ANTHROPIC_API_KEY")
+
+
+def configured_openrouter_api_key() -> str | None:
+    return os.environ.get("OPENROUTER_API_KEY")
+
+
+def configured_openrouter_http_referer() -> str | None:
+    return os.environ.get("OPENROUTER_HTTP_REFERER")
+
+
+def configured_openrouter_app_title() -> str | None:
+    return os.environ.get("OPENROUTER_APP_TITLE")
+
+
+def configured_openrouter_router_metadata_enabled() -> bool:
+    value = os.environ.get("OPENROUTER_ROUTER_METADATA")
+    if value is None or value.lower() == "disabled":
+        return False
+    if value.lower() == "enabled":
+        return True
+    raise RuntimeError(
+        "OPENROUTER_ROUTER_METADATA must be 'enabled' or 'disabled' when set"
+    )
+
+
+def configured_database_url() -> str | None:
+    return os.environ.get("CAYU_DATABASE_URL")
+
+
+def configured_public_authority_alias_codec() -> PublicAuthorityAliasCodec | None:
+    return public_authority_alias_codec_from_environment()
+
+
+def configured_memory_evidence_key() -> str:
+    """Resolve private memory-key material at the configuration boundary."""
+
+    key = os.environ.get("CAYU_MEMORY_EVIDENCE_KEY")
+    if key is not None:
+        return key
+    try:
+        return _LOCAL_MEMORY_KEY.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            "automatic memory requires CAYU_MEMORY_EVIDENCE_KEY or the private "
+            "data/memory-evidence.key created by `cayu new`"
+        ) from exc
 '''
 
 _SQLITE_STORAGE_PY = '''"""Construct the selected durable application stores."""
@@ -294,8 +354,9 @@ from cayu import (
     SQLiteSessionStore,
     SQLiteTaskStore,
     TaskStore,
-    public_authority_alias_codec_from_environment,
 )
+
+from configuration.settings import configured_public_authority_alias_codec
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,7 +381,7 @@ def build_stores(
             if session_store is not None
             else SQLiteSessionStore(
                 "data/cayu.db",
-                public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+                public_authority_alias_codec=configured_public_authority_alias_codec(),
             )
         ),
         task_store=(
@@ -342,7 +403,6 @@ def build_stores(
 
 _POSTGRES_STORAGE_PY = '''"""Construct the selected durable Postgres application stores."""
 
-import os
 from dataclasses import dataclass
 
 from cayu import (
@@ -353,7 +413,11 @@ from cayu import (
     PostgresTaskStore,
     SessionStore,
     TaskStore,
-    public_authority_alias_codec_from_environment,
+)
+
+from configuration.settings import (
+    configured_database_url,
+    configured_public_authority_alias_codec,
 )
 
 _INSPECTION_DSN = "postgresql://cayu-unconfigured@127.0.0.1/cayu"
@@ -375,14 +439,14 @@ def build_stores(
 ) -> ApplicationStores:
     """Build lazy Postgres stores without connecting during import or inspection."""
 
-    conninfo = os.environ.get("CAYU_DATABASE_URL") or _INSPECTION_DSN
+    conninfo = configured_database_url() or _INSPECTION_DSN
     return ApplicationStores(
         session_store=(
             session_store
             if session_store is not None
             else PostgresSessionStore(
                 conninfo,
-                public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+                public_authority_alias_codec=configured_public_authority_alias_codec(),
             )
         ),
         task_store=(
@@ -552,18 +616,17 @@ def build_tool_exposure_policy(tools: tuple[str, ...]) -> ToolExposurePolicy:
 
 _RUNTIME_PY = '''"""Application-wide runtime policy and collaborator construction seam."""
 
-import os
 from dataclasses import dataclass
-from pathlib import Path
 
-from cayu import RequestFootprintConfig
+from cayu import CayuConfig, RequestFootprintConfig
 
-_PROJECT_ROOT = Path(__file__).parents[1]
-_LOCAL_MEMORY_KEY = _PROJECT_ROOT / "data" / "memory-evidence.key"
-
+from configuration.settings import (
+    configured_memory_evidence_key,
+)
 
 @dataclass(frozen=True, slots=True)
 class RuntimeOptions:
+    config: CayuConfig
     enable_logging: bool
     knowledge_review_namespace: str | None
     request_footprint: RequestFootprintConfig
@@ -573,24 +636,18 @@ def build_runtime_options() -> RuntimeOptions:
     """Construct the selected event-sink profile without starting lifecycle work."""
 
     return RuntimeOptions(
+        config=CayuConfig(),
         enable_logging=__ENABLE_LOGGING__,
         knowledge_review_namespace=__KNOWLEDGE_NAMESPACE_LITERAL__,
         request_footprint=_request_footprint_config(),
     )
 
 
+
 def _request_footprint_config() -> RequestFootprintConfig:
     if not __MEMORY_ENABLED__:
         return RequestFootprintConfig()
-    key = os.environ.get("CAYU_MEMORY_EVIDENCE_KEY")
-    if key is None:
-        try:
-            key = _LOCAL_MEMORY_KEY.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise RuntimeError(
-                "automatic memory requires CAYU_MEMORY_EVIDENCE_KEY or the private "
-                "data/memory-evidence.key created by `cayu new`"
-            ) from exc
+    key = configured_memory_evidence_key()
     if len(key.encode("utf-8")) < 32:
         raise RuntimeError("the memory evidence key must contain at least 32 bytes")
     return RequestFootprintConfig(

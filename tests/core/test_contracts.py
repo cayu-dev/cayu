@@ -129,6 +129,8 @@ from cayu.runtime._model_errors import (
     model_provider_error_from_payload,
 )
 from cayu.runtime.approvals import copy_resolution_actor
+from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.runtime.sessions import copy_resume_request, copy_run_request
 from cayu.runtime.structured_output import validate_structured_output_text
 from cayu.storage import KnowledgeEntry, KnowledgeHit
 from cayu.storage.memory import copy_knowledge_entry
@@ -257,6 +259,8 @@ def test_dispatch_request_validates_boundary_data():
 
     assert request.session_id == "sess_dispatch"
     assert request.dispatch_id == "dispatch_1"
+    assert request.max_steps == DEFAULT_MAX_STEPS
+    assert "max_steps" not in request.model_fields_set
     assert request.metadata == {"source": "test"}
     assert request.structured_output is not None
     assert request.structured_output.json_schema["required"] == ["answer"]
@@ -3301,7 +3305,8 @@ def test_run_request_session_id_is_explicit_unique_session_id():
     )
 
     assert request.session_id == "sess_existing"
-    assert request.max_steps == 16
+    assert request.max_steps == DEFAULT_MAX_STEPS
+    assert "max_steps" not in request.model_fields_set
 
 
 def test_resume_request_requires_existing_session_id_and_new_messages():
@@ -3316,7 +3321,8 @@ def test_resume_request_requires_existing_session_id_and_new_messages():
     assert request.messages[0].content[0].text == "continue"
     assert request.target == ModelTarget(provider_name="fake", model="upgraded-model")
     assert request.metadata == {"source": "test"}
-    assert request.max_steps == 16
+    assert request.max_steps == DEFAULT_MAX_STEPS
+    assert "max_steps" not in request.model_fields_set
 
     with pytest.raises(ValidationError, match="cannot be blank"):
         ResumeRequest(
@@ -3342,6 +3348,32 @@ def test_run_request_rejects_coerced_max_steps():
             messages=[Message.text("user", "resume")],
             max_steps="2",  # type: ignore[arg-type]
         )
+
+
+def test_runtime_request_copies_preserve_omitted_and_explicit_step_budgets():
+    run = RunRequest(agent_name="orchestrator", messages=[])
+    resume = ResumeRequest(
+        session_id="sess_existing",
+        messages=[Message.text("user", "resume")],
+    )
+    dispatch = DispatchRequest(
+        session_id="sess_existing",
+        messages=[Message.text("user", "dispatch")],
+    )
+
+    for copied in (
+        copy_run_request(run),
+        copy_resume_request(resume),
+        copy_dispatch_request(dispatch),
+    ):
+        assert copied.max_steps == DEFAULT_MAX_STEPS
+        assert "max_steps" not in copied.model_fields_set
+
+    explicit = copy_run_request(
+        RunRequest(agent_name="orchestrator", messages=[], max_steps=MAX_STEPS)
+    )
+    assert explicit.max_steps == MAX_STEPS
+    assert "max_steps" in explicit.model_fields_set
 
 
 def test_session_store_is_contract_only():

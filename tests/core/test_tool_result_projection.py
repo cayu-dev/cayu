@@ -31,6 +31,7 @@ from cayu import (
     ArtifactWriteSettlementPhase,
     ArtifactWriteSettlementStatus,
     CayuApp,
+    CayuConfig,
     Environment,
     EnvironmentSpec,
     Event,
@@ -55,6 +56,7 @@ from cayu import (
     Tool,
     ToolContext,
     ToolEffect,
+    ToolExecutionConfig,
     ToolResult,
     ToolResultProjection,
     ToolResultProjectionPolicy,
@@ -1742,7 +1744,7 @@ def test_partial_hook_control_cannot_poison_runtime_timeout_boundary() -> None:
         enable_logging=False,
         session_store=session_store,
         secret_redactor=SecretRedactor("in_process"),
-        tool_timeout_seconds=0.01,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.01)),
     )
     app.register_provider(provider, default=True)
     app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)

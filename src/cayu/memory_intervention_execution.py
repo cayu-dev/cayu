@@ -1988,6 +1988,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             raise MemoryInterventionExecutionConflict(
                 "Runtime execution profile differs from durable execution authority."
             )
+        runtime_request = app._with_application_run_defaults(runtime_request)
         prepared = await app._session_engine._prepare_initial_run(
             runtime_request,
             admit_session=False,

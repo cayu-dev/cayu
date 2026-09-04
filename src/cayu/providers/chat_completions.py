@@ -68,11 +68,6 @@ from cayu.providers.base import (
     privacy_safe_provider_option_projection,
 )
 from cayu.providers.deadlines import (
-    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
-    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
-    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
-    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
-    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
     ProviderProgressKind,
     ProviderStreamDeadlines,
     _resolve_provider_stream_deadlines,
@@ -444,12 +439,7 @@ class ChatCompletionsProvider(ModelProvider):
         allow_http: bool = False,
         stream_include_usage: bool = True,
         timeout_s: float = DEFAULT_CHAT_COMPLETIONS_TIMEOUT_SECONDS,
-        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
-        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
-        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
-        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
-        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
-        stream_idle_timeout_s: float | None = None,
+        stream_deadlines: ProviderStreamDeadlines | None = None,
         transport: ChatCompletionsTransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         openrouter_http_referer: str | None = None,
@@ -505,12 +495,7 @@ class ChatCompletionsProvider(ModelProvider):
                 )
         self.timeout_s = _validate_timeout_s(timeout_s)
         self._stream_deadlines = _resolve_provider_stream_deadlines(
-            transport_idle_timeout_s=transport_idle_timeout_s,
-            protocol_idle_timeout_s=protocol_idle_timeout_s,
-            semantic_progress_timeout_s=semantic_progress_timeout_s,
-            absolute_stream_timeout_s=absolute_stream_timeout_s,
-            max_concurrent_streams=max_concurrent_streams,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            stream_deadlines=stream_deadlines,
         )
         # A caller-supplied transport manages its own scheme policy; the default
         # transport inherits allow_http so a local http endpoint actually connects.

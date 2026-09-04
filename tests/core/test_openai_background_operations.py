@@ -29,6 +29,7 @@ from cayu.providers import (
     ProviderOperationState,
     ProviderOperationStatus,
     ProviderProgressKind,
+    ProviderStreamDeadlines,
     TargetedToolProjectionRequest,
     ToolDiscoveryProjectionRequest,
 )
@@ -492,10 +493,12 @@ async def test_openai_background_start_preserves_deadline_through_close_failure(
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.01,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            protocol_idle_timeout_s=1,
+        ),
     )
     adapter = provider.provider_operations
     assert adapter is not None
@@ -544,10 +547,12 @@ async def test_cayu_app_preserves_typed_background_start_deadline() -> None:
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.01,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            protocol_idle_timeout_s=1,
+        ),
     )
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
@@ -637,10 +642,12 @@ async def test_cayu_app_background_deadline_projects_exact_reattachment() -> Non
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.01,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            protocol_idle_timeout_s=1,
+        ),
     )
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
@@ -713,10 +720,12 @@ async def test_openai_background_deadline_does_not_wait_for_nonsettling_close() 
         api_key="test-key",
         background=True,
         transport=BlockingStartTransport(),
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.01,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            protocol_idle_timeout_s=1,
+        ),
     )
     adapter = provider.provider_operations
     assert adapter is not None
@@ -769,10 +778,12 @@ async def test_openai_background_real_cancellation_during_deadline_cleanup_wins(
         api_key="test-key",
         background=True,
         transport=BlockingStartTransport(),
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.01,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            protocol_idle_timeout_s=1,
+        ),
     )
     adapter = provider.provider_operations
     assert adapter is not None
@@ -915,10 +926,12 @@ async def test_openai_background_runtime_handoff_excludes_consumer_pause_from_se
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.01,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            protocol_idle_timeout_s=1,
+        ),
     )
     app = CayuApp(enable_logging=False)
     app.register_provider(provider, default=True)
@@ -961,10 +974,12 @@ async def test_openai_background_reconnect_handoff_excludes_semantic_idle_pause(
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.01,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            protocol_idle_timeout_s=1,
+        ),
     )
     adapter = provider.provider_operations
     assert adapter is not None
@@ -994,10 +1009,12 @@ async def test_openai_background_handoff_pause_still_consumes_absolute_lifetime(
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=1,
-        absolute_stream_timeout_s=0.01,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=0.01,
+            semantic_progress_timeout_s=1,
+            protocol_idle_timeout_s=1,
+        ),
     )
     adapter = provider.provider_operations
     assert adapter is not None
@@ -1056,10 +1073,12 @@ async def test_openai_background_reconnect_semantic_deadline_retains_exact_ident
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.03,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.03,
+            protocol_idle_timeout_s=1,
+        ),
     )
     adapter = provider.provider_operations
     assert adapter is not None
@@ -1137,10 +1156,12 @@ async def test_openai_background_reconnect_first_read_deadline_retains_exact_ide
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.01,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.01,
+            protocol_idle_timeout_s=1,
+        ),
     )
     adapter = provider.provider_operations
     assert adapter is not None
@@ -1343,10 +1364,12 @@ async def test_openai_background_reconnect_deadline_is_durable_exact_evidence(
         api_key="test-key",
         background=True,
         transport=transport,
-        transport_idle_timeout_s=1,
-        protocol_idle_timeout_s=1,
-        semantic_progress_timeout_s=0.02,
-        absolute_stream_timeout_s=1,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=1,
+            absolute_stream_timeout_s=1,
+            semantic_progress_timeout_s=0.02,
+            protocol_idle_timeout_s=1,
+        ),
     )
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)

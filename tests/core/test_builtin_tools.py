@@ -26,9 +26,11 @@ from cayu import (
     ArtifactReadResult,
     ArtifactScope,
     ArtifactStore,
+    CayuConfig,
     Environment,
     EnvironmentSpec,
     SecretRedactor,
+    ToolExecutionConfig,
     file_attachment,
 )
 from cayu._validation import thaw_json_value
@@ -6080,8 +6082,11 @@ def test_runtime_allows_configured_file_attachment_byte_limit():
         ]
     )
     app = CayuApp(
-        max_file_attachment_bytes=size_bytes,
-        max_total_file_attachment_bytes=size_bytes,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(
+                max_file_attachment_bytes=size_bytes, max_total_file_attachment_bytes=size_bytes
+            )
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_environment(
@@ -6146,7 +6151,11 @@ def test_runtime_rejects_total_file_attachment_bytes(tmp_path):
             ],
         ]
     )
-    app = CayuApp(max_total_file_attachment_bytes=first.size_bytes)
+    app = CayuApp(
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(max_total_file_attachment_bytes=first.size_bytes)
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(EnvironmentSpec(name="local-dev"), artifact_store=artifact_store),
@@ -6199,7 +6208,11 @@ def test_runtime_counts_duplicate_file_attachment_references_toward_total_limit(
             ],
         ]
     )
-    app = CayuApp(max_total_file_attachment_bytes=artifact.size_bytes)
+    app = CayuApp(
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(max_total_file_attachment_bytes=artifact.size_bytes)
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(EnvironmentSpec(name="local-dev"), artifact_store=artifact_store),
@@ -6260,7 +6273,9 @@ def test_runtime_rejects_file_attachment_count(tmp_path):
             ],
         ]
     )
-    app = CayuApp(max_file_attachments_per_request=1)
+    app = CayuApp(
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_file_attachments_per_request=1))
+    )
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(EnvironmentSpec(name="local-dev"), artifact_store=artifact_store),
@@ -6313,7 +6328,9 @@ def test_runtime_counts_duplicate_file_attachment_references_toward_count_limit(
             ],
         ]
     )
-    app = CayuApp(max_file_attachments_per_request=1)
+    app = CayuApp(
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_file_attachments_per_request=1))
+    )
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(EnvironmentSpec(name="local-dev"), artifact_store=artifact_store),

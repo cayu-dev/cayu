@@ -8,9 +8,11 @@ import pytest
 from cayu import (
     AgentSpec,
     CayuApp,
+    CayuConfig,
     ChildSessionCompleted,
     CorpusComparisonReason,
     EvalCase,
+    EvalConfig,
     EvalPlan,
     EvalStatus,
     EvalSuite,
@@ -228,9 +230,10 @@ def _register_app(
     batches: list[list[ModelStreamEvent]] | None = None,
     *,
     session_store: SessionStore | None = None,
+    config: CayuConfig | None = None,
     provider: ScriptedModelProvider | None = None,
 ) -> CayuApp:
-    app = CayuApp(session_store=session_store, enable_logging=False)
+    app = CayuApp(config=config, session_store=session_store, enable_logging=False)
     app.register_provider(provider or ScriptedModelProvider(batches or []), default=True)
     app.register_agent(AgentSpec(name="first", model="scripted-model"), tools=[_EchoTool()])
     app.register_agent(AgentSpec(name="second", model="scripted-model"), tools=[_EchoTool()])
@@ -1120,8 +1123,12 @@ def test_cancelling_result_projection_closes_owned_execution_without_output() ->
     asyncio.run(run())
 
 
-def test_per_trial_factory_isolates_concurrent_workflow_instances_and_closes_them() -> None:
-    seed_app = _register_app()
+@pytest.mark.parametrize("explicit_concurrency", [None, 2])
+def test_per_trial_factory_isolates_concurrent_workflow_instances_and_closes_them(
+    explicit_concurrency,
+) -> None:
+    config = CayuConfig(evals=EvalConfig(max_concurrency=2))
+    seed_app = _register_app(config=config)
     invocations = []
     closed: list[str] = []
     apps: list[CayuApp] = []
@@ -1133,7 +1140,7 @@ def test_per_trial_factory_isolates_concurrent_workflow_instances_and_closes_the
 
     def factory(invocation):
         invocations.append(invocation)
-        app = _register_app()
+        app = _register_app(config=config)
         apps.append(app)
 
         async def close() -> None:
@@ -1173,7 +1180,7 @@ def test_per_trial_factory_isolates_concurrent_workflow_instances_and_closes_the
         run_workflow_eval_suite(
             target,
             suite,
-            max_concurrency=2,
+            max_concurrency=explicit_concurrency,
             retain_trajectory=True,
         )
     )

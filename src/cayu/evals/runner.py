@@ -768,7 +768,7 @@ async def run_workflow_eval_suite(
     *,
     retain_trajectory: bool = False,
     retain_final_output: bool = True,
-    max_concurrency: int = 1,
+    max_concurrency: int | None = None,
     case_timeout_seconds: float | None = None,
     trials: int = 1,
     execution_capacity: EvalExecutionCapacity | None = None,
@@ -780,6 +780,14 @@ async def run_workflow_eval_suite(
 
     if type(target) is not WorkflowEvalTarget:
         raise TypeError("run_workflow_eval_suite requires an exact WorkflowEvalTarget.")
+    if trial_policy is not None and type(trial_policy) is not EvalSuiteTrialPolicyV1:
+        raise TypeError("trial_policy must be an exact policy or None.")
+    if max_concurrency is None:
+        max_concurrency = (
+            trial_policy.max_concurrency
+            if trial_policy is not None
+            else target.app.config.evals.max_concurrency
+        )
     target_identity = target.identity()
     app_manifest_fingerprint = target.app.describe().fingerprint
     try:
@@ -830,7 +838,7 @@ async def run_eval_suite(
     *,
     retain_trajectory: bool = False,
     retain_final_output: bool = True,
-    max_concurrency: int = 1,
+    max_concurrency: int | None = None,
     case_timeout_seconds: float | None = None,
     trials: int = 1,
     execution_capacity: EvalExecutionCapacity | None = None,
@@ -838,8 +846,9 @@ async def run_eval_suite(
 ) -> EvalRun:
     """Run every case in the suite and aggregate the results.
 
-    `max_concurrency` runs up to that many concrete case trials at once (default 1 =
-    sequential). Results always keep suite and trial order. Note:
+    `max_concurrency` runs up to that many concrete case trials at once. When
+    omitted, an explicit trial policy wins, then `app.config.evals.max_concurrency`
+    (default 1 = sequential). Results always keep suite and trial order. Note:
     `ScriptedModelProvider` consumes batches by positional request index, so with
     concurrency > 1 interleaved cases may pull each other's batches — keep the
     default for scripted multi-case suites.
@@ -855,6 +864,16 @@ async def run_eval_suite(
     evaluated. It cannot be combined with trajectory retention because a retained
     trajectory must remain lossless.
     """
+    if not isinstance(app, CayuApp):
+        raise TypeError("run_eval_suite requires a CayuApp.")
+    if trial_policy is not None and type(trial_policy) is not EvalSuiteTrialPolicyV1:
+        raise TypeError("run_eval_suite trial_policy must be an exact policy or None.")
+    if max_concurrency is None:
+        max_concurrency = (
+            trial_policy.max_concurrency
+            if trial_policy is not None
+            else app.config.evals.max_concurrency
+        )
     run, _ = await _run_eval_suite(
         app,
         suite,
@@ -1081,7 +1100,7 @@ async def run_eval_plan(
     corpus: EvalCorpusDocument | None = None,
     suite_id: str | None = None,
     retain_trajectory: bool = False,
-    max_concurrency: int = 1,
+    max_concurrency: int | None = None,
     case_timeout_seconds: float | None = None,
     trials: int | None = None,
     execution_capacity: EvalExecutionCapacity | None = None,

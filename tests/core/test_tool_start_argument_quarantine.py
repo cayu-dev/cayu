@@ -16,9 +16,11 @@ from tests.core._workload_secret_support import (
 
 from cayu import (
     ArtifactExternalizingToolResultPolicy,
+    CayuConfig,
     LocalArtifactStore,
     PostgresSessionStore,
     SQLiteSessionStore,
+    ToolExecutionConfig,
 )
 from cayu.core import (
     AgentSpec,
@@ -2079,7 +2081,9 @@ async def _run_failed_execution_scenario(*, timed_out: bool) -> None:
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        tool_timeout_seconds=0.01 if timed_out else None,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.01 if timed_out else None)
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_environment(
@@ -2178,7 +2182,7 @@ def test_tool_timeout_does_not_wait_for_a_nonresponsive_secret_resolver(
         app = CayuApp(
             session_store=store,
             enable_logging=False,
-            tool_timeout_seconds=0.01,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.01)),
         )
         app.register_provider(provider, default=True)
         app.register_environment(
@@ -2636,7 +2640,9 @@ async def _run_multi_call_secret_scope_scenario(*, max_parallel_tool_calls: int)
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        max_parallel_tool_calls=max_parallel_tool_calls,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+        ),
         runtime_hooks=[hook],
     )
     app.register_provider(provider, default=True)
@@ -2754,7 +2760,9 @@ def test_multi_call_round_redacts_arguments_when_only_a_sibling_resolves_the_sec
         app = CayuApp(
             session_store=store,
             enable_logging=False,
-            max_parallel_tool_calls=max_parallel_tool_calls,
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+            ),
             runtime_hooks=[hook],
         )
         app.register_provider(provider, default=True)
@@ -2862,7 +2870,9 @@ def test_multi_call_policy_denial_omits_output_before_a_sibling_resolves_its_sec
             event_sinks=[sink],
             runtime_hooks=[hook],
             enable_logging=False,
-            max_parallel_tool_calls=max_parallel_tool_calls,
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+            ),
         )
         app.register_provider(provider, default=True)
         app.register_environment(
@@ -3099,7 +3109,9 @@ def test_multi_call_result_redacts_argument_before_a_sibling_resolves_its_secret
             event_sinks=[sink],
             runtime_hooks=[hook],
             enable_logging=False,
-            max_parallel_tool_calls=max_parallel_tool_calls,
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+            ),
         )
         app.register_provider(provider, default=True)
         app.register_environment(
@@ -3844,7 +3856,11 @@ def test_mid_round_limit_publishes_completed_stage_before_interrupting(monkeypat
             ]
         )
         tool = AdvanceClockTool()
-        app = CayuApp(session_store=store, max_parallel_tool_calls=1, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=1)),
+            enable_logging=False,
+        )
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
@@ -4199,7 +4215,9 @@ def test_dynamic_multi_call_preserves_unrelated_results_without_secret_resolutio
                 SecretRedactor() if structural_secret is None else SecretRedactor(structural_secret)
             ),
             enable_logging=False,
-            max_parallel_tool_calls=max_parallel_tool_calls,
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+            ),
         )
         app.register_provider(provider, default=True)
         app.register_environment(
@@ -4479,7 +4497,9 @@ def test_multi_call_before_hook_output_redacts_before_a_sibling_resolves_its_sec
             event_sinks=[sink],
             runtime_hooks=[hook],
             enable_logging=False,
-            max_parallel_tool_calls=max_parallel_tool_calls,
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+            ),
         )
         app.register_provider(provider, default=True)
         app.register_environment(

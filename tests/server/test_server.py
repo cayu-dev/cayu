@@ -134,6 +134,7 @@ from cayu.runtime._event_projection import (
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.provider_operations import (
     PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES,
 )
@@ -2941,11 +2942,13 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     captured: list[int] = []
+    captured_explicitness: list[bool] = []
     captured_targets: list[ModelTarget | None] = []
     original_run = app.run
 
     def spy_run(request: RunRequest):
         captured.append(request.max_steps)
+        captured_explicitness.append("max_steps" in request.model_fields_set)
         captured_targets.append(request.target)
         return original_run(request)
 
@@ -2970,7 +2973,8 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
         assert response.status_code == 200
         list(response.iter_lines())
 
-    assert captured == [20, 7]
+    assert captured == [DEFAULT_MAX_STEPS, 7]
+    assert captured_explicitness == [False, True]
     assert captured_targets == [
         None,
         ModelTarget(provider_name="fake", model="request-model"),

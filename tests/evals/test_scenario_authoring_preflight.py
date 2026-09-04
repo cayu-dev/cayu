@@ -14,6 +14,7 @@ from cayu import (
     AlwaysRequireApprovalToolPolicy,
     ArtifactScope,
     CayuApp,
+    CayuConfig,
     CorpusExecutionLimits,
     CorpusTarget,
     Environment,
@@ -40,6 +41,7 @@ from cayu import (
     StaticVault,
     Tool,
     ToolContext,
+    ToolExecutionConfig,
     ToolResult,
     ToolSpec,
     compile_eval_scenario_draft,
@@ -72,9 +74,13 @@ def _target(
 ) -> CorpusTarget:
     app = CayuApp(
         enable_logging=False,
-        max_file_attachment_bytes=max_file_attachment_bytes,
-        max_total_file_attachment_bytes=max_total_file_attachment_bytes,
-        max_file_attachments_per_request=max_file_attachments_per_request,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(
+                max_file_attachment_bytes=max_file_attachment_bytes,
+                max_file_attachments_per_request=max_file_attachments_per_request,
+                max_total_file_attachment_bytes=max_total_file_attachment_bytes,
+            )
+        ),
     )
     app.register_provider(ScriptedModelProvider([]), default=True)
     agent = AgentSpec(name="assistant", model="scenario-model")

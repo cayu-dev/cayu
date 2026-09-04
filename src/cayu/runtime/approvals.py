@@ -29,6 +29,7 @@ from cayu.runtime._run_limit_accounting import (
 )
 from cayu.runtime._tool_argument_publication import pause_checkpoint_validation_view
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
+from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -173,7 +174,7 @@ class ToolApprovalRequest(BaseModel):
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
@@ -275,7 +276,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
@@ -556,7 +557,7 @@ class PendingToolApproval(BaseModel):
     tool_calls: list[PendingToolCallApproval]
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -741,7 +742,7 @@ class PendingToolApprovalEventView(BaseModel):
     tool_calls: list[PendingToolCallApprovalEventView]
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None

@@ -2,6 +2,47 @@
 
 This is a design/maintainer document for Cayu's production agent runtime. It names contracts that must stay stable as the runtime evolves.
 
+## Application Runtime Configuration
+
+`CayuConfig` is the immutable application tuning API. `CayuApp()` uses a
+64-step model budget; the supported maximum is 256. Configure alternatives
+directly in Python:
+
+```python
+from cayu import CayuApp, CayuConfig, EvalConfig, RunDefaults
+
+app = CayuApp(config=CayuConfig(
+    run=RunDefaults(max_steps=128),
+    evals=EvalConfig(max_concurrency=100),
+))
+```
+
+Explicit invocation and workflow-role settings take precedence over application
+defaults. An explicit `max_steps=16` remains a deliberate 16-step allowance.
+Admission records resolved invocation settings and execution-profile identity
+before execution. Recovery uses recorded semantics; missing required invocation
+settings are rejected, with no historical 16-step or current-default fallback.
+Profile-only recovery authentication retains recorded component identities and
+does not invent execution settings.
+
+`cayu inspect --json` exposes configuration values, owners, and sources
+(`framework`, `application`, or `explicit`). Application tuning is supplied
+through `config=`; individual tuning constructor aliases and named presets are
+not supported. Provider/store injection remains independent of configuration.
+
+Evaluation concurrency defaults to 1 and supports values through 100. Explicit
+runner concurrency wins over an explicit suite policy, which wins over the
+application default for direct and workflow evaluation. Overrides must fit the
+suite policy. Portable corpus suites retain their recorded policies; durable
+workers use recorded launch settings. These defaults do not replace aggregate
+`EvalExecutionCapacity` or raise trusted target limits.
+
+Generated agent, service, and coding presets share one application layout.
+`configuration/settings.py` owns environment reads and validation;
+`configuration/runtime.py` constructs `CayuConfig` directly. Per-run overrides
+remain at the invocation boundary. Schema versions and internal validation
+ceilings remain feature-owned contracts rather than application settings.
+
 ## Boundary Data
 
 Runtime boundary data should be portable across local processes, remote runners, hosted runtimes, event stores, dashboards, and replay tools.
@@ -6012,7 +6053,7 @@ Turns messages into event streams using:
 
 The initial `CayuApp` runtime registers agent specs, model providers, and tools, then emits and persists events for one session run. A run may make multiple model requests: model output can request tools, the runtime executes those tools, appends assistant `tool_call` messages and matching `tool_result` messages, and calls the model again until the model completes without tool calls or consumes `RunRequest.max_steps`. If the model still requests continuation after that final allowed step, Cayu treats the configured boundary as a controlled pause: it emits `session.limit_reached` with `limit="model_steps"`, `maximum` equal to the configured allowance, and `actual` equal to the consumed steps; records the turn as interrupted; and emits `session.interrupted` with `interruption_type="limit_reached"` after transitioning the durable session to the resumable `interrupted` state. A later `resume(...)` invocation supplies a fresh `max_steps` allowance and continues from the durable transcript. Multiple tool calls from one model step are grouped into one assistant message and one tool-result message in Cayu's internal transcript. Provider adapters must emit a `completed` stream event for each model step; a stream that ends silently is treated as a failed runtime contract.
 
-The tool calls in one model step run concurrently by default, bounded by a semaphore of size `CayuApp(max_parallel_tool_calls=…)` (default 4); set it to `1` to force fully sequential execution. Concurrency cuts wall-clock time when a step emits several independent, I/O-bound calls. A tool whose `ToolSpec.parallel_safe` is `False` (the default is `True`) is an ordering **barrier** — it runs alone in its model-order position, after everything before it and before everything after it — the opt-out for tools with side effects or single-threaded backends. `parallel_safe` controls ordering only; it is intentionally separate from `ToolSpec.effect`, which describes retry/idempotency semantics. Execution preserves the model's tool-call order: a round is split into ordered segments where each contiguous run of `parallel_safe` calls executes concurrently and each `parallel_safe=False` call runs by itself, so `[safe A, safe B, unsafe C, safe D]` runs as concurrent `A/B`, then `C`, then `D` (never `A/B/D` before `C`, which would read-after-write). The built-in mutating tools (`exec_command`, `write_file`, `remember_knowledge`, and the spawning subagent tool) ship with `parallel_safe=False`; pure readers keep the default ordering. `read_file` is effect-conservative even though it is read-oriented, because workspace image/PDF reads can create artifact snapshots. Approval and `ask_user` are unaffected: policy is evaluated before execution and a round that requires approval or asks the user pauses before any tool runs, so a concurrent segment only ever contains already-authorized calls. The persisted `tool_result` message keeps the model's tool-call order regardless of completion order. A round is projected against `max_tool_calls`, token, and cost limits once before execution begins; because a concurrent batch cannot be stopped part-way, a batch of cost-incurring tools can overshoot a token/cost budget that a cap of `1` would have caught between calls. If a session is interrupted mid-batch, calls that already finished are recorded as completed (not re-run on resume); only unfinished calls are marked interrupted.
+The tool calls in one model step run concurrently by default, bounded by a semaphore of size `CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=…))` (default 4); set it to `1` to force fully sequential execution. Concurrency cuts wall-clock time when a step emits several independent, I/O-bound calls. A tool whose `ToolSpec.parallel_safe` is `False` (the default is `True`) is an ordering **barrier** — it runs alone in its model-order position, after everything before it and before everything after it — the opt-out for tools with side effects or single-threaded backends. `parallel_safe` controls ordering only; it is intentionally separate from `ToolSpec.effect`, which describes retry/idempotency semantics. Execution preserves the model's tool-call order: a round is split into ordered segments where each contiguous run of `parallel_safe` calls executes concurrently and each `parallel_safe=False` call runs by itself, so `[safe A, safe B, unsafe C, safe D]` runs as concurrent `A/B`, then `C`, then `D` (never `A/B/D` before `C`, which would read-after-write). The built-in mutating tools (`exec_command`, `write_file`, `remember_knowledge`, and the spawning subagent tool) ship with `parallel_safe=False`; pure readers keep the default ordering. `read_file` is effect-conservative even though it is read-oriented, because workspace image/PDF reads can create artifact snapshots. Approval and `ask_user` are unaffected: policy is evaluated before execution and a round that requires approval or asks the user pauses before any tool runs, so a concurrent segment only ever contains already-authorized calls. The persisted `tool_result` message keeps the model's tool-call order regardless of completion order. A round is projected against `max_tool_calls`, token, and cost limits once before execution begins; because a concurrent batch cannot be stopped part-way, a batch of cost-incurring tools can overshoot a token/cost budget that a cap of `1` would have caught between calls. If a session is interrupted mid-batch, calls that already finished are recorded as completed (not re-run on resume); only unfinished calls are marked interrupted.
 
 Registered tools declare their provider-facing JSON Schema through
 `ToolSpec.input_schema`; the default `Tool.schema` property exposes that value,
@@ -8081,26 +8122,27 @@ finite positive values: `transport_idle_timeout_s` observes raw response bytes,
 reasoning, content, tool calls, hosted-tool activity, citations, usage, or
 terminal progress, and `absolute_stream_timeout_s` caps the active streaming
 dispatch until an authoritative terminal response is accepted. Their defaults
-are 120, 120, 120, and 600 seconds respectively:
+are 120, 120, 120, and 600 seconds respectively. Configure the six bundled
+providers with one immutable `ProviderStreamDeadlines` policy:
 
 ```python
+from cayu.providers import OpenAIProvider, ProviderStreamDeadlines
+
+
 OpenAIProvider(
     timeout_s=600,
-    transport_idle_timeout_s=120,
-    protocol_idle_timeout_s=120,
-    semantic_progress_timeout_s=120,
-    absolute_stream_timeout_s=600,
+    stream_deadlines=ProviderStreamDeadlines(
+        transport_idle_timeout_s=120,
+        protocol_idle_timeout_s=120,
+        semantic_progress_timeout_s=120,
+        absolute_stream_timeout_s=600,
+    ),
 )
 ```
 
-For provider-constructor compatibility, the six bundled providers still accept
-the former `stream_idle_timeout_s` keyword. It assigns the same finite positive
-value to the transport, protocol, and semantic idle clocks while leaving the
-absolute clock independently configurable. The alias cannot be combined with a
-non-default value for any of the three new idle-clock keywords. Exported custom
-transport protocols must migrate to the four explicit deadline keywords; Cayu
-does not adapt the former transport signature because a single legacy argument
-cannot preserve distinct raw-transport and decoded-protocol clock ownership.
+`stream_deadlines` is the sole bundled-provider deadline configuration input.
+Custom transport protocols receive the four explicit clocks independently,
+preserving transport and decoded-protocol ownership.
 
 Comments, heartbeats, incomplete lines, empty or duplicate deltas, and unknown
 events do not count as semantic progress. Custom `ModelProvider` implementations

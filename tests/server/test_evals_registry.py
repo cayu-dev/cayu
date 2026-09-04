@@ -22,12 +22,15 @@ from cayu import (
     EvalRunInvocation,
     EvalScenarioRunInvocation,
     Message,
+    RunDefaults,
+    RunRequest,
     SecretRedactor,
     default_price_book,
 )
 from cayu.evals.execution import evaluation_target_identity
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.project_control_plane import ProjectEvalJudgeConfiguration
+from cayu.runtime.config import DEFAULT_MAX_STEPS, CayuConfig
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginClaim,
@@ -156,7 +159,7 @@ def test_generated_registry_maps_each_agent_to_normal_authority_without_serializ
         assert entry.max_trials == 1
         assert entry.max_concurrency == 1
         assert entry.max_timeout_seconds == 3_600
-        assert entry.max_steps == 16
+        assert entry.max_steps == DEFAULT_MAX_STEPS
         assert entry.cost_budget_available is False
         assert entry.cost_budget_currencies == ()
         assert entry.judge_profiles == ()
@@ -166,6 +169,45 @@ def test_generated_registry_maps_each_agent_to_normal_authority_without_serializ
         assert runtime_target.request_base.agent_name == entry.agent_name
         assert runtime_target.request_base.messages == []
         assert runtime_target.application_release_id == "release-one"
+
+
+def test_eval_registry_resolves_app_max_steps_and_preserves_explicit_override() -> None:
+    async def scenario() -> None:
+        app = CayuApp(config=CayuConfig(run=RunDefaults(max_steps=128)), enable_logging=False)
+        app.register_provider(_provider(), default=True)
+        app.register_agent(AgentSpec(name="agent", model="fixture-model"))
+        manifest = app.describe()
+        generated = generated_eval_target_registry(
+            app,
+            project_id="configured-registry-project",
+            application_release_id="configured-registry-release",
+            app_manifest_fingerprint=manifest.fingerprint,
+        )
+        assert generated is not None
+
+        generated_entry = generated.catalog().items[0]
+        generated_profile = await generated.prepare_execution_profile(generated_entry.target_key)
+        assert generated_entry.max_steps == 128
+        assert generated_profile.snapshot.ceilings.max_steps == 128
+
+        explicit_target = CorpusTarget(
+            key="configured-explicit-target",
+            app=app,
+            request_base=RunRequest(
+                agent_name="agent",
+                messages=[],
+                max_steps=80,
+            ),
+            application_release_id="configured-registry-release",
+            limits=CorpusExecutionLimits(),
+        )
+        explicit = explicit_eval_target_registry(explicit_target)
+        explicit_entry = explicit.catalog().items[0]
+        explicit_profile = await explicit.prepare_execution_profile(explicit_target.key)
+        assert explicit_entry.max_steps == 80
+        assert explicit_profile.snapshot.ceilings.max_steps == 80
+
+    asyncio.run(scenario())
 
 
 def test_generated_registry_publishes_only_an_explicit_declarative_judge() -> None:

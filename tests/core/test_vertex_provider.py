@@ -12,10 +12,12 @@ from cayu import (
     AgentSpec,
     AnthropicProvider,
     CayuApp,
+    CayuConfig,
     EventType,
     Message,
     RecentTurnsContextPolicy,
     RetryPolicy,
+    RunDefaults,
     RunRequest,
     StructuredOutputSpec,
 )
@@ -1194,7 +1196,9 @@ async def test_runtime_does_not_recover_from_conflicting_vertex_413(
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
     app = CayuApp(
         enable_logging=False,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(_provider(HttpxVertexTransport()), default=True)
     app.register_agent(
@@ -1304,7 +1308,9 @@ async def test_runtime_does_not_retry_conflicting_buffered_vertex_identity(
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
     app = CayuApp(
         enable_logging=False,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(_provider(HttpxVertexTransport()), default=True)
     app.register_agent(AgentSpec(name="assistant", model="claude-sonnet-4-6"))

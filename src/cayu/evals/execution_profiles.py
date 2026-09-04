@@ -36,6 +36,7 @@ from cayu.evals.execution import (
     CorpusTarget,
     WorkflowEvalTarget,
 )
+from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.sessions import copy_run_request
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -229,7 +230,7 @@ class EvalExecutionResourceCeilingsV1(BaseModel):
         ge=1,
         le=CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS,
     )
-    max_steps: StrictInt = Field(ge=1, le=256)
+    max_steps: StrictInt = Field(ge=1, le=MAX_STEPS)
     run_limits: RunLimits
 
     @field_validator("run_limits", mode="before")
@@ -492,8 +493,11 @@ async def prepare_eval_execution_profile(
     if policy.max_concurrency > target.limits.max_concurrency:
         raise ValueError("Eval execution profile concurrency ceiling exceeds its target authority.")
 
-    prepared = await target.app._session_engine._prepare_initial_run(
+    request = target.app._with_application_run_defaults(
         copy_run_request(target.request_base),
+    )
+    prepared = await target.app._session_engine._prepare_initial_run(
+        request,
         admit_session=False,
     )
     if prepared is None:

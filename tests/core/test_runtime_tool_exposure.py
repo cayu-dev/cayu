@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 import cayu.runtime.execution_profiles as execution_profiles
+from cayu import CayuConfig, RunDefaults
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.events import (
     event_with_runtime_envelope_authority,
@@ -1521,7 +1522,9 @@ def test_one_exposure_snapshot_is_reused_for_retry_and_overflow_recovery(
     provider = _RecoveringProvider()
     policy = _PhaseExposurePolicy()
     app = CayuApp(
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
         request_footprint=RequestFootprintConfig(
             fingerprint_key_id="frozen-exposure",
             fingerprint_key="frozen-exposure-test-key-material-0001",

@@ -913,13 +913,28 @@ domain behavior; `cayu check` keeps the tracer-bullet warning active until the
 explicit authoring marker is removed.
 """
 
+_SERVICE_SETTINGS_APPEND = '''
+
+
+def configured_product_auth_tokens_json() -> str | None:
+    """Return the serialized product-token mapping without interpreting secrets."""
+
+    return os.environ.get("PRODUCT_AUTH_TOKENS_JSON")
+
+
+def configured_operator_bearer_token() -> str | None:
+    """Return the configured operator credential for service authentication."""
+
+    return os.environ.get("CAYU_OPERATOR_BEARER_TOKEN")
+'''
+
+
 _SERVICE_PY = '''"""Maintained public-service factory for __PROJECT_NAME__."""
 
 from __future__ import annotations
 
 import hmac
 import json
-import os
 import re
 
 from fastapi import HTTPException, Request
@@ -942,6 +957,10 @@ from cayu.server import (
 )
 
 from app import build_app
+from configuration.settings import (
+    configured_operator_bearer_token,
+    configured_product_auth_tokens_json,
+)
 from product_store import SQLiteProductOperationStore
 
 _BEARER_TOKEN_RE = re.compile(r"[-A-Za-z0-9._~+/]+=*", flags=re.ASCII)
@@ -977,7 +996,7 @@ async def _development_product_auth(request: Request) -> ProductPrincipal:
 
 
 def _configured_product_principals() -> dict[str, ProductPrincipal] | None:
-    raw = os.environ.get("PRODUCT_AUTH_TOKENS_JSON")
+    raw = configured_product_auth_tokens_json()
     try:
         configured = json.loads(raw) if raw else None
     except json.JSONDecodeError:
@@ -1019,9 +1038,7 @@ def _production_product_access():
 
 
 def _production_operator_access() -> ServerAccessConfig | PlaceholderOperatorAccess:
-    configured_token = _validated_bearer_token(
-        os.environ.get("CAYU_OPERATOR_BEARER_TOKEN")
-    )
+    configured_token = _validated_bearer_token(configured_operator_bearer_token())
     if configured_token is None:
         return PlaceholderOperatorAccess()
     product_principals = _configured_product_principals()
@@ -1836,6 +1853,11 @@ def profiled_session_identity(
                 )
             ),
             registered_provider=app._providers.get(provider_name),
+            finalization=execution_profile_admission.model_finalization_material(
+                max_steps=app.config.run.max_steps,
+                limits=app.config.run.copy_limits(),
+                retry_policy=app.config.run.retry_policy,
+            ),
         ),
     )
 
@@ -3578,6 +3600,9 @@ def project_files(
     )
     files.update(
         {
+            "configuration/settings.py": (
+                files["configuration/settings.py"] + _SERVICE_SETTINGS_APPEND
+            ),
             "service.py": render(_SERVICE_PY),
             "product_store.py": _PRODUCT_STORE_PY,
             "tests/test_public_service_security.py": _SERVICE_SECURITY_TEST_PY,

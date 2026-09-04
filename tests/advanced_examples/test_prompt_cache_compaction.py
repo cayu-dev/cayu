@@ -32,7 +32,7 @@ from cayu import (
     SessionStatus,
     ToolEffect,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, ProviderStreamDeadlines
 
 
 def test_stable_context_loader_declares_its_read_only_effect() -> None:
@@ -42,10 +42,12 @@ def test_stable_context_loader_declares_its_read_only_effect() -> None:
 def test_prompt_cache_recording_provider_forwards_stream_deadlines() -> None:
     delegate = AnthropicProvider(
         api_key="test-key",
-        transport_idle_timeout_s=11,
-        protocol_idle_timeout_s=12,
-        semantic_progress_timeout_s=13,
-        absolute_stream_timeout_s=14,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=11,
+            semantic_progress_timeout_s=13,
+            protocol_idle_timeout_s=12,
+            absolute_stream_timeout_s=14,
+        ),
     )
     provider = RecordingProvider(delegate)
 

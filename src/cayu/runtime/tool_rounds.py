@@ -17,6 +17,7 @@ from cayu.runtime.approvals import (
     copy_resolution_actor,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -54,7 +55,7 @@ class ToolRoundRecoveryRequest(BaseModel):
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None

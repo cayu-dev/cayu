@@ -18,6 +18,7 @@ from cayu import (
     AgentSpec,
     BudgetLimit,
     CayuApp,
+    CayuConfig,
     Event,
     EventType,
     ExecutionProfileBehaviorIdentity,
@@ -29,6 +30,7 @@ from cayu import (
     RecentTurnsContextPolicy,
     ResumeRequest,
     RetryPolicy,
+    RunDefaults,
     RunRequest,
     SQLiteSessionStore,
     file_attachment,
@@ -8254,7 +8256,9 @@ def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
     provider = OpenAIProvider(api_key="test-key", transport=transport)
     app = CayuApp(
         session_store=store,
-        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        config=CayuConfig(
+            run=RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))

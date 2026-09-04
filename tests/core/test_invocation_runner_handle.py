@@ -22,6 +22,7 @@ import cayu.runtime._invocation_secrets as invocation_secrets_module
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._resources as resources_module
 import cayu.tools._runner as runner_module
+from cayu import CayuConfig, ToolExecutionConfig
 from cayu._exception_groups import iter_exception_tree
 from cayu._task_wait import capture_awaitable_outcome
 from cayu._validation import compact_json_utf8_size
@@ -2002,7 +2003,7 @@ def test_parallel_runner_cleanup_failures_cross_task_group_cancellation() -> Non
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        max_parallel_tool_calls=2,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=2)),
     )
     app.register_provider(provider, default=True)
     app.register_environment(
@@ -2177,7 +2178,7 @@ def test_parallel_grouped_child_cancellation_preserves_runner_cleanup_failure() 
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        max_parallel_tool_calls=2,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=2)),
     )
     app.register_provider(provider, default=True)
     app.register_environment(

@@ -26,7 +26,13 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, build_openai_payload
+from cayu.providers import (
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    ProviderStreamDeadlines,
+    build_openai_payload,
+)
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage import KnowledgeEntry, KnowledgeHit, KnowledgeQuery, KnowledgeSearchResult
 
@@ -396,10 +402,12 @@ def test_tool_result_projection_recording_provider_forwards_request_analysis_hoo
     delegate = tool_result_projection_live.AnthropicProvider(
         api_key="test-key",
         max_tokens=321,
-        transport_idle_timeout_s=11,
-        protocol_idle_timeout_s=12,
-        semantic_progress_timeout_s=13,
-        absolute_stream_timeout_s=14,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=11,
+            absolute_stream_timeout_s=14,
+            semantic_progress_timeout_s=13,
+            protocol_idle_timeout_s=12,
+        ),
         cache_policy=CachePolicy(
             breakpoints=(
                 CacheBreakpoint.SYSTEM_PROMPT,

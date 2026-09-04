@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 
+from cayu import CayuConfig, ToolExecutionConfig
 from cayu.core import AgentSpec, Event, EventType, Message, ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
@@ -270,7 +271,9 @@ def _build(
     app = CayuApp(
         session_store=InMemorySessionStore(),
         enable_logging=False,
-        max_parallel_tool_calls=max_parallel_tool_calls,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+        ),
     )
     app.register_provider(_ScriptedProvider(tool_calls), default=True)
     app.register_agent(
@@ -492,7 +495,7 @@ def test_remember_knowledge_timeout_returns_while_owned_publication_finishes() -
         app = CayuApp(
             session_store=session_store,
             enable_logging=False,
-            tool_timeout_seconds=0.05,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.05)),
         )
         app.register_provider(
             _ScriptedProvider(
@@ -743,7 +746,7 @@ def test_remember_knowledge_timeout_abandons_cancellation_resistant_read(
         app = CayuApp(
             session_store=session_store,
             enable_logging=False,
-            tool_timeout_seconds=0.05,
+            config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.05)),
         )
         app.register_provider(
             _ScriptedProvider(

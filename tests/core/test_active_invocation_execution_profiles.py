@@ -21,6 +21,7 @@ from cayu import (
     BudgetLimit,
     BudgetPolicy,
     CayuApp,
+    CayuConfig,
     CheckpointCompactionContextPolicy,
     ContextCountingConfig,
     ContextCountingMode,
@@ -65,6 +66,7 @@ from cayu import (
     ResolutionActorSource,
     ResumeRequest,
     RetryPolicy,
+    RunDefaults,
     RunLimits,
     RunRequest,
     RuntimeBuildProvenance,
@@ -1178,7 +1180,7 @@ def test_fork_current_child_profile_requires_and_records_authorized_adoption(
         )
         source_app = CayuApp(
             session_store=store,
-            retry_policy=retry_policy,
+            config=CayuConfig(run=RunDefaults(retry_policy=retry_policy)),
             enable_logging=False,
         )
         source_app.register_provider(source_provider, default=True)
@@ -1202,7 +1204,7 @@ def test_fork_current_child_profile_requires_and_records_authorized_adoption(
         policy = RecordingAdoptionPolicy()
         fork_app = CayuApp(
             session_store=store,
-            retry_policy=retry_policy,
+            config=CayuConfig(run=RunDefaults(retry_policy=retry_policy)),
             enable_logging=False,
             execution_profile_policy=policy,
         )

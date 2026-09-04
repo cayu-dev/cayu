@@ -8,6 +8,7 @@ import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 from tests.core._execution_profile_fixtures import create_admitted_session
 
+from cayu import CayuConfig, ToolExecutionConfig
 from cayu.core import (
     AgentSpec,
     Event,
@@ -176,7 +177,9 @@ def _register_runtime(
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        max_parallel_tool_calls=max_parallel_tool_calls,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+        ),
         secret_redactor=secret_redactor,
     )
     app.register_provider(provider, default=True)
@@ -210,6 +213,7 @@ async def _publish_structured_model_step(
     )
     tool_capability_ceiling = ToolCapabilityCeiling(tool_names=tuple(tool.name for tool in tools))
     execution_profile = session_engine_module._execution_profile_identity(
+        max_steps=64,
         registered_agent=profile_app._agents["assistant"],
         provider_name=provider.name,
         registered_provider=profile_app._providers[provider.name],

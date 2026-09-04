@@ -50,6 +50,26 @@ _RESERVED_TEMPLATE_TOKENS = (
 )
 
 
+def _assert_generated_configuration_boundary(project: Path) -> None:
+    """Keep maintained application configuration reads in one owned module."""
+
+    settings = project / "configuration" / "settings.py"
+    assert settings.is_file()
+    assert "os.environ" in settings.read_text(encoding="utf-8")
+    forbidden = (
+        "os.environ",
+        "os.getenv",
+        "public_authority_alias_codec_from_environment(",
+    )
+    for path in project.rglob("*.py"):
+        relative = path.relative_to(project)
+        if path == settings or relative.parts[0] == "tests":
+            continue
+        source = path.read_text(encoding="utf-8")
+        for marker in forbidden:
+            assert marker not in source, f"{relative} bypasses configuration/settings.py"
+
+
 def _bypass_coding_dependency_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep non-probe scaffold tests independent of host ripgrep availability."""
 
@@ -121,6 +141,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
 
     assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
     proj = tmp_path / "myproj"
+    _assert_generated_configuration_boundary(proj)
     for filename in (
         "app.py",
         "configuration/settings.py",
@@ -228,7 +249,11 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert 'eval_target = "evals.agent:build_eval"' in pyproject
     assert '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"' in pyproject
     assert 'else SQLiteSessionStore(\n                "data/cayu.db",' in storage_source
-    assert "public_authority_alias_codec_from_environment()" in storage_source
+    assert "configured_public_authority_alias_codec()" in storage_source
+    assert "public_authority_alias_codec_from_environment()" in configuration_source
+    assert "os.environ" not in provider_source
+    assert "os.environ" not in storage_source
+    assert "config=runtime.config" in app_source
     assert 'SQLiteTaskStore("data/cayu.db")' in storage_source
     assert "sessions.sqlite" not in storage_source
     assert "def build_app(" in app_source
@@ -335,6 +360,7 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
     _bypass_coding_dependency_preflight(monkeypatch)
     assert main(["new", "coder", "--preset", "coding", "--dir", str(tmp_path)]) == 0
     project = tmp_path / "coder"
+    _assert_generated_configuration_boundary(project)
 
     for filename in (
         "environments/command_probe.py",
@@ -394,9 +420,11 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
         encoding="utf-8"
     )
     assert "mode=SubagentExecutionMode.BACKGROUND" in composition
-    assert 'os.environ.get("CAYU_WORKSPACE_ROOT", ".")' in (
-        project / "environments/coding.py"
-    ).read_text(encoding="utf-8")
+    settings_source = (project / "configuration/settings.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("CAYU_WORKSPACE_ROOT", ".")' in settings_source
+    assert "configured_coding_workspace_root()" in (project / "environments/coding.py").read_text(
+        encoding="utf-8"
+    )
     assert "inherit_env=False" in composition
     assert '_STATE_ROOT = _PROJECT_ROOT / ".cayu" / "runtime"' in composition
     assert "excluded_directory_names=_PROTECTED_WORKSPACE_DIRECTORY_NAMES" in composition
@@ -1436,6 +1464,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
 ) -> None:
     assert main(["new", "myservice", "--preset", "service", "--dir", str(tmp_path)]) == 0
     project = tmp_path / "myservice"
+    _assert_generated_configuration_boundary(project)
 
     for filename in (
         "service.py",
@@ -1450,6 +1479,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert 'factory = "app:build_app"' in pyproject
 
     service_source = (project / "service.py").read_text(encoding="utf-8")
+    settings_source = (project / "configuration/settings.py").read_text(encoding="utf-8")
     product_store_source = (project / "product_store.py").read_text(encoding="utf-8")
     assert "create_agent_service(" in service_source
     assert "await asyncio.to_thread" in product_store_source
@@ -1468,8 +1498,10 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert "ProjectControlPlaneContext" in service_source
     assert "project_context: ProjectControlPlaneContext | None = None" in service_source
     assert "project_context=project_context" in service_source
-    assert "PRODUCT_AUTH_TOKENS_JSON" in service_source
-    assert "CAYU_OPERATOR_BEARER_TOKEN" in service_source
+    assert "PRODUCT_AUTH_TOKENS_JSON" in settings_source
+    assert "CAYU_OPERATOR_BEARER_TOKEN" in settings_source
+    assert "configured_product_auth_tokens_json()" in service_source
+    assert "configured_operator_bearer_token()" in service_source
     assert "@app." not in service_source
     assert "create_agent_service(" in service_source
 
@@ -2347,3 +2379,41 @@ def test_cayu_new_rejects_an_invalid_explicit_agent_name_before_creating_files(
 
     assert "invalid agent name 'code review agent'" in capsys.readouterr().err
     assert not (tmp_path / "valid-project").exists()
+
+
+@pytest.mark.parametrize("preset", ["agent", "service", "coding"])
+def test_generated_presets_apply_runtime_configuration(tmp_path, monkeypatch, preset):
+    _bypass_coding_dependency_preflight(monkeypatch)
+    assert (
+        main(
+            [
+                "new",
+                "configured-app",
+                "--preset",
+                preset,
+                "--dir",
+                str(tmp_path),
+                "--without",
+                "knowledge",
+                "--without",
+                "memory",
+            ]
+        )
+        == 0
+    )
+    project = tmp_path / "configured-app"
+    runtime_path = project / "configuration" / "runtime.py"
+    source = runtime_path.read_text()
+    source = source.replace(
+        "from cayu import CayuConfig,", "from cayu import CayuConfig, RunDefaults,"
+    )
+    source = source.replace(
+        "config=CayuConfig(),", "config=CayuConfig(run=RunDefaults(max_steps=96)),"
+    )
+    runtime_path.write_text(source)
+    _assert_generated_configuration_boundary(project)
+    with project_context(project):
+        module = importlib.import_module("app")
+        app = module.build_app(provider=ScriptedModelProvider([]))
+        assert app.config.run.max_steps == 96
+        assert app.describe().runtime.configuration.values["run"]["max_steps"] == 96

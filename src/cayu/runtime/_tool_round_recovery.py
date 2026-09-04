@@ -41,6 +41,7 @@ from cayu.runtime.approvals import (
     copy_distinct_pending_tool_call_approvals,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -113,7 +114,7 @@ class PendingToolRound(BaseModel):
     staged_terminals: list[StagedToolCallTerminal] = Field(default_factory=list)
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
-    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None

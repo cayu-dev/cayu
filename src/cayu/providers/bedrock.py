@@ -63,11 +63,6 @@ from cayu.providers.base import (
     _terminal_preserving_provider_stream,
 )
 from cayu.providers.deadlines import (
-    DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
-    DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
-    DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
-    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
-    DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
     ProviderDeadlineKind,
     ProviderProgressKind,
     ProviderStreamDeadlineController,
@@ -381,12 +376,7 @@ class BedrockProvider(ModelProvider):
         client: Any | None = None,
         name: str = "bedrock",
         max_tokens: int = DEFAULT_BEDROCK_MAX_TOKENS,
-        transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS,
-        protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS,
-        semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS,
-        absolute_stream_timeout_s: float = DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS,
-        max_concurrent_streams: int = DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
-        stream_idle_timeout_s: float | None = None,
+        stream_deadlines: ProviderStreamDeadlines | None = None,
         stream_close_timeout_s: float = DEFAULT_BEDROCK_STREAM_CLOSE_TIMEOUT_SECONDS,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
@@ -403,12 +393,7 @@ class BedrockProvider(ModelProvider):
             raise ValueError("max_tokens must be greater than zero.")
         self.max_tokens = max_tokens
         self._stream_deadlines = _resolve_provider_stream_deadlines(
-            transport_idle_timeout_s=transport_idle_timeout_s,
-            protocol_idle_timeout_s=protocol_idle_timeout_s,
-            semantic_progress_timeout_s=semantic_progress_timeout_s,
-            absolute_stream_timeout_s=absolute_stream_timeout_s,
-            max_concurrent_streams=max_concurrent_streams,
-            stream_idle_timeout_s=stream_idle_timeout_s,
+            stream_deadlines=stream_deadlines,
         )
         self.stream_close_timeout_s = _positive_float(
             stream_close_timeout_s, "stream_close_timeout_s"
