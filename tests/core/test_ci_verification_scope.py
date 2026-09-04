@@ -56,7 +56,11 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
         sqlite_cancellation=False,
     )
     assert select_pull_request_jobs(["scripts/generate_dashboard_api_types.py"]) == dashboard_only
-    assert select_pull_request_jobs(["src/cayu/artifacts/base.py"]) == dashboard_only
+    assert select_pull_request_jobs(["src/cayu/artifacts/base.py"]) == VerificationScope(
+        dashboard=True,
+        release_artifacts=True,
+        sqlite_cancellation=False,
+    )
     assert select_pull_request_jobs(["src/cayu/evals/corpus.py"]) == dashboard_only
     assert select_pull_request_jobs([".gitattributes"]) == VerificationScope(
         dashboard=True,
@@ -92,6 +96,11 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
     )
     assert select_pull_request_jobs(["tests/cli/test_scaffold_docker_live.py"]) == expected
     assert select_pull_request_jobs(["src/cayu/guides/evals-first.md"]) == expected
+    assert select_pull_request_jobs(["src/cayu/artifacts/settlement.py"]) == VerificationScope(
+        dashboard=True,
+        release_artifacts=True,
+        sqlite_cancellation=False,
+    )
     assert select_pull_request_jobs(
         ["src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"]
     ) == VerificationScope(

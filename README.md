@@ -389,6 +389,11 @@ task queues, environments, memory stores, servers, or multi-agent topology when
 the behavior requires them. Give coding agents narrow domain tools before
 granting broader shell access.
 
+Artifact writes have a bounded cancellation-settlement contract. After a
+dispatched write is interrupted, stores distinguish an exact committed artifact,
+positively proved absence, and a typed reconciliation-required orphan candidate;
+the candidate is diagnostic evidence, never a readable artifact reference.
+
 ## Application UI and control plane
 
 Your application should own:

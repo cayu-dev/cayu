@@ -48,6 +48,59 @@ steps:
     run: uv venv --python 3.11 .release-venv
   - name: Install built wheel
     run: uv pip install --python .release-venv/bin/python dist/first/*.whl
+  - name: Smoke-test artifact settlement surface from the built wheel
+    run: |
+      .release-venv/bin/python - <<'PY'
+      from datetime import UTC, datetime
+
+      from cayu import (
+          ArtifactWriteSettlementEvidence,
+          ArtifactWriteSettlementFailureCode,
+          ArtifactWriteSettlementObservation,
+          ArtifactWriteSettlementObserver,
+          ArtifactWriteSettlementPhase,
+          ArtifactWriteSettlementRegistration,
+          ArtifactWriteSettlementStatus,
+          artifact_store_identity_sha256,
+          artifact_write_settlements,
+          register_artifact_write_operation,
+          record_artifact_write_settlement,
+      )
+
+      now = datetime.now(UTC)
+      evidence = ArtifactWriteSettlementEvidence(
+          operation_id="artifact_write_11111111111111111111111111111111",
+          artifact_id="art_22222222222222222222222222222222",
+          store_identity_sha256=artifact_store_identity_sha256("installed-store"),
+          status=ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED,
+          phase=ArtifactWriteSettlementPhase.COMMIT,
+          observation=ArtifactWriteSettlementObservation.CALLER_BOUNDARY,
+          started_at=now,
+          observed_at=now,
+          elapsed_ms=0,
+          failure_codes=(ArtifactWriteSettlementFailureCode.COMMIT_FAILED,),
+      )
+      error = RuntimeError("installed settlement smoke")
+      with ArtifactWriteSettlementObserver() as observer:
+          record_artifact_write_settlement(evidence, error=error)
+      assert observer.snapshot() == (evidence,)
+      assert artifact_write_settlements(error) == (evidence,)
+
+      with ArtifactWriteSettlementObserver() as observer:
+          registration = register_artifact_write_operation(
+              artifact_id="art_33333333333333333333333333333333",
+              store_id="installed-third-party-store",
+          )
+          assert isinstance(registration, ArtifactWriteSettlementRegistration)
+          registration.set_phase(ArtifactWriteSettlementPhase.COMMIT)
+          active = observer.record_active_candidates()
+          late = registration.record(
+              status=ArtifactWriteSettlementStatus.COMMITTED,
+              phase=ArtifactWriteSettlementPhase.SETTLED,
+          )
+      assert active[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+      assert late.observation is ArtifactWriteSettlementObservation.LATE
+      PY
   - name: Smoke-test diagnostic support bundles from the built wheel
     run: .release-venv/bin/python scripts/smoke_built_wheel_doctor.py
   - name: Check every packaged guide from the built wheel

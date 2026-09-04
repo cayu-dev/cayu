@@ -12,6 +12,7 @@ from cayu._validation import (
     collision_safe_json_object,
     copy_durable_json_value,
 )
+from cayu.artifacts.settlement import ArtifactWriteSettlementEvidence
 from cayu.core.events import (
     Event,
     EventType,
@@ -1409,6 +1410,7 @@ _TOOL_RESULT_PROJECTION_RECORD_FIELDS = frozenset(
     {
         "artifact_id",
         "artifact_sha256",
+        "artifact_write_settlement",
         "failure_type",
         "logical_identity_sha256",
         "original_bytes",
@@ -1422,8 +1424,19 @@ _TOOL_RESULT_PROJECTION_RECORD_FIELDS = frozenset(
         "tool_call_id_sha256",
     }
 )
-_TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS = frozenset(
-    ("tool_result_projection", field_name) for field_name in _TOOL_RESULT_PROJECTION_RECORD_FIELDS
+_ARTIFACT_WRITE_SETTLEMENT_RECORD_FIELDS = frozenset(ArtifactWriteSettlementEvidence.model_fields)
+_TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS = (
+    frozenset(
+        ("tool_result_projection", field_name)
+        for field_name in _TOOL_RESULT_PROJECTION_RECORD_FIELDS
+    )
+    | frozenset(
+        ("tool_result_projection", "artifact_write_settlement", field_name)
+        for field_name in _ARTIFACT_WRITE_SETTLEMENT_RECORD_FIELDS
+    )
+    | {
+        ("tool_result_projection", "artifact_write_settlement", "failure_codes", "*"),
+    }
 )
 _TOOL_EVENT_NESTED_PATHS = (
     _TOOL_RESULT_NESTED_PATHS
@@ -3731,6 +3744,7 @@ def _prepare_runtime_event(
         event,
         reject_malformed=True,
         trust_persisted_projection=False,
+        redactor=redactor,
     )
     projection_references = (
         {} if tool_event_boundary is None else tool_event_boundary.projection_references
@@ -4089,6 +4103,7 @@ def _project_runtime_event(
         event,
         reject_malformed=False,
         trust_persisted_projection=trust_persisted_projection,
+        redactor=redactor,
     )
     projection_references = (
         {} if tool_event_boundary is None else tool_event_boundary.projection_references
@@ -5488,6 +5503,7 @@ def _recognized_tool_event_boundary(
     *,
     reject_malformed: bool,
     trust_persisted_projection: bool,
+    redactor: SecretRedactor,
 ) -> _ToolEventBoundary | None:
     """Parse runtime tool controls and projection references exactly once."""
 
@@ -5498,6 +5514,7 @@ def _recognized_tool_event_boundary(
             event.payload,
             include_terminal_controls=event.type
             in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
+            redactor=redactor,
         )
     except (TypeError, ValueError):
         if reject_malformed:

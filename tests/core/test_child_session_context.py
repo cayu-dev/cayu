@@ -147,8 +147,7 @@ def test_sqlite_child_lifecycle_candidate_read_uses_bounded_page_index(tmp_path:
         connection.close()
     assert any("idx_cayu_child_lifecycle_candidates_page" in str(row[3]) for row in plan)
     assert any(
-        "idx_cayu_transcript_messages_session_role_order" in str(row[3])
-        for row in transcript_plan
+        "idx_cayu_transcript_messages_session_role_order" in str(row[3]) for row in transcript_plan
     )
 
 

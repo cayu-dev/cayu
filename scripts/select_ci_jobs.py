@@ -125,6 +125,7 @@ def _affects_release_artifacts(path: str) -> bool:
         (
             "dashboard/",
             "maintenance/model_catalog/",
+            "src/cayu/artifacts/",
             "src/cayu/cli/",
             "src/cayu/data/",
             "src/cayu/guides/",

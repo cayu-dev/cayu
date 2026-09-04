@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+from threading import Barrier as ThreadBarrier
 from threading import Event as ThreadEvent
+from threading import Lock as ThreadLock
 from typing import Any
 
 import pytest
@@ -10,8 +12,11 @@ import pytest
 from cayu import (
     ArtifactScope,
     ArtifactStoreUnavailableError,
+    ArtifactWriteSettlementFailureCode,
+    ArtifactWriteSettlementStatus,
     InvalidArtifactIdError,
     S3ArtifactStore,
+    artifact_write_settlements,
 )
 
 
@@ -115,6 +120,47 @@ class _BlockingContentUploadS3Client(_S3Client):
             finally:
                 self.content_upload_finished.set()
         return super().put_object(**kwargs)
+
+
+class _BlockingMetadataCommitS3Client(_S3Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.metadata_commit_started = ThreadEvent()
+        self.release_metadata_commit = ThreadEvent()
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        if kwargs["Key"].endswith("/metadata.json"):
+            self.metadata_commit_started.set()
+            if not self.release_metadata_commit.wait(timeout=2):
+                raise TimeoutError("test did not release S3 metadata commit")
+        return super().put_object(**kwargs)
+
+
+class _WriteThenLoseAcknowledgementS3Client(_S3Client):
+    def __init__(self, suffix: str) -> None:
+        super().__init__()
+        self.suffix = suffix
+        self.lost = False
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        response = super().put_object(**kwargs)
+        if not self.lost and kwargs["Key"].endswith(self.suffix):
+            self.lost = True
+            raise _ClientError("AcknowledgementLost")
+        return response
+
+
+class _ConcurrentContentUploadS3Client(_S3Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.content_barrier = ThreadBarrier(2)
+        self.write_lock = ThreadLock()
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        if kwargs["Key"].endswith("/content"):
+            self.content_barrier.wait(timeout=2)
+        with self.write_lock:
+            return super().put_object(**kwargs)
 
 
 def test_s3_artifact_store_puts_reads_lists_and_deletes() -> None:
@@ -279,19 +325,118 @@ def test_s3_artifact_store_reuses_a_supplied_identity_only_for_an_exact_match() 
         "artifact_id": artifact_id,
         "filename": "tool-result.txt",
         "content_type": "text/plain",
+        "scope": ArtifactScope.SESSION,
         "session_id": "sess_1",
-        "metadata": {"type": "cayu.tool_result_artifact.v1"},
+        "agent_name": "assistant",
+        "environment_name": "local",
+        "metadata": {"alpha": 1, "enabled": False},
     }
 
     first = asyncio.run(store.put_bytes(b"stable", **kwargs))
-    replayed = asyncio.run(store.put_bytes(b"stable", **kwargs))
+    replayed = asyncio.run(
+        store.put_bytes(
+            b"stable",
+            **{**kwargs, "metadata": {"enabled": False, "alpha": 1}},
+        )
+    )
 
     assert replayed == first
     assert asyncio.run(store.list(session_id="sess_1")).artifacts == (first,)
-    with pytest.raises(ValueError, match="different content or metadata"):
-        asyncio.run(store.put_bytes(b"changed", **kwargs))
-    with pytest.raises(ValueError, match="different content or metadata"):
-        asyncio.run(store.put_bytes(b"stable", **{**kwargs, "filename": "changed.txt"}))
+    conflicts = (
+        (b"changed", {}),
+        (b"stable", {"filename": "changed.txt"}),
+        (b"stable", {"content_type": "application/octet-stream"}),
+        (b"stable", {"scope": ArtifactScope.ENVIRONMENT}),
+        (b"stable", {"session_id": "sess_changed"}),
+        (b"stable", {"agent_name": "reviewer"}),
+        (b"stable", {"environment_name": "remote"}),
+        (b"stable", {"metadata": {"alpha": 1, "enabled": True}}),
+    )
+    for content, update in conflicts:
+        with pytest.raises(ValueError, match="different content or metadata"):
+            asyncio.run(store.put_bytes(content, **{**kwargs, **update}))
+
+    assert asyncio.run(store.read_bytes(artifact_id)).metadata == first
+
+
+def test_s3_concurrent_conflicting_writers_preserve_the_conditional_winner() -> None:
+    client = _ConcurrentContentUploadS3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact_id = f"art_{'7' * 32}"
+
+    async def scenario():
+        return await asyncio.gather(
+            store.put_bytes(
+                b"first",
+                artifact_id=artifact_id,
+                filename="first.txt",
+                session_id="sess_1",
+            ),
+            store.put_bytes(
+                b"second",
+                artifact_id=artifact_id,
+                filename="second.txt",
+                session_id="sess_1",
+            ),
+            return_exceptions=True,
+        )
+
+    outcomes = asyncio.run(scenario())
+
+    successes = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], ValueError)
+    committed = asyncio.run(store.read_bytes(artifact_id))
+    assert committed.content in {b"first", b"second"}
+    assert committed.metadata.filename == (
+        "first.txt" if committed.content == b"first" else "second.txt"
+    )
+    assert client.delete_calls == []
+
+
+def test_s3_concurrent_same_content_metadata_conflict_is_explicit() -> None:
+    client = _ConcurrentContentUploadS3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact_id = f"art_{'8' * 32}"
+
+    async def scenario():
+        return await asyncio.gather(
+            store.put_bytes(
+                b"shared",
+                artifact_id=artifact_id,
+                filename="first.txt",
+                session_id="sess_1",
+            ),
+            store.put_bytes(
+                b"shared",
+                artifact_id=artifact_id,
+                filename="second.txt",
+                session_id="sess_1",
+            ),
+            return_exceptions=True,
+        )
+
+    outcomes = asyncio.run(scenario())
+
+    successes = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], ValueError)
+    assert "different content or metadata" in str(failures[0])
+    settlement = artifact_write_settlements(failures[0])
+    assert len(settlement) == 1
+    assert settlement[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+    assert settlement[0].failure_codes == (
+        ArtifactWriteSettlementFailureCode.MUTATION_FAILED,
+        ArtifactWriteSettlementFailureCode.COMMIT_FAILED,
+    )
+    committed = asyncio.run(store.read_bytes(artifact_id))
+    assert committed.content == b"shared"
+    assert committed.metadata.filename in {"first.txt", "second.txt"}
+    assert client.delete_calls == []
 
 
 def test_s3_supplied_identity_finishes_metadata_commit_after_retry() -> None:
@@ -318,6 +463,22 @@ def test_s3_supplied_identity_finishes_metadata_commit_after_retry() -> None:
     assert recovered.id == artifact_id
     assert asyncio.run(store.read_bytes(artifact_id)).content == b"recoverable"
     assert asyncio.run(store.list(session_id="sess_1")).artifacts == (recovered,)
+
+
+@pytest.mark.parametrize("lost_suffix", ["/content", "/metadata.json"])
+def test_s3_generated_identity_reconciles_lost_write_acknowledgement(
+    lost_suffix: str,
+) -> None:
+    client = _WriteThenLoseAcknowledgementS3Client(lost_suffix)
+    store = S3ArtifactStore("bucket", client=client)
+
+    artifact = asyncio.run(
+        store.put_bytes(b"recoverable", filename="generated.txt", session_id="sess_1")
+    )
+
+    assert client.lost is True
+    assert asyncio.run(store.read_bytes(artifact.id)).content == b"recoverable"
+    assert asyncio.run(store.list(session_id="sess_1")).artifacts == (artifact,)
 
 
 def test_s3_cancelled_content_upload_does_not_leave_an_unlisted_object() -> None:
@@ -357,7 +518,124 @@ def test_s3_cancelled_content_upload_does_not_leave_an_unlisted_object() -> None
     asyncio.run(scenario())
 
 
-def test_s3_cancelled_content_upload_is_removed_when_metadata_commit_fails() -> None:
+def test_s3_child_task_cancellation_keeps_dispatched_request_owned(monkeypatch) -> None:
+    client = _BlockingContentUploadS3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact_id = f"art_{'8' * 32}"
+    child_tasks: list[asyncio.Task] = []
+    real_operation = store._run_artifact_write
+
+    async def capture_child(*args, **kwargs):
+        child = asyncio.current_task()
+        assert child is not None
+        child_tasks.append(child)
+        return await real_operation(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_run_artifact_write", capture_child)
+
+    async def scenario():
+        put_task = asyncio.create_task(
+            store.put_bytes(
+                b"owned-request",
+                artifact_id=artifact_id,
+                filename="owned.txt",
+                content_type="text/plain",
+                session_id="sess_1",
+            )
+        )
+        assert await asyncio.to_thread(client.content_upload_started.wait, 1)
+        assert len(child_tasks) == 1
+        child_tasks[0].cancel("supervisor stopped S3 child")
+        await asyncio.sleep(0)
+        assert not put_task.done()
+
+        client.release_content_upload.set()
+        with pytest.raises(
+            RuntimeError,
+            match="S3 artifact publication was cancelled without caller cancellation",
+        ) as raised:
+            await put_task
+        assert isinstance(raised.value.__cause__, asyncio.CancelledError)
+        evidence = artifact_write_settlements(raised.value)
+        assert len(evidence) == 1
+        assert evidence[0].status is ArtifactWriteSettlementStatus.COMMITTED
+        assert evidence[0].failure_codes == (ArtifactWriteSettlementFailureCode.CHILD_CANCELLED,)
+        return put_task
+
+    put_task = asyncio.run(scenario())
+
+    assert not put_task.cancelled()
+    assert child_tasks[0].done()
+    assert child_tasks[0].cancelling() == 0
+    assert not child_tasks[0].cancelled()
+    assert client.content_upload_finished.is_set()
+    assert asyncio.run(store.read_bytes(artifact_id)).content == b"owned-request"
+    assert [item.id for item in asyncio.run(store.list(session_id="sess_1")).artifacts] == [
+        artifact_id
+    ]
+
+
+def test_s3_cancelled_generated_write_retains_its_committed_identity() -> None:
+    client = _BlockingContentUploadS3Client()
+    store = S3ArtifactStore("bucket", client=client)
+
+    async def scenario() -> None:
+        put_task = asyncio.create_task(
+            store.put_bytes(
+                b"generated",
+                filename="generated.txt",
+                session_id="sess_1",
+            )
+        )
+        assert await asyncio.to_thread(client.content_upload_started.wait, 1)
+        put_task.cancel("caller stopped")
+        client.release_content_upload.set()
+
+        with pytest.raises(asyncio.CancelledError, match="caller stopped") as raised:
+            await put_task
+        evidence = artifact_write_settlements(raised.value)
+        assert len(evidence) == 1
+        assert evidence[0].status is ArtifactWriteSettlementStatus.COMMITTED
+        read = await store.read_bytes(evidence[0].artifact_id)
+        assert read.content == b"generated"
+
+    asyncio.run(scenario())
+
+
+def test_s3_cancellation_during_metadata_commit_preserves_commit_evidence() -> None:
+    client = _BlockingMetadataCommitS3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact_id = f"art_{'8' * 32}"
+
+    async def scenario() -> None:
+        put_task = asyncio.create_task(
+            store.put_bytes(
+                b"commit-content",
+                artifact_id=artifact_id,
+                filename="commit.txt",
+                session_id="sess_1",
+            )
+        )
+        assert await asyncio.to_thread(client.metadata_commit_started.wait, 1)
+        put_task.cancel("caller stopped during commit")
+        assert not put_task.done()
+        client.release_metadata_commit.set()
+
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="caller stopped during commit",
+        ) as raised:
+            await put_task
+        evidence = artifact_write_settlements(raised.value)
+        assert len(evidence) == 1
+        assert evidence[0].artifact_id == artifact_id
+        assert evidence[0].status is ArtifactWriteSettlementStatus.COMMITTED
+        assert (await store.read_bytes(artifact_id)).content == b"commit-content"
+
+    asyncio.run(scenario())
+
+
+def test_s3_cancelled_content_upload_retains_a_fenced_orphan_candidate() -> None:
     client = _BlockingContentUploadS3Client()
     client.fail_put_suffix = "metadata.json"
     store = S3ArtifactStore("bucket", client=client)
@@ -382,12 +660,25 @@ def test_s3_cancelled_content_upload_is_removed_when_metadata_commit_fails() -> 
         finally:
             client.release_content_upload.set()
 
-        with pytest.raises(asyncio.CancelledError, match="projection timeout"):
+        with pytest.raises(asyncio.CancelledError, match="projection timeout") as raised:
             await put_task
         assert await asyncio.to_thread(client.content_upload_finished.wait, 1)
 
-        assert client.objects == {}
-        assert len(client.delete_calls) == 1
+        evidence = artifact_write_settlements(raised.value)
+        assert len(evidence) == 1
+        assert evidence[0].artifact_id == artifact_id
+        assert evidence[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+        assert evidence[0].failure_codes == (
+            ArtifactWriteSettlementFailureCode.COMMIT_FAILED,
+            ArtifactWriteSettlementFailureCode.RECONCILIATION_FAILED,
+        )
+        cancellation_cause = raised.value.__cause__
+        assert isinstance(cancellation_cause, ArtifactStoreUnavailableError)
+        combined = cancellation_cause.__cause__
+        assert isinstance(combined, BaseExceptionGroup)
+        assert len(combined.exceptions) == 2
+        assert any(key.endswith("/content") for _, key in client.objects)
+        assert client.delete_calls == []
         assert (await store.list(session_id="sess_1")).artifacts == ()
 
     asyncio.run(scenario())
@@ -407,19 +698,23 @@ def test_s3_artifact_store_rejects_invalid_ids_before_aws() -> None:
     assert client.delete_calls == []
 
 
-def test_s3_artifact_store_removes_content_when_metadata_commit_fails() -> None:
+def test_s3_generated_write_retains_identity_when_metadata_commit_fails() -> None:
     client = _S3Client()
     client.fail_put_suffix = "metadata.json"
     store = S3ArtifactStore("bucket", client=client)
 
-    with pytest.raises(ArtifactStoreUnavailableError, match="commit"):
+    with pytest.raises(ArtifactStoreUnavailableError, match="commit") as raised:
         asyncio.run(store.put_bytes(b"orphan", filename="orphan.txt", session_id="sess_1"))
 
-    assert client.objects == {}
-    assert len(client.delete_calls) == 1
+    evidence = artifact_write_settlements(raised.value)
+    assert len(evidence) == 1
+    assert evidence[0].artifact_id.startswith("art_")
+    assert evidence[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+    assert any(key.endswith(f"/{evidence[0].artifact_id}/content") for _, key in client.objects)
+    assert client.delete_calls == []
 
 
-def test_s3_artifact_store_keeps_failed_write_cleanup_best_effort() -> None:
+def test_s3_failed_write_never_uses_unfenced_final_key_cleanup() -> None:
     client = _S3Client()
     client.fail_put_suffix = "metadata.json"
     client.delete_errors_by_suffix["/content"] = "AccessDenied"
@@ -429,7 +724,7 @@ def test_s3_artifact_store_keeps_failed_write_cleanup_best_effort() -> None:
         asyncio.run(store.put_bytes(b"orphan", filename="orphan.txt", session_id="sess_1"))
 
     assert any(key.endswith("/content") for _, key in client.objects)
-    assert len(client.delete_calls) == 1
+    assert client.delete_calls == []
 
 
 def test_s3_artifact_store_treats_missing_bucket_as_backend_unavailable() -> None:

@@ -42,6 +42,7 @@ from tests.core.test_provider_operation_offline_recovery import (
 )
 from tests.core.test_recovery_plans import assert_recovery_plan_store_conformance
 from tests.core.tool_result_projection_conformance import (
+    assert_tool_result_projection_orphan_evidence_conformance,
     assert_tool_result_projection_recovery_conformance,
     assert_tool_result_projection_session_store_conformance,
 )
@@ -392,6 +393,11 @@ def test_postgres_session_store_preserves_projected_tool_results(
             store,
             LocalArtifactStore(tmp_path / "postgres-projection-recovery-artifacts"),
             session_id="sess_projection_recovery_postgres",
+        )
+        await assert_tool_result_projection_orphan_evidence_conformance(
+            store,
+            LocalArtifactStore(tmp_path / "postgres-projection-orphan-artifacts"),
+            session_id="sess_projection_orphan_postgres",
         )
 
     _run(postgres_dsn, ops)

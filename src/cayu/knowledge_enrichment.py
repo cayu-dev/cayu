@@ -1564,12 +1564,15 @@ class KnowledgeEnrichmentWorker:
         worker_id: str,
         lease_seconds: int,
     ) -> KnowledgeEnrichmentJob | None:
+        if task.lease_expires_at is None:
+            raise TaskClaimLost("Claimed enrichment task has no worker lease.")
         stop_heartbeat = asyncio.Event()
         heartbeat = asyncio.create_task(
             _heartbeat_claim(
                 self._queue.task_store,
                 task.id,
                 worker_id,
+                lease_expires_at=task.lease_expires_at,
                 lease_seconds=lease_seconds,
                 stop=stop_heartbeat,
             )
@@ -2423,15 +2426,22 @@ async def _heartbeat_claim(
     task_id: str,
     worker_id: str,
     *,
+    lease_expires_at: datetime,
     lease_seconds: int,
     stop: asyncio.Event,
 ) -> None:
     async def heartbeat() -> Task:
-        return await task_store.heartbeat(
+        nonlocal lease_expires_at
+        renewed = await task_store.heartbeat(
             task_id,
             worker_id,
+            lease_expires_at=lease_expires_at,
             extend_seconds=lease_seconds,
         )
+        if renewed.lease_expires_at is None:
+            raise TaskClaimLost("Enrichment heartbeat returned no worker lease.")
+        lease_expires_at = renewed.lease_expires_at
+        return renewed
 
     async def reconcile_failure(heartbeat_error: Exception) -> None:
         try:

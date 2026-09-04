@@ -17,19 +17,25 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any
 from uuid import uuid4
 
+from cayu._exception_groups import exception_cause, exception_context, set_exception_context
 from cayu._filesystem_lock import cooperative_path_lock
-from cayu._task_wait import (
-    await_shielded_task_outcome,
-    unexpected_child_cancellation_error,
-)
 from cayu._validation import (
     copy_durable_json_object,
     require_clean_nonblank,
     require_nonblank,
     require_unicode_scalar_text,
+)
+from cayu.artifacts._settlement import (
+    _absent_artifact_write,
+    _ArtifactWritePhaseReporter,
+    _ArtifactWriteRegistry,
+    _await_owned_sync_call,
+    _committed_artifact_write,
+    _settle_artifact_write,
+    _unsettled_artifact_write,
 )
 from cayu.artifacts.base import (
     ArtifactListResult,
@@ -40,6 +46,10 @@ from cayu.artifacts.base import (
     ArtifactStoreUnavailableError,
     InvalidArtifactIdError,
     _require_matching_artifact,
+)
+from cayu.artifacts.settlement import (
+    ArtifactWriteSettlementFailureCode,
+    ArtifactWriteSettlementPhase,
 )
 
 _CONTENT_FILE = "content"
@@ -72,51 +82,30 @@ _SUPPORTS_DIRECTORY_FD = (
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
 )
-_ResultT = TypeVar("_ResultT")
 
 
 class _PublishedLocalArtifactError(Exception):
     """Carry a failure that happened after the final artifact became visible."""
 
     def __init__(self, error: BaseException) -> None:
-        super().__init__(str(error))
+        super().__init__("Local artifact publication failed after becoming visible.")
         self.error = error
 
 
-def _visible_exception_evidence(error: BaseException) -> BaseException | None:
-    if error.__cause__ is not None:
-        return error.__cause__
-    if error.__context__ is not None and not error.__suppress_context__:
-        return error.__context__
-    return None
+class _AbsentLocalArtifactError(Exception):
+    """Carry positive evidence that this invocation left no artifact state."""
 
-
-def _ordered_exception_evidence(
-    authoritative: BaseException,
-    additions: list[BaseException],
-    *,
-    message: str,
-) -> BaseException | None:
-    evidence: list[BaseException] = []
-    for candidate in (_visible_exception_evidence(authoritative), *additions):
-        if candidate is None or candidate is authoritative:
-            continue
-        if any(existing is candidate for existing in evidence):
-            continue
-        evidence.append(candidate)
-    if not evidence:
-        return None
-    if len(evidence) == 1:
-        return evidence[0]
-    return BaseExceptionGroup(message, evidence)
+    def __init__(self, error: BaseException) -> None:
+        super().__init__("Local artifact publication failed before publication.")
+        self.error = error
 
 
 def _detach_redundant_cleanup_context(
     cleanup_error: BaseException,
     primary_error: BaseException,
 ) -> None:
-    if cleanup_error.__cause__ is None and cleanup_error.__context__ is primary_error:
-        cleanup_error.__context__ = None
+    if exception_cause(cleanup_error) is None and exception_context(cleanup_error) is primary_error:
+        set_exception_context(cleanup_error, None)
 
 
 class LocalArtifactStore(ArtifactStore):
@@ -160,6 +149,7 @@ class LocalArtifactStore(ArtifactStore):
             self.id = require_unicode_scalar_text(clean_store_id, "store_id")
         self.root = root_path
         self._root_identity = _stat_identity(root_stat)
+        self._write_registry = _ArtifactWriteRegistry()
 
     async def put_bytes(
         self,
@@ -202,31 +192,21 @@ class LocalArtifactStore(ArtifactStore):
             metadata=copied_metadata,
         )
         _require_durable_publication_support()
-        try:
-            if artifact_id is None:
-                await _await_local_mutation(
-                    _write_generated_artifact,
-                    self.root,
-                    self._root_identity,
-                    artifact,
-                    content,
-                    operation="Local artifact publication",
-                )
-                return artifact
-            return await _await_local_mutation(
-                _put_deterministic_artifact,
-                self.root,
-                self._root_identity,
-                artifact,
-                content,
-                operation="Deterministic local artifact publication",
-            )
-        except (ArtifactStoreUnavailableError, TypeError, ValueError):
-            raise
-        except OSError as exc:
-            raise ArtifactStoreUnavailableError(
-                "Local artifact store could not write artifact content."
-            ) from exc
+        callback = _write_generated_artifact if artifact_id is None else _put_deterministic_artifact
+        return await _settle_artifact_write(
+            registry=self._write_registry,
+            store_id=self.id,
+            artifact_id=artifact.id,
+            operation_name="Local artifact publication",
+            operation=lambda reporter: _run_local_artifact_write(
+                reporter,
+                callback=callback,
+                root=self.root,
+                root_identity=self._root_identity,
+                artifact=artifact,
+                content=content,
+            ),
+        )
 
     async def read_bytes(
         self,
@@ -304,36 +284,64 @@ class LocalArtifactStore(ArtifactStore):
             ) from exc
 
 
-async def _await_local_mutation(
-    callback: Callable[..., _ResultT],
-    *args: Any,
-    operation: str,
-) -> _ResultT:
-    """Settle an off-thread filesystem mutation before re-delivering cancellation."""
+async def _run_local_artifact_write(
+    reporter: _ArtifactWritePhaseReporter,
+    *,
+    callback: Callable[..., object],
+    root: Path,
+    root_identity: tuple[int, int],
+    artifact: ArtifactMetadata,
+    content: bytes,
+):
+    reporter.set(ArtifactWriteSettlementPhase.CONTENT)
+    try:
+        result = await _await_owned_sync_call(
+            reporter,
+            callback,
+            root,
+            root_identity,
+            artifact,
+            content,
+            reporter.set,
+        )
+    except _AbsentLocalArtifactError as failure:
+        return _absent_artifact_write(
+            _local_publication_error(failure.error),
+            phase=ArtifactWriteSettlementPhase.CLEANUP,
+            failure_codes=(ArtifactWriteSettlementFailureCode.MUTATION_FAILED,),
+            cancellation_error=failure.error,
+        )
+    except _PublishedLocalArtifactError as failure:
+        return _unsettled_artifact_write(
+            _local_publication_error(failure.error),
+            phase=ArtifactWriteSettlementPhase.COMMIT,
+            failure_codes=(ArtifactWriteSettlementFailureCode.COMMIT_FAILED,),
+            cancellation_error=failure.error,
+        )
+    except BaseException as error:
+        return _unsettled_artifact_write(
+            _local_publication_error(error),
+            phase=reporter.phase,
+            failure_codes=(
+                ArtifactWriteSettlementFailureCode.MUTATION_FAILED,
+                ArtifactWriteSettlementFailureCode.CLEANUP_FAILED,
+            ),
+            cancellation_error=error,
+        )
+    committed = result if type(result) is ArtifactMetadata else artifact
+    return _committed_artifact_write(committed)
 
-    task = asyncio.create_task(asyncio.to_thread(callback, *args))
-    outcome = await await_shielded_task_outcome(task)
-    error = outcome.error
-    if isinstance(error, _PublishedLocalArtifactError):
-        error = error.error
-    if isinstance(error, asyncio.CancelledError):
-        error = unexpected_child_cancellation_error(error, operation=operation)
-    cancellation = outcome.cancellation
-    if cancellation is not None:
-        if error is not None:
-            cause = _ordered_exception_evidence(
-                cancellation,
-                [error],
-                message=f"{operation} also failed while caller cancellation was pending.",
-            )
-            cancellation.add_note(f"{operation} also failed while caller cancellation was pending.")
-            if cause is None:  # pragma: no cover - error is non-cancellation evidence
-                raise cancellation
-            raise cancellation from cause
-        raise cancellation
-    if error is not None:
-        raise error
-    return cast("_ResultT", outcome.result)
+
+def _local_publication_error(error: BaseException) -> BaseException:
+    if issubclass(type(error), (ArtifactStoreUnavailableError, TypeError, ValueError)):
+        return error
+    if issubclass(type(error), OSError):
+        unavailable = ArtifactStoreUnavailableError(
+            "Local artifact store could not write artifact content."
+        )
+        unavailable.__cause__ = error
+        return unavailable
+    return error
 
 
 def _new_artifact_id() -> str:
@@ -690,11 +698,14 @@ def _write_artifact(
     root_identity: tuple[int, int],
     artifact: ArtifactMetadata,
     content: bytes,
+    report_phase: Callable[[ArtifactWriteSettlementPhase], None] | None = None,
 ) -> tuple[int, int]:
     target = _artifact_dir(root, artifact.id)
     staging_name = f"{artifact.id}.staging-{uuid4().hex}"
     staging = root / staging_name
     published = False
+    staging_created = False
+    created_identity: tuple[int, int] | None = None
     try:
         with _open_store_root(root, root_identity) as root_fd:
             try:
@@ -702,6 +713,7 @@ def _write_artifact(
                     staging.mkdir(mode=0o700, parents=False)
                 else:
                     os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
+                staging_created = True
             except FileExistsError as exc:  # pragma: no cover - UUID collision
                 raise ArtifactStoreUnavailableError(
                     "Local artifact staging directory already exists."
@@ -733,6 +745,8 @@ def _write_artifact(
                         metadata_bytes,
                     )
                     _sync_open_directory(directory_fd, staging, directory_identity)
+                if report_phase is not None:
+                    report_phase(ArtifactWriteSettlementPhase.COMMIT)
                 try:
                     _rename_directory_no_replace(
                         staging,
@@ -746,12 +760,24 @@ def _write_artifact(
                         raise FileExistsError(f"Artifact already exists: {artifact.id}") from exc
                     raise
             except BaseException as primary_error:
+                if report_phase is not None:
+                    report_phase(ArtifactWriteSettlementPhase.CLEANUP)
                 try:
-                    _remove_artifact_directory_if_unchanged(
-                        staging,
-                        created_identity,
-                        parent_fd=root_fd,
-                    )
+                    if not published:
+                        _remove_artifact_directory_if_unchanged(
+                            staging,
+                            created_identity,
+                            parent_fd=root_fd,
+                            ignore_errors=False,
+                        )
+                        try:
+                            _stat_directory_entry(staging, parent_fd=root_fd)
+                        except FileNotFoundError:
+                            _sync_open_directory(root_fd, root, root_identity)
+                        else:
+                            raise ArtifactStoreUnavailableError(
+                                "Local artifact staging cleanup could not prove absence."
+                            )
                 except BaseException as cleanup_error:
                     _detach_redundant_cleanup_context(cleanup_error, primary_error)
                     raise ArtifactStoreUnavailableError(
@@ -760,11 +786,16 @@ def _write_artifact(
                         "Local artifact publication and staging cleanup failures.",
                         [primary_error, cleanup_error],
                     )
-                raise
+                raise _AbsentLocalArtifactError(primary_error) from primary_error
             return created_identity
     except BaseException as error:
         if published:
-            raise _PublishedLocalArtifactError(error) from error
+            published_error = error.error if isinstance(error, _AbsentLocalArtifactError) else error
+            raise _PublishedLocalArtifactError(published_error) from published_error
+        if isinstance(error, _AbsentLocalArtifactError):
+            raise
+        if not staging_created:
+            raise _AbsentLocalArtifactError(error) from error
         raise
 
 
@@ -773,6 +804,7 @@ def _write_generated_artifact(
     root_identity: tuple[int, int],
     artifact: ArtifactMetadata,
     content: bytes,
+    report_phase: Callable[[ArtifactWriteSettlementPhase], None],
 ) -> tuple[int, int]:
     published_identity: tuple[int, int] | None = None
     write_error: BaseException | None = None
@@ -784,6 +816,7 @@ def _write_generated_artifact(
                     root_identity,
                     artifact,
                     content,
+                    report_phase,
                 )
             except BaseException as error:
                 # Keep the body outcome until the lock has physically released so
@@ -807,10 +840,12 @@ def _write_generated_artifact(
                 "Local artifact publication and ownership-lock cleanup failures.",
                 [write_error, lock_error],
             )
+            if isinstance(write_error, _AbsentLocalArtifactError):
+                raise _AbsentLocalArtifactError(combined_error) from combined_error
             raise combined_error from combined_error.__cause__
         if published_identity is not None:
             raise _PublishedLocalArtifactError(lock_error) from lock_error
-        raise
+        raise _AbsentLocalArtifactError(lock_error) from lock_error
     if write_error is not None:
         raise write_error
     if published_identity is None:  # pragma: no cover - write returned without an outcome
@@ -823,17 +858,26 @@ def _put_deterministic_artifact(
     root_identity: tuple[int, int],
     artifact: ArtifactMetadata,
     content: bytes,
+    report_phase: Callable[[ArtifactWriteSettlementPhase], None],
 ) -> ArtifactMetadata:
     with _artifact_ownership_lock(root, artifact.id):
         for attempt in range(3):
             try:
-                _write_artifact(root, root_identity, artifact, content)
-            except FileExistsError:
+                _write_artifact(
+                    root,
+                    root_identity,
+                    artifact,
+                    content,
+                    report_phase,
+                )
+            except _AbsentLocalArtifactError as write_failure:
+                if not isinstance(write_failure.error, FileExistsError):
+                    raise
                 try:
                     existing = _read_artifact(root, root_identity, artifact.id, None)
-                except (FileNotFoundError, ValueError):
+                except (FileNotFoundError, ValueError) as read_error:
                     if attempt >= 2:
-                        raise
+                        raise _AbsentLocalArtifactError(read_error) from read_error
                     _remove_matching_incomplete_artifact(
                         root,
                         root_identity,
@@ -841,8 +885,14 @@ def _put_deterministic_artifact(
                         content,
                     )
                     continue
-                _require_matching_artifact(existing, expected=artifact, content=content)
-                _sync_existing_artifact(root, root_identity, artifact.id)
+                try:
+                    _require_matching_artifact(existing, expected=artifact, content=content)
+                except ValueError as conflict:
+                    raise _AbsentLocalArtifactError(conflict) from conflict
+                try:
+                    _sync_existing_artifact(root, root_identity, artifact.id)
+                except BaseException as sync_error:
+                    raise _PublishedLocalArtifactError(sync_error) from sync_error
                 return existing.metadata
             else:
                 return artifact

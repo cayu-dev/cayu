@@ -19,11 +19,18 @@ from pydantic import (
 
 from cayu._validation import (
     copy_durable_json_value,
+    inspect_bounded_durable_json,
     require_clean_nonblank,
     require_durable_text,
     require_unicode_scalar_text,
 )
 from cayu.artifacts import ArtifactMetadata, ArtifactScope, ArtifactStore
+from cayu.artifacts.settlement import (
+    ArtifactWriteSettlementEvidence,
+    ArtifactWriteSettlementStatus,
+    artifact_write_settlements,
+    copy_artifact_write_settlement,
+)
 from cayu.core.tools import ToolResult
 from cayu.tools.files import _READ_FILE_TRUNCATION_MARKER
 
@@ -42,6 +49,8 @@ MAX_TOOL_RESULT_PREVIEW_BYTES = MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES - (4 * 1
 MAX_TOOL_RESULT_ARTIFACT_REFERENCE_BYTES = 4 * 1024
 _PROJECTION_FAILURE_CONTENT_MAX_BYTES = 1024
 _ARTIFACT_STORE_ID_MAX_BYTES = 256
+_ARTIFACT_WRITE_SETTLEMENT_PAYLOAD_MAX_BYTES = 4 * 1024
+_ARTIFACT_WRITE_SETTLEMENT_PAYLOAD_MAX_NODES = 64
 _TOOL_RESULT_PROJECTION_REFERENCE_MARKER = "\n[cayu tool-result projection reference]\n"
 _MAX_GENERATED_READBACK_BYTES = DEFAULT_TOOL_RESULT_MAX_INLINE_BYTES
 _UNAVAILABLE_BOUNDARY_TOKEN_ESTIMATION_METHOD = "unavailable_after_boundary_redaction_v1"
@@ -62,6 +71,7 @@ _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS = frozenset(
 )
 _TOOL_RESULT_PROJECTION_PUBLIC_STRUCTURE_KEYS = _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS | {
     "artifact_sha256",
+    "artifact_write_settlement",
     "failure_type",
     "logical_identity_sha256",
     "original_bytes",
@@ -124,6 +134,7 @@ class ToolResultProjectionRecord(BaseModel):
     logical_identity_sha256: str | None = None
     tool_call_id_sha256: str | None = None
     failure_type: str | None = None
+    artifact_write_settlement: ArtifactWriteSettlementEvidence | None = None
 
     @field_validator("policy_id", "token_estimation_method")
     @classmethod
@@ -155,6 +166,30 @@ class ToolResultProjectionRecord(BaseModel):
             raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
         return value
 
+    @field_validator("artifact_write_settlement", mode="before")
+    @classmethod
+    def copy_settlement_evidence(
+        cls,
+        value: object,
+    ) -> ArtifactWriteSettlementEvidence | None:
+        if value is None:
+            return None
+        if type(value) is ArtifactWriteSettlementEvidence:
+            return copy_artifact_write_settlement(value)
+        if type(value) is dict:
+            inspect_bounded_durable_json(
+                value,
+                "artifact_write_settlement",
+                max_bytes=_ARTIFACT_WRITE_SETTLEMENT_PAYLOAD_MAX_BYTES,
+                max_nodes=_ARTIFACT_WRITE_SETTLEMENT_PAYLOAD_MAX_NODES,
+                max_nesting=4,
+            )
+            copied = copy_durable_json_value(value, "artifact_write_settlement")
+            return ArtifactWriteSettlementEvidence.model_validate_json(
+                json.dumps(copied, sort_keys=True, separators=(",", ":"))
+            )
+        raise TypeError("artifact_write_settlement has an invalid type.")
+
     @model_validator(mode="after")
     def validate_status_fields(self) -> ToolResultProjectionRecord:
         artifact_fields = (
@@ -173,8 +208,18 @@ class ToolResultProjectionRecord(BaseModel):
         if self.status is ToolResultProjectionStatus.FAILED:
             if self.failure_type is None:
                 raise ValueError("Failed projection records require failure_type.")
+            if (
+                self.artifact_write_settlement is not None
+                and self.artifact_write_settlement.status
+                is not ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+            ):
+                raise ValueError(
+                    "Failed projection settlement evidence must require reconciliation."
+                )
         elif self.failure_type is not None:
             raise ValueError("Only failed projection records can include failure_type.")
+        elif self.artifact_write_settlement is not None:
+            raise ValueError("Only failed projection records can include settlement evidence.")
         return self
 
 
@@ -188,10 +233,14 @@ class ToolResultProjection:
             raise TypeError("ToolResultProjection result must be a ToolResult.")
         if type(self.record) is not ToolResultProjectionRecord:
             raise TypeError("ToolResultProjection record must be a ToolResultProjectionRecord.")
-        copied_result = ToolResult(**self.result.model_dump(mode="python"))
-        copied_record = ToolResultProjectionRecord.model_validate(
-            self.record.model_dump(mode="json")
+        copied_result = ToolResult(**self.result.model_dump(mode="python", warnings=False))
+        record_payload = self.record.model_dump(
+            mode="python",
+            warnings=False,
+            exclude={"artifact_write_settlement"},
         )
+        record_payload["artifact_write_settlement"] = self.record.artifact_write_settlement
+        copied_record = ToolResultProjectionRecord.model_validate(record_payload)
         projected_bytes = len(copied_result.content.encode("utf-8"))
         if copied_record.projected_bytes != projected_bytes:
             raise ValueError(
@@ -428,6 +477,7 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
                 metadata=metadata_payload,
             )
         except Exception as exc:
+            settlement = _last_reconciliation_candidate(artifact_write_settlements(exc))
             return self._failed_projection(
                 request=request,
                 original_bytes=original_bytes,
@@ -436,6 +486,7 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
                     exc,
                     fallback="artifact_store_failure",
                 ),
+                artifact_write_settlement=settlement,
             )
 
         reference = {
@@ -494,6 +545,7 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
         original_bytes: int,
         original_token_estimate: int,
         failure_type: str,
+        artifact_write_settlement: ArtifactWriteSettlementEvidence | None = None,
     ) -> ToolResultProjection:
         projected_result = ToolResult(
             content=_projection_failure_content(self.identity),
@@ -509,6 +561,7 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
                 projected_result=projected_result,
                 original_token_estimate=original_token_estimate,
                 failure_type=failure_type,
+                artifact_write_settlement=artifact_write_settlement,
             ),
         )
 
@@ -524,6 +577,7 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
         logical_identity_sha256: str | None = None,
         tool_call_id_sha256: str | None = None,
         failure_type: str | None = None,
+        artifact_write_settlement: ArtifactWriteSettlementEvidence | None = None,
     ) -> ToolResultProjectionRecord:
         return ToolResultProjectionRecord(
             status=status,
@@ -538,6 +592,7 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
             logical_identity_sha256=logical_identity_sha256,
             tool_call_id_sha256=tool_call_id_sha256,
             failure_type=failure_type,
+            artifact_write_settlement=artifact_write_settlement,
         )
 
 
@@ -565,6 +620,7 @@ def projection_failure(
     policy: ToolResultProjectionPolicy,
     request: ToolResultProjectionRequest,
     failure_type: str,
+    artifact_write_settlement: ArtifactWriteSettlementEvidence | None = None,
 ) -> ToolResultProjection:
     """Build the runtime fallback when a custom policy raises or returns invalid data."""
 
@@ -589,8 +645,22 @@ def projection_failure(
             projected_token_estimate=0,
             token_estimation_method="unavailable_after_policy_failure_v1",
             failure_type=require_clean_nonblank(failure_type, "failure_type"),
+            artifact_write_settlement=(
+                None
+                if artifact_write_settlement is None
+                else copy_artifact_write_settlement(artifact_write_settlement)
+            ),
         ),
     )
+
+
+def _last_reconciliation_candidate(
+    records: tuple[ArtifactWriteSettlementEvidence, ...],
+) -> ArtifactWriteSettlementEvidence | None:
+    for record in reversed(records):
+        if record.status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED:
+            return copy_artifact_write_settlement(record)
+    return None
 
 
 def validate_tool_result_projection(
@@ -598,9 +668,15 @@ def validate_tool_result_projection(
     *,
     request: ToolResultProjectionRequest,
     policy: ToolResultProjectionPolicy,
+    observed_artifact_write_settlements: tuple[ArtifactWriteSettlementEvidence, ...],
 ) -> ToolResultProjection:
     """Copy and validate a policy result at the runtime trust boundary."""
 
+    if type(observed_artifact_write_settlements) is not tuple or any(
+        type(record) is not ArtifactWriteSettlementEvidence
+        for record in observed_artifact_write_settlements
+    ):
+        raise TypeError("Observed artifact write settlements must be an exact tuple.")
     if type(projection) is not ToolResultProjection:
         raise TypeError("Tool-result projection policies must return ToolResultProjection.")
     copied = ToolResultProjection(result=projection.result, record=projection.record)
@@ -614,6 +690,11 @@ def validate_tool_result_projection(
         raise ValueError("Tool-result projection cannot replace the error disposition.")
     if copied.result.artifacts[: len(request.result.artifacts)] != request.result.artifacts:
         raise ValueError("Tool-result projection cannot replace existing artifact references.")
+    settlement = copied.record.artifact_write_settlement
+    if settlement is not None and settlement not in observed_artifact_write_settlements:
+        raise ValueError(
+            "Tool-result projection settlement was not observed for this projection operation."
+        )
     if copied.record.status is ToolResultProjectionStatus.UNCHANGED:
         if copied.result != request.result:
             raise ValueError("Unchanged tool-result projection must preserve the complete result.")

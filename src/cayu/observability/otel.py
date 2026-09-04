@@ -48,6 +48,15 @@ CAYU_TOOL_RESULT_TOKEN_ESTIMATION_METHOD = "cayu.tool_result.token_estimation_me
 CAYU_TOOL_RESULT_ARTIFACT_ID = "cayu.tool_result.artifact_id"
 CAYU_TOOL_RESULT_ARTIFACT_SHA256 = "cayu.tool_result.artifact_sha256"
 CAYU_TOOL_RESULT_PROJECTION_FAILURE_TYPE = "cayu.tool_result.projection.failure_type"
+CAYU_ARTIFACT_WRITE_SETTLEMENT_STATUS = "cayu.artifact_write.settlement.status"
+CAYU_ARTIFACT_WRITE_SETTLEMENT_OPERATION_ID = "cayu.artifact_write.settlement.operation_id"
+CAYU_ARTIFACT_WRITE_SETTLEMENT_ARTIFACT_ID = "cayu.artifact_write.settlement.artifact_id"
+CAYU_ARTIFACT_WRITE_SETTLEMENT_STORE_IDENTITY = (
+    "cayu.artifact_write.settlement.store_identity_sha256"
+)
+CAYU_ARTIFACT_WRITE_SETTLEMENT_PHASE = "cayu.artifact_write.settlement.phase"
+CAYU_ARTIFACT_WRITE_SETTLEMENT_OBSERVATION = "cayu.artifact_write.settlement.observation"
+CAYU_ARTIFACT_WRITE_SETTLEMENT_ELAPSED_MS = "cayu.artifact_write.settlement.elapsed_ms"
 # Marks a span force-closed without its own completion event (e.g. an in-flight
 # model/tool span when the session was interrupted) so it is not mistaken for a
 # clean success.
@@ -678,6 +687,25 @@ def _set_tool_result_projection_attributes(
         ("projected_token_estimate", CAYU_TOOL_RESULT_PROJECTED_TOKEN_ESTIMATE),
     ):
         _set_int(span, attribute, projection.get(key))
+    settlement = projection.get("artifact_write_settlement")
+    if type(settlement) is not dict:
+        return
+    for key, attribute in (
+        ("status", CAYU_ARTIFACT_WRITE_SETTLEMENT_STATUS),
+        ("operation_id", CAYU_ARTIFACT_WRITE_SETTLEMENT_OPERATION_ID),
+        ("artifact_id", CAYU_ARTIFACT_WRITE_SETTLEMENT_ARTIFACT_ID),
+        ("store_identity_sha256", CAYU_ARTIFACT_WRITE_SETTLEMENT_STORE_IDENTITY),
+        ("phase", CAYU_ARTIFACT_WRITE_SETTLEMENT_PHASE),
+        ("observation", CAYU_ARTIFACT_WRITE_SETTLEMENT_OBSERVATION),
+    ):
+        value = settlement.get(key)
+        if type(value) is str and value:
+            span.set_attribute(attribute, redactor.redact_text(value))
+    _set_int(
+        span,
+        CAYU_ARTIFACT_WRITE_SETTLEMENT_ELAPSED_MS,
+        settlement.get("elapsed_ms"),
+    )
 
 
 def _error_text(event: Event) -> str:

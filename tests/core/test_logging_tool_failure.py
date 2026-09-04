@@ -77,6 +77,57 @@ def test_tool_projection_logs_only_bounded_diagnostics(
     assert "private oversized preview content" not in message
 
 
+def test_tool_projection_logs_bounded_artifact_settlement_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("cayu.test.toolprojection.settlement")
+    sink = LoggingEventSink(logger=logger)
+    event = Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id="sess_logs",
+        tool_name="search",
+        payload={
+            "tool_call_id": "call_1",
+            "result": {"content": "private provider failure", "is_error": True},
+            "tool_result_projection": {
+                "status": "failed",
+                "policy_id": "cayu.artifact_externalizing_tool_result.v1",
+                "original_bytes": 40_000,
+                "projected_bytes": 64,
+                "original_token_estimate": 10_000,
+                "projected_token_estimate": 16,
+                "token_estimation_method": "unicode_codepoints_divided_by_4_ceiling_v1",
+                "failure_type": "projection_timeout",
+                "artifact_write_settlement": {
+                    "schema_version": 1,
+                    "operation_id": "artifact_write_11111111111111111111111111111111",
+                    "artifact_id": "art_22222222222222222222222222222222",
+                    "store_identity_sha256": "a" * 64,
+                    "status": "reconciliation_required",
+                    "phase": "commit",
+                    "observation": "caller_boundary",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "observed_at": "2026-01-01T00:00:01Z",
+                    "elapsed_ms": 1000,
+                    "backend_locator": None,
+                    "backend_version": None,
+                    "failure_codes": ["settlement_deadline_expired"],
+                },
+            },
+        },
+    )
+
+    caplog.set_level(logging.INFO, logger=logger.name)
+    asyncio.run(sink.emit(event))
+
+    message = caplog.records[0].message
+    assert "artifact_write_settlement_status=reconciliation_required" in message
+    assert "artifact_write_settlement_phase=commit" in message
+    assert "artifact_write_settlement_elapsed_ms=1000" in message
+    assert "store_identity_sha256=" + ("a" * 64) in message
+    assert "private provider failure" not in message
+
+
 def test_unchanged_tool_projection_keeps_the_failure_reason(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -323,6 +323,25 @@ class ArtifactStore(ABC):
         This decision must be atomic across concurrent callers: for conflicting
         writes to one identity, at most one value may commit and every loser must
         observe a conflict rather than replace or acknowledge the winner.
+
+        Cancellation or a caller-owned timeout after dispatch does not prove
+        that the mutation stopped. Implementations must settle the invocation
+        as one of: ``committed`` when the exact bytes and immutable metadata are
+        durable, readable by id, and list-visible; ``absent`` only after positive
+        proof that no state owned by the invocation remains; or
+        ``reconciliation_required`` with bounded, content-free identity evidence.
+        Caller cancellation remains authoritative after that classification.
+        Reconciliation-required evidence is diagnostic only: it is never
+        ``ArtifactMetadata`` and cannot authorize reads or publication.
+
+        Built-in stores attach evidence to the authoritative exception and emit
+        late completion through ``ArtifactWriteSettlementObserver``. Third-party
+        stores must provide equivalent semantics. They register an operation
+        before dispatch with ``register_artifact_write_operation`` so Cayu can
+        identify active work at a runtime deadline, and atomically record its
+        terminal classification and release observer ownership through that
+        registration. ``record_artifact_write_settlement`` is only for
+        already-terminal evidence without an active registration.
         """
 
     @abstractmethod

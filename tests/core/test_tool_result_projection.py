@@ -3,17 +3,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
 import warnings
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from pydantic import SecretStr
 from tests.core.tool_result_projection_conformance import (
+    assert_tool_result_projection_orphan_evidence_conformance,
     assert_tool_result_projection_recovery_conformance,
     assert_tool_result_projection_session_store_conformance,
 )
 
+import cayu.artifacts.local as local_artifacts
 from cayu import (
     MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES,
     MAX_TOOL_RESULT_ARTIFACT_REFERENCE_BYTES,
@@ -21,6 +25,11 @@ from cayu import (
     AgentSpec,
     ArtifactExternalizingToolResultPolicy,
     ArtifactStoreUnavailableError,
+    ArtifactWriteSettlementEvidence,
+    ArtifactWriteSettlementFailureCode,
+    ArtifactWriteSettlementObservation,
+    ArtifactWriteSettlementPhase,
+    ArtifactWriteSettlementStatus,
     CayuApp,
     Environment,
     EnvironmentSpec,
@@ -47,9 +56,15 @@ from cayu import (
     ToolContext,
     ToolEffect,
     ToolResult,
+    ToolResultProjection,
     ToolResultProjectionPolicy,
+    ToolResultProjectionRecord,
     ToolResultProjectionRequest,
+    ToolResultProjectionStatus,
     ToolSpec,
+    artifact_store_identity_sha256,
+    record_artifact_write_settlement,
+    register_artifact_write_operation,
 )
 from cayu.core.events import event_with_runtime_nested_payload_authority
 from cayu.runtime import (
@@ -147,23 +162,39 @@ class _LateCompletingArtifactStore(_BlockingArtifactStore):
         self.cancellation_observed = asyncio.Event()
 
     async def put_bytes(self, content: bytes, *, filename: str, **kwargs: Any):
+        artifact_id = kwargs.get("artifact_id")
+        assert type(artifact_id) is str
+        registration = register_artifact_write_operation(
+            artifact_id=artifact_id,
+            store_id=self.id,
+        )
+        registration.set_phase(ArtifactWriteSettlementPhase.CONTENT)
         self.writes += 1
         self.started.set()
         try:
-            await self.release.wait()
-        except asyncio.CancelledError:
-            self.cancellation_observed.set()
-            task = asyncio.current_task()
-            if task is not None:
-                while task.cancelling():
-                    task.uncancel()
-            await self.release.wait()
-        return await LocalArtifactStore.put_bytes(
-            self,
-            content,
-            filename=filename,
-            **kwargs,
-        )
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancellation_observed.set()
+                task = asyncio.current_task()
+                if task is not None:
+                    while task.cancelling():
+                        task.uncancel()
+                await self.release.wait()
+            artifact = await LocalArtifactStore.put_bytes(
+                self,
+                content,
+                filename=filename,
+                **kwargs,
+            )
+            registration.record(
+                status=ArtifactWriteSettlementStatus.COMMITTED,
+                phase=ArtifactWriteSettlementPhase.SETTLED,
+            )
+            return artifact
+        except BaseException:
+            registration.close()
+            raise
 
 
 class _SelfCancellingProjectionPolicy(ToolResultProjectionPolicy):
@@ -174,6 +205,117 @@ class _SelfCancellingProjectionPolicy(ToolResultProjectionPolicy):
     async def project(self, request: ToolResultProjectionRequest):
         del request
         raise asyncio.CancelledError("projection policy cancelled itself")
+
+
+class _RegisteredFailingArtifactStore(LocalArtifactStore):
+    def __init__(
+        self,
+        root,
+        *,
+        store_id: str,
+        backend_locator: str | None = None,
+        backend_version: str | None = None,
+    ) -> None:
+        super().__init__(root, store_id=store_id)
+        self.backend_locator = backend_locator
+        self.backend_version = backend_version
+
+    async def put_bytes(self, content: bytes, *, filename: str, **kwargs: Any):
+        del content, filename
+        artifact_id = kwargs.get("artifact_id")
+        assert type(artifact_id) is str
+        registration = register_artifact_write_operation(
+            artifact_id=artifact_id,
+            store_id=self.id,
+        )
+        registration.set_phase(ArtifactWriteSettlementPhase.COMMIT)
+        error = ArtifactStoreUnavailableError("third-party settlement canary")
+        registration.record(
+            status=ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED,
+            phase=ArtifactWriteSettlementPhase.RECONCILIATION,
+            error=error,
+            failure_codes=(ArtifactWriteSettlementFailureCode.COMMIT_FAILED,),
+            backend_locator=self.backend_locator,
+            backend_version=self.backend_version,
+        )
+        raise error
+
+
+class _ObservedArtifactFailureProjectionPolicy(ToolResultProjectionPolicy):
+    def __init__(self, fallback: str) -> None:
+        self.fallback = fallback
+
+    @property
+    def identity(self) -> str:
+        return "tests.observed_artifact_failure_projection.v1"
+
+    async def project(self, request: ToolResultProjectionRequest):
+        assert request.artifact_store is not None
+        try:
+            await request.artifact_store.put_bytes(
+                request.result.content.encode(),
+                artifact_id=f"art_{'d' * 32}",
+                filename="projection.txt",
+                session_id=request.session_id,
+            )
+        except ArtifactStoreUnavailableError:
+            if self.fallback == "missing":
+                return None
+            if self.fallback == "invalid":
+                return object()
+            raise
+        raise AssertionError("failing store unexpectedly returned")
+
+
+class _HistoricalSettlementProjectionPolicy(ToolResultProjectionPolicy):
+    def __init__(self, behavior: str) -> None:
+        self.behavior = behavior
+        now = datetime.now(UTC)
+        self.historical_settlement = ArtifactWriteSettlementEvidence(
+            operation_id=f"artifact_write_{'1' * 32}",
+            artifact_id=f"art_{'2' * 32}",
+            store_identity_sha256=artifact_store_identity_sha256("historical-store"),
+            status=ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED,
+            phase=ArtifactWriteSettlementPhase.RECONCILIATION,
+            observation=ArtifactWriteSettlementObservation.CALLER_BOUNDARY,
+            started_at=now,
+            observed_at=now,
+            elapsed_ms=0,
+            failure_codes=(ArtifactWriteSettlementFailureCode.COMMIT_FAILED,),
+        )
+        self.historical_error = ArtifactStoreUnavailableError("historical write failed")
+        record_artifact_write_settlement(
+            self.historical_settlement,
+            error=self.historical_error,
+        )
+
+    @property
+    def identity(self) -> str:
+        return "tests.historical_settlement_projection.v1"
+
+    async def project(self, request: ToolResultProjectionRequest):
+        if self.behavior == "raise":
+            raise RuntimeError("current projection failed") from self.historical_error
+        projected_result = ToolResult(
+            content="[projection rejected]",
+            structured=request.result.structured,
+            artifacts=request.result.artifacts,
+            is_error=request.result.is_error,
+        )
+        return ToolResultProjection(
+            result=projected_result,
+            record=ToolResultProjectionRecord(
+                status=ToolResultProjectionStatus.FAILED,
+                policy_id=self.identity,
+                original_bytes=len(request.result.content.encode("utf-8")),
+                projected_bytes=len(projected_result.content.encode("utf-8")),
+                original_token_estimate=0,
+                projected_token_estimate=0,
+                token_estimation_method="tests_exact_v1",
+                failure_type="historical_failure",
+                artifact_write_settlement=self.historical_settlement,
+            ),
+        )
 
 
 class _RejectFirstToolRoundPublicationStore(InMemorySessionStore):
@@ -294,7 +436,7 @@ def _run_tool_result(
     *,
     tmp_path,
     content: str,
-    policy: ArtifactExternalizingToolResultPolicy | None,
+    policy: ToolResultProjectionPolicy | None,
     store: LocalArtifactStore | None = None,
     secret_redactor: SecretRedactor | None = None,
     structured: dict[str, Any] | None = None,
@@ -1933,6 +2075,254 @@ def test_cayu_app_publishes_bounded_failure_without_oversized_fallback(tmp_path)
     assert "q" * 100 not in serialized
 
 
+def test_cayu_app_projects_local_orphan_candidate_without_artifact_authority(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    primary_canary = "provider-primary-secret-canary"
+    cleanup_canary = "provider-cleanup-secret-canary"
+
+    def fail_publication(*_args, **_kwargs) -> None:
+        raise OSError(primary_canary)
+
+    def fail_cleanup(*_args, **_kwargs) -> None:
+        raise OSError(cleanup_canary)
+
+    monkeypatch.setattr(local_artifacts, "_rename_directory_no_replace", fail_publication)
+    monkeypatch.setattr(
+        local_artifacts,
+        "_remove_artifact_directory_if_unchanged",
+        fail_cleanup,
+    )
+    policy = ArtifactExternalizingToolResultPolicy(
+        max_inline_bytes=64,
+        max_inline_token_estimate=None,
+    )
+
+    _app, _store, _provider, tool, events = _run_tool_result(
+        tmp_path=tmp_path,
+        content="orphan-" + ("x" * 10_000),
+        policy=policy,
+    )
+
+    terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    projection = terminal.payload["tool_result_projection"]
+    settlement = projection["artifact_write_settlement"]
+    assert projection["status"] == "failed"
+    assert settlement["status"] == "reconciliation_required"
+    assert settlement["phase"] == "cleanup"
+    assert settlement["artifact_id"].startswith("art_")
+    assert settlement["failure_codes"] == ["mutation_failed", "cleanup_failed"]
+    assert "artifact_id" not in projection
+    assert terminal.payload["result"]["artifacts"] == tool.result.artifacts
+    serialized = json.dumps(terminal.model_dump(mode="json"))
+    assert primary_canary not in serialized
+    assert cleanup_canary not in serialized
+
+
+@pytest.mark.parametrize("mutation", ("hostile_value", "oversized_mapping"))
+def test_runtime_rejects_mutated_settlement_before_diagnostic_serialization(
+    tmp_path,
+    caplog,
+    capsys,
+    mutation,
+) -> None:
+    secret = "rejected-projection-settlement-secret-canary"
+
+    class SecretValue:
+        def __str__(self) -> str:
+            return secret
+
+        def __repr__(self) -> str:
+            return secret
+
+    class MutatedSettlementPolicy(ToolResultProjectionPolicy):
+        @property
+        def identity(self) -> str:
+            return "tests.mutated_settlement_projection.v1"
+
+        async def project(self, request: ToolResultProjectionRequest):
+            projected_result = ToolResult(
+                content="[projection rejected]",
+                structured=request.result.structured,
+                artifacts=request.result.artifacts,
+                is_error=request.result.is_error,
+            )
+            now = datetime.now(UTC)
+            settlement = ArtifactWriteSettlementEvidence(
+                operation_id=f"artifact_write_{'e' * 32}",
+                artifact_id=f"art_{'f' * 32}",
+                store_identity_sha256=artifact_store_identity_sha256("test-store"),
+                status=ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED,
+                phase=ArtifactWriteSettlementPhase.COMMIT,
+                observation=ArtifactWriteSettlementObservation.CALLER_BOUNDARY,
+                started_at=now,
+                observed_at=now,
+                elapsed_ms=0,
+                failure_codes=(ArtifactWriteSettlementFailureCode.COMMIT_FAILED,),
+            )
+            projection = ToolResultProjection(
+                result=projected_result,
+                record=ToolResultProjectionRecord(
+                    status=ToolResultProjectionStatus.FAILED,
+                    policy_id=self.identity,
+                    original_bytes=len(request.result.content.encode("utf-8")),
+                    projected_bytes=len(projected_result.content.encode("utf-8")),
+                    original_token_estimate=0,
+                    projected_token_estimate=0,
+                    token_estimation_method="tests_exact_v1",
+                    failure_type="test_failure",
+                    artifact_write_settlement=settlement,
+                ),
+            )
+            if mutation == "hostile_value":
+                copied_settlement = projection.record.artifact_write_settlement
+                assert copied_settlement is not None
+                object.__setattr__(copied_settlement, "artifact_id", SecretValue())
+            else:
+                object.__setattr__(
+                    projection.record,
+                    "artifact_write_settlement",
+                    {"unexpected": secret * 1024},
+                )
+            return projection
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        _app, _store, _provider, _tool, events = _run_tool_result(
+            tmp_path=tmp_path,
+            content="ordinary application result",
+            policy=MutatedSettlementPolicy(),
+        )
+
+    terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    projection = terminal.payload["tool_result_projection"]
+    output = capsys.readouterr()
+    diagnostics = (
+        caplog.text,
+        output.out,
+        output.err,
+        *(str(item.message) for item in captured_warnings),
+    )
+    assert projection["status"] == "failed"
+    assert "artifact_write_settlement" not in projection
+    assert all(secret not in diagnostic for diagnostic in diagnostics)
+
+
+@pytest.mark.parametrize(
+    ("fallback", "failure_type"),
+    (
+        ("raise", "ArtifactStoreUnavailableError"),
+        ("missing", "missing_projection_result"),
+        ("invalid", "TypeError"),
+    ),
+)
+def test_custom_projection_failure_preserves_observed_store_settlement(
+    tmp_path,
+    fallback,
+    failure_type,
+) -> None:
+    store = _RegisteredFailingArtifactStore(
+        tmp_path / "registered-failing-artifacts",
+        store_id="registered-failing-artifacts",
+    )
+
+    _app, _store, _provider, tool, events = _run_tool_result(
+        tmp_path=tmp_path,
+        content="custom policy result",
+        policy=_ObservedArtifactFailureProjectionPolicy(fallback),
+        store=store,
+    )
+
+    terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    projection = terminal.payload["tool_result_projection"]
+    settlement = projection["artifact_write_settlement"]
+    assert projection["status"] == "failed"
+    assert projection["failure_type"] == failure_type
+    assert settlement["status"] == "reconciliation_required"
+    assert settlement["phase"] == "reconciliation"
+    assert settlement["failure_codes"] == ["commit_failed"]
+    assert "artifact_id" not in projection
+    assert terminal.payload["result"]["artifacts"] == tool.result.artifacts
+    assert "third-party settlement canary" not in json.dumps(terminal.model_dump(mode="json"))
+
+
+@pytest.mark.parametrize(
+    ("behavior", "failure_type"),
+    (("raise", "RuntimeError"), ("return", "ValueError")),
+)
+def test_runtime_rejects_historical_settlement_not_observed_for_current_projection(
+    tmp_path,
+    behavior,
+    failure_type,
+) -> None:
+    _app, _store, _provider, _tool, events = _run_tool_result(
+        tmp_path=tmp_path,
+        content="ordinary current result",
+        policy=_HistoricalSettlementProjectionPolicy(behavior),
+    )
+
+    terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    projection = terminal.payload["tool_result_projection"]
+    assert projection["status"] == "failed"
+    assert projection["failure_type"] == failure_type
+    assert "artifact_write_settlement" not in projection
+
+
+@pytest.mark.parametrize(
+    ("backend_locator", "backend_version", "omitted_field", "retained_field"),
+    (
+        (
+            "s3://private-bucket/{secret}",
+            "safe-driver-version",
+            "backend_locator",
+            "backend_version",
+        ),
+        (
+            "safe-backend-locator",
+            "driver-{secret}",
+            "backend_version",
+            "backend_locator",
+        ),
+    ),
+)
+def test_runtime_omits_only_secret_bearing_settlement_extension_metadata(
+    tmp_path,
+    backend_locator,
+    backend_version,
+    omitted_field,
+    retained_field,
+) -> None:
+    secret = "registered-backend-locator-secret"
+    backend_locator = backend_locator.format(secret=secret)
+    backend_version = backend_version.format(secret=secret)
+    store = _RegisteredFailingArtifactStore(
+        tmp_path / "secret-locator-artifacts",
+        store_id="secret-locator-artifacts",
+        backend_locator=backend_locator,
+        backend_version=backend_version,
+    )
+
+    app, _store, _provider, _tool, events = _run_tool_result(
+        tmp_path=tmp_path,
+        content="custom policy result",
+        policy=_ObservedArtifactFailureProjectionPolicy("raise"),
+        store=store,
+        secret_redactor=SecretRedactor(secret),
+    )
+    durable_events = asyncio.run(app.session_store.load_events("sess_runtime_projection"))
+
+    for event_set in (events, durable_events):
+        terminal = next(event for event in event_set if event.type is EventType.TOOL_CALL_COMPLETED)
+        settlement = terminal.payload["tool_result_projection"]["artifact_write_settlement"]
+        assert settlement["status"] == "reconciliation_required"
+        assert omitted_field not in settlement
+        expected_retained = (
+            backend_locator if retained_field == "backend_locator" else backend_version
+        )
+        assert settlement[retained_field] == expected_retained
+        assert secret not in json.dumps(terminal.model_dump(mode="json"))
+
+
 def test_self_cancelled_projection_policy_publishes_bounded_failure() -> None:
     provider = _FakeProvider(
         [
@@ -2379,6 +2769,119 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
     assert artifact_store.writes == 1
 
 
+def test_projection_timeout_records_active_local_write_without_artifact_authority(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from cayu.runtime import _tool_round_executor
+
+    monkeypatch.setattr(
+        _tool_round_executor,
+        "_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    rename = local_artifacts._rename_directory_no_replace
+
+    def blocked_rename(*args, **kwargs) -> None:
+        started.set()
+        try:
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release local artifact publication")
+            rename(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(local_artifacts, "_rename_directory_no_replace", blocked_rename)
+
+    async def scenario() -> tuple[list[Event], list[Event]]:
+        artifact_store = LocalArtifactStore(
+            tmp_path / "active-timeout-artifacts",
+            store_id="active-timeout-artifacts",
+        )
+        provider = _FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_active_projection_timeout",
+                        name="result_tool",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        )
+        app = CayuApp(
+            enable_logging=False,
+            tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
+                max_inline_bytes=64,
+                max_inline_token_estimate=None,
+            ),
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), artifact_store=artifact_store),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_ResultTool(ToolResult(content="x" * 10_000))],
+        )
+        session_id = "sess_active_projection_timeout"
+        run_task = asyncio.create_task(
+            _collect(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "run")],
+                    )
+                )
+            )
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0)
+            interrupt_events = await asyncio.wait_for(
+                _collect(
+                    app.interrupt_session(
+                        InterruptSessionRequest(
+                            session_id=session_id,
+                            reason="active local publication did not settle",
+                        )
+                    )
+                ),
+                timeout=1,
+            )
+            run_events = await asyncio.wait_for(run_task, timeout=1)
+            return interrupt_events, run_events
+        finally:
+            release.set()
+            while not finished.is_set():
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+    interrupt_events, run_events = asyncio.run(scenario())
+
+    assert interrupt_events[-1].type is EventType.SESSION_INTERRUPTED
+    assert run_events[-1].type is EventType.SESSION_INTERRUPTED
+    terminal = next(event for event in run_events if event.type is EventType.TOOL_CALL_COMPLETED)
+    projection = terminal.payload["tool_result_projection"]
+    settlement = projection["artifact_write_settlement"]
+    assert projection["status"] == "failed"
+    assert projection["failure_type"] == "projection_timeout"
+    assert "artifact_id" not in projection
+    assert settlement["status"] == "reconciliation_required"
+    # The deadline may race content fsync with the immediately following
+    # commit-phase notification. Both are truthful last-observed phases.
+    assert settlement["phase"] in {"content", "commit"}
+    assert settlement["failure_codes"] == ["settlement_deadline_expired"]
+    assert settlement["artifact_id"].startswith("art_")
+    assert terminal.payload["result"]["artifacts"] == []
+
+
 def test_late_projection_completion_is_an_identifiable_publication_orphan(
     tmp_path,
     monkeypatch,
@@ -2429,20 +2932,33 @@ def test_late_projection_completion_is_an_identifiable_publication_orphan(
             tools=[_ResultTool(ToolResult(content="late-" + ("x" * 10_000)))],
         )
 
-        events = await asyncio.wait_for(
-            _collect(
-                app.run(
-                    RunRequest(
-                        session_id="sess_late_projection",
-                        agent_name="assistant",
-                        messages=[Message.text("user", "run")],
-                    )
+        events: list[Event] = []
+
+        async def collect_run() -> None:
+            async for event in app.run(
+                RunRequest(
+                    session_id="sess_late_projection",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "run")],
                 )
-            ),
-            timeout=1,
-        )
+            ):
+                events.append(event)
+
+        run_task = asyncio.create_task(collect_run())
         await asyncio.wait_for(artifact_store.cancellation_observed.wait(), timeout=1)
+
+        async def wait_for_terminal_projection() -> None:
+            while not any(event.type is EventType.TOOL_CALL_COMPLETED for event in events):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_terminal_projection(), timeout=1)
+        terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+        settlement = terminal.payload["tool_result_projection"]["artifact_write_settlement"]
+        assert settlement["status"] == "reconciliation_required"
+        assert settlement["phase"] == "content"
+        assert not run_task.done()
         artifact_store.release.set()
+        await asyncio.wait_for(run_task, timeout=1)
 
         async def wait_for_orphan() -> dict[str, Any]:
             while True:
@@ -2457,8 +2973,14 @@ def test_late_projection_completion_is_an_identifiable_publication_orphan(
     events, metadata = asyncio.run(scenario())
 
     terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
-    assert terminal.payload["tool_result_projection"]["failure_type"] == "projection_timeout"
-    assert "artifact_id" not in terminal.payload["tool_result_projection"]
+    projection = terminal.payload["tool_result_projection"]
+    assert projection["failure_type"] == "projection_timeout"
+    assert "artifact_id" not in projection
+    settlement = projection["artifact_write_settlement"]
+    assert settlement["status"] == "reconciliation_required"
+    assert settlement["phase"] == "content"
+    assert settlement["artifact_id"].startswith("art_")
+    assert terminal.payload["result"]["artifacts"] == []
     assert metadata["type"] == "cayu.tool_result_artifact.v1"
     assert metadata["logical_identity_sha256"]
     assert metadata["tool_call_id_sha256"]
@@ -2579,6 +3101,11 @@ def test_in_memory_session_store_preserves_projected_tool_results(tmp_path) -> N
             artifact_store,
             session_id="sess_projection_recovery_in_memory",
         )
+        await assert_tool_result_projection_orphan_evidence_conformance(
+            session_store,
+            LocalArtifactStore(tmp_path / "in-memory-orphan-artifacts"),
+            session_id="sess_projection_orphan_in_memory",
+        )
 
     asyncio.run(scenario())
 
@@ -2597,6 +3124,11 @@ def test_sqlite_session_store_preserves_projected_tool_results(tmp_path) -> None
                 session_store,
                 LocalArtifactStore(tmp_path / "sqlite-recovery-artifacts"),
                 session_id="sess_projection_recovery_sqlite",
+            )
+            await assert_tool_result_projection_orphan_evidence_conformance(
+                session_store,
+                LocalArtifactStore(tmp_path / "sqlite-orphan-artifacts"),
+                session_id="sess_projection_orphan_sqlite",
             )
         finally:
             await session_store.close()

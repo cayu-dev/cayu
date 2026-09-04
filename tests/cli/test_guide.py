@@ -151,6 +151,10 @@ def test_package_shipped_durable_operations_guide_is_runnable(capsys) -> None:
     normalized = guide.casefold()
 
     assert "# Durable operations lifecycle" in guide
+    assert "## Artifact-write cancellation settlement" in guide
+    assert "ArtifactWriteSettlementEvidence" in guide
+    assert "register_artifact_write_operation" in guide
+    assert "reconciliation-required" in guide
     for phase in ("observe", "diagnose", "propose", "authorize", "act once", "verify", "recover"):
         assert phase in normalized
     assert "never automatically replay" in normalized

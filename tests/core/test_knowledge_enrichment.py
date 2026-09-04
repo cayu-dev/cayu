@@ -893,6 +893,7 @@ def test_heartbeat_authority_loss_cannot_publish_a_terminal_job_result() -> None
             task_id: str,
             worker_id: str,
             *,
+            lease_expires_at: datetime,
             handoff_id: str | None = None,
             extend_seconds: int = 300,
         ):

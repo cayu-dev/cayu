@@ -461,6 +461,7 @@ def runtime_tool_event_boundary_controls(
     payload: dict[str, Any],
     *,
     include_terminal_controls: bool = True,
+    redactor: SecretRedactor | None = None,
 ) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
     """Return validated controls and strict projection references for publication."""
 
@@ -468,6 +469,8 @@ def runtime_tool_event_boundary_controls(
         raise TypeError("Runtime tool event payload must be a dict.")
     if type(include_terminal_controls) is not bool:
         raise TypeError("include_terminal_controls must be a bool.")
+    if redactor is not None and not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor or None.")
     controls: dict[str, Any] = _runtime_tool_event_linkage_fields(payload)
     projection_references: dict[int, dict[str, Any]] = {}
     if include_terminal_controls:
@@ -476,9 +479,9 @@ def runtime_tool_event_boundary_controls(
     evidence = _runtime_tool_result_projection(payload)
     if evidence is not None:
         projection, projection_references = evidence
-        controls["tool_result_projection"] = projection.record.model_dump(
-            mode="json",
-            exclude_none=True,
+        controls["tool_result_projection"] = _projection_record_for_event_boundary(
+            projection,
+            redactor=redactor,
         )
     return (
         copy_durable_json_value(controls, "runtime_tool_event_controls"),
@@ -490,6 +493,28 @@ def runtime_tool_event_boundary_controls(
             for index, reference in projection_references.items()
         },
     )
+
+
+def _projection_record_for_event_boundary(
+    projection: ToolResultProjection,
+    *,
+    redactor: SecretRedactor | None,
+) -> dict[str, Any]:
+    """Omit secret-bearing optional extension metadata before control restoration."""
+
+    record = projection.record.model_dump(mode="json", exclude_none=True)
+    if redactor is None:
+        return record
+    settlement = record.get("artifact_write_settlement")
+    if type(settlement) is not dict:
+        return record
+    settlement = dict(settlement)
+    for field in ("backend_locator", "backend_version"):
+        value = settlement.get(field)
+        if type(value) is str and redactor.redact_text(value) != value:
+            settlement.pop(field, None)
+    record["artifact_write_settlement"] = settlement
+    return record
 
 
 def project_runtime_tool_result_for_boundary(

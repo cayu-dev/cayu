@@ -28,6 +28,37 @@ the focused `cayu guide tool-effects#act-once-recovery` protocol within the Act
 once and Inspect/recover phases. It adds durable uncertainty and bounded
 reconciliation dispositions; it is not a second lifecycle.
 
+## Artifact-write cancellation settlement
+
+`ArtifactStore.put_bytes()` uses the same durable uncertainty discipline. Once
+a local thread or remote request may have started, caller cancellation and
+caller-owned timeout do not prove that it stopped. A conforming store classifies
+the invocation as exact committed, positively absent, or
+reconciliation-required. The third outcome is bounded diagnostic evidence with
+a stable operation/artifact identity; it is not `ArtifactMetadata`, cannot be
+passed to `read_bytes()`, and never authorizes publication to a model.
+
+Built-in stores attach `ArtifactWriteSettlementEvidence` to the authoritative
+`CancelledError` or operational failure. Use
+`artifact_write_settlements(error)` for direct exception diagnostics, or install
+an `ArtifactWriteSettlementObserver` around task creation when an operator also
+needs a late final record. Generated and deterministic IDs are fixed before
+dispatch. Reconcile a deterministic retry against exact bytes and immutable
+metadata; never delete a final backend key merely because an acknowledgement or
+readback was unavailable.
+
+Third-party stores call `register_artifact_write_operation(...)` after fixing
+the artifact ID and before the first possible mutation. Update the returned
+registration's phase, keep it open while an opaque thread or remote request may
+still run, and call `registration.record(...)` with the final classification.
+When a caller-boundary candidate precedes retained work, pass `final=False` and
+close the registration only from the retained operation's terminal callback.
+This lets Cayu's runtime snapshot an active candidate before it cancels a timed-
+out projection policy; registering only after cancellation is too late. Keep an
+explicit operation ID unique while an observer retains its active or recorded
+evidence; duplicate registration fails before dispatch, and `drain()` permits
+deliberate reuse after removing the old evidence.
+
 ## Runnable public-API skeleton
 
 This credential-free program performs no real external effect. Its proposal and

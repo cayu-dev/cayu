@@ -18,8 +18,16 @@ _BASE_EXCEPTION_GROUP_EXCEPTIONS_DESCRIPTOR = BaseExceptionGroup.__dict__["excep
 
 def exception_group_children(
     error: BaseExceptionGroup,
+    *,
+    maximum: int | None = None,
 ) -> tuple[BaseException, ...] | None:
     """Return base-owned group children without invoking subclass accessors."""
+
+    if maximum is not None:
+        if type(maximum) is not int:
+            raise TypeError("maximum must be an integer or None.")
+        if maximum < 0:
+            raise ValueError("maximum must be non-negative.")
 
     try:
         children = _BASE_EXCEPTION_GROUP_EXCEPTIONS_DESCRIPTOR.__get__(
@@ -28,11 +36,12 @@ def exception_group_children(
         )
     except BaseException:
         return None
-    if type(children) is not tuple or not all(
-        isinstance(child, BaseException) for child in children
-    ):
+    if type(children) is not tuple:
         return None
-    return children
+    selected = children if maximum is None else children[:maximum]
+    if not all(isinstance(child, BaseException) for child in selected):
+        return None
+    return selected
 
 
 def exception_cause(error: BaseException) -> BaseException | None:

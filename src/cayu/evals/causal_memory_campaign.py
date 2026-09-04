@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from pydantic import SecretStr
+
 from cayu.agent_snapshots import (
     AgentSnapshot,
     AgentSnapshotAuthorityRef,
@@ -159,6 +161,7 @@ from cayu.storage.memory import (
     KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeStatus,
+    KnowledgeStore,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
 
@@ -297,7 +300,7 @@ class _CampaignApplicationFactory(MemoryInterventionRuntimeApplicationFactory):
     def build_app(
         self,
         *,
-        knowledge_store: InMemoryKnowledgeStore,
+        knowledge_store: KnowledgeStore,
         scope: KnowledgeAccessScope,
         policy: AutomaticRecallPolicy,
     ) -> CayuApp:
@@ -305,7 +308,7 @@ class _CampaignApplicationFactory(MemoryInterventionRuntimeApplicationFactory):
             session_store=self.sessions,
             request_footprint=RequestFootprintConfig(
                 fingerprint_key_id="causal-memory-reference",
-                fingerprint_key="causal-memory-reference-key-material",
+                fingerprint_key=SecretStr("causal-memory-reference-key-material"),
             ),
             enable_logging=False,
         )
@@ -694,30 +697,32 @@ def _intervention_specs(
         revision_fingerprint=_SOURCE_REVISION_FINGERPRINT,
         item_fingerprint=_SOURCE_ITEM_FINGERPRINT,
     )
-    common = {
-        "snapshot": snapshot,
-        "starting_recall_policy": starting_policy,
-        "trial_state_mode": AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
-    }
     replacement = _fixture(_REPLACEMENT_TEXT)
     return {
         "as-declared": MemoryInterventionSpec.create(
             spec_id="causal-memory-as-declared",
+            snapshot=snapshot,
+            starting_recall_policy=starting_policy,
             trial_recall_policy=starting_policy,
+            trial_state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
             kind=MemoryInterventionKind.AS_DECLARED,
             bounds=MemoryInterventionBounds(max_changed_items=0, max_fixture_bytes=0),
-            **common,
         ),
         "automatic-recall-off": MemoryInterventionSpec.create(
             spec_id="causal-memory-automatic-recall-off",
+            snapshot=snapshot,
+            starting_recall_policy=starting_policy,
             trial_recall_policy=_recall_policy(AutomaticRecallMode.OFF),
+            trial_state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
             kind=MemoryInterventionKind.AUTOMATIC_RECALL_OFF,
             bounds=MemoryInterventionBounds(max_changed_items=0, max_fixture_bytes=0),
-            **common,
         ),
         "omit-items": MemoryInterventionSpec.create(
             spec_id="causal-memory-omit-items",
+            snapshot=snapshot,
+            starting_recall_policy=starting_policy,
             trial_recall_policy=starting_policy,
+            trial_state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
             kind=MemoryInterventionKind.OMIT_ITEMS,
             bounds=MemoryInterventionBounds(max_changed_items=1, max_fixture_bytes=0),
             changes=(
@@ -728,11 +733,13 @@ def _intervention_specs(
             proposer_fingerprint=_digest("causal-memory-reference-proposer"),
             source_fingerprint=_digest("causal-memory-reference-source"),
             reason="Measure task sensitivity to one exact current knowledge item.",
-            **common,
         ),
         "replace-items": MemoryInterventionSpec.create(
             spec_id="causal-memory-replace-items",
+            snapshot=snapshot,
+            starting_recall_policy=starting_policy,
             trial_recall_policy=starting_policy,
+            trial_state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
             kind=MemoryInterventionKind.REPLACE_ITEMS,
             bounds=MemoryInterventionBounds(
                 max_changed_items=1,
@@ -748,7 +755,6 @@ def _intervention_specs(
             proposer_fingerprint=_digest("causal-memory-reference-proposer"),
             source_fingerprint=_digest("causal-memory-reference-source"),
             reason="Measure sensitivity to a deliberately weak adversarial replacement.",
-            **common,
         ),
     }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
 
@@ -8,6 +9,12 @@ from cayu import (
     AgentSpec,
     ArtifactExternalizingToolResultPolicy,
     ArtifactStore,
+    ArtifactStoreUnavailableError,
+    ArtifactWriteSettlementEvidence,
+    ArtifactWriteSettlementFailureCode,
+    ArtifactWriteSettlementObservation,
+    ArtifactWriteSettlementPhase,
+    ArtifactWriteSettlementStatus,
     CayuApp,
     Environment,
     EnvironmentSpec,
@@ -23,6 +30,8 @@ from cayu import (
     ToolEffect,
     ToolResult,
     ToolSpec,
+    artifact_store_identity_sha256,
+    record_artifact_write_settlement,
 )
 from cayu.runtime import (
     RuntimePublicationRequest,
@@ -67,6 +76,43 @@ class _ConformanceTool(Tool):
         del ctx, args
         self.calls += 1
         return ToolResult(content=self.content)
+
+
+class _OrphaningArtifactStore(ArtifactStore):
+    def __init__(self, delegate: ArtifactStore) -> None:
+        self.delegate = delegate
+        self.id = delegate.id
+        self.artifact_id: str | None = None
+
+    async def put_bytes(self, content: bytes, *, artifact_id: str | None = None, **kwargs: Any):
+        del content, kwargs
+        assert artifact_id is not None
+        self.artifact_id = artifact_id
+        observed_at = datetime.now(UTC)
+        evidence = ArtifactWriteSettlementEvidence(
+            operation_id="artifact_write_11111111111111111111111111111111",
+            artifact_id=artifact_id,
+            store_identity_sha256=artifact_store_identity_sha256(self.id),
+            status=ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED,
+            phase=ArtifactWriteSettlementPhase.COMMIT,
+            observation=ArtifactWriteSettlementObservation.CALLER_BOUNDARY,
+            started_at=observed_at,
+            observed_at=observed_at,
+            elapsed_ms=0,
+            failure_codes=(ArtifactWriteSettlementFailureCode.COMMIT_FAILED,),
+        )
+        error = ArtifactStoreUnavailableError("Artifact commit could not be reconciled.")
+        record_artifact_write_settlement(evidence, error=error)
+        raise error
+
+    async def read_bytes(self, artifact_id: str, *, max_bytes: int | None = None):
+        return await self.delegate.read_bytes(artifact_id, max_bytes=max_bytes)
+
+    async def list(self, **kwargs: Any):
+        return await self.delegate.list(**kwargs)
+
+    async def delete(self, artifact_id: str) -> None:
+        await self.delegate.delete(artifact_id)
 
 
 async def assert_tool_result_projection_session_store_conformance(
@@ -123,6 +169,72 @@ async def assert_tool_result_projection_session_store_conformance(
     )
     persisted = await artifact_store.read_bytes(reference["artifact_id"])
     assert persisted.content.decode() == original
+
+
+async def assert_tool_result_projection_orphan_evidence_conformance(
+    session_store: SessionStore,
+    artifact_store: ArtifactStore,
+    *,
+    session_id: str,
+) -> None:
+    original = "session-store-orphan-" + ("o" * 10_000)
+    provider = _ConformanceProvider()
+    orphaning_store = _OrphaningArtifactStore(artifact_store)
+    app = CayuApp(
+        enable_logging=False,
+        session_store=session_store,
+        tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
+            max_inline_bytes=1024,
+            max_inline_token_estimate=None,
+            preview_bytes=32,
+        ),
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), artifact_store=orphaning_store),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[_ConformanceTool(original)],
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                messages=[Message.text("user", "run")],
+            )
+        )
+    ]
+
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    durable_events = await session_store.load_events(session_id)
+    public_terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    durable_terminal = next(
+        event for event in durable_events if event.type is EventType.TOOL_CALL_COMPLETED
+    )
+    for terminal in (public_terminal, durable_terminal):
+        projection = terminal.payload["tool_result_projection"]
+        settlement = projection["artifact_write_settlement"]
+        assert projection["status"] == "failed"
+        assert "artifact_id" not in projection
+        assert settlement["status"] == "reconciliation_required"
+        assert settlement["artifact_id"] == orphaning_store.artifact_id
+        assert terminal.payload["result"]["artifacts"] == []
+    assert orphaning_store.artifact_id is not None
+    assert orphaning_store.artifact_id not in provider.requests[1].model_dump_json()
+    transcript = await session_store.load_transcript(session_id)
+    tool_result = next(
+        part
+        for message in transcript
+        if message.role == "tool"
+        for part in message.content
+        if part.tool_call_id == "call_projection_conformance"
+    )
+    assert tool_result.artifacts == []
 
 
 async def assert_tool_result_projection_recovery_conformance(

@@ -46,6 +46,9 @@ from cayu._validation import (
 )
 from cayu._workspace_mutation import workspace_mutation_task_settlement_probe
 from cayu.artifacts import ArtifactScope, LocalArtifactStore
+from cayu.artifacts.settlement import (
+    ArtifactWriteSettlementObserver,
+)
 from cayu.core.agents import AgentSpec
 from cayu.core.events import (
     Event,
@@ -241,6 +244,7 @@ from cayu.runtime.tool_result_projection import (
     _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
     ToolResultProjectionPolicy,
     ToolResultProjectionRequest,
+    _last_reconciliation_candidate,
     projection_failure,
     safe_projection_failure_type,
     validate_tool_result_projection,
@@ -6056,21 +6060,28 @@ class ToolRoundExecutor:
             tool_call_id=tool_call.id,
             artifact_store=_artifact_store(registered_environment),
         )
-        policy_task = asyncio.create_task(policy.project(request))
+        settlement_observer = ArtifactWriteSettlementObserver()
+        with settlement_observer:
+            policy_task = asyncio.create_task(policy.project(request))
         outcome = await await_shielded_task_outcome(
             policy_task,
             timeout_s=_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS,
         )
         error = outcome.error
         if outcome.timed_out:
+            settlement_observer.record_active_candidates()
             policy_task.cancel()
             policy_task.add_done_callback(_consume_projection_task_outcome)
             projection = projection_failure(
                 policy=policy,
                 request=request,
                 failure_type="projection_timeout",
+                artifact_write_settlement=_last_reconciliation_candidate(
+                    settlement_observer.snapshot()
+                ),
             )
         elif error is not None:
+            settlement = _last_reconciliation_candidate(settlement_observer.snapshot())
             if isinstance(error, asyncio.CancelledError):
                 error = unexpected_child_cancellation_error(
                     error,
@@ -6085,12 +6096,16 @@ class ToolRoundExecutor:
                     error,
                     fallback="projection_policy_failure",
                 ),
+                artifact_write_settlement=settlement,
             )
         elif outcome.result is None:
             projection = projection_failure(
                 policy=policy,
                 request=request,
                 failure_type="missing_projection_result",
+                artifact_write_settlement=_last_reconciliation_candidate(
+                    settlement_observer.snapshot()
+                ),
             )
         else:
             try:
@@ -6098,6 +6113,7 @@ class ToolRoundExecutor:
                     outcome.result,
                     request=request,
                     policy=policy,
+                    observed_artifact_write_settlements=settlement_observer.snapshot(),
                 )
             except Exception as exc:
                 projection = projection_failure(
@@ -6106,6 +6122,9 @@ class ToolRoundExecutor:
                     failure_type=safe_projection_failure_type(
                         exc,
                         fallback="projection_policy_failure",
+                    ),
+                    artifact_write_settlement=_last_reconciliation_candidate(
+                        settlement_observer.snapshot()
                     ),
                 )
         payload = dict(event.payload)

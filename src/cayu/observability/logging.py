@@ -346,6 +346,24 @@ def _append_tool_result_projection(
             projection.get(key),
             redactor=redactor,
         )
+    settlement = projection.get("artifact_write_settlement")
+    if type(settlement) is not dict:
+        return
+    for key in (
+        "status",
+        "operation_id",
+        "artifact_id",
+        "store_identity_sha256",
+        "phase",
+        "observation",
+        "elapsed_ms",
+    ):
+        _append(
+            parts,
+            f"artifact_write_settlement_{key}",
+            settlement.get(key),
+            redactor=redactor,
+        )
 
 
 def _append_policy_denial(

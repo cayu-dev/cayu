@@ -10049,7 +10049,98 @@ when the adapter crosses an external sandbox boundary.
 
 Uploaded/generated file reference boundary. Artifacts are not the active project filesystem. They are durable file blobs with metadata, content type, size, creation time, and explicit scope.
 
-`LocalArtifactStore` is available for local filesystem-backed artifact storage. It stores each artifact as content plus JSON metadata under one root. Writes prepare both files in a private staging directory, flush and synchronize both regular files and the staging directory, atomically rename the complete directory into place with no-replace semantics, and synchronize the store root before acknowledging success. Newly created store-root ancestry is published one directory at a time, with each directory and its parent synchronized before creation proceeds. Final-root creation is protected by a cooperative lock and a deterministic pending sidecar in the parent: every initialization attempt creates or validates the sidecar before accepting an existing-or-new raced root, filesystem-equivalent spellings of existing path components resolve to the same sidecar, and the sidecar is removed only after the root entry is durable. The store pins the exact root identity completed by that protocol and rejects a replacement during initialization. A pre-provisioned root without that marker does not require read permission on or synchronization of its unchanged parent during ordinary publication. A process, kernel, or power-loss crash therefore cannot expose a newly partial artifact under its final id, an acknowledged artifact has crossed the operating system's durable-write boundary, and a racing target is never overwritten. If final root synchronization fails after the rename, the caller receives an unavailable error and the complete publication remains an ambiguous outcome; an exact deterministic retry validates and re-synchronizes that publication before acknowledging it. A deterministic retry may also replace a legacy partial directory only after validating that any existing content and metadata match the same requested write. Concurrent identical writers therefore converge on one committed artifact, while malformed metadata, conflicting content, or unexpected filesystem entries fail closed. Listings exclude legacy records whose content is missing or whose size conflicts with metadata. Caller cancellation during publication is deferred until the dispatched filesystem mutation physically settles, so another writer cannot overtake an abandoned thread; the original `CancelledError` remains authoritative and retains any worker failure as ordered causal evidence. All Cayu mutations of one artifact id share the same deterministic cooperative ownership-lock shard; the fixed shard namespace bounds lock-file growth per store root while allowing unrelated shards to proceed concurrently. Once a complete generated publication releases that shard, later caller cancellation or publication-finalization failure is an ambiguous outcome: the store leaves the artifact discoverable instead of deleting state that a concurrent exact retry may already have durably acknowledged. An exact deterministic retry validates and re-synchronizes the same directory before acknowledging it. Local deletion is serialized by the same ownership lock, but deletion acknowledgements are not currently crash-durable because the store does not synchronize the root after removal; caller cancellation may stop waiting while the off-thread deletion continues.
+`ArtifactStore.put_bytes(...)` has one cancellation-settlement contract. After
+caller cancellation or a caller-owned timeout reaches a dispatched write, the
+invocation is classified as `committed`, `absent`, or
+`reconciliation_required`. Committed means the exact requested bytes and
+immutable metadata are durable, readable by artifact id, and visible to the
+store's committed listing semantics. Absent requires positive backend evidence
+that no state owned by that invocation remains; cancellation, timeout, or a
+failed read is never absence by inference. Reconciliation-required is a bounded
+orphan candidate containing only an operation id, artifact id, SHA-256 store
+identity, phase, timestamps, closed failure codes, and optional bounded safe
+backend locator/version. It is diagnostic evidence, not `ArtifactMetadata`, and
+must never be passed to read paths, published as an artifact reference, or
+treated as permission to consume an object.
+
+Built-in stores preserve the original `CancelledError` after classification.
+They attach an `ArtifactWriteSettlementEvidence` record that callers can read
+with `artifact_write_settlements(error)`. A caller that also needs late results
+installs the synchronous, bounded `ArtifactWriteSettlementObserver` around task
+creation and later calls `snapshot()` or `drain()`; the observer never invokes
+application callbacks from a mutation task. If settlement exceeds the built-in
+five-second post-cancellation deadline, the store retains sole ownership of the
+still-running task and first emits a caller-boundary candidate, then one late
+committed, absent, or reconciliation-required record when the task terminates.
+Generated and caller-supplied artifact ids are fixed before dispatch, so both
+remain identifiable after cancellation. Each built-in store admits at most 64
+active or retained write tasks; capacity exhaustion fails before another
+artifact mutation is dispatched.
+
+Third-party stores participate in the same runtime deadline boundary by calling
+`register_artifact_write_operation(...)` after fixing the artifact identity and
+before dispatch. The returned operation-scoped registration updates the active
+phase and records terminal evidence without application callbacks. It remains
+open while an opaque mutation may still run; a caller-boundary candidate uses
+`final=False`, and only the final retained callback releases it. The public
+`record_artifact_write_settlement(...)` helper remains the lower-level surface
+for evidence that is already terminal and has no active registration; it cannot
+finalize or bypass a registered operation. Registering or recording only after
+a runtime timeout cannot retroactively identify the durable terminal event.
+An explicitly supplied registration operation id must remain unique while its
+active or recorded evidence is retained by the current observer; duplicate
+registration fails before dispatch, and draining the retained record permits
+deliberate reuse.
+
+`LocalArtifactStore` is available for local filesystem-backed artifact storage.
+It stores each artifact as content plus JSON metadata under one root. Writes
+prepare both files in a private staging directory, flush and synchronize both
+regular files and the staging directory, atomically rename the complete
+directory into place with no-replace semantics, and synchronize the store root
+before acknowledging success. Newly created store-root ancestry is published
+one directory at a time, with each directory and its parent synchronized before
+creation proceeds. Final-root creation is protected by a cooperative lock and a
+deterministic pending sidecar in the parent: every initialization attempt
+creates or validates the sidecar before accepting an existing-or-new raced
+root, filesystem-equivalent spellings of existing path components resolve to
+the same sidecar, and the sidecar is removed only after the root entry is
+durable. The store pins the exact root identity completed by that protocol and
+rejects a replacement during initialization. A pre-provisioned root without
+that marker does not require read permission on or synchronization of its
+unchanged parent during ordinary publication. A process, kernel, or power-loss
+crash therefore cannot expose a newly partial artifact under its final id, an
+acknowledged artifact has crossed the operating system's durable-write
+boundary, and a racing target is never overwritten.
+
+If final root synchronization fails after the rename, the caller receives an
+unavailable error and the complete publication is reconciliation-required; an
+exact deterministic retry validates and re-synchronizes that publication
+before acknowledging it. A deterministic retry may also replace a legacy
+partial directory only after validating that any existing content and metadata
+match the same requested write. Concurrent identical writers therefore
+converge on one committed artifact, while malformed metadata, conflicting
+content, or unexpected filesystem entries fail closed. Listings exclude legacy
+records whose content is missing or whose size conflicts with metadata. All
+Cayu mutations of one artifact id share the same deterministic cooperative
+ownership-lock shard; the fixed shard namespace bounds lock-file growth per
+store root while allowing unrelated shards to proceed concurrently.
+
+Caller cancellation first waits for the dispatched filesystem mutation for at
+most the shared five-second settlement deadline. If it is still running, the
+caller receives the original `CancelledError` with a reconciliation-required
+candidate while the store retains the worker and its ownership lock until
+physical completion. Another writer therefore cannot overtake the retained
+worker. If the worker settles within the deadline, the original cancellation
+remains authoritative and retains any worker failure as ordered causal
+evidence. Once a complete generated publication releases its shard, later
+caller cancellation or publication-finalization failure is
+reconciliation-required: the store leaves the artifact discoverable instead of
+deleting state that a concurrent exact retry may already have durably
+acknowledged. An exact deterministic retry validates and re-synchronizes the
+same directory before acknowledging it. Local deletion is serialized by the
+same ownership lock, but deletion acknowledgements are not currently
+crash-durable because the store does not synchronize the root after removal;
+caller cancellation may stop waiting while the off-thread deletion continues.
 
 Local artifact ids use the exact generated form `art_` followed by 32 lowercase hexadecimal characters; malformed ids are rejected before filesystem access. The store pins the initialized root directory identity and anchors operations to a validated root directory descriptor where the platform supports directory-relative access. Replacing the configured root path, including with a symlink or Windows reparse point, makes the store unavailable rather than redirecting artifact I/O. Stored artifact directories, metadata, and content must be regular filesystem entries rather than symbolic links. Orphan private staging directories are ignored after restart rather than reclaimed without proof that another process has released them. Platforms without a supported directory-synchronization primitive may read existing local artifacts but fail closed before publishing new ones. Durable descriptor synchronization uses `fsync` on supported POSIX platforms and `F_FULLFSYNC` on macOS; an unavailable or rejected platform primitive fails publication rather than weakening the acknowledgement contract. Filesystem, device, and remote-storage guarantees outside that operating-system contract remain deployment concerns. Session-scoped artifacts require `session_id`; environment-scoped artifacts require `environment_name`. `read_file(artifact_id=...)` enforces that the artifact belongs to the current session or current environment before exposing content to the model.
 
@@ -10155,15 +10246,17 @@ raw session id. `LocalArtifactStore` and
 `S3ArtifactStore` accept this caller-supplied identity idempotently: an exact
 content/metadata retry reuses the object, while a conflict fails. The S3
 content object precedes its metadata commit marker, and a retry can complete a
-missing marker after verifying already-uploaded bytes. Because cancellation
-cannot stop an in-flight threaded S3 request, the built-in store settles the
-content upload and metadata commit before redelivering caller cancellation; a
-late successful upload therefore remains discoverable instead of leaving a
-content-only object. If that metadata commit fails, the cancelled invocation
-settles cleanup of content it created before redelivering cancellation. A
-store identity copied into the model-facing reference is limited to 256 UTF-8
-bytes; a store with a larger identity fails projection before artifact
-persistence.
+missing marker after verifying already-uploaded bytes. Generated writes perform
+the same exact readback after an upload acknowledgement is lost. Because
+cancellation cannot stop an in-flight threaded S3 request, the built-in store
+waits through the shared settlement deadline and then retains an unfinished
+write under store ownership. It never blindly deletes a final content or
+metadata key after an ambiguous failure: an exact retry may already have
+committed or adopted that key. Content without a validated metadata marker is
+therefore reconciliation-required and remains excluded from committed listing
+semantics. A store identity copied into the model-facing reference is limited
+to 256 UTF-8 bytes; a store with a larger identity fails projection before
+artifact persistence.
 
 If the artifact store is missing, unavailable, or returns an invalid object,
 Cayu publishes an explicit bounded projection-failure result. It never falls
@@ -10175,13 +10268,26 @@ executing the tool or externalizing again. Operators can identify a possible
 orphan by artifact metadata type, session scope, logical identity hash, and the
 absence of the artifact id from terminal tool evidence; automatic garbage
 collection is intentionally outside this policy. Projection persistence has a
-30-second runtime deadline. Cayu asks a timed-out policy task to cancel,
-publishes a bounded `projection_timeout` failure, and continues interruption or
-terminal publication instead of leaving a session in `interrupting`
-indefinitely. A custom policy or store must cooperate with task cancellation.
-If it completes after the deadline despite cancellation, its deterministic
-object is a possible publication orphan identifiable by the same metadata
-described above. When operator cancellation arrives while persistence is
+30-second runtime deadline. Cayu records active artifact-write candidates,
+asks a timed-out policy task to cancel, publishes a bounded
+`projection_timeout` failure, and continues interruption or terminal
+publication instead of leaving a session in `interrupting` indefinitely. A
+failed projection record may carry one nested
+`ArtifactWriteSettlementEvidence` only when it is reconciliation-required. The
+nested record is diagnostic evidence and never populates the projection's
+artifact-reference fields or result artifacts. Custom stores participate by
+registering the operation before dispatch and recording its terminal
+classification through that registration. Runtime publication accepts a
+settlement only when the observer installed for that exact policy invocation
+captured the complete record; evidence found only on an older exception cause
+or returned without current-operation observation is not current settlement
+authority. Optional extension locator/version fields that contain a registered
+secret are omitted before durable and public event publication, while safe
+sibling fields remain available. Custom policies and stores should also
+cooperate with task cancellation. If a policy completes after the
+deadline despite cancellation, its deterministic object is a possible
+publication orphan identifiable by the observer evidence and metadata described
+above. When operator cancellation arrives while persistence is
 already completing, Cayu consumes the completed projection (or its bounded
 failure), publishes that terminal evidence, and only then redelivers
 cancellation. Resume therefore does not rerun the completed tool or repeat the
@@ -10189,11 +10295,12 @@ store write.
 
 Terminal events, Python logs, and OpenTelemetry tool spans expose only bounded
 projection diagnostics: status, policy id, original/projected byte and token
-estimates, estimation method, artifact id/hash, and safe failure type. They do
-not include externalized or projection-failure content or backend exception
-messages. An `unchanged` failed tool result retains its ordinary bounded,
-redacted failure reason in logs and span status because its content was not
-replaced.
+estimates, estimation method, artifact id/hash, safe failure type, and the
+bounded nested settlement fields when reconciliation is required. They do not
+include externalized or projection-failure content, raw store identities, or
+backend exception messages. An `unchanged` failed tool result retains its
+ordinary bounded, redacted failure reason in logs and span status because its
+content was not replaced.
 
 This feature bounds a completed tool's model-facing text. It does not replace
 oversized prompt-file fallback, stream progress from a running tool, compact
@@ -10426,7 +10533,9 @@ Provider-native file upload APIs can be added later as provider-specific optimiz
 `S3ArtifactStore` is the built-in AWS remote store. It writes content before a
 JSON metadata commit marker, lists only committed artifacts, uses ranged object
 reads for `max_bytes`, and maps missing objects separately from unavailable S3
-backends.
+backends. Ambiguous final-key failures are retained for exact retry and reported
+as reconciliation-required; the store does not infer absence or blindly delete
+keys after acknowledgement loss.
 
 Artifact result objects enforce consistent metadata:
 

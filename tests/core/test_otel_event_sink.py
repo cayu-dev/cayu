@@ -605,6 +605,55 @@ def test_tool_span_carries_bounded_projection_diagnostics() -> None:
     assert "private oversized preview content" not in str(tool.status.description)
 
 
+def test_tool_span_carries_bounded_artifact_settlement_diagnostics() -> None:
+    exporter, sink = _make_sink()
+    events = _session_events("sess_projection_settlement")
+    events[4] = events[4].model_copy(
+        update={
+            "type": EventType.TOOL_CALL_FAILED,
+            "payload": {
+                "tool_call_id": "call_1",
+                "result": {"content": "private provider failure", "is_error": True},
+                "tool_result_projection": {
+                    "status": "failed",
+                    "policy_id": "cayu.artifact_externalizing_tool_result.v1",
+                    "original_bytes": 40_000,
+                    "projected_bytes": 64,
+                    "original_token_estimate": 10_000,
+                    "projected_token_estimate": 16,
+                    "token_estimation_method": "unicode_codepoints_divided_by_4_ceiling_v1",
+                    "failure_type": "projection_timeout",
+                    "artifact_write_settlement": {
+                        "schema_version": 1,
+                        "operation_id": "artifact_write_11111111111111111111111111111111",
+                        "artifact_id": "art_22222222222222222222222222222222",
+                        "store_identity_sha256": "a" * 64,
+                        "status": "reconciliation_required",
+                        "phase": "commit",
+                        "observation": "caller_boundary",
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "observed_at": "2026-01-01T00:00:01Z",
+                        "elapsed_ms": 1000,
+                        "backend_locator": None,
+                        "backend_version": None,
+                        "failure_codes": ["settlement_deadline_expired"],
+                    },
+                },
+            },
+        }
+    )
+
+    _drive(sink, events)
+
+    tool = _spans_by_name(exporter)["execute_tool exec_command"]
+    attrs = tool.attributes
+    assert attrs[otel.CAYU_ARTIFACT_WRITE_SETTLEMENT_STATUS] == "reconciliation_required"
+    assert attrs[otel.CAYU_ARTIFACT_WRITE_SETTLEMENT_PHASE] == "commit"
+    assert attrs[otel.CAYU_ARTIFACT_WRITE_SETTLEMENT_ELAPSED_MS] == 1000
+    assert attrs[otel.CAYU_ARTIFACT_WRITE_SETTLEMENT_STORE_IDENTITY] == "a" * 64
+    assert "private provider failure" not in repr(attrs)
+
+
 def test_unchanged_tool_projection_keeps_span_failure_description() -> None:
     exporter, sink = _make_sink()
     events = _session_events("sess_projection_unchanged")

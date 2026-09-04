@@ -16,9 +16,13 @@ import pytest
 
 from cayu import _filesystem_lock as lock_module
 from cayu.artifacts import (
+    ArtifactScope,
     ArtifactStoreUnavailableError,
+    ArtifactWriteSettlementFailureCode,
+    ArtifactWriteSettlementStatus,
     InvalidArtifactIdError,
     LocalArtifactStore,
+    artifact_write_settlements,
 )
 from cayu.artifacts import local as local_module
 
@@ -68,6 +72,45 @@ def _assert_acyclic_exception_graph(error: BaseException) -> list[BaseException]
     identities = [id(item) for item in observed]
     assert len(identities) == len(set(identities)), "exception appears more than once"
     return observed
+
+
+def test_local_deterministic_retry_binds_the_complete_write_tuple(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    kwargs = {
+        "artifact_id": _ARTIFACT_ID,
+        "filename": "durable.txt",
+        "content_type": "text/plain",
+        "scope": ArtifactScope.SESSION,
+        "session_id": "sess_durable",
+        "agent_name": "assistant",
+        "environment_name": "local",
+        "metadata": {"alpha": 1, "enabled": False},
+    }
+
+    first = asyncio.run(store.put_bytes(b"durable-content", **kwargs))
+    replayed = asyncio.run(
+        store.put_bytes(
+            b"durable-content",
+            **{**kwargs, "metadata": {"enabled": False, "alpha": 1}},
+        )
+    )
+
+    assert replayed == first
+    conflicts = (
+        (b"changed-content", {}),
+        (b"durable-content", {"filename": "changed.txt"}),
+        (b"durable-content", {"content_type": "application/octet-stream"}),
+        (b"durable-content", {"scope": ArtifactScope.ENVIRONMENT}),
+        (b"durable-content", {"session_id": "sess_changed"}),
+        (b"durable-content", {"agent_name": "reviewer"}),
+        (b"durable-content", {"environment_name": "remote"}),
+        (b"durable-content", {"metadata": {"alpha": 1, "enabled": True}}),
+    )
+    for content, update in conflicts:
+        with pytest.raises(ValueError, match="different content or metadata"):
+            asyncio.run(store.put_bytes(content, **{**kwargs, **update}))
+
+    assert asyncio.run(store.read_bytes(_ARTIFACT_ID)).metadata == first
 
 
 def test_local_artifact_put_syncs_files_then_directories(monkeypatch, tmp_path):
@@ -517,6 +560,62 @@ def test_local_artifact_put_cleans_staging_after_file_write_failure(
     assert list(root.iterdir()) == []
 
 
+def test_local_staging_identity_failure_requires_reconciliation(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    store = LocalArtifactStore(root)
+    real_stat = local_module._stat_directory_entry
+    failed = False
+
+    def fail_initial_staging_stat(path, *, parent_fd=None):
+        nonlocal failed
+        if not failed and ".staging-" in path.name:
+            failed = True
+            raise OSError("staging identity unavailable")
+        return real_stat(path, parent_fd=parent_fd)
+
+    monkeypatch.setattr(local_module, "_stat_directory_entry", fail_initial_staging_stat)
+
+    with pytest.raises(ArtifactStoreUnavailableError) as exc_info:
+        _put(store, artifact_id=_ARTIFACT_ID)
+
+    assert failed
+    settlement = artifact_write_settlements(exc_info.value)
+    assert len(settlement) == 1
+    assert settlement[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+    assert any(".staging-" in entry.name for entry in root.iterdir())
+
+
+def test_local_unproved_staging_removal_requires_reconciliation(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    store = LocalArtifactStore(root)
+    real_write = local_module._write_artifact_file
+
+    def fail_metadata_write(*args, **kwargs) -> None:
+        if args[3] == "metadata.json":
+            raise OSError("metadata write failed")
+        real_write(*args, **kwargs)
+
+    def leave_staging_in_place(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(local_module, "_write_artifact_file", fail_metadata_write)
+    monkeypatch.setattr(local_module.shutil, "rmtree", leave_staging_in_place)
+
+    with pytest.raises(ArtifactStoreUnavailableError) as exc_info:
+        _put(store, artifact_id=_ARTIFACT_ID)
+
+    settlement = artifact_write_settlements(exc_info.value)
+    assert len(settlement) == 1
+    assert settlement[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+    assert settlement[0].failure_codes == (
+        ArtifactWriteSettlementFailureCode.MUTATION_FAILED,
+        ArtifactWriteSettlementFailureCode.CLEANUP_FAILED,
+    )
+    assert any(".staging-" in entry.name for entry in root.iterdir())
+
+
 def test_local_artifact_put_cleans_staging_after_rename_failure(monkeypatch, tmp_path):
     root = tmp_path / "artifacts"
     root.mkdir()
@@ -671,15 +770,167 @@ def test_local_artifact_cancellation_waits_for_dispatched_write(monkeypatch, tmp
         assert not contender.done()
         release.set()
 
-        with pytest.raises(asyncio.CancelledError, match="stop local artifact write"):
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="stop local artifact write",
+        ) as raised:
             await first
         assert first.cancelled()
+        settlement = artifact_write_settlements(raised.value)
+        assert len(settlement) == 1
+        assert settlement[0].artifact_id == _ARTIFACT_ID
+        assert settlement[0].status is ArtifactWriteSettlementStatus.COMMITTED
         return await contender
 
     artifact = asyncio.run(exercise())
 
     assert artifact.id == _ARTIFACT_ID
     assert asyncio.run(store.read_bytes(_ARTIFACT_ID)).content == b"durable-content"
+
+
+def test_local_child_task_cancellation_keeps_dispatched_thread_owned(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    store = LocalArtifactStore(root)
+    dispatched = threading.Event()
+    release = threading.Event()
+    child_tasks: list[asyncio.Task] = []
+    real_rename = local_module._rename_directory_no_replace
+    real_operation = local_module._run_local_artifact_write
+
+    def blocked_rename(*args, **kwargs) -> None:
+        dispatched.set()
+        assert release.wait(timeout=10)
+        real_rename(*args, **kwargs)
+
+    async def capture_child(*args, **kwargs):
+        child = asyncio.current_task()
+        assert child is not None
+        child_tasks.append(child)
+        return await real_operation(*args, **kwargs)
+
+    monkeypatch.setattr(local_module, "_rename_directory_no_replace", blocked_rename)
+    monkeypatch.setattr(local_module, "_run_local_artifact_write", capture_child)
+
+    async def exercise():
+        put_task = asyncio.create_task(
+            store.put_bytes(
+                b"durable-content",
+                artifact_id=_ARTIFACT_ID,
+                filename="durable.txt",
+                content_type="text/plain",
+                session_id="sess_durable",
+            )
+        )
+        assert await asyncio.to_thread(dispatched.wait, 10)
+        assert len(child_tasks) == 1
+        child_tasks[0].cancel("supervisor stopped child")
+        await asyncio.sleep(0)
+        assert not put_task.done()
+
+        contender = asyncio.create_task(
+            store.put_bytes(
+                b"durable-content",
+                artifact_id=_ARTIFACT_ID,
+                filename="durable.txt",
+                content_type="text/plain",
+                session_id="sess_durable",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not contender.done()
+        release.set()
+
+        with pytest.raises(
+            RuntimeError,
+            match="Local artifact publication was cancelled without caller cancellation",
+        ) as raised:
+            await put_task
+        assert isinstance(raised.value.__cause__, asyncio.CancelledError)
+        evidence = artifact_write_settlements(raised.value)
+        assert len(evidence) == 1
+        assert evidence[0].status is ArtifactWriteSettlementStatus.COMMITTED
+        assert evidence[0].failure_codes == (ArtifactWriteSettlementFailureCode.CHILD_CANCELLED,)
+        return put_task, await contender
+
+    put_task, contender = asyncio.run(exercise())
+
+    assert not put_task.cancelled()
+    assert child_tasks[0].done()
+    assert child_tasks[0].cancelling() == 0
+    assert not child_tasks[0].cancelled()
+    assert contender.id == _ARTIFACT_ID
+    assert asyncio.run(store.read_bytes(_ARTIFACT_ID)).content == b"durable-content"
+
+
+def test_local_child_task_cancellation_preserves_later_worker_failure(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    store = LocalArtifactStore(root)
+    dispatched = threading.Event()
+    release = threading.Event()
+    child_tasks: list[asyncio.Task] = []
+    publication_error = OSError("publication failed after child cancellation")
+    real_operation = local_module._run_local_artifact_write
+
+    def failing_rename(*_args, **_kwargs) -> None:
+        dispatched.set()
+        assert release.wait(timeout=10)
+        raise publication_error
+
+    async def capture_child(*args, **kwargs):
+        child = asyncio.current_task()
+        assert child is not None
+        child_tasks.append(child)
+        return await real_operation(*args, **kwargs)
+
+    monkeypatch.setattr(local_module, "_rename_directory_no_replace", failing_rename)
+    monkeypatch.setattr(local_module, "_run_local_artifact_write", capture_child)
+
+    async def exercise():
+        put_task = asyncio.create_task(
+            store.put_bytes(
+                b"durable-content",
+                artifact_id=_ARTIFACT_ID,
+                filename="durable.txt",
+                content_type="text/plain",
+                session_id="sess_durable",
+            )
+        )
+        assert await asyncio.to_thread(dispatched.wait, 10)
+        child_tasks[0].cancel("supervisor stopped child")
+        await asyncio.sleep(0)
+        assert not put_task.done()
+        release.set()
+        with pytest.raises(
+            ArtifactStoreUnavailableError,
+            match="could not write artifact content",
+        ) as raised:
+            await put_task
+        return put_task, raised.value
+
+    put_task, failure = asyncio.run(exercise())
+
+    assert not put_task.cancelled()
+    assert child_tasks[0].done()
+    assert child_tasks[0].cancelling() == 0
+    assert not child_tasks[0].cancelled()
+    observed = _assert_acyclic_exception_graph(failure)
+    assert sum(error is publication_error for error in observed) == 1
+    assert sum(isinstance(error, asyncio.CancelledError) for error in observed) == 1
+    evidence = artifact_write_settlements(failure)
+    assert len(evidence) == 1
+    assert evidence[0].status is ArtifactWriteSettlementStatus.ABSENT
+    assert evidence[0].failure_codes == (
+        ArtifactWriteSettlementFailureCode.MUTATION_FAILED,
+        ArtifactWriteSettlementFailureCode.CHILD_CANCELLED,
+    )
 
 
 def test_local_artifact_cancellation_preserves_worker_failure(monkeypatch, tmp_path):
@@ -713,12 +964,69 @@ def test_local_artifact_cancellation_preserves_worker_failure(monkeypatch, tmp_p
             await task
         assert isinstance(exc.value.__cause__, OSError)
         assert "also failed" in " ".join(exc.value.__notes__)
+        settlement = artifact_write_settlements(exc.value)
+        assert len(settlement) == 1
+        assert settlement[0].status is ArtifactWriteSettlementStatus.ABSENT
         return task
 
     task = asyncio.run(exercise())
 
     assert task.cancelled()
     assert list(root.iterdir()) == []
+
+
+def test_local_cancellation_during_cleanup_waits_for_positive_absence(monkeypatch, tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    store = LocalArtifactStore(root)
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    real_write = local_module._write_artifact_file
+    real_cleanup = local_module._remove_artifact_directory_if_unchanged
+
+    def fail_metadata(*args, **kwargs) -> None:
+        if args[3] == "metadata.json":
+            raise OSError("metadata write failed")
+        real_write(*args, **kwargs)
+
+    def blocked_cleanup(*args, **kwargs) -> None:
+        cleanup_started.set()
+        assert release_cleanup.wait(timeout=10)
+        real_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(local_module, "_write_artifact_file", fail_metadata)
+    monkeypatch.setattr(
+        local_module,
+        "_remove_artifact_directory_if_unchanged",
+        blocked_cleanup,
+    )
+
+    async def exercise() -> asyncio.Task:
+        task = asyncio.create_task(
+            store.put_bytes(
+                b"durable-content",
+                artifact_id=_ARTIFACT_ID,
+                filename="durable.txt",
+                content_type="text/plain",
+                session_id="sess_durable",
+            )
+        )
+        assert await asyncio.to_thread(cleanup_started.wait, 10)
+        task.cancel("stop during local cleanup")
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError, match="stop during local cleanup") as raised:
+            await task
+        evidence = artifact_write_settlements(raised.value)
+        assert len(evidence) == 1
+        assert evidence[0].status is ArtifactWriteSettlementStatus.ABSENT
+        return task
+
+    task = asyncio.run(exercise())
+
+    assert task.cancelled()
+    assert not any(".staging-" in entry.name for entry in root.iterdir())
 
 
 def test_generated_artifact_cancellation_leaves_exact_publication_retryable(
@@ -1329,6 +1637,13 @@ def test_metadata_failure_and_staging_cleanup_preserve_both_failures(monkeypatch
         "primary write failed",
         "staging cleanup failed",
     ]
+    settlement = artifact_write_settlements(exc_info.value)
+    assert len(settlement) == 1
+    assert settlement[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+    assert settlement[0].failure_codes == (
+        ArtifactWriteSettlementFailureCode.MUTATION_FAILED,
+        ArtifactWriteSettlementFailureCode.CLEANUP_FAILED,
+    )
 
 
 @pytest.mark.parametrize("failed_file_index", (1, 2))

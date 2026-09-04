@@ -225,9 +225,7 @@ class ChildSessionContextCoverage(BaseModel):
         if (self.state is ChildSessionContextCoverageState.COMPLETE) == incomplete:
             raise ValueError("Child-session context coverage state conflicts with its evidence.")
         if self.rendered_entry_count + self.unavailable_child_count > self.inspected_child_count:
-            raise ValueError(
-                "Rendered and unavailable children cannot exceed inspected children."
-            )
+            raise ValueError("Rendered and unavailable children cannot exceed inspected children.")
         if self.state is ChildSessionContextCoverageState.UNAVAILABLE and (
             self.inspected_child_count != 0
             or self.rendered_entry_count != 0

@@ -89,6 +89,21 @@ the foundational backends, not to absorb every vendor SDK.
   shared conformance suite. If a reusable external conformance harness would unblock an
   integration, open an issue so that contract can be designed explicitly.
 
+  External artifact stores must also implement the cancellation-settlement
+  contract on `ArtifactStore.put_bytes`: after dispatch, report exact committed
+  state, positively proved absence, or bounded reconciliation-required evidence.
+  Call `register_artifact_write_operation` after fixing the artifact identity and
+  before dispatch, update its phase, and keep the registration open until the
+  exact mutation is terminal. Its `record(...)` method publishes typed caller or
+  late evidence and can attach it to the authoritative exception. The lower-level
+  `record_artifact_write_settlement` helper remains available for already-terminal
+  evidence without an active registration; it cannot finalize or bypass a
+  registered operation. Keep a supplied operation ID unique while the current
+  observer retains active or recorded evidence; duplicate registration fails
+  before dispatch, and draining the record permits deliberate reuse. Do not infer
+  absence from cancellation, timeout, or an
+  unavailable read, and do not return an orphan candidate as `ArtifactMetadata`.
+
   A standalone adapter does not need in-tree placement to be a first-class integration;
   in-tree placement adds maintenance burden without adding capability for its users.
 - **If your integration needs a capability the seam doesn't expose**, that's a feature
