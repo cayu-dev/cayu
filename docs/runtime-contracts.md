@@ -1704,6 +1704,34 @@ work for agents that do not enable discovery.
 
 `Session.last_activity_at` is the durable recovery signal. Runtime progress writes refresh it. Recovery callers provide `inactive_for_seconds`; `SessionStore` resolves that duration against its authoritative time and applies the predicate before `limit`, so a fast or slow worker clock cannot steal live work and recent rows cannot hide older stalled work. `last_activity_before` remains available for ordinary absolute-time session queries, but it is not recovery ownership authority. Operator annotation writes through `update_labels(...)` or `update_metadata(...)` advance `updated_at` but leave `last_activity_at` unchanged, so editing a stalled session cannot postpone recovery. Profile-aware recovery first uses `reserve_stalled_run_recovery(...)` to atomically verify inactivity and install its exact checkpoint claim without refreshing activity. It then uses the typed invocation-lifecycle rebind boundary to advance the epoch and transfer the frozen profile. Failure or cancellation between those stages releases the exact checkpoint claim; a concurrent worker can never infer ownership from a caller timestamp. Recovery that needs no invocation profile may claim directly through `fence_stalled_run(...)`. A plain status or checkpoint update is not an ownership transfer.
 
+An accepted interruption of a proven zero-work SDK/HTTP invocation can be terminalized by
+`recover_incomplete_session(...)` even when the registered execution profile has
+changed or the old registrations are unavailable. This narrow path requires an
+exact durable interruption decision and initial invocation authority (including
+recovery-only epoch rebinds). In-memory,
+SQLite, and PostgreSQL stores recheck the session incarnation, epoch, checkpoint,
+and inactivity at the atomic publication boundary. They inspect at most 17
+records per evidence collection and decline unfamiliar or excess evidence:
+provider/model/tool operation records, approvals, pending user input, queued or
+deferred interaction input, environment/workspace work, child sessions, attached
+tasks, and live recovery ownership require ordinary exact-profile recovery. An expired
+incomplete-session recovery claim can be consumed by this same atomic boundary.
+The same transaction publishes the matching interaction and session interruption
+events, their terminal decision receipt, and the standard invocation release
+receipt, advances the epoch, and removes only the accepted interruption markers.
+A retry reads the same durable terminal evidence; it does not execute providers,
+tools, environments, or application hooks. Execution continuation still requires
+normal execution-profile admission. Custom stores must implement the optional
+`_terminalize_zero_work_interruption` atomic protocol to support this path; the
+base implementation declines it without mutation.
+
+Recovery plans expose this case as `terminalize_zero_work` with registration
+status `terminalization_only`; they do not report the old profile as validated.
+Default execution selects that action when offered, and a changed proof cannot
+fall back to broader recovery. Plan-owned terminalization also requires the exact
+live store-time recovery claim. Unsupported or ambiguous cases retain their
+ordinary registration and recovery blockers.
+
 Registered applications expose recovery as a two-step operator workflow. `CayuApp.plan_recovery(RecoveryPlanRequest(...))` performs bounded, read-only inspection of explicitly selected session ids or statuses. Each immutable plan item binds the public session identity, session incarnation, lifecycle and run epoch, the durable execution-profile fingerprint and current registrations, recovery and task claims, pending approval/input/manual-tool actions, active model-stage and provider-reattachment capability, and any pending interruption cascade. The serialized plan includes only safe identifiers and digests: it never includes prompts, messages, tool arguments or results, credentials, reconnect metadata, checkpoint payloads, or raw exception messages. Use `cayu recovery plan --session SESSION_ID --output plan.json` (or a bounded repeated `--status` selection) to create this artifact through the project's canonical application factory.
 
 `CayuApp.execute_recovery(RecoveryExecutionRequest(...))` accepts that exact plan plus explicit decisions. `cayu recovery execute plan.json --execution-id ID` is the equivalent operator command. An unchanged item with only deterministic work defaults to `automatic_repair`; unknown model or tool effects, approvals, and user input remain blocked until an exact allowed decision is supplied. State drift after planning returns a blocked stale-plan receipt without mutation. Each mutating item first acquires a store-time lease in its checkpoint, then composes the existing run fencing, provider reattachment, tool/manual recovery, interruption, environment lifecycle, and budget-settlement boundaries. Its completion atomically clears that lease and appends a deterministic `recovery.plan.item.executed` receipt. Retrying the same plan and execution id replays that receipt instead of reapplying recovery. Independent sessions may execute concurrently up to `max_concurrency`; the per-session durable owner, rather than a cohort-wide lock, prevents duplicate work. Cancellation never converts an uncertain mutation into success, and a new plan is required after state changes. When `ServerLifecycleConfig.startup_recovery_statuses` is explicitly configured, server startup uses this same bounded plan/execution contract, a deterministic execution id, and bounded per-session concurrency for every cursor page; startup recovery remains disabled when that application policy is absent.

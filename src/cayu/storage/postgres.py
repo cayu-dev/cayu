@@ -31,6 +31,10 @@ if TYPE_CHECKING:
         KnowledgeSemanticWatchAuthority,
         KnowledgeSemanticWatchReceipt,
     )
+    from cayu.runtime._zero_work_interruption import (
+        ZeroWorkInterruptionPublication,
+        ZeroWorkInterruptionRequest,
+    )
 
 try:
     from psycopg import AsyncConnection, sql
@@ -24553,6 +24557,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         """Return the immutable codec configured for durable alias registration."""
 
         return self._public_authority_alias_codec
+
+    async def _terminalize_zero_work_interruption(
+        self,
+        request: ZeroWorkInterruptionRequest,
+    ) -> ZeroWorkInterruptionPublication | None:
+        """Atomically prove and terminalize zero work; unsupported stores decline."""
+        from cayu.storage._zero_work_interruption import postgres_terminalize
+
+        return await postgres_terminalize(self, request)
 
     async def _preflight_migration_authority(self, cur: Any) -> None:
         await migration_authority.preflight_postgres_public_authority(

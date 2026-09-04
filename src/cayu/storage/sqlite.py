@@ -11,8 +11,14 @@ from concurrent.futures import Executor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, ClassVar, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from cayu.runtime._zero_work_interruption import (
+        ZeroWorkInterruptionPublication,
+        ZeroWorkInterruptionRequest,
+    )
 
 from pydantic import ValidationError
 
@@ -2102,6 +2108,15 @@ class SQLiteSessionStore(SessionStore):
               AND trim(interaction.value) <> ''
             """
         )
+
+    async def _terminalize_zero_work_interruption(
+        self,
+        request: ZeroWorkInterruptionRequest,
+    ) -> ZeroWorkInterruptionPublication | None:
+        """Atomically prove and terminalize zero work; unsupported stores decline."""
+        from cayu.storage._zero_work_interruption import sqlite_terminalize
+
+        return await sqlite_terminalize(self, request)
 
     async def _run_read(self, query: Callable[[sqlite3.Connection], _T]) -> _T:
         """Run a cancellable read while retaining physical connection ownership."""

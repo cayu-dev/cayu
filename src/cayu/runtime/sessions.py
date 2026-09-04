@@ -43,6 +43,10 @@ if TYPE_CHECKING:
         ReleaseInvocationCommand,
         SettleInvocationCommand,
     )
+    from cayu.runtime._zero_work_interruption import (
+        ZeroWorkInterruptionPublication,
+        ZeroWorkInterruptionRequest,
+    )
 
 from pydantic import (
     BaseModel,
@@ -5218,6 +5222,7 @@ def transform_fork_checkpoint(
 
 
 RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX = "__cayu_runtime_publication_v1__:"
+ZERO_WORK_INTERRUPTION_OPERATION_KEY = "__cayu_zero_work_interruption_v1__"
 INTERACTION_TRANSITION_OPERATION_KEY_PREFIX = "__cayu_interaction_transition_v1__:"
 INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX = "__cayu_invocation_terminal_event_v1__:"
 RUNTIME_PUBLICATION_RECORD_TYPE = "cayu.runtime-publication"
@@ -7591,6 +7596,7 @@ class SessionOutcome(BaseModel):
 
 
 class IncompleteSessionRecoveryAction(StrEnum):
+    TERMINALIZED_ZERO_WORK = "terminalized_zero_work"
     SKIPPED_ACTIVE = "skipped_active"
     SKIPPED_TERMINAL = "skipped_terminal"
     SKIPPED_UNREGISTERED_AGENT = "skipped_unregistered_agent"
@@ -9540,6 +9546,13 @@ class SessionStore(ABC):
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
         """Return the immutable codec bound to this store, when supported."""
 
+        return None
+
+    async def _terminalize_zero_work_interruption(
+        self,
+        request: ZeroWorkInterruptionRequest,
+    ) -> ZeroWorkInterruptionPublication | None:
+        """Atomically prove and terminalize zero work; unsupported stores decline."""
         return None
 
     async def register_public_authority_alias(
@@ -12687,6 +12700,15 @@ class InMemorySessionStore(SessionStore):
         self._remove_transcript_search_session_unlocked(session_id)
         self._transcript_search_documents[session_id] = []
         self._extend_transcript_search_unlocked(session_id, messages)
+
+    async def _terminalize_zero_work_interruption(
+        self,
+        request: ZeroWorkInterruptionRequest,
+    ) -> ZeroWorkInterruptionPublication | None:
+        """Atomically prove and terminalize zero work; unsupported stores decline."""
+        from cayu.storage._zero_work_interruption import memory_terminalize
+
+        return await memory_terminalize(self, request)
 
     async def register_public_authority_alias(
         self,
@@ -22719,6 +22741,8 @@ def validate_profiled_fork_evidence(
 
 def _reject_reserved_runtime_publication_key(value: str, field_name: str) -> str:
     value = require_clean_nonblank(value, field_name)
+    if value == ZERO_WORK_INTERRUPTION_OPERATION_KEY:
+        raise ValueError(f"{field_name} cannot use the reserved zero-work interruption key.")
     if value.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
         raise ValueError(f"{field_name} cannot use the reserved runtime publication namespace.")
     if value.startswith(INTERACTION_TRANSITION_OPERATION_KEY_PREFIX):

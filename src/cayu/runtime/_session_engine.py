@@ -7404,6 +7404,7 @@ class SessionEngine:
         if any(
             action in result.actions
             for action in (
+                IncompleteSessionRecoveryAction.TERMINALIZED_ZERO_WORK,
                 IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,
                 IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT,
             )

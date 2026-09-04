@@ -111,6 +111,7 @@ from cayu.runtime._diagnostics import (
     exception_diagnostic,
     task_failure_payload_from_diagnostic,
 )
+from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime._durable_subagents import (
     durable_subagent_submission_from_checkpoint,
     durable_subagent_submission_receipt_from_checkpoint,
@@ -15503,6 +15504,52 @@ class RecoveryCoordinator:
             next_cursor=None,
         )
 
+    async def terminalize_zero_work_interruption(
+        self,
+        *,
+        session: Session,
+        inactive_for_seconds: int | None,
+        commit: bool = False,
+        recovery_ownership: DurableOperationOwnership | None = None,
+    ) -> IncompleteSessionRecoveryResult | None:
+        from cayu.runtime._zero_work_interruption import ZeroWorkInterruptionRequest
+
+        if session.status not in {SessionStatus.INTERRUPTING, SessionStatus.INTERRUPTED}:
+            return None
+        if self._session_control.has_active_tasks(session.id):
+            return None
+        if self._task_store is not None and await self._task_store.list_tasks(
+            TaskQuery(session_id=session.id, limit=1)
+        ):
+            return None
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        request = ZeroWorkInterruptionRequest(
+            session, checkpoint, inactive_for_seconds, commit, recovery_ownership
+        )
+        try:
+            publication = await self._session_store._terminalize_zero_work_interruption(request)
+        except Exception:
+            if not commit:
+                raise
+            readback = await self._session_store._terminalize_zero_work_interruption(
+                ZeroWorkInterruptionRequest(
+                    session, checkpoint, inactive_for_seconds, False, recovery_ownership
+                )
+            )
+            if readback is None or not readback.replayed:
+                raise
+            publication = readback
+        if publication is None:
+            return None
+        return IncompleteSessionRecoveryResult(
+            session_id=session.id,
+            previous_status=session.status,
+            status=publication.session.status,
+            actions=(IncompleteSessionRecoveryAction.TERMINALIZED_ZERO_WORK,),
+            events=publication.events,
+            message="Terminalized proven zero work without reconstructing an executable profile.",
+        )
+
     async def preflight_incomplete_session(
         self,
         *,
@@ -15701,6 +15748,21 @@ class RecoveryCoordinator:
                 return
             await before_mutation()
             mutation_admitted = True
+
+        zero_work = await self.terminalize_zero_work_interruption(
+            session=session,
+            inactive_for_seconds=inactive_for_seconds,
+        )
+        if zero_work is not None:
+            await admit_before_mutation()
+            committed = await self.terminalize_zero_work_interruption(
+                session=session,
+                inactive_for_seconds=inactive_for_seconds,
+                commit=True,
+            )
+            if committed is not None:
+                return committed
+            raise RuntimeError("Zero-work interruption authority changed before publication.")
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
         if self._committed_runtime_task_failure_recovery is not None:

@@ -601,6 +601,10 @@ class RecoveryPlanCoordinator:
                 session.metadata
             ).fingerprint
 
+        zero_work = await self._recovery_coordinator.terminalize_zero_work_interruption(
+            session=session,
+            inactive_for_seconds=request.selection.inactive_for_seconds,
+        )
         registration_status = RecoveryRegistrationStatus.READY
         registration_reason: str | None = None
         registered_provider: runtime_records.RegisteredProvider | None = None
@@ -632,7 +636,12 @@ class RecoveryPlanCoordinator:
                 registration_status = RecoveryRegistrationStatus.INCOMPATIBLE
                 registration_reason = type(exc).__name__
 
-        if registration_status is not RecoveryRegistrationStatus.READY:
+        if zero_work is not None:
+            registration_status = RecoveryRegistrationStatus.TERMINALIZATION_ONLY
+            registration_reason = "zero_work_does_not_require_executable_profile"
+            preflight = None
+
+        if zero_work is None and registration_status is not RecoveryRegistrationStatus.READY:
             blockers.append(
                 RecoveryPlanBlocker(
                     code=(
@@ -851,7 +860,11 @@ class RecoveryPlanCoordinator:
             if (preflight is None or cascade is not None) and not any(
                 blocker.code in decision_blockers for blocker in blockers
             ):
-                allowed_actions.append(RecoveryPlanAction.AUTOMATIC_REPAIR)
+                allowed_actions.append(
+                    RecoveryPlanAction.TERMINALIZE_ZERO_WORK
+                    if zero_work is not None
+                    else RecoveryPlanAction.AUTOMATIC_REPAIR
+                )
             if (
                 model_evidence is not None
                 and model_evidence.provider_reattachment_supported
@@ -1364,6 +1377,8 @@ class RecoveryPlanCoordinator:
                 action = (
                     RecoveryPlanAction.AUTOMATIC_REPAIR
                     if RecoveryPlanAction.AUTOMATIC_REPAIR in item.allowed_actions
+                    else RecoveryPlanAction.TERMINALIZE_ZERO_WORK
+                    if RecoveryPlanAction.TERMINALIZE_ZERO_WORK in item.allowed_actions
                     else RecoveryPlanAction.LEAVE_INTACT
                 )
                 decision = RecoveryDecision(item_id=item.item_id, action=action)
@@ -1609,6 +1624,7 @@ class RecoveryPlanCoordinator:
             else:
                 try:
                     recovery_actions, event_ids = await self._apply_decision(
+                        recovery_ownership=ownership,
                         request=request,
                         private_session_id=private_session_id,
                         item=item,
@@ -1858,6 +1874,7 @@ class RecoveryPlanCoordinator:
     async def _apply_decision(
         self,
         *,
+        recovery_ownership: DurableOperationOwnership,
         request: RecoveryExecutionRequest,
         private_session_id: str,
         item: RecoveryPlanItem,
@@ -1865,20 +1882,41 @@ class RecoveryPlanCoordinator:
         inactive_for_seconds: int | None,
         recoverable_task: Task | None,
     ) -> tuple[tuple[IncompleteSessionRecoveryAction, ...], tuple[str, ...]]:
-        if decision.action is RecoveryPlanAction.AUTOMATIC_REPAIR:
-            result = await self._recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id=private_session_id,
-                    # This plan's exact checkpoint claim refreshed activity
-                    # only after atomically matching the planned snapshot. A
-                    # second inactivity check would compare against our own
-                    # lease write instead of the operator-inspected state.
+        if decision.action in {
+            RecoveryPlanAction.AUTOMATIC_REPAIR,
+            RecoveryPlanAction.TERMINALIZE_ZERO_WORK,
+        }:
+            if decision.action is RecoveryPlanAction.TERMINALIZE_ZERO_WORK:
+                session = await self._session_store.load(private_session_id)
+                if session is None:
+                    raise RecoveryPlanExecutionFenced("Zero-work session disappeared.")
+                result = await self._recovery_coordinator.terminalize_zero_work_interruption(
+                    recovery_ownership=recovery_ownership,
+                    session=session,
                     inactive_for_seconds=None,
-                    reason="operator_executed_recovery_plan",
-                    metadata={"plan_item_id": item.item_id},
+                    commit=True,
                 )
-            )
-            if item.interruption_cascade is not None:
+                if result is None:
+                    raise RecoveryPlanExecutionFenced(
+                        "Zero-work evidence changed before terminalization."
+                    )
+            else:
+                result = await self._recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=private_session_id,
+                        # This plan's exact checkpoint claim refreshed activity
+                        # only after atomically matching the planned snapshot. A
+                        # second inactivity check would compare against our own
+                        # lease write instead of the operator-inspected state.
+                        inactive_for_seconds=None,
+                        reason="operator_executed_recovery_plan",
+                        metadata={"plan_item_id": item.item_id},
+                    )
+                )
+            if (
+                item.interruption_cascade is not None
+                and decision.action is not RecoveryPlanAction.TERMINALIZE_ZERO_WORK
+            ):
                 await self._recover_interruption_cascade(
                     private_session_id,
                     inactive_for_seconds,

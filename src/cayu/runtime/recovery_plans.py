@@ -131,6 +131,7 @@ class RecoveryPlanRequest(BaseModel):
 
 
 class RecoveryRegistrationStatus(StrEnum):
+    TERMINALIZATION_ONLY = "terminalization_only"
     READY = "ready"
     MISSING_AGENT = "missing_agent"
     MISSING_PROVIDER = "missing_provider"
@@ -172,6 +173,7 @@ class RecoveryRegistrationEvidence(BaseModel):
 
 
 class RecoveryPlanAction(StrEnum):
+    TERMINALIZE_ZERO_WORK = "terminalize_zero_work"
     AUTOMATIC_REPAIR = "automatic_repair"
     LEAVE_INTACT = "leave_intact"
     MODEL_MARK_FAILED = "model_mark_failed"
