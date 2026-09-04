@@ -25,6 +25,7 @@ from cayu.evals import (
     EvalStatus,
     EvalSuite,
     MemoryExperimentReport,
+    WorkflowEvalTarget,
     build_memory_experiment_report,
     captured_evaluation_result_from_json,
     compare_eval_results,
@@ -245,7 +246,9 @@ async def _run(args: argparse.Namespace) -> int:
         )
         plan = await _load_eval_plan(project.target, label=label)
         if args.corpus is None:
-            if plan.corpus_target is not None:
+            if plan.corpus_target is not None or (
+                plan.workflow_target is not None and plan.suite is None
+            ):
                 raise ValueError("Corpus EvalPlan execution requires --corpus FILE.")
             if args.suite is not None:
                 raise ValueError("--suite requires --corpus FILE.")
@@ -262,8 +265,10 @@ async def _run(args: argparse.Namespace) -> int:
                 Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
             return _status_exit_code(run.status)
 
-        if plan.corpus_target is None:
-            raise ValueError("--corpus requires an EvalPlan configured with corpus_target.")
+        if plan.corpus_target is None and plan.workflow_target is None:
+            raise ValueError(
+                "--corpus requires an EvalPlan configured with corpus_target or workflow_target."
+            )
         if args.case_timeout_seconds is not None:
             raise ValueError("Corpus timeout comes from the corpus; omit --case-timeout-seconds.")
         corpus = load_eval_corpus(args.corpus)
@@ -565,31 +570,45 @@ def _coerce_plan(value: Any) -> EvalPlan:
     if type(value) is EvalPlan:
         if value.corpus_target is not None:
             return EvalPlan(corpus_target=value.corpus_target)
+        if value.workflow_target is not None:
+            return EvalPlan(workflow_target=value.workflow_target, suite=value.suite)
         return _validate_plan(value.app, value.suite)
+    if type(value) is WorkflowEvalTarget:
+        return EvalPlan(workflow_target=value)
     if isinstance(value, tuple | list) and len(value) == 2:
         app, suite = value
         return _validate_plan(app, suite)
     app = getattr(value, "app", None)
     suite = getattr(value, "suite", None)
     corpus_target = getattr(value, "corpus_target", None)
-    if (app is not None or suite is not None) and corpus_target is not None:
-        raise ValueError("Eval target cannot configure direct and corpus modes together.")
+    workflow_target = getattr(value, "workflow_target", None)
+    configured = sum((app is not None, corpus_target is not None, workflow_target is not None))
+    if configured > 1:
+        raise ValueError("Eval target cannot configure multiple execution target modes.")
+    if workflow_target is not None:
+        return _validate_workflow_plan(workflow_target, suite)
     if app is not None or suite is not None:
         return _validate_plan(app, suite)
     if corpus_target is not None:
         return _validate_corpus_plan(corpus_target)
     if isinstance(value, dict):
-        has_direct = "app" in value or "suite" in value
+        has_direct = "app" in value
         has_corpus = "corpus_target" in value
-        if has_direct and has_corpus:
-            raise ValueError("Eval target cannot configure direct and corpus modes together.")
+        has_workflow = "workflow_target" in value
+        if sum((has_direct, has_corpus, has_workflow)) > 1:
+            raise ValueError("Eval target cannot configure multiple execution target modes.")
+        if has_workflow:
+            return _validate_workflow_plan(
+                value["workflow_target"],
+                value.get("suite"),
+            )
         if has_direct:
             return _validate_plan(value.get("app"), value.get("suite"))
         if has_corpus:
             return _validate_corpus_plan(value["corpus_target"])
     raise TypeError(
         "Eval target must return EvalPlan, (CayuApp, EvalSuite), app/suite attributes, "
-        "or a corpus_target attribute."
+        "a corpus_target attribute, or a workflow_target attribute."
     )
 
 
@@ -605,6 +624,14 @@ def _validate_corpus_plan(target: Any) -> EvalPlan:
     if type(target) is not CorpusTarget:
         raise TypeError("Eval plan corpus_target must be an exact CorpusTarget.")
     return EvalPlan(corpus_target=target)
+
+
+def _validate_workflow_plan(target: Any, suite: Any = None) -> EvalPlan:
+    if type(target) is not WorkflowEvalTarget:
+        raise TypeError("Eval plan workflow_target must be an exact WorkflowEvalTarget.")
+    if suite is not None and type(suite) is not EvalSuite:
+        suite = EvalSuite.model_validate(suite)
+    return EvalPlan(workflow_target=target, suite=suite)
 
 
 def _write_or_print(content: str, path: str | None) -> None:

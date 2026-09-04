@@ -88,8 +88,10 @@ return one of:
 
 - `EvalPlan(app=app, suite=suite)`
 - `EvalPlan(corpus_target=CorpusTarget(...))`
+- `EvalPlan(workflow_target=WorkflowEvalTarget(...), suite=suite)` for a direct suite
+- `EvalPlan(workflow_target=WorkflowEvalTarget(...))` with `--corpus`
 - `(app, suite)`
-- an object or dict with either `app` and `suite`, or `corpus_target`
+- an object or dict with `app` and `suite`, `corpus_target`, or `workflow_target`
 
 Projects can declare one default alongside their application factory:
 
@@ -636,8 +638,9 @@ portable Control Plane or corpus contract.
 
 Process evidence retains at most 4,096 allowlisted facts. Missing root evidence
 and bounded prefixes are `unavailable`, never a pass or candidate mismatch.
-Exact ordering applies only within the root session because Cayu has no durable
-cross-session total order to invent. `ChildStatusAssertionSpec` separately
+Exact ordering applies only within an ordinary root session. A typed workflow
+target projects the workflow's causally ordered child closure in durable lineage
+order. `ChildStatusAssertionSpec` separately
 supports completed, failed, and interrupted direct children; incomplete child
 tree capture remains unavailable. Control Plane can author all three contracts
 for a new suite or captured-session promotion, and SDK, stores, result
@@ -728,6 +731,89 @@ not impose a universal upper bound on the operator-selected value.
 The target key and application release ID are public result identity: both must
 cross the target app's workload-secret redaction boundary unchanged, or target
 validation fails before provider dispatch.
+
+### Application-owned workflow targets
+
+`WorkflowEvalTarget` makes a `WorkflowBase` run—not one child agent session—the
+candidate under evaluation. It reuses the same `EvalSuite`, corpus compiler,
+assertions, scheduler, stores, reports, CLI, and server execution path:
+
+```python
+from cayu import (
+    EvalPlan,
+    WorkflowEvalExecution,
+    WorkflowEvalResult,
+    WorkflowEvalTarget,
+)
+
+
+def build_execution(invocation):
+    runtime = build_runtime_for_trial(invocation)
+    return WorkflowEvalExecution(
+        app=runtime.app,
+        workflow=RefundWorkflow(runtime.app),
+        close=runtime.close,
+    )
+
+
+def project_result(evidence):
+    answer = evidence.completion_event.payload["answer"]
+    return WorkflowEvalResult(final_output=answer, structured_output={"answer": answer})
+
+
+workflow_target = WorkflowEvalTarget(
+    key="refund-workflow",
+    app=build_manifest_reference_app(),
+    request_base=workflow_profile_probe_request,
+    application_release_id="refund-service-2026-09-04",
+    workflow_spec=RefundWorkflow.spec,
+    implementation_revision="sha256:...",
+    result_projector_revision="sha256:...",
+    execution_scope_revision="sha256:...",
+    workflow_factory=build_execution,
+    result_projector=project_result,
+)
+
+# Add suite=direct_suite for direct Python/CLI execution, or omit it and pass a corpus.
+eval_plan = EvalPlan(workflow_target=workflow_target)
+```
+
+The factory is invoked exactly once per concrete case trial. Its input contains
+only bounded case messages, public run/suite/case/trial identities, the
+recovery-stable workflow run ID and idempotency key, and the target's bounded
+application context; evaluator assertions and private evaluator state are not
+exposed. The default `per_trial` scope requires a fresh application and workflow
+instance for every trial. `shared` is opt-in, sequential only, and requires the
+factory to return the same application/workflow pair. Every factory-returned
+application must resolve the target's profile-probe request to the same exact
+execution-profile fingerprint as the trusted target application. A per-trial
+factory that rebuilds process-local providers, tools, policies, hooks, or
+environments must give those components stable behavior identities when the
+rebuilt instances are intended to be equivalent.
+
+The root ID is deterministic for the target revision and concrete run/case/trial
+slot. A replacement durable worker therefore re-enters the same workflow journal
+and uses Runtime's existing attempt fencing and child-step recovery instead of
+creating another retry/checkpoint system. Executable factories and projectors
+remain in the registered Python target; corpus and server records retain only
+their public behavior identity. Recovery checkpoints discard raw text,
+structured output, transcripts, and trajectories after the bounded public
+projection has been prepared.
+
+The projector runs only after Cayu proves exactly one `workflow.completed` event
+for the current durable workflow attempt. Its bounded typed result is bound to
+that completion event and target/projector revisions. A missing, conflicting, or
+superseded completion, invalid projector output, or failed/expired `close`
+callback produces a stable error diagnostic and cannot publish candidate output.
+The retained root trajectory contains the workflow journal, complete admitted
+child tree, aggregate child usage, workflow-wide tool/process evidence, and the
+typed structured output. Workspace or artifact evidence fails unavailable when
+multiple child environments make one unambiguous observation impossible.
+Workflow case timeout and caller cancellation cover factory construction,
+workflow draining, projection, evidence capture, and assertions; the optional
+`close` callback then has its own positive, finite timeout capped at 300 seconds.
+`max_concurrency` continues to bound concrete Evals trials, while application
+factories remain responsible for the Runtime environments owned by one trial.
 
 Before provider dispatch, `compile_corpus_suite(...)` revalidates the complete
 corpus and matches its target key, evidence-policy revision, applicable trusted

@@ -48,6 +48,10 @@ steps:
     run: uv venv --python 3.11 .release-venv
   - name: Install built wheel
     run: uv pip install --python .release-venv/bin/python dist/first/*.whl
+  - name: Smoke-test workflow eval surface from the built wheel
+    run: |
+      unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+      .release-venv/bin/python scripts/smoke_built_wheel_workflow_eval.py
   - name: Smoke-test artifact settlement surface from the built wheel
     run: |
       .release-venv/bin/python - <<'PY'

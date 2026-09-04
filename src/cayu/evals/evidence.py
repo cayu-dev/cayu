@@ -16,7 +16,7 @@ from cayu._validation import (
 )
 from cayu.artifacts import ArtifactScope
 from cayu.core.events import Event, EventType
-from cayu.core.messages import ToolCallPart
+from cayu.core.messages import Message, ToolCallPart
 from cayu.core.tools import ToolResult
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
@@ -743,10 +743,34 @@ def _bounded_tool_names(
     return tuple(values), False
 
 
+def _workflow_evidence_nodes(trajectory: Trajectory) -> tuple[Trajectory, ...]:
+    if trajectory.workflow_output is None:
+        return (trajectory,)
+    nodes: list[Trajectory] = []
+
+    def visit(node: Trajectory) -> None:
+        nodes.append(node)
+        for child in node.children:
+            visit(child)
+
+    visit(trajectory)
+    return tuple(nodes)
+
+
+def _workflow_evidence_events(trajectory: Trajectory) -> tuple[Event, ...]:
+    return tuple(event for node in _workflow_evidence_nodes(trajectory) for event in node.events)
+
+
+def _workflow_evidence_transcript(trajectory: Trajectory) -> tuple[Message, ...]:
+    return tuple(
+        message for node in _workflow_evidence_nodes(trajectory) for message in node.transcript
+    )
+
+
 def _requested_tool_names(trajectory: Trajectory) -> Iterable[str]:
     return (
         part.tool_name
-        for message in trajectory.transcript
+        for message in _workflow_evidence_transcript(trajectory)
         for part in message.content
         if type(part) is ToolCallPart
     )
@@ -754,7 +778,9 @@ def _requested_tool_names(trajectory: Trajectory) -> Iterable[str]:
 
 def _started_tool_names(trajectory: Trajectory) -> Iterable[str | None]:
     return (
-        event.tool_name for event in trajectory.events if event.type == EventType.TOOL_CALL_STARTED
+        event.tool_name
+        for event in _workflow_evidence_events(trajectory)
+        if event.type == EventType.TOOL_CALL_STARTED
     )
 
 
@@ -805,12 +831,12 @@ def _tool_lifecycle_matches_transcript(trajectory: Trajectory) -> bool:
             part.tool_name,
             _tool_round_identity_from_part(part),
         )
-        for message in trajectory.transcript
+        for message in _workflow_evidence_transcript(trajectory)
         for part in message.content
         if type(part) is ToolCallPart
     )
     started: Counter[tuple[str, str, tuple[str, str, str] | None]] = Counter()
-    for event in trajectory.events:
+    for event in _workflow_evidence_events(trajectory):
         if event.type != EventType.TOOL_CALL_STARTED:
             continue
         tool_call_id = event.payload.get("tool_call_id")
@@ -850,7 +876,10 @@ def _project_tool_evidence(
     started_result = _bounded_tool_names(_started_tool_names(trajectory), app=app)
     usage = trajectory.usage_summary
     tool_count = (
-        sum(event.type == EventType.TOOL_CALL_STARTED for event in trajectory.events)
+        sum(
+            event.type == EventType.TOOL_CALL_STARTED
+            for event in _workflow_evidence_events(trajectory)
+        )
         if usage is None and allow_event_count_fallback
         else (None if usage is None else usage.tool_calls)
     )
@@ -997,12 +1026,12 @@ def _project_tool_call_evidence(
     if tool_evidence_state == "unavailable" or tool_calls_started is None:
         has_tool_lifecycle = any(
             event.type == EventType.TOOL_CALL_STARTED or event.type in _TOOL_TERMINAL_EVENT_TYPES
-            for event in trajectory.events
+            for event in _workflow_evidence_events(trajectory)
         )
         return (), "incompatible" if has_tool_lifecycle else "unavailable"
     started_records = tuple(
         (position, event)
-        for position, event in enumerate(trajectory.events)
+        for position, event in enumerate(_workflow_evidence_events(trajectory))
         if event.type == EventType.TOOL_CALL_STARTED
     )
     if len(started_records) != tool_calls_started:
@@ -1016,7 +1045,7 @@ def _project_tool_call_evidence(
         for key, count in Counter(_tool_event_key(event) for _, event in started_records).items()
         if key is not None and count > 1
     }
-    for position, event in enumerate(trajectory.events):
+    for position, event in enumerate(_workflow_evidence_events(trajectory)):
         if event.type not in _TOOL_TERMINAL_EVENT_TYPES:
             continue
         key = _tool_event_key(event)
@@ -1096,7 +1125,17 @@ def _project_structural_evidence(
     tuple[ArtifactStructuralEvidenceV1, ...],
     tuple[ArtifactScopeEvidenceV1, ...],
 ]:
-    probes = trajectory.probes
+    structural_trajectory = trajectory
+    if trajectory.workflow_output is not None:
+        candidates = tuple(
+            node
+            for node in _workflow_evidence_nodes(trajectory)[1:]
+            if node.probes.workspace_available or node.probes.artifacts_available
+        )
+        if len(candidates) != 1:
+            return (), "unavailable", (), ()
+        structural_trajectory = candidates[0]
+    probes = structural_trajectory.probes
     if not root_evidence_available:
         return (), "unavailable", (), ()
 
@@ -1119,7 +1158,7 @@ def _project_structural_evidence(
     projected_artifacts: list[ArtifactStructuralEvidenceV1] = []
     scope_evidence: list[ArtifactScopeEvidenceV1] = []
 
-    session = trajectory.session
+    session = structural_trajectory.session
     for scope in requested_scopes:
         scope_state: EvidenceState = (
             "unavailable"
@@ -1267,7 +1306,7 @@ def _build_assertion_evidence_view(
     else:
         retained_process_events: list[EvalProcessEventKind] = []
         process_events_overflow = False
-        for event in trajectory.events:
+        for event in _workflow_evidence_events(trajectory):
             process_event = _PORTABLE_PROCESS_EVENT_KINDS.get(event.type)
             if process_event is None:
                 continue
@@ -1295,7 +1334,10 @@ def _build_assertion_evidence_view(
     # context, matching the existing direct-assertion contract.
     usage = trajectory.usage_summary if root_available else None
     model_steps = (
-        sum(event.type == EventType.MODEL_COMPLETED for event in trajectory.events)
+        sum(
+            event.type == EventType.MODEL_COMPLETED
+            for event in _workflow_evidence_events(trajectory)
+        )
         if usage is None and root_available and allow_event_count_fallback
         else (None if usage is None else usage.model_steps)
     )
@@ -1321,7 +1363,7 @@ def _build_assertion_evidence_view(
         raise ValueError("Compiled pricing profile changed after assertion compilation.")
     costs: list[AssertionCostEvidenceV1] = []
     if pricing_snapshot is not None and session is not None and model_step_state == "complete":
-        events = list(trajectory.events)
+        events = list(_workflow_evidence_events(trajectory))
         for currency in cost_currencies:
             summary = _estimate_session_cost(
                 session_id=session.id,

@@ -582,7 +582,7 @@ def render_corpus_execution_comparison_html(
     </table>
     <section class="notice">
       <p>Target <code>{_escape(comparison.baseline.target_key)}</code> · corpus <code>{_escape(comparison.baseline.corpus_revision)}</code> · suite <code>{_escape(comparison.baseline.suite_id)}</code> at <code>{_escape(comparison.baseline.suite_revision)}</code></p>
-      <p>Evidence policy <code>{_escape(comparison.baseline.evidence_policy_revision)}</code> · pricing profile <code>{_escape(comparison.baseline.pricing_profile_fingerprint or "not used")}</code> · external target <code>{_escape(comparison.baseline.external_target_revision or "not used")}</code></p>
+      <p>Evidence policy <code>{_escape(comparison.baseline.evidence_policy_revision)}</code> · pricing profile <code>{_escape(comparison.baseline.pricing_profile_fingerprint or "not used")}</code> · application execution target <code>{_escape(comparison.baseline.external_target_revision or "not used")}</code></p>
       <p>Baseline trial policy <code>{_escape(comparison.baseline.trial_policy_revision)}</code> · accepted exposure <code>{_escape(comparison.baseline.accepted_exposure_revision or "not applicable")}</code> · exposure comparison contract <code>{_escape(comparison.baseline.accepted_exposure_comparison_revision or "not applicable")}</code></p>
       <p>Current trial policy <code>{_escape(comparison.current.trial_policy_revision)}</code> · accepted exposure <code>{_escape(comparison.current.accepted_exposure_revision or "not applicable")}</code> · exposure comparison contract <code>{_escape(comparison.current.accepted_exposure_comparison_revision or "not applicable")}</code></p>
     </section>

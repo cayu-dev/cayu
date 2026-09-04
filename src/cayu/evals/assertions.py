@@ -813,8 +813,9 @@ class ArtifactCreated(EvalAssertion):
         probes = context.probes
         if not probes.artifacts_available:
             return self.unavailable("Artifact evidence was not captured for this trajectory.")
-        session_id = context.session.id if context.session is not None else None
-        environment_name = context.session.environment_name if context.session is not None else None
+        probe_session = context.probe_session
+        session_id = probe_session.id if probe_session is not None else None
+        environment_name = probe_session.environment_name if probe_session is not None else None
         # scope=None means "an artifact this session created", so it must not match a
         # prior case's ENVIRONMENT-scoped artifact (those persist across cases in the
         # same environment). Request scope=ArtifactScope.ENVIRONMENT explicitly for that.

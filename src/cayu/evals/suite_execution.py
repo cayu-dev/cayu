@@ -13,7 +13,7 @@ from cayu.evals.corpus import (
     eval_suite_trial_policy,
     pricing_profile_identity,
 )
-from cayu.evals.execution import CorpusTarget, evaluation_target_identity
+from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget, evaluation_target_identity
 from cayu.evals.scenario import EvalScenarioDocumentV2
 from cayu.evals.scenario_preflight import ScenarioLaunchBindingV2, ScenarioLaunchSettingsV2
 from cayu.evals.suite_authoring import (
@@ -90,8 +90,8 @@ def corpus_for_authored_scenario_case(
         raise TypeError("scenario must be an exact EvalScenarioDocumentV2.")
     if type(binding) is not ScenarioLaunchBindingV2:
         raise TypeError("binding must be an exact ScenarioLaunchBindingV2.")
-    if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+    if type(target) not in {CorpusTarget, WorkflowEvalTarget}:
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     target_identity = evaluation_target_identity(target, project_root=project_root)
     if (
         stimulus.scenario_id != scenario.id
@@ -130,8 +130,8 @@ def _corpus_for_authored_cases(
     scenario_inputs: dict[str, RunInputSpec] | None = None,
     project_root: Path | None,
 ) -> EvalCorpusDocument:
-    if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+    if type(target) not in {CorpusTarget, WorkflowEvalTarget}:
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     if document.target_key != target.key:
         raise ValueError("Authored eval suite target does not match the trusted target.")
     target_identity = evaluation_target_identity(target, project_root=project_root)

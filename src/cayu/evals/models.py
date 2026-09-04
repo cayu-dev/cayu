@@ -42,6 +42,7 @@ from cayu.evals.memory_attribution import (
     eval_memory_attribution_fingerprint,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.evals.workflow_target import WorkflowEvalOutputEvidenceV1
 from cayu.memory_attribution import MemoryAttribution
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.sessions import Session, SessionStatus
@@ -51,6 +52,7 @@ from cayu.runtime.usage import (
     ModelCompletionPurpose,
     SessionUsageSummary,
     aggregate_usage_metrics_from_durable_payload,
+    combine_session_usage_summaries,
     session_usage_summary,
     session_usage_summary_payload,
 )
@@ -331,6 +333,10 @@ class EvalTrialResult(BaseModel):
     session_id: str | None = None
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     final_output: str = ""
+    structured_output: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     assertions: tuple[EvalAssertionResult, ...] = Field(default_factory=tuple)
     error: str | None = None
     unavailable_reason: str | None = None
@@ -361,6 +367,13 @@ class EvalTrialResult(BaseModel):
     @classmethod
     def validate_final_output(cls, value: str, info) -> str:
         return require_durable_text(value, info.field_name)
+
+    @field_validator("structured_output", mode="before")
+    @classmethod
+    def copy_structured_output(cls, value):
+        if value is None:
+            return None
+        return copy_durable_json_object(value, "structured_output")
 
     @field_validator("trajectory", mode="before")
     @classmethod
@@ -457,10 +470,22 @@ class EvalTrialResult(BaseModel):
                 or self.trajectory.session.id != self.session_id
             ):
                 raise ValueError("trajectory must belong to the trial session_id.")
-            if self.events_count != len(self.trajectory.events):
+            expected_event_count = (
+                sum(len(node.events) for node in _trajectory_nodes(self.trajectory))
+                if self.trajectory.workflow_output is not None
+                else len(self.trajectory.events)
+            )
+            if self.events_count != expected_event_count:
                 raise ValueError("events_count must match the retained trajectory.")
             if self.final_output != self.trajectory.final_output:
                 raise ValueError("final_output must match the retained trajectory.")
+            trajectory_structured_output = (
+                None
+                if self.trajectory.workflow_output is None
+                else self.trajectory.workflow_output.structured_output
+            )
+            if self.structured_output != trajectory_structured_output:
+                raise ValueError("structured_output must match the retained trajectory.")
             trajectory_usage = (
                 None
                 if self.trajectory.usage_summary is None
@@ -1630,6 +1655,10 @@ class Trajectory(BaseModel):
     usage_summary: SessionUsageSummary | None = None
     memory_attribution: MemoryAttribution | None = None
     final_output: str = ""
+    workflow_output: WorkflowEvalOutputEvidenceV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     probes: TrajectoryProbes = Field(default_factory=TrajectoryProbes)
     children: tuple[Trajectory, ...] = Field(default_factory=tuple)
     # True when the sub-agent walk stopped before enumerating every child — a store error mid-walk
@@ -1712,6 +1741,11 @@ class Trajectory(BaseModel):
     @classmethod
     def validate_final_output(cls, value: str, info) -> str:
         return require_durable_text(value, info.field_name)
+
+    @field_validator("workflow_output", mode="before")
+    @classmethod
+    def revalidate_workflow_output(cls, value):
+        return _revalidate_model_instance(value, WorkflowEvalOutputEvidenceV1)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -1892,16 +1926,31 @@ def _validate_trajectory_record_tree(
             SessionStatus.INTERRUPTED,
         }:
             raise ValueError("Session-backed trajectories require a terminal session status.")
-        _validate_trajectory_terminal_boundary(trajectory)
+        if trajectory.workflow_output is None:
+            _validate_trajectory_terminal_boundary(trajectory)
         if trajectory.usage_summary is None:
             raise ValueError("A session-backed trajectory requires an exact usage summary.")
-        expected_usage = session_usage_summary(trajectory.session.id, list(trajectory.events))
+        expected_usage = (
+            combine_session_usage_summaries(
+                trajectory.session.id,
+                tuple(
+                    node.usage_summary
+                    for node in _trajectory_nodes(trajectory)[1:]
+                    if node.usage_summary is not None
+                ),
+            )
+            if trajectory.workflow_output is not None
+            else session_usage_summary(trajectory.session.id, list(trajectory.events))
+        )
         if session_usage_summary_payload(trajectory.usage_summary) != session_usage_summary_payload(
             expected_usage
         ):
             raise ValueError("Trajectory usage must match its retained events.")
-        if trajectory.final_output != _trajectory_final_output_text(trajectory.transcript):
-            raise ValueError("Trajectory final_output must match its retained transcript.")
+        if trajectory.workflow_output is None:
+            if trajectory.final_output != _trajectory_final_output_text(trajectory.transcript):
+                raise ValueError("Trajectory final_output must match its retained transcript.")
+        else:
+            _validate_workflow_output_binding(trajectory)
     for child in trajectory.children:
         _validate_trajectory_record_tree(child, seen_session_ids=seen_session_ids)
 
@@ -1942,8 +1991,81 @@ def _validate_trajectory_terminal_boundary(trajectory: Trajectory) -> None:
             "Session-backed trajectories require exactly one current-run terminal event."
         )
     expected = _TRAJECTORY_TERMINAL_EVENT_BY_STATUS[trajectory.session.status]
-    if terminal_events[0].type != expected or trajectory.events[-1].type != expected:
+    if terminal_events[0].type != expected:
         raise ValueError("Trajectory terminal event must match the session status boundary.")
+    if trajectory.workflow_output is None and trajectory.events[-1].type != expected:
+        raise ValueError("Trajectory terminal event must match the session status boundary.")
+
+
+def _trajectory_nodes(trajectory: Trajectory) -> tuple[Trajectory, ...]:
+    nodes: list[Trajectory] = []
+
+    def visit(node: Trajectory) -> None:
+        nodes.append(node)
+        for child in node.children:
+            visit(child)
+
+    visit(trajectory)
+    return tuple(nodes)
+
+
+def _validate_workflow_output_binding(trajectory: Trajectory) -> None:
+    from cayu.evals.workflow_target import (
+        workflow_eval_input_messages_sha256,
+        workflow_eval_output_sha256,
+    )
+    from cayu.workflows.journal import (
+        WORKFLOW_ATTEMPT_EVENT_TYPE,
+        WORKFLOW_JOURNAL_PROVIDER,
+    )
+
+    output = trajectory.workflow_output
+    session = trajectory.session
+    if output is None or session is None:
+        raise ValueError("Workflow output requires a session-backed trajectory.")
+    if session.provider_name != WORKFLOW_JOURNAL_PROVIDER:
+        raise ValueError("Workflow output requires a workflow journal anchor.")
+    if session.status is not SessionStatus.COMPLETED:
+        raise ValueError("Workflow output requires a completed journal anchor.")
+    if session.agent_name != output.workflow_name:
+        raise ValueError("Workflow output name does not match its journal anchor.")
+    if len(trajectory.transcript) != output.input_message_count:
+        raise ValueError("Workflow input count does not match its bound evidence.")
+    if workflow_eval_input_messages_sha256(trajectory.transcript) != output.input_messages_sha256:
+        raise ValueError("Workflow input does not match its bound evidence.")
+    if workflow_eval_output_sha256(trajectory.final_output) != output.final_output_sha256:
+        raise ValueError("Workflow final output does not match its bound evidence.")
+    attempt_markers = tuple(
+        event for event in trajectory.events if event.type == WORKFLOW_ATTEMPT_EVENT_TYPE
+    )
+    if not attempt_markers or attempt_markers[-1].payload.get("attempt_id") != output.attempt_id:
+        raise ValueError("Workflow output is not bound to the current workflow attempt.")
+    current_events = tuple(
+        event for event in trajectory.events if event.payload.get("attempt_id") == output.attempt_id
+    )
+    current_markers = tuple(
+        event for event in current_events if event.type == WORKFLOW_ATTEMPT_EVENT_TYPE
+    )
+    starts = tuple(event for event in current_events if event.type == EventType.WORKFLOW_STARTED)
+    completions = tuple(
+        event for event in current_events if event.type == EventType.WORKFLOW_COMPLETED
+    )
+    if len(current_markers) != 1 or len(starts) != 1 or len(completions) != 1:
+        raise ValueError("Workflow output requires one exact current-attempt boundary.")
+    completion = completions[0]
+    if (
+        current_events.index(current_markers[0]) >= current_events.index(starts[0])
+        or current_events.index(starts[0]) >= current_events.index(completion)
+        or current_events[-1] is not completion
+    ):
+        raise ValueError("Workflow output current-attempt boundary order is invalid.")
+    if completion.id != output.completion_event_id:
+        raise ValueError("Workflow output completion identity does not match its evidence.")
+    if any(
+        event.workflow_name != output.workflow_name
+        for event in (current_markers[0], starts[0], completion)
+    ):
+        raise ValueError("Workflow completion name does not match its output evidence.")
 
 
 def _trajectory_tree_is_complete(trajectory: Trajectory) -> bool:
@@ -2003,11 +2125,17 @@ class EvalContext:
 
     @property
     def events(self) -> tuple[Event, ...]:
-        return self.trajectory.events
+        if self.trajectory.workflow_output is None:
+            return self.trajectory.events
+        return tuple(event for node in _trajectory_nodes(self.trajectory) for event in node.events)
 
     @property
     def transcript(self) -> tuple[Message, ...]:
-        return self.trajectory.transcript
+        if self.trajectory.workflow_output is None:
+            return self.trajectory.transcript
+        return tuple(
+            message for node in _trajectory_nodes(self.trajectory) for message in node.transcript
+        )
 
     @property
     def usage_summary(self) -> SessionUsageSummary | None:
@@ -2019,7 +2147,27 @@ class EvalContext:
 
     @property
     def probes(self) -> TrajectoryProbes:
-        return self.trajectory.probes
+        if self.trajectory.workflow_output is None:
+            return self.trajectory.probes
+        candidates = tuple(
+            node.probes
+            for node in _trajectory_nodes(self.trajectory)[1:]
+            if node.probes.workspace_available or node.probes.artifacts_available
+        )
+        return candidates[0] if len(candidates) == 1 else self.trajectory.probes
+
+    @property
+    def probe_session(self) -> Session | None:
+        """Session that owns the unambiguous structural probe projection."""
+
+        if self.trajectory.workflow_output is None:
+            return self.trajectory.session
+        candidates = tuple(
+            node
+            for node in _trajectory_nodes(self.trajectory)[1:]
+            if node.probes.workspace_available or node.probes.artifacts_available
+        )
+        return candidates[0].session if len(candidates) == 1 else self.trajectory.session
 
 
 # EvalTrialResult.trajectory forward-references Trajectory, which is defined later in this module;

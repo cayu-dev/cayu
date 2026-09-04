@@ -19,7 +19,9 @@ from cayu.evals.execution import (
     CorpusExecutionLimits,
     CorpusTarget,
     ModelJudgeTarget,
+    WorkflowEvalTarget,
     _candidate_judge_route_relation,
+    _copy_corpus_target,
     evaluation_target_identity,
     model_judge_profile,
 )
@@ -62,6 +64,14 @@ _TARGET_KEY_DOMAIN = b"cayu-generated-eval-target-v1\0"
 _EVAL_PROFILE_RESOLUTION_CONCURRENCY = 16
 _GENERATED_JUDGE_AGENT_NAME = "cayu-evals-default-judge"
 _GENERATED_JUDGE_KEY = "project-default-judge"
+_EXACT_TARGET_TYPES = {CorpusTarget, WorkflowEvalTarget}
+
+
+def _copy_target_with(
+    target: CorpusTarget,
+    **updates: object,
+) -> CorpusTarget:
+    return _copy_corpus_target(target.model_copy(update=updates))
 
 
 def _narrow_optional_limit(current: int | None, requested: int | None) -> int | None:
@@ -106,8 +116,8 @@ def _narrow_run_limits(current: RunLimits, requested: RunLimits | None) -> RunLi
 def cost_budget_currencies_for_target(target: CorpusTarget) -> tuple[str, ...]:
     """Return currencies currently compatible with one target's resolved model route."""
 
-    if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+    if type(target) not in _EXACT_TARGET_TYPES:
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     pricing = target.price_book
     if pricing is None:
         return ()
@@ -150,8 +160,8 @@ def target_for_eval_invocation(
 ) -> CorpusTarget:
     """Apply one durable run's contractions and trusted provenance to a target."""
 
-    if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+    if type(target) not in _EXACT_TARGET_TYPES:
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     if type(invocation) is not EvalRunInvocation:
         raise TypeError("invocation must be an exact EvalRunInvocation.")
     request = copy_run_request(target.request_base)
@@ -207,18 +217,7 @@ def target_for_eval_invocation(
         source=invocation.source,
         verified_origin=invocation.origin,
     )
-    return CorpusTarget(
-        key=target.key,
-        app=target.app,
-        request_base=request,
-        bootstrap_messages=target.bootstrap_messages,
-        application_release_id=target.application_release_id,
-        evidence_policy=target.evidence_policy,
-        price_book=target.price_book,
-        model_judges=target.model_judges,
-        limits=target.limits,
-        external_process=target.external_process,
-    )
+    return _copy_target_with(target, request_base=request)
 
 
 def _target_identity_component(value: str, field_name: str) -> str:
@@ -265,8 +264,8 @@ class EvalTargetRegistration:
     def __post_init__(self) -> None:
         if type(self.catalog_entry) is not EvalTargetCatalogEntry:
             raise TypeError("catalog_entry must be an exact EvalTargetCatalogEntry.")
-        if type(self.target) is not CorpusTarget:
-            raise TypeError("target must be an exact CorpusTarget.")
+        if type(self.target) not in _EXACT_TARGET_TYPES:
+            raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
         if type(self.execution_profile_policy) is not EvalExecutionProfilePolicyV1:
             raise TypeError(
                 "execution_profile_policy must be an exact EvalExecutionProfilePolicyV1."
@@ -306,18 +305,7 @@ class EvalTargetRegistration:
                 "max_concurrency": policy.max_concurrency,
             }
         )
-        return CorpusTarget(
-            key=self.target.key,
-            app=self.target.app,
-            request_base=self.target.request_base,
-            bootstrap_messages=self.target.bootstrap_messages,
-            application_release_id=self.target.application_release_id,
-            evidence_policy=self.target.evidence_policy,
-            price_book=self.target.price_book,
-            model_judges=self.target.model_judges,
-            limits=limits,
-            external_process=self.target.external_process,
-        )
+        return _copy_target_with(self.target, limits=limits)
 
 
 class EvalTargetRegistry:
@@ -459,27 +447,19 @@ class EvalTargetRegistry:
             raise KeyError(f"Eval target not found: {target_key}")
         target = registration.execution_target() if effective_target is None else effective_target
         if (
-            type(target) is not CorpusTarget
+            type(target) not in _EXACT_TARGET_TYPES
             or target.key != target_key
             or target.app is not registration.target.app
         ):
             raise ValueError("Effective eval target does not match its published registration.")
-        target = CorpusTarget(
-            key=target.key,
-            app=target.app,
-            request_base=target.request_base,
-            bootstrap_messages=target.bootstrap_messages,
-            application_release_id=target.application_release_id,
-            evidence_policy=target.evidence_policy,
-            price_book=target.price_book,
-            model_judges=target.model_judges,
+        target = _copy_target_with(
+            target,
             limits=target.limits.model_copy(
                 update={
                     "max_trials": registration.execution_profile_policy.max_trials,
                     "max_concurrency": registration.execution_profile_policy.max_concurrency,
                 }
             ),
-            external_process=target.external_process,
         )
         identity = evaluation_target_identity(
             target,
@@ -732,8 +712,8 @@ def explicit_eval_target_registry(
 ) -> EvalTargetRegistry:
     """Adapt the V1 singleton target into the common registry contract."""
 
-    if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+    if type(target) not in _EXACT_TARGET_TYPES:
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     policy = EvalExecutionProfilePolicyV1.safe_default() if policy is None else policy
     if type(policy) is not EvalExecutionProfilePolicyV1:
         raise TypeError("policy must be an exact EvalExecutionProfilePolicyV1 or None.")

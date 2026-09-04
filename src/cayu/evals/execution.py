@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -19,8 +20,9 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import json_utf8_size_within_limit
+from cayu._validation import copy_durable_json_object, json_utf8_size_within_limit
 from cayu.core.messages import Message, MessageRole, TextPart, detach_message
+from cayu.core.workflows import WorkflowSpec, copy_workflow_spec
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.capacity import (
     DEFAULT_EVAL_MAX_ACTIVE_TRIALS,
@@ -80,6 +82,15 @@ from cayu.evals.result_contract import (
 )
 from cayu.evals.runner import EvalCase, EvalSuite, _run_eval_suite_with_public_projection
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
+from cayu.evals.workflow_target import (
+    WORKFLOW_EVAL_DEFAULT_CLOSE_TIMEOUT_SECONDS,
+    WORKFLOW_EVAL_MAX_APPLICATION_CONTEXT_BYTES,
+    WORKFLOW_EVAL_MAX_CLOSE_TIMEOUT_SECONDS,
+    WorkflowEvalFactory,
+    WorkflowEvalInstanceScope,
+    WorkflowEvalResultProjector,
+    WorkflowEvalTargetIdentityV1,
+)
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, copy_price_book
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
@@ -171,6 +182,10 @@ class EvaluationTargetIdentity(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    workflow: WorkflowEvalTargetIdentityV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -213,8 +228,17 @@ class EvaluationTargetIdentity(BaseModel):
             return value.model_dump(mode="json")
         return value
 
+    @field_validator("workflow", mode="before")
+    @classmethod
+    def copy_workflow(cls, value: object) -> object:
+        if type(value) is WorkflowEvalTargetIdentityV1:
+            return value.model_dump(mode="json")
+        return value
+
     @model_validator(mode="after")
     def validate_app_manifest(self) -> EvaluationTargetIdentity:
+        if self.external_process is not None and self.workflow is not None:
+            raise ValueError("An eval target cannot be both external-process and workflow-root.")
         fingerprint = self.app_manifest.fingerprint
         if len(fingerprint) != 64 or any(
             character not in "0123456789abcdef" for character in fingerprint
@@ -848,6 +872,101 @@ class CorpusTarget(BaseModel):
         return self
 
 
+class WorkflowEvalTarget(CorpusTarget):
+    """Trusted application-owned workflow-root execution target.
+
+    ``request_base`` and ``bootstrap_messages`` remain the shared corpus input
+    compiler contract. The request's agent name is only a profile-probe identity;
+    candidate execution is performed exclusively by ``workflow_factory``.
+    """
+
+    workflow_spec: WorkflowSpec
+    implementation_revision: StrictStr
+    result_projector_revision: StrictStr
+    execution_scope_revision: StrictStr
+    instance_scope: WorkflowEvalInstanceScope = WorkflowEvalInstanceScope.PER_TRIAL
+    workflow_factory: WorkflowEvalFactory = Field(exclude=True, repr=False)
+    result_projector: WorkflowEvalResultProjector = Field(exclude=True, repr=False)
+    application_context: dict[str, Any] = Field(default_factory=dict, exclude=True, repr=False)
+    close_timeout_seconds: float = WORKFLOW_EVAL_DEFAULT_CLOSE_TIMEOUT_SECONDS
+
+    @field_validator("workflow_spec", mode="before")
+    @classmethod
+    def copy_workflow_spec(cls, value: object) -> WorkflowSpec:
+        if not isinstance(value, WorkflowSpec):
+            raise TypeError("WorkflowEvalTarget workflow_spec must be a WorkflowSpec.")
+        return copy_workflow_spec(value)
+
+    @field_validator(
+        "implementation_revision",
+        "result_projector_revision",
+        "execution_scope_revision",
+    )
+    @classmethod
+    def validate_workflow_revisions(cls, value: str, info) -> str:
+        if (
+            len(value) != 71
+            or not value.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in value[7:])
+        ):
+            raise ValueError(f"{info.field_name} must be a sha256 revision.")
+        return value
+
+    @field_validator("workflow_factory", "result_projector")
+    @classmethod
+    def validate_callbacks(cls, value: object, info) -> object:
+        if not callable(value):
+            raise TypeError(f"WorkflowEvalTarget {info.field_name} must be callable.")
+        return value
+
+    @field_validator("application_context", mode="before")
+    @classmethod
+    def copy_application_context(cls, value: object) -> dict[str, Any]:
+        copied = copy_durable_json_object(value, "application_context")
+        if not json_utf8_size_within_limit(
+            copied,
+            WORKFLOW_EVAL_MAX_APPLICATION_CONTEXT_BYTES,
+        ):
+            raise ValueError("application_context exceeds its canonical JSON byte limit.")
+        return copied
+
+    @field_validator("close_timeout_seconds", mode="before")
+    @classmethod
+    def validate_close_timeout(cls, value: object) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 < value <= WORKFLOW_EVAL_MAX_CLOSE_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "close_timeout_seconds must be a finite positive number no greater than "
+                f"{WORKFLOW_EVAL_MAX_CLOSE_TIMEOUT_SECONDS}."
+            )
+        return float(value)
+
+    @model_validator(mode="after")
+    def validate_workflow_contract(self) -> WorkflowEvalTarget:
+        if self.external_process is not None:
+            raise ValueError("WorkflowEvalTarget cannot also configure an external process.")
+        # Constructing the identity here catches changed/malformed revisions before
+        # corpus compilation or candidate/provider dispatch.
+        self.identity()
+        return self
+
+    def identity(self) -> WorkflowEvalTargetIdentityV1:
+        return WorkflowEvalTargetIdentityV1.create(
+            workflow_spec=self.workflow_spec,
+            implementation_revision=self.implementation_revision,
+            result_projector_revision=self.result_projector_revision,
+            execution_scope_revision=self.execution_scope_revision,
+            application_context=self.application_context,
+            evidence_policy_revision=self.evidence_policy.revision,
+            instance_scope=self.instance_scope,
+            close_timeout_seconds=self.close_timeout_seconds,
+        )
+
+
 @dataclass(frozen=True)
 class CompiledCorpusSuite:
     """One validated corpus suite ready for the existing evaluator."""
@@ -866,8 +985,29 @@ class _CorpusCompilationContext:
 
 
 def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
+    if type(target) is WorkflowEvalTarget:
+        return WorkflowEvalTarget(
+            key=target.key,
+            app=target.app,
+            request_base=target.request_base,
+            bootstrap_messages=target.bootstrap_messages,
+            application_release_id=target.application_release_id,
+            evidence_policy=target.evidence_policy,
+            price_book=target.price_book,
+            model_judges=target.model_judges,
+            limits=target.limits,
+            workflow_spec=target.workflow_spec,
+            implementation_revision=target.implementation_revision,
+            result_projector_revision=target.result_projector_revision,
+            execution_scope_revision=target.execution_scope_revision,
+            instance_scope=target.instance_scope,
+            workflow_factory=target.workflow_factory,
+            result_projector=target.result_projector,
+            application_context=target.application_context,
+            close_timeout_seconds=target.close_timeout_seconds,
+        )
     if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     return CorpusTarget(
         key=target.key,
         app=target.app,
@@ -903,8 +1043,8 @@ def _evaluation_target_identity_from_validated_target(
 ) -> EvaluationTargetIdentity:
     """Describe an internally validated target without another potentially large copy."""
 
-    if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+    if type(target) not in {CorpusTarget, WorkflowEvalTarget}:
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     manifest = (
         target.app.describe()
         if project_root is None
@@ -917,6 +1057,7 @@ def _evaluation_target_identity_from_validated_target(
         application_release_id=target.application_release_id,
         app_manifest=manifest,
         external_process=target.external_process,
+        workflow=(target.identity() if type(target) is WorkflowEvalTarget else None),
     )
 
 
@@ -933,8 +1074,8 @@ def _prepare_corpus_with_validated_target(
 ) -> _CorpusCompilationContext:
     if type(corpus) is not EvalCorpusDocument:
         raise TypeError("corpus must be an exact EvalCorpusDocument.")
-    if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+    if type(target) not in {CorpusTarget, WorkflowEvalTarget}:
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     validated_corpus = EvalCorpusDocument.model_validate(_model_python_input(corpus))
     if validated_corpus.target_key != target.key:
         raise ValueError("Eval corpus target key does not match the trusted CorpusTarget.")
@@ -1168,6 +1309,7 @@ class CorpusExecutionResult(BaseModel):
                 application_release_id=value.application_release_id,
                 app_manifest=value.app_manifest,
                 external_process=value.external_process,
+                workflow=value.workflow,
             )
         if isinstance(value, BaseModel):
             raise TypeError("target must be an exact EvaluationTargetIdentity or JSON object.")
@@ -1239,6 +1381,11 @@ class CorpusExecutionResult(BaseModel):
                 )
             if len({trial.native_run_id for trial in self.external_trials}) != 1:
                 raise ValueError("External trial identities require one exact native run ID.")
+        if (
+            self.target.workflow is not None
+            and self.target.workflow.evidence_policy_revision != self.run.evidence_policy_revision
+        ):
+            raise ValueError("Workflow target evidence policy does not match the published run.")
         if any(
             trial.status in {"passed", "failed"} and trial.output.evidence_state == "unavailable"
             for case in self.run.cases
@@ -1362,6 +1509,26 @@ async def _run_compiled_corpus_suite(
         raise EvalExecutionProfileChangedError(
             "CorpusTarget application manifest does not match its registered identity."
         )
+    workflow_execution_profile_fingerprint: str | None = None
+    if type(validated_target) is WorkflowEvalTarget:
+        try:
+            workflow_execution_profile_fingerprint = (
+                await validated_target.app.inspect_run_execution_profile(
+                    copy_run_request(validated_target.request_base)
+                )
+            )
+        except Exception as exc:
+            raise EvalExecutionProfileChangedError(
+                "Workflow target execution profile could not be established "
+                f"({type(exc).__name__})."
+            ) from None
+        if (
+            expected_execution_profile is not None
+            and workflow_execution_profile_fingerprint != expected_execution_profile.fingerprint
+        ):
+            raise EvalExecutionProfileChangedError(
+                "Workflow target execution profile does not match its registered identity."
+            )
     trial_count = len(compiled.suite.cases) * compiled.trials
     output_preview_bytes = min(
         EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
@@ -1442,8 +1609,11 @@ async def _run_compiled_corpus_suite(
         output_preview_bytes=output_preview_bytes,
         run_stream=(
             run_stream
-            if expected_app_manifest_fingerprint is not None
-            or expected_execution_profile is not None
+            if type(validated_target) is not WorkflowEvalTarget
+            and (
+                expected_app_manifest_fingerprint is not None
+                or expected_execution_profile is not None
+            )
             else None
         ),
         run_id=selected_run_id,
@@ -1451,7 +1621,27 @@ async def _run_compiled_corpus_suite(
         execution_capacity=execution_capacity,
         completed_trials=completed_trials,
         trial_completed=trial_completed,
+        workflow_target=(
+            validated_target if type(validated_target) is WorkflowEvalTarget else None
+        ),
+        workflow_execution_profile_fingerprint=workflow_execution_profile_fingerprint,
     )
+    if workflow_execution_profile_fingerprint is not None:
+        try:
+            final_workflow_execution_profile_fingerprint = (
+                await validated_target.app.inspect_run_execution_profile(
+                    copy_run_request(validated_target.request_base)
+                )
+            )
+        except Exception as exc:
+            raise EvalExecutionProfileChangedError(
+                "Workflow target execution profile could not be revalidated "
+                f"({type(exc).__name__})."
+            ) from None
+        if final_workflow_execution_profile_fingerprint != workflow_execution_profile_fingerprint:
+            raise EvalExecutionProfileChangedError(
+                "Workflow target execution profile changed during eval execution."
+            )
     return await asyncio.to_thread(
         _finalize_compiled_corpus_result,
         validated_target,
@@ -1486,9 +1676,10 @@ def _finalize_compiled_corpus_result(
         or target_after.application_release_id != target_before.application_release_id
         or target_after.app_manifest_fingerprint != target_before.app_manifest_fingerprint
         or target_after.external_process != target_before.external_process
+        or target_after.workflow != target_before.workflow
     ):
         raise EvalExecutionProfileChangedError(
-            "CorpusTarget application manifest changed or external process identity changed "
+            "CorpusTarget application manifest changed or execution target identity changed "
             "during eval execution."
         )
     run_document: dict[str, Any] = _model_instance_python_input(internal_run)

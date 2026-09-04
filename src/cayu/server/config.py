@@ -34,7 +34,7 @@ from cayu._validation import (
 )
 from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import EvaluationEvidencePolicySpec
-from cayu.evals.execution import CorpusTarget
+from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
@@ -352,7 +352,7 @@ class EvalsConfig(BaseModel):
         revalidate_instances="always",
     )
 
-    target: CorpusTarget = Field(exclude=True, repr=False)
+    target: CorpusTarget | WorkflowEvalTarget = Field(exclude=True, repr=False)
     store: EvalStore = Field(exclude=True, repr=False)
     execution_capacity: EvalExecutionCapacity = Field(
         default_factory=EvalExecutionCapacity,
@@ -388,8 +388,8 @@ class EvalsConfig(BaseModel):
             message="Invalid Evals configuration.",
             preserve_messages=True,
         )
-        if type(config.target) is not CorpusTarget:
-            message = "target must be an exact CorpusTarget."
+        if type(config.target) not in {CorpusTarget, WorkflowEvalTarget}:
+            message = "target must be an exact CorpusTarget or WorkflowEvalTarget."
             location = "target"
         elif not isinstance(config.store, EvalStore):
             message = "store must implement EvalStore."

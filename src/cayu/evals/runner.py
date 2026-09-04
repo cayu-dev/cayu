@@ -94,9 +94,22 @@ from cayu.evals.trajectory import (
     _revalidate_fresh_capture,
     _trajectory_from_terminal_evidence,
     _validated_terminal_session_evidence,
+    _workflow_trajectory_from_session,
     final_output_text,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.evals.workflow_target import (
+    WorkflowEvalExecution,
+    WorkflowEvalFailure,
+    WorkflowEvalFailureCode,
+    WorkflowEvalInvocation,
+    WorkflowEvalOutputEvidenceV1,
+    WorkflowEvalResult,
+    WorkflowEvalTerminalEvidence,
+    workflow_eval_input_messages_sha256,
+    workflow_eval_output_sha256,
+    workflow_eval_trial_session_id,
+)
 from cayu.memory_attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
@@ -108,6 +121,8 @@ from cayu.runtime.app import CayuApp
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.sessions import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
+    EventQuery,
+    EventRecord,
     RunnerObservedEventIdentity,
     RunRequest,
     Session,
@@ -129,6 +144,11 @@ from cayu.tools._operation_boundary import (
     await_invocation_operation,
     retained_invocation_operation_outcome_if_done,
 )
+from cayu.workflows import (
+    WORKFLOW_ATTEMPT_EVENT_TYPE,
+    WORKFLOW_JOURNAL_PROVIDER,
+    WorkflowSupersededError,
+)
 from cayu.workspaces import WorkspaceReadResult
 
 TrialRequestTransform = Callable[[str, str, int, RunRequest], RunRequest]
@@ -140,11 +160,42 @@ TrialCompletionCallback = Callable[
 if TYPE_CHECKING:
     from cayu.evals.corpus import EvalCorpusDocument
     from cayu.evals.evidence import AssertionEvidenceView
-    from cayu.evals.execution import CorpusExecutionResult, CorpusTarget
+    from cayu.evals.execution import CorpusExecutionResult, CorpusTarget, WorkflowEvalTarget
 
 
 class _FreshInterruptedEvidenceUnavailable(RuntimeError):
     """The runner-owned interrupted session could not be reconciled exactly."""
+
+
+class _WorkflowInstanceTracker:
+    """Enforce a target's declared shared/per-trial application ownership."""
+
+    def __init__(self, scope: str) -> None:
+        self._scope = scope
+        self._lock = Lock()
+        self._executions: list[WorkflowEvalExecution] = []
+
+    def observe(self, execution: WorkflowEvalExecution) -> None:
+        with self._lock:
+            if self._executions:
+                first = self._executions[0]
+                reuses_instance = any(
+                    execution.app is prior.app or execution.workflow is prior.workflow
+                    for prior in self._executions
+                )
+                if self._scope == "per_trial" and reuses_instance:
+                    raise WorkflowEvalFailure(
+                        WorkflowEvalFailureCode.TARGET_FAILED,
+                        "Per-trial workflow target reused application or workflow state.",
+                    )
+                if self._scope == "shared" and (
+                    execution.app is not first.app or execution.workflow is not first.workflow
+                ):
+                    raise WorkflowEvalFailure(
+                        WorkflowEvalFailureCode.TARGET_FAILED,
+                        "Shared workflow target changed application or workflow state.",
+                    )
+            self._executions.append(execution)
 
 
 class _FreshMemoryAttributionReadFailed(RuntimeError):
@@ -669,15 +720,18 @@ class EvalPlan:
     app: CayuApp | None = None
     suite: EvalSuite | None = None
     corpus_target: CorpusTarget | None = None
+    workflow_target: WorkflowEvalTarget | None = None
 
     def __post_init__(self) -> None:
-        from cayu.evals.execution import CorpusTarget
+        from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
 
-        direct_configured = self.app is not None or self.suite is not None
+        direct_configured = self.app is not None
         corpus_configured = self.corpus_target is not None
-        if direct_configured == corpus_configured:
+        workflow_configured = self.workflow_target is not None
+        if sum((direct_configured, corpus_configured, workflow_configured)) != 1:
             raise ValueError(
-                "EvalPlan requires exactly one mode: app with suite, or corpus_target."
+                "EvalPlan requires exactly one mode: app with suite, corpus_target, "
+                "or workflow_target."
             )
         if direct_configured:
             if not isinstance(self.app, CayuApp):
@@ -691,7 +745,83 @@ class EvalPlan:
             )
             return
         if type(self.corpus_target) is not CorpusTarget:
-            raise TypeError("EvalPlan corpus_target must be an exact CorpusTarget.")
+            if not workflow_configured:
+                raise TypeError("EvalPlan corpus_target must be an exact CorpusTarget.")
+        elif self.suite is not None:
+            raise ValueError("Corpus EvalPlan execution does not accept a direct suite.")
+        if workflow_configured:
+            if type(self.workflow_target) is not WorkflowEvalTarget:
+                raise TypeError("EvalPlan workflow_target must be an exact WorkflowEvalTarget.")
+            if self.app is not None or self.corpus_target is not None:
+                raise ValueError(
+                    "Workflow EvalPlan execution cannot also configure another target."
+                )
+            if self.suite is not None:
+                if type(self.suite) is not EvalSuite:
+                    raise TypeError("EvalPlan suite must be an exact EvalSuite.")
+                object.__setattr__(self, "suite", _detach_eval_suite(self.suite))
+
+
+async def run_workflow_eval_suite(
+    target: WorkflowEvalTarget,
+    suite: EvalSuite,
+    *,
+    retain_trajectory: bool = False,
+    retain_final_output: bool = True,
+    max_concurrency: int = 1,
+    case_timeout_seconds: float | None = None,
+    trials: int = 1,
+    execution_capacity: EvalExecutionCapacity | None = None,
+    trial_policy: EvalSuiteTrialPolicyV1 | None = None,
+) -> EvalRun:
+    """Run a typed application-owned workflow as the root eval target."""
+
+    from cayu.evals.execution import WorkflowEvalTarget
+
+    if type(target) is not WorkflowEvalTarget:
+        raise TypeError("run_workflow_eval_suite requires an exact WorkflowEvalTarget.")
+    target_identity = target.identity()
+    app_manifest_fingerprint = target.app.describe().fingerprint
+    try:
+        execution_profile_fingerprint = await target.app.inspect_run_execution_profile(
+            copy_run_request(target.request_base)
+        )
+    except Exception as exc:
+        raise EvalExecutionProfileChangedError(
+            f"WorkflowEvalTarget execution profile could not be established ({type(exc).__name__})."
+        ) from None
+    run, _ = await _run_eval_suite(
+        target.app,
+        suite,
+        retain_trajectory=retain_trajectory,
+        retain_final_output=retain_final_output,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=case_timeout_seconds,
+        trials=trials,
+        trial_policy=trial_policy,
+        public_output_preview_bytes=None,
+        execution_capacity=execution_capacity,
+        workflow_target=target,
+        workflow_execution_profile_fingerprint=execution_profile_fingerprint,
+    )
+    try:
+        final_execution_profile_fingerprint = await target.app.inspect_run_execution_profile(
+            copy_run_request(target.request_base)
+        )
+    except Exception as exc:
+        raise EvalExecutionProfileChangedError(
+            f"WorkflowEvalTarget execution profile could not be revalidated ({type(exc).__name__})."
+        ) from None
+    if (
+        target.identity() != target_identity
+        or target.app.describe().fingerprint != app_manifest_fingerprint
+        or final_execution_profile_fingerprint != execution_profile_fingerprint
+    ):
+        raise EvalExecutionProfileChangedError(
+            "WorkflowEvalTarget identity, application manifest, or execution profile changed "
+            "during eval execution."
+        )
+    return run
 
 
 async def run_eval_suite(
@@ -756,6 +886,8 @@ async def _run_eval_suite_with_public_projection(
     completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
     | None = None,
     trial_completed: TrialCompletionCallback | None = None,
+    workflow_target: WorkflowEvalTarget | None = None,
+    workflow_execution_profile_fingerprint: str | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]]]:
     """Run a corpus suite and return its separate runner-owned public sidecar."""
 
@@ -775,6 +907,8 @@ async def _run_eval_suite_with_public_projection(
         execution_capacity=execution_capacity,
         completed_trials=completed_trials,
         trial_completed=trial_completed,
+        workflow_target=workflow_target,
+        workflow_execution_profile_fingerprint=workflow_execution_profile_fingerprint,
     )
     if public_data is None:
         raise RuntimeError("Corpus execution lost its runner-owned public projection.")
@@ -799,6 +933,8 @@ async def _run_eval_suite(
     completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
     | None = None,
     trial_completed: TrialCompletionCallback | None = None,
+    workflow_target: WorkflowEvalTarget | None = None,
+    workflow_execution_profile_fingerprint: str | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
@@ -851,6 +987,33 @@ async def _run_eval_suite(
         raise TypeError("trial_completed must be callable or None.")
     if (completed_trials or trial_completed is not None) and public_output_preview_bytes is None:
         raise ValueError("Durable trial recovery requires the public trial projection.")
+    if workflow_target is not None:
+        from cayu.evals.execution import WorkflowEvalTarget
+
+        if type(workflow_target) is not WorkflowEvalTarget:
+            raise TypeError("workflow_target must be an exact WorkflowEvalTarget or None.")
+        if workflow_target.app is not app:
+            raise ValueError("workflow_target app must match the eval runner application.")
+        if workflow_target.instance_scope.value == "shared" and max_concurrency > 1:
+            raise ValueError(
+                "A shared workflow target requires max_concurrency=1; use per_trial "
+                "for concurrent trials."
+            )
+        if run_stream is not None or trial_request_transform is not None:
+            raise ValueError("Workflow eval targets own their execution and request identity.")
+        if (
+            type(workflow_execution_profile_fingerprint) is not str
+            or len(workflow_execution_profile_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in workflow_execution_profile_fingerprint
+            )
+        ):
+            raise ValueError(
+                "Workflow eval execution requires an exact execution-profile fingerprint."
+            )
+    elif workflow_execution_profile_fingerprint is not None:
+        raise ValueError("workflow_execution_profile_fingerprint requires a workflow eval target.")
     started_at = datetime.now(UTC)
     trial_count = len(suite.cases) * trials
     memory_attribution_bounds = eval_memory_attribution_bounds_for_trial_count(trial_count)
@@ -860,6 +1023,11 @@ async def _run_eval_suite(
     memory_attribution_max_bytes = eval_memory_attribution_max_bytes_for_trial_count(trial_count)
     memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(
         max_operations=max_concurrency
+    )
+    workflow_instance_tracker = (
+        None
+        if workflow_target is None
+        else _WorkflowInstanceTracker(workflow_target.instance_scope.value)
     )
     async with memory_attribution_read_lifecycle:
         results, public_data_by_case = await _run_suite_cases(
@@ -881,6 +1049,10 @@ async def _run_eval_suite(
             execution_capacity=execution_capacity,
             completed_trials=completed_trials,
             trial_completed=trial_completed,
+            run_id=run_id,
+            workflow_target=workflow_target,
+            workflow_instance_tracker=workflow_instance_tracker,
+            workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
         )
     observed_started_at = min(result.started_at for result in results)
     observed_completed_at = max(result.completed_at for result in results)
@@ -918,7 +1090,10 @@ async def run_eval_plan(
         raise TypeError("run_eval_plan requires an EvalPlan.")
     if execution_capacity is not None and type(execution_capacity) is not EvalExecutionCapacity:
         raise TypeError("execution_capacity must be an exact EvalExecutionCapacity or None.")
-    if plan.corpus_target is not None:
+    portable_target = plan.corpus_target or (
+        plan.workflow_target if plan.workflow_target is not None and plan.suite is None else None
+    )
+    if portable_target is not None:
         from cayu.evals.corpus import EvalCorpusDocument
         from cayu.evals.execution import run_corpus_suite
 
@@ -931,7 +1106,7 @@ async def run_eval_plan(
         if case_timeout_seconds is not None or trials is not None:
             raise ValueError("Corpus trial count and timeout come only from the corpus contract.")
         return await run_corpus_suite(
-            plan.corpus_target,
+            portable_target,
             corpus,
             suite_id,
             max_concurrency=max_concurrency,
@@ -939,6 +1114,18 @@ async def run_eval_plan(
         )
     if corpus is not None or suite_id is not None:
         raise ValueError("Direct EvalPlan execution does not accept corpus or suite_id.")
+    if plan.workflow_target is not None:
+        if type(plan.suite) is not EvalSuite:
+            raise TypeError("Workflow EvalPlan requires an exact EvalSuite or a corpus.")
+        return await run_workflow_eval_suite(
+            plan.workflow_target,
+            plan.suite,
+            retain_trajectory=retain_trajectory,
+            max_concurrency=max_concurrency,
+            case_timeout_seconds=case_timeout_seconds,
+            trials=1 if trials is None else trials,
+            execution_capacity=execution_capacity,
+        )
     if not isinstance(plan.app, CayuApp) or type(plan.suite) is not EvalSuite:
         raise TypeError("Direct EvalPlan requires a CayuApp and exact EvalSuite.")
     return await run_eval_suite(
@@ -972,6 +1159,10 @@ async def _run_suite_cases(
     execution_capacity: EvalExecutionCapacity | None,
     completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]],
     trial_completed: TrialCompletionCallback | None,
+    run_id: str,
+    workflow_target: WorkflowEvalTarget | None,
+    workflow_instance_tracker: _WorkflowInstanceTracker | None,
+    workflow_execution_profile_fingerprint: str | None,
 ) -> tuple[
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
@@ -1022,6 +1213,10 @@ async def _run_suite_cases(
                     memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
                     run_stream=run_stream,
                     trial_request_transform=trial_request_transform,
+                    run_id=run_id,
+                    workflow_target=workflow_target,
+                    workflow_instance_tracker=workflow_instance_tracker,
+                    workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
                 )
                 result, public_data = execution
                 if trial_completed is not None:
@@ -1245,6 +1440,681 @@ async def _run_case_once(
     return result
 
 
+_WORKFLOW_EVAL_EVENT_PAGE_SIZE = 5_000
+_WORKFLOW_EVAL_MAX_EVENTS = 10_000
+
+
+async def _load_workflow_eval_records(
+    app: CayuApp,
+    *,
+    session_id: str,
+    workflow_name: str,
+) -> tuple[EventRecord, ...]:
+    records: list[EventRecord] = []
+    after_sequence = 0
+    while True:
+        page = await app.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                workflow_name=workflow_name,
+                after_sequence=after_sequence,
+                limit=_WORKFLOW_EVAL_EVENT_PAGE_SIZE,
+            )
+        )
+        if not page:
+            break
+        if any(type(record) is not EventRecord for record in page):
+            raise WorkflowEvalFailure(
+                WorkflowEvalFailureCode.TARGET_FAILED,
+                "Workflow evidence store returned an invalid event record.",
+            )
+        if any(record.sequence <= after_sequence for record in page):
+            raise WorkflowEvalFailure(
+                WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+                "Workflow evidence contains a non-monotonic event sequence.",
+            )
+        records.extend(page)
+        if len(records) > _WORKFLOW_EVAL_MAX_EVENTS:
+            raise WorkflowEvalFailure(
+                WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+                "Workflow evidence exceeds the bounded event limit.",
+            )
+        after_sequence = page[-1].sequence
+        if len(page) < _WORKFLOW_EVAL_EVENT_PAGE_SIZE:
+            break
+    if len({record.event.id for record in records}) != len(records):
+        raise WorkflowEvalFailure(
+            WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+            "Workflow evidence contains duplicate event identities.",
+        )
+    return tuple(records)
+
+
+def _current_workflow_completion(
+    records: tuple[EventRecord, ...],
+    *,
+    workflow_name: str,
+) -> tuple[str, EventRecord]:
+    attempts = tuple(
+        record
+        for record in records
+        if record.event.type == WORKFLOW_ATTEMPT_EVENT_TYPE
+        and isinstance(record.event.payload.get("attempt_id"), str)
+        and record.event.payload.get("attempt_id")
+    )
+    if not attempts:
+        raise WorkflowEvalFailure(
+            WorkflowEvalFailureCode.COMPLETION_MISSING,
+            "Workflow current-attempt evidence is missing.",
+        )
+    attempt_id = str(attempts[-1].event.payload["attempt_id"])
+    current = tuple(
+        record for record in records if record.event.payload.get("attempt_id") == attempt_id
+    )
+    markers = tuple(
+        record for record in current if record.event.type == WORKFLOW_ATTEMPT_EVENT_TYPE
+    )
+    starts = tuple(record for record in current if record.event.type == EventType.WORKFLOW_STARTED)
+    completions = tuple(
+        record for record in current if record.event.type == EventType.WORKFLOW_COMPLETED
+    )
+    if not completions:
+        raise WorkflowEvalFailure(
+            WorkflowEvalFailureCode.COMPLETION_MISSING,
+            "Workflow current-attempt completion evidence is missing.",
+        )
+    if len(markers) != 1 or len(starts) != 1 or len(completions) != 1:
+        raise WorkflowEvalFailure(
+            WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+            "Workflow current-attempt boundary evidence is conflicting.",
+        )
+    completion = completions[0]
+    if (
+        completion.event.workflow_name != workflow_name
+        or markers[0].sequence >= starts[0].sequence
+        or starts[0].sequence >= completion.sequence
+    ):
+        raise WorkflowEvalFailure(
+            WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+            "Workflow current-attempt completion evidence is invalid.",
+        )
+    if completion.sequence != current[-1].sequence:
+        raise WorkflowEvalFailure(
+            WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+            "Workflow current-attempt evidence continues after completion.",
+        )
+    return attempt_id, completion
+
+
+async def _capture_workflow_child_probes(
+    app: CayuApp,
+    children: tuple[Trajectory, ...],
+    requirements: ProbeRequirements,
+) -> tuple[Trajectory, ...]:
+    captured: list[Trajectory] = []
+    for child in children:
+        descendants = await _capture_workflow_child_probes(app, child.children, requirements)
+        probes = await _capture_probes(app, child.session, requirements)
+        captured.append(child.model_copy(update={"children": descendants, "probes": probes}))
+    return tuple(captured)
+
+
+def _workflow_event_count(trajectory: Trajectory) -> int:
+    return len(trajectory.events) + sum(
+        _workflow_event_count(child) for child in trajectory.children
+    )
+
+
+_WORKFLOW_FAILURE_DIAGNOSTICS = {
+    WorkflowEvalFailureCode.TARGET_FAILED: EvalTrialDiagnosticCode.WORKFLOW_TARGET_FAILED,
+    WorkflowEvalFailureCode.EXECUTION_FAILED: (EvalTrialDiagnosticCode.WORKFLOW_EXECUTION_FAILED),
+    WorkflowEvalFailureCode.COMPLETION_MISSING: (
+        EvalTrialDiagnosticCode.WORKFLOW_COMPLETION_MISSING
+    ),
+    WorkflowEvalFailureCode.COMPLETION_CONFLICT: (
+        EvalTrialDiagnosticCode.WORKFLOW_COMPLETION_CONFLICT
+    ),
+    WorkflowEvalFailureCode.ATTEMPT_SUPERSEDED: (
+        EvalTrialDiagnosticCode.WORKFLOW_ATTEMPT_SUPERSEDED
+    ),
+    WorkflowEvalFailureCode.PROJECTOR_FAILED: EvalTrialDiagnosticCode.WORKFLOW_PROJECTOR_FAILED,
+    WorkflowEvalFailureCode.OUTPUT_INVALID: EvalTrialDiagnosticCode.WORKFLOW_OUTPUT_INVALID,
+    WorkflowEvalFailureCode.QUIESCENCE_FAILED: (EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED),
+}
+
+
+async def _run_workflow_case_once_with_public_projection(
+    target: WorkflowEvalTarget,
+    case: EvalCase,
+    *,
+    trial_number: int,
+    suite_id: str,
+    run_id: str,
+    retain_trajectory: bool,
+    retain_final_output: bool,
+    timeout_seconds: float | None,
+    public_output_preview_bytes: int | None,
+    memory_attribution_bounds: MemoryAttributionBounds | None,
+    memory_attribution_source_limit: int | None,
+    memory_attribution_max_bytes: int | None,
+    memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
+    workflow_instance_tracker: _WorkflowInstanceTracker,
+    workflow_execution_profile_fingerprint: str,
+) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
+    """Execute one workflow trial and bind output to durable current-attempt evidence."""
+
+    from cayu.evals.execution import WorkflowEvalTarget
+
+    if type(target) is not WorkflowEvalTarget:
+        raise TypeError("workflow target execution requires an exact WorkflowEvalTarget.")
+    started_at = datetime.now(UTC)
+    workflow_identity = target.identity()
+    app_manifest = target.app.describe()
+    root_session_id = workflow_eval_trial_session_id(
+        target_revision=workflow_identity.revision,
+        run_id=run_id,
+        suite_id=suite_id,
+        case_id=case.id,
+        trial_number=trial_number,
+    )
+    request = _isolated_trial_request(case.request).model_copy(
+        update={"session_id": root_session_id, "causal_budget_id": root_session_id}
+    )
+    execution: WorkflowEvalExecution | None = None
+    runtime_app = target.app
+    trajectory: Trajectory | None = None
+    final_output = ""
+    structured_output: dict[str, Any] | None = None
+    assertion_results: list[EvalAssertionResult] = []
+    run_error: str | None = None
+    diagnostic_code: EvalTrialDiagnosticCode | None = None
+    public_output = EvalTrialOutputPreviewV1.unavailable()
+    capture_state: _CaptureState | None = None
+    publication_attempt_id: str | None = None
+    publication_completion_event_id: str | None = None
+    publication_record_identity: tuple[tuple[int, str], ...] | None = None
+    selected_memory_bounds = MemoryAttributionBounds.model_validate(
+        (memory_attribution_bounds or standard_eval_memory_attribution_bounds()).model_dump(
+            mode="python"
+        )
+    )
+    selected_memory_source_limit = (
+        EVAL_MEMORY_ATTRIBUTION_MAX_SOURCES
+        if memory_attribution_source_limit is None
+        else memory_attribution_source_limit
+    )
+    selected_memory_max_bytes = (
+        EVAL_MEMORY_ATTRIBUTION_MAX_BYTES
+        if memory_attribution_max_bytes is None
+        else memory_attribution_max_bytes
+    )
+    memory_attribution = EvalMemoryAttributionEvidenceV1.unavailable(
+        EvalMemoryEvidenceLimitation.MISSING,
+        effective_bounds=selected_memory_bounds,
+        effective_source_limit=selected_memory_source_limit,
+        effective_max_bytes=selected_memory_max_bytes,
+    )
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            invocation = WorkflowEvalInvocation(
+                run_id=run_id,
+                suite_id=suite_id,
+                case_id=case.id,
+                trial_number=trial_number,
+                workflow_run_id=root_session_id,
+                idempotency_key=f"cayu-eval:{root_session_id}",
+                messages=tuple(request.messages),
+                application_context=target.application_context,
+            )
+            try:
+                built = target.workflow_factory(invocation)
+                if inspect.isawaitable(built):
+                    built = await built
+            except Exception as exc:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.TARGET_FAILED,
+                    f"Workflow target factory failed ({type(exc).__name__}).",
+                ) from None
+            if type(built) is not WorkflowEvalExecution:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.TARGET_FAILED,
+                    "Workflow target factory returned an invalid execution.",
+                )
+            execution = built
+            workflow_instance_tracker.observe(execution)
+            runtime_app = execution.app
+            if runtime_app.describe().fingerprint != app_manifest.fingerprint:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.TARGET_FAILED,
+                    "Workflow target application manifest does not match its declared identity.",
+                )
+            try:
+                runtime_execution_profile_fingerprint = (
+                    await runtime_app.inspect_run_execution_profile(
+                        copy_run_request(target.request_base)
+                    )
+                )
+            except Exception as exc:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.TARGET_FAILED,
+                    "Workflow target execution profile could not be established "
+                    f"({type(exc).__name__}).",
+                ) from None
+            if runtime_execution_profile_fingerprint != workflow_execution_profile_fingerprint:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.TARGET_FAILED,
+                    "Workflow target execution profile does not match its declared identity.",
+                )
+            if execution.workflow.spec != target.workflow_spec:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.TARGET_FAILED,
+                    "Workflow target factory returned a different workflow specification.",
+                )
+            try:
+                async for emitted in execution.workflow.run(root_session_id):
+                    if type(emitted) is not Event:
+                        raise TypeError("workflow run yielded a non-Event value")
+            except Exception as exc:
+                if exception_tree_contains(exc, (WorkflowSupersededError,)):
+                    raise WorkflowEvalFailure(
+                        WorkflowEvalFailureCode.ATTEMPT_SUPERSEDED,
+                        "Workflow attempt was superseded during execution.",
+                    ) from None
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.EXECUTION_FAILED,
+                    f"Workflow execution failed ({type(exc).__name__}).",
+                ) from None
+
+            workflow_session = await runtime_app.session_store.load(root_session_id)
+            if (
+                workflow_session is None
+                or workflow_session.status is not SessionStatus.COMPLETED
+                or workflow_session.provider_name != WORKFLOW_JOURNAL_PROVIDER
+                or workflow_session.agent_name != target.workflow_spec.name
+            ):
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.COMPLETION_MISSING,
+                    "Workflow journal anchor is missing or invalid.",
+                )
+            records = await _load_workflow_eval_records(
+                runtime_app,
+                session_id=root_session_id,
+                workflow_name=target.workflow_spec.name,
+            )
+            attempt_id, completion = _current_workflow_completion(
+                records,
+                workflow_name=target.workflow_spec.name,
+            )
+            terminal = WorkflowEvalTerminalEvidence(
+                workflow_run_id=root_session_id,
+                workflow_name=target.workflow_spec.name,
+                attempt_id=attempt_id,
+                completion_event=completion.event,
+            )
+            try:
+                projected = target.result_projector(terminal)
+                if inspect.isawaitable(projected):
+                    projected = await projected
+            except Exception as exc:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.PROJECTOR_FAILED,
+                    f"Workflow result projector failed ({type(exc).__name__}).",
+                ) from None
+            if type(projected) is not WorkflowEvalResult:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.OUTPUT_INVALID,
+                    "Workflow result projector returned an invalid result.",
+                )
+            try:
+                projected = WorkflowEvalResult.model_validate(
+                    projected.model_dump(mode="python", round_trip=True, warnings="none")
+                )
+            except (TypeError, ValueError):
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.OUTPUT_INVALID,
+                    "Workflow result projector returned an invalid result.",
+                ) from None
+
+            latest_records = await _load_workflow_eval_records(
+                runtime_app,
+                session_id=root_session_id,
+                workflow_name=target.workflow_spec.name,
+            )
+            latest_attempt_id, latest_completion = _current_workflow_completion(
+                latest_records,
+                workflow_name=target.workflow_spec.name,
+            )
+            if latest_attempt_id != attempt_id or latest_completion.event.id != completion.event.id:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.ATTEMPT_SUPERSEDED,
+                    "Workflow attempt changed while its result was being projected.",
+                )
+
+            final_output = projected.final_output
+            structured_output = projected.structured_output
+            output_evidence = WorkflowEvalOutputEvidenceV1(
+                target_revision=workflow_identity.revision,
+                projector_revision=workflow_identity.result_projector_revision,
+                workflow_name=target.workflow_spec.name,
+                attempt_id=attempt_id,
+                completion_event_id=completion.event.id,
+                input_message_count=len(request.messages),
+                input_messages_sha256=workflow_eval_input_messages_sha256(tuple(request.messages)),
+                final_output_sha256=workflow_eval_output_sha256(final_output),
+                structured_output=structured_output,
+            )
+            capture_state = _CaptureState(bounds=SessionTrajectoryBounds(), strict=False)
+            children_incomplete = _IncompleteFlag()
+            if not runtime_app.session_store.supports_session_lineage:
+                children_incomplete.value = True
+            children = await _build_child_trajectories(
+                runtime_app,
+                root_session_id,
+                visited={root_session_id},
+                incomplete=children_incomplete,
+                parent_terminal_sequence=completion.sequence,
+                state=capture_state,
+            )
+            requirements = _collect_probe_requirements(case.assertions)
+            children = await _capture_workflow_child_probes(
+                runtime_app,
+                children,
+                requirements,
+            )
+            trajectory = _workflow_trajectory_from_session(
+                workflow_session,
+                workflow_events=tuple(record.event for record in latest_records),
+                input_messages=tuple(request.messages),
+                output_evidence=output_evidence,
+                final_output=final_output,
+                children=children,
+                children_incomplete=children_incomplete.value,
+                metadata=case.metadata,
+            )
+            if children_incomplete.value:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.TARGET_FAILED,
+                    "Workflow child-session evidence could not be captured completely.",
+                )
+            memory_alias_key = memory_evidence_key(runtime_app._request_footprint)
+            first_memory_projection = await _owned_fresh_memory_attribution_projection(
+                runtime_app,
+                trajectory,
+                bounds=selected_memory_bounds,
+                lifecycle=memory_attribution_read_lifecycle,
+            )
+            if runtime_app.session_store.supports_session_lineage:
+                await _owned_fresh_capture_revalidation(
+                    runtime_app,
+                    capture_state,
+                    root_session_id=root_session_id,
+                    root_interrupted_observed_events=(),
+                    lifecycle=memory_attribution_read_lifecycle,
+                )
+            revalidated_memory_projection = await _owned_fresh_memory_attribution_projection(
+                runtime_app,
+                trajectory,
+                bounds=selected_memory_bounds,
+                lifecycle=memory_attribution_read_lifecycle,
+            )
+            if _memory_attribution_snapshot(
+                first_memory_projection
+            ) != _memory_attribution_snapshot(revalidated_memory_projection):
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+                    "Workflow memory evidence changed before evaluation publication.",
+                )
+            trajectory = revalidated_memory_projection
+            memory_attribution = eval_memory_attribution_evidence_from_trajectory(
+                trajectory,
+                effective_bounds=selected_memory_bounds,
+                effective_source_limit=selected_memory_source_limit,
+                effective_max_bytes=selected_memory_max_bytes,
+                source_alias_key_id=(None if memory_alias_key is None else memory_alias_key.key_id),
+                source_alias_key=None if memory_alias_key is None else memory_alias_key.key,
+            )
+            context = EvalContext(
+                trajectory=trajectory,
+                suite_id=suite_id,
+                case_id=case.id,
+                metadata=case.metadata,
+                root_evidence_available=True,
+            )
+            prepared, prepared_error = _prepare_portable_evidence(
+                case.assertions,
+                context,
+                runtime_app=runtime_app,
+                memory_attribution_evidence=memory_attribution,
+            )
+            if public_output_preview_bytes is not None and prepared is not None:
+                public_output = EvalTrialOutputPreviewV1.from_retained_evidence(
+                    prepared.final_output,
+                    prepared.final_output_state,
+                    max_preview_bytes=public_output_preview_bytes,
+                )
+            assertion_results = list(
+                await _evaluate_assertions_with_prepared_evidence(
+                    case.assertions,
+                    context,
+                    portable_evidence=prepared,
+                    portable_evidence_error=prepared_error,
+                )
+            )
+            assertion_error = _assertion_diagnostic(
+                assertion_results,
+                EvalOutcome.ERROR,
+                "Assertion evaluation failed",
+            )
+            if assertion_error is not None:
+                run_error = assertion_error
+                diagnostic_code = EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED
+            if runtime_app.session_store.supports_session_lineage:
+                await _owned_fresh_capture_revalidation(
+                    runtime_app,
+                    capture_state,
+                    root_session_id=root_session_id,
+                    root_interrupted_observed_events=(),
+                    lifecycle=memory_attribution_read_lifecycle,
+                )
+            final_records = await _load_workflow_eval_records(
+                runtime_app,
+                session_id=root_session_id,
+                workflow_name=target.workflow_spec.name,
+            )
+            final_attempt_id, final_completion = _current_workflow_completion(
+                final_records,
+                workflow_name=target.workflow_spec.name,
+            )
+            if final_attempt_id != attempt_id:
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.ATTEMPT_SUPERSEDED,
+                    "Workflow attempt changed before evaluation publication.",
+                )
+            if final_completion.event.id != completion.event.id or tuple(
+                (record.sequence, record.event.id) for record in final_records
+            ) != tuple((record.sequence, record.event.id) for record in latest_records):
+                raise WorkflowEvalFailure(
+                    WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+                    "Workflow evidence changed before evaluation publication.",
+                )
+            publication_attempt_id = final_attempt_id
+            publication_completion_event_id = final_completion.event.id
+            publication_record_identity = tuple(
+                (record.sequence, record.event.id) for record in final_records
+            )
+    except TimeoutError:
+        run_error = f"Eval case timed out after {timeout_seconds} seconds."
+        diagnostic_code = EvalTrialDiagnosticCode.CASE_TIMEOUT
+        public_output = EvalTrialOutputPreviewV1.unavailable()
+        trajectory = None
+        final_output = ""
+        structured_output = None
+    except WorkflowEvalFailure as exc:
+        run_error = str(exc)
+        diagnostic_code = _WORKFLOW_FAILURE_DIAGNOSTICS[exc.code]
+        public_output = EvalTrialOutputPreviewV1.unavailable()
+        trajectory = None
+        final_output = ""
+        structured_output = None
+    except Exception as exc:
+        run_error = f"Workflow eval evidence preparation failed ({type(exc).__name__})."
+        diagnostic_code = EvalTrialDiagnosticCode.EVIDENCE_PREPARATION_FAILED
+        public_output = EvalTrialOutputPreviewV1.unavailable()
+        trajectory = None
+        final_output = ""
+        structured_output = None
+    finally:
+        quiescence_succeeded = True
+        if execution is not None and execution.close is not None:
+            try:
+                async with asyncio.timeout(target.close_timeout_seconds):
+                    await execution.close()
+            except Exception as exc:
+                quiescence_succeeded = False
+                run_error = f"Workflow target quiescence failed ({type(exc).__name__})."
+                diagnostic_code = EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED
+                public_output = EvalTrialOutputPreviewV1.unavailable()
+                trajectory = None
+                final_output = ""
+                structured_output = None
+        if (
+            quiescence_succeeded
+            and capture_state is not None
+            and publication_attempt_id is not None
+            and publication_completion_event_id is not None
+            and publication_record_identity is not None
+        ):
+            try:
+                if runtime_app.describe().fingerprint != app_manifest.fingerprint:
+                    raise WorkflowEvalFailure(
+                        WorkflowEvalFailureCode.TARGET_FAILED,
+                        "Workflow target application manifest changed during quiescence.",
+                    )
+                try:
+                    settled_execution_profile_fingerprint = (
+                        await runtime_app.inspect_run_execution_profile(
+                            copy_run_request(target.request_base)
+                        )
+                    )
+                except Exception as exc:
+                    raise WorkflowEvalFailure(
+                        WorkflowEvalFailureCode.TARGET_FAILED,
+                        "Workflow target execution profile could not be revalidated "
+                        f"({type(exc).__name__}).",
+                    ) from None
+                if settled_execution_profile_fingerprint != workflow_execution_profile_fingerprint:
+                    raise WorkflowEvalFailure(
+                        WorkflowEvalFailureCode.TARGET_FAILED,
+                        "Workflow target execution profile changed during quiescence.",
+                    )
+                settled_records = await _load_workflow_eval_records(
+                    runtime_app,
+                    session_id=root_session_id,
+                    workflow_name=target.workflow_spec.name,
+                )
+                settled_attempt_id, settled_completion = _current_workflow_completion(
+                    settled_records,
+                    workflow_name=target.workflow_spec.name,
+                )
+                if (
+                    settled_attempt_id != publication_attempt_id
+                    or settled_completion.event.id != publication_completion_event_id
+                    or tuple((record.sequence, record.event.id) for record in settled_records)
+                    != publication_record_identity
+                ):
+                    raise WorkflowEvalFailure(
+                        WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+                        "Workflow evidence changed during target quiescence.",
+                    )
+                if runtime_app.session_store.supports_session_lineage:
+                    await _owned_fresh_capture_revalidation(
+                        runtime_app,
+                        capture_state,
+                        root_session_id=root_session_id,
+                        root_interrupted_observed_events=(),
+                        lifecycle=memory_attribution_read_lifecycle,
+                    )
+            except WorkflowEvalFailure as exc:
+                run_error = str(exc)
+                diagnostic_code = _WORKFLOW_FAILURE_DIAGNOSTICS[exc.code]
+                public_output = EvalTrialOutputPreviewV1.unavailable()
+                trajectory = None
+                final_output = ""
+                structured_output = None
+            except SessionTrajectoryError as exc:
+                if exc.code is SessionTrajectoryErrorCode.CLOSURE_CHANGED:
+                    run_error = "Workflow evidence changed during target quiescence."
+                    diagnostic_code = EvalTrialDiagnosticCode.WORKFLOW_COMPLETION_CONFLICT
+                else:
+                    run_error = (
+                        "Workflow evidence could not be revalidated after target quiescence "
+                        f"({exc.code.value})."
+                    )
+                    diagnostic_code = EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED
+                public_output = EvalTrialOutputPreviewV1.unavailable()
+                trajectory = None
+                final_output = ""
+                structured_output = None
+            except Exception as exc:
+                run_error = (
+                    "Workflow evidence could not be revalidated after target quiescence "
+                    f"({type(exc).__name__})."
+                )
+                diagnostic_code = EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED
+                public_output = EvalTrialOutputPreviewV1.unavailable()
+                trajectory = None
+                final_output = ""
+                structured_output = None
+
+    if run_error is not None:
+        assertion_results = list(
+            _blocked_assertion_results(
+                case.assertions,
+                EvalOutcome.ERROR,
+                run_error,
+                memory_attribution_evidence=memory_attribution,
+            )
+        )
+    completed_at = datetime.now(UTC)
+    status = _trial_status(run_error, None, assertion_results)
+    if diagnostic_code is None:
+        diagnostic_code = (
+            EvalTrialDiagnosticCode.PASSED
+            if status is EvalStatus.PASSED
+            else EvalTrialDiagnosticCode.ASSERTION_FAILED
+        )
+    public_data = (
+        None
+        if public_output_preview_bytes is None
+        else _EvalTrialPublicData(diagnostic_code=diagnostic_code, output=public_output)
+    )
+    return (
+        EvalTrialResult(
+            trial_number=trial_number,
+            status=status,
+            session_id=root_session_id,
+            score=_trial_score(status, assertion_results),
+            final_output=final_output if retain_final_output else "",
+            structured_output=structured_output if retain_final_output else None,
+            assertions=tuple(assertion_results),
+            error=run_error,
+            evidence_complete=trajectory is not None and not trajectory.children_incomplete,
+            events_count=0 if trajectory is None else _workflow_event_count(trajectory),
+            usage_summary=(
+                None
+                if trajectory is None or trajectory.usage_summary is None
+                else session_usage_summary_payload(trajectory.usage_summary)
+            ),
+            memory_attribution=memory_attribution,
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=_duration_ms(started_at, completed_at),
+            trajectory=trajectory if retain_trajectory else None,
+        ),
+        public_data,
+    )
+
+
 async def _run_case_once_with_public_projection(
     app: CayuApp,
     case: EvalCase,
@@ -1261,7 +2131,35 @@ async def _run_case_once_with_public_projection(
     memory_attribution_source_limit: int | None = None,
     memory_attribution_max_bytes: int | None = None,
     memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
+    run_id: str | None = None,
+    workflow_target: WorkflowEvalTarget | None = None,
+    workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
+    workflow_execution_profile_fingerprint: str | None = None,
 ) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
+    if workflow_target is not None:
+        if run_id is None:
+            raise ValueError("Workflow eval execution requires the enclosing run_id.")
+        if workflow_instance_tracker is None:
+            raise ValueError("Workflow eval execution requires an instance tracker.")
+        if workflow_execution_profile_fingerprint is None:
+            raise ValueError("Workflow eval execution requires an execution-profile identity.")
+        return await _run_workflow_case_once_with_public_projection(
+            workflow_target,
+            case,
+            trial_number=trial_number,
+            suite_id=suite_id,
+            run_id=run_id,
+            retain_trajectory=retain_trajectory,
+            retain_final_output=retain_final_output,
+            timeout_seconds=timeout_seconds,
+            public_output_preview_bytes=public_output_preview_bytes,
+            memory_attribution_bounds=memory_attribution_bounds,
+            memory_attribution_source_limit=memory_attribution_source_limit,
+            memory_attribution_max_bytes=memory_attribution_max_bytes,
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+            workflow_instance_tracker=workflow_instance_tracker,
+            workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
+        )
     started_at = datetime.now(UTC)
     trial_request = _isolated_trial_request(case.request)
     if trial_request_transform is not None:

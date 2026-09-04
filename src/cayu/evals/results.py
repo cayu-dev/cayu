@@ -495,9 +495,17 @@ def eval_result_projection(
             origin=EvalResultOrigin.FRESH_EXECUTION,
             target=EvalResultTargetIdentityV1.from_fresh_target(validated_fresh.target),
             external_target_revision=(
-                None
-                if validated_fresh.target.external_process is None
-                else validated_fresh.target.external_process.revision
+                # Projection V2 predates workflow targets and has one optional
+                # application-owned execution-target revision slot. Workflow
+                # and external targets are mutually exclusive, so reuse that
+                # stable slot rather than changing the existing result schema.
+                validated_fresh.target.external_process.revision
+                if validated_fresh.target.external_process is not None
+                else (
+                    None
+                    if validated_fresh.target.workflow is None
+                    else validated_fresh.target.workflow.revision
+                )
             ),
             corpus_revision=run.corpus_revision,
             suite_id=run.suite_id,

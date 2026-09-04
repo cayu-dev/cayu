@@ -10,13 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType, event_payload_authority_is_runtime_generated
-from cayu.core.messages import Message, MessageRole, TextPart
+from cayu.core.messages import Message, MessageRole, TextPart, detach_message
 from cayu.evals.models import (
     Trajectory,
     TrajectoryProbes,
     _trajectory_promotion_capture_sha256,
     _validate_trajectory_record_contract,
 )
+from cayu.evals.workflow_target import WorkflowEvalOutputEvidenceV1
 from cayu.memory_attribution import MemoryAttribution, MemoryAttributionBounds
 from cayu.runtime._memory_attribution import (
     MemoryAttributionCaptureBudget,
@@ -51,7 +52,11 @@ from cayu.runtime.sessions import (
     copy_terminal_session_evidence,
     parse_session_input_contract_evidence,
 )
-from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
+from cayu.runtime.usage import (
+    SessionUsageSummary,
+    combine_session_usage_summaries,
+    session_usage_summary,
+)
 
 # Fresh evals retain descendant evidence for assertions and replay. Page the durable
 # parent index instead of assuming the first page is complete, while retaining a hard
@@ -526,6 +531,56 @@ def _trajectory_from_terminal_evidence(
         # Bind only the finalized root. Hashing each subtree while recursive
         # capture unwinds would revisit deep descendants once per ancestor.
         trajectory._promotion_capture_sha256 = _trajectory_promotion_capture_sha256(trajectory)
+    return trajectory
+
+
+def _workflow_trajectory_from_session(
+    session: Session,
+    *,
+    workflow_events: tuple[Event, ...],
+    input_messages: tuple[Message, ...],
+    output_evidence: WorkflowEvalOutputEvidenceV1,
+    final_output: str,
+    children: tuple[Trajectory, ...] = (),
+    children_incomplete: bool = False,
+    probes: TrajectoryProbes | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Trajectory:
+    """Build a workflow-root record whose durable boundary is workflow completion."""
+
+    durable_workflow_events = tuple(_trajectory_event(event) for event in workflow_events)
+    descendant_usage: list[SessionUsageSummary] = []
+
+    def visit(children_to_visit: tuple[Trajectory, ...]) -> None:
+        for child in children_to_visit:
+            if child.usage_summary is not None:
+                descendant_usage.append(child.usage_summary)
+            visit(child.children)
+
+    visit(children)
+    trajectory = Trajectory(
+        session=session,
+        events=durable_workflow_events,
+        transcript=tuple(detach_message(message) for message in input_messages),
+        usage_summary=combine_session_usage_summaries(
+            session.id,
+            tuple(descendant_usage),
+        ),
+        final_output=final_output,
+        workflow_output=output_evidence,
+        probes=TrajectoryProbes() if probes is None else probes,
+        children=children,
+        children_incomplete=children_incomplete,
+        metadata={} if metadata is None else metadata,
+    )
+    try:
+        _validate_trajectory_record_contract(trajectory)
+    except (TypeError, ValueError) as exc:
+        raise SessionTrajectoryError(
+            SessionTrajectoryErrorCode.EVIDENCE_INCONSISTENT,
+            session_id=session.id,
+            parent_session_id=session.parent_session_id,
+        ) from exc
     return trajectory
 
 

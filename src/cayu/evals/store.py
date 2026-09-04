@@ -1262,8 +1262,12 @@ class EvalRunTrialCheckpoint(_EvalStoreModel):
 
     @model_validator(mode="after")
     def validate_private_checkpoint(self) -> EvalRunTrialCheckpoint:
-        if self.result.trajectory is not None or self.result.final_output:
-            raise ValueError("Durable eval trial checkpoints cannot retain raw trajectory output.")
+        if (
+            self.result.trajectory is not None
+            or self.result.final_output
+            or self.result.structured_output is not None
+        ):
+            raise ValueError("Durable eval trial checkpoints cannot retain raw candidate output.")
         return self
 
     @property

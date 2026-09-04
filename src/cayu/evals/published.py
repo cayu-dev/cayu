@@ -177,6 +177,24 @@ _TRIAL_MESSAGE = {
         "The external target execution identity could not be proven."
     ),
     EvalTrialDiagnosticCode.EXTERNAL_TARGET_FAILED: "The external target execution failed.",
+    EvalTrialDiagnosticCode.WORKFLOW_TARGET_FAILED: "The workflow target construction failed.",
+    EvalTrialDiagnosticCode.WORKFLOW_EXECUTION_FAILED: "The workflow execution failed.",
+    EvalTrialDiagnosticCode.WORKFLOW_COMPLETION_MISSING: (
+        "The workflow completion evidence was missing."
+    ),
+    EvalTrialDiagnosticCode.WORKFLOW_COMPLETION_CONFLICT: (
+        "The workflow completion evidence was conflicting."
+    ),
+    EvalTrialDiagnosticCode.WORKFLOW_ATTEMPT_SUPERSEDED: (
+        "The workflow attempt was superseded during evaluation."
+    ),
+    EvalTrialDiagnosticCode.WORKFLOW_PROJECTOR_FAILED: ("The workflow result projector failed."),
+    EvalTrialDiagnosticCode.WORKFLOW_OUTPUT_INVALID: (
+        "The workflow result projector returned invalid output."
+    ),
+    EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED: (
+        "The workflow target did not close cleanly."
+    ),
     EvalTrialDiagnosticCode.EXECUTION_FAILED: "Trial execution failed.",
     EvalTrialDiagnosticCode.SESSION_FAILED: "The trial session failed.",
     EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED: "Terminal evidence capture failed.",
@@ -208,6 +226,14 @@ _TRIAL_CODES_BY_STATUS = {
     },
     "error": {
         EvalTrialDiagnosticCode.EXTERNAL_TARGET_FAILED,
+        EvalTrialDiagnosticCode.WORKFLOW_TARGET_FAILED,
+        EvalTrialDiagnosticCode.WORKFLOW_EXECUTION_FAILED,
+        EvalTrialDiagnosticCode.WORKFLOW_COMPLETION_MISSING,
+        EvalTrialDiagnosticCode.WORKFLOW_COMPLETION_CONFLICT,
+        EvalTrialDiagnosticCode.WORKFLOW_ATTEMPT_SUPERSEDED,
+        EvalTrialDiagnosticCode.WORKFLOW_PROJECTOR_FAILED,
+        EvalTrialDiagnosticCode.WORKFLOW_OUTPUT_INVALID,
+        EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED,
         EvalTrialDiagnosticCode.EXECUTION_FAILED,
         EvalTrialDiagnosticCode.SESSION_FAILED,
         EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED,

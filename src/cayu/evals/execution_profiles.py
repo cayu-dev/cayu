@@ -34,6 +34,7 @@ from cayu.evals.execution import (
     CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS,
     CORPUS_EXECUTION_MAX_TOTAL_INPUT_CHARS,
     CorpusTarget,
+    WorkflowEvalTarget,
 )
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.sessions import copy_run_request
@@ -436,6 +437,11 @@ def _eval_execution_target_material_identity(
             if target.external_process is None
             else target.external_process.model_dump(mode="json")
         ),
+        "workflow": (
+            target.identity().model_dump(mode="json")
+            if type(target) is WorkflowEvalTarget
+            else None
+        ),
     }
     canonical = canonical_durable_json_bytes(material, "eval execution target material")
     try:
@@ -477,8 +483,8 @@ async def prepare_eval_execution_profile(
 ) -> PreparedEvalExecutionProfile:
     """Resolve current runtime identity without admitting a session or doing governed work."""
 
-    if type(target) is not CorpusTarget:
-        raise TypeError("target must be an exact CorpusTarget.")
+    if type(target) not in {CorpusTarget, WorkflowEvalTarget}:
+        raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     if type(policy) is not EvalExecutionProfilePolicyV1:
         raise TypeError("policy must be an exact EvalExecutionProfilePolicyV1.")
     if policy.max_trials > target.limits.max_trials:

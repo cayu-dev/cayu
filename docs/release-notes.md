@@ -30,6 +30,10 @@ deployments must use one consistent public-authority alias keyring.
 
 ### What this candidate validates
 
+- Evals can execute an application-owned `WorkflowBase` as a typed target, bind
+  projected output to the current durable completion attempt, and score its
+  complete child/tool/usage closure through direct suites, portable corpora, CLI,
+  and server workers.
 - Durable interaction admission, replay, approval, model-budget settlement,
   and terminal recovery now retain bounded, attributable evidence across
   crashes and retries.
