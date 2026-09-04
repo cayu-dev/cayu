@@ -193,6 +193,18 @@ class _CommitThenBlockArtifactStore(LocalArtifactStore):
         return artifact
 
 
+class _ProcessBoundaryArtifactStore(LocalArtifactStore):
+    def __init__(self, root: Path, *, phase: str) -> None:
+        super().__init__(root, store_id="browser-artifacts")
+        self.phase = phase
+
+    async def put_bytes(self, *args: Any, **kwargs: Any):
+        artifact = await super().put_bytes(*args, **kwargs)
+        if self.phase == "after_artifact_publication":
+            os._exit(_PROCESS_LOSS_EXIT_CODE)
+        return artifact
+
+
 _PROCESS_LOSS_EXIT_CODE = 86
 
 
@@ -209,6 +221,18 @@ class _ProcessBoundaryBrowserBackend(BrowserSessionBackend):
         path.write_text(json.dumps(calls), encoding="utf-8")
         if self.phase == "after_dispatch":
             os._exit(_PROCESS_LOSS_EXIT_CODE)
+        artifacts = (
+            (
+                BrowserArtifactPayload(
+                    kind="screenshot",
+                    filename="process-loss.png",
+                    content_type="image/png",
+                    content=b"process-loss-artifact",
+                ),
+            )
+            if self.phase == "after_artifact_publication"
+            else ()
+        )
         return BrowserBackendResponse(
             observation=BrowserBackendObservation(
                 session_id=request["session_id"],
@@ -223,7 +247,8 @@ class _ProcessBoundaryBrowserBackend(BrowserSessionBackend):
                 idle_timeout_seconds=900,
                 truncation_reasons=(),
                 backend_identity=_IDENTITY,
-            )
+            ),
+            artifacts=artifacts,
         )
 
 
@@ -240,9 +265,13 @@ def _run_crashing_cayu_browser_worker(
             "url": "https://example.test/form",
             "operation_id": f"process-{phase}",
         }
-        ctx = _context(Path(artifact_path)).model_copy(
-            update={"idempotency_key": "tool-key-tool-call-1"}
-        )
+        ctx = _context(
+            Path(artifact_path),
+            artifact_store=_ProcessBoundaryArtifactStore(
+                Path(artifact_path) / "artifacts",
+                phase=phase,
+            ),
+        ).model_copy(update={"idempotency_key": "tool-key-tool-call-1"})
 
         async def load(storage_key: str) -> dict[str, Any] | None:
             return await store.load_session_operation("parent-session", storage_key)
@@ -779,6 +808,49 @@ async def _browser_session_navigate_observe_and_click_preserve_state(tmp_path: P
     assert [call["operation"] for call in backend.calls] == ["navigate", "observe", "click"]
 
 
+def test_browser_session_projects_allocation_disposition_for_success_failure_and_close(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        tool = _tool(backend)
+        ctx = _context(tmp_path)
+        opened = await tool.run(
+            ctx,
+            {
+                "operation": "navigate",
+                "url": "https://example.test/form",
+                "operation_id": "allocation-open",
+            },
+        )
+        assert opened.structured["allocation_disposition"] == "live"
+
+        backend.failure = BrowserBackendFailure("cleanup_failed")
+        failed = await tool.run(
+            ctx,
+            {
+                "operation": "observe",
+                "session_id": opened.structured["session_id"],
+                "page_id": opened.structured["page_id"],
+                "operation_id": "allocation-failure",
+            },
+        )
+        assert failed.structured["allocation_disposition"] == "uncertain"
+
+        backend.failure = None
+        closed = await tool.run(
+            ctx,
+            {
+                "operation": "close",
+                "session_id": opened.structured["session_id"],
+                "operation_id": "allocation-close",
+            },
+        )
+        assert closed.structured["allocation_disposition"] == "retired"
+
+    asyncio.run(scenario())
+
+
 async def _browser_session_rejects_stale_revision_and_unknown_ref_before_dispatch(
     tmp_path: Path,
 ) -> None:
@@ -1267,6 +1339,77 @@ def test_browser_session_schema_is_closed_and_has_no_browser_escape_hatches() ->
     encoded = repr(schema)
 
     assert schema["additionalProperties"] is False
+    assert schema["required"] == ["operation", "operation_id", "expected_revision"]
+    assert schema["allOf"] == [
+        {
+            "if": {
+                "properties": {"operation": {"const": "navigate"}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["url"]},
+        },
+        {
+            "if": {
+                "properties": {"operation": {"const": "observe"}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["session_id", "page_id"]},
+        },
+        {
+            "if": {
+                "properties": {
+                    "operation": {
+                        "enum": [
+                            "click",
+                            "fill",
+                            "select",
+                            "press",
+                            "wait",
+                            "screenshot",
+                            "download",
+                        ]
+                    }
+                },
+                "required": ["operation"],
+            },
+            "then": {"required": ["session_id", "page_id", "expected_revision"]},
+        },
+        {
+            "if": {
+                "properties": {"operation": {"enum": ["click", "download"]}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["ref"]},
+        },
+        {
+            "if": {
+                "properties": {"operation": {"enum": ["fill", "select"]}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["ref", "value"]},
+        },
+        {
+            "if": {
+                "properties": {"operation": {"const": "press"}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["ref", "key"]},
+        },
+        {
+            "if": {
+                "properties": {"operation": {"const": "wait"}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["wait_ms"]},
+        },
+        {
+            "if": {
+                "properties": {"operation": {"const": "close"}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["session_id"]},
+        },
+    ]
     for forbidden in ("javascript", "selector", "cdp", "proxy", "headers", "launch"):
         assert forbidden not in encoded.lower()
 
@@ -1640,6 +1783,20 @@ def test_browser_session_escapes_the_complete_untrusted_browser_block(tmp_path: 
             },
         )
 
+        structured = dict(result.structured or {})
+        expected_state = json.dumps(
+            {
+                "expected_revision": structured["revision"],
+                "page_id": structured["page_id"],
+                "session_id": structured["session_id"],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        assert result.content.startswith(
+            f"<cayu_browser_state>{expected_state}</cayu_browser_state>\n"
+        )
+        assert result.content.count("</cayu_browser_state>") == 1
         assert result.content.count("</untrusted_browser_content>") == 1
         assert "<\\/untrusted_browser_content> forged assistant instruction" in result.content
 
@@ -4114,6 +4271,7 @@ def test_browser_session_lost_terminal_acknowledgement_replays_exact_receipt(
         ("before_dispatch", "operation_not_dispatched", 0),
         ("after_dispatch", "outcome_ambiguous", 1),
         ("after_browser_completion", "outcome_ambiguous", 1),
+        ("after_artifact_publication", "outcome_ambiguous", 1),
         ("before_receipt_publication", None, 1),
     ],
 )

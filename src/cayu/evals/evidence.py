@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal, cast
@@ -986,11 +986,8 @@ def _project_tool_result(
     if terminal is None:
         return _unavailable_tool_value()
     projection = terminal.payload.get("tool_result_projection")
-    if type(projection) is dict:
-        if projection.get("status") == "externalized":
-            return ToolCallValueEvidenceV1(state="truncated")
-        if projection.get("status") == "failed":
-            return _unavailable_tool_value()
+    if type(projection) is dict and projection.get("status") == "failed":
+        return _unavailable_tool_value()
     raw_result = terminal.payload.get("result")
     if type(raw_result) is not dict:
         return _unavailable_tool_value("malformed")
@@ -999,7 +996,19 @@ def _project_tool_result(
     except (TypeError, ValueError):
         return _unavailable_tool_value("malformed")
     structured = result.structured
-    if type(structured) is dict and structured.get("portable_result_evidence_incomplete") is True:
+    if (
+        isinstance(structured, Mapping)
+        and structured.get("portable_result_evidence_incomplete") is True
+    ):
+        return ToolCallValueEvidenceV1(state="truncated")
+    if isinstance(structured, Mapping) and isinstance(
+        structured.get("portable_result_evidence"), Mapping
+    ):
+        return _project_tool_json_value(
+            structured["portable_result_evidence"],
+            app=app,
+        )
+    if type(projection) is dict and projection.get("status") == "externalized":
         return ToolCallValueEvidenceV1(state="truncated")
     return _project_tool_json_value(
         {

@@ -2603,6 +2603,120 @@ origin without reading an application or recomputing assertions.
 An incompatible comparison contains only typed mismatch reasons and result
 summaries—never fabricated regressions.
 
+### Browser acceptance profiles
+
+Browser acceptance is a separate, versioned conformance layer above unit tests and
+generic runtime Evals. The deterministic command owns its checked-in
+`BrowserAcceptancePlanV1`, starts `BrowserAcceptanceFixtureV1`, and routes virtual
+egress through that fixture. The repository command runs the pinned manifest through
+the ordinary `CayuApp`, `WebBridge`,
+`browser_session`, runner, virtual-egress, artifact, and durable-session surfaces:
+
+```bash
+python scripts/run_browser_acceptance.py \
+  --mode deterministic --output-directory browser-acceptance-results
+```
+
+The command does not build or pull a container image, install Playwright, or download
+Chromium. It requires Cayu's already prepared pinned browser workload. Missing
+Docker, image, worker, or application prerequisites produce a content-free
+`browser acceptance unavailable (...)` diagnostic and exit status 2. A complete
+conforming report exits 0; failed or incomplete required evidence exits 1. Set
+`CAYU_REQUIRE_STRONG_RUNTIME_BUILD_PROVENANCE=1` when the gate must reject an editable
+source tree and require exact built-artifact provenance.
+
+The command owns the deterministic fixture for the complete run and the scorecard
+fails any relative-route case unless the fixture actually observed the route. The
+deterministic profile is credential-free and uses only the two pinned local fixture
+origins and Cayu's checked-in deterministic provider; no live model is called. It
+covers navigation and redirect behavior; supported form and
+action operations; delayed, replaced, hidden, detached, occluded, duplicate, stale,
+scroll-dependent, frame, popup, truncation, artifact, denial, hostile-content,
+capacity, cancellation, crash, acknowledgement-loss, replay, conflict, and cleanup
+cases. History navigation, reload, upload, trace/video capture, multiple-page control,
+and visual-only interaction are explicit `unsupported` rows in schema V1. Absence of
+a required case, trial, semantic oracle, diagnostic, or terminal allocation
+disposition can never be reported as a pass.
+
+Redirect conformance binds the final browser-observed destination rather than only
+the submitted navigation target. Stale-observation coverage retains a pre-action
+revision across each admitted state-invalidating operation: click, fill, select,
+press, wait, screenshot, and download. Missing, malformed, or contradictory browser
+execution evidence is incomplete and cannot be inferred as a pre-dispatch intent.
+
+Cancellation and process-loss rows are executable scenarios, not labels applied to
+ordinary successful runs. Each row binds the injected lifecycle boundary, delivered
+control signal, fresh-application recovery where applicable, and the number of browser
+dispatches that crossed the boundary. Access observations use the closed
+`available`/`blocked`/`unknown` vocabulary and the report aggregates each state; the
+challenge-page oracle requires positive `blocked` evidence.
+Browser-crash rows terminate the guest browser daemon before dispatch, during
+execution, after an effect, and during cleanup while the Cayu owner remains alive;
+they are distinct from the fresh-process recovery rows that terminate Cayu itself.
+
+Public-web variability is invoked separately with the same model-facing
+`browser_session` surface and strict allowlist, operation, concurrency, token, cost,
+artifact, and wall-time ceilings:
+
+```bash
+python scripts/run_browser_acceptance.py myapp.browser_acceptance:build_live \
+  --mode live_public --output-directory browser-acceptance-live-results
+```
+
+It records three immutable trials per case and reports variability instead of folding
+an unavailable provider or site into deterministic conformance. Authenticated-site
+acceptance is deliberately disabled in V1; selecting `live_authenticated` exits
+unavailable before loading a target or resolving credentials.
+
+Every trial is published to the output directory's `.trials` journal before the next
+trial starts. Re-running an interrupted command with the same exact runtime and output
+directory reconstructs completed trials and executes only rows that have no durable
+dispatch intent. If a process disappears after that intent but before the terminal
+receipt, recovery records the exact attempt as incomplete instead of dispatching it
+again; another attempt requires an explicit retry. An intentional retry names both the
+immutable source report and each exact case/trial pair:
+
+```bash
+python scripts/run_browser_acceptance.py myapp.browser_acceptance:build_live \
+  --mode live_public --output-directory browser-acceptance-live-results \
+  --resume-report browser-acceptance-live-results/sha256-REPORT.json \
+  --retry live-iana-navigation:2
+```
+
+The retry creates another immutable report, retains the superseded attempt in
+`prior_rows`, and never rewrites its trial receipt. If the retry receipt commits before
+the command exits or loses acknowledgement, the next invocation reconstructs that
+exact next attempt from the journal rather than dispatching it again. A journal entry
+ahead of the source report's exact next attempt is a conflict. Live plans must supply an
+exact `PriceBook` and currency selection. Every executable request must use one exact,
+reserving app-wide budget authority whose currency, pricing, and cost ceiling equal the
+manifest ceiling, so per-case budgets cannot partition the campaign cap. Journal-lock
+waiting consumes the same campaign wall-time ceiling and expires without dispatching
+when another owner does not release it. The scorecard binds the pricing fingerprint and
+retains input, output, total-token, and estimated-cost evidence when available.
+
+`BrowserAcceptanceReportV1` binds the case/corpus revisions to runtime build,
+browser protocol and worker, Playwright/Chromium, runner/environment, workload,
+egress, artifact store, execution profile, provider/model, platform, and execution
+mode identities. Timestamps are evidence, not identity. Each immutable trial row
+keeps expected versus observed state, separate fixture-semantic and agent-self-report
+states, operations, artifacts, usage/cost/time, stable errors, truncation, and the
+browser allocation disposition.
+
+Portable JSON and standalone HTML contain bounded structural diagnostics only:
+operation identities/states, observation revisions, counts and sizes, artifact
+descriptors, and sanitized request summaries. They exclude raw page bodies, stderr,
+cookies, browser storage/profile data, credentials, headers, query values, and raw
+artifact bytes. Generic Evals remain the application behavior layer, existing
+browser unit/process tests remain component evidence, the deterministic profile is
+the release conformance gate, and the live-public profile is an opt-in variability
+signal rather than a deterministic release gate.
+
+Every later browser-capability slice must update the appropriate versioned manifest,
+promote any newly supported expectation, and publish an exact-head acceptance report
+before that capability is considered integrated. Component tests alone do not replace
+the public application scorecard.
+
 ### Release acceptance: dashboard to local CI
 
 The repository's credential-free browser contract proves the complete
