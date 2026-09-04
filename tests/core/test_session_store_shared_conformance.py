@@ -21,6 +21,7 @@ from tests.core._execution_profile_fixtures import (
     create_admitted_session,
     interrupt_and_release_test_invocation,
     profiled_session_identity,
+    versioned_test_provider_identity,
 )
 from tests.core._session_operation_fault_harness import (
     MatchPolicy,
@@ -293,7 +294,10 @@ from cayu.runtime.checkpoints import (
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
-from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+    execution_profile_from_session_metadata,
+)
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.runtime.provider_operations import (
@@ -312,15 +316,18 @@ from cayu.runtime.provider_operations import (
 from cayu.runtime.sessions import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
     PersistedEventSideEffectDelivery,
     QueuedDispatchTerminalReceiptQuery,
+    QueuedInteractionProfileHandoff,
     _checkpoint_with_session_run_operation,
     _deactivate_session_run_fence,
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
     fork_session_invocation,
+    queued_interaction_profile_handoff_evidence,
 )
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -25427,6 +25434,302 @@ def test_session_store_conformance_interaction_completion_replays_queue_decision
             assert replayed.status_changed is False
             assert replayed.session == publication.session
         finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_atomically_rebinds_queued_next_turn(
+    session_store_case,
+) -> None:
+    class BlockingQueuedHandoffProvider(ModelProvider):
+        name = "atomic-queued-handoff"
+
+        def __init__(self) -> None:
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.second_started = asyncio.Event()
+            self.release_second = asyncio.Event()
+            self.requests: list[ModelRequest] = []
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return versioned_test_provider_identity(self)
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+                text = "first"
+            else:
+                self.second_started.set()
+                await self.release_second.wait()
+                text = "second"
+            yield ModelStreamEvent.text_delta(text)
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        provider = BlockingQueuedHandoffProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = f"atomic-queued-handoff-{session_store_case[0]}"
+
+        async def execute() -> list[Event]:
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(execute())
+        try:
+            await asyncio.wait_for(provider.first_started.wait(), timeout=10)
+            checkpoint_a = await store.load_checkpoint(session_id)
+            active_a = active_invocation_execution_profile_from_checkpoint(checkpoint_a)
+            assert active_a is not None
+            accepted = await store.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id=session_id,
+                    idempotency_key="atomic-next-turn",
+                    content="continue",
+                    delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                )
+            )
+            provider.release_first.set()
+            await asyncio.wait_for(provider.second_started.wait(), timeout=10)
+
+            checkpoint_b = await store.load_checkpoint(session_id)
+            active_b = active_invocation_execution_profile_from_checkpoint(checkpoint_b)
+            assert active_b is not None
+            assert active_b.interaction_id != active_a.interaction_id
+            assert active_b.run_epoch == active_a.run_epoch
+            assert active_b.profile == active_a.profile
+            durable = await store.load_events(session_id)
+            predecessor = next(
+                event
+                for event in durable
+                if event.type is EventType.INTERACTION_COMPLETED
+                and event.interaction_id == active_a.interaction_id
+            )
+            target_start = next(
+                event
+                for event in durable
+                if event.type is EventType.INTERACTION_STARTED
+                and event.interaction_id == active_b.interaction_id
+            )
+            delivery = next(
+                event for event in durable if event.type is EventType.SESSION_MESSAGE_DELIVERED
+            )
+            handoff = QueuedInteractionProfileHandoff(
+                expected_session_instance_id=(await store.load(session_id)).instance_id,  # type: ignore[union-attr]
+                predecessor_settlement_event_id=predecessor.id,
+                expected_active_profile=active_a,
+                target_active_profile=active_b,
+            )
+            assert target_start.payload[
+                QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY
+            ] == queued_interaction_profile_handoff_evidence(handoff)
+            assert delivery.interaction_id == active_b.interaction_id
+            assert accepted.message.status is SessionMessageQueueStatus.QUEUED
+
+            with pytest.raises(
+                ValueError,
+                match="start evidence requires its atomic profile handoff",
+            ):
+                await store.deliver_queued_session_messages(
+                    session_id,
+                    include_on_idle=True,
+                    delivery_id=active_b.interaction_id,
+                    interaction_id=active_b.interaction_id,
+                    interaction_started_event=target_start,
+                )
+            replay = await store.deliver_queued_session_messages(
+                session_id,
+                include_on_idle=True,
+                delivery_id=active_b.interaction_id,
+                interaction_id=active_b.interaction_id,
+                interaction_started_event=target_start,
+                profile_handoff=handoff,
+            )
+            assert replay.replayed is True
+            assert [message.queue_id for message in replay.messages] == [accepted.message.queue_id]
+            assert replay.active_invocation_profile == active_b
+
+            provider.release_second.set()
+            emitted = await asyncio.wait_for(run_task, timeout=10)
+            assert emitted[-1].type is EventType.SESSION_COMPLETED
+
+            store = await _reopen_store(session_store_case, store)
+            persisted_checkpoint = await store.load_checkpoint(session_id)
+            assert (
+                active_invocation_execution_profile_from_checkpoint(persisted_checkpoint)
+                == active_b
+            )
+        finally:
+            provider.release_first.set()
+            provider.release_second.set()
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_repairs_exact_legacy_queued_handoff(
+    session_store_case,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingLegacyHandoffProvider(ModelProvider):
+        name = "legacy-queued-handoff"
+
+        def __init__(self) -> None:
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.second_started = asyncio.Event()
+            self.release_second = asyncio.Event()
+            self.calls = 0
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return versioned_test_provider_identity(self)
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            else:
+                self.second_started.set()
+                await self.release_second.wait()
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_type = type(store)
+        original_delivery = store_type.deliver_queued_session_messages
+
+        async def legacy_split_delivery(self, session_id: str, **kwargs):
+            handoff = kwargs.get("profile_handoff")
+            started = kwargs.get("interaction_started_event")
+            if handoff is None or started is None:
+                return await original_delivery(self, session_id, **kwargs)
+            payload = copy.deepcopy(started.payload)
+            payload.pop(QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY)
+            legacy_started = started.model_copy(update={"payload": payload}, deep=True)
+            legacy_kwargs = {
+                **kwargs,
+                "interaction_started_event": legacy_started,
+                "profile_handoff": None,
+            }
+            batch = await original_delivery(self, session_id, **legacy_kwargs)
+            return batch.model_copy(
+                update={"active_invocation_profile": handoff.target_active_profile},
+                deep=True,
+            )
+
+        monkeypatch.setattr(
+            store_type,
+            "deliver_queued_session_messages",
+            legacy_split_delivery,
+        )
+        provider = BlockingLegacyHandoffProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = f"legacy-queued-handoff-{session_store_case[0]}"
+
+        async def execute() -> list[Event]:
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(execute())
+        try:
+            await asyncio.wait_for(provider.first_started.wait(), timeout=10)
+            active_a = active_invocation_execution_profile_from_checkpoint(
+                await store.load_checkpoint(session_id)
+            )
+            assert active_a is not None
+            await store.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id=session_id,
+                    idempotency_key="legacy-next-turn",
+                    content="continue",
+                    delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                )
+            )
+            provider.release_first.set()
+            await asyncio.wait_for(provider.second_started.wait(), timeout=10)
+
+            session = await store.load(session_id)
+            checkpoint = await store.load_checkpoint(session_id)
+            assert session is not None
+            assert active_invocation_execution_profile_from_checkpoint(checkpoint) == active_a
+            starts = [
+                event
+                for event in await store.load_events(session_id)
+                if event.type is EventType.INTERACTION_STARTED
+            ]
+            assert len(starts) == 2
+            assert QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY not in starts[1].payload
+
+            fresh = CayuApp(session_store=store, enable_logging=False)
+            fresh.register_provider(provider, default=True)
+            fresh.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            repaired = await fresh._validate_execution_profile_continuation_for_recovery(
+                session,
+                checkpoint,
+                fresh._get_registered_agent(session.agent_name),
+                fresh._get_registered_provider(session.provider_name),
+                budget_policy=None,
+            )
+            assert repaired.interaction_id == starts[1].interaction_id
+            assert (
+                active_invocation_execution_profile_from_checkpoint(
+                    await store.load_checkpoint(session_id)
+                )
+                == repaired
+            )
+
+            provider.release_second.set()
+            emitted = await asyncio.wait_for(run_task, timeout=10)
+            assert emitted[-1].type is EventType.SESSION_COMPLETED
+            monkeypatch.setattr(
+                store_type,
+                "deliver_queued_session_messages",
+                original_delivery,
+            )
+            store = await _reopen_store(session_store_case, store)
+            assert (
+                active_invocation_execution_profile_from_checkpoint(
+                    await store.load_checkpoint(session_id)
+                )
+                == repaired
+            )
+        finally:
+            provider.release_first.set()
+            provider.release_second.set()
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
             await _close_store(store)
 
     asyncio.run(run())

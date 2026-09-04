@@ -8882,6 +8882,24 @@ class ModelStepRun:
 
         return self._execution_profile
 
+    def rebind_queued_interaction(self, invocation_context: InvocationContext) -> None:
+        """Install the store-authenticated same-epoch context before the next step."""
+
+        current = self._invocation_context
+        if (
+            current is None
+            or type(invocation_context) is not InvocationContext
+            or current.binding.session_id != invocation_context.binding.session_id
+            or current.binding.session_instance_id != invocation_context.binding.session_instance_id
+            or current.binding.run_epoch != invocation_context.binding.run_epoch
+            or current.profile is not invocation_context.profile
+            or current.tool_capability_ceiling != invocation_context.tool_capability_ceiling
+            or current.binding.interaction_id == invocation_context.binding.interaction_id
+        ):
+            raise ValueError("Model-step queued handoff lost frozen invocation authority.")
+        self._invocation_context = invocation_context
+        self._interaction_id = invocation_context.binding.interaction_id
+
     def _resolve_tool_exposure(
         self,
         *,

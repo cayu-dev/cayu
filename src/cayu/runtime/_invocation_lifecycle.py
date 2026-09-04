@@ -756,6 +756,70 @@ class InvocationContext:
             recovery_claim_id=self.recovery_claim_id,
         )
 
+    def with_queued_interaction(
+        self,
+        session: Session,
+        *,
+        active_profile: ActiveInvocationExecutionProfile,
+    ) -> InvocationContext:
+        """Transfer this exact same-epoch authority to an atomically started turn."""
+
+        if type(session) is not Session:
+            raise TypeError("session must be a Session.")
+        if type(active_profile) is not ActiveInvocationExecutionProfile:
+            raise TypeError("active_profile must be an ActiveInvocationExecutionProfile.")
+        binding = self.binding
+        if not isinstance(binding, AdmittedInvocationBinding):
+            raise ValueError("Queued interaction handoff requires admitted invocation authority.")
+        if (
+            session.id != binding.session_id
+            or session.instance_id != binding.session_instance_id
+            or session.run_epoch != binding.run_epoch
+            or session.agent_name != binding.agent_name
+            or session.provider_name != binding.provider_name
+            or session.model != binding.model
+            or session.runtime_name != binding.runtime_name
+            or session.runtime_version != binding.runtime_version
+            or session.runtime_build_provenance != binding.runtime_build_provenance
+            or session.environment_name != binding.environment_name
+            or active_profile.session_id != session.id
+            or active_profile.run_epoch != session.run_epoch
+            or active_profile.profile != self.profile
+            or active_profile.interaction_id == binding.interaction_id
+        ):
+            raise ValueError("Queued interaction handoff conflicts with invocation authority.")
+        rebound_active_profile = active_profile.model_copy(
+            update={"profile": self.profile},
+            deep=False,
+        )
+        return _authenticated_invocation_context(
+            active_profile=rebound_active_profile,
+            binding=AdmittedInvocationBinding(
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                interaction_id=active_profile.interaction_id,
+                run_epoch=session.run_epoch,
+                agent_name=session.agent_name,
+                provider_name=session.provider_name,
+                model=session.model,
+                runtime_name=session.runtime_name,
+                runtime_version=session.runtime_version,
+                environment_name=session.environment_name,
+                runtime_build_provenance=session.runtime_build_provenance,
+            ),
+            validated_profile=self.profile,
+            registered_agent=self.registered_agent,
+            registered_provider=self.registered_provider,
+            registered_environment=self.registered_environment,
+            runtime_hooks=self.runtime_hooks,
+            loop_policies=self.loop_policies,
+            request_loop_policies=self.request_loop_policies,
+            budget_policy=self.budget_policy,
+            tool_capability_ceiling=self.tool_capability_ceiling,
+            targeted_tool_grants=self.targeted_tool_grants,
+            recovery_claim_id=self.recovery_claim_id,
+        )
+
     def without_recovery_claim(self) -> InvocationContext:
         """Drop a settled recovery claim while preserving invocation authority."""
 

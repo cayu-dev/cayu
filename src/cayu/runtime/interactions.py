@@ -123,6 +123,10 @@ class InteractionSummaryEvidence(BaseModel):
         pattern=r"^sha256:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
+    queued_interaction_profile_handoff: dict[str, str | int] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("token_usage", mode="before")
     @classmethod

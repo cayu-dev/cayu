@@ -1613,7 +1613,30 @@ wait for the next safe boundary instead of extending the current batch forever.
 
 Delivery is one store transaction: append the user message to the durable
 transcript, mark its queue row delivered, and append
-`session.message.delivered`. Queue acceptance carries a private, runtime-owned
+`session.message.delivered`. When delivery starts a successor interaction in
+the same run epoch, that transaction also compare-and-swaps the active
+invocation profile from the terminal predecessor interaction to the exact new
+interaction and persists `interaction.started` with the handoff identity. The
+profile, provider/model target, run epoch, tool ceiling, transcript boundary,
+and provider-stage authority do not change. Delivery acknowledgement replay
+must return the same target profile; it cannot re-evaluate the queue or split
+the interaction start from its checkpoint authority. A custom store that
+overrides delivery must explicitly redeclare
+`queued_interaction_profile_handoff_version = 1` on that concrete
+implementation and provide the same atomic comparison, receipt, and replay
+semantics; inherited or missing capability fails closed before delivery.
+
+Historical stores can contain the older split state in which the predecessor
+is terminal and the queued successor and provider stage are durable while the
+checkpoint still names the predecessor. Fresh-process recovery repairs only an
+exact delivery receipt plus the predecessor's queue-conditional terminal
+receipt and the successor's active, dispatched provider stage bound to the same
+profile fingerprint. The store rechecks all of that evidence and the A-to-B
+checkpoint CAS in one transaction. Missing, stale, conflicting, or undispatched
+stage evidence fails closed; recovery never infers authority from an open
+interaction alone.
+
+Queue acceptance carries a private, runtime-owned
 contract for the prepared message and records whether workload-secret redaction
 changed it. Delivery carries a second private contract that binds the same
 canonical digest to its exact transcript index. A reconstruction must match

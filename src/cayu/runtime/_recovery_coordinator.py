@@ -3856,6 +3856,28 @@ class RecoveryCoordinator:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> None:
+        if invocation_context is not None:
+            # A nested continuation can atomically consume a queued message and
+            # transfer the same run epoch from interaction A to interaction B.
+            # Recovery entrypoints retain their original local A context, so
+            # derive cleanup authority from the durable checkpoint before any
+            # owner/fence cleanup observes it.  ``with_queued_interaction``
+            # authenticates the complete stable profile and collaborator set;
+            # incompatible durable state remains fail-closed below.
+            current_session = await self._session_store.load(session_id)
+            current_checkpoint = await self._session_store.load_checkpoint(session_id)
+            current_profile = active_invocation_execution_profile_from_checkpoint(
+                current_checkpoint
+            )
+            if (
+                current_session is not None
+                and current_profile is not None
+                and current_profile != invocation_context.active_profile
+            ):
+                invocation_context = invocation_context.with_queued_interaction(
+                    current_session,
+                    active_profile=current_profile,
+                )
         cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
         if stream is not None:
             cleanup_steps.append(("nested stream close", stream.aclose))

@@ -145,6 +145,7 @@ from cayu.runtime._environment_allocation import (
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import (
+    AdmittedInvocationBinding,
     InvocationContext,
     ReleaseInvocationCommand,
     _release_invocation_command_with_cleanup_authority,
@@ -453,25 +454,51 @@ def _retain_cleanup_invocation_context(
     current = owner.invocation_context
     if current is invocation_context:
         return
-    if current is not None and (
-        current.active_profile != invocation_context.active_profile
-        or current.binding != invocation_context.binding
-        or current.profile is not invocation_context.profile
-        or current.registered_agent is not invocation_context.registered_agent
-        or current.registered_provider is not invocation_context.registered_provider
-        or current.runtime_hooks is not invocation_context.runtime_hooks
-        or current.loop_policies is not invocation_context.loop_policies
-        or current.request_loop_policies is not invocation_context.request_loop_policies
-        or current.budget_policy is not invocation_context.budget_policy
-        or current.tool_capability_ceiling != invocation_context.tool_capability_ceiling
-        or current.targeted_tool_grants != invocation_context.targeted_tool_grants
-    ):
-        raise RuntimeError("Environment cleanup owner invocation context changed.")
     if current is not None:
         if current.registered_environment is not owner.registered_environment:
             raise RuntimeError("Environment cleanup owner lost its retained environment context.")
-        if invocation_context.registered_environment is owner.registered_environment:
-            owner.invocation_context = invocation_context
+        if invocation_context.registered_environment is not owner.registered_environment:
+            raise RuntimeError("Environment cleanup context does not own the retained environment.")
+        stable_authority_changed = (
+            current.profile is not invocation_context.profile
+            or current.registered_agent is not invocation_context.registered_agent
+            or current.registered_provider is not invocation_context.registered_provider
+            or current.runtime_hooks is not invocation_context.runtime_hooks
+            or current.loop_policies is not invocation_context.loop_policies
+            or current.request_loop_policies is not invocation_context.request_loop_policies
+            or current.budget_policy is not invocation_context.budget_policy
+            or current.tool_capability_ceiling != invocation_context.tool_capability_ceiling
+            or current.targeted_tool_grants != invocation_context.targeted_tool_grants
+            or current.recovery_claim_id != invocation_context.recovery_claim_id
+        )
+        exact_queued_successor = (
+            isinstance(current.binding, AdmittedInvocationBinding)
+            and isinstance(invocation_context.binding, AdmittedInvocationBinding)
+            and current.binding.interaction_id != invocation_context.binding.interaction_id
+            and replace(
+                current.binding,
+                interaction_id=invocation_context.binding.interaction_id,
+            )
+            == invocation_context.binding
+            and current.active_profile.interaction_id
+            != invocation_context.active_profile.interaction_id
+            and current.active_profile.model_copy(
+                update={
+                    "interaction_id": invocation_context.active_profile.interaction_id,
+                },
+                deep=False,
+            )
+            == invocation_context.active_profile
+        )
+        if stable_authority_changed or (
+            (
+                current.active_profile != invocation_context.active_profile
+                or current.binding != invocation_context.binding
+            )
+            and not exact_queued_successor
+        ):
+            raise RuntimeError("Environment cleanup owner invocation context changed.")
+        owner.invocation_context = invocation_context
         return
     if invocation_context.registered_environment is not owner.registered_environment:
         raise RuntimeError("Environment cleanup context does not own the retained environment.")

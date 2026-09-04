@@ -2214,6 +2214,7 @@ class SessionMessageDeliveryBatch(BaseModel):
     eligible_through: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     has_more: StrictBool = False
     replayed: StrictBool = False
+    active_invocation_profile: ActiveInvocationExecutionProfile | None = None
 
     @field_validator("messages", mode="before")
     @classmethod
@@ -2233,6 +2234,78 @@ class SessionMessageDeliveryBatch(BaseModel):
                 raise ValueError("delivery_id is required.")
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("active_invocation_profile", mode="before")
+    @classmethod
+    def copy_active_invocation_profile(
+        cls,
+        value: object,
+    ) -> ActiveInvocationExecutionProfile | None:
+        if value is None:
+            return None
+        if isinstance(value, ActiveInvocationExecutionProfile):
+            value = value.model_dump(mode="json")
+        return ActiveInvocationExecutionProfile.model_validate(value)
+
+
+class QueuedInteractionProfileHandoff(BaseModel):
+    """Exact authority for one same-epoch queued interaction handoff."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = 1
+    expected_session_instance_id: str
+    predecessor_settlement_event_id: str
+    expected_active_profile: ActiveInvocationExecutionProfile
+    target_active_profile: ActiveInvocationExecutionProfile
+
+    @field_validator("expected_session_instance_id", "predecessor_settlement_event_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_handoff(self) -> QueuedInteractionProfileHandoff:
+        expected = self.expected_active_profile
+        target = self.target_active_profile
+        if (
+            expected.session_id != target.session_id
+            or expected.run_epoch != target.run_epoch
+            or expected.profile != target.profile
+        ):
+            raise ValueError(
+                "Queued interaction handoff must retain the exact session, epoch, and profile."
+            )
+        if expected.interaction_id == target.interaction_id:
+            raise ValueError("Queued interaction handoff requires a new interaction.")
+        return self
+
+
+QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY = "queued_interaction_profile_handoff"
+
+
+def queued_interaction_profile_handoff_evidence(
+    handoff: QueuedInteractionProfileHandoff,
+) -> dict[str, Any]:
+    """Return bounded public evidence that binds a delivery receipt to its CAS."""
+
+    copied = QueuedInteractionProfileHandoff.model_validate(handoff)
+    expected = copied.expected_active_profile
+    target = copied.target_active_profile
+    return {
+        "schema_version": 1,
+        "session_instance_id": copied.expected_session_instance_id,
+        "run_epoch": expected.run_epoch,
+        "predecessor_interaction_id": expected.interaction_id,
+        "predecessor_settlement_event_id": copied.predecessor_settlement_event_id,
+        "target_interaction_id": target.interaction_id,
+        "execution_profile_fingerprint": target.profile.fingerprint,
+    }
 
 
 class InteractionTransitionResult(BaseModel):
@@ -9452,6 +9525,7 @@ class SessionStore(ABC):
     # delivering a command they cannot interpret atomically.
     invocation_lifecycle_command_version: ClassVar[int | None] = None
     terminal_interaction_publication_version: ClassVar[int | None] = None
+    queued_interaction_profile_handoff_version: ClassVar[int | None] = None
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
     supports_atomic_session_operation_initialization: ClassVar[bool] = False
@@ -10532,6 +10606,7 @@ class SessionStore(ABC):
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
+        profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> SessionMessageDeliveryBatch:
         """Atomically append and mark one bounded queue batch delivered.
 
@@ -10539,6 +10614,24 @@ class SessionStore(ABC):
         reconstruction. Omitting it creates a one-shot identity for direct store
         callers and returns that identity in the result.
         """
+
+    async def repair_queued_interaction_profile_handoff(
+        self,
+        session_id: str,
+        *,
+        interaction_started_event: Event,
+        profile_handoff: QueuedInteractionProfileHandoff,
+    ) -> ActiveInvocationExecutionProfile:
+        """Repair one historical split delivery from exact provider-stage evidence.
+
+        This compatibility seam is intentionally fail-closed for custom stores.
+        New deliveries must bind the target profile in
+        :meth:`deliver_queued_session_messages` instead.
+        """
+
+        raise NotImplementedError(
+            "This SessionStore does not support historical queued handoff repair."
+        )
 
     @abstractmethod
     async def publish_checkpoint_and_events(
@@ -12011,6 +12104,7 @@ class _InMemoryMessageDeliveryRecord:
     limit: int
     interaction_id: str | None
     interaction_started_event: Event | None
+    profile_handoff: QueuedInteractionProfileHandoff | None
     batch: SessionMessageDeliveryBatch
 
 
@@ -12030,6 +12124,7 @@ class InMemorySessionStore(SessionStore):
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
     terminal_interaction_publication_version: ClassVar[int | None] = 1
+    queued_interaction_profile_handoff_version: ClassVar[int | None] = 1
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
@@ -16359,6 +16454,7 @@ class InMemorySessionStore(SessionStore):
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
+        profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> SessionMessageDeliveryBatch:
         session_id = require_clean_nonblank(session_id, "session_id")
         delivery_id = (
@@ -16374,6 +16470,13 @@ class InMemorySessionStore(SessionStore):
             session_id,
             interaction_id,
             interaction_started_event,
+        )
+        profile_handoff = _copy_queued_interaction_profile_handoff(
+            session_id,
+            delivery_id,
+            interaction_id,
+            interaction_started_event,
+            profile_handoff,
         )
         eligible_through = _validate_message_delivery_eligible_through(eligible_through)
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
@@ -16393,11 +16496,66 @@ class InMemorySessionStore(SessionStore):
                     limit=limit,
                     interaction_id=interaction_id,
                     interaction_started_event=interaction_started_event,
+                    profile_handoff=profile_handoff,
                 )
-                return existing_delivery.batch.model_copy(
+                replayed_batch = existing_delivery.batch.model_copy(
                     update={"replayed": True},
                     deep=True,
                 )
+                if replayed_batch.messages and profile_handoff is not None:
+                    operation_records = self._session_operation_records.get(session_id, {})
+                    receipt_record = operation_records.get(
+                        _interaction_transition_storage_key(
+                            profile_handoff.predecessor_settlement_event_id
+                        )
+                    )
+                    if receipt_record is None:
+                        raise SessionRunFenced(
+                            "Queued interaction handoff lost its predecessor settlement receipt."
+                        )
+                    active_model_stage: ActiveModelCompletionStage | None = None
+                    stage_dispatch: ModelCompletionStageDispatch | None = None
+                    active_record = operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+                    if active_record is not None:
+                        marker = _reconstruct_active_model_completion_stage_record(
+                            active_record,
+                            session_id=session_id,
+                        )
+                        _, _, preparation_key, terminal_key = (
+                            _model_completion_stage_storage_identity(
+                                session_id,
+                                marker.stage_id,
+                            )
+                        )
+                        active_model_stage = _reconstruct_active_model_completion_stage(
+                            active_record,
+                            operation_records.get(preparation_key),
+                            operation_records.get(terminal_key),
+                            session_id=session_id,
+                        )
+                        dispatch_record = operation_records.get(
+                            _model_completion_stage_dispatch_storage_key(marker.stage_id)
+                        )
+                        if dispatch_record is not None:
+                            stage_dispatch = _reconstruct_model_completion_stage_dispatch(
+                                dispatch_record,
+                                session_id=session_id,
+                                stage_id=marker.stage_id,
+                                storage_key=_model_completion_stage_dispatch_storage_key(
+                                    marker.stage_id
+                                ),
+                            )
+                    repaired_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
+                        session,
+                        self._checkpoints.get(session_id),
+                        profile_handoff,
+                        settlement_record=receipt_record,
+                        replayed_delivery=True,
+                        active_model_stage=active_model_stage,
+                        stage_dispatch=stage_dispatch,
+                    )
+                    self._store_checkpoint_unlocked(session_id, repaired_checkpoint)
+                return replayed_batch
             if session.status != SessionStatus.RUNNING:
                 raise SessionStatusConflict(
                     "Queued session messages may be delivered only while running."
@@ -16441,12 +16599,32 @@ class InMemorySessionStore(SessionStore):
                         limit=limit,
                         interaction_id=interaction_id,
                         interaction_started_event=interaction_started_event,
+                        profile_handoff=profile_handoff,
                         batch=batch,
                     )
                 )
                 return batch
             if selected_key is None:
                 raise RuntimeError("Queued message selection lost its pending index.")
+
+            rebound_checkpoint: dict[str, Any] | None = None
+            if profile_handoff is not None:
+                receipt_record = self._session_operation_records.get(session_id, {}).get(
+                    _interaction_transition_storage_key(
+                        profile_handoff.predecessor_settlement_event_id
+                    )
+                )
+                if receipt_record is None:
+                    raise SessionRunFenced(
+                        "Queued interaction handoff lost its predecessor settlement receipt."
+                    )
+                rebound_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
+                    session,
+                    self._checkpoints.get(session_id),
+                    profile_handoff,
+                    settlement_record=receipt_record,
+                    replayed_delivery=False,
+                )
 
             transcript_cursor = len(self._transcripts.get(session_id, []))
             delivered_at = self._ownership_clock()
@@ -16524,6 +16702,8 @@ class InMemorySessionStore(SessionStore):
             for updated_message in updated_messages:
                 messages_by_idempotency[updated_message.idempotency_key] = updated_message
             self._sessions[session_id] = updated_session
+            if rebound_checkpoint is not None:
+                self._store_checkpoint_unlocked(session_id, rebound_checkpoint)
 
             def has_eligible(delivery_mode: SessionMessageDeliveryMode) -> bool:
                 pending = self._pending_session_messages.get((session_id, delivery_mode))
@@ -16539,6 +16719,9 @@ class InMemorySessionStore(SessionStore):
                 interaction_id=interaction_id,
                 eligible_through=boundary,
                 has_more=has_more,
+                active_invocation_profile=(
+                    None if profile_handoff is None else profile_handoff.target_active_profile
+                ),
             )
             self._session_message_delivery_records[delivery_id] = _InMemoryMessageDeliveryRecord(
                 session_id=session_id,
@@ -16547,9 +16730,70 @@ class InMemorySessionStore(SessionStore):
                 limit=limit,
                 interaction_id=interaction_id,
                 interaction_started_event=interaction_started_event,
+                profile_handoff=profile_handoff,
                 batch=batch,
             )
             return batch
+
+    async def repair_queued_interaction_profile_handoff(
+        self,
+        session_id: str,
+        *,
+        interaction_started_event: Event,
+        profile_handoff: QueuedInteractionProfileHandoff,
+    ) -> ActiveInvocationExecutionProfile:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_started_event, profile_handoff = (
+            _copy_historical_queued_interaction_profile_handoff(
+                session_id,
+                interaction_started_event,
+                profile_handoff,
+            )
+        )
+        target = profile_handoff.target_active_profile
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            delivery = self._session_message_delivery_records.get(target.interaction_id)
+            if (
+                delivery is None
+                or delivery.session_id != session_id
+                or delivery.interaction_id != target.interaction_id
+                or delivery.interaction_started_event != interaction_started_event
+                or not delivery.batch.messages
+                or (
+                    delivery.profile_handoff is not None
+                    and delivery.profile_handoff != profile_handoff
+                )
+            ):
+                raise SessionRunFenced(
+                    "Historical queued interaction handoff lacks its exact delivery receipt."
+                )
+            operation_records = self._session_operation_records.get(session_id, {})
+            settlement_record = operation_records.get(
+                _interaction_transition_storage_key(profile_handoff.predecessor_settlement_event_id)
+            )
+            if settlement_record is None:
+                raise SessionRunFenced(
+                    "Historical queued interaction handoff lost its predecessor settlement."
+                )
+            active_model_stage, stage_dispatch = _historical_queued_handoff_stage_from_records(
+                session_id,
+                operation_records,
+            )
+            repaired_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
+                session,
+                self._checkpoints.get(session_id),
+                profile_handoff,
+                settlement_record=settlement_record,
+                replayed_delivery=True,
+                active_model_stage=active_model_stage,
+                stage_dispatch=stage_dispatch,
+            )
+            self._store_checkpoint_unlocked(session_id, repaired_checkpoint)
+            return target.model_copy(deep=True)
 
     async def publish_checkpoint_and_events(
         self,
@@ -28211,6 +28455,7 @@ def _validate_equivalent_message_delivery(
     limit: int,
     interaction_id: str | None,
     interaction_started_event: Event | None,
+    profile_handoff: QueuedInteractionProfileHandoff | None,
 ) -> None:
     if (
         existing.session_id != session_id
@@ -28219,8 +28464,219 @@ def _validate_equivalent_message_delivery(
         or existing.limit != limit
         or existing.interaction_id != interaction_id
         or existing.interaction_started_event != interaction_started_event
+        or existing.profile_handoff != profile_handoff
     ):
         raise ValueError("delivery_id was already used for a different queue delivery.")
+
+
+def _copy_queued_interaction_profile_handoff(
+    session_id: str,
+    delivery_id: str,
+    interaction_id: str | None,
+    interaction_started_event: Event | None,
+    handoff: QueuedInteractionProfileHandoff | None,
+) -> QueuedInteractionProfileHandoff | None:
+    if handoff is None:
+        if (
+            interaction_started_event is not None
+            and QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY in interaction_started_event.payload
+        ):
+            raise ValueError(
+                "Queued interaction start evidence requires its atomic profile handoff."
+            )
+        return None
+    copied = QueuedInteractionProfileHandoff.model_validate(
+        handoff.model_dump(mode="json")
+        if isinstance(handoff, QueuedInteractionProfileHandoff)
+        else handoff
+    )
+    if (
+        copied.expected_active_profile.session_id != session_id
+        or copied.target_active_profile.session_id != session_id
+        or interaction_id != copied.target_active_profile.interaction_id
+        or interaction_started_event is None
+        or interaction_started_event.interaction_id != interaction_id
+        or delivery_id != interaction_id
+        or interaction_started_event.payload.get(QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY)
+        != queued_interaction_profile_handoff_evidence(copied)
+    ):
+        raise ValueError(
+            "Queued interaction profile handoff conflicts with its first delivery identity."
+        )
+    return copied
+
+
+def _copy_historical_queued_interaction_profile_handoff(
+    session_id: str,
+    interaction_started_event: Event,
+    handoff: QueuedInteractionProfileHandoff,
+) -> tuple[Event, QueuedInteractionProfileHandoff]:
+    """Validate repair input while accepting legacy starts without handoff evidence."""
+
+    copied_handoff = QueuedInteractionProfileHandoff.model_validate(
+        handoff.model_dump(mode="json")
+        if isinstance(handoff, QueuedInteractionProfileHandoff)
+        else handoff
+    )
+    target = copied_handoff.target_active_profile
+    copied_event = _copy_queued_interaction_started_event(
+        session_id,
+        target.interaction_id,
+        interaction_started_event,
+    )
+    if copied_event is None:
+        raise TypeError("interaction_started_event is required.")
+    has_persisted_evidence = QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY in copied_event.payload
+    persisted_evidence = copied_event.payload.get(QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY)
+    if (
+        copied_handoff.expected_active_profile.session_id != session_id
+        or target.session_id != session_id
+        or (
+            has_persisted_evidence
+            and persisted_evidence != queued_interaction_profile_handoff_evidence(copied_handoff)
+        )
+    ):
+        raise ValueError("Historical queued interaction handoff evidence conflicts.")
+    return copied_event, copied_handoff
+
+
+def _checkpoint_after_queued_interaction_profile_handoff(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    handoff: QueuedInteractionProfileHandoff,
+    *,
+    settlement_record: object,
+    replayed_delivery: bool,
+    active_model_stage: ActiveModelCompletionStage | None = None,
+    stage_dispatch: ModelCompletionStageDispatch | None = None,
+) -> dict[str, Any]:
+    """CAS A to B only from the exact queue-conditional settlement receipt."""
+
+    expected = handoff.expected_active_profile
+    target = handoff.target_active_profile
+    if (
+        session.id != expected.session_id
+        or session.instance_id != handoff.expected_session_instance_id
+        or session.run_epoch != expected.run_epoch
+    ):
+        raise SessionRunFenced("Queued interaction handoff lost its session run authority.")
+    receipt = _load_interaction_transition_receipt(settlement_record)
+    _validate_interaction_transition_receipt_authority(
+        receipt,
+        current_session=session,
+        current_checkpoint=checkpoint,
+        expected_session_instance_id=handoff.expected_session_instance_id,
+        expected_active_invocation_profile=expected,
+    )
+    if (
+        receipt.event.id != handoff.predecessor_settlement_event_id
+        or receipt.event.type is not EventType.INTERACTION_COMPLETED
+        or receipt.event.interaction_id != expected.interaction_id
+        or not receipt.only_if_no_queued_messages
+        or receipt.to_status is not SessionStatus.COMPLETED
+        or receipt.status_changed
+        or receipt.terminal_event is not None
+    ):
+        raise SessionRunFenced(
+            "Queued interaction handoff lacks the exact predecessor settlement receipt."
+        )
+    current = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    if current == target:
+        if not replayed_delivery:
+            raise SessionRunFenced("Queued interaction handoff was already committed elsewhere.")
+        assert checkpoint is not None
+        return copy_durable_json_object(checkpoint, "checkpoint")
+    if session.status is not SessionStatus.RUNNING:
+        raise SessionRunFenced("Queued interaction handoff lost its running session authority.")
+    if current != expected:
+        raise SessionRunFenced("Queued interaction handoff lost its active-profile CAS.")
+    if replayed_delivery:
+        _validate_historical_queued_interaction_profile_handoff_stage(
+            handoff,
+            active_model_stage=active_model_stage,
+            stage_dispatch=stage_dispatch,
+        )
+    return checkpoint_with_active_invocation_execution_profile(
+        checkpoint,
+        session_id=session.id,
+        interaction_id=target.interaction_id,
+        run_epoch=target.run_epoch,
+        profile=target.profile,
+        expected=expected,
+    )
+
+
+def _validate_historical_queued_interaction_profile_handoff_stage(
+    handoff: QueuedInteractionProfileHandoff,
+    *,
+    active_model_stage: ActiveModelCompletionStage | None,
+    stage_dispatch: ModelCompletionStageDispatch | None,
+) -> None:
+    """Require exact dispatched B authority before repairing a historical split."""
+
+    target = handoff.target_active_profile
+    if active_model_stage is None or stage_dispatch is None:
+        raise SessionRunFenced(
+            "Historical queued interaction handoff lacks an active dispatched target stage."
+        )
+    stage = active_model_stage.stage
+    try:
+        _validate_model_completion_stage_dispatch(stage_dispatch, stage)
+    except SessionModelCompletionStageConflict as exc:
+        raise SessionRunFenced(
+            "Historical queued interaction handoff has conflicting target dispatch evidence."
+        ) from exc
+    if (
+        stage.session_id != target.session_id
+        or stage.source_run_epoch != target.run_epoch
+        or stage.intent.get("interaction_id") != target.interaction_id
+        or _model_completion_stage_execution_profile_fingerprint(stage)
+        != target.profile.fingerprint
+        or stage_dispatch.interaction_id != target.interaction_id
+        or stage_dispatch.source_run_epoch != target.run_epoch
+        or stage_dispatch.execution_profile_fingerprint != target.profile.fingerprint
+    ):
+        raise SessionRunFenced(
+            "Historical queued interaction handoff target stage lacks exact profile authority."
+        )
+
+
+def _historical_queued_handoff_stage_from_records(
+    session_id: str,
+    operation_records: Mapping[str, Any],
+) -> tuple[ActiveModelCompletionStage | None, ModelCompletionStageDispatch | None]:
+    """Reconstruct one active stage and dispatch from a store-atomic record snapshot."""
+
+    active_record = operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+    if active_record is None:
+        return None, None
+    marker = _reconstruct_active_model_completion_stage_record(
+        active_record,
+        session_id=session_id,
+    )
+    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+        session_id,
+        marker.stage_id,
+    )
+    active = _reconstruct_active_model_completion_stage(
+        active_record,
+        operation_records.get(preparation_key),
+        operation_records.get(terminal_key),
+        session_id=session_id,
+    )
+    dispatch_key = _model_completion_stage_dispatch_storage_key(marker.stage_id)
+    dispatch_record = operation_records.get(dispatch_key)
+    dispatch = (
+        None
+        if dispatch_record is None
+        else _reconstruct_model_completion_stage_dispatch(
+            dispatch_record,
+            session_id=session_id,
+            stage_id=marker.stage_id,
+            storage_key=dispatch_key,
+        )
+    )
+    return active, dispatch
 
 
 def _validate_message_delivery_eligible_through(value: int | None) -> int | None:

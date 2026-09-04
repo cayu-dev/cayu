@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -58,7 +59,20 @@ from cayu.runtime._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.runtime.sessions import SESSION_MESSAGE_DELIVERY_BATCH_LIMIT, EventQuery
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.runtime.sessions import (
+    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
+    SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    EventQuery,
+    QueuedInteractionProfileHandoff,
+    SessionModelCompletionStageConflict,
+    SessionRunFenced,
+    _canonical_runtime_publication_digest,
+    _model_completion_stage_dispatch_storage_key,
+)
 from cayu.runtime.task_worker import run_task_worker
 from cayu.storage import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
@@ -375,6 +389,7 @@ class UndeclaredTerminalTransitionStore(InMemorySessionStore):
 class DeliveryFenceStore(InterruptTrackingStore):
     invocation_lifecycle_command_version = 1
     terminal_interaction_publication_version = 1
+    queued_interaction_profile_handoff_version = 1
 
     def __init__(
         self,
@@ -419,6 +434,7 @@ class DeliveryFenceStore(InterruptTrackingStore):
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
+        profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> SessionMessageDeliveryBatch:
         self._delivery_calls += 1
         if self._delivery_calls == self._block_on_call:
@@ -432,11 +448,13 @@ class DeliveryFenceStore(InterruptTrackingStore):
             limit=limit,
             interaction_id=interaction_id,
             interaction_started_event=interaction_started_event,
+            profile_handoff=profile_handoff,
         )
 
 
 class CommitThenLoseDeliveryAcknowledgementStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
+    queued_interaction_profile_handoff_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -454,6 +472,7 @@ class CommitThenLoseDeliveryAcknowledgementStore(InMemorySessionStore):
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
+        profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> SessionMessageDeliveryBatch:
         result = await super().deliver_queued_session_messages(
             session_id,
@@ -463,6 +482,7 @@ class CommitThenLoseDeliveryAcknowledgementStore(InMemorySessionStore):
             limit=limit,
             interaction_id=interaction_id,
             interaction_started_event=interaction_started_event,
+            profile_handoff=profile_handoff,
         )
         self.attempted_delivery_ids.append(result.delivery_id)
         if result.messages and not result.replayed and not self.lost_acknowledgement:
@@ -470,6 +490,109 @@ class CommitThenLoseDeliveryAcknowledgementStore(InMemorySessionStore):
             self.lost_delivery_id = result.delivery_id
             raise ConnectionError("queue delivery acknowledgement lost")
         return result
+
+
+class LegacySplitQueuedHandoffStore(InMemorySessionStore):
+    """Reproduce the pre-fix B delivery with an A-bound checkpoint."""
+
+    invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
+    queued_interaction_profile_handoff_version = 1
+
+    def __init__(self, *, corrupt_stage: str | None = None) -> None:
+        super().__init__()
+        self.corrupt_stage = corrupt_stage
+        self._corrupted = False
+        self._dispatch_calls = 0
+
+    async def deliver_queued_session_messages(
+        self,
+        session_id: str,
+        *,
+        include_on_idle: bool,
+        delivery_id: str | None = None,
+        eligible_through: int | None = None,
+        limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+        interaction_id: str | None = None,
+        interaction_started_event: Event | None = None,
+        profile_handoff: QueuedInteractionProfileHandoff | None = None,
+    ) -> SessionMessageDeliveryBatch:
+        if profile_handoff is None or interaction_started_event is None:
+            return await super().deliver_queued_session_messages(
+                session_id,
+                include_on_idle=include_on_idle,
+                delivery_id=delivery_id,
+                eligible_through=eligible_through,
+                limit=limit,
+                interaction_id=interaction_id,
+                interaction_started_event=interaction_started_event,
+                profile_handoff=profile_handoff,
+            )
+        legacy_payload = deepcopy(interaction_started_event.payload)
+        legacy_payload.pop(QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY)
+        legacy_started = interaction_started_event.model_copy(
+            update={"payload": legacy_payload},
+            deep=True,
+        )
+        batch = await super().deliver_queued_session_messages(
+            session_id,
+            include_on_idle=include_on_idle,
+            delivery_id=delivery_id,
+            eligible_through=eligible_through,
+            limit=limit,
+            interaction_id=interaction_id,
+            interaction_started_event=legacy_started,
+            profile_handoff=None,
+        )
+        return batch.model_copy(
+            update={
+                "active_invocation_profile": profile_handoff.target_active_profile,
+            },
+            deep=True,
+        )
+
+    async def mark_model_completion_stage_dispatched(self, session_id: str, *, stage, **kwargs):
+        dispatch = await super().mark_model_completion_stage_dispatched(
+            session_id,
+            stage=stage,
+            **kwargs,
+        )
+        self._dispatch_calls += 1
+        if self._corrupted or self._dispatch_calls != 2:
+            return dispatch
+        dispatch_key = _model_completion_stage_dispatch_storage_key(stage.stage_id)
+        async with self._lock:
+            records = self._session_operation_records[session_id]
+            if self.corrupt_stage == "missing_dispatch":
+                records.pop(dispatch_key)
+                self._corrupted = True
+            elif self.corrupt_stage == "wrong_fingerprint":
+                record = deepcopy(records[dispatch_key])
+                record["execution_profile_fingerprint"] = "0" * 64
+                record["record_digest"] = _canonical_runtime_publication_digest(
+                    {key: value for key, value in record.items() if key != "record_digest"}
+                )
+                records[dispatch_key] = record
+                self._corrupted = True
+        return dispatch
+
+    async def repair_queued_interaction_profile_handoff(self, *args, **kwargs):
+        if self.corrupt_stage == "stage_race" and not self._corrupted:
+            session_id = args[0]
+            async with self._lock:
+                self._session_operation_records[session_id].pop(
+                    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
+                )
+                self._corrupted = True
+        return await super().repair_queued_interaction_profile_handoff(*args, **kwargs)
+
+
+class UndeclaredQueuedHandoffStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
+
+    async def deliver_queued_session_messages(self, session_id: str, **kwargs):
+        return await super().deliver_queued_session_messages(session_id, **kwargs)
 
 
 async def _assert_public_delivery_resolves_to_queue(
@@ -1937,6 +2060,157 @@ def test_runtime_reconstructs_queued_interaction_after_delivery_acknowledgement_
         assert sum(event.type == EventType.SESSION_MESSAGE_DELIVERED for event in events) == 1
         assert sum(event.type == EventType.INTERACTION_STARTED for event in events) == 2
         assert sum(event.type == EventType.INTERACTION_COMPLETED for event in events) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("corrupt_stage", "repairs"),
+    [
+        (None, True),
+        ("missing_dispatch", False),
+        ("wrong_fingerprint", False),
+        ("stage_race", False),
+    ],
+)
+def test_fresh_runtime_repairs_only_exact_legacy_queued_handoff(
+    corrupt_stage: str | None,
+    repairs: bool,
+) -> None:
+    async def run() -> None:
+        store = LegacySplitQueuedHandoffStore(corrupt_stage=corrupt_stage)
+        provider = BlockingTwoTurnProvider()
+        provider.block_second = True
+        controller = CayuApp(session_store=store, enable_logging=False)
+        controller.register_provider(provider)
+        controller.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        accepting_process = CayuApp(session_store=store, enable_logging=False)
+        session_id = f"sess_legacy_queued_handoff_{corrupt_stage or 'valid'}"
+
+        async def execute() -> list[Event]:
+            return [
+                event
+                async for event in controller.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(execute())
+        await provider.first_started.wait()
+        await accepting_process.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id=session_id,
+                idempotency_key="legacy-split-next-turn",
+                content="continue in B",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+        )
+        provider.release_first.set()
+        await provider.second_started.wait()
+
+        session = await store.load(session_id)
+        checkpoint = await store.load_checkpoint(session_id)
+        assert session is not None and session.status is SessionStatus.RUNNING
+        active_before = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        assert active_before is not None
+        interaction_starts = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.INTERACTION_STARTED
+        ]
+        assert len(interaction_starts) == 2
+        assert active_before.interaction_id == interaction_starts[0].interaction_id
+        assert (
+            interaction_starts[1].payload.get(QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY)
+            is None
+        )
+        active_stage = await store.load_active_model_completion_stage(session_id)
+        assert active_stage is not None
+        assert active_stage.stage.intent["interaction_id"] == interaction_starts[1].interaction_id
+
+        fresh_runtime = CayuApp(session_store=store, enable_logging=False)
+        fresh_runtime.register_provider(provider)
+        fresh_runtime.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def validate():
+            return await fresh_runtime._validate_execution_profile_continuation_for_recovery(
+                session,
+                checkpoint,
+                fresh_runtime._get_registered_agent(session.agent_name),
+                fresh_runtime._get_registered_provider(session.provider_name),
+                budget_policy=None,
+            )
+
+        if repairs:
+            repaired = await validate()
+            assert repaired.interaction_id == interaction_starts[1].interaction_id
+            checkpoint_after = await store.load_checkpoint(session_id)
+            assert active_invocation_execution_profile_from_checkpoint(checkpoint_after) == repaired
+        else:
+            with pytest.raises((SessionRunFenced, SessionModelCompletionStageConflict)):
+                await validate()
+            checkpoint_after = await store.load_checkpoint(session_id)
+            assert (
+                active_invocation_execution_profile_from_checkpoint(checkpoint_after)
+                == active_before
+            )
+
+        provider.release_second.set()
+        run_outcome = (await asyncio.gather(run_task, return_exceptions=True))[0]
+        if repairs:
+            assert isinstance(run_outcome, list)
+        else:
+            assert isinstance(run_outcome, (RuntimeError, SessionRunFenced))
+
+    asyncio.run(run())
+
+
+def test_custom_store_override_without_atomic_handoff_attestation_fails_closed() -> None:
+    async def run() -> None:
+        store = UndeclaredQueuedHandoffStore()
+        provider = BlockingTwoTurnProvider()
+        controller = CayuApp(session_store=store, enable_logging=False)
+        controller.register_provider(provider)
+        controller.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        accepting_process = CayuApp(session_store=store, enable_logging=False)
+
+        async def execute() -> list[Event]:
+            return [
+                event
+                async for event in controller.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sess_undeclared_queued_handoff",
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(execute())
+        await provider.first_started.wait()
+        await accepting_process.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id="sess_undeclared_queued_handoff",
+                idempotency_key="undeclared-handoff",
+                content="must not split durable authority",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+        )
+        provider.release_first.set()
+        events = await run_task
+
+        session = await store.load("sess_undeclared_queued_handoff")
+        assert session is not None and session.status is SessionStatus.FAILED
+        assert len(provider.requests) == 1
+        assert any(
+            event.type is EventType.SESSION_FAILED
+            and "does not attest atomic queued interaction handoffs" in event.payload["error"]
+            for event in events
+        )
 
     asyncio.run(run())
 

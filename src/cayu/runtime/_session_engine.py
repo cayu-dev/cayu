@@ -540,8 +540,10 @@ from cayu.runtime.sessions import (
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+    ActiveModelCompletionStage,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -569,6 +571,7 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectStatus,
     ProfiledSessionForkResult,
     PromptAnatomyTransitionReceipt,
+    QueuedInteractionProfileHandoff,
     ResumeRequest,
     RunRequest,
     RuntimePublicationRequest,
@@ -641,6 +644,7 @@ from cayu.runtime.sessions import (
     fork_source_state_sha256,
     fork_source_transcript_sha256,
     model_completion_stage_settlement_request,
+    queued_interaction_profile_handoff_evidence,
     queued_session_message_input,
     run_request_authority_is_runtime_generated,
     run_request_with_runtime_initial_transcript_authority,
@@ -5489,8 +5493,11 @@ class SessionEngine:
                 if open_interaction_id is None:
                     raise RuntimeError("Interaction lifecycle event has no interaction identity.")
                 if snapshot.interaction_id != open_interaction_id:
-                    raise RuntimeError(
-                        "Active invocation execution profile belongs to another interaction."
+                    snapshot = await self._repair_historical_queued_profile_handoff(
+                        session=session,
+                        snapshot=snapshot,
+                        open_interaction_event=latest_interactions[0].event,
+                        active_model_completion=active_model_completion,
                     )
             if frozen_candidate_profile is not None:
                 return snapshot.model_copy(update={"profile": frozen_candidate_profile})
@@ -5541,6 +5548,81 @@ class SessionEngine:
             candidate_profile_fingerprint=candidate.fingerprint,
             changed_component_classes=changed,
         )
+
+    async def _repair_historical_queued_profile_handoff(
+        self,
+        *,
+        session: Session,
+        snapshot: ActiveInvocationExecutionProfile,
+        open_interaction_event: Event,
+        active_model_completion: ActiveModelCompletionStage | None,
+    ) -> ActiveInvocationExecutionProfile:
+        """Repair only the legacy A-profile/B-delivery provider-dispatch split."""
+
+        target_interaction_id = open_interaction_event.interaction_id
+        recovery_context = (
+            None
+            if active_model_completion is None
+            else model_completion_recovery_context_from_stage(active_model_completion.stage)
+        )
+        if (
+            open_interaction_event.type is not EventType.INTERACTION_STARTED
+            or target_interaction_id is None
+            or recovery_context is None
+            or recovery_context.interaction_id != target_interaction_id
+            or recovery_context.execution_profile_fingerprint != snapshot.profile.fingerprint
+        ):
+            raise RuntimeError(
+                "Active invocation execution profile belongs to another interaction."
+            )
+        predecessor_events = await self.session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                interaction_id=snapshot.interaction_id,
+                event_types=tuple(INTERACTION_TERMINAL_EVENT_TYPES),
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if (
+            not predecessor_events
+            or predecessor_events[0].event.type is not EventType.INTERACTION_COMPLETED
+        ):
+            raise RuntimeError(
+                "Historical queued interaction handoff has no exact terminal predecessor."
+            )
+        target = ActiveInvocationExecutionProfile(
+            session_id=session.id,
+            interaction_id=target_interaction_id,
+            run_epoch=session.run_epoch,
+            profile=snapshot.profile,
+        )
+        handoff = QueuedInteractionProfileHandoff(
+            expected_session_instance_id=session.instance_id,
+            predecessor_settlement_event_id=predecessor_events[0].event.id,
+            expected_active_profile=snapshot,
+            target_active_profile=target,
+        )
+        has_durable_evidence = (
+            QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY in open_interaction_event.payload
+        )
+        durable_evidence = open_interaction_event.payload.get(
+            QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY
+        )
+        if has_durable_evidence and durable_evidence != queued_interaction_profile_handoff_evidence(
+            handoff
+        ):
+            raise RuntimeError("Historical queued interaction handoff evidence is malformed.")
+        repaired = await self.session_store.repair_queued_interaction_profile_handoff(
+            session.id,
+            interaction_started_event=open_interaction_event,
+            profile_handoff=handoff,
+        )
+        if repaired != target:
+            raise SessionRunFenced(
+                "Historical queued interaction handoff repair returned different authority."
+            )
+        return target
 
     async def _classify_execution_profile(
         self,
@@ -7410,6 +7492,7 @@ class SessionEngine:
         environment_name: str | None,
         interaction_id: str,
         targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
+        queued_profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> Event:
         return self._interaction_started_event_from_identity(
             session_id=session.id,
@@ -7417,6 +7500,7 @@ class SessionEngine:
             environment_name=environment_name,
             interaction_id=interaction_id,
             targeted_tool_grants=targeted_tool_grants,
+            queued_profile_handoff=queued_profile_handoff,
         )
 
     def _interaction_started_event_from_identity(
@@ -7428,6 +7512,7 @@ class SessionEngine:
         interaction_id: str,
         event_id: str | None = None,
         targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
+        queued_profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> Event:
         event_id = (
             str(uuid4()) if event_id is None else require_clean_nonblank(event_id, "event_id")
@@ -7455,7 +7540,20 @@ class SessionEngine:
                         timestamp=started_at,
                         agent_name=agent_name,
                         environment_name=environment_name,
-                        payload=evidence.model_dump(mode="json"),
+                        payload={
+                            **evidence.model_dump(mode="json"),
+                            **(
+                                {}
+                                if queued_profile_handoff is None
+                                else {
+                                    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY: (
+                                        queued_interaction_profile_handoff_evidence(
+                                            queued_profile_handoff
+                                        )
+                                    )
+                                }
+                            ),
+                        },
                     )
                 ),
                 "session_id",
@@ -12215,9 +12313,12 @@ class SessionEngine:
         messages: list[Message],
         include_on_idle: bool,
         continue_active_interaction: bool = False,
-    ) -> list[Event]:
+        invocation_context: InvocationContext | None = None,
+        predecessor_settlement_event: Event | None = None,
+    ) -> tuple[list[Event], InvocationContext | None]:
         delivered_events: list[Event] = []
         eligible_through: int | None = None
+        profile_handoff: QueuedInteractionProfileHandoff | None = None
         if continue_active_interaction:
             delivery_interaction_id = _current_session_interaction_id(session_id)
             if delivery_interaction_id is None:
@@ -12225,13 +12326,64 @@ class SessionEngine:
             interaction_started = True
             interaction_started_event = None
         else:
+            if (
+                invocation_context is None
+                or predecessor_settlement_event is None
+                or predecessor_settlement_event.type is not EventType.INTERACTION_COMPLETED
+                or predecessor_settlement_event.interaction_id
+                != invocation_context.binding.interaction_id
+            ):
+                raise SessionRunFenced(
+                    "Queued interaction delivery lost its predecessor invocation settlement."
+                )
+            delivery_method = self.session_store.deliver_queued_session_messages
+            store_type = type(delivery_method.__self__)
+            delivery_owner = next(
+                (
+                    owner
+                    for owner in type.__getattribute__(store_type, "__mro__")
+                    if "deliver_queued_session_messages" in type.__getattribute__(owner, "__dict__")
+                ),
+                None,
+            )
+            if (
+                getattr(
+                    self.session_store,
+                    "queued_interaction_profile_handoff_version",
+                    None,
+                )
+                != 1
+                or delivery_owner is None
+                or (
+                    type.__getattribute__(delivery_owner, "__dict__").get(
+                        "queued_interaction_profile_handoff_version"
+                    )
+                    != 1
+                )
+            ):
+                raise NotImplementedError(
+                    "This SessionStore does not attest atomic queued interaction handoffs."
+                )
             delivery_interaction_id = str(uuid4())
+            target_active_profile = ActiveInvocationExecutionProfile(
+                session_id=session.id,
+                interaction_id=delivery_interaction_id,
+                run_epoch=session.run_epoch,
+                profile=invocation_context.profile,
+            )
+            profile_handoff = QueuedInteractionProfileHandoff(
+                expected_session_instance_id=session.instance_id,
+                predecessor_settlement_event_id=predecessor_settlement_event.id,
+                expected_active_profile=invocation_context.active_profile,
+                target_active_profile=target_active_profile,
+            )
             interaction_started = False
             interaction_started_event = self._interaction_started_event(
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
                 interaction_id=delivery_interaction_id,
+                queued_profile_handoff=profile_handoff,
             )
         delivery_batch_index = 0
         while True:
@@ -12252,6 +12404,7 @@ class SessionEngine:
                             interaction_started_event=(
                                 None if interaction_started else interaction_started_event
                             ),
+                            profile_handoff=(None if interaction_started else profile_handoff),
                         )
                     )
                 except Exception as error:
@@ -12266,6 +12419,7 @@ class SessionEngine:
                         interaction_started_event=(
                             None if interaction_started else interaction_started_event
                         ),
+                        profile_handoff=(None if interaction_started else profile_handoff),
                     )
             except SessionStatusConflict:
                 # An interrupt can win after the loop's durable status check,
@@ -12281,7 +12435,21 @@ class SessionEngine:
             messages.extend(
                 queued_session_message_input(queued_message) for queued_message in batch.messages
             )
-            if batch.messages and not continue_active_interaction:
+            if batch.messages and not continue_active_interaction and not interaction_started:
+                active_invocation_profile = batch.active_invocation_profile
+                if (
+                    profile_handoff is None
+                    or active_invocation_profile is None
+                    or active_invocation_profile != profile_handoff.target_active_profile
+                    or invocation_context is None
+                ):
+                    raise SessionRunFenced(
+                        "Queued delivery did not return its exact active-profile handoff."
+                    )
+                invocation_context = invocation_context.with_queued_interaction(
+                    session,
+                    active_profile=active_invocation_profile,
+                )
                 _activate_session_interaction(session_id, delivery_interaction_id)
             if batch.events:
                 await self._event_writer.fan_out_persisted(list(batch.events))
@@ -12295,7 +12463,7 @@ class SessionEngine:
                     )
                 interaction_started = True
             if not batch.has_more:
-                return delivered_events
+                return delivered_events, invocation_context
             delivery_batch_index += 1
 
     async def _compact_session(
@@ -15106,16 +15274,20 @@ class SessionEngine:
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None = None,
-    ) -> tuple[bool, list[Event]]:
+        predecessor_settlement_event: Event | None = None,
+    ) -> tuple[bool, list[Event], InvocationContext | None]:
         if step < max_steps:
-            return True, await self._deliver_queued_session_messages(
+            events, rebound_context = await self._deliver_queued_session_messages(
                 session_id=session.id,
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
                 messages=messages,
                 include_on_idle=True,
+                invocation_context=invocation_context,
+                predecessor_settlement_event=predecessor_settlement_event,
             )
+            return True, events, rebound_context
         events = [
             event
             async for event in self._stop_session_for_model_step_limit(
@@ -15133,7 +15305,7 @@ class SessionEngine:
                 invocation_context=invocation_context,
             )
         ]
-        return False, events
+        return False, events, invocation_context
 
     async def _enforce_compaction_budget_limits(
         self,
@@ -21347,6 +21519,7 @@ class SessionEngine:
                     (
                         should_continue,
                         queued_events,
+                        rebound_invocation_context,
                     ) = await self._handle_queued_messages_before_completion(
                         session=session,
                         registered_agent=registered_agent,
@@ -21360,7 +21533,11 @@ class SessionEngine:
                         active_run=active_run,
                         execution_profile=execution_profile,
                         invocation_context=invocation_context,
+                        predecessor_settlement_event=interaction_completed_event,
                     )
+                    if rebound_invocation_context is None:
+                        raise RuntimeError("Queued handoff lost live invocation authority.")
+                    invocation_context = rebound_invocation_context
                     for event in queued_events:
                         yield event
                     if not should_continue:
@@ -21613,6 +21790,19 @@ class SessionEngine:
                 model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
             )
+
+            def install_queued_invocation_context(
+                rebound: InvocationContext | None,
+            ) -> None:
+                nonlocal invocation_context
+                if rebound is None:
+                    raise RuntimeError("Queued handoff lost live invocation authority.")
+                if rebound is invocation_context:
+                    return
+                model_step_run.rebind_queued_interaction(rebound)
+                tool_round_runner.rebind_queued_interaction(rebound)
+                invocation_context = rebound
+
             first_model_step = initial_model_step_number or 1
             model_steps = () if skip_model_steps else range(first_model_step, max_steps + 1)
             for step in model_steps:
@@ -21623,7 +21813,7 @@ class SessionEngine:
                 )
                 await self._session_control.raise_if_interrupted(session.id)
                 if step == first_model_step and deliver_queued_input_before_first_step:
-                    for event in await self._deliver_queued_session_messages(
+                    queued_events, retained_context = await self._deliver_queued_session_messages(
                         session_id=session.id,
                         session=session,
                         registered_agent=registered_agent,
@@ -21631,7 +21821,13 @@ class SessionEngine:
                         messages=messages,
                         include_on_idle=False,
                         continue_active_interaction=True,
-                    ):
+                        invocation_context=invocation_context,
+                    )
+                    if retained_context is not invocation_context:
+                        raise RuntimeError(
+                            "Active-interaction queued delivery changed invocation authority."
+                        )
+                    for event in queued_events:
                         yield event
                 # Recovery paths can rematerialize the durable transcript. Reapply the
                 # stable retained-prefix projection to the already boundary-sanitized
@@ -22073,6 +22269,7 @@ class SessionEngine:
                             (
                                 should_continue,
                                 queued_events,
+                                rebound_invocation_context,
                             ) = await self._handle_queued_messages_before_completion(
                                 session=session,
                                 registered_agent=registered_agent,
@@ -22086,7 +22283,9 @@ class SessionEngine:
                                 active_run=active_run,
                                 execution_profile=execution_profile,
                                 invocation_context=invocation_context,
+                                predecessor_settlement_event=interaction_completed_event,
                             )
+                            install_queued_invocation_context(rebound_invocation_context)
                             for event in queued_events:
                                 yield event
                             if not should_continue:
@@ -22176,6 +22375,7 @@ class SessionEngine:
                                     (
                                         should_continue,
                                         queued_events,
+                                        rebound_invocation_context,
                                     ) = await self._handle_queued_messages_before_completion(
                                         session=session,
                                         registered_agent=registered_agent,
@@ -22189,7 +22389,9 @@ class SessionEngine:
                                         active_run=active_run,
                                         execution_profile=execution_profile,
                                         invocation_context=invocation_context,
+                                        predecessor_settlement_event=(interaction_completed_event),
                                     )
+                                    install_queued_invocation_context(rebound_invocation_context)
                                     for event in queued_events:
                                         yield event
                                     if not should_continue:
@@ -22400,6 +22602,7 @@ class SessionEngine:
                         (
                             should_continue,
                             queued_events,
+                            rebound_invocation_context,
                         ) = await self._handle_queued_messages_before_completion(
                             session=session,
                             registered_agent=registered_agent,
@@ -22413,7 +22616,9 @@ class SessionEngine:
                             active_run=active_run,
                             execution_profile=execution_profile,
                             invocation_context=invocation_context,
+                            predecessor_settlement_event=interaction_completed_event,
                         )
+                        install_queued_invocation_context(rebound_invocation_context)
                         for event in queued_events:
                             yield event
                         if not should_continue:

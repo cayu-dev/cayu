@@ -263,6 +263,7 @@ from cayu.runtime.sessions import (
     ProfiledSessionForkResult,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
+    QueuedInteractionProfileHandoff,
     RunnerObservedEventIdentity,
     RunRequest,
     RuntimePublicationMutation,
@@ -335,6 +336,7 @@ from cayu.runtime.sessions import (
     _build_runtime_publication_receipt,
     _checkpoint_after_exact_invocation_terminal_decision,
     _checkpoint_after_initial_transcript_publication,
+    _checkpoint_after_queued_interaction_profile_handoff,
     _checkpoint_transform_result_preserving_completion_result_event_publications,
     _child_session_lifecycle_entry,
     _child_session_lifecycle_entry_sort_key,
@@ -344,6 +346,7 @@ from cayu.runtime.sessions import (
     _classify_terminal_session_evidence_records,
     _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
+    _copy_historical_queued_interaction_profile_handoff,
     _copy_mcp_manifest_publication,
     _copy_optional_event_id,
     _copy_optional_execution_profile,
@@ -351,6 +354,7 @@ from cayu.runtime.sessions import (
     _copy_optional_interaction_admission,
     _copy_optional_tool_capability_ceiling,
     _copy_profiled_fork_authority,
+    _copy_queued_interaction_profile_handoff,
     _copy_queued_interaction_started_event,
     _copy_runner_owned_interruption_proof,
     _copy_session_event_batch,
@@ -365,6 +369,7 @@ from cayu.runtime.sessions import (
     _event_file_attachment_attestations_are_runtime_owned,
     _event_input_contract_is_runtime_owned,
     _execution_profile_rejection_events_equivalent,
+    _historical_queued_handoff_stage_from_records,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_checkpoint,
     _initial_transcript_prefix_count,
@@ -24491,6 +24496,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
     terminal_interaction_publication_version: ClassVar[int | None] = 1
+    queued_interaction_profile_handoff_version: ClassVar[int | None] = 1
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
@@ -30529,6 +30535,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
+        profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> SessionMessageDeliveryBatch:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -30544,6 +30551,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             session_id,
             interaction_id,
             interaction_started_event,
+        )
+        profile_handoff = _copy_queued_interaction_profile_handoff(
+            session_id,
+            delivery_id,
+            interaction_id,
+            interaction_started_event,
+            profile_handoff,
         )
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
@@ -30606,6 +30620,90 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             }
                         if len(queued_by_id) != len(queue_ids):
                             raise RuntimeError("Queue delivery replay lost a delivered message.")
+                        if queue_ids and profile_handoff is not None:
+                            await cur.execute(
+                                "SELECT record FROM cayu_session_operations "
+                                "WHERE session_id = %s AND idempotency_key = %s",
+                                (
+                                    session_id,
+                                    _interaction_transition_storage_key(
+                                        profile_handoff.predecessor_settlement_event_id
+                                    ),
+                                ),
+                            )
+                            receipt_row = await cur.fetchone()
+                            if receipt_row is None:
+                                raise SessionRunFenced(
+                                    "Queued interaction handoff lost its predecessor "
+                                    "settlement receipt."
+                                )
+                            active_model_stage = None
+                            stage_dispatch = None
+                            await cur.execute(
+                                "SELECT record FROM cayu_session_operations "
+                                "WHERE session_id = %s AND idempotency_key = %s",
+                                (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                            )
+                            active_row = await cur.fetchone()
+                            if active_row is not None:
+                                active_record = _decode_model_completion_stage_record(active_row[0])
+                                marker = _reconstruct_active_model_completion_stage_record(
+                                    active_record,
+                                    session_id=session_id,
+                                )
+                                _, _, preparation_key, terminal_key = (
+                                    _model_completion_stage_storage_identity(
+                                        session_id,
+                                        marker.stage_id,
+                                    )
+                                )
+                                dispatch_key = _model_completion_stage_dispatch_storage_key(
+                                    marker.stage_id
+                                )
+                                await cur.execute(
+                                    "SELECT idempotency_key, record "
+                                    "FROM cayu_session_operations WHERE session_id = %s "
+                                    "AND idempotency_key = ANY(%s)",
+                                    (
+                                        session_id,
+                                        [preparation_key, terminal_key, dispatch_key],
+                                    ),
+                                )
+                                stage_records = {
+                                    row[0]: _decode_model_completion_stage_record(row[1])
+                                    for row in await cur.fetchall()
+                                }
+                                active_model_stage = _reconstruct_active_model_completion_stage(
+                                    active_record,
+                                    stage_records.get(preparation_key),
+                                    stage_records.get(terminal_key),
+                                    session_id=session_id,
+                                )
+                                dispatch_record = stage_records.get(dispatch_key)
+                                if dispatch_record is not None:
+                                    stage_dispatch = _reconstruct_model_completion_stage_dispatch(
+                                        dispatch_record,
+                                        session_id=session_id,
+                                        stage_id=marker.stage_id,
+                                        storage_key=dispatch_key,
+                                    )
+                            repaired_checkpoint = (
+                                _checkpoint_after_queued_interaction_profile_handoff(
+                                    loaded,
+                                    await self._load_checkpoint(cur, session_id),
+                                    profile_handoff,
+                                    settlement_record=_json_obj(receipt_row[0]),
+                                    replayed_delivery=True,
+                                    active_model_stage=active_model_stage,
+                                    stage_dispatch=stage_dispatch,
+                                )
+                            )
+                            await self._upsert_checkpoint(
+                                cur,
+                                session_id,
+                                repaired_checkpoint,
+                                await self._session_store_now(cur),
+                            )
                         await conn.commit()
                         return SessionMessageDeliveryBatch(
                             messages=tuple(queued_by_id[queue_id] for queue_id in queue_ids),
@@ -30615,6 +30713,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             eligible_through=delivery_row[4],
                             has_more=delivery_row[6],
                             replayed=True,
+                            active_invocation_profile=(
+                                None
+                                if not queue_ids or profile_handoff is None
+                                else profile_handoff.target_active_profile
+                            ),
                         )
                     if loaded.status != SessionStatus.RUNNING:
                         raise SessionStatusConflict(
@@ -30686,6 +30789,31 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             interaction_id=interaction_id,
                             eligible_through=boundary,
                             has_more=False,
+                        )
+                    rebound_checkpoint: dict[str, Any] | None = None
+                    if profile_handoff is not None:
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (
+                                session_id,
+                                _interaction_transition_storage_key(
+                                    profile_handoff.predecessor_settlement_event_id
+                                ),
+                            ),
+                        )
+                        receipt_row = await cur.fetchone()
+                        if receipt_row is None:
+                            raise SessionRunFenced(
+                                "Queued interaction handoff lost its predecessor "
+                                "settlement receipt."
+                            )
+                        rebound_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
+                            loaded,
+                            await self._load_checkpoint(cur, session_id),
+                            profile_handoff,
+                            settlement_record=_json_obj(receipt_row[0]),
+                            replayed_delivery=False,
                         )
                     transcript_cursor = await _transcript_cursor(cur, session_id)
                     delivered_at = await self._session_store_now(cur)
@@ -30882,6 +31010,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             delivered_at,
                         ),
                     )
+                    if rebound_checkpoint is not None:
+                        await self._upsert_checkpoint(
+                            cur,
+                            session_id,
+                            rebound_checkpoint,
+                            delivered_at,
+                        )
                 await conn.commit()
                 return SessionMessageDeliveryBatch(
                     messages=tuple(updated_messages),
@@ -30890,7 +31025,131 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     interaction_id=interaction_id,
                     eligible_through=boundary,
                     has_more=remaining is not None,
+                    active_invocation_profile=(
+                        None if profile_handoff is None else profile_handoff.target_active_profile
+                    ),
                 )
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def repair_queued_interaction_profile_handoff(
+        self,
+        session_id: str,
+        *,
+        interaction_started_event: Event,
+        profile_handoff: QueuedInteractionProfileHandoff,
+    ) -> ActiveInvocationExecutionProfile:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_started_event, profile_handoff = (
+            _copy_historical_queued_interaction_profile_handoff(
+                session_id,
+                interaction_started_event,
+                profile_handoff,
+            )
+        )
+        target = profile_handoff.target_active_profile
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, loaded)
+                    await cur.execute(
+                        "SELECT session_id, interaction_id, interaction_started_event, "
+                        "queue_ids FROM cayu_session_message_deliveries "
+                        "WHERE delivery_id = %s",
+                        (target.interaction_id,),
+                    )
+                    delivery_row = await cur.fetchone()
+                    stored_started_event = (
+                        None
+                        if delivery_row is None or delivery_row[2] is None
+                        else Event(**_json_obj(delivery_row[2]))
+                    )
+                    if (
+                        delivery_row is None
+                        or delivery_row[0] != session_id
+                        or delivery_row[1] != target.interaction_id
+                        or stored_started_event != interaction_started_event
+                        or not list(delivery_row[3])
+                    ):
+                        raise SessionRunFenced(
+                            "Historical queued interaction handoff lacks its exact delivery receipt."
+                        )
+                    await cur.execute(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (
+                            session_id,
+                            _interaction_transition_storage_key(
+                                profile_handoff.predecessor_settlement_event_id
+                            ),
+                        ),
+                    )
+                    receipt_row = await cur.fetchone()
+                    if receipt_row is None:
+                        raise SessionRunFenced(
+                            "Historical queued interaction handoff lost its predecessor settlement."
+                        )
+                    await cur.execute(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    )
+                    active_row = await cur.fetchone()
+                    stage_records: dict[str, Any] = {}
+                    if active_row is not None:
+                        active_record = _decode_model_completion_stage_record(active_row[0])
+                        marker = _reconstruct_active_model_completion_stage_record(
+                            active_record,
+                            session_id=session_id,
+                        )
+                        _, _, preparation_key, terminal_key = (
+                            _model_completion_stage_storage_identity(
+                                session_id,
+                                marker.stage_id,
+                            )
+                        )
+                        dispatch_key = _model_completion_stage_dispatch_storage_key(marker.stage_id)
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (
+                                session_id,
+                                [preparation_key, terminal_key, dispatch_key],
+                            ),
+                        )
+                        stage_records = {
+                            row[0]: _decode_model_completion_stage_record(row[1])
+                            for row in await cur.fetchall()
+                        }
+                        stage_records[MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY] = active_record
+                    active_model_stage, stage_dispatch = (
+                        _historical_queued_handoff_stage_from_records(
+                            session_id,
+                            stage_records,
+                        )
+                    )
+                    repaired_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
+                        loaded,
+                        await self._load_checkpoint(cur, session_id),
+                        profile_handoff,
+                        settlement_record=_json_obj(receipt_row[0]),
+                        replayed_delivery=True,
+                        active_model_stage=active_model_stage,
+                        stage_dispatch=stage_dispatch,
+                    )
+                    await self._upsert_checkpoint(
+                        cur,
+                        session_id,
+                        repaired_checkpoint,
+                        await self._session_store_now(cur),
+                    )
+                await conn.commit()
+                return target.model_copy(deep=True)
             except Exception:
                 await conn.rollback()
                 raise
