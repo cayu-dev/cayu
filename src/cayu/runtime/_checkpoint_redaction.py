@@ -13,6 +13,8 @@ from cayu.runtime.checkpoints import (
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_METADATA_KEY,
@@ -155,6 +157,8 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "approval_close_intent",
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     "components",
     "assistant_publication",
     "approval_resolution_intent",
@@ -447,6 +451,9 @@ _DURABLE_UNTRUSTED_CONTAINERS = frozenset(
         "provider_options",
         "request_metadata",
         "structured",
+        "task_error_payload",
+        "terminal_payload",
+        "turn_completed_payload",
     }
 )
 # ``records`` is a map from caller-generated operation IDs to one typed runtime
@@ -484,6 +491,8 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
     {
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         AUTOMATIC_RECALL_CHECKPOINT_KEY,
         COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
@@ -590,6 +599,41 @@ _FORK_RUNTIME_SESSION_STATUS_VALUES = frozenset(
 )
 _COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX = "completion-result-publication:v1:"
 _COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX = "completion-result-owner:v1:"
+_INVOCATION_TERMINAL_DECISION_ROOTS = frozenset(
+    {
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    }
+)
+_INVOCATION_TERMINAL_DECISION_FIELDS = frozenset(
+    {
+        "record_type",
+        "schema_version",
+        "decision_id",
+        "outcome",
+        "session_id",
+        "session_instance_id",
+        "run_epoch",
+        "profile_interaction_id",
+        "interaction_id",
+        "execution_profile_fingerprint",
+        "interaction_event_id",
+        "predecessor_interaction_event_id",
+        "terminal_event_id",
+        "observed_at",
+        "terminal_payload",
+        "interruption_request_id",
+        "task_id",
+        "runtime_task_failure_id",
+        "task_terminalization_request_sha256",
+        "task_error_payload",
+        "turn_completed_payload",
+        "record_digest",
+    }
+)
+_INVOCATION_TERMINAL_DECISION_UNTRUSTED_FIELDS = frozenset(
+    {"terminal_payload", "task_error_payload", "turn_completed_payload"}
+)
 
 
 def require_secret_free_durable_object(
@@ -628,6 +672,7 @@ def durable_value_contains_secret(
     _trusted_targeted_tool_references: frozenset[tuple[tuple[str, ...], str]] | None = None,
     _trusted_lifecycle_receipt_values: frozenset[tuple[tuple[str, ...], str]] | None = None,
     _trusted_lifecycle_receipt_keys: frozenset[tuple[tuple[str, ...], str]] | None = None,
+    _trusted_terminal_decision_values: frozenset[tuple[tuple[str, ...], str]] | None = None,
 ) -> bool:
     """Return whether a checkpoint tree contains secret text outside schema-owned keys."""
 
@@ -638,11 +683,25 @@ def durable_value_contains_secret(
             _trusted_lifecycle_receipt_values,
             _trusted_lifecycle_receipt_keys,
         ) = _invocation_lifecycle_receipt_metadata_authority(value, path=path)
-    if type(value) is str:
-        if (path, value) in _trusted_targeted_tool_references or (
-            path,
+    if _trusted_terminal_decision_values is None:
+        _trusted_terminal_decision_values = _invocation_terminal_decision_authority(
             value,
-        ) in _trusted_lifecycle_receipt_values:
+            path=path,
+        )
+    if type(value) is str:
+        if (
+            (path, value) in _trusted_targeted_tool_references
+            or (
+                path,
+                value,
+            )
+            in _trusted_lifecycle_receipt_values
+            or (
+                path,
+                value,
+            )
+            in _trusted_terminal_decision_values
+        ):
             return False
         if path in _trusted_web_control_paths:
             # Exact closed controls are runtime protocol, not copied workload
@@ -707,6 +766,7 @@ def durable_value_contains_secret(
                 _trusted_targeted_tool_references=_trusted_targeted_tool_references,
                 _trusted_lifecycle_receipt_values=_trusted_lifecycle_receipt_values,
                 _trusted_lifecycle_receipt_keys=_trusted_lifecycle_receipt_keys,
+                _trusted_terminal_decision_values=_trusted_terminal_decision_values,
             )
             for item in value
         )
@@ -738,6 +798,7 @@ def durable_value_contains_secret(
                     or _is_durable_subagent_structural_key(path, key)
                     or _is_completion_result_event_publication_structural_key(path, key)
                     or _is_invocation_lifecycle_receipt_structural_key(path, key)
+                    or _is_invocation_terminal_decision_structural_key(path, key)
                     or _is_active_invocation_build_provenance_structural_key(path, key)
                     or (path, key) in _trusted_lifecycle_receipt_keys
                     or _is_quarantined_assistant_message_structural_key(path, key)
@@ -765,6 +826,7 @@ def durable_value_contains_secret(
                 _trusted_targeted_tool_references=_trusted_targeted_tool_references,
                 _trusted_lifecycle_receipt_values=_trusted_lifecycle_receipt_values,
                 _trusted_lifecycle_receipt_keys=_trusted_lifecycle_receipt_keys,
+                _trusted_terminal_decision_values=_trusted_terminal_decision_values,
             ):
                 return True
         return False
@@ -847,6 +909,42 @@ def _targeted_tool_reference_authority(
                         getattr(resolved, field_name),
                     )
                 )
+    return frozenset(trusted)
+
+
+def _invocation_terminal_decision_authority(
+    value: Any,
+    *,
+    path: tuple[str, ...],
+) -> frozenset[tuple[tuple[str, ...], str]]:
+    """Authenticate top-level controls and identities of a complete decision."""
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    if not path and type(value) is dict:
+        for root in _INVOCATION_TERMINAL_DECISION_ROOTS:
+            candidate = value.get(root)
+            if type(candidate) is dict:
+                candidates.append((root, candidate))
+    elif len(path) == 1 and path[0] in _INVOCATION_TERMINAL_DECISION_ROOTS and type(value) is dict:
+        candidates.append((path[0], value))
+    if not candidates:
+        return frozenset()
+
+    from cayu.runtime._invocation_terminal_decision import InvocationTerminalDecision
+
+    trusted: set[tuple[tuple[str, ...], str]] = set()
+    for root, candidate in candidates:
+        try:
+            decision = InvocationTerminalDecision.model_validate(candidate)
+        except (TypeError, ValueError):
+            continue
+        projected = decision.model_dump(mode="json")
+        for field_name, field_value in projected.items():
+            if (
+                field_name not in _INVOCATION_TERMINAL_DECISION_UNTRUSTED_FIELDS
+                and type(field_value) is str
+            ):
+                trusted.add(((root, field_name), field_value))
     return frozenset(trusted)
 
 
@@ -1120,6 +1218,17 @@ def _is_invocation_lifecycle_receipt_structural_key(
     }
 
 
+def _is_invocation_terminal_decision_structural_key(
+    path: tuple[str, ...],
+    key: str,
+) -> bool:
+    return (
+        len(path) == 1
+        and path[0] in _INVOCATION_TERMINAL_DECISION_ROOTS
+        and key in _INVOCATION_TERMINAL_DECISION_FIELDS
+    )
+
+
 def _is_workspace_observation_identity_path(path: tuple[str, ...]) -> bool:
     return (
         len(path) == 3
@@ -1163,6 +1272,12 @@ def _path_has_typed_schema(path: tuple[str, ...]) -> bool:
         return True
     if path and path[0] == INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY:
         return True
+    if path and path[0] in _INVOCATION_TERMINAL_DECISION_ROOTS:
+        return len(path) == 1 or (
+            len(path) == 2
+            and path[1] in _INVOCATION_TERMINAL_DECISION_FIELDS
+            and path[1] not in _INVOCATION_TERMINAL_DECISION_UNTRUSTED_FIELDS
+        )
     if path and path[0] not in _DURABLE_ROOT_STRUCTURE_KEYS:
         return False
     for index, part in enumerate(path):

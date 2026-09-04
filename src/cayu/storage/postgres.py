@@ -111,6 +111,7 @@ from cayu.runtime._child_session_notifications import (
     child_session_notification_stage_binding,
     child_session_notification_storage_key,
 )
+from cayu.runtime._invocation_terminal_decision import InvocationTerminalDecision
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
@@ -281,6 +282,7 @@ from cayu.runtime.sessions import (
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
+    SessionModelCompletionDispatchAlreadyAuthorized,
     SessionModelCompletionStageConflict,
     SessionModelTransition,
     SessionOperationalSnapshot,
@@ -331,6 +333,7 @@ from cayu.runtime.sessions import (
     _assert_session_run_epoch_value,
     _authenticated_public_authority_alias_private_value,
     _build_runtime_publication_receipt,
+    _checkpoint_after_exact_invocation_terminal_decision,
     _checkpoint_after_initial_transcript_publication,
     _checkpoint_transform_result_preserving_completion_result_event_publications,
     _child_session_lifecycle_entry,
@@ -342,6 +345,7 @@ from cayu.runtime.sessions import (
     _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
     _copy_mcp_manifest_publication,
+    _copy_optional_event_id,
     _copy_optional_execution_profile,
     _copy_optional_execution_profile_decision,
     _copy_optional_interaction_admission,
@@ -24486,6 +24490,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_execution_profile_admission: ClassVar[bool] = True
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
+    terminal_interaction_publication_version: ClassVar[int | None] = 1
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
@@ -27750,6 +27755,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         execution_profile_decision: ExecutionProfileDecision | None = None,
         adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
+        expected_latest_interaction_event_id: str | None = None,
+        require_no_active_model_completion_dispatch: bool = False,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -27786,6 +27793,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         prepared_tool_capability_ceiling = _copy_optional_tool_capability_ceiling(
             tool_capability_ceiling
         )
+        expected_latest_interaction_event_id = _copy_optional_event_id(
+            expected_latest_interaction_event_id,
+            "expected_latest_interaction_event_id",
+        )
+        if type(require_no_active_model_completion_dispatch) is not bool:
+            raise TypeError("require_no_active_model_completion_dispatch must be a boolean.")
         if prepared_execution_profile_decision is not None and admission is None:
             raise ValueError("An execution-profile decision requires atomic interaction admission.")
         if admission is not None and to_status is not SessionStatus.RUNNING:
@@ -27803,6 +27816,50 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionStatusConflict(
                             f"Session status transition not allowed: {loaded.status} -> {to_status}"
                         )
+                    if expected_latest_interaction_event_id is not None:
+                        await cur.execute(
+                            "SELECT retained.event_id "
+                            "FROM cayu_interaction_latest_events AS event "
+                            "JOIN cayu_events AS retained "
+                            "ON retained.sequence = event.latest_event_sequence "
+                            "WHERE event.session_id = %s "
+                            "ORDER BY event.latest_event_sequence DESC LIMIT 1 FOR UPDATE",
+                            (session_id,),
+                        )
+                        latest_interaction_row = await cur.fetchone()
+                        if (
+                            latest_interaction_row is None
+                            or latest_interaction_row[0] != expected_latest_interaction_event_id
+                        ):
+                            raise SessionRunFenced(
+                                "Session latest interaction changed before the status transition."
+                            )
+                    if require_no_active_model_completion_dispatch:
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                        )
+                        active_row = await cur.fetchone()
+                        if active_row is not None:
+                            active_marker = _reconstruct_active_model_completion_stage_record(
+                                _decode_model_completion_stage_record(active_row[0]),
+                                session_id=session_id,
+                            )
+                            await cur.execute(
+                                "SELECT 1 FROM cayu_session_operations "
+                                "WHERE session_id = %s AND idempotency_key = %s",
+                                (
+                                    session_id,
+                                    _model_completion_stage_dispatch_storage_key(
+                                        active_marker.stage_id
+                                    ),
+                                ),
+                            )
+                            if await cur.fetchone() is not None:
+                                raise SessionModelCompletionDispatchAlreadyAuthorized(
+                                    "Provider dispatch was authorized before terminal decision election."
+                                )
                     transition_profile_metadata = _validate_execution_profile_admission(
                         loaded,
                         candidate_profile=prepared_execution_profile,
@@ -28328,6 +28385,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         only_if_no_queued_messages: bool = False,
         model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
         checkpoint_mutation: dict[str, Any] | None = None,
+        terminal_event: Event | None = None,
+        terminal_decision: InvocationTerminalDecision | None = None,
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
@@ -28354,6 +28413,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             only_if_no_queued_messages=only_if_no_queued_messages,
             model_completion_stage_settlement=model_completion_stage_settlement,
             checkpoint_mutation=checkpoint_mutation,
+            terminal_event=terminal_event,
+            terminal_decision=terminal_decision,
         )
         copied_event = transition.event
         allowed_statuses = set(transition.from_statuses)
@@ -28361,6 +28422,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         conditional = transition.only_if_no_queued_messages
         settlement_request = transition.model_completion_stage_settlement
         checkpoint_mutation_request = transition.checkpoint_mutation
+        copied_terminal_event = transition.terminal_event
+        terminal_decision = transition.terminal_decision
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -28382,6 +28445,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         (session_id, copied_event.id),
                     )
                     existing_row = await cur.fetchone()
+                    existing_terminal_row = None
+                    if copied_terminal_event is not None:
+                        await cur.execute(
+                            "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                            (session_id, copied_terminal_event.id),
+                        )
+                        existing_terminal_row = await cur.fetchone()
                     if receipt_row is not None:
                         receipt = _reconstruct_interaction_transition_receipt(
                             _json_obj(receipt_row[0]),
@@ -28405,10 +28475,22 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             raise RuntimeError(
                                 "Interaction transition receipt conflicts with retained event history."
                             )
+                        if copied_terminal_event is not None and (
+                            receipt.terminal_event != copied_terminal_event
+                            or (
+                                existing_terminal_row is not None
+                                and Event(**_json_obj(existing_terminal_row[0]))
+                                != receipt.terminal_event
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Interaction transition receipt conflicts with its terminal session event."
+                            )
                         await conn.commit()
                         return InteractionTransitionResult(
                             session=receipt.session,
                             event=receipt.event,
+                            terminal_event=receipt.terminal_event,
                             status_changed=receipt.status_changed,
                             replayed=True,
                         )
@@ -28416,7 +28498,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise RuntimeError(
                             "Interaction transition event exists without its immutable receipt."
                         )
+                    if existing_terminal_row is not None:
+                        raise RuntimeError(
+                            "Terminal session event exists without its interaction receipt."
+                        )
                     checkpoint = await self._load_checkpoint(cur, session_id)
+                    settled_checkpoint = _checkpoint_after_exact_invocation_terminal_decision(
+                        checkpoint,
+                        session=loaded,
+                        expected=terminal_decision,
+                    )
                     active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
                         checkpoint,
                         now=await self._session_store_now(cur),
@@ -28437,7 +28528,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
 
                         assert expected_session_instance_id is not None
-                        checkpoint = await self._load_checkpoint(cur, session_id)
                         if expected_invocation_authority_state == "released":
                             require_released_invocation_command_authority(
                                 loaded,
@@ -28445,7 +28535,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 session_id=session_id,
                                 session_instance_id=expected_session_instance_id,
                                 active_profile=expected_active_invocation_profile,
-                                events=(copied_event,),
+                                events=tuple(
+                                    event
+                                    for event in (copied_event, copied_terminal_event)
+                                    if event is not None
+                                ),
                             )
                         else:
                             require_invocation_command_authority(
@@ -28457,7 +28551,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     {expected_active_invocation_profile.run_epoch}
                                 ),
                                 active_profile=expected_active_invocation_profile,
-                                events=(copied_event,),
+                                events=tuple(
+                                    event
+                                    for event in (copied_event, copied_terminal_event)
+                                    if event is not None
+                                ),
                             )
                     if loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
@@ -28549,13 +28647,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             request=settlement_request,
                             settled_at=updated_at,
                         )
+                    committed_events = [
+                        event
+                        for event in (copied_event, copied_terminal_event)
+                        if event is not None
+                    ]
                     await cur.execute(
                         """
                         UPDATE cayu_sessions
                         SET status = CASE WHEN %s THEN status ELSE %s END,
                             updated_at = CASE WHEN %s THEN updated_at ELSE %s END,
                             last_activity_at = %s,
-                            event_seq = event_seq + 1
+                            event_seq = event_seq + %s
                         WHERE id = %s
                         RETURNING event_seq
                         """,
@@ -28565,6 +28668,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             queued,
                             updated_at,
                             updated_at,
+                            len(committed_events),
                             session_id,
                         ),
                     )
@@ -28607,16 +28711,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             raise SessionModelCompletionStageConflict(
                                 "The active model-completion stage changed during settlement."
                             )
-                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
-                        copied_event
-                    )
                     await self._register_event_public_authorities(
                         cur,
                         session_id,
-                        [copied_event],
+                        committed_events,
                     )
-                    await cur.execute(
-                        """
+                    first_session_order = order_row[0] - len(committed_events) + 1
+                    for event_offset, committed_event in enumerate(committed_events):
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(committed_event)
+                        )
+                        await cur.execute(
+                            """
                         INSERT INTO cayu_events (
                             session_id, session_order, event_id, interaction_id,
                             event_type, timestamp, agent_name, environment_name,
@@ -28628,30 +28734,38 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             %s, %s, %s, %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s, %s, %s
                         )
-                        """,
-                        (
-                            session_id,
-                            order_row[0],
-                            copied_event.id,
-                            copied_event.interaction_id,
-                            str(copied_event.type),
-                            pg_support.to_utc(copied_event.timestamp),
-                            copied_event.agent_name,
-                            copied_event.environment_name,
-                            copied_event.workflow_name,
-                            copied_event.tool_name,
-                            _dumps(copied_event.payload),
-                            _dumps(copied_event.model_dump(mode="json")),
-                            lookup_key,
-                            projection,
-                            projection_bytes,
-                        ),
-                    )
+                            """,
+                            (
+                                session_id,
+                                first_session_order + event_offset,
+                                committed_event.id,
+                                committed_event.interaction_id,
+                                str(committed_event.type),
+                                pg_support.to_utc(committed_event.timestamp),
+                                committed_event.agent_name,
+                                committed_event.environment_name,
+                                committed_event.workflow_name,
+                                committed_event.tool_name,
+                                _dumps(committed_event.payload),
+                                _dumps(committed_event.model_dump(mode="json")),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
+                            ),
+                        )
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         session_id,
-                        [copied_event],
+                        committed_events,
                     )
+                    if terminal_decision is not None:
+                        assert settled_checkpoint is not None
+                        await self._upsert_checkpoint(
+                            cur,
+                            session_id,
+                            settled_checkpoint,
+                            updated_at,
+                        )
                     transitioned = await self._load(cur, session_id)
                     if transitioned is None:
                         raise KeyError(f"Session not found: {session_id}")
@@ -28663,6 +28777,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         only_if_no_queued_messages=conditional,
                         model_completion_stage_settlement=settlement_request,
                         checkpoint_mutation=checkpoint_mutation_request,
+                        terminal_event=copied_terminal_event,
+                        terminal_decision=terminal_decision,
                         status_changed=not queued,
                         invocation_session_instance_id=expected_session_instance_id,
                         invocation_active_profile=expected_active_invocation_profile,
@@ -28687,6 +28803,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         return InteractionTransitionResult(
             session=transitioned,
             event=copied_event,
+            terminal_event=copied_terminal_event,
             status_changed=not queued,
         )
 
@@ -28712,6 +28829,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         }
         if transition.checkpoint_mutation is not None:
             kwargs["checkpoint_mutation"] = transition.checkpoint_mutation
+        if transition.terminal_event is not None:
+            kwargs["terminal_event"] = transition.terminal_event
+            kwargs["terminal_decision"] = transition.terminal_decision
         return await self.publish_interaction_transition(copied.session_id, **kwargs)
 
     async def load_interaction_transition_receipt(

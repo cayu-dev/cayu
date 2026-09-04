@@ -55,6 +55,13 @@ from cayu.core.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.core.runtime_authority import SessionRunFenced
+from cayu.runtime._continuation_task_failure import (
+    RuntimeTaskFailureTerminalizationPending,
+    runtime_task_failure_identity_from_task,
+    runtime_task_failure_terminalization_pending_from_error,
+    runtime_task_failure_terminalization_request,
+    runtime_task_failure_terminalization_request_sha256,
+)
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerCadence,
     DurableWorkerDemandPolicy,
@@ -67,6 +74,11 @@ from cayu.runtime._durable_worker_loop import (
     validate_worker_interval,
     wait_or_stop,
     worker_stop_requested,
+)
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_active_profile,
 )
 from cayu.runtime._task_lease_authority import (
     TaskLeaseAuthority as _TaskLeaseAuthority,
@@ -83,6 +95,9 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_mutation_is_cancellation_quiescent,
 )
 from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.runtime.sessions import IncompleteSessionRecoveryRequest, SessionStatus
 from cayu.runtime.tasks import (
     InterruptedTaskContinuationClaimPage,
@@ -115,6 +130,7 @@ from cayu.runtime.tasks import (
     _task_retry_cancellation_requested,
     _task_retry_requested_cancellation_settlement,
     _task_retry_runtime_terminal_request,
+    _terminalize_claimed_task,
     _terminalize_claimed_task_or_detect_peer_winner,
     copy_task,
     interrupted_task_handoff_request,
@@ -715,6 +731,7 @@ async def _handle_with_heartbeat(
         )
     )
     handler_error: Exception | None = None
+    pending_runtime_task_failure: RuntimeTaskFailureTerminalizationPending | None = None
     handler_outcome: TaskHandlerOutcome | TaskRetryAttemptReport | None = None
     interrupted_authority_loss = False
     retry_elapsed = retry_deadline_elapsed
@@ -766,6 +783,9 @@ async def _handle_with_heartbeat(
                 ):
                     interrupted_authority_loss = True
                 else:
+                    pending_runtime_task_failure = (
+                        runtime_task_failure_terminalization_pending_from_error(exc)
+                    )
                     handler_error = exc
 
         if retry_elapsed or retry_cancellation_requested:
@@ -856,6 +876,17 @@ async def _handle_with_heartbeat(
             nonlocal handler_error
 
             if handler_error is not None:
+                if pending_runtime_task_failure is not None:
+                    await _settle_pending_runtime_task_failure_owner(
+                        app,
+                        task_store,
+                        task_id=task.id,
+                        worker_id=worker_id,
+                        lease_authority=lease_authority,
+                        pending=pending_runtime_task_failure,
+                    )
+                    handler_error = None
+                    return
                 failure_payload = _task_failure_payload(app, handler_error)
                 handler_error = None
                 await _safe_fail_payload(
@@ -2921,6 +2952,122 @@ async def _settle_recovered_continuation_authority_loss(
         app.redact_json(current.session_id),
     )
     return False
+
+
+async def _settle_pending_runtime_task_failure_owner(
+    app: CayuApp,
+    task_store: TaskStore,
+    *,
+    task_id: str,
+    worker_id: str,
+    lease_authority: _TaskLeaseAuthority,
+    pending: RuntimeTaskFailureTerminalizationPending,
+) -> None:
+    """Settle only the worker whose exact durable failure decision is active."""
+
+    if type(pending) is not RuntimeTaskFailureTerminalizationPending:
+        raise TypeError("pending must be a RuntimeTaskFailureTerminalizationPending.")
+    if pending.task_id != task_id:
+        raise TaskClaimLost("Pending runtime task failure is bound to a different task.") from None
+
+    current = await task_store.load_task(task_id)
+    if current is None:
+        raise TaskClaimLost("Pending runtime task failure lost its attached task.") from None
+    if current.status is TaskStatus.FAILED:
+        failure_identity = runtime_task_failure_identity_from_task(
+            current,
+            session_id=pending.session_id,
+            session_instance_id=pending.session_instance_id,
+        )
+        if (
+            failure_identity is not None
+            and failure_identity.failure_id == pending.runtime_task_failure_id
+            and failure_identity.run_epoch == pending.run_epoch
+        ):
+            return
+        raise TaskClaimLost(
+            "Pending runtime task failure conflicts with the terminal task evidence."
+        ) from None
+    if (
+        current.status is not TaskStatus.RUNNING
+        or current.session_id != pending.session_id
+        or current.session_instance_id != pending.session_instance_id
+    ):
+        raise TaskClaimLost(
+            "Pending runtime task failure conflicts with the attached task authority."
+        ) from None
+
+    session = await app.session_store.load(pending.session_id)
+    checkpoint = await app.session_store.load_checkpoint(pending.session_id)
+    decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    if (
+        session is None
+        or session.instance_id != pending.session_instance_id
+        or session.run_epoch != pending.run_epoch
+        or session.status
+        not in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING, SessionStatus.FAILED}
+        or decision is None
+        or decision.outcome is not InvocationTerminalOutcome.FAILED
+        or decision.decision_id != pending.decision_id
+        or decision.runtime_task_failure_id != pending.runtime_task_failure_id
+        or decision.task_id != task_id
+        or active_profile is None
+        or not invocation_terminal_decision_matches_active_profile(
+            decision,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            run_epoch=session.run_epoch,
+            interaction_id=active_profile.interaction_id,
+            execution_profile_fingerprint=active_profile.profile.fingerprint,
+        )
+    ):
+        raise TaskClaimLost(
+            "Pending runtime task failure lost its exact durable decision authority."
+        ) from None
+
+    if (
+        current.worker_id != worker_id
+        or current.lease_expires_at != lease_authority.lease_expires_at
+        or current.interrupted_handoff_id != lease_authority.handoff_id
+    ):
+        raise TaskClaimLost(
+            "Pending runtime task failure no longer owns the worker lease."
+        ) from None
+    if (
+        decision.task_error_payload is None
+        or decision.task_terminalization_request_sha256 is None
+        or decision.task_terminalization_request_sha256
+        != runtime_task_failure_terminalization_request_sha256(
+            task_id=task_id,
+            task_worker_id=worker_id,
+            task_handoff_id=lease_authority.handoff_id,
+            session_id=pending.session_id,
+            error=decision.task_error_payload,
+        )
+    ):
+        raise TaskClaimLost(
+            "Pending runtime task failure conflicts with its elected task mutation."
+        ) from None
+    terminal = await _terminalize_claimed_task(
+        task_store,
+        runtime_task_failure_terminalization_request(
+            task_id=task_id,
+            task_worker_id=worker_id,
+            task_handoff_id=lease_authority.handoff_id,
+            session_id=pending.session_id,
+            error=decision.task_error_payload,
+        ),
+    )
+    if (
+        terminal.status is not TaskStatus.FAILED
+        or terminal.session_id != pending.session_id
+        or terminal.session_instance_id != pending.session_instance_id
+        or terminal.error != decision.task_error_payload
+    ):
+        raise TaskClaimLost(
+            "Task terminalization returned conflicting runtime failure evidence."
+        ) from None
 
 
 async def _heartbeat_until(

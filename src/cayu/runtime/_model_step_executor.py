@@ -6704,6 +6704,13 @@ class ModelStepExecutor:
                 child_session_notification_binding,
                 True,
             )
+        # Durable dispatch admission and interruption-decision election share
+        # one store-owned fence. If dispatch won that fence, interruption may
+        # move the session to INTERRUPTING without yet electing a terminal
+        # outcome. Re-read that authority before entering provider-owned code
+        # so a dispatch that was only durably prepared cannot start after the
+        # interruption request became authoritative.
+        await self._session_control.raise_if_interrupted(session.id)
         context_exposure = (
             None if completion_dispatch is None else completion_dispatch.context_exposure
         )

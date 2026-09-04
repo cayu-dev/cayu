@@ -28,6 +28,8 @@ from cayu.runtime.checkpoints import (
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
     validate_runtime_checkpoint_root_projection,
@@ -287,6 +289,14 @@ class _RuntimeCheckpointSessionStore:
         checker = getattr(
             self._store,
             "_supports_completion_result_event_publication_reservation_protocol",
+            None,
+        )
+        return callable(checker) and checker() is True
+
+    def _supports_terminal_interaction_publication_protocol(self) -> bool:
+        checker = getattr(
+            self._store,
+            "_supports_terminal_interaction_publication_protocol",
             None,
         )
         return callable(checker) and checker() is True
@@ -916,11 +926,13 @@ class _RuntimeCheckpointSessionStore:
             in {
                 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
                 INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+                INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+                SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
             }
             for operation in request.mutation.operations
         ):
             raise ValueError(
-                "Runtime publication callers cannot mutate active invocation lifecycle authority."
+                "Runtime publication callers cannot mutate invocation lifecycle authority."
             )
         if any(
             operation.key == COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY

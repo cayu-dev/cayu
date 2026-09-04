@@ -42,6 +42,12 @@ from cayu.core.events import (
 )
 from cayu.core.messages import Message, detach_message
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_recovery_profile,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.runtime.budgets import BudgetPolicy
 from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
@@ -53,6 +59,8 @@ from cayu.runtime.checkpoints import (
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,
     INVOCATION_LIFECYCLE_RECEIPT_LEDGER_SCHEMA_VERSION,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -831,6 +839,8 @@ class InvocationCheckpointPatch(BaseModel):
                 CHECKPOINT_SCHEMA_VERSION_KEY,
                 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
                 INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+                INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+                SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
             }
             for operation in self.mutation.operations
         ):
@@ -2310,6 +2320,55 @@ def require_invocation_admission_source_authority(
     )
 
 
+def _checkpoint_after_predecessor_terminal_decision(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    *,
+    expected_active_profile: ActiveInvocationExecutionProfile | None,
+) -> dict[str, Any] | None:
+    """Retire only the settled winner owned by the admitted predecessor.
+
+    A settled decision is the acknowledgement-loss authority for the terminal
+    invocation. The next typed admission is the first boundary allowed to
+    consume it, atomically with installing the successor invocation.
+    """
+
+    active_decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+    if active_decision is not None:
+        raise SessionRunFenced(
+            "Invocation admission found an unsettled predecessor terminal decision."
+        )
+    settled = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
+    if settled is None:
+        return None if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    if expected_active_profile is None:
+        raise SessionRunFenced(
+            "Invocation admission lacks the profile authority for its settled predecessor."
+        )
+    expected_outcome = {
+        SessionStatus.FAILED: InvocationTerminalOutcome.FAILED,
+        SessionStatus.INTERRUPTED: InvocationTerminalOutcome.INTERRUPTED,
+    }.get(session.status)
+    if expected_outcome is None or settled.outcome is not expected_outcome:
+        raise SessionRunFenced(
+            "Invocation admission found a status-inconsistent settled predecessor."
+        )
+    if not invocation_terminal_decision_matches_recovery_profile(
+        settled,
+        session_id=session.id,
+        session_instance_id=session.instance_id,
+        current_run_epoch=session.run_epoch,
+        interaction_id=expected_active_profile.interaction_id,
+        execution_profile_fingerprint=expected_active_profile.profile.fingerprint,
+    ):
+        raise SessionRunFenced(
+            "Invocation admission found a settled decision from another predecessor."
+        )
+    updated = copy_durable_json_object(checkpoint, "checkpoint")
+    updated.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY)
+    return updated or None
+
+
 class InvocationMutationResult(BaseModel):
     """One admitted or rebound invocation and its exact active authority."""
 
@@ -2716,7 +2775,12 @@ async def apply_invocation_lifecycle_command(
                 raise SessionRunFenced(
                     "Invocation admission source checkpoint changed after command preparation."
                 )
-            return _apply_checkpoint_patch(copied.checkpoint_patch, checkpoint)
+            updated = _checkpoint_after_predecessor_terminal_decision(
+                session,
+                checkpoint,
+                expected_active_profile=copied.expected_active_profile,
+            )
+            return _apply_checkpoint_patch(copied.checkpoint_patch, updated)
 
         def record_admit_result(session: Session, checkpoint: dict[str, Any] | None):
             return checkpoint_with_invocation_lifecycle_receipt(

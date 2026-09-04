@@ -8,6 +8,12 @@ from hashlib import sha256
 from typing import Any, Literal
 
 from cayu._clock import normalize_utc_datetime
+from cayu._exception_groups import (
+    exception_cause,
+    exception_context,
+    exception_group_children,
+)
+from cayu._exception_state import exception_state, set_exception_state
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -25,6 +31,94 @@ from cayu.runtime.tasks import (
 
 _RUNTIME_TASK_FAILURE_MARKER_KEY = "runtime_task_failure"
 _RUNTIME_TASK_FAILURE_SCHEMA = "cayu.runtime-task-failure.v2"
+_RUNTIME_TASK_FAILURE_TERMINALIZATION_PENDING_STATE = (
+    "_cayu_runtime_task_failure_terminalization_pending"
+)
+
+
+class RuntimeTaskFailureTerminalizationPending(RuntimeError):
+    """Private handoff proving that an exact failure decision owns task settlement."""
+
+    def __init__(
+        self,
+        *,
+        decision_id: str,
+        runtime_task_failure_id: str,
+        task_id: str,
+        session_id: str,
+        session_instance_id: str,
+        run_epoch: int,
+    ) -> None:
+        super().__init__("Exact runtime task-failure terminalization remains pending.")
+        self.decision_id = require_durable_clean_nonblank(decision_id, "decision_id")
+        self.runtime_task_failure_id = require_durable_clean_nonblank(
+            runtime_task_failure_id,
+            "runtime_task_failure_id",
+        )
+        self.task_id = require_durable_clean_nonblank(task_id, "task_id")
+        self.session_id = require_durable_clean_nonblank(session_id, "session_id")
+        self.session_instance_id = require_durable_clean_nonblank(
+            session_instance_id,
+            "session_instance_id",
+        )
+        if type(run_epoch) is not int or run_epoch < 0:
+            raise ValueError("run_epoch must be a non-negative integer.")
+        self.run_epoch = run_epoch
+
+
+def retain_runtime_task_failure_terminalization_pending(
+    error: BaseException,
+    pending: RuntimeTaskFailureTerminalizationPending,
+) -> bool:
+    """Attach one runtime-owned worker handoff without changing the primary error."""
+
+    if type(pending) is not RuntimeTaskFailureTerminalizationPending:
+        raise TypeError("pending must be RuntimeTaskFailureTerminalizationPending.")
+    return set_exception_state(
+        error,
+        _RUNTIME_TASK_FAILURE_TERMINALIZATION_PENDING_STATE,
+        pending,
+    )
+
+
+def runtime_task_failure_terminalization_pending_from_error(
+    error: BaseException,
+) -> RuntimeTaskFailureTerminalizationPending | None:
+    """Recover the private pending handoff from a propagated runtime failure."""
+
+    found: RuntimeTaskFailureTerminalizationPending | None = None
+    pending: list[BaseException] = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        value = (
+            candidate
+            if type(candidate) is RuntimeTaskFailureTerminalizationPending
+            else exception_state(
+                candidate,
+                _RUNTIME_TASK_FAILURE_TERMINALIZATION_PENDING_STATE,
+            )
+        )
+        if value is not None:
+            if type(value) is not RuntimeTaskFailureTerminalizationPending:
+                raise RuntimeError("Runtime task-failure pending handoff is malformed.")
+            if found is not None and value is not found:
+                raise RuntimeError("Runtime task-failure pending handoff is conflicting.")
+            found = value
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(reversed(children))
+        cause = exception_cause(candidate)
+        if cause is not None:
+            pending.append(cause)
+        context = exception_context(candidate)
+        if context is not None:
+            pending.append(context)
+    return found
 
 
 @dataclass(frozen=True)
@@ -226,6 +320,7 @@ def runtime_task_failure_receipt_matches(
     task: Task | None,
     task_worker_id: str,
     task_handoff_id: str | None,
+    task_lease_expires_at: datetime | None = None,
     session_id: str,
     session_instance_id: str,
 ) -> bool:
@@ -244,6 +339,7 @@ def runtime_task_failure_receipt_matches(
         TaskTerminalizationRequest(
             task_id=task.id,
             worker_id=task_worker_id,
+            lease_expires_at=task_lease_expires_at,
             handoff_id=task_handoff_id,
             kind=TaskTerminalKind.FAILED,
             error=task.error,
@@ -262,6 +358,91 @@ def runtime_task_failure_receipt_matches(
         and receipt.idempotency_key == request.idempotency_key
         and receipt.request_sha256 == request_sha256
         and receipt.task == task
+    )
+
+
+def runtime_task_failure_terminalization_request(
+    *,
+    task_id: str,
+    task_worker_id: str,
+    task_handoff_id: str | None,
+    session_id: str,
+    error: dict[str, Any],
+) -> TaskTerminalizationRequest:
+    """Build the exact claimed-worker mutation used by live failure and replay."""
+
+    return TaskTerminalizationRequest(
+        task_id=task_id,
+        worker_id=task_worker_id,
+        handoff_id=task_handoff_id,
+        kind=TaskTerminalKind.FAILED,
+        error=error,
+        idempotency_key=runtime_task_terminalization_idempotency_key(
+            task_id=task_id,
+            session_id=session_id,
+            kind=TaskTerminalKind.FAILED,
+        ),
+    )
+
+
+def runtime_task_failure_terminalization_request_sha256(
+    *,
+    task_id: str,
+    task_worker_id: str,
+    task_handoff_id: str | None,
+    session_id: str,
+    error: dict[str, Any],
+) -> str:
+    """Return the content identity of one claimed runtime failure mutation."""
+
+    _, request_sha256 = prepare_task_terminalization(
+        runtime_task_failure_terminalization_request(
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session_id,
+            error=error,
+        )
+    )
+    return request_sha256
+
+
+def runtime_task_failure_decision_receipt_matches(
+    *,
+    receipt: TaskTerminalizationReceipt | None,
+    task: Task | None,
+    expected_request_sha256: str,
+    session_id: str,
+    session_instance_id: str,
+) -> bool:
+    """Authenticate historical claimed-worker authority from immutable evidence."""
+
+    if (
+        receipt is None
+        or task is None
+        or task.error is None
+        or receipt.task_id != task.id
+        or receipt.idempotency_key
+        != runtime_task_terminalization_idempotency_key(
+            task_id=task.id,
+            session_id=session_id,
+            kind=TaskTerminalKind.FAILED,
+        )
+        or receipt.kind is not TaskTerminalKind.FAILED
+        or receipt.request_sha256 != expected_request_sha256
+        or receipt.task != task
+        or task.status is not TaskStatus.FAILED
+        or task.session_id != session_id
+        or task.session_instance_id != session_instance_id
+    ):
+        return False
+    return (
+        runtime_task_failure_identity_from_task(
+            task,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+        )
+        is not None
     )
 
 

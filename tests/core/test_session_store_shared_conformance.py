@@ -18,6 +18,7 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr, ValidationError
 from tests.core._execution_profile_fixtures import (
+    create_admitted_session,
     interrupt_and_release_test_invocation,
     profiled_session_identity,
 )
@@ -258,6 +259,14 @@ from cayu.runtime._event_projection import (
     public_event_sequence,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    build_invocation_terminal_decision,
+    checkpoint_with_invocation_terminal_decision,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_event_id,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
@@ -286,6 +295,7 @@ from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.execution_units import ModelAttemptIdentity
+from cayu.runtime.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,
     ProviderOperationResolutionAction,
@@ -18671,6 +18681,24 @@ def test_session_store_conformance_records_exact_model_stage_dispatch(
             assert dispatch.source_run_epoch == running.run_epoch
 
             with pytest.raises(
+                sessions_module.SessionModelCompletionDispatchAlreadyAuthorized,
+                match="Provider dispatch was authorized",
+            ):
+                await store.transition_status_and_checkpoint(
+                    session_id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=lambda _session, checkpoint: (
+                        {} if checkpoint is None else checkpoint
+                    ),
+                    require_no_active_model_completion_dispatch=True,
+                )
+            after_conflict = await store.load(session_id)
+            assert after_conflict is not None
+            assert after_conflict.status is SessionStatus.RUNNING
+            assert after_conflict.run_epoch == running.run_epoch
+
+            with pytest.raises(
                 SessionModelCompletionStageConflict,
                 match="dispatched model-completion stage cannot be abandoned",
             ):
@@ -24548,6 +24576,422 @@ def test_session_store_conformance_interaction_transition_is_atomic_and_reconstr
                     to_status=SessionStatus.FAILED,
                 )
         finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_terminal_decision_publishes_exact_event_pair_atomically(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"terminal-decision-pair-{session_store_case[0]}"
+        interaction_id = f"terminal-decision-interaction-{session_store_case[0]}"
+        try:
+            provider = ScriptedModelProvider([])
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="scripted-model"))
+            admitted = await create_admitted_session(
+                store,
+                request=RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                provider_name=provider.name,
+                model="scripted-model",
+                interaction_id=interaction_id,
+                provider=provider,
+                app=app,
+            )
+            observed_at = datetime(2026, 9, 3, 12, tzinfo=UTC)
+            interruption_request_id = "terminal-decision-interrupt-request"
+            interaction_event_id = invocation_terminal_event_id(
+                outcome=InvocationTerminalOutcome.INTERRUPTED,
+                session_id=session_id,
+                session_instance_id=admitted.session.instance_id,
+                run_epoch=admitted.session.run_epoch,
+                interaction_id=interaction_id,
+                source_id=interruption_request_id,
+                event_kind="interaction",
+            )
+            terminal_event_id = invocation_terminal_event_id(
+                outcome=InvocationTerminalOutcome.INTERRUPTED,
+                session_id=session_id,
+                session_instance_id=admitted.session.instance_id,
+                run_epoch=admitted.session.run_epoch,
+                interaction_id=interaction_id,
+                source_id=interruption_request_id,
+                event_kind="session",
+            )
+            terminal_payload = {
+                "interruption_type": "operator_requested",
+                "interruption_request_id": interruption_request_id,
+                "reason": "stop",
+            }
+            decision = build_invocation_terminal_decision(
+                outcome=InvocationTerminalOutcome.INTERRUPTED,
+                session_id=session_id,
+                session_instance_id=admitted.session.instance_id,
+                run_epoch=admitted.session.run_epoch,
+                profile_interaction_id=interaction_id,
+                interaction_id=interaction_id,
+                execution_profile_fingerprint=(
+                    admitted.active_invocation_profile.profile.fingerprint
+                ),
+                interaction_event_id=interaction_event_id,
+                terminal_event_id=terminal_event_id,
+                observed_at=observed_at,
+                terminal_payload=terminal_payload,
+                interruption_request_id=interruption_request_id,
+            )
+
+            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+                await store.publish_checkpoint_and_events(
+                    session_id,
+                    checkpoint_transform=lambda _session, checkpoint: (
+                        checkpoint_with_invocation_terminal_decision(checkpoint, decision)
+                    ),
+                    events=[],
+                    expected_statuses={SessionStatus.RUNNING},
+                    expected_run_epoch=admitted.session.run_epoch,
+                )
+
+            interaction_event = Event(
+                id=interaction_event_id,
+                type=EventType.INTERACTION_INTERRUPTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+                timestamp=observed_at,
+            )
+            terminal_event = Event(
+                id=terminal_event_id,
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=session_id,
+                timestamp=observed_at,
+                payload=terminal_payload,
+            )
+            published = await store.publish_interaction_transition(
+                session_id,
+                event=interaction_event,
+                from_statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+                to_status=SessionStatus.INTERRUPTED,
+                terminal_event=terminal_event,
+                terminal_decision=decision,
+            )
+            assert published.session.status is SessionStatus.INTERRUPTED
+            assert published.event == interaction_event
+            assert published.terminal_event == terminal_event
+            assert (
+                invocation_terminal_decision_from_checkpoint(
+                    await store.load_checkpoint(session_id)
+                )
+                is None
+            )
+            assert (
+                settled_invocation_terminal_decision_from_checkpoint(
+                    await store.load_checkpoint(session_id)
+                )
+                == decision
+            )
+            receipt_storage_key = (
+                "__cayu_interaction_transition_v1__:"
+                + sha256(interaction_event_id.encode("utf-8")).hexdigest()
+            )
+            raw_receipt = await _load_raw_session_operation_record(
+                session_store_case,
+                store,
+                session_id=session_id,
+                storage_key=receipt_storage_key,
+            )
+            assert raw_receipt is not None
+            assert raw_receipt["schema_version"] == 6
+            assert raw_receipt["terminal_decision"] == decision.model_dump(mode="json")
+            assert [
+                record.event
+                for record in await store.query_events(
+                    EventQuery(session_id=session_id, order_by=EventOrder.SEQUENCE_ASC)
+                )
+                if record.event.id in {interaction_event_id, terminal_event_id}
+            ] == [interaction_event, terminal_event]
+
+            store = await _reopen_store(session_store_case, store)
+            replayed = await store.publish_interaction_transition(
+                session_id,
+                event=interaction_event,
+                from_statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+                to_status=SessionStatus.INTERRUPTED,
+                terminal_event=terminal_event,
+                terminal_decision=decision,
+            )
+            assert replayed.replayed is True
+            assert replayed.session == published.session
+            assert replayed.terminal_event == terminal_event
+
+            stale_failure = build_invocation_terminal_decision(
+                outcome=InvocationTerminalOutcome.FAILED,
+                session_id=session_id,
+                session_instance_id=admitted.session.instance_id,
+                run_epoch=admitted.session.run_epoch,
+                profile_interaction_id=interaction_id,
+                interaction_id=interaction_id,
+                execution_profile_fingerprint=(
+                    admitted.active_invocation_profile.profile.fingerprint
+                ),
+                interaction_event_id="stale-failure:interaction_failed",
+                terminal_event_id="stale-failure:session_failed",
+                observed_at=observed_at,
+                terminal_payload={"runtime_task_failure_id": "stale-failure"},
+                task_id="stale-task",
+                runtime_task_failure_id="stale-failure",
+                task_error_payload={"error": "stale"},
+                turn_completed_payload={"status": "failed"},
+            )
+            with pytest.raises(SessionRunFenced):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=Event(
+                        id="stale-failure:interaction_failed",
+                        type=EventType.INTERACTION_FAILED,
+                        session_id=session_id,
+                        interaction_id=interaction_id,
+                        timestamp=observed_at,
+                    ),
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.FAILED,
+                    terminal_event=Event(
+                        id="stale-failure:session_failed",
+                        type=EventType.SESSION_FAILED,
+                        session_id=session_id,
+                        timestamp=observed_at,
+                        payload={"runtime_task_failure_id": "stale-failure"},
+                    ),
+                    terminal_decision=stale_failure,
+                )
+        finally:
+            await store.release_run_fence(session_id)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_interrupt_transition_rejects_stale_latest_interaction(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"interrupt-latest-interaction-{session_store_case[0]}"
+        interaction_id = f"interrupt-latest-interaction-id-{session_store_case[0]}"
+        try:
+            provider = ScriptedModelProvider([])
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="scripted-model"))
+            admitted = await create_admitted_session(
+                store,
+                request=RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                provider_name=provider.name,
+                model="scripted-model",
+                interaction_id=interaction_id,
+                provider=provider,
+                app=app,
+            )
+            lifecycle_records = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            assert len(lifecycle_records) == 1
+            stale_event_id = lifecycle_records[0].event.id
+            newer_event = Event(
+                id=f"newer-interaction-event-{session_store_case[0]}",
+                type=EventType.INTERACTION_RESUMED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            await store.append_events(session_id, [newer_event])
+            checkpoint_before = await store.load_checkpoint(session_id)
+
+            with pytest.raises(
+                SessionRunFenced,
+                match="latest interaction changed",
+            ):
+                await store.transition_status_and_checkpoint(
+                    session_id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=lambda _session, checkpoint: {
+                        **(checkpoint or {}),
+                        "must_not_commit": True,
+                    },
+                    expected_latest_interaction_event_id=stale_event_id,
+                )
+
+            current = await store.load(session_id)
+            assert current is not None
+            assert current.instance_id == admitted.session.instance_id
+            assert current.status is SessionStatus.RUNNING
+            assert current.run_epoch == admitted.session.run_epoch
+            assert await store.load_checkpoint(session_id) == checkpoint_before
+        finally:
+            await store.release_run_fence(session_id)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_invocation_terminal_decision_rejects_non_derived_event_identity() -> None:
+    with pytest.raises(
+        ValueError,
+        match="event identities conflict with its authority",
+    ):
+        build_invocation_terminal_decision(
+            outcome=InvocationTerminalOutcome.INTERRUPTED,
+            session_id="terminal-decision-session",
+            session_instance_id="terminal-decision-instance",
+            run_epoch=1,
+            profile_interaction_id="terminal-decision-interaction",
+            interaction_id="terminal-decision-interaction",
+            execution_profile_fingerprint="0" * 64,
+            interaction_event_id="forged-interaction-event",
+            terminal_event_id="forged-terminal-event",
+            observed_at=datetime(2026, 9, 3, 12, tzinfo=UTC),
+            terminal_payload={"reason": "stop"},
+            interruption_request_id="terminal-decision-request",
+        )
+
+
+def test_session_store_conformance_terminal_decision_rejects_profile_drift(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"terminal-decision-profile-drift-{session_store_case[0]}"
+        interaction_id = f"terminal-decision-profile-interaction-{session_store_case[0]}"
+        try:
+            provider = ScriptedModelProvider([])
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="scripted-model"))
+            admitted = await create_admitted_session(
+                store,
+                request=RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                provider_name=provider.name,
+                model="scripted-model",
+                interaction_id=interaction_id,
+                provider=provider,
+                app=app,
+            )
+            observed_at = datetime(2026, 9, 3, 13, tzinfo=UTC)
+            interruption_request_id = "terminal-decision-profile-drift-request"
+            interaction_event_id = invocation_terminal_event_id(
+                outcome=InvocationTerminalOutcome.INTERRUPTED,
+                session_id=session_id,
+                session_instance_id=admitted.session.instance_id,
+                run_epoch=admitted.session.run_epoch,
+                interaction_id=interaction_id,
+                source_id=interruption_request_id,
+                event_kind="interaction",
+            )
+            terminal_event_id = invocation_terminal_event_id(
+                outcome=InvocationTerminalOutcome.INTERRUPTED,
+                session_id=session_id,
+                session_instance_id=admitted.session.instance_id,
+                run_epoch=admitted.session.run_epoch,
+                interaction_id=interaction_id,
+                source_id=interruption_request_id,
+                event_kind="session",
+            )
+            terminal_payload = {
+                "interruption_type": "operator_requested",
+                "interruption_request_id": interruption_request_id,
+                "reason": "stop",
+            }
+            forged_decision = build_invocation_terminal_decision(
+                outcome=InvocationTerminalOutcome.INTERRUPTED,
+                session_id=session_id,
+                session_instance_id=admitted.session.instance_id,
+                run_epoch=admitted.session.run_epoch,
+                profile_interaction_id=interaction_id,
+                interaction_id=interaction_id,
+                execution_profile_fingerprint="0" * 64,
+                interaction_event_id=interaction_event_id,
+                terminal_event_id=terminal_event_id,
+                observed_at=observed_at,
+                terminal_payload=terminal_payload,
+                interruption_request_id=interruption_request_id,
+            )
+
+            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+                await store.publish_checkpoint_and_events(
+                    session_id,
+                    checkpoint_transform=lambda _session, checkpoint: (
+                        checkpoint_with_invocation_terminal_decision(
+                            checkpoint,
+                            forged_decision,
+                        )
+                    ),
+                    events=[],
+                    expected_statuses={SessionStatus.RUNNING},
+                    expected_run_epoch=admitted.session.run_epoch,
+                )
+
+            with pytest.raises(SessionRunFenced):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=Event(
+                        id=interaction_event_id,
+                        type=EventType.INTERACTION_INTERRUPTED,
+                        session_id=session_id,
+                        interaction_id=interaction_id,
+                        timestamp=observed_at,
+                    ),
+                    from_statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+                    to_status=SessionStatus.INTERRUPTED,
+                    terminal_event=Event(
+                        id=terminal_event_id,
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session_id,
+                        timestamp=observed_at,
+                        payload=terminal_payload,
+                    ),
+                    terminal_decision=forged_decision,
+                )
+
+            unchanged = await store.load(session_id)
+            assert unchanged is not None
+            assert unchanged.status is SessionStatus.RUNNING
+            assert (
+                invocation_terminal_decision_from_checkpoint(
+                    await store.load_checkpoint(session_id)
+                )
+                == forged_decision
+            )
+            assert not await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=(
+                        EventType.INTERACTION_INTERRUPTED,
+                        EventType.SESSION_INTERRUPTED,
+                    ),
+                    order_by=EventOrder.SEQUENCE_ASC,
+                )
+            )
+        finally:
+            await store.release_run_fence(session_id)
             await _close_store(store)
 
     asyncio.run(run())

@@ -26,14 +26,19 @@ from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
+    EnqueueSessionMessageRequest,
     Event,
     EventQuery,
     EventType,
     ExecutionProfileBehaviorIdentity,
     ExecutionProfileMismatchError,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InMemoryTaskStore,
     InterruptedTaskContinuationClaimPage,
+    InterruptSessionRequest,
     Message,
     ModelStreamEvent,
     PendingActionQuery,
@@ -44,7 +49,10 @@ from cayu import (
     RuntimeHook,
     RuntimeHookContext,
     ScriptedModelProvider,
+    SessionMessageDeliveryMode,
+    SessionMessageQueueStatus,
     SessionRunFenced,
+    SessionStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
     Task,
@@ -81,7 +89,18 @@ from cayu import (
     interrupted_task_handoff_request,
     run_task_worker,
 )
+from cayu.providers import ModelProvider, ModelRequest
 from cayu.runtime import SessionStatus
+from cayu.runtime._continuation_task_failure import (
+    runtime_task_terminalization_idempotency_key,
+)
+from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.runtime.provider_operations import provider_operation_resolution_request_digest
 from cayu.runtime.sessions import (
     ModelCompletionStageDisposition,
@@ -2405,6 +2424,409 @@ def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plan
     assert handoff_evidence == [
         ("task-handoff", "released"),
     ]
+
+
+@pytest.mark.parametrize("session_store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "settle_before_stale_claim",
+    [False, True],
+    ids=["active-winner", "settled-winner"],
+)
+def test_remote_interrupt_wins_linked_task_failure_and_preserves_queued_turn(
+    session_store_kind: str,
+    settle_before_stale_claim: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InterruptThenFailProvider(ModelProvider):
+        name = "interrupt-then-fail"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.started = asyncio.Event()
+            self.release_failure = asyncio.Event()
+
+        async def stream(self, request: ModelRequest):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                self.started.set()
+                await self.release_failure.wait()
+                raise RuntimeError("provider failed after remote interruption")
+            yield ModelStreamEvent.text_delta("continued exactly once")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> None:
+        session_store: SessionStore = (
+            InMemorySessionStore()
+            if session_store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "terminal-race-sessions.sqlite")
+        )
+        task_store: TaskStore = SQLiteTaskStore(tmp_path / "terminal-race-tasks.sqlite")
+        provider = InterruptThenFailProvider()
+        owner = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        interrupter = CayuApp(session_store=session_store, enable_logging=False)
+        for app in (owner, interrupter):
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        stale_claim_entered = asyncio.Event()
+        release_stale_claim = asyncio.Event()
+        if settle_before_stale_claim:
+            original_claim = owner._session_engine._claim_invocation_terminal_decision
+
+            async def pause_stale_failure_claim(*, session, decision):
+                stale_claim_entered.set()
+                await release_stale_claim.wait()
+                await original_claim(session=session, decision=decision)
+
+            monkeypatch.setattr(
+                owner._session_engine,
+                "_claim_invocation_terminal_decision",
+                pause_stale_failure_claim,
+            )
+        await task_store.create_task(
+            TaskCreate(
+                task_id="terminal-race-task",
+                type="job",
+                assigned_agent_name="worker-agent",
+            )
+        )
+
+        async def execute(
+            app: CayuApp,
+            task: Task,
+            worker_id: str,
+        ) -> TaskHandlerOutcome:
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="terminal-race-session",
+                    task_id=task.id,
+                    task_worker_id=worker_id,
+                    task_lease_expires_at=task.lease_expires_at,
+                    messages=[Message.text("user", "begin")],
+                )
+            ):
+                pass
+            return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                owner,
+                task_store,
+                execute,
+                worker_id="terminal-race-worker",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                reclaim=False,
+            )
+        )
+        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        accepted = await interrupter.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id="terminal-race-session",
+                idempotency_key="terminal-race-next-turn",
+                content="deliver after interruption",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+        )
+
+        async def interrupt() -> list[Event]:
+            return [
+                event
+                async for event in interrupter.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="terminal-race-session",
+                        reason="remote operator wins",
+                    )
+                )
+            ]
+
+        interrupt_task = asyncio.create_task(interrupt())
+        for _ in range(500):
+            current = await session_store.load("terminal-race-session")
+            if current is not None and current.status is SessionStatus.INTERRUPTING:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("Remote interruption did not reach its durable decision.")
+        provider.release_failure.set()
+        if settle_before_stale_claim:
+            await asyncio.wait_for(stale_claim_entered.wait(), timeout=5)
+            interrupting = await session_store.load("terminal-race-session")
+            checkpoint = await session_store.load_checkpoint("terminal-race-session")
+            interruption_decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+            already_settled = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
+            assert interrupting is not None
+            assert interrupting.status is SessionStatus.INTERRUPTING
+            if interruption_decision is None and already_settled is None:
+                assert checkpoint is not None
+                terminal_payload = checkpoint[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY]
+                assert type(terminal_payload) is dict
+                interruption_request_id = interruption_request_id_from_payload(terminal_payload)
+                assert interruption_request_id is not None
+                interruption_decision = (
+                    await interrupter._session_engine._ensure_interruption_terminal_decision(
+                        session=interrupting,
+                        terminal_payload=terminal_payload,
+                        interruption_request_id=interruption_request_id,
+                    )
+                )
+            if interruption_decision is None:
+                interruption_decision = already_settled
+            assert interruption_decision is not None
+            assert interruption_decision.outcome is InvocationTerminalOutcome.INTERRUPTED
+            if already_settled is None:
+                assert interruption_decision.interaction_event_id is not None
+                decided_terminal_event = Event(
+                    id=interruption_decision.terminal_event_id,
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="terminal-race-session",
+                    timestamp=interruption_decision.observed_at,
+                    payload=interruption_decision.terminal_payload,
+                )
+                await session_store.publish_interaction_transition(
+                    "terminal-race-session",
+                    event=Event(
+                        id=interruption_decision.interaction_event_id,
+                        type=EventType.INTERACTION_INTERRUPTED,
+                        session_id="terminal-race-session",
+                        interaction_id=interruption_decision.interaction_id,
+                        timestamp=interruption_decision.observed_at,
+                    ),
+                    from_statuses={SessionStatus.INTERRUPTING},
+                    to_status=SessionStatus.INTERRUPTED,
+                    terminal_event=decided_terminal_event,
+                    terminal_decision=interruption_decision,
+                )
+            settled_checkpoint = await session_store.load_checkpoint("terminal-race-session")
+            assert invocation_terminal_decision_from_checkpoint(settled_checkpoint) is None
+            assert (
+                settled_invocation_terminal_decision_from_checkpoint(settled_checkpoint)
+                == interruption_decision
+            )
+            release_stale_claim.set()
+
+        assert await asyncio.wait_for(worker, timeout=10) == 1
+        interrupt_events = await asyncio.wait_for(interrupt_task, timeout=10)
+        interrupted_task = await task_store.load_task("terminal-race-task")
+        interrupted_session = await session_store.load("terminal-race-session")
+        durable_events = await session_store.load_events("terminal-race-session")
+        assert interrupted_task is not None
+        assert interrupted_task.status is TaskStatus.RUNNING
+        assert interrupted_task.worker_id is None
+        assert interrupted_session is not None
+        assert interrupted_session.status is SessionStatus.INTERRUPTED
+        assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+        assert sum(event.type is EventType.SESSION_INTERRUPTED for event in durable_events) == 1
+        assert not any(event.type is EventType.SESSION_FAILED for event in durable_events)
+        assert not any(event.type is EventType.TASK_FAILED for event in durable_events)
+        replay = await interrupter.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id="terminal-race-session",
+                idempotency_key="terminal-race-next-turn",
+                content="deliver after interruption",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+        )
+        assert replay.replayed is True
+        assert replay.message.queue_id == accepted.message.queue_id
+        assert replay.message.status is SessionMessageQueueStatus.QUEUED
+
+        continuation = await task_store.claim_interrupted_task_continuation(
+            "terminal-race-continuation",
+            TaskQuery(type="job"),
+            handoff_id=str(uuid4()),
+        )
+        assert continuation.task is not None
+        if settle_before_stale_claim:
+            # This variant deliberately publishes only the winning terminal
+            # pair, before the winner's trailing cleanup releases the session
+            # fence. Its purpose is to prove that a stale task-failure owner
+            # still recognizes the immutable winner receipt and leaves the
+            # interrupted task claimable instead of failing it.
+            assert continuation.task.status is TaskStatus.RUNNING
+            if isinstance(session_store, SQLiteSessionStore):
+                await session_store.close()
+            await task_store.close()
+            return
+        resumed = [
+            event
+            async for event in owner.resume(
+                ResumeRequest(
+                    session_id="terminal-race-session",
+                    task_worker_id="terminal-race-continuation",
+                    task_handoff_id=continuation.task.interrupted_handoff_id,
+                    messages=[Message.text("user", "resume")],
+                )
+            )
+        ]
+        assert resumed[-1].type is EventType.SESSION_COMPLETED
+        completed_task = await task_store.load_task("terminal-race-task")
+        assert completed_task is not None and completed_task.status is TaskStatus.COMPLETED
+        assert len(provider.requests) == 2
+        queued_deliveries = [
+            event
+            for event in await session_store.load_events("terminal-race-session")
+            if event.type is EventType.SESSION_MESSAGE_DELIVERED
+            and event.payload.get("queue_id") == accepted.message.queue_id
+        ]
+        assert len(queued_deliveries) == 1
+
+        if isinstance(session_store, SQLiteSessionStore):
+            await session_store.close()
+        await task_store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("session_store_kind", ["memory", "sqlite"])
+def test_linked_task_failure_winner_fences_remote_interrupt(
+    session_store_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ControlledFailureProvider(ModelProvider):
+        name = "controlled-terminal-failure"
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.fail = asyncio.Event()
+            self.request_count = 0
+
+        async def stream(self, request: ModelRequest):
+            self.request_count += 1
+            self.started.set()
+            await self.fail.wait()
+            raise RuntimeError("linked task failure wins")
+            yield  # pragma: no cover
+
+    async def run() -> None:
+        session_store: SessionStore = (
+            InMemorySessionStore()
+            if session_store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "failure-winner-sessions.sqlite")
+        )
+        task_store: TaskStore = SQLiteTaskStore(tmp_path / "failure-winner-tasks.sqlite")
+        provider = ControlledFailureProvider()
+        owner = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        interrupter = CayuApp(session_store=session_store, enable_logging=False)
+        for app in (owner, interrupter):
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        await task_store.create_task(
+            TaskCreate(
+                task_id="failure-winner-task",
+                type="job",
+                assigned_agent_name="worker-agent",
+            )
+        )
+
+        decision_claimed = asyncio.Event()
+        release_failure_owner = asyncio.Event()
+        original_claim = owner._session_engine._claim_invocation_terminal_decision
+
+        async def claim_then_pause(*, session, decision):
+            await original_claim(session=session, decision=decision)
+            decision_claimed.set()
+            await release_failure_owner.wait()
+
+        monkeypatch.setattr(
+            owner._session_engine,
+            "_claim_invocation_terminal_decision",
+            claim_then_pause,
+        )
+
+        async def execute(
+            app: CayuApp,
+            task: Task,
+            worker_id: str,
+        ) -> TaskHandlerOutcome:
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="failure-winner-session",
+                    task_id=task.id,
+                    task_worker_id=worker_id,
+                    task_lease_expires_at=task.lease_expires_at,
+                    messages=[Message.text("user", "begin")],
+                )
+            ):
+                pass
+            return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                owner,
+                task_store,
+                execute,
+                worker_id="failure-winner-worker",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                reclaim=False,
+            )
+        )
+        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        accepted = await interrupter.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id="failure-winner-session",
+                idempotency_key="failure-winner-next-turn",
+                content="preserve despite failure",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+        )
+        provider.fail.set()
+        await asyncio.wait_for(decision_claimed.wait(), timeout=5)
+
+        with pytest.raises(
+            (RuntimeError, SessionRunFenced, TimeoutError),
+            match="terminal|fenc|finalizing",
+        ):
+            _ = [
+                event
+                async for event in interrupter.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="failure-winner-session",
+                        reason="late remote interrupt",
+                    )
+                )
+            ]
+        release_failure_owner.set()
+        assert await asyncio.wait_for(worker, timeout=10) == 1
+
+        failed_task = await task_store.load_task("failure-winner-task")
+        failed_session = await session_store.load("failure-winner-session")
+        durable_events = await session_store.load_events("failure-winner-session")
+        assert failed_task is not None and failed_task.status is TaskStatus.FAILED
+        assert failed_session is not None and failed_session.status is SessionStatus.FAILED
+        assert sum(event.type is EventType.SESSION_FAILED for event in durable_events) == 1
+        assert sum(event.type is EventType.TASK_FAILED for event in durable_events) == 1
+        assert not any(event.type is EventType.SESSION_INTERRUPTED for event in durable_events)
+        queued_replay = await interrupter.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id="failure-winner-session",
+                idempotency_key="failure-winner-next-turn",
+                content="preserve despite failure",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+        )
+        assert queued_replay.replayed is True
+        assert queued_replay.message.queue_id == accepted.message.queue_id
+        assert queued_replay.message.status is SessionMessageQueueStatus.QUEUED
+        assert provider.request_count == 1
+
+        if isinstance(session_store, SQLiteSessionStore):
+            await session_store.close()
+        await task_store.close()
+
+    asyncio.run(run())
 
 
 def test_terminal_peer_winner_during_handoff_does_not_stop_worker() -> None:
@@ -5807,7 +6229,9 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
         )
 
         original_publish = app._session_engine._publish_sibling_interaction_transition
-        original_terminal = app._session_engine._emit_terminal_event_with_hooks
+        original_atomic_terminal = (
+            app._session_engine._emit_atomically_persisted_terminal_event_with_hooks
+        )
 
         async def lose_after_task_failure(*args, **kwargs):
             if kwargs.get("to_status") is SessionStatus.FAILED:
@@ -5824,13 +6248,13 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
                 and event.payload.get("runtime_task_failure_id") is not None
             ):
                 raise _ContinuationProcessLoss(
-                    "process lost after interaction failure and before session event"
+                    "process lost after atomic terminal publication and before event delivery"
                 )
-            async for emitted in original_terminal(*args, **kwargs):
+            async for emitted in original_atomic_terminal(*args, **kwargs):
                 yield emitted
 
         async def lose_after_session_event(*args, **kwargs):
-            async for emitted in original_terminal(*args, **kwargs):
+            async for emitted in original_atomic_terminal(*args, **kwargs):
                 yield emitted
                 if (
                     emitted.type is EventType.SESSION_FAILED
@@ -5849,13 +6273,13 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
         elif loss_point == "before_session_event":
             monkeypatch.setattr(
                 app._session_engine,
-                "_emit_terminal_event_with_hooks",
+                "_emit_atomically_persisted_terminal_event_with_hooks",
                 lose_before_session_event,
             )
         else:
             monkeypatch.setattr(
                 app._session_engine,
-                "_emit_terminal_event_with_hooks",
+                "_emit_atomically_persisted_terminal_event_with_hooks",
                 lose_after_session_event,
             )
         with pytest.raises(_ContinuationProcessLoss):
@@ -5870,11 +6294,11 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
             "cayu.runtime-task-failure.v2"
         )
         assert live_session is not None
-        assert failed_task.error["runtime_task_failure"]["run_epoch"] == (
-            live_session.run_epoch
-            if loss_point == "before_interaction"
-            else live_session.run_epoch - 1
-        )
+        failure_run_epoch = failed_task.error["runtime_task_failure"]["run_epoch"]
+        assert live_session.run_epoch in {
+            failure_run_epoch,
+            failure_run_epoch + (0 if loss_point == "before_interaction" else 1),
+        }
         assert live_session.status is (
             SessionStatus.RUNNING if loss_point == "before_interaction" else SessionStatus.FAILED
         )
@@ -5895,8 +6319,8 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
         )
         monkeypatch.setattr(
             app._session_engine,
-            "_emit_terminal_event_with_hooks",
-            original_terminal,
+            "_emit_atomically_persisted_terminal_event_with_hooks",
+            original_atomic_terminal,
         )
         drifted_hook = _VersionedSessionFailureHook("2")
         drifted_app = CayuApp(
@@ -6046,7 +6470,589 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
     asyncio.run(scenario())
 
 
-def test_elected_worker_completes_task_through_manual_tool_recovery() -> None:
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("recovery_entrance", ["single", "batch"])
+@pytest.mark.parametrize("failure_signal", ["process_loss", "ordinary_store_failure"])
+def test_recovery_finishes_failure_decision_committed_before_task_terminalization(
+    store_kind: str,
+    recovery_entrance: str,
+    failure_signal: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _WorkerProcessLoss(BaseException):
+        pass
+
+    ownership_now = [datetime(2026, 1, 1, tzinfo=UTC)]
+
+    async def scenario() -> None:
+        task_store: TaskStore = (
+            InMemoryTaskStore(ownership_clock=lambda: ownership_now[0])
+            if store_kind == "memory"
+            else SQLiteTaskStore(
+                tmp_path / "pre-terminal-task-loss.sqlite",
+                ownership_clock=lambda: ownership_now[0],
+            )
+        )
+        session_store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "pre-terminal-session-loss.sqlite")
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.error("provider failed before task terminalization"),
+                    ModelStreamEvent.completed({"finish_reason": "error"}),
+                ]
+            ]
+        )
+        app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        await task_store.create_task(TaskCreate(task_id="pre-terminal-task-loss", type="job"))
+        claimed = await task_store.claim_task("lost-worker", lease_seconds=1)
+        assert claimed is not None and claimed.lease_expires_at is not None
+
+        original_fail_task = app._session_engine._fail_task
+
+        async def lose_before_task_terminalization(*args, **kwargs):
+            del args, kwargs
+            if failure_signal == "ordinary_store_failure":
+                raise RuntimeError("task store unavailable before terminalization")
+            raise _WorkerProcessLoss("worker disappeared after the failure decision committed")
+
+        monkeypatch.setattr(
+            app._session_engine,
+            "_fail_task",
+            lose_before_task_terminalization,
+        )
+        expected_failure = _WorkerProcessLoss if failure_signal == "process_loss" else RuntimeError
+        with pytest.raises(expected_failure):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="pre-terminal-session-loss",
+                    task_id=claimed.id,
+                    task_worker_id="lost-worker",
+                    task_lease_expires_at=claimed.lease_expires_at,
+                    messages=[Message.text("user", "fail this attempt")],
+                )
+            ):
+                pass
+        monkeypatch.setattr(app._session_engine, "_fail_task", original_fail_task)
+
+        stranded_task = await task_store.load_task(claimed.id)
+        stranded_session = await session_store.load("pre-terminal-session-loss")
+        stranded_checkpoint = await session_store.load_checkpoint("pre-terminal-session-loss")
+        decision = invocation_terminal_decision_from_checkpoint(stranded_checkpoint)
+        assert stranded_task is not None and stranded_task.status is TaskStatus.RUNNING
+        assert stranded_session is not None and stranded_session.status is SessionStatus.RUNNING
+        assert decision is not None
+        assert decision.outcome is InvocationTerminalOutcome.FAILED
+        assert decision.task_id == claimed.id
+
+        recovered_app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        recovered_app.register_provider(provider, default=True)
+        recovered_app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+        async def recover_once():
+            if recovery_entrance == "single":
+                return await recovered_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id="pre-terminal-session-loss",
+                        inactive_for_seconds=None,
+                        reason="recover_committed_failure",
+                    )
+                )
+            page = await recovered_app.recover_incomplete_sessions(
+                IncompleteSessionsRecoveryRequest(
+                    statuses={SessionStatus.RUNNING},
+                    inactive_for_seconds=None,
+                    reason="recover_committed_failure",
+                )
+            )
+            assert len(page.results) == 1
+            return page.results[0]
+
+        live_owner = await recover_once()
+        assert live_owner.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert (await task_store.load_task(claimed.id)).status is TaskStatus.RUNNING
+        ownership_now[0] += timedelta(seconds=2)
+        recovered = await recover_once()
+
+        failed_task = await task_store.load_task(claimed.id)
+        failed_session = await session_store.load("pre-terminal-session-loss")
+        assert failed_task is not None and failed_task.status is TaskStatus.FAILED
+        assert failed_session is not None and failed_session.status is SessionStatus.FAILED
+        assert recovered.status is SessionStatus.FAILED
+        assert recovered.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,)
+        assert len(provider.requests) == 1
+        durable_events = await session_store.load_events("pre-terminal-session-loss")
+        assert sum(event.type is EventType.TASK_FAILED for event in durable_events) == 1
+        assert sum(event.type is EventType.INTERACTION_FAILED for event in durable_events) == 1
+        assert sum(event.type is EventType.SESSION_FAILED for event in durable_events) == 1
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+        if isinstance(session_store, SQLiteSessionStore):
+            await session_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("recovery_entrance", ["single", "batch"])
+@pytest.mark.parametrize("terminalization_ack_lost", [False, True])
+def test_recovery_finishes_failure_after_claimed_task_terminalization_commits(
+    store_kind: str,
+    recovery_entrance: str,
+    terminalization_ack_lost: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _WorkerProcessLoss(BaseException):
+        pass
+
+    async def scenario() -> None:
+        task_store: TaskStore = (
+            InMemoryTaskStore()
+            if store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "post-terminal-task-loss.sqlite")
+        )
+        session_store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "post-terminal-session-loss.sqlite")
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.error("provider failed before terminal publication"),
+                    ModelStreamEvent.completed({"finish_reason": "error"}),
+                ]
+            ]
+        )
+        app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        await task_store.create_task(TaskCreate(task_id="post-terminal-task-loss", type="job"))
+        claimed = await task_store.claim_task("lost-worker", lease_seconds=300)
+        assert claimed is not None and claimed.lease_expires_at is not None
+
+        if terminalization_ack_lost:
+            original_terminalize = task_store.terminalize_task
+            terminalization_calls = 0
+
+            async def terminalize_then_lose_acknowledgement(request):
+                nonlocal terminalization_calls
+                terminalization_calls += 1
+                task = await original_terminalize(request)
+                if terminalization_calls == 1:
+                    raise ConnectionError("task terminalization acknowledgement lost")
+                return task
+
+            monkeypatch.setattr(
+                task_store,
+                "terminalize_task",
+                terminalize_then_lose_acknowledgement,
+            )
+
+        original_emit = app._event_writer.emit
+
+        async def lose_before_task_failure_event(event: Event):
+            if event.type is EventType.TASK_FAILED:
+                raise _WorkerProcessLoss("worker disappeared after task failure committed")
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", lose_before_task_failure_event)
+        with pytest.raises(_WorkerProcessLoss):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="post-terminal-session-loss",
+                    task_id=claimed.id,
+                    task_worker_id="lost-worker",
+                    task_lease_expires_at=claimed.lease_expires_at,
+                    messages=[Message.text("user", "fail this attempt")],
+                )
+            ):
+                pass
+
+        failed_before_recovery = await task_store.load_task(claimed.id)
+        running_before_recovery = await session_store.load("post-terminal-session-loss")
+        checkpoint = await session_store.load_checkpoint("post-terminal-session-loss")
+        decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+        assert failed_before_recovery is not None
+        assert failed_before_recovery.status is TaskStatus.FAILED
+        assert failed_before_recovery.worker_id is None
+        assert failed_before_recovery.lease_expires_at is None
+        assert failed_before_recovery.interrupted_handoff_id is None
+        assert running_before_recovery is not None
+        assert running_before_recovery.status is SessionStatus.RUNNING
+        assert decision is not None
+        assert decision.outcome is InvocationTerminalOutcome.FAILED
+        assert decision.task_terminalization_request_sha256 is not None
+        receipt = await task_store.load_task_terminalization_receipt(
+            claimed.id,
+            runtime_task_terminalization_idempotency_key(
+                task_id=claimed.id,
+                session_id="post-terminal-session-loss",
+                kind=TaskTerminalKind.FAILED,
+            ),
+        )
+        assert receipt is not None
+        assert receipt.request_sha256 == decision.task_terminalization_request_sha256
+        before_events = await session_store.load_events("post-terminal-session-loss")
+        assert not any(event.type is EventType.TASK_FAILED for event in before_events)
+        assert not any(event.type is EventType.SESSION_FAILED for event in before_events)
+
+        recovered_app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        recovered_app.register_provider(provider, default=True)
+        recovered_app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        if (
+            store_kind == "memory"
+            and recovery_entrance == "single"
+            and not terminalization_ack_lost
+        ):
+            original_load_receipt = task_store.load_task_terminalization_receipt
+
+            async def load_missing_receipt(_task_id: str, _idempotency_key: str):
+                return None
+
+            monkeypatch.setattr(
+                task_store,
+                "load_task_terminalization_receipt",
+                load_missing_receipt,
+            )
+            with pytest.raises(TaskClaimLost, match="elected receipt"):
+                await recovered_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id="post-terminal-session-loss",
+                        inactive_for_seconds=None,
+                        reason="reject_missing_claimed_terminal_receipt",
+                    )
+                )
+
+            async def load_conflicting_receipt(task_id: str, idempotency_key: str):
+                loaded = await original_load_receipt(task_id, idempotency_key)
+                assert loaded is not None
+                return loaded.model_copy(update={"request_sha256": "0" * 64})
+
+            monkeypatch.setattr(
+                task_store,
+                "load_task_terminalization_receipt",
+                load_conflicting_receipt,
+            )
+            with pytest.raises(TaskClaimLost, match="elected receipt"):
+                await recovered_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id="post-terminal-session-loss",
+                        inactive_for_seconds=None,
+                        reason="reject_conflicting_claimed_terminal_receipt",
+                    )
+                )
+            monkeypatch.setattr(
+                task_store,
+                "load_task_terminalization_receipt",
+                original_load_receipt,
+            )
+            rejected_session = await session_store.load("post-terminal-session-loss")
+            rejected_events = await session_store.load_events("post-terminal-session-loss")
+            assert rejected_session is not None
+            assert rejected_session.status is SessionStatus.RUNNING
+            assert not any(event.type is EventType.TASK_FAILED for event in rejected_events)
+            assert not any(event.type is EventType.SESSION_FAILED for event in rejected_events)
+        if recovery_entrance == "single":
+            recovered = await recovered_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id="post-terminal-session-loss",
+                    inactive_for_seconds=None,
+                    reason="recover_claimed_terminal_failure",
+                )
+            )
+        else:
+            page = await recovered_app.recover_incomplete_sessions(
+                IncompleteSessionsRecoveryRequest(
+                    statuses={SessionStatus.RUNNING},
+                    inactive_for_seconds=None,
+                    reason="recover_claimed_terminal_failure",
+                )
+            )
+            assert len(page.results) == 1
+            recovered = page.results[0]
+
+        failed_task = await task_store.load_task(claimed.id)
+        failed_session = await session_store.load("post-terminal-session-loss")
+        assert failed_task == failed_before_recovery
+        assert failed_session is not None and failed_session.status is SessionStatus.FAILED
+        assert recovered.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,)
+        assert len(provider.requests) == 1
+        durable_events = await session_store.load_events("post-terminal-session-loss")
+        assert sum(event.type is EventType.TASK_FAILED for event in durable_events) == 1
+        assert sum(event.type is EventType.INTERACTION_FAILED for event in durable_events) == 1
+        assert sum(event.type is EventType.SESSION_FAILED for event in durable_events) == 1
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+        if isinstance(session_store, SQLiteSessionStore):
+            await session_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("terminalization_acknowledgement_loss", [False, True])
+@pytest.mark.parametrize("wrap_handler_error", [False, True])
+def test_task_worker_preserves_elected_failure_when_task_terminalization_fails_before_commit(
+    store_kind: str,
+    terminalization_acknowledgement_loss: bool,
+    wrap_handler_error: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        task_store: TaskStore = (
+            InMemoryTaskStore()
+            if store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "worker-terminalization-task.sqlite")
+        )
+        session_store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "worker-terminalization-session.sqlite")
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.error("provider failed under the managed worker"),
+                    ModelStreamEvent.completed({"finish_reason": "error"}),
+                ]
+            ]
+        )
+        app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        await task_store.create_task(TaskCreate(task_id="worker-terminalization-task", type="job"))
+
+        original_fail_task = app._session_engine._fail_task
+        fail_calls = 0
+
+        async def fail_before_task_terminalization(*args, **kwargs):
+            nonlocal fail_calls
+            fail_calls += 1
+            if fail_calls == 1:
+                raise RuntimeError("task store unavailable before terminalization")
+            return await original_fail_task(*args, **kwargs)
+
+        monkeypatch.setattr(
+            app._session_engine,
+            "_fail_task",
+            fail_before_task_terminalization,
+        )
+        original_terminalize = task_store.terminalize_task
+        terminalization_calls = 0
+        terminalization_patch_installed = False
+
+        async def terminalize_then_lose_acknowledgement(request):
+            nonlocal terminalization_calls
+            terminalization_calls += 1
+            terminal = await original_terminalize(request)
+            if terminalization_acknowledgement_loss and terminalization_calls == 1:
+                raise ConnectionError("task terminalization acknowledgement lost")
+            return terminal
+
+        async def handler(
+            runtime: CayuApp,
+            task: Task,
+            worker_id: str,
+        ) -> None:
+            nonlocal terminalization_patch_installed
+            assert task.lease_expires_at is not None
+            if not terminalization_patch_installed:
+                monkeypatch.setattr(
+                    task_store,
+                    "terminalize_task",
+                    terminalize_then_lose_acknowledgement,
+                )
+                terminalization_patch_installed = True
+
+            async def execute() -> None:
+                async for _event in runtime.run(
+                    RunRequest(
+                        agent_name="worker-agent",
+                        session_id="worker-terminalization-session",
+                        task_id=task.id,
+                        task_worker_id=worker_id,
+                        task_lease_expires_at=task.lease_expires_at,
+                        messages=[Message.text("user", "fail this managed attempt")],
+                    )
+                ):
+                    pass
+
+            if not wrap_handler_error:
+                await execute()
+                return
+            try:
+                await execute()
+            except Exception as exc:
+                raise RuntimeError("application handler wrapped the runtime failure") from exc
+
+        processed = await run_task_worker(
+            app,
+            task_store,
+            handler,
+            worker_id="managed-worker",
+            poll_interval_s=0.001,
+            reclaim=False,
+            max_tasks=1,
+        )
+        assert processed == 1
+        assert fail_calls == 1
+        assert terminalization_calls == 1
+
+        failed_task = await task_store.load_task("worker-terminalization-task")
+        running_session = await session_store.load("worker-terminalization-session")
+        checkpoint = await session_store.load_checkpoint("worker-terminalization-session")
+        decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+        assert failed_task is not None
+        assert failed_task.status is TaskStatus.FAILED
+        assert failed_task.worker_id is None
+        assert failed_task.lease_expires_at is None
+        assert failed_task.error is not None
+        assert running_session is not None
+        assert running_session.status is SessionStatus.RUNNING
+        assert decision is not None
+        assert decision.outcome is InvocationTerminalOutcome.FAILED
+        assert decision.task_id == failed_task.id
+        assert decision.task_terminalization_request_sha256 is not None
+        receipt = await task_store.load_task_terminalization_receipt(
+            failed_task.id,
+            runtime_task_terminalization_idempotency_key(
+                task_id=failed_task.id,
+                session_id=running_session.id,
+                kind=TaskTerminalKind.FAILED,
+            ),
+        )
+        assert receipt is not None
+        assert receipt.request_sha256 == decision.task_terminalization_request_sha256
+        assert receipt.task == failed_task
+
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=running_session.id,
+                inactive_for_seconds=None,
+                reason="recover_worker_terminalization_failure",
+            )
+        )
+        terminal_task = await task_store.load_task(failed_task.id)
+        terminal_session = await session_store.load(running_session.id)
+        assert terminal_task is not None and terminal_task.status is TaskStatus.FAILED
+        assert terminal_session is not None and terminal_session.status is SessionStatus.FAILED
+        assert recovered.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,)
+        assert len(provider.requests) == 1
+        durable_events = await session_store.load_events(running_session.id)
+        assert sum(event.type is EventType.TASK_FAILED for event in durable_events) == 1
+        assert sum(event.type is EventType.INTERACTION_FAILED for event in durable_events) == 1
+        assert sum(event.type is EventType.SESSION_FAILED for event in durable_events) == 1
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+        if isinstance(session_store, SQLiteSessionStore):
+            await session_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "store_kind",
+    ["explicitly-unsupported", "inherited-declaration", "undeclared-method-override"],
+)
+def test_task_linked_run_rejects_unsupported_terminal_publication_before_mutation(
+    store_kind: str,
+) -> None:
+    class ExplicitlyUnsupportedStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+        terminal_interaction_publication_version = None
+
+    class InheritedDeclarationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+    class UndeclaredMethodOverrideStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
+            return await super().publish_checkpoint_and_events(session_id, **kwargs)
+
+    async def scenario() -> None:
+        store_type = {
+            "explicitly-unsupported": ExplicitlyUnsupportedStore,
+            "inherited-declaration": InheritedDeclarationStore,
+            "undeclared-method-override": UndeclaredMethodOverrideStore,
+        }[store_kind]
+        session_store = store_type()
+        task_store = InMemoryTaskStore()
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("must not dispatch"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        created = await task_store.create_task(
+            TaskCreate(task_id="unsupported-terminal-task", type="job")
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="does not support atomic terminal interaction publication",
+        ):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="unsupported-terminal-session",
+                    task_id=created.id,
+                    messages=[Message.text("user", "must fail closed")],
+                )
+            ):
+                pass
+
+        assert await session_store.load("unsupported-terminal-session") is None
+        assert await task_store.load_task(created.id) == created
+        assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_elected_worker_cannot_override_task_failure_through_manual_tool_recovery() -> None:
     class RecoverableTool(Tool):
         spec = ToolSpec(
             name="recoverable_tool",
@@ -6066,6 +7072,7 @@ def test_elected_worker_completes_task_through_manual_tool_recovery() -> None:
 
     class FailFirstToolTerminalStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
+        terminal_interaction_publication_version = 1
 
         def __init__(self) -> None:
             super().__init__()
@@ -6130,23 +7137,24 @@ def test_elected_worker_completes_task_through_manual_tool_recovery() -> None:
         claimed = await task_store.claim_task("prior-worker", TaskQuery(type="job"))
         assert claimed is not None
         initial_events: list[Event] = []
-        async for event in app.run(
-            RunRequest(
-                agent_name="worker-agent",
-                session_id="elected-tool-recovery-session",
-                task_id=claimed.id,
-                task_worker_id="prior-worker",
-                task_lease_expires_at=claimed.lease_expires_at,
-                messages=[Message.text("user", "Publish the recovered release.")],
-            )
-        ):
-            initial_events.append(event)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            async for event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="elected-tool-recovery-session",
+                    task_id=claimed.id,
+                    task_worker_id="prior-worker",
+                    task_lease_expires_at=claimed.lease_expires_at,
+                    messages=[Message.text("user", "Publish the recovered release.")],
+                )
+            ):
+                initial_events.append(event)
 
         crashed_session = await session_store.load("elected-tool-recovery-session")
         attached = await task_store.load_task("elected-tool-recovery-task")
         checkpoint = await session_store.load_checkpoint("elected-tool-recovery-session")
-        assert initial_events[-1].type is EventType.SESSION_FAILED
-        assert crashed_session is not None and crashed_session.status is SessionStatus.FAILED
+        assert initial_events[-1].type is EventType.TOOL_CALL_STARTED
+        assert crashed_session is not None and crashed_session.status is SessionStatus.RUNNING
         assert attached is not None and attached.worker_id == "prior-worker"
         assert checkpoint is not None
         pending_round = checkpoint["pending_tool_round"]
@@ -6189,10 +7197,12 @@ def test_elected_worker_completes_task_through_manual_tool_recovery() -> None:
         )
 
     task, session_status = asyncio.run(scenario())
-    assert task is not None and task.status is TaskStatus.COMPLETED
+    assert task is not None and task.status is TaskStatus.FAILED
     assert task.worker_id is None
-    assert session_status is SessionStatus.COMPLETED
-    assert len(provider.requests) == 2
+    assert task.error is not None
+    assert task.error["runtime_task_failure"]["schema"] == "cayu.runtime-task-failure.v2"
+    assert session_status is SessionStatus.FAILED
+    assert len(provider.requests) == 1
 
 
 def test_tool_approval_rechecks_worker_authority_after_session_admission() -> None:

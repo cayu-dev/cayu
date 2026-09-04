@@ -44,7 +44,7 @@ records detached request history so tests can inspect stable request-aware evide
 ## Root checkpoint schema compatibility
 
 The runtime-owned root checkpoint object carries
-`checkpoint_schema_version`. The current version is `6` and the minimum
+`checkpoint_schema_version`. The current version is `7` and the minimum
 supported version is `1`. A versionless root is the single supported legacy
 representation and is decoded as version 1; a present value that is not a positive integer is
 never treated as legacy. Runtime reads decode at one compatibility boundary
@@ -121,6 +121,14 @@ and rejects future checkpoint schemas without mutation. Generic metadata,
 checkpoint, publication, and extension transforms therefore cannot create,
 replace, delete, or reinterpret invocation lifecycle receipts. Only the
 authenticated lifecycle command adapter may mutate this root.
+
+The version 6 to version 7 upcaster reserves
+`invocation_terminal_decision` for the runtime-owned winner when external
+interruption races a linked task failure. Historical roots do not gain an
+invented winner, and any colliding pre-v7 value is discarded. Generic
+checkpoint writers cannot create, replace, or delete this decision. Only the
+typed invocation terminal-decision and interaction-transition boundaries may
+install or settle it.
 
 Custom `SessionStore` implementations must accept the optional
 `checkpoint_root_guard` on bounded pending-action, interruption-marker,
@@ -5188,6 +5196,60 @@ cleanup failure. Ownerless replay additionally requires a receipt-capable task
 store and authoritative absence of the claimed-worker receipt; malformed,
 stale-epoch, wrong-worker, profile-mismatched, and conflicting terminal evidence
 fail closed.
+
+When an external interruption races that linked task failure, the invocation
+elects one durable terminal decision before either outcome can become visible.
+The decision binds the session incarnation, source run epoch, the profile's
+admission interaction, the interaction being terminalized, the execution-profile
+fingerprint, the exact session event and either the new interaction-terminal event
+or the already-terminal predecessor interaction event, and either
+the interruption request or the linked task failure identity and safe payloads.
+For a claimed task failure it also binds the complete terminalization request
+SHA-256 before mutating the task. If that mutation commits but its acknowledgement
+or the worker is lost, generic recovery authenticates the immutable claimed-worker
+receipt against that digest and terminal task snapshot instead of deriving
+historical authority from worker, lease, or handoff fields cleared at commit.
+When the interaction remains open, the winning store transaction appends the
+matching interaction terminal event and `session.failed` or `session.interrupted`
+event, changes the session status, and atomically replaces the active decision
+with an immutable settled-winner receipt. If queued-input completion already
+closed the interaction, interruption instead commits the session event and
+settled winner before making terminal session status observable; restart recovery
+finishes that remaining status transition without manufacturing a second
+interaction terminal. Provider-operation recovery may advance the session to the exact
+successor epoch, but the receipt continues to bind the source invocation epoch
+and profile. The receipt remains available for exact terminal replay until a
+typed successor admission atomically authenticates and retires it while binding
+the next invocation; an older settled winner can therefore never govern a later
+terminal race. A stale
+failure owner cannot overwrite an interruption winner; it leaves the task
+resumable under its existing handoff instead of emitting `task.failed`.
+Accepted queued input is not consumed by this election and is delivered once
+only after an explicit continuation. If the winner commits but acknowledgement
+or a worker is lost, recovery authenticates and replays the same decision and
+event identities without redispatching provider or tool work or manufacturing
+the competing terminal outcome. If a failure decision commits before its linked
+task can be terminalized, recovery first requires the exact attached session
+incarnation and expired worker/lease/handoff generation, atomically publishes
+the matching task-failure receipt, and then follows the same deterministic
+terminal replay. A still-live task owner remains fenced and is not preempted.
+
+The paired terminal publication is a strengthened store boundary. A custom
+`SessionStore` participates only when its concrete class explicitly declares
+`terminal_interaction_publication_version = 1`, implements the atomic
+latest-interaction and provider-dispatch admission fences on its status/checkpoint
+transition, and commits the interaction event, session event, status change,
+active-to-settled decision transition, side-effect handoffs, and immutable
+transition receipt in one transaction. It also implements atomic checkpoint/event
+publication for the already-closed-interaction variant, where session event and
+winner settlement precede the separately fenced terminal status transition.
+Merely accepting the optional publication arguments, inheriting a built-in
+implementation, or publishing the two events sequentially is not capability
+evidence. Because any task-linked invocation can reach this failure boundary,
+unsupported stores reject task-linked initial runs and continuations before
+session admission, task mutation, or provider/tool dispatch.
+The capability is not required for sessions without a linked task; their
+existing interruption publication contract remains unchanged.
 
 Custom task stores opt in with `supports_interrupted_task_handoffs = True` only
 when release, receipt readback, expired-candidate discovery, and recovery have

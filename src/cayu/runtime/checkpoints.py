@@ -18,6 +18,8 @@ CHECKPOINT_SCHEMA_VERSION_KEY = "checkpoint_schema_version"
 WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY = "workspace_observations"
 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY = "active_invocation_execution_profile"
 INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY = "invocation_lifecycle_receipt"
+INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY = "invocation_terminal_decision"
+SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY = "settled_invocation_terminal_decision"
 INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE = "cayu.invocation-lifecycle-command-receipt-ledger"
 INVOCATION_LIFECYCLE_RECEIPT_LEDGER_SCHEMA_VERSION = 1
 AUTOMATIC_RECALL_CHECKPOINT_KEY = "automatic_recall"
@@ -25,7 +27,7 @@ COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY = "completion_result_event_p
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY = "runtime_authored_user_message"
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION = 1
 AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY = "ambiguous_pending_user_input"
-CURRENT_CHECKPOINT_SCHEMA_VERSION = 6
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 7
 MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
 _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
@@ -359,6 +361,18 @@ def _migrate_checkpoint_v5_to_v6(checkpoint: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_checkpoint_v6_to_v7(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Reserve the invocation terminal-decision authority plane for v7 readers."""
+
+    migrated = copy_durable_json_object(checkpoint, "checkpoint")
+    # Version 6 treated this spelling as ordinary application state. It cannot
+    # become runtime terminal authority merely because a newer reader knows it.
+    migrated.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
+    migrated.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
+    migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 7
+    return migrated
+
+
 _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
     current_version=CURRENT_CHECKPOINT_SCHEMA_VERSION,
     migrations=(
@@ -386,6 +400,11 @@ _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
             source_version=5,
             target_version=6,
             migrate=_migrate_checkpoint_v5_to_v6,
+        ),
+        CheckpointMigration(
+            source_version=6,
+            target_version=7,
+            migrate=_migrate_checkpoint_v6_to_v7,
         ),
     ),
 )
@@ -479,20 +498,17 @@ def runtime_checkpoint_writer_view(
     )
     if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
         return copy_durable_json_object(current, "checkpoint")
-    if writer_version not in {1, 2, 3, 4, 5}:
+    if writer_version not in {1, 2, 3, 4, 5, 6}:
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
     projected = copy_durable_json_object(current, "checkpoint")
-    if (
-        writer_version < CURRENT_CHECKPOINT_SCHEMA_VERSION
-        and AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY in projected
-    ):
+    if writer_version < 6 and AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY in projected:
         raise ValueError(
             "Ambiguous user-input pause authority cannot be represented by an older "
             f"v{writer_version} writer."
         )
     pending_user_input = projected.get("pending_user_input")
-    if writer_version < CURRENT_CHECKPOINT_SCHEMA_VERSION and (
+    if writer_version < 6 and (
         (type(pending_user_input) is dict and "schema_version" in pending_user_input)
         or "user_input_resolution_intent" in projected
     ):
@@ -502,7 +518,7 @@ def runtime_checkpoint_writer_view(
         )
     pending_interrupt = projected.get("pending_session_interrupt")
     if (
-        writer_version < CURRENT_CHECKPOINT_SCHEMA_VERSION
+        writer_version < 6
         and type(pending_interrupt) is dict
         and (
             "user_input_supersession_intent" in pending_interrupt
@@ -523,6 +539,19 @@ def runtime_checkpoint_writer_view(
             "Invocation lifecycle receipt authority cannot be represented by an older "
             f"v{writer_version} writer."
         )
+    if writer_version < 7 and INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in projected:
+        raise ValueError(
+            "Invocation terminal-decision authority cannot be represented by an older "
+            f"v{writer_version} writer."
+        )
+    if writer_version < 7 and SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in projected:
+        raise ValueError(
+            "Settled invocation terminal-decision authority cannot be represented by an older "
+            f"v{writer_version} writer."
+        )
+    if writer_version == 6:
+        projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 6
+        return projected
     if writer_version == 4:
         projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 4
         return projected

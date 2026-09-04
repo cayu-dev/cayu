@@ -103,6 +103,10 @@ from cayu.runtime import _model_step_executor as model_step_executor
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.runtime._model_errors import _BillingIdentityResolutionCancelled
 from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
@@ -7216,13 +7220,21 @@ def test_interruption_claim_acknowledgement_loss_reconciles_committed_epoch() ->
         assert store.interruption_claim_committed is True
         assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
         interrupted = await store.load(session_id)
-        interrupted_profile = active_invocation_execution_profile_from_checkpoint(
-            await store.load_checkpoint(session_id)
-        )
+        checkpoint = await store.load_checkpoint(session_id)
+        interrupted_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        settled_decision = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
         assert interrupted is not None
         assert interrupted.status is SessionStatus.INTERRUPTED
         assert interrupted_profile is not None
         assert interrupted_profile.run_epoch == interrupted.run_epoch - 1
+        assert settled_decision is not None
+        assert settled_decision.outcome is InvocationTerminalOutcome.INTERRUPTED
+        assert settled_decision.run_epoch == interrupted_profile.run_epoch - 1
+        assert settled_decision.interaction_id == interrupted_profile.interaction_id
+        assert (
+            settled_decision.execution_profile_fingerprint
+            == interrupted_profile.profile.fingerprint
+        )
 
     asyncio.run(scenario())
 

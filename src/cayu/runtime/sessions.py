@@ -148,6 +148,13 @@ from cayu.runtime._child_session_notifications import (
     child_session_notification_stage_binding,
     child_session_notification_storage_key,
 )
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalDecision,
+    InvocationTerminalOutcome,
+    checkpoint_after_invocation_terminal_decision,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_recovery_profile,
+)
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
@@ -218,6 +225,8 @@ from cayu.runtime.checkpoints import (
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
     decode_runtime_checkpoint,
 )
@@ -508,6 +517,10 @@ class SessionRuntimePublicationConflict(ValueError):
 
 class SessionModelCompletionStageConflict(SessionRuntimePublicationConflict):
     """A logical model-completion stage conflicts with immutable durable evidence."""
+
+
+class SessionModelCompletionDispatchAlreadyAuthorized(SessionModelCompletionStageConflict):
+    """A provider dispatch won admission before terminal-decision election."""
 
 
 class SessionModelCompletionStageIncomplete(RuntimeError):
@@ -2229,6 +2242,7 @@ class InteractionTransitionResult(BaseModel):
 
     session: Session
     event: Event
+    terminal_event: Event | None = None
     status_changed: StrictBool
     replayed: StrictBool = False
 
@@ -2241,6 +2255,11 @@ class InteractionTransitionResult(BaseModel):
     @classmethod
     def copy_event(cls, value: Event) -> Event:
         return copy_event(value)
+
+    @field_validator("terminal_event")
+    @classmethod
+    def copy_terminal_event(cls, value: Event | None) -> Event | None:
+        return None if value is None else copy_event(value)
 
 
 class ModelCompletionStageDisposition(StrEnum):
@@ -2476,11 +2495,26 @@ class InteractionTransitionSpec(BaseModel):
     only_if_no_queued_messages: StrictBool = False
     model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None
     checkpoint_mutation: dict[str, Any] | None = None
+    terminal_event: Event | None = None
+    terminal_decision: InvocationTerminalDecision | None = None
 
     @field_validator("event")
     @classmethod
     def copy_event(cls, value: Event) -> Event:
         return copy_event(value)
+
+    @field_validator("terminal_event")
+    @classmethod
+    def copy_terminal_event(cls, value: Event | None) -> Event | None:
+        return None if value is None else copy_event(value)
+
+    @field_validator("terminal_decision")
+    @classmethod
+    def copy_terminal_decision(
+        cls,
+        value: InvocationTerminalDecision | None,
+    ) -> InvocationTerminalDecision | None:
+        return None if value is None else value.model_copy(deep=True)
 
     @field_validator("from_statuses")
     @classmethod
@@ -2576,6 +2610,44 @@ class InteractionTransitionSpec(BaseModel):
                 )
             if self.model_completion_stage_settlement.interaction_id != self.event.interaction_id:
                 raise ValueError("Model-completion settlement belongs to a different interaction.")
+        if (self.terminal_event is None) != (self.terminal_decision is None):
+            raise ValueError(
+                "A terminal session event and terminal decision must be supplied together."
+            )
+        if self.terminal_event is not None:
+            terminal_event = self.terminal_event
+            decision = self.terminal_decision
+            assert decision is not None
+            expected_event_type = {
+                SessionStatus.FAILED: EventType.SESSION_FAILED,
+                SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+            }.get(self.to_status)
+            expected_outcome = {
+                SessionStatus.FAILED: InvocationTerminalOutcome.FAILED,
+                SessionStatus.INTERRUPTED: InvocationTerminalOutcome.INTERRUPTED,
+            }.get(self.to_status)
+            if expected_event_type is None or expected_outcome is None:
+                raise ValueError(
+                    "Paired terminal publication requires failed or interrupted status."
+                )
+            if (
+                terminal_event.type is not expected_event_type
+                or terminal_event.session_id != self.event.session_id
+                or terminal_event.interaction_id is not None
+                or decision.interaction_event_id is None
+                or terminal_event.id != decision.terminal_event_id
+                or self.event.id != decision.interaction_event_id
+                or self.event.interaction_id != decision.interaction_id
+                or decision.session_id != self.event.session_id
+                or decision.outcome is not expected_outcome
+                or terminal_event.timestamp != decision.observed_at
+                or self.event.timestamp != decision.observed_at
+                or any(
+                    terminal_event.payload.get(key) != value
+                    for key, value in decision.terminal_payload.items()
+                )
+            ):
+                raise ValueError("Paired terminal publication conflicts with its decision.")
         return self
 
 
@@ -2630,7 +2702,7 @@ class _InteractionTransitionReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     record_type: Literal["cayu.interaction-transition"] = "cayu.interaction-transition"
-    schema_version: Literal[1, 2, 3, 4, 5] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6] = 1
     session: Session
     event: Event
     from_statuses: tuple[SessionStatus, ...]
@@ -2638,6 +2710,8 @@ class _InteractionTransitionReceipt(BaseModel):
     only_if_no_queued_messages: StrictBool
     model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None
     checkpoint_mutation: dict[str, Any] | None = None
+    terminal_event: Event | None = None
+    terminal_decision: InvocationTerminalDecision | None = None
     invocation_session_instance_id: str | None = None
     invocation_active_profile: ActiveInvocationExecutionProfile | None = None
     invocation_authority_state: Literal["active", "released"] | None = None
@@ -2664,6 +2738,11 @@ class _InteractionTransitionReceipt(BaseModel):
             raise TypeError("checkpoint_mutation must be an object or None.")
         return copy_durable_json_object(value, "checkpoint_mutation")
 
+    @field_validator("terminal_event")
+    @classmethod
+    def copy_terminal_event(cls, value: Event | None) -> Event | None:
+        return None if value is None else copy_event(value)
+
     @field_validator("record_digest")
     @classmethod
     def validate_record_digest(cls, value: str) -> str:
@@ -2686,6 +2765,10 @@ class _InteractionTransitionReceipt(BaseModel):
         elif not self.only_if_no_queued_messages or self.session.status not in self.from_statuses:
             raise ValueError("Interaction-transition receipt unchanged status is inconsistent.")
         carries_invocation_authority = self.invocation_session_instance_id is not None
+        if self.schema_version < 6 and (
+            self.terminal_event is not None or self.terminal_decision is not None
+        ):
+            raise ValueError("Interaction-transition receipt version conflicts with terminality.")
         if carries_invocation_authority != (self.invocation_active_profile is not None):
             raise ValueError("Interaction-transition invocation authority is incomplete.")
         if self.schema_version == 1:
@@ -2711,13 +2794,35 @@ class _InteractionTransitionReceipt(BaseModel):
             ):
                 raise ValueError("Interaction-transition receipt version conflicts with authority.")
             require_clean_nonblank(self.recovery_claim_id, "recovery_claim_id")
-        else:
+        elif self.schema_version == 5:
             if (
                 self.checkpoint_mutation is None
                 or self.recovery_claim_id is not None
                 or (not carries_invocation_authority or self.invocation_authority_state != "active")
+                or self.terminal_event is not None
+                or self.terminal_decision is not None
             ):
                 raise ValueError("Interaction-transition receipt version conflicts with mutation.")
+        else:
+            if (self.terminal_event is None) != (self.terminal_decision is None):
+                raise ValueError("Terminal interaction receipt authority is incomplete.")
+            if self.terminal_event is None:
+                raise ValueError("Version 6 interaction receipt requires terminal evidence.")
+            if self.checkpoint_mutation is not None:
+                raise ValueError("Terminal interaction receipt conflicts with mutation.")
+            if carries_invocation_authority != (self.invocation_authority_state is not None):
+                raise ValueError("Interaction-transition receipt version conflicts with authority.")
+            if self.recovery_claim_id is not None:
+                require_clean_nonblank(self.recovery_claim_id, "recovery_claim_id")
+            InteractionTransitionSpec(
+                event=self.event,
+                from_statuses=self.from_statuses,
+                to_status=self.to_status,
+                only_if_no_queued_messages=self.only_if_no_queued_messages,
+                model_completion_stage_settlement=self.model_completion_stage_settlement,
+                terminal_event=self.terminal_event,
+                terminal_decision=self.terminal_decision,
+            )
         if self.schema_version < 5 and self.checkpoint_mutation is not None:
             raise ValueError("Interaction-transition receipt version conflicts with mutation.")
         if carries_invocation_authority:
@@ -4544,6 +4649,8 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
             for key in (
                 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
                 INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+                INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+                SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
                 WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
             )
         )
@@ -4582,6 +4689,8 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
         for authority_key in (
             ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
             INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+            SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         ):
             updated.pop(authority_key, None)
             if authoritative_current is not None and authority_key in authoritative_current:
@@ -4623,6 +4732,8 @@ def _copy_checkpoint_for_transform(
             raise AssertionError("Stored checkpoint decoded to no state.")
         copied.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, None)
         copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
+        copied.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
+        copied.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
     return copied
 
 
@@ -9319,6 +9430,7 @@ class SessionStore(ABC):
     # reject partial, legacy, and unknown-future store implementations before
     # delivering a command they cannot interpret atomically.
     invocation_lifecycle_command_version: ClassVar[int | None] = None
+    terminal_interaction_publication_version: ClassVar[int | None] = None
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
     supports_atomic_session_operation_initialization: ClassVar[bool] = False
@@ -9627,6 +9739,8 @@ class SessionStore(ABC):
         execution_profile_decision: ExecutionProfileDecision | None = None,
         adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
+        expected_latest_interaction_event_id: str | None = None,
+        require_no_active_model_completion_dispatch: bool = False,
     ) -> Session:
         """Atomically persist status, checkpoint, interaction, target, and profile admission.
 
@@ -9920,6 +10034,72 @@ class SessionStore(ABC):
             and capability_owner_index <= rejection_owner_index
         )
 
+    def _supports_terminal_interaction_publication_protocol(self) -> bool:
+        """Authenticate the optional paired terminal-publication extension."""
+
+        method_names = (
+            "transition_status_and_checkpoint",
+            "publish_checkpoint_and_events",
+            "publish_interaction_transition",
+            "_mark_model_completion_stage_dispatched_atomic",
+        )
+        store_type = type(self)
+        mro = type.__getattribute__(store_type, "__mro__")
+        concrete_declarations = type.__getattribute__(store_type, "__dict__")
+        if concrete_declarations.get("terminal_interaction_publication_version") != 1:
+            return False
+
+        getattribute_owner = next(
+            (
+                owner
+                for owner in mro
+                if "__getattribute__" in type.__getattribute__(owner, "__dict__")
+            ),
+            None,
+        )
+        if getattribute_owner is None or (
+            type.__getattribute__(getattribute_owner, "__dict__")["__getattribute__"]
+            is not object.__getattribute__
+        ):
+            return False
+        try:
+            instance_state = object.__getattribute__(self, "__dict__")
+        except AttributeError:
+            instance_state = None
+        protected_names = (*method_names, "terminal_interaction_publication_version")
+        if isinstance(instance_state, dict) and any(
+            name in instance_state for name in protected_names
+        ):
+            return False
+
+        for method_name in method_names:
+            owner = next(
+                (
+                    candidate
+                    for candidate in mro
+                    if method_name in type.__getattribute__(candidate, "__dict__")
+                ),
+                None,
+            )
+            if owner is None:
+                return False
+            declarations = type.__getattribute__(owner, "__dict__")
+            implementation = declarations[method_name]
+            if type(implementation) is not FunctionType:
+                return False
+            if owner is not SessionStore and (
+                declarations.get("terminal_interaction_publication_version") != 1
+            ):
+                return False
+            resolved = object.__getattribute__(self, method_name)
+            if (
+                type(resolved) is not MethodType
+                or resolved.__self__ is not self
+                or resolved.__func__ is not implementation
+            ):
+                return False
+        return True
+
     async def reject_execution_profile_resume(
         self,
         session_id: str,
@@ -9995,6 +10175,8 @@ class SessionStore(ABC):
         only_if_no_queued_messages: bool = False,
         model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
         checkpoint_mutation: dict[str, Any] | None = None,
+        terminal_event: Event | None = None,
+        terminal_decision: InvocationTerminalDecision | None = None,
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
@@ -10011,7 +10193,9 @@ class SessionStore(ABC):
         against store-owned time after acquiring the mutation lock and before
         first publication, and reject an unclaimed first publication while a
         store-time-live recovery claim exists. Exact receipt replay remains
-        valid after the lease has settled.
+        valid after the lease has settled. When terminal evidence is supplied,
+        the interaction event, session terminal event, terminal status, and
+        exact winning decision commit in one transaction.
         """
 
     async def load_interaction_transition_receipt(
@@ -11824,6 +12008,7 @@ class InMemorySessionStore(SessionStore):
     supports_execution_profile_admission: ClassVar[bool] = True
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
+    terminal_interaction_publication_version: ClassVar[int | None] = 1
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
@@ -14341,6 +14526,8 @@ class InMemorySessionStore(SessionStore):
         execution_profile_decision: ExecutionProfileDecision | None = None,
         adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
+        expected_latest_interaction_event_id: str | None = None,
+        require_no_active_model_completion_dispatch: bool = False,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -14375,6 +14562,12 @@ class InMemorySessionStore(SessionStore):
         prepared_tool_capability_ceiling = _copy_optional_tool_capability_ceiling(
             tool_capability_ceiling
         )
+        expected_latest_interaction_event_id = _copy_optional_event_id(
+            expected_latest_interaction_event_id,
+            "expected_latest_interaction_event_id",
+        )
+        if type(require_no_active_model_completion_dispatch) is not bool:
+            raise TypeError("require_no_active_model_completion_dispatch must be a boolean.")
         if prepared_execution_profile_decision is not None and admission is None:
             raise ValueError("An execution-profile decision requires atomic interaction admission.")
         if admission is not None and to_status is not SessionStatus.RUNNING:
@@ -14388,6 +14581,34 @@ class InMemorySessionStore(SessionStore):
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
+            if expected_latest_interaction_event_id is not None:
+                latest_interactions = self._latest_interaction_event_records_by_sequence.get(
+                    session_id,
+                    [],
+                )
+                latest_interaction = latest_interactions[-1] if latest_interactions else None
+                if (
+                    latest_interaction is None
+                    or latest_interaction.event.id != expected_latest_interaction_event_id
+                ):
+                    raise SessionRunFenced(
+                        "Session latest interaction changed before the status transition."
+                    )
+            if require_no_active_model_completion_dispatch:
+                operation_records = self._session_operation_records.get(session_id, {})
+                active_record = operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+                if active_record is not None:
+                    active_marker = _reconstruct_active_model_completion_stage_record(
+                        active_record,
+                        session_id=session_id,
+                    )
+                    dispatch_key = _model_completion_stage_dispatch_storage_key(
+                        active_marker.stage_id
+                    )
+                    if operation_records.get(dispatch_key) is not None:
+                        raise SessionModelCompletionDispatchAlreadyAuthorized(
+                            "Provider dispatch was authorized before terminal decision election."
+                        )
             transition_profile_metadata = _validate_execution_profile_admission(
                 session,
                 candidate_profile=prepared_execution_profile,
@@ -14606,6 +14827,8 @@ class InMemorySessionStore(SessionStore):
         only_if_no_queued_messages: bool = False,
         model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
         checkpoint_mutation: dict[str, Any] | None = None,
+        terminal_event: Event | None = None,
+        terminal_decision: InvocationTerminalDecision | None = None,
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
@@ -14629,6 +14852,8 @@ class InMemorySessionStore(SessionStore):
             only_if_no_queued_messages=only_if_no_queued_messages,
             model_completion_stage_settlement=model_completion_stage_settlement,
             checkpoint_mutation=checkpoint_mutation,
+            terminal_event=terminal_event,
+            terminal_decision=terminal_decision,
         )
         copied_event = transition.event
         allowed_statuses = set(transition.from_statuses)
@@ -14636,6 +14861,8 @@ class InMemorySessionStore(SessionStore):
         conditional = transition.only_if_no_queued_messages
         settlement_request = transition.model_completion_stage_settlement
         checkpoint_mutation_request = transition.checkpoint_mutation
+        copied_terminal_event = transition.terminal_event
+        terminal_decision = transition.terminal_decision
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -14646,6 +14873,11 @@ class InMemorySessionStore(SessionStore):
             operation_records = self._session_operation_records.setdefault(session_id, {})
             receipt_record = operation_records.get(receipt_storage_key)
             existing = self._event_records_by_id.get((session_id, copied_event.id))
+            existing_terminal = (
+                None
+                if copied_terminal_event is None
+                else self._event_records_by_id.get((session_id, copied_terminal_event.id))
+            )
             if receipt_record is not None:
                 receipt = _reconstruct_interaction_transition_receipt(
                     receipt_record,
@@ -14664,9 +14896,20 @@ class InMemorySessionStore(SessionStore):
                     raise RuntimeError(
                         "Interaction transition receipt conflicts with retained event history."
                     )
+                if copied_terminal_event is not None and (
+                    receipt.terminal_event != copied_terminal_event
+                    or (
+                        existing_terminal is not None
+                        and existing_terminal.event != receipt.terminal_event
+                    )
+                ):
+                    raise RuntimeError(
+                        "Interaction transition receipt conflicts with its terminal session event."
+                    )
                 return InteractionTransitionResult(
                     session=receipt.session,
                     event=receipt.event,
+                    terminal_event=receipt.terminal_event,
                     status_changed=receipt.status_changed,
                     replayed=True,
                 )
@@ -14674,8 +14917,16 @@ class InMemorySessionStore(SessionStore):
                 raise RuntimeError(
                     "Interaction transition event exists without its immutable receipt."
                 )
+            if existing_terminal is not None:
+                raise RuntimeError("Terminal session event exists without its interaction receipt.")
+            current_checkpoint = self._checkpoints.get(session_id)
+            settled_checkpoint = _checkpoint_after_exact_invocation_terminal_decision(
+                current_checkpoint,
+                session=session,
+                expected=terminal_decision,
+            )
             active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-                self._checkpoints.get(session_id),
+                current_checkpoint,
                 now=self._ownership_clock(),
             )
             if expected_recovery_claim_id is None:
@@ -14697,21 +14948,29 @@ class InMemorySessionStore(SessionStore):
                 if expected_invocation_authority_state == "released":
                     require_released_invocation_command_authority(
                         session,
-                        self._checkpoints.get(session_id),
+                        current_checkpoint,
                         session_id=session_id,
                         session_instance_id=expected_session_instance_id,
                         active_profile=expected_active_invocation_profile,
-                        events=(copied_event,),
+                        events=tuple(
+                            event
+                            for event in (copied_event, copied_terminal_event)
+                            if event is not None
+                        ),
                     )
                 else:
                     require_invocation_command_authority(
                         session,
-                        self._checkpoints.get(session_id),
+                        current_checkpoint,
                         session_id=session_id,
                         session_instance_id=expected_session_instance_id,
                         run_epochs=frozenset({expected_active_invocation_profile.run_epoch}),
                         active_profile=expected_active_invocation_profile,
-                        events=(copied_event,),
+                        events=tuple(
+                            event
+                            for event in (copied_event, copied_terminal_event)
+                            if event is not None
+                        ),
                     )
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(
@@ -14763,7 +15022,7 @@ class InMemorySessionStore(SessionStore):
                 )
             prepared_event_append = self._prepare_event_append_unlocked(
                 session,
-                [copied_event],
+                [event for event in (copied_event, copied_terminal_event) if event is not None],
             )
             updated_checkpoint = self._checkpoints.get(session_id)
             if not queued and checkpoint_mutation_request is not None:
@@ -14790,6 +15049,8 @@ class InMemorySessionStore(SessionStore):
                 only_if_no_queued_messages=conditional,
                 model_completion_stage_settlement=settlement_request,
                 checkpoint_mutation=checkpoint_mutation_request,
+                terminal_event=copied_terminal_event,
+                terminal_decision=terminal_decision,
                 status_changed=not queued,
                 invocation_session_instance_id=expected_session_instance_id,
                 invocation_active_profile=expected_active_invocation_profile,
@@ -14815,6 +15076,9 @@ class InMemorySessionStore(SessionStore):
             if not queued and checkpoint_mutation_request is not None:
                 assert updated_checkpoint is not None
                 self._checkpoints[session_id] = updated_checkpoint
+            if terminal_decision is not None:
+                assert settled_checkpoint is not None
+                self._store_checkpoint_unlocked(session_id, settled_checkpoint)
             self._refresh_child_lifecycle_candidate_unlocked(updated)
             if settlement_record is not None and settlement_storage_key is not None:
                 operation_records[settlement_storage_key] = settlement_record
@@ -14823,6 +15087,7 @@ class InMemorySessionStore(SessionStore):
             return InteractionTransitionResult(
                 session=updated,
                 event=copied_event,
+                terminal_event=copied_terminal_event,
                 status_changed=not queued,
             )
 
@@ -14848,6 +15113,9 @@ class InMemorySessionStore(SessionStore):
         }
         if transition.checkpoint_mutation is not None:
             kwargs["checkpoint_mutation"] = transition.checkpoint_mutation
+        if transition.terminal_event is not None:
+            kwargs["terminal_event"] = transition.terminal_event
+            kwargs["terminal_decision"] = transition.terminal_decision
         return await self.publish_interaction_transition(copied.session_id, **kwargs)
 
     async def load_interaction_transition_receipt(
@@ -14889,6 +15157,17 @@ class InMemorySessionStore(SessionStore):
                 raise RuntimeError(
                     "Interaction transition receipt conflicts with retained event history."
                 )
+            if receipt.terminal_event is not None:
+                retained_terminal = self._event_records_by_id.get(
+                    (session_id, receipt.terminal_event.id)
+                )
+                if (
+                    retained_terminal is not None
+                    and retained_terminal.event != receipt.terminal_event
+                ):
+                    raise RuntimeError(
+                        "Interaction transition receipt conflicts with retained terminal history."
+                    )
             return InteractionTransitionReceiptResult(
                 session=receipt.session,
                 transition=_interaction_transition_spec_from_receipt(receipt),
@@ -21747,6 +22026,17 @@ def _validate_status_set(
     return set(statuses)
 
 
+def _copy_optional_event_id(value: str | None, field_name: str) -> str | None:
+    """Defensively validate an optional exact durable event identity."""
+
+    if value is None:
+        return None
+    copied = require_clean_nonblank(value, field_name)
+    if len(copied) > EVENT_ID_MAX_CHARS:
+        raise ValueError(f"{field_name} exceeds the event-id limit.")
+    return copied
+
+
 def _audit_resolution_actor(actor: ResolutionActor | None) -> ResolutionActor | None:
     if actor is None:
         return None
@@ -22287,6 +22577,41 @@ def _validate_interaction_transition_recovery_claim_id(
     )
 
 
+def _checkpoint_after_exact_invocation_terminal_decision(
+    checkpoint: dict[str, Any] | None,
+    *,
+    session: Session,
+    expected: InvocationTerminalDecision | None,
+) -> dict[str, Any] | None:
+    """Authenticate and retire a paired terminal-publication winner."""
+
+    current = invocation_terminal_decision_from_checkpoint(checkpoint)
+    if expected is None:
+        if current is not None:
+            raise SessionRunFenced("Interaction transition is owned by another terminal decision.")
+        return checkpoint
+    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    if (
+        current != expected
+        or active_profile is None
+        or active_profile.session_id != session.id
+        or active_profile.run_epoch != session.run_epoch
+        or not invocation_terminal_decision_matches_recovery_profile(
+            expected,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            current_run_epoch=session.run_epoch,
+            interaction_id=active_profile.interaction_id,
+            execution_profile_fingerprint=active_profile.profile.fingerprint,
+        )
+    ):
+        raise SessionRunFenced("Interaction transition lost its exact terminal decision authority.")
+    return checkpoint_after_invocation_terminal_decision(
+        checkpoint,
+        expected=expected,
+    )
+
+
 def _interaction_transition_receipt_record(
     *,
     session: Session,
@@ -22295,7 +22620,9 @@ def _interaction_transition_receipt_record(
     to_status: SessionStatus,
     only_if_no_queued_messages: bool,
     model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None,
-    checkpoint_mutation: dict[str, Any] | None,
+    checkpoint_mutation: dict[str, Any] | None = None,
+    terminal_event: Event | None = None,
+    terminal_decision: InvocationTerminalDecision | None = None,
     status_changed: bool,
     invocation_session_instance_id: str | None = None,
     invocation_active_profile: ActiveInvocationExecutionProfile | None = None,
@@ -22306,7 +22633,11 @@ def _interaction_transition_receipt_record(
         raise TypeError("Interaction-transition invocation authority is incomplete.")
     if invocation_active_profile is None and invocation_authority_state != "active":
         raise TypeError("Released interaction authority requires an invocation profile.")
-    if checkpoint_mutation is not None:
+    if terminal_event is not None:
+        if terminal_decision is None:
+            raise TypeError("Terminal interaction receipt requires its decision.")
+        schema_version = 6
+    elif checkpoint_mutation is not None:
         schema_version = 5
     elif recovery_claim_id is not None:
         recovery_claim_id = require_clean_nonblank(recovery_claim_id, "recovery_claim_id")
@@ -22337,10 +22668,16 @@ def _interaction_transition_receipt_record(
             checkpoint_mutation,
             "checkpoint_mutation",
         )
+    if terminal_event is not None:
+        assert terminal_decision is not None
+        payload["terminal_event"] = terminal_event.model_dump(mode="json")
+        payload["terminal_decision"] = terminal_decision.model_dump(mode="json")
     if invocation_active_profile is not None:
         payload["invocation_session_instance_id"] = invocation_session_instance_id
         payload["invocation_active_profile"] = invocation_active_profile.model_dump(mode="json")
-    if schema_version == 3 or (schema_version in {4, 5} and invocation_active_profile is not None):
+    if schema_version == 3 or (
+        schema_version in {4, 5, 6} and invocation_active_profile is not None
+    ):
         payload["invocation_authority_state"] = invocation_authority_state
     if recovery_claim_id is not None:
         payload["recovery_claim_id"] = recovery_claim_id
@@ -22353,12 +22690,14 @@ def _interaction_transition_receipt_record(
         only_if_no_queued_messages=only_if_no_queued_messages,
         model_completion_stage_settlement=model_completion_stage_settlement,
         checkpoint_mutation=checkpoint_mutation,
+        terminal_event=terminal_event,
+        terminal_decision=terminal_decision,
         invocation_session_instance_id=invocation_session_instance_id,
         invocation_active_profile=invocation_active_profile,
         invocation_authority_state=(
             invocation_authority_state
             if schema_version == 3
-            or (schema_version in {4, 5} and invocation_active_profile is not None)
+            or (schema_version in {4, 5, 6} and invocation_active_profile is not None)
             else None
         ),
         recovery_claim_id=recovery_claim_id,
@@ -22384,8 +22723,11 @@ def _load_interaction_transition_receipt(record: object) -> _InteractionTransiti
             digest_payload.pop("invocation_authority_state", None)
         if receipt.schema_version < 4 or receipt.recovery_claim_id is None:
             digest_payload.pop("recovery_claim_id", None)
-        if receipt.schema_version < 5:
+        if receipt.schema_version < 5 or receipt.checkpoint_mutation is None:
             digest_payload.pop("checkpoint_mutation", None)
+        if receipt.schema_version < 6:
+            digest_payload.pop("terminal_event", None)
+            digest_payload.pop("terminal_decision", None)
         if _canonical_runtime_publication_digest(digest_payload) != receipt.record_digest:
             raise ValueError
     except (TypeError, ValueError) as exc:
@@ -22507,6 +22849,8 @@ def _interaction_transition_spec_from_receipt(
         only_if_no_queued_messages=receipt.only_if_no_queued_messages,
         model_completion_stage_settlement=(receipt.model_completion_stage_settlement),
         checkpoint_mutation=receipt.checkpoint_mutation,
+        terminal_event=receipt.terminal_event,
+        terminal_decision=receipt.terminal_decision,
     )
 
 
@@ -27919,6 +28263,8 @@ def _prepare_interaction_transition(
     only_if_no_queued_messages: bool,
     model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
     checkpoint_mutation: dict[str, Any] | None = None,
+    terminal_event: Event | None = None,
+    terminal_decision: InvocationTerminalDecision | None = None,
 ) -> tuple[str, InteractionTransitionSpec]:
     session_id = require_clean_nonblank(session_id, "session_id")
     if type(event) is not Event:
@@ -27944,6 +28290,8 @@ def _prepare_interaction_transition(
         only_if_no_queued_messages=only_if_no_queued_messages,
         model_completion_stage_settlement=model_completion_stage_settlement,
         checkpoint_mutation=checkpoint_mutation,
+        terminal_event=terminal_event,
+        terminal_decision=terminal_decision,
     )
     if transition.event.session_id != session_id:
         raise ValueError("Interaction transition event belongs to a different session.")

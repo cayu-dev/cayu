@@ -73,6 +73,8 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     CheckpointCompatibilityError,
 )
 from cayu.runtime.execution_profiles import (
@@ -2924,6 +2926,8 @@ def test_create_cancellation_after_commit_is_replayable() -> None:
     [
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     ],
 )
 def test_invocation_checkpoint_patch_rejects_active_authority(reserved_key: str) -> None:

@@ -147,6 +147,12 @@ from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
     prepare_rebind_invocation_command,
 )
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_active_profile,
+    invocation_terminal_decision_matches_recovery_profile,
+)
 from cayu.runtime._isolated_tool_process import (
     isolated_tool_dispatch_authority_digests,
     isolated_tool_dispatch_authority_storage_key,
@@ -1708,6 +1714,10 @@ IncompleteRecoveryResultHook = Callable[
     [IncompleteSessionRecoveryResult, InvocationContext | None],
     Awaitable[IncompleteSessionRecoveryResult],
 ]
+CommittedRuntimeTaskFailureRecovery = Callable[
+    [Session, dict[str, Any] | None, SessionStatus, RecoveryMutationHook],
+    Awaitable[IncompleteSessionRecoveryResult | None],
+]
 MaterializeDeferredInteractionInput = Callable[[str], Awaitable[bool]]
 ResumeInteraction = Callable[
     [
@@ -1857,9 +1867,24 @@ class RecoveryCoordinator:
         self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
         self._runtime_hooks = runtime_hooks
         self._loop_policies = loop_policies
+        self._committed_runtime_task_failure_recovery: (
+            CommittedRuntimeTaskFailureRecovery | None
+        ) = None
         self._workspace_artifact_recovery_operations = BoundedInvocationOperationRegistry(
             max_operations=64
         )
+
+    def bind_committed_runtime_task_failure_recovery(
+        self,
+        recovery: CommittedRuntimeTaskFailureRecovery,
+    ) -> None:
+        """Bind the session owner that can finish one committed terminal winner."""
+
+        if not callable(recovery):
+            raise TypeError("recovery must be callable.")
+        if self._committed_runtime_task_failure_recovery is not None:
+            raise RuntimeError("Committed runtime task failure recovery is already bound.")
+        self._committed_runtime_task_failure_recovery = recovery
 
     async def _run_cleanup_steps(
         self,
@@ -2352,6 +2377,7 @@ class RecoveryCoordinator:
             checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any]:
             current_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            terminal_decision = invocation_terminal_decision_from_checkpoint(checkpoint)
             pending_interrupt = (
                 None
                 if checkpoint is None
@@ -2380,6 +2406,22 @@ class RecoveryCoordinator:
             ):
                 raise RuntimeError(
                     "Provider-operation interruption profile changed before recovery claimed it."
+                )
+            if (
+                terminal_decision is None
+                or terminal_decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
+                or terminal_decision.interruption_request_id != interruption_request_id
+                or not invocation_terminal_decision_matches_active_profile(
+                    terminal_decision,
+                    session_id=current_session.id,
+                    session_instance_id=current_session.instance_id,
+                    run_epoch=current_session.run_epoch,
+                    interaction_id=current_profile.interaction_id,
+                    execution_profile_fingerprint=current_profile.profile.fingerprint,
+                )
+            ):
+                raise SessionRunFenced(
+                    "Provider-operation interruption lost its terminal decision authority."
                 )
             if current_profile.session_id != current_session.id:
                 raise SessionRunFenced(
@@ -2551,6 +2593,7 @@ class RecoveryCoordinator:
             return None
         checkpoint = await self._session_store.load_checkpoint(session_id)
         current_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        terminal_decision = invocation_terminal_decision_from_checkpoint(checkpoint)
         pending_interrupt = (
             None
             if checkpoint is None
@@ -2565,6 +2608,17 @@ class RecoveryCoordinator:
             or type(pending_interrupt) is not dict
             or interruption_request_id_from_payload(pending_interrupt) != interruption_request_id
             or _incomplete_recovery_claim_from_checkpoint(checkpoint) is not None
+            or terminal_decision is None
+            or terminal_decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
+            or terminal_decision.interruption_request_id != interruption_request_id
+            or not invocation_terminal_decision_matches_recovery_profile(
+                terminal_decision,
+                session_id=current.id,
+                session_instance_id=current.instance_id,
+                current_run_epoch=current.run_epoch,
+                interaction_id=current_profile.interaction_id,
+                execution_profile_fingerprint=current_profile.profile.fingerprint,
+            )
         ):
             return None
         return current
@@ -15439,6 +15493,15 @@ class RecoveryCoordinator:
             mutation_admitted = True
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
+        if self._committed_runtime_task_failure_recovery is not None:
+            recovered_runtime_failure = await self._committed_runtime_task_failure_recovery(
+                session,
+                checkpoint,
+                previous_status,
+                admit_before_mutation,
+            )
+            if recovered_runtime_failure is not None:
+                return recovered_runtime_failure
         pending_completion_finalization = pending_completion_finalization_from_checkpoint(
             checkpoint
         )

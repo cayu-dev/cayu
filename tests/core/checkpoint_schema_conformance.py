@@ -33,6 +33,8 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     CheckpointCompatibilityError,
 )
 from cayu.runtime.execution_profiles import (
@@ -213,40 +215,47 @@ async def assert_runtime_publication_rejects_invocation_authority_mutation(
     """Generic publications cannot create or remove invocation authority."""
 
     current_store = runtime_checkpoint_session_store(store)
-    for action in ("set", "delete"):
-        session_id = f"{session_id_prefix}-{action}"
-        await store.create(
-            RunRequest(agent_name="checkpoint-agent", session_id=session_id, messages=[]),
-            identity=SessionIdentity(
-                provider_name="checkpoint-conformance",
-                model="checkpoint-model",
-            ),
-        )
-        operation = RuntimePublicationCheckpointOperation(
-            key=ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-            expected_value_digest="0" * 64 if action == "delete" else None,
-            action=action,
-            value={} if action == "set" else None,
-        )
-        request = RuntimePublicationRequest(
-            publication_id=f"checkpoint-invocation-authority-{action}",
-            kind="approval-open",
-            intent={"kind": "checkpoint-invocation-authority-conformance"},
-            mutation=RuntimePublicationMutation(operations=(operation,)),
-            transcript_messages=(),
-            events=(),
-        )
-
-        with pytest.raises(ValueError, match="active invocation"):
-            await current_store.publish_runtime_publication(
-                session_id,
-                request=request,
-                expected_statuses={SessionStatus.PENDING},
-                expected_run_epoch=0,
-                expected_transcript_cursor=0,
+    authority_keys = (
+        ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    )
+    for authority_index, authority_key in enumerate(authority_keys):
+        for action in ("set", "delete"):
+            session_id = f"{session_id_prefix}-{authority_index}-{action}"
+            await store.create(
+                RunRequest(agent_name="checkpoint-agent", session_id=session_id, messages=[]),
+                identity=SessionIdentity(
+                    provider_name="checkpoint-conformance",
+                    model="checkpoint-model",
+                ),
+            )
+            operation = RuntimePublicationCheckpointOperation(
+                key=authority_key,
+                expected_value_digest="0" * 64 if action == "delete" else None,
+                action=action,
+                value={} if action == "set" else None,
+            )
+            request = RuntimePublicationRequest(
+                publication_id=(f"checkpoint-invocation-authority-{authority_index}-{action}"),
+                kind="approval-open",
+                intent={"kind": "checkpoint-invocation-authority-conformance"},
+                mutation=RuntimePublicationMutation(operations=(operation,)),
+                transcript_messages=(),
+                events=(),
             )
 
-        assert await store.load_checkpoint(session_id) is None
+            with pytest.raises(ValueError, match="invocation lifecycle authority"):
+                await current_store.publish_runtime_publication(
+                    session_id,
+                    request=request,
+                    expected_statuses={SessionStatus.PENDING},
+                    expected_run_epoch=0,
+                    expected_transcript_cursor=0,
+                )
+
+            assert await store.load_checkpoint(session_id) is None
 
 
 async def assert_assistant_publication_checkpoint_conformance(

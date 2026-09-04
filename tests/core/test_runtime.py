@@ -316,11 +316,14 @@ from cayu.runtime.checkpoints import (
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.runtime.context import (
     ContextBuildError,
     ContextBuildResult,
     RuntimeManagedContextPolicy,
+    project_runtime_managed_context_checkpoint,
     validate_context_messages,
 )
 from cayu.runtime.sessions import (
@@ -1731,6 +1734,7 @@ def assert_only_model_step_publication_checkpoint(
         CHECKPOINT_SCHEMA_VERSION_KEY,
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
@@ -22676,6 +22680,8 @@ def test_fork_does_not_inherit_source_result_event_publication_reservation() -> 
         COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
         AUTOMATIC_RECALL_CHECKPOINT_KEY,
     ),
@@ -22697,6 +22703,20 @@ def test_fork_source_checkpoint_digest_ignores_source_owned_runtime_state(
 
     assert fork_source_checkpoint_projection(source_state) == child_state
     assert fork_source_checkpoint_sha256(source_state) == fork_source_checkpoint_sha256(child_state)
+
+
+def test_context_projection_hides_terminal_decision_authority() -> None:
+    ordinary_checkpoint = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "application_checkpoint": 14,
+    }
+    source = {
+        **ordinary_checkpoint,
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: {"private": "active"},
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: {"private": "settled"},
+    }
+
+    assert project_runtime_managed_context_checkpoint(source) == ordinary_checkpoint
 
 
 def test_pending_terminal_interruption_blocks_fork_snapshot_and_publication() -> None:
@@ -60314,7 +60334,7 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
         CHECKPOINT_SCHEMA_VERSION_KEY,
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-        model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     }
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert (

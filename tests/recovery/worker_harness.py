@@ -32,15 +32,19 @@ from cayu.runtime import (
     ResolutionActorSource,
     ResumeRequest,
     RunRequest,
+    RuntimeHook,
+    RuntimeHookContext,
     Session,
     SessionQuery,
     Task,
     TaskCreate,
+    TaskHandlerOutcome,
     TaskQuery,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRequest,
     ToolRoundRecoveryRequest,
+    run_task_worker,
 )
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
@@ -70,6 +74,7 @@ class RecoveryScenario(StrEnum):
     APPROVAL = "approval"
     BACKGROUND_SUBAGENT = "background_subagent"
     TASK_CLAIM = "task_claim"
+    TERMINAL_RACE = "terminal_race"
 
 
 class RecoveryAction(StrEnum):
@@ -83,6 +88,7 @@ class RecoveryAction(StrEnum):
     START_ATTACHED = "start_attached"
     RECOVER_UNATTACHED = "recover_unattached"
     RECOVER_ATTACHED = "recover_attached"
+    RUN = "run"
 
 
 _SCENARIO_ACTIONS = {
@@ -101,6 +107,7 @@ _SCENARIO_ACTIONS = {
             RecoveryAction.RECOVER_ATTACHED,
         }
     ),
+    RecoveryScenario.TERMINAL_RACE: frozenset({RecoveryAction.RUN}),
 }
 
 
@@ -156,6 +163,7 @@ class WorkerHandle:
         *,
         phase_path: Path,
         result_path: Path,
+        control_path: Path,
         stdout_path: Path,
         stderr_path: Path,
         stdout_stream,
@@ -165,6 +173,7 @@ class WorkerHandle:
         self.process = process
         self.phase_path = phase_path
         self.result_path = result_path
+        self.control_path = control_path
         self.stdout_path = stdout_path
         self.stderr_path = stderr_path
         self._stdout_stream = stdout_stream
@@ -214,6 +223,9 @@ class WorkerHandle:
         if not self.result_path.exists():
             raise AssertionError(f"worker wrote no result\n{self._diagnostics()}")
         return json.loads(self.result_path.read_text(encoding="utf-8"))
+
+    def signal(self, phase: str) -> None:
+        _write_json_atomic(self.control_path, {"phase": phase})
 
     def terminate_if_running(self) -> None:
         if self.process.poll() is None:
@@ -273,6 +285,7 @@ class RecoveryHarness:
         worker_id = uuid4().hex
         phase_path = self.root / f"phase-{worker_id}.json"
         result_path = self.root / f"result-{worker_id}.json"
+        control_path = self.root / f"control-{worker_id}.json"
         stdout_path = self.root / f"stdout-{worker_id}.log"
         stderr_path = self.root / f"stderr-{worker_id}.log"
         config_path = self.root / f"config-{worker_id}.json"
@@ -283,6 +296,7 @@ class RecoveryHarness:
             "backend": self.backend.as_json(),
             "phase_path": str(phase_path),
             "result_path": str(result_path),
+            "control_path": str(control_path),
             "marker_path": str(self.marker_path),
             **values,
         }
@@ -316,6 +330,7 @@ class RecoveryHarness:
             process,
             phase_path=phase_path,
             result_path=result_path,
+            control_path=control_path,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             stdout_stream=stdout_stream,
@@ -372,6 +387,12 @@ class RecoveryHarness:
         finally:
             await store.close()
 
+    def session_store(self):
+        return _session_store(self.backend)
+
+    def task_store(self):
+        return _task_store(self.backend)
+
     def read_marker(self) -> list[dict[str, Any]]:
         if not self.marker_path.exists():
             return []
@@ -385,6 +406,7 @@ class RecoveryHarness:
         paths = {self.marker_path}
         for pattern in (
             "config-*.json",
+            "control-*.json",
             "phase-*.json",
             "result-*.json",
             "stdout-*.log",
@@ -500,12 +522,129 @@ class _RecoveryProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class TerminalRaceProvider(ModelProvider):
+    name = _PROVIDER_NAME
+
+    def __init__(
+        self,
+        *,
+        phase_path: Path | None = None,
+        control_path: Path | None = None,
+        race_mode: str = "provider_failure",
+    ) -> None:
+        if race_mode not in {
+            "provider_failure",
+            "before_next_provider",
+            "failure_decision_loss",
+            "failure_task_commit_loss",
+        }:
+            raise ValueError("Unsupported terminal-race mode.")
+        self.phase_path = phase_path
+        self.control_path = control_path
+        self.race_mode = race_mode
+        self.request_count = 0
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:terminal-race-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.request_count += 1
+        if self.race_mode in {"failure_decision_loss", "failure_task_commit_loss"}:
+            raise RuntimeError("provider failed before the task owner disappeared")
+        if self.phase_path is not None and self.request_count == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call_terminal_race_side_effect",
+                name="side_effect",
+                arguments={},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if (
+            self.phase_path is not None
+            and self.request_count == 2
+            and self.race_mode == "provider_failure"
+        ):
+            if self.control_path is None:
+                raise AssertionError("Terminal-race provider requires a control path.")
+            _write_json_atomic(
+                self.phase_path,
+                {
+                    "phase": "provider_started_after_tool",
+                    "request_count": self.request_count,
+                },
+            )
+            while not self.control_path.exists():
+                await asyncio.sleep(_POLL_INTERVAL_S)
+            raise RuntimeError("provider failed after the remote interruption decision")
+        if (
+            self.phase_path is not None
+            and self.request_count == 2
+            and self.race_mode == "before_next_provider"
+        ):
+            _write_json_atomic(
+                self.phase_path,
+                {
+                    "phase": "provider_started_after_interrupt",
+                    "request_count": self.request_count,
+                },
+            )
+            raise RuntimeError("provider started after the remote interruption decision")
+        yield ModelStreamEvent.text_delta("Recovery completed.")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class TerminalRaceHook(RuntimeHook):
+    def __init__(self, marker_path: Path | None = None) -> None:
+        self.marker_path = marker_path
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:terminal-race-hook",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
+        if self.marker_path is not None:
+            _append_json_line(
+                self.marker_path,
+                {
+                    "phase": "terminal_hook_completed",
+                    "session_id": context.session.id,
+                    "terminal_event_id": context.terminal_event.id,
+                },
+            )
+
+
+def terminal_race_tools(
+    marker_path: Path,
+    *,
+    phase_path: Path | None = None,
+    control_path: Path | None = None,
+) -> list[Tool]:
+    return [
+        _MarkerTool(
+            marker_path,
+            phase_path,
+            control_path=control_path,
+            phase_name="tool_completed_before_next_provider",
+        )
+    ]
+
+
 class _MarkerTool(Tool):
     def __init__(
         self,
         marker_path: Path,
         phase_path: Path | None,
         *,
+        control_path: Path | None = None,
         phase_name: str = "tool_side_effect_recorded",
     ) -> None:
         super().__init__(
@@ -524,6 +663,7 @@ class _MarkerTool(Tool):
         )
         self.marker_path = marker_path
         self.phase_path = phase_path
+        self.control_path = control_path
         self.phase_name = phase_name
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
@@ -546,7 +686,11 @@ class _MarkerTool(Tool):
                     **record,
                 },
             )
-            await asyncio.Event().wait()
+            if self.control_path is None:
+                await asyncio.Event().wait()
+            else:
+                while not self.control_path.exists():
+                    await asyncio.sleep(_POLL_INTERVAL_S)
         return ToolResult(content="side effect recorded", structured=record)
 
 
@@ -747,6 +891,40 @@ def _task_app(config: dict[str, Any], *, initial: bool, session_store, task_stor
         ],
     )
     return app
+
+
+def _terminal_race_app(
+    config: dict[str, Any],
+    *,
+    session_store,
+    task_store,
+) -> tuple[CayuApp, TerminalRaceProvider]:
+    race_mode = config.get("race_mode", "provider_failure")
+    provider = TerminalRaceProvider(
+        phase_path=Path(config["phase_path"]),
+        control_path=Path(config["control_path"]),
+        race_mode=race_mode,
+    )
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        runtime_hooks=[TerminalRaceHook(Path(config["marker_path"]))],
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name=_AGENT_NAME, model="recovery-model"),
+        tools=terminal_race_tools(
+            Path(config["marker_path"]),
+            phase_path=(
+                Path(config["phase_path"]) if race_mode == "before_next_provider" else None
+            ),
+            control_path=(
+                Path(config["control_path"]) if race_mode == "before_next_provider" else None
+            ),
+        ),
+    )
+    return app, provider
 
 
 async def _run_ordinary_tool(config: dict[str, Any]) -> dict[str, Any]:
@@ -1019,6 +1197,88 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
         await task_store.close()
 
 
+async def _run_terminal_race(config: dict[str, Any]) -> dict[str, Any]:
+    backend = BackendConfig.from_json(config["backend"])
+    session_store = _session_store(backend)
+    task_store = _task_store(backend)
+    task_id = config["task_id"]
+    task_type = config["task_type"]
+    session_id = config["session_id"]
+    app, provider = _terminal_race_app(
+        config,
+        session_store=session_store,
+        task_store=task_store,
+    )
+    if config.get("race_mode") == "failure_decision_loss":
+
+        async def lose_before_task_terminalization(*args, **kwargs):
+            del args, kwargs
+            _write_json_atomic(
+                Path(config["phase_path"]),
+                {"phase": "failure_decision_committed"},
+            )
+            await asyncio.Event().wait()
+
+        app._session_engine._fail_task = lose_before_task_terminalization
+    elif config.get("race_mode") == "failure_task_commit_loss":
+        original_fail_task = app._session_engine._fail_task
+
+        async def lose_after_task_terminalization(*args, **kwargs):
+            task = await original_fail_task(*args, **kwargs)
+            _write_json_atomic(
+                Path(config["phase_path"]),
+                {"phase": "task_failure_committed"},
+            )
+            await asyncio.Event().wait()
+            return task
+
+        app._session_engine._fail_task = lose_after_task_terminalization
+    try:
+        await task_store.create_task(
+            TaskCreate(
+                task_id=task_id,
+                type=task_type,
+                assigned_agent_name=_AGENT_NAME,
+            )
+        )
+
+        async def execute(
+            worker_app: CayuApp,
+            task: Task,
+            worker_id: str,
+        ) -> TaskHandlerOutcome:
+            async for _event in worker_app.run(
+                RunRequest(
+                    agent_name=_AGENT_NAME,
+                    session_id=session_id,
+                    task_id=task.id,
+                    task_worker_id=worker_id,
+                    task_lease_expires_at=task.lease_expires_at,
+                    messages=[Message.text("user", "Run through the terminal race.")],
+                )
+            ):
+                pass
+            return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+        processed = await run_task_worker(
+            app,
+            task_store,
+            execute,
+            worker_id="terminal-race-owner",
+            query=TaskQuery(type=task_type),
+            max_tasks=1,
+            lease_seconds=(1 if config.get("race_mode") == "failure_decision_loss" else 300),
+            reclaim=False,
+        )
+        return {
+            "processed": processed,
+            "provider_request_count": provider.request_count,
+        }
+    finally:
+        await session_store.close()
+        await task_store.close()
+
+
 async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
     scenario = RecoveryScenario(config["scenario"])
     action = RecoveryAction(config["action"])
@@ -1029,6 +1289,7 @@ async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
         RecoveryScenario.APPROVAL: _run_approval,
         RecoveryScenario.BACKGROUND_SUBAGENT: _run_background_subagent,
         RecoveryScenario.TASK_CLAIM: _run_task_claim,
+        RecoveryScenario.TERMINAL_RACE: _run_terminal_race,
     }
     return await handlers[scenario](config)
 

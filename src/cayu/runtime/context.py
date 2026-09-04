@@ -92,8 +92,10 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
@@ -1448,7 +1450,12 @@ def _copy_secret_free_context_checkpoint_evidence(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Copy the two checkpoint representations through one validation seam."""
 
-    if checkpoint is not None and INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in checkpoint:
+    private_authority_keys = {
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    }
+    if checkpoint is not None and private_authority_keys.intersection(checkpoint):
         raise ValueError(
             f"{checkpoint_field_name} cannot contain private invocation lifecycle authority."
         )
@@ -6630,16 +6637,18 @@ def project_runtime_managed_context_checkpoint(
 ) -> dict[str, Any] | None:
     """Project checkpoint state visible to checkpoint-aware context policies.
 
-    Invocation lifecycle receipts are private store/runtime authority. A
-    generic context policy may carry ordinary checkpoint state forward, but it
-    must neither observe that receipt ledger nor acquire its provenance by
-    returning an identically named object.
+    Invocation lifecycle receipts and terminal decisions are private
+    store/runtime authority. A generic context policy may carry ordinary
+    checkpoint state forward, but it must neither observe those records nor
+    acquire their provenance by returning identically named objects.
     """
 
     if checkpoint is None:
         return None
     projected = copy_json_value(checkpoint, "checkpoint")
     projected.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
+    projected.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
+    projected.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
     return projected
 
 

@@ -1480,6 +1480,9 @@ class CayuApp:
             egress_authority_adoption_handler=egress_authority_adoption_handler,
             execution_profile_process_identity=self._execution_profile_process_identity,
         )
+        self._recovery_coordinator.bind_committed_runtime_task_failure_recovery(
+            self._session_engine._recover_committed_runtime_task_failure
+        )
         self._durable_subagent_coordinator = DurableSubagentCoordinator(
             session_store=self.session_store,
             runtime_session_store=self._runtime_session_store,

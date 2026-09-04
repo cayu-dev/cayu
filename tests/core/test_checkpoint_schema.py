@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any, cast
 
@@ -27,14 +28,22 @@ from cayu.runtime import InMemorySessionStore
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _session_engine as session_engine
+from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
+)
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    build_invocation_terminal_decision,
+    invocation_terminal_event_id,
 )
 from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     CheckpointMigration,
     CheckpointMigrationDefinitionError,
     CheckpointMigrator,
@@ -55,6 +64,7 @@ from cayu.runtime.workspace_observation_recovery import (
     WorkspaceObservationPhase,
     workspace_observations_from_checkpoint,
 )
+from cayu.vaults import SecretRedactor
 
 _FROZEN_VERSIONLESS_ROOT_CHECKPOINTS = {
     "approval": {
@@ -271,6 +281,155 @@ def test_v5_user_input_lookalikes_do_not_become_v6_authority() -> None:
     )
     assert "user_input_supersession_intent" in source_pending_interrupt
     assert "ambiguous_user_input_supersession_intent" in source_pending_interrupt
+
+
+def test_v6_terminal_decision_lookalikes_do_not_become_v7_authority() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 6,
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: {
+            "record_type": "cayu.invocation-terminal-decision",
+            "decision_id": "caller-owned-active-collision",
+        },
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: {
+            "record_type": "cayu.invocation-terminal-decision",
+            "decision_id": "caller-owned-settled-collision",
+        },
+        "future_additive_field": {"kept": True},
+    }
+
+    decoded = decode_runtime_checkpoint(source, session_id="sess-v6-terminal-collision")
+
+    assert decoded == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "future_additive_field": {"kept": True},
+    }
+    assert INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in source
+    assert SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in source
+    assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == 6
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "decision_id",
+        "interrupted",
+        "predecessor_interaction_event_id",
+        "task_terminalization_request_sha256",
+    ],
+)
+def test_valid_terminal_decision_controls_survive_short_secret_collisions(
+    secret: str,
+) -> None:
+    session_id = "sess-terminal-decision-secret-collision"
+    session_instance_id = "session-instance-terminal-decision-secret-collision"
+    interaction_id = "interaction-terminal-decision-secret-collision"
+    interruption_request_id = "interrupt-terminal-decision-secret-collision"
+    event_kwargs = {
+        "outcome": InvocationTerminalOutcome.INTERRUPTED,
+        "session_id": session_id,
+        "session_instance_id": session_instance_id,
+        "run_epoch": 1,
+        "interaction_id": interaction_id,
+        "source_id": interruption_request_id,
+    }
+    decision = build_invocation_terminal_decision(
+        outcome=InvocationTerminalOutcome.INTERRUPTED,
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+        run_epoch=1,
+        profile_interaction_id=interaction_id,
+        interaction_id=interaction_id,
+        execution_profile_fingerprint="1" * 64,
+        interaction_event_id=invocation_terminal_event_id(
+            **event_kwargs,
+            event_kind="interaction",
+        ),
+        terminal_event_id=invocation_terminal_event_id(
+            **event_kwargs,
+            event_kind="session",
+        ),
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        terminal_payload={"reason": "operator requested"},
+        interruption_request_id=interruption_request_id,
+    )
+
+    for root in (
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    ):
+        checkpoint = {
+            CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+            root: decision.model_dump(mode="json"),
+        }
+        assert not durable_value_contains_secret(
+            checkpoint,
+            redactor=SecretRedactor([secret]),
+        )
+
+
+def test_terminal_decision_payload_remains_subject_to_secret_rejection() -> None:
+    session_id = "sess-terminal-decision-secret-payload"
+    session_instance_id = "session-instance-terminal-decision-secret-payload"
+    interaction_id = "interaction-terminal-decision-secret-payload"
+    interruption_request_id = "interrupt-terminal-decision-secret-payload"
+    event_kwargs = {
+        "outcome": InvocationTerminalOutcome.INTERRUPTED,
+        "session_id": session_id,
+        "session_instance_id": session_instance_id,
+        "run_epoch": 1,
+        "interaction_id": interaction_id,
+        "source_id": interruption_request_id,
+    }
+    decision = build_invocation_terminal_decision(
+        outcome=InvocationTerminalOutcome.INTERRUPTED,
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+        run_epoch=1,
+        profile_interaction_id=interaction_id,
+        interaction_id=interaction_id,
+        execution_profile_fingerprint="2" * 64,
+        interaction_event_id=invocation_terminal_event_id(
+            **event_kwargs,
+            event_kind="interaction",
+        ),
+        terminal_event_id=invocation_terminal_event_id(
+            **event_kwargs,
+            event_kind="session",
+        ),
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        terminal_payload={"reason": "terminal-payload-secret"},
+        interruption_request_id=interruption_request_id,
+    )
+
+    assert durable_value_contains_secret(
+        {
+            CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+            INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: decision.model_dump(mode="json"),
+        },
+        redactor=SecretRedactor(["terminal-payload-secret"]),
+    )
+
+
+def test_failure_terminal_decision_rejects_malformed_terminalization_digest() -> None:
+    with pytest.raises(ValueError, match="task_terminalization_request_sha256"):
+        build_invocation_terminal_decision(
+            outcome=InvocationTerminalOutcome.FAILED,
+            session_id="sess-failure-terminalization-digest",
+            session_instance_id="instance-failure-terminalization-digest",
+            run_epoch=1,
+            profile_interaction_id="interaction-failure-terminalization-digest",
+            interaction_id="interaction-failure-terminalization-digest",
+            execution_profile_fingerprint="3" * 64,
+            interaction_event_id="runtime-failure:interaction_failed",
+            terminal_event_id="runtime-failure:session_failed",
+            observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            terminal_payload={"runtime_task_failure_id": "runtime-failure"},
+            task_id="task-failure-terminalization-digest",
+            runtime_task_failure_id="runtime-failure",
+            task_terminalization_request_sha256="invalid",
+            task_error_payload={"type": "RuntimeError"},
+            turn_completed_payload={"status": "failed"},
+        )
 
 
 def test_versionless_root_checkpoint_has_a_fixed_legacy_version() -> None:
@@ -694,6 +853,48 @@ def test_v5_writer_view_rejects_exact_user_input_authority(
             source,
             writer_version=5,
             session_id="sess-v5-exact-user-input-writer-view",
+        )
+
+
+def test_v6_writer_view_preserves_v6_user_input_authority() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "pending_user_input": {"schema_version": 1},
+        "user_input_resolution_intent": {"schema_version": 1},
+        AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY: {"schema_version": 1},
+        "pending_session_interrupt": {
+            "user_input_supersession_intent": {"schema_version": 1},
+            "ambiguous_user_input_supersession_intent": {"schema_version": 1},
+        },
+    }
+
+    projected = runtime_checkpoint_writer_view(
+        source,
+        writer_version=6,
+        session_id="sess-v6-user-input-writer-view",
+    )
+
+    assert projected == {**source, CHECKPOINT_SCHEMA_VERSION_KEY: 6}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    ],
+)
+def test_v6_writer_view_rejects_terminal_decision_authority(field_name: str) -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        field_name: {"record_type": "cayu.invocation-terminal-decision"},
+    }
+
+    with pytest.raises(ValueError, match="cannot be represented"):
+        runtime_checkpoint_writer_view(
+            source,
+            writer_version=6,
+            session_id="sess-v6-terminal-decision-writer-view",
         )
 
 
