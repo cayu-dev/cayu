@@ -511,6 +511,7 @@ from cayu.runtime.tool_rounds import (
     ToolRoundRecoveryRequest,
     copy_tool_round_recovery_request,
 )
+from cayu.runtime.tool_terminal_publication import ToolTerminalPublicationMetricsSnapshot
 from cayu.runtime.usage import (
     USAGE_BEARING_EVENT_TYPES,
     CausalBudgetUsageSummary,
@@ -2089,6 +2090,11 @@ class CayuApp:
         """Return content-free process-local cleanup supervision state."""
 
         return self._recovery_cleanup_supervisor.snapshot()
+
+    def tool_terminal_publication_status(self) -> ToolTerminalPublicationMetricsSnapshot:
+        """Return content-free staged-terminal backlog and fairness measurements."""
+
+        return self._tool_round_executor.terminal_publication_metrics()
 
     async def drain_recovery_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Wait boundedly for active and outcome-unknown recovery cleanup."""
@@ -8423,6 +8429,7 @@ def _validate_registered_tool(
         parallel_safe=spec.parallel_safe,
         effect=spec.effect,
         workspace_mutation=spec.workspace_mutation,
+        max_terminal_payload_bytes=spec.max_terminal_payload_bytes,
     )
     command_policy = getattr(tool, "command_policy", None)
     if isinstance(tool, ProcessIsolatedTool):
@@ -8439,6 +8446,13 @@ def _validate_registered_tool(
         execution_contract = ToolExecutionContract(
             timeout_strength=("cooperative_in_process" if timeout_seconds is not None else "none")
         ).model_dump(mode="json")
+    execution_contract = (
+        ToolExecutionContract.model_validate(execution_contract)
+        .model_copy(
+            update={"max_terminal_payload_bytes": validated_spec.max_terminal_payload_bytes}
+        )
+        .model_dump(mode="json")
+    )
     return runtime_records.RegisteredTool(
         name=validated_spec.name,
         description=validated_spec.description,

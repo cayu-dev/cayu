@@ -262,6 +262,31 @@ def _execution_outcome(
     )
 
 
+def terminal_payload_limit_failure(
+    *,
+    effect: ToolEffect,
+    maximum_bytes: int,
+    observed_bytes: int,
+    redactor: SecretRedactor,
+) -> ToolExecutionOutcome:
+    """Return bounded authority for a tool that violated its declared output contract."""
+
+    if type(maximum_bytes) is not int or maximum_bytes <= 0:
+        raise ValueError("maximum_bytes must be a positive integer.")
+    if type(observed_bytes) is not int or observed_bytes <= maximum_bytes:
+        raise ValueError("observed_bytes must exceed maximum_bytes.")
+    result, controls = tool_results.terminal_failure_result(
+        terminal_outcome="invalid_tool_output",
+        effect=effect,
+        message=(
+            "Tool output violated its registered durable terminal payload limit "
+            f"({observed_bytes} bytes observed; {maximum_bytes} bytes allowed)."
+        ),
+        redactor=redactor,
+    )
+    return _execution_outcome(result, controls)
+
+
 def _isolated_failure_outcome(
     *,
     terminal_outcome: str,

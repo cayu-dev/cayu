@@ -184,6 +184,13 @@ _TOOL_LINKAGE_AUTHORITY_KEYS = frozenset(
     }
 )
 _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS = frozenset({"execution_profile_fingerprint"})
+_TOOL_TERMINAL_TIMING_KEYS = frozenset(
+    {
+        "tool_effect_completed_at",
+        "tool_terminal_staged_at",
+        "tool_terminal_publication_started_at",
+    }
+)
 _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS = frozenset({"exposure_fingerprint", "profile_id"})
 _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS = _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS | {
     "catalogue_revision"
@@ -224,6 +231,7 @@ _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS = (
     | _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS
     | _TARGETED_TOOL_GRANT_PUBLIC_AUTHORITY_KEYS
     | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+    | _TOOL_TERMINAL_TIMING_KEYS
 )
 _TOOL_EVENT_TYPES = frozenset(
     {
@@ -2468,6 +2476,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "tool_timeout_strength",
         WEB_ACCESS_RESULT_AUTHORITY_FIELD,
         SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
+        *_TOOL_TERMINAL_TIMING_KEYS,
     }
     tool_actor_paths = _resolution_actor_nested_paths("resolved_by")
     policies[EventType.TOOL_CALL_STARTED] = _policy(
@@ -2514,6 +2523,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
                 "resolution_request_digest",
                 WEB_ACCESS_RESULT_AUTHORITY_FIELD,
                 SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
+                *_TOOL_TERMINAL_TIMING_KEYS,
             },
             internal_authority_keys={
                 WEB_ACCESS_RESULT_AUTHORITY_FIELD,
@@ -2522,6 +2532,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             public_authority_keys=(
                 _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
                 | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+                | _TOOL_TERMINAL_TIMING_KEYS
             ),
             aliased_authority_keys={
                 "approval_id",
@@ -2773,6 +2784,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.TOOL_CALL_BLOCKED] = _policy(
         *tool_common,
+        *_TOOL_TERMINAL_TIMING_KEYS,
         "blocked_by",
         "decision",
         "denied_by",
@@ -2785,11 +2797,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             _TOOL_LINKAGE_AUTHORITY_KEYS
             | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS
             | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+            | _TOOL_TERMINAL_TIMING_KEYS
         ),
         public_authority_keys=(
             _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
             | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS
             | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+            | _TOOL_TERMINAL_TIMING_KEYS
         ),
         aliased_authority_keys={
             "approval_id",
@@ -2866,11 +2880,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "resolved_by",
         owned_nested_paths=_TOOL_DENIAL_RESULT_NESTED_PATHS | tool_actor_paths,
         authority_keys=(
-            _TOOL_LINKAGE_AUTHORITY_KEYS | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+            _TOOL_LINKAGE_AUTHORITY_KEYS
+            | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+            | _TOOL_TERMINAL_TIMING_KEYS
         ),
         public_authority_keys=(
             _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
             | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+            | _TOOL_TERMINAL_TIMING_KEYS
         ),
         aliased_authority_keys={
             "approval_id",
@@ -4793,6 +4810,7 @@ def _reject_secret_authority_values(
             "handoff_id",
             "pause_digest",
             "resolution_request_digest",
+            *_TOOL_TERMINAL_TIMING_KEYS,
             *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
         } and (
             event_payload_authority_is_runtime_generated(
@@ -4946,6 +4964,15 @@ def _public_authority_is_trusted(
         type(value) is str and bool(value.strip()) and len(value) <= 256
     ):
         return False
+    if field_name in _TOOL_TERMINAL_TIMING_KEYS:
+        if type(value) is not str:
+            return False
+        try:
+            parsed_timestamp = datetime.fromisoformat(value)
+        except ValueError:
+            return False
+        if parsed_timestamp.tzinfo is None:
+            return False
     if field_name in {"descriptor_version", "effective_tool_id", "tool_id"}:
         if type(value) is not str:
             return False
@@ -5098,6 +5125,39 @@ def _validate_fixed_field_types(event: Event, *, policy: EventPayloadPolicy) -> 
             continue
         if type(value) is not int or value < 1:
             raise TypeError(f"event.payload.{field_name} must be a positive integer.")
+    timing_values = {
+        field_name: event.payload[field_name]
+        for field_name in _TOOL_TERMINAL_TIMING_KEYS
+        if field_name in policy.owned_keys and field_name in event.payload
+    }
+    if timing_values:
+        if set(timing_values) != _TOOL_TERMINAL_TIMING_KEYS:
+            raise ValueError("Terminal publication timing fields must be complete together.")
+        parsed: dict[str, datetime] = {}
+        for field_name, value in timing_values.items():
+            if type(value) is not str:
+                raise TypeError(f"event.payload.{field_name} must be an ISO timestamp string.")
+            try:
+                timestamp = datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"event.payload.{field_name} must be an ISO timestamp string."
+                ) from exc
+            if timestamp.tzinfo is None:
+                raise ValueError(f"event.payload.{field_name} must include a UTC offset.")
+            parsed[field_name] = timestamp
+        effect = parsed["tool_effect_completed_at"]
+        staged = parsed["tool_terminal_staged_at"]
+        publication = parsed["tool_terminal_publication_started_at"]
+        if not effect <= staged <= publication:
+            raise ValueError("Terminal publication timing fields are not monotonic.")
+        event_timestamp = (
+            event.timestamp.replace(tzinfo=effect.tzinfo)
+            if event.timestamp.tzinfo is None
+            else event.timestamp
+        )
+        if event_timestamp != publication:
+            raise ValueError("Terminal event timestamp must equal publication start time.")
 
 
 def _validate_budget_payload_schema(event: Event) -> None:
@@ -5756,9 +5816,20 @@ def _synchronize_runtime_tool_result_projection_record(
     if type(controls.get("tool_result_projection")) is not dict:
         return
     result = payload.get("result")
+    trusted_record = controls.get("tool_result_projection")
     record = payload.get("tool_result_projection")
-    if type(result) is not dict or type(record) is not dict:
+    if type(result) is not dict or type(trusted_record) is not dict or type(record) is not dict:
         raise AssertionError("Validated projection lost its result or evidence record.")
+    # The complete record was validated together with its strict artifact
+    # reference before it entered ``controls``.  Restore that runtime-owned
+    # evidence as one unit: individual hashes and artifact identities must not
+    # be rewritten merely because a later tool resolves an overlapping secret.
+    trusted_record_copy = copy_durable_json_value(
+        trusted_record,
+        "tool_result_projection",
+    )
+    record.clear()
+    record.update(trusted_record_copy)
     content = result.get("content")
     if type(content) is not str:
         raise AssertionError("Validated projection lost its content.")

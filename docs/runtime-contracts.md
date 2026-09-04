@@ -1922,6 +1922,34 @@ Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positi
 
 `BoundWorkspace.snapshot` and a `WorkspaceBinding.finalize(...)` return value can carry `WorkspaceSnapshot` records. A snapshot is non-secret durable identity for a concrete workspace version: for example a git commit, S3 object generation, EFS snapshot id, sandbox filesystem generation, or app-owned sync token. `environment.binding.completed` includes `bound_snapshot` when the binding knows the version made visible to the runner. `environment.binding.finalize_completed` includes `final_snapshot` when finalization syncs or persists a new version after the session. Snapshots do not implement storage, copying, mounting, or cleanup by themselves; those behaviors remain in the binding/workspace/runner implementation. Apps should treat snapshot metadata as observability and replay/debug context, not as a place for secrets.
 
+## Tool terminal publication capacity
+
+`ToolSpec.max_terminal_payload_bytes` is an optional immutable declaration of
+the largest durable result payload a tool may produce. It participates in the
+catalogue and execution-profile identity. For a deferred multi-call round,
+Cayu reserves the sum of those result declarations, published model-argument
+sizes, and fixed runtime-envelope headroom before dispatching any tool effect.
+A round whose hooks may modify published arguments receives an exclusive lease
+because the effective argument size is not known at admission. Declared rounds
+share one process-local byte domain; a round containing an undeclared tool, or
+whose complete declaration exceeds that domain, receives an exclusive oversize
+lease. The lease remains owned until every durable staged terminal has been
+published. This whole-round admission prevents sibling results from deadlocking
+after their effects have executed.
+
+A tool that exceeds its declaration receives one bounded authoritative
+`invalid_tool_output` failure; Cayu does not truncate a successful result or
+erase workspace-settlement evidence. If the fixed failure plus runtime-owned
+effect evidence cannot fit the declaration, publication fails closed. A
+checkpoint write with an uncertain acknowledgement retains its lease until
+readback, retry, or recovery reconciles the stage; proven pre-commit rejection
+can release it. Tools without a declaration preserve exact results under the
+exclusive rule. `CayuApp.tool_terminal_publication_status()` exposes only
+content-free counts, byte totals, waiters, oldest delay, validation CPU, and
+publication lag. Large validation/projection work is offloaded under a
+separate bounded cooperative scheduling domain so unrelated sessions,
+interrupts, and lease heartbeats can run.
+
 ## Tool exposure selection contracts
 
 Registration, cataloguing, exposure, and authorization are distinct. A

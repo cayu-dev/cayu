@@ -174,6 +174,12 @@ def _read_file_tool_spec(
 ) -> ToolSpec:
     return ToolSpec(
         name="read_file",
+        # Text is capped by MAX_READ_LIMIT_BYTES. Native attachments are
+        # represented by bounded metadata, but reserve their configured source
+        # ceiling plus framing/structured-result headroom conservatively.
+        max_terminal_payload_bytes=(
+            max(MAX_READ_LIMIT_BYTES, max_attachment_limit_bytes) + 1024 * 1024
+        ),
         # Workspace image/PDF reads can create artifact snapshots; keep this conservative until
         # snapshot writes are idempotent/content-addressed.
         effect=ToolEffect.EXTERNAL,

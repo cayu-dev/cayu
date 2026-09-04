@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
+from dataclasses import dataclass
 from itertools import islice
 
 from cayu.core.events import (
@@ -45,6 +46,12 @@ _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0
 _MAX_AGGREGATED_FAILURES = 16
 _MAX_EXCEPTION_NOTES = 16
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRuntimeEvent:
+    owner: object
+    event: Event
 
 
 def _reconcile_exact_persisted_event(
@@ -96,6 +103,7 @@ class RuntimeEventWriter:
                 "authority alias keyring."
             )
         self._public_authority_alias_codec = store_alias_codec
+        self._prepared_event_owner = object()
         if self._secret_redactor.has_values and (
             self._public_authority_alias_codec is None
             or not session_store.supports_public_authority_aliases
@@ -106,8 +114,50 @@ class RuntimeEventWriter:
             )
 
     async def emit(self, event: Event) -> Event:
-        event = self.prepare(attribute_event_to_current_interaction(event))
+        prepared = self._prepare_for_append(event)
+        return await self._emit_prepared(prepared)
+
+    async def emit_cooperatively(
+        self,
+        event: Event,
+        *,
+        estimated_bytes: int,
+        scheduler: Callable[[int, Callable[[], object]], Awaitable[object]],
+        persisted_observer: Callable[[Event], None] | None = None,
+    ) -> Event:
+        """Schedule preparation while retaining the writer-owned append boundary."""
+
+        if not callable(scheduler):
+            raise TypeError("Runtime event preparation scheduler must be callable.")
+        prepared = await scheduler(estimated_bytes, lambda: self._prepare_for_append(event))
+        if (
+            type(prepared) is not _PreparedRuntimeEvent
+            or prepared.owner is not self._prepared_event_owner
+        ):
+            raise RuntimeError("Runtime event preparation scheduler lost writer authority.")
+        return await self._emit_prepared(prepared, persisted_observer=persisted_observer)
+
+    def _prepare_for_append(self, event: Event) -> _PreparedRuntimeEvent:
+        prepared = self.prepare(attribute_event_to_current_interaction(event))
+        return _PreparedRuntimeEvent(self._prepared_event_owner, prepared)
+
+    async def _emit_prepared(
+        self,
+        prepared: _PreparedRuntimeEvent,
+        *,
+        persisted_observer: Callable[[Event], None] | None = None,
+    ) -> Event:
+        """Append only a writer-owned prepared event token."""
+
+        if (
+            type(prepared) is not _PreparedRuntimeEvent
+            or prepared.owner is not self._prepared_event_owner
+        ):
+            raise TypeError("Prepared runtime event authority is invalid.")
+        event = prepared.event
         await self._session_store.append_event(event.session_id, event)
+        if persisted_observer is not None:
+            persisted_observer(event)
         self._retain_terminal_event_authority(event)
         claim = await self._session_store.claim_persisted_event_side_effect(
             session_id=event.session_id,

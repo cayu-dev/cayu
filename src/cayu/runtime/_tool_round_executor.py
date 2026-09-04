@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Literal, Never, TypeVar, cast
 from uuid import uuid4
@@ -36,6 +36,7 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
+    JsonUtf8SizeCounter,
     copy_durable_json_object,
     copy_durable_json_value,
     copy_json_value,
@@ -54,6 +55,7 @@ from cayu.core.events import (
     Event,
     EventType,
     copy_event,
+    event_nested_payload_authority_is_runtime_generated,
     event_payload_authority_is_runtime_generated,
     event_retains_runtime_payload_authority,
     event_with_runtime_envelope_authority,
@@ -249,6 +251,11 @@ from cayu.runtime.tool_result_projection import (
     safe_projection_failure_type,
     validate_tool_result_projection,
 )
+from cayu.runtime.tool_terminal_publication import (
+    TOOL_TERMINAL_PUBLICATION_SLICE_BYTES,
+    ToolTerminalPublicationGovernor,
+    ToolTerminalPublicationMetricsSnapshot,
+)
 from cayu.runtime.user_input import (
     PENDING_USER_INPUT_CHECKPOINT_KEY,
     PendingUserInput,
@@ -387,6 +394,15 @@ def _event_with_workspace_observation_authority(
 
 
 _TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS = 30.0
+_TOOL_EFFECT_COMPLETED_AT_FIELD = "tool_effect_completed_at"
+_TOOL_TERMINAL_STAGED_AT_FIELD = "tool_terminal_staged_at"
+_TOOL_TERMINAL_PUBLICATION_STARTED_AT_FIELD = "tool_terminal_publication_started_at"
+_TOOL_TERMINAL_TIMING_FIELDS = (
+    _TOOL_EFFECT_COMPLETED_AT_FIELD,
+    _TOOL_TERMINAL_STAGED_AT_FIELD,
+    _TOOL_TERMINAL_PUBLICATION_STARTED_AT_FIELD,
+)
+_TOOL_TERMINAL_RUNTIME_PAYLOAD_HEADROOM_BYTES = 64 * 1024
 _WORKSPACE_RECEIPT_INLINE_PATH_LIMIT = 32
 _WORKSPACE_RECEIPT_INLINE_BYTES = 8 * 1024
 _WORKSPACE_OBSERVATION_RUNTIME_LIMITS = WorkspaceRevisionObservationLimits()
@@ -473,6 +489,7 @@ DeferredTerminalStager = Callable[
 ]
 DeferredTerminalFinalizer = Callable[[Event], Awaitable[Event]]
 DeferredTerminalCaptureRecorder = Callable[[Event], Awaitable[Event]]
+TerminalEventEmitter = Callable[[Event], Awaitable[Event]]
 
 _AMBIGUOUS_POLICY_RECOVERY_REASON = (
     "Tool policy planning was interrupted without a durable outcome; "
@@ -653,6 +670,9 @@ class _ToolRoundPublicationCoordinator:
         redactor: SecretRedactor,
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ResolvedToolExposureAuthority | None = None,
+        publication_governor: ToolTerminalPublicationGovernor | None = None,
+        clock: Callable[[], datetime] | None = None,
+        terminal_payload_limits: Mapping[str, int | None] | None = None,
     ) -> None:
         self._session_id = require_clean_nonblank(session_id, "session_id")
         self._tool_round_identity = copy_tool_round_identity(tool_round_identity)
@@ -671,6 +691,36 @@ class _ToolRoundPublicationCoordinator:
         )
         self._unsafe_tool_call_ids: set[str] = set()
         self._lock = asyncio.Lock()
+        self._publication_governor = publication_governor or ToolTerminalPublicationGovernor()
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._terminal_payload_limits = (
+            {} if terminal_payload_limits is None else dict(terminal_payload_limits)
+        )
+        if any(
+            type(tool_call_id) is not str
+            or not tool_call_id
+            or (limit is not None and (type(limit) is not int or limit <= 0))
+            for tool_call_id, limit in self._terminal_payload_limits.items()
+        ):
+            raise ValueError("Terminal payload limits must map call IDs to positive bytes or None.")
+        limits = tuple(self._terminal_payload_limits.values())
+        self._capacity_maximum_bytes = (
+            sum(
+                limit + _TOOL_TERMINAL_RUNTIME_PAYLOAD_HEADROOM_BYTES
+                for limit in limits
+                if limit is not None
+            )
+            if limits and all(limit is not None for limit in limits)
+            else None
+        )
+        self._capacity_reserved = False
+        self._capacity_sealed = False
+        # Register the write attempt before the atomic checkpoint transform.
+        # If its acknowledgement is lost, retain the lease until a retry or
+        # recovery owner reconciles and publishes the durable stage.
+        self._stage_attempted_event_ids: set[str] = set()
+        self._staged_event_ids: set[str] = set()
+        self._published_event_ids: set[str] = set()
 
     @property
     def redactor(self) -> SecretRedactor:
@@ -685,6 +735,84 @@ class _ToolRoundPublicationCoordinator:
         """Return whether every sealed call contributed complete secret evidence."""
 
         return not self._unsafe_tool_call_ids
+
+    async def reserve_capacity(self) -> None:
+        """Acquire this complete round's byte lease before tool dispatch."""
+
+        await self._publication_governor.reserve_round(
+            session_id=self._session_id,
+            tool_round_id=self._tool_round_identity.tool_round_id,
+            maximum_bytes=self._capacity_maximum_bytes,
+        )
+        self._capacity_reserved = True
+
+    async def restore_staged_capacity(
+        self,
+        staged_terminals: Iterable[tool_round_recovery.StagedToolCallTerminal],
+    ) -> None:
+        """Attach durable stages to a recovered owner of the round lease."""
+
+        if not self._capacity_reserved:
+            raise RuntimeError("Staged terminal recovery requires a round reservation.")
+        for staged in staged_terminals:
+            if staged.event.session_id != self._session_id:
+                raise RuntimeError("Staged terminal capacity belongs to a different session.")
+            payload_bytes = staged.payload_bytes
+            if payload_bytes is None:
+                payload_bytes = await self._publication_governor.run_cpu(
+                    _terminal_publication_work_estimate(staged.event),
+                    lambda staged=staged: _durable_payload_utf8_size(staged.event.payload),
+                )
+            self.validate_staged_payload(staged.tool_call_id, payload_bytes)
+            effect_completed_at = _normalized_event_timestamp(
+                staged.effect_completed_at or staged.event.timestamp
+            )
+            self._publication_governor.reconcile_stage(
+                session_id=self._session_id,
+                event_id=staged.event.id,
+                payload_bytes=payload_bytes,
+                effect_completed_at=effect_completed_at,
+                tool_round_id=self._tool_round_identity.tool_round_id,
+            )
+            self._stage_attempted_event_ids.discard(staged.event.id)
+            self._staged_event_ids.add(staged.event.id)
+
+    def terminal_payload_limit(self, tool_call_id: str) -> int | None:
+        return self._terminal_payload_limits.get(tool_call_id)
+
+    def validate_staged_payload(self, tool_call_id: str, payload_bytes: int) -> None:
+        declared = self.terminal_payload_limit(tool_call_id)
+        if (
+            declared is not None
+            and payload_bytes > declared + _TOOL_TERMINAL_RUNTIME_PAYLOAD_HEADROOM_BYTES
+        ):
+            raise RuntimeError(
+                "Bounded tool terminal exceeded its reserved runtime payload envelope."
+            )
+
+    def seal_capacity(self) -> None:
+        """Declare that no additional terminal can enter this round."""
+
+        self._capacity_sealed = True
+        self._release_capacity_if_drained()
+
+    def terminal_published(self, event_id: str) -> None:
+        self._published_event_ids.add(event_id)
+        self._release_capacity_if_drained()
+
+    def _release_capacity_if_drained(self) -> None:
+        if (
+            not self._capacity_reserved
+            or not self._capacity_sealed
+            or self._stage_attempted_event_ids
+            or not self._staged_event_ids.issubset(self._published_event_ids)
+        ):
+            return
+        self._publication_governor.release_round(
+            session_id=self._session_id,
+            tool_round_id=self._tool_round_identity.tool_round_id,
+        )
+        self._capacity_reserved = False
 
     def restore_staged_event_authority(self, event: Event) -> Event:
         restored = restore_staged_terminal_authority(
@@ -707,6 +835,110 @@ class _ToolRoundPublicationCoordinator:
             restored,
             self._execution_profile_fingerprint,
         )
+
+    async def start_publication(
+        self,
+        staged: tool_round_recovery.StagedToolCallTerminal,
+    ) -> tool_round_recovery.StagedToolCallTerminal:
+        """Durably pin public timing before the first append attempt."""
+
+        effect_completed_at = _normalized_event_timestamp(
+            staged.effect_completed_at or staged.event.timestamp
+        )
+        staged_at = staged.staged_at or effect_completed_at
+        payload_bytes = staged.payload_bytes
+        if payload_bytes is None:
+            payload_bytes = await self._publication_governor.run_cpu(
+                _terminal_publication_work_estimate(staged.event),
+                lambda: _durable_payload_utf8_size(staged.event.payload),
+            )
+        self._publication_governor.reconcile_stage(
+            session_id=self._session_id,
+            event_id=staged.event.id,
+            payload_bytes=payload_bytes,
+            effect_completed_at=effect_completed_at,
+            tool_round_id=(
+                self._tool_round_identity.tool_round_id if self._capacity_reserved else None
+            ),
+        )
+        self._staged_event_ids.add(staged.event.id)
+        if staged.publication_started_at is not None:
+            return staged
+        publication_started_at = max(self._clock(), staged_at)
+        payload = dict(staged.event.payload)
+        payload.update(
+            {
+                _TOOL_EFFECT_COMPLETED_AT_FIELD: effect_completed_at.isoformat(),
+                _TOOL_TERMINAL_STAGED_AT_FIELD: staged_at.isoformat(),
+                _TOOL_TERMINAL_PUBLICATION_STARTED_AT_FIELD: (publication_started_at.isoformat()),
+            }
+        )
+        public_event = staged.event.model_copy(
+            update={"timestamp": publication_started_at, "payload": payload}
+        )
+        public_payload_bytes = await self._publication_governor.run_cpu(
+            _terminal_publication_work_estimate(public_event),
+            lambda: _durable_payload_utf8_size(public_event.payload),
+        )
+        self.validate_staged_payload(staged.tool_call_id, public_payload_bytes)
+        await self._session_store.transform_checkpoint(
+            self._session_id,
+            tool_round_recovery.started_staged_terminal_publication_transform(
+                tool_round_identity=self._tool_round_identity,
+                tool_call_id=staged.tool_call_id,
+                event=public_event,
+                payload_bytes=public_payload_bytes,
+                effect_completed_at=effect_completed_at,
+                staged_at=staged_at,
+                publication_started_at=publication_started_at,
+            ),
+        )
+        checkpoint = await self._session_store.load_checkpoint(self._session_id)
+        stored = next(
+            (
+                item
+                for item in tool_round_recovery.checkpoint_staged_terminals(
+                    checkpoint,
+                    tool_round_identity=self._tool_round_identity,
+                )
+                if item.tool_call_id == staged.tool_call_id
+            ),
+            None,
+        )
+        if (
+            stored is None
+            or stored.publication_started_at != publication_started_at
+            or stored.payload_bytes != public_payload_bytes
+        ):
+            raise RuntimeError("Staged terminal publication timing was not acknowledged.")
+        self._record_durable_stage(stored)
+        return stored
+
+    def restore_started_publication_authority(
+        self,
+        staged: tool_round_recovery.StagedToolCallTerminal,
+    ) -> Event:
+        """Restore typed timing authority from the durable staged record."""
+
+        restored = self.restore_staged_event_authority(staged.event)
+        if (
+            staged.effect_completed_at is None
+            or staged.staged_at is None
+            or staged.publication_started_at is None
+        ):
+            return restored
+        expected = {
+            _TOOL_EFFECT_COMPLETED_AT_FIELD: staged.effect_completed_at.isoformat(),
+            _TOOL_TERMINAL_STAGED_AT_FIELD: staged.staged_at.isoformat(),
+            _TOOL_TERMINAL_PUBLICATION_STARTED_AT_FIELD: (
+                staged.publication_started_at.isoformat()
+            ),
+        }
+        if restored.timestamp != staged.publication_started_at or any(
+            restored.payload.get(field_name) != value for field_name, value in expected.items()
+        ):
+            raise RuntimeError("Staged terminal event conflicts with its publication timing.")
+        return event_with_runtime_payload_authority(restored, *expected)
 
     async def register_redactor(
         self,
@@ -757,28 +989,102 @@ class _ToolRoundPublicationCoordinator:
         snapshot: invocation_secrets.InvocationPublicationSnapshot,
         hooks_state: Literal["pending", "finalized", "observational", "completed"],
     ) -> Event:
-        """Persist a stable terminal event after applying the cumulative scope."""
+        """Persist a stable terminal event before redelivering caller cancellation."""
+
+        stage_task = asyncio.create_task(
+            self._stage_terminal_owned(
+                tool_call_id=tool_call_id,
+                event=event,
+                snapshot=snapshot,
+                hooks_state=hooks_state,
+            )
+        )
+        outcome = await await_shielded_task_outcome(stage_task)
+        if outcome.error is not None:
+            raise outcome.error
+        if outcome.result is None:  # pragma: no cover - owned task invariant
+            raise RuntimeError("Staged terminal publication returned no durable event.")
+        if outcome.cancellation is not None:
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed,
+                cancellation=outcome.cancellation,
+            )
+            raise outcome.cancellation
+        return outcome.result
+
+    async def _stage_terminal_owned(
+        self,
+        *,
+        tool_call_id: str,
+        event: Event,
+        snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        hooks_state: Literal["pending", "finalized", "observational", "completed"],
+    ) -> Event:
+        """Complete one cancellation-resistant durable staging operation."""
 
         if event.session_id != self._session_id:
             raise ValueError("Staged terminal event belongs to a different session.")
         async with self._lock:
+            previous_redactor = self._redactor
             self._redactor = self._redactor.merged_with(snapshot.redactor)
             if snapshot.secret_scope_incomplete:
                 self._unsafe_tool_call_ids.add(tool_call_id)
-            staged = tool_round_recovery.StagedToolCallTerminal(
-                tool_call_id=tool_call_id,
-                event=_project_staged_terminal_event(event, redactor=self._redactor),
-                hooks_state=hooks_state,
-            )
-            await self._session_store.transform_checkpoint(
-                self._session_id,
-                self._checkpoint_transform(
-                    tool_call_id=tool_call_id,
-                    cover_call=True,
-                    unsafe_scope=snapshot.secret_scope_incomplete,
-                    staged_terminal=staged,
+            estimated_bytes = _terminal_publication_work_estimate(event)
+            projected, payload_bytes = await self._publication_governor.run_cpu(
+                estimated_bytes,
+                lambda: _project_and_size_staged_terminal_event(
+                    event,
+                    redactor=self._redactor,
                 ),
             )
+            self.validate_staged_payload(tool_call_id, payload_bytes)
+            projected_payload = dict(projected.payload)
+            for field_name in _TOOL_TERMINAL_TIMING_FIELDS:
+                projected_payload.pop(field_name, None)
+            projected = projected.model_copy(update={"payload": projected_payload})
+            effect_completed_at = _normalized_event_timestamp(event.timestamp)
+            staged_at = max(self._clock(), effect_completed_at)
+            staged = tool_round_recovery.StagedToolCallTerminal(
+                tool_call_id=tool_call_id,
+                event=projected,
+                hooks_state=hooks_state,
+                payload_bytes=payload_bytes,
+                effect_completed_at=effect_completed_at,
+                staged_at=staged_at,
+            )
+            self._stage_attempted_event_ids.add(projected.id)
+            try:
+                await self._session_store.transform_checkpoint(
+                    self._session_id,
+                    self._checkpoint_transform(
+                        tool_call_id=tool_call_id,
+                        cover_call=True,
+                        unsafe_scope=snapshot.secret_scope_incomplete,
+                        staged_terminal=staged,
+                        reproject_existing=not previous_redactor.has_same_registry(self._redactor),
+                    ),
+                )
+            except BaseException:
+                # A transform error may be either a definite rejection or a
+                # lost acknowledgement after commit. Reconcile from the
+                # authoritative checkpoint before the outer owner seals the
+                # lease: proven absence is abortable, while uncertainty or a
+                # durable stage keeps its pre-effect reservation fenced.
+                with suppress(BaseException):
+                    checkpoint = await self._session_store.load_checkpoint(self._session_id)
+                    stored_stages = tool_round_recovery.checkpoint_staged_terminals(
+                        checkpoint,
+                        tool_round_identity=self._tool_round_identity,
+                    )
+                    stored = next(
+                        (item for item in stored_stages if item.tool_call_id == tool_call_id),
+                        None,
+                    )
+                    if stored is None:
+                        self._stage_attempted_event_ids.discard(projected.id)
+                    elif stored.event.id == projected.id:
+                        self._record_durable_stage(stored)
+                raise
             checkpoint = await self._session_store.load_checkpoint(self._session_id)
             stored_stages = tool_round_recovery.checkpoint_staged_terminals(
                 checkpoint,
@@ -790,7 +1096,30 @@ class _ToolRoundPublicationCoordinator:
             )
             if stored is None or stored.event.id != event.id:
                 raise RuntimeError("Staged terminal acknowledgement conflicts with its event.")
+            self._record_durable_stage(stored)
             return self.restore_staged_event_authority(stored.event)
+
+    def _record_durable_stage(
+        self,
+        stored: tool_round_recovery.StagedToolCallTerminal,
+    ) -> None:
+        if (
+            stored.payload_bytes is None
+            or stored.effect_completed_at is None
+            or stored.staged_at is None
+        ):
+            raise RuntimeError("Staged terminal acknowledgement lost size or timing evidence.")
+        self._publication_governor.reconcile_stage(
+            session_id=self._session_id,
+            event_id=stored.event.id,
+            payload_bytes=stored.payload_bytes,
+            effect_completed_at=stored.effect_completed_at,
+            tool_round_id=(
+                self._tool_round_identity.tool_round_id if self._capacity_reserved else None
+            ),
+        )
+        self._stage_attempted_event_ids.discard(stored.event.id)
+        self._staged_event_ids.add(stored.event.id)
 
     async def record_projected_terminal(self, event: Event) -> Event:
         """Persist a public projection while retaining its current hook state."""
@@ -820,7 +1149,17 @@ class _ToolRoundPublicationCoordinator:
             # finalized round redactor.  Preparing that event again validates
             # the boundary while preserving the runtime-owned projection
             # authority attached to externalized artifact references.
-            projected = prepare_runtime_event(event, redactor=self._redactor)
+            projected, payload_bytes = await self._publication_governor.run_cpu(
+                _terminal_publication_work_estimate(event),
+                lambda: _prepare_and_size_projected_terminal_event(
+                    event,
+                    redactor=self._redactor,
+                ),
+            )
+            tool_call_id = projected.payload.get("tool_call_id")
+            if type(tool_call_id) is not str:
+                raise ValueError("Projected terminal lost its tool-call identity.")
+            self.validate_staged_payload(tool_call_id, payload_bytes)
             await self._session_store.transform_checkpoint(
                 self._session_id,
                 (
@@ -830,6 +1169,7 @@ class _ToolRoundPublicationCoordinator:
                 )(
                     tool_round_identity=self._tool_round_identity,
                     event=projected,
+                    payload_bytes=payload_bytes,
                 ),
             )
             checkpoint = await self._session_store.load_checkpoint(self._session_id)
@@ -837,7 +1177,6 @@ class _ToolRoundPublicationCoordinator:
                 checkpoint,
                 tool_round_identity=self._tool_round_identity,
             )
-            tool_call_id = projected.payload.get("tool_call_id")
             stored = next(
                 (item for item in stored_stages if item.tool_call_id == tool_call_id),
                 None,
@@ -845,11 +1184,13 @@ class _ToolRoundPublicationCoordinator:
             if (
                 stored is None
                 or stored.event.id != projected.id
+                or stored.payload_bytes != payload_bytes
                 or (hooks_completed and stored.hooks_state != "completed")
                 or (not hooks_completed and stored.event != projected)
             ):
                 raise RuntimeError("Projected terminal acknowledgement conflicts with its stage.")
-            return self.restore_staged_event_authority(stored.event)
+            self._record_durable_stage(stored)
+            return self.restore_started_publication_authority(stored)
 
     def _checkpoint_transform(
         self,
@@ -858,6 +1199,7 @@ class _ToolRoundPublicationCoordinator:
         cover_call: bool,
         staged_terminal: tool_round_recovery.StagedToolCallTerminal | None,
         unsafe_scope: bool = False,
+        reproject_existing: bool = True,
     ) -> CheckpointTransform:
         identity = copy_tool_round_identity(self._tool_round_identity)
         redactor = self._redactor
@@ -886,19 +1228,23 @@ class _ToolRoundPublicationCoordinator:
                 updated,
                 tool_round_identity=identity,
             )
-            projected = [
-                item.model_copy(
-                    update={
-                        "event": _project_staged_terminal_event(
-                            item.event,
-                            redactor=redactor,
-                            trust_persisted_tool_result_authority=True,
-                        )
-                    },
-                    deep=True,
-                )
-                for item in existing_stages
-            ]
+            projected = (
+                [
+                    item.model_copy(
+                        update={
+                            "event": _project_staged_terminal_event(
+                                item.event,
+                                redactor=redactor,
+                                trust_persisted_tool_result_authority=True,
+                            )
+                        },
+                        deep=True,
+                    )
+                    for item in existing_stages
+                ]
+                if reproject_existing
+                else existing_stages
+            )
             if staged_terminal is not None:
                 existing = next(
                     (
@@ -969,11 +1315,38 @@ class ToolRoundExecutor:
         self._tool_timeout_seconds = tool_timeout_seconds
         self._max_parallel_tool_calls = max_parallel_tool_calls
         self._clock = clock
+        self._terminal_publication_governor = ToolTerminalPublicationGovernor()
         self._checkpoint_transform = checkpoint_transform
         self._apply_limit_evaluation = apply_limit_evaluation
         self._close_interrupted_round = close_interrupted_round
         self._workspace_capture_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS
+        )
+
+    def terminal_publication_metrics(self) -> ToolTerminalPublicationMetricsSnapshot:
+        """Return current content-free terminal-publication backlog and latency metrics."""
+
+        return self._terminal_publication_governor.snapshot()
+
+    async def _emit_staged_terminal_fairly(self, event: Event) -> Event:
+        """Prepare staged payload CPU off-loop, then use the writer's exact prepared path."""
+
+        return await self._event_writer.emit_cooperatively(
+            event,
+            # Final preparation validates every event field. Conservatively
+            # classify staged terminals as off-loop even when their content
+            # string is small; nested arguments and metadata are not safely
+            # measurable in constant time at this scheduling boundary.
+            estimated_bytes=max(
+                _terminal_publication_work_estimate(event),
+                TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1,
+            ),
+            scheduler=self._terminal_publication_governor.run_cpu,
+            persisted_observer=lambda persisted: self._terminal_publication_governor.published(
+                session_id=persisted.session_id,
+                event_id=persisted.id,
+                published_at=self._clock(),
+            ),
         )
 
     def create_run(
@@ -5767,6 +6140,63 @@ class ToolRoundExecutor:
                 if stop:
                     return
 
+    async def _enforce_terminal_result_payload_limit(
+        self,
+        *,
+        event: Event,
+        result: ToolResult,
+        registered_tool: runtime_records.RegisteredTool | None,
+        redactor: SecretRedactor,
+    ) -> tuple[Event, ToolResult, bool]:
+        """Replace an oversized finalized result with bounded effect authority."""
+
+        if registered_tool is None:
+            return event, result, False
+        maximum_bytes = ToolExecutionContract.model_validate(
+            registered_tool.execution_contract
+        ).max_terminal_payload_bytes
+        if maximum_bytes is None:
+            return event, result, False
+        observed_bytes = await self._terminal_publication_governor.run_cpu(
+            _terminal_publication_work_estimate(event),
+            lambda: _durable_payload_utf8_size(result.model_dump(mode="json")),
+        )
+        if observed_bytes <= maximum_bytes:
+            return event, result, False
+
+        failure = tool_execution.terminal_payload_limit_failure(
+            effect=registered_tool.effect,
+            maximum_bytes=maximum_bytes,
+            observed_bytes=observed_bytes,
+            redactor=redactor,
+        )
+        failure_result = failure.result
+        failure_payload = dict(event.payload)
+        for field_name in tool_results.runtime_terminal_controls(failure_payload):
+            failure_payload.pop(field_name, None)
+        failure_payload.pop("tool_result_projection", None)
+        failure_payload["result"] = failure_result.model_dump()
+        failure_payload.update(failure.terminal_payload_fields())
+        failed_event = event.model_copy(
+            update={
+                "type": EventType.TOOL_CALL_FAILED,
+                "payload": failure_payload,
+            }
+        )
+        failed_event, failure_result = _prepare_tool_result_event(
+            event=failed_event,
+            result=failure_result,
+            redactor=redactor,
+            runtime_tool=registered_tool.tool,
+        )
+        failure_bytes = _durable_payload_utf8_size(failure_result.model_dump(mode="json"))
+        if failure_bytes > maximum_bytes:
+            raise RuntimeError(
+                "Registered terminal payload limit cannot contain its bounded "
+                "contract-failure result."
+            )
+        return failed_event, failure_result, True
+
     async def emit_tool_call_result_with_hooks(
         self,
         *,
@@ -5786,6 +6216,7 @@ class ToolRoundExecutor:
         deferred_terminal_stager: DeferredTerminalStager | None = None,
         deferred_terminal_projection_recorder: DeferredTerminalFinalizer | None = None,
         deferred_terminal_finalizer: DeferredTerminalFinalizer | None = None,
+        terminal_event_emitter: TerminalEventEmitter | None = None,
         hooks_already_completed: bool = False,
         publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
@@ -5809,6 +6240,12 @@ class ToolRoundExecutor:
             raise ValueError("Deferred terminal staging requires a publication snapshot.")
         if deferred_terminal_projection_recorder is not None and not publish_before_hooks:
             raise ValueError("Deferred terminal projection recording requires observational hooks.")
+
+        async def emit_terminal_event(candidate: Event) -> Event:
+            if terminal_event_emitter is not None:
+                return await terminal_event_emitter(candidate)
+            return await self._event_writer.emit(candidate)
+
         registered_tool = registered_agent.executable_tool(tool_call.name)
         quarantine_hook_output = (
             registered_tool is not None and not registered_tool.publish_arguments
@@ -5871,18 +6308,100 @@ class ToolRoundExecutor:
                     if field_name in event.payload
                 ),
             )
-        event, result = _prepare_tool_result_event(
-            event=event,
-            result=result,
-            redactor=resolved_output_redactor,
-            runtime_tool=executed_runtime_tool,
+        boundary_controls, _boundary_references = tool_results.runtime_tool_event_boundary_controls(
+            event.payload,
+            include_terminal_controls=event.type
+            in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
         )
-        if not resolved_output_redactor.has_same_registry(resolved_redactor):
+        projection_record = boundary_controls.get("tool_result_projection")
+        trusted_projection = (
+            type(projection_record) is dict
+            and type(projection_record.get("policy_id")) is str
+            and event_nested_payload_authority_is_runtime_generated(
+                event,
+                path=_TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+                value=projection_record["policy_id"],
+            )
+        )
+        if trusted_projection:
+            # Projection evidence and its strict artifact reference were
+            # validated as one runtime-owned unit before durable staging.
+            # Re-enter the schema-aware event boundary so a later secret scope
+            # cannot rewrite the artifact identity during terminal replay.
+            event = prepare_runtime_event(event, redactor=resolved_output_redactor)
+            stored_result = event.payload.get("result")
+            if type(stored_result) is not dict:
+                raise RuntimeError("Projected terminal lost its tool result.")
+            result = tool_results.tool_result_from_payload(stored_result)
+            if not resolved_output_redactor.has_same_registry(resolved_redactor):
+                event = prepare_runtime_event(event, redactor=resolved_redactor)
+                stored_result = event.payload.get("result")
+                if type(stored_result) is not dict:
+                    raise RuntimeError("Projected terminal lost its tool result.")
+                result = tool_results.tool_result_from_payload(stored_result)
+        else:
             event, result = _prepare_tool_result_event(
                 event=event,
                 result=result,
-                redactor=resolved_redactor,
+                redactor=resolved_output_redactor,
+                runtime_tool=executed_runtime_tool,
             )
+            if not resolved_output_redactor.has_same_registry(resolved_redactor):
+                event, result = _prepare_tool_result_event(
+                    event=event,
+                    result=result,
+                    redactor=resolved_redactor,
+                )
+        event = _restore_targeted_tool_invocation_event_authority(
+            event,
+            tool_call,
+            redactor=resolved_redactor,
+        )
+        pre_staging_projection_cancellation: asyncio.CancelledError | None = None
+        projection_policy = getattr(self, "_tool_result_projection_policy", None)
+        if deferred_terminal_stager is not None and projection_policy is not None:
+            runtime_hooks = (
+                self._runtime_hooks
+                if invocation_context is None
+                else invocation_context.runtime_hooks
+            )
+            has_after_tool_hooks = any(
+                _runtime_hook_supports_phase(
+                    hook=registered_hook.hook,
+                    phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                )
+                for registered_hook in (*runtime_hooks, *registered_agent.runtime_hooks)
+            )
+            # Observational hooks already run after projection. With no
+            # after-tool hooks there is likewise no modifier to preserve. In
+            # both cases externalize before the durable stage so one large
+            # completed result cannot inflate every later checkpoint copy.
+            if publish_before_hooks or not has_after_tool_hooks:
+                (
+                    event,
+                    result,
+                    pre_staging_projection_cancellation,
+                ) = await self._project_terminal_tool_result(
+                    event=event,
+                    result=result,
+                    session=session,
+                    registered_environment=registered_environment,
+                    tool_call=tool_call,
+                )
+                event = _restore_targeted_tool_invocation_event_authority(
+                    event,
+                    tool_call,
+                    redactor=resolved_redactor,
+                )
+        event, result, result_limit_failed = await self._enforce_terminal_result_payload_limit(
+            event=event,
+            result=result,
+            registered_tool=registered_tool,
+            redactor=resolved_redactor,
+        )
+        if result_limit_failed:
+            allow_modification = False
+            publish_before_hooks = True
         event = _restore_targeted_tool_invocation_event_authority(
             event,
             tool_call,
@@ -5902,9 +6421,11 @@ class ToolRoundExecutor:
                     publication_snapshot,
                 ),
             )
+            if pre_staging_projection_cancellation is not None:
+                raise pre_staging_projection_cancellation
             return
         if hooks_already_completed:
-            tool_event = await self._event_writer.emit(event)
+            tool_event = await emit_terminal_event(event)
             yield (
                 tool_event,
                 runtime_records.ToolCallOutcome(
@@ -5914,13 +6435,16 @@ class ToolRoundExecutor:
             )
             return
         if publish_before_hooks:
-            event, result, projection_cancellation = await self._project_terminal_tool_result(
-                event=event,
-                result=result,
-                session=session,
-                registered_environment=registered_environment,
-                tool_call=hook_tool_call,
-            )
+            if "tool_result_projection" in event.payload:
+                projection_cancellation = None
+            else:
+                event, result, projection_cancellation = await self._project_terminal_tool_result(
+                    event=event,
+                    result=result,
+                    session=session,
+                    registered_environment=registered_environment,
+                    tool_call=hook_tool_call,
+                )
             event = _restore_targeted_tool_invocation_event_authority(
                 event,
                 tool_call,
@@ -5937,7 +6461,7 @@ class ToolRoundExecutor:
                 if type(stored_result) is not dict:
                     raise RuntimeError("Projected staged terminal lost its tool result.")
                 result = tool_results.tool_result_from_payload(stored_result)
-            tool_event = await self._event_writer.emit(event)
+            tool_event = await emit_terminal_event(event)
             yield (
                 tool_event,
                 runtime_records.ToolCallOutcome(
@@ -6006,12 +6530,25 @@ class ToolRoundExecutor:
                     redactor=resolved_redactor,
                     restore_terminal_result_controls=False,
                 )
-        event, final_result, projection_cancellation = await self._project_terminal_tool_result(
+        if "tool_result_projection" in event.payload and final_result is result:
+            projection_cancellation = None
+        else:
+            event, final_result, projection_cancellation = await self._project_terminal_tool_result(
+                event=event,
+                result=final_result,
+                session=session,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+            )
+        (
+            event,
+            final_result,
+            _result_limit_failed,
+        ) = await self._enforce_terminal_result_payload_limit(
             event=event,
             result=final_result,
-            session=session,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
+            registered_tool=registered_tool,
+            redactor=resolved_redactor,
         )
         event = _restore_targeted_tool_invocation_event_authority(
             event,
@@ -6029,7 +6566,7 @@ class ToolRoundExecutor:
             if type(stored_result) is not dict:
                 raise RuntimeError("Finalized staged terminal lost its tool result.")
             final_result = tool_results.tool_result_from_payload(stored_result)
-        tool_event = await self._event_writer.emit(event)
+        tool_event = await emit_terminal_event(event)
         yield (
             tool_event,
             runtime_records.ToolCallOutcome(
@@ -6705,6 +7242,18 @@ class ToolRoundRun:
                 ),
                 execution_profile=self._execution_profile,
                 tool_exposure=tool_exposure,
+                publication_governor=executor._terminal_publication_governor,
+                clock=executor._clock,
+                terminal_payload_limits=await _tool_terminal_payload_limits(
+                    self._registered_agent,
+                    tool_calls,
+                    publication_governor=executor._terminal_publication_governor,
+                    runtime_hooks=(
+                        executor._runtime_hooks
+                        if self._invocation_context is None
+                        else self._invocation_context.runtime_hooks
+                    ),
+                ),
             )
             if defer_round_terminals
             else None
@@ -6861,7 +7410,16 @@ class ToolRoundRun:
                 staged = staged_by_id.get(tool_call.id)
                 if staged is None:
                     continue
-                staged_event = publication_coordinator.restore_staged_event_authority(staged.event)
+                staged = await publication_coordinator.start_publication(staged)
+                staged_bytes = staged.payload_bytes or _terminal_publication_work_estimate(
+                    staged.event
+                )
+                staged_event = await executor._terminal_publication_governor.run_cpu(
+                    staged_bytes,
+                    lambda staged=staged: (
+                        publication_coordinator.restore_started_publication_authority(staged)
+                    ),
+                )
                 result_payload = staged_event.payload.get("result")
                 if type(result_payload) is not dict:
                     raise RuntimeError("Staged terminal publication lost its tool result.")
@@ -6926,8 +7484,16 @@ class ToolRoundRun:
                     deferred_terminal_finalizer=(
                         None if hooks_already_completed else complete_round_terminal_hooks
                     ),
+                    terminal_event_emitter=executor._emit_staged_terminal_fairly,
                     hooks_already_completed=hooks_already_completed,
                 ):
+                    if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
+                        executor._terminal_publication_governor.published(
+                            session_id=session.id,
+                            event_id=event.id,
+                            published_at=executor._clock(),
+                        )
+                        publication_coordinator.terminal_published(event.id)
                     yield event
                     if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
                         durable_lifecycle_events.append(copy_event(event))
@@ -6942,6 +7508,8 @@ class ToolRoundRun:
             ]
 
         async def publish_staged_terminals_before_limit() -> AsyncIterator[Event]:
+            if publication_coordinator is not None:
+                publication_coordinator.seal_capacity()
             expected_stage_ids = {outcome.call.id for outcome in tool_outcomes}
             async for event in publish_staged_round_terminals(expected_stage_ids):
                 yield event
@@ -6949,7 +7517,10 @@ class ToolRoundRun:
         async def publish_staged_terminals_before_interrupt() -> AsyncIterator[Event]:
             """Make already completed effects authoritative before round interruption."""
 
-            if publication_coordinator is None or not staged_private_outcomes:
+            if publication_coordinator is None:
+                return
+            publication_coordinator.seal_capacity()
+            if not staged_private_outcomes:
                 return
             async for event in publish_staged_round_terminals(set(staged_private_outcomes)):
                 yield event
@@ -6964,6 +7535,8 @@ class ToolRoundRun:
         round_task = asyncio.current_task()
         round_cancellation_baseline = 0 if round_task is None else round_task.cancelling()
         try:
+            if publication_coordinator is not None:
+                await publication_coordinator.reserve_capacity()
             for run_parallel, segment_calls in segments:
                 if run_parallel:
                     call_stream = self._run_tool_calls_parallel(
@@ -7037,9 +7610,12 @@ class ToolRoundRun:
                 if self.stopped_for_limit:
                     break
             if self.stopped_for_limit:
+                if publication_coordinator is not None:
+                    publication_coordinator.seal_capacity()
                 return
         except WorkspaceMutationSettlementError as settlement_failure:
             if publication_coordinator is not None:
+                publication_coordinator.seal_capacity()
                 expected_stage_ids = set(staged_private_outcomes)
                 try:
                     async for event in publish_staged_round_terminals(expected_stage_ids):
@@ -7060,6 +7636,8 @@ class ToolRoundRun:
                     raise settlement_failure from publication_failure
             raise settlement_failure
         except BaseExceptionGroup as exc:
+            if publication_coordinator is not None:
+                publication_coordinator.seal_capacity()
             current_task = asyncio.current_task()
             minimum_cancellation_requests = 0 if current_task is None else current_task.cancelling()
             if not is_current_runner_cancellation_group(exc):
@@ -7126,6 +7704,8 @@ class ToolRoundRun:
                 raise interrupt from exception_cause(interrupt)
             raise
         except asyncio.CancelledError as exc:
+            if publication_coordinator is not None:
+                publication_coordinator.seal_capacity()
             current_task = asyncio.current_task()
             minimum_cancellation_requests = 0 if current_task is None else current_task.cancelling()
             try:
@@ -7157,6 +7737,8 @@ class ToolRoundRun:
             )
             raise
         except SessionInterruptedByRequest as exc:
+            if publication_coordinator is not None:
+                publication_coordinator.seal_capacity()
             async for event in publish_staged_terminals_before_interrupt():
                 yield event
             async for event in self.close_after_interrupt(
@@ -7167,6 +7749,10 @@ class ToolRoundRun:
                 tool_round_identity=tool_round_identity,
             ):
                 yield event
+            raise
+        except Exception:
+            if publication_coordinator is not None:
+                publication_coordinator.seal_capacity()
             raise
         except (KeyboardInterrupt, SystemExit, GeneratorExit):
             # An async-generator close cannot yield, but a tool outcome that is
@@ -7181,6 +7767,7 @@ class ToolRoundRun:
             # and interruption closure could account for completed effects.
             # Rebuild the normal successful outcome list from the final public
             # events in model order.
+            publication_coordinator.seal_capacity()
             async for event in publish_staged_round_terminals({call.id for call in tool_calls}):
                 yield event
 
@@ -10101,6 +10688,46 @@ def _tool_effect(
     return registered_tool.effect
 
 
+async def _tool_terminal_payload_limits(
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_calls: Iterable[runtime_records.ToolCallRequest],
+    *,
+    publication_governor: ToolTerminalPublicationGovernor,
+    runtime_hooks: Iterable[runtime_records.RegisteredRuntimeHook] = (),
+) -> dict[str, int | None]:
+    """Resolve frozen registration-time terminal bounds for round admission."""
+
+    has_argument_modifying_hook = any(
+        _runtime_hook_supports_phase(
+            hook=registered_hook.hook,
+            phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+        )
+        for registered_hook in (*runtime_hooks, *registered_agent.runtime_hooks)
+    )
+    limits: dict[str, int | None] = {}
+    for tool_call in tool_calls:
+        registered_tool = registered_agent.executable_tool(tool_call.name)
+        if registered_tool is None:
+            limits[tool_call.id] = None
+            continue
+        contract = ToolExecutionContract.model_validate(registered_tool.execution_contract)
+        result_limit = contract.max_terminal_payload_bytes
+        if result_limit is None:
+            limits[tool_call.id] = None
+            continue
+        if registered_tool.publish_arguments and has_argument_modifying_hook:
+            limits[tool_call.id] = None
+            continue
+        argument_bytes = 0
+        if registered_tool.publish_arguments:
+            argument_bytes = await publication_governor.run_cpu(
+                (TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1 if tool_call.arguments else 0),
+                lambda tool_call=tool_call: _durable_payload_utf8_size(tool_call.arguments),
+            )
+        limits[tool_call.id] = result_limit + argument_bytes
+    return limits
+
+
 def _tool_round_publishes_arguments(
     registered_agent: runtime_records.RegisteredAgentState,
     tool_calls: list[runtime_records.ToolCallRequest],
@@ -10550,12 +11177,35 @@ def _project_staged_terminal_event(
 ) -> Event:
     """Progressively sanitize one private terminal without changing its identity."""
 
+    controls, _references = tool_results.runtime_tool_event_boundary_controls(
+        event.payload,
+        include_terminal_controls=event.type
+        in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
+    )
     if trust_persisted_tool_result_authority:
         event = web_access_results.restore_persisted_web_access_result_authority(event)
         event = shared_artifact_results.restore_persisted_shared_artifact_result_authority(event)
-    raw_result = event.payload.get("result")
-    if type(raw_result) is not dict:
+        if "tool_result_projection" in controls:
+            event = event_with_runtime_nested_payload_authority(
+                event,
+                _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+            )
+    if type(event.payload.get("result")) is not dict:
         raise ValueError("Staged terminal event requires a tool result object.")
+    if "tool_result_projection" in controls and (
+        event_nested_payload_authority_is_runtime_generated(
+            event,
+            path=_TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+            value=controls["tool_result_projection"]["policy_id"],
+        )
+    ):
+        # The staging entrance already prepared the event once. Re-enter the
+        # generic event boundary with the cumulative redactor so its validated
+        # artifact projection and typed authorities survive later secrets.
+        return prepare_runtime_event(event, redactor=redactor)
+    raw_result = event.payload.get("result")
+    if type(raw_result) is not dict:  # pragma: no cover - checked above
+        raise AssertionError("Staged terminal result changed during projection.")
     result = tool_results.tool_result_from_payload(raw_result)
     projected, _ = _prepare_tool_result_event(
         event=event,
@@ -10563,6 +11213,56 @@ def _project_staged_terminal_event(
         redactor=redactor,
     )
     return copy_event(projected)
+
+
+def _terminal_publication_work_estimate(event: Event) -> int:
+    """Return a bounded-cost conservative estimate for scheduler admission."""
+
+    raw_result = event.payload.get("result")
+    content = raw_result.get("content") if type(raw_result) is dict else None
+    structured = raw_result.get("structured") if type(raw_result) is dict else None
+    artifacts = raw_result.get("artifacts") if type(raw_result) is dict else None
+    # ``len`` is constant-time and four bytes per scalar is a safe UTF-8 upper
+    # bound. Nested structured/artifact data cannot be measured in constant
+    # time, so conservatively offload any non-empty value rather than walking
+    # an untrusted graph on the event loop merely to join the fair queue.
+    if structured not in (None, {}, []) or artifacts not in (None, [], {}):
+        return TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1
+    return (len(content) * 4 if type(content) is str else 0) + 16 * 1024
+
+
+def _normalized_event_timestamp(value: datetime) -> datetime:
+    """Apply Cayu's legacy offset-less-as-UTC event timestamp convention."""
+
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def _durable_payload_utf8_size(payload: dict[str, Any]) -> int:
+    limit = 2**63 - 1
+    counter = JsonUtf8SizeCounter(limit, canonical_durable_numbers=True)
+    if not counter.value(payload) or counter.encountered_unsupported_value:
+        raise ValueError("Staged terminal payload has no bounded durable JSON size.")
+    return limit - counter.remaining
+
+
+def _project_and_size_staged_terminal_event(
+    event: Event,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[Event, int]:
+    projected = _project_staged_terminal_event(event, redactor=redactor)
+    return projected, _durable_payload_utf8_size(projected.payload)
+
+
+def _prepare_and_size_projected_terminal_event(
+    event: Event,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[Event, int]:
+    """Validate a revised durable stage and measure the exact replacement."""
+
+    projected = prepare_runtime_event(event, redactor=redactor)
+    return projected, _durable_payload_utf8_size(projected.payload)
 
 
 def _staged_terminal_argument_projections(

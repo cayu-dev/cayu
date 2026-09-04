@@ -16,6 +16,7 @@ from pydantic import (
     PrivateAttr,
     SerializerFunctionWrapHandler,
     StrictBool,
+    StrictInt,
     computed_field,
     field_serializer,
     field_validator,
@@ -23,6 +24,7 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
@@ -127,6 +129,11 @@ class _ToolSpecInput(BaseModel):
     parallel_safe: StrictBool = True
     effect: ToolEffect = ToolEffect.EXTERNAL
     workspace_mutation: StrictBool = False
+    max_terminal_payload_bytes: StrictInt | None = Field(
+        default=None,
+        ge=64 * 1024,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
 
     @field_validator("input_schema", mode="before")
@@ -168,6 +175,11 @@ class ToolSpec(BaseModel):
     parallel_safe: StrictBool = True
     effect: ToolEffect = ToolEffect.EXTERNAL
     workspace_mutation: StrictBool = False
+    max_terminal_payload_bytes: StrictInt | None = Field(
+        default=None,
+        ge=64 * 1024,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
     _input_schema: Any = PrivateAttr(default_factory=dict)
 
@@ -180,6 +192,7 @@ class ToolSpec(BaseModel):
         parallel_safe: bool = True,
         effect: ToolEffect = ToolEffect.EXTERNAL,
         workspace_mutation: bool = False,
+        max_terminal_payload_bytes: int | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         **data: Any,
     ) -> None:
@@ -191,6 +204,7 @@ class ToolSpec(BaseModel):
                 "parallel_safe": parallel_safe,
                 "effect": effect,
                 "workspace_mutation": workspace_mutation,
+                "max_terminal_payload_bytes": max_terminal_payload_bytes,
                 "execution_profile_identity": execution_profile_identity,
                 **data,
             }
@@ -201,6 +215,7 @@ class ToolSpec(BaseModel):
             parallel_safe=parsed.parallel_safe,
             effect=parsed.effect,
             workspace_mutation=parsed.workspace_mutation,
+            max_terminal_payload_bytes=parsed.max_terminal_payload_bytes,
             execution_profile_identity=copy_execution_profile_behavior_identity(
                 parsed.execution_profile_identity
             ),

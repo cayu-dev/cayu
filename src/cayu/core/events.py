@@ -17,6 +17,22 @@ _CUSTOM_EVENT_TYPE_RE = re.compile(r"^custom\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)
 EVENT_ID_MAX_CHARS = 512
 
 
+class _PayloadIdentity:
+    """Keep one stamped object alive and compare identity without reading content."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _PayloadIdentity and self.value is other.value
+
+
+class _PayloadStampMismatch(Exception):
+    """Internal signal that an Event payload changed after validation."""
+
+
 def _empty_runtime_authority() -> frozenset[tuple[str, str]]:
     """Return a precisely typed empty private-authority registry."""
 
@@ -242,11 +258,18 @@ class Event(BaseModel):
         default_factory=_empty_runtime_authority
     )
     _durable_sequence: int | None = PrivateAttr(default=None)
+    # A content-independent structural stamp lets runtime-owned copies reuse
+    # already-validated immutable strings without trusting a caller-mutated
+    # payload. ``model_copy(update=...)`` and any nested mutation change the
+    # root/container/scalar identity graph and therefore fall back to the full
+    # durable validator.
+    _payload_validation_stamp: object | None = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
         del __context
         self._id_origin = "caller" if "id" in self.model_fields_set else "runtime"
         self._runtime_generated_id = self.id if self._id_origin == "runtime" else None
+        self._payload_validation_stamp = _durable_payload_stamp(self.payload)
 
     def __eq__(self, other: object) -> bool:
         """Compare only public durable fields, never private projection metadata."""
@@ -321,6 +344,16 @@ class Event(BaseModel):
 def copy_event(event: Event) -> Event:
     if type(event) is not Event:
         raise TypeError("Events must be Event instances.")
+    try:
+        payload = _copy_prevalidated_payload(
+            event.payload,
+            event._payload_validation_stamp,
+        )
+    except _PayloadStampMismatch:
+        payload_is_unchanged = False
+        payload = copy_durable_json_value(event.payload, "payload")
+    else:
+        payload_is_unchanged = True
     copied = Event(
         type=event.type,
         session_id=event.session_id,
@@ -331,8 +364,14 @@ def copy_event(event: Event) -> Event:
         environment_name=event.environment_name,
         workflow_name=event.workflow_name,
         tool_name=event.tool_name,
-        payload=copy_durable_json_value(event.payload, "payload"),
+        # Validate the small envelope normally. The payload is installed below
+        # only when its structural stamp proves it is the exact graph already
+        # accepted by Event's durable validator.
+        payload={} if payload_is_unchanged else payload,
     )
+    if payload_is_unchanged:
+        copied.payload = payload
+        copied._payload_validation_stamp = _durable_payload_stamp(payload)
     copied._id_origin = event._id_origin
     copied._runtime_generated_id = event._runtime_generated_id
     copied._runtime_payload_authority = event._runtime_payload_authority
@@ -340,6 +379,83 @@ def copy_event(event: Event) -> Event:
     copied._runtime_envelope_authority = event._runtime_envelope_authority
     copied._durable_sequence = event._durable_sequence
     return copied
+
+
+def _durable_payload_stamp(value: Any) -> object:
+    """Return a mutation-sensitive identity stamp without reading string data."""
+
+    value_type = type(value)
+    if value_type is dict:
+        return (
+            "object",
+            _PayloadIdentity(value),
+            tuple(
+                (_PayloadIdentity(key), _durable_payload_stamp(item)) for key, item in value.items()
+            ),
+        )
+    if value_type is list:
+        return (
+            "array",
+            _PayloadIdentity(value),
+            tuple(_durable_payload_stamp(item) for item in value),
+        )
+    return (value_type, _PayloadIdentity(value))
+
+
+def _copy_prevalidated_payload(value: Any, stamp: object) -> Any:
+    """Copy and identity-check one validated graph in the same traversal.
+
+    Reading each container into a local immutable snapshot before comparing it
+    closes the check-then-copy race: a replacement observed by this pass must
+    match the strong object reference retained in ``stamp``. A later mutation
+    affects only the caller's graph, never the detached result.
+    """
+
+    value_type = type(value)
+    if value_type is dict:
+        if (
+            type(stamp) is not tuple
+            or len(stamp) != 3
+            or stamp[0] != "object"
+            or stamp[1] != _PayloadIdentity(value)
+            or type(stamp[2]) is not tuple
+        ):
+            raise _PayloadStampMismatch
+        items = tuple(value.items())
+        children = stamp[2]
+        if len(items) != len(children):
+            raise _PayloadStampMismatch
+        copied: dict[str, Any] = {}
+        for (key, item), child in zip(items, children, strict=True):
+            if type(child) is not tuple or len(child) != 2 or child[0] != _PayloadIdentity(key):
+                raise _PayloadStampMismatch
+            copied[key] = _copy_prevalidated_payload(item, child[1])
+        return copied
+    if value_type is list:
+        if (
+            type(stamp) is not tuple
+            or len(stamp) != 3
+            or stamp[0] != "array"
+            or stamp[1] != _PayloadIdentity(value)
+            or type(stamp[2]) is not tuple
+        ):
+            raise _PayloadStampMismatch
+        items = tuple(value)
+        children = stamp[2]
+        if len(items) != len(children):
+            raise _PayloadStampMismatch
+        return [
+            _copy_prevalidated_payload(item, child)
+            for item, child in zip(items, children, strict=True)
+        ]
+    if (
+        type(stamp) is not tuple
+        or len(stamp) != 2
+        or stamp[0] is not value_type
+        or stamp[1] != _PayloadIdentity(value)
+    ):
+        raise _PayloadStampMismatch
+    return value
 
 
 def event_id_is_runtime_generated(event: Event) -> bool:

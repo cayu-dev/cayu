@@ -23,6 +23,7 @@ from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners import RunnerExecutionError, attach_cancellation_artifacts
 from cayu.runtime import (
+    AfterToolCallDecision,
     BudgetLimit,
     CayuApp,
     InMemorySessionStore,
@@ -31,8 +32,10 @@ from cayu.runtime import (
     RetryPolicy,
     RunLimits,
     RunRequest,
+    RuntimeHook,
     Session,
     SessionStatus,
+    ToolCallHookContext,
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _web_access_results as web_access_results
@@ -44,6 +47,7 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundExecutor,
     ToolRoundRun,
     _copy_agent_spec,
+    _durable_payload_utf8_size,
     _project_staged_terminal_event,
     _restore_targeted_tool_invocation_event_authority,
     _ToolRoundPublicationCoordinator,
@@ -357,6 +361,61 @@ class _SideEffectTool(Tool):
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         self.calls.append(args)
         return ToolResult(content="recorded")
+
+
+class _OversizedBoundedResultTool(Tool):
+    spec = ToolSpec(
+        name="side_effect",
+        description="Return a result larger than the declared durable contract.",
+        input_schema={"type": "object", "properties": {}},
+        max_terminal_payload_bytes=64 * 1024,
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        self.calls += 1
+        return ToolResult(content="x" * (70 * 1024))
+
+
+class _BoundedSmallResultTool(Tool):
+    spec = ToolSpec(
+        name="side_effect",
+        description="Return a small result under a bounded durable contract.",
+        input_schema={
+            "type": "object",
+            "properties": {"blob": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        max_terminal_payload_bytes=64 * 1024,
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx
+        self.calls.append(args)
+        return ToolResult(content="ok")
+
+
+class _BoundedWorkspaceResultTool(_BoundedSmallResultTool):
+    spec = ToolSpec(
+        name="side_effect",
+        description="Return a bounded result after a workspace-owned effect.",
+        input_schema={
+            "type": "object",
+            "properties": {"blob": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        parallel_safe=False,
+        workspace_mutation=True,
+        max_terminal_payload_bytes=64 * 1024,
+    )
 
 
 def _app_with_completed_session(
@@ -1035,6 +1094,207 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
     assert messages[-1].role == "tool"
     transcript = asyncio.run(store.load_transcript("sess_runner_execute"))
     assert transcript[-1].role == "tool"
+
+
+def test_tool_result_over_declared_terminal_limit_is_bounded_effect_authority() -> None:
+    store = InMemorySessionStore()
+    provider = _FakeProvider(
+        [
+            ModelStreamEvent.text_delta("initial"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    tool = _OversizedBoundedResultTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+
+    async def scenario() -> Event:
+        session_id = "sess_declared_terminal_overflow"
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "initialize")],
+            )
+        ):
+            pass
+        session = await rebind_test_invocation(store, session_id)
+        runner = await _tool_round_run(app, session, limits=RunLimits())
+        tool_calls = [_tool_call()]
+        checkpoint, _pending = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
+        events = [
+            event
+            async for event in runner.run(
+                messages=await store.load_transcript(session.id),
+                tool_calls=tool_calls,
+                tool_round_identity=_tool_round_identity(),
+            )
+        ]
+        return next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+
+    terminal = asyncio.run(scenario())
+
+    assert tool.calls == 1
+    assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
+    assert terminal.payload["tool_effect"] == "external"
+    assert terminal.payload["outcome_unknown"] is True
+    assert terminal.payload["manual_reconciliation_required"] is True
+    assert terminal.payload["result"]["is_error"] is True
+    assert len(terminal.payload["result"]["content"].encode("utf-8")) < 1024
+
+
+def test_large_arguments_do_not_consume_the_declared_result_payload_limit() -> None:
+    store = InMemorySessionStore()
+    provider = _FakeProvider(
+        [
+            ModelStreamEvent.text_delta("initial"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    tool = _BoundedWorkspaceResultTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+
+    async def scenario() -> Event:
+        session_id = "sess_large_arguments_small_terminal_result"
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "initialize")],
+            )
+        ):
+            pass
+        session = await rebind_test_invocation(store, session_id)
+        runner = await _tool_round_run(app, session, limits=RunLimits())
+        tool_call = runtime_records.ToolCallRequest(
+            id="call_1",
+            name="side_effect",
+            arguments={"blob": "x" * 70_000},
+        )
+        checkpoint, _pending = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=[tool_call],
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
+        events = [
+            event
+            async for event in runner.run(
+                messages=await store.load_transcript(session.id),
+                tool_calls=[tool_call],
+                tool_round_identity=_tool_round_identity(),
+            )
+        ]
+        return next(
+            event
+            for event in events
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        )
+
+    terminal = asyncio.run(scenario())
+
+    assert tool.calls == [{"blob": "x" * 70_000}]
+    assert terminal.type is EventType.TOOL_CALL_COMPLETED
+    assert terminal.payload["result"]["content"] == "ok"
+    assert "terminal_outcome" not in terminal.payload
+    publication = app.tool_terminal_publication_status()
+    assert publication.maximum_reserved_round_bytes == (
+        128 * 1024 + _durable_payload_utf8_size({"blob": "x" * 70_000})
+    )
+    assert publication.oversized_offloads >= 1
+    assert publication.active_round_reservations == 0
+
+
+def test_after_hook_result_rewrite_is_rebounded_before_staged_publication() -> None:
+    class OversizedRewriteHook(RuntimeHook):
+        async def after_tool_call(
+            self,
+            context: ToolCallHookContext,
+        ) -> AfterToolCallDecision:
+            del context
+            return AfterToolCallDecision(
+                action="modify",
+                modified_result=ToolResult(content="y" * 300_000),
+            )
+
+    store = InMemorySessionStore()
+    provider = _FakeProvider(
+        [
+            ModelStreamEvent.text_delta("initial"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    tool = _BoundedWorkspaceResultTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        runtime_hooks=[OversizedRewriteHook()],
+    )
+
+    async def scenario() -> Event:
+        session_id = "sess_hook_rewrite_terminal_overflow"
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "initialize")],
+            )
+        ):
+            pass
+        session = await rebind_test_invocation(store, session_id)
+        runner = await _tool_round_run(app, session, limits=RunLimits())
+        tool_calls = [_tool_call()]
+        checkpoint, _pending = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
+        events = [
+            event
+            async for event in runner.run(
+                messages=await store.load_transcript(session.id),
+                tool_calls=tool_calls,
+                tool_round_identity=_tool_round_identity(),
+            )
+        ]
+        return next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+
+    terminal = asyncio.run(scenario())
+    publication = app.tool_terminal_publication_status()
+
+    assert tool.calls == [{}]
+    assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
+    assert terminal.payload["result"]["is_error"] is True
+    assert len(terminal.payload["result"]["content"].encode("utf-8")) < 1024
+    assert publication.maximum_staged_bytes == _durable_payload_utf8_size(terminal.payload)
+    assert publication.maximum_staged_bytes <= publication.maximum_reserved_round_bytes
+    assert publication.active_round_reservations == 0
 
 
 def test_tool_round_budget_gate_retains_the_originating_model_attempt() -> None:

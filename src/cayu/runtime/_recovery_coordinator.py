@@ -81,7 +81,6 @@ from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
@@ -89,7 +88,6 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime import pending_actions
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
@@ -208,6 +206,7 @@ from cayu.runtime._tool_round_executor import (
     _interrupted_tool_call_event,
     _interrupted_tool_call_outcome,
     _staged_terminal_argument_projections,
+    _tool_terminal_payload_limits,
     _ToolRoundPublicationCoordinator,
     _workspace_mutation_incomplete_event,
     policy_denial_payload_fields,
@@ -7453,6 +7452,7 @@ class RecoveryCoordinator:
             )
         pending_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        publication_coordinator: _ToolRoundPublicationCoordinator | None = None
         # Restore the original run's config persisted on the pending input. Explicit
         # values have already been checked against the frozen invocation profile.
         invocation_semantics = _effective_user_input_invocation_semantics(
@@ -7624,10 +7624,32 @@ class RecoveryCoordinator:
                     redactor=base_round_redactor,
                     execution_profile=execution_profile_snapshot.profile,
                     tool_exposure=pending.tool_exposure,
+                    publication_governor=(self._tool_round_executor._terminal_publication_governor),
+                    clock=self._clock,
+                    terminal_payload_limits=await _tool_terminal_payload_limits(
+                        registered_agent,
+                        round_tool_calls,
+                        publication_governor=(
+                            self._tool_round_executor._terminal_publication_governor
+                        ),
+                        runtime_hooks=(
+                            self._tool_round_executor._runtime_hooks
+                            if invocation_context is None
+                            else invocation_context.runtime_hooks
+                        ),
+                    ),
                 )
                 if defer_round_terminals
                 else None
             )
+            if publication_coordinator is not None:
+                await publication_coordinator.reserve_capacity()
+                await publication_coordinator.restore_staged_capacity(
+                    tool_round_recovery.checkpoint_staged_terminals(
+                        await self._session_store.load_checkpoint(session.id),
+                        tool_round_identity=tool_round_identity,
+                    )
+                )
             staged_hook_modes: dict[str, tuple[bool, bool]] = {}
 
             async def record_round_publication_snapshot(
@@ -8356,6 +8378,9 @@ class RecoveryCoordinator:
                     yield event
                 return
             raise
+        finally:
+            if publication_coordinator is not None:
+                publication_coordinator.seal_capacity()
 
     async def _publish_continuation_staged_terminals(
         self,
@@ -8398,8 +8423,18 @@ class RecoveryCoordinator:
             if staged is None:
                 continue
             if tool_call.id in already_published_ids:
+                self._tool_round_executor._terminal_publication_governor.published(
+                    session_id=session.id,
+                    event_id=staged.event.id,
+                    published_at=self._clock(),
+                )
+                coordinator.terminal_published(staged.event.id)
                 continue
-            staged_event = coordinator.restore_staged_event_authority(staged.event)
+            staged = await coordinator.start_publication(staged)
+            staged_event = await self._tool_round_executor._terminal_publication_governor.run_cpu(
+                staged.payload_bytes or 0,
+                lambda staged=staged: coordinator.restore_started_publication_authority(staged),
+            )
             authority_fields: list[str] = []
             for field_name, expected_value in pause_authority.items():
                 if staged_event.payload.get(field_name) != expected_value:
@@ -8453,9 +8488,18 @@ class RecoveryCoordinator:
                     else None
                 ),
                 deferred_terminal_finalizer=(None if hooks_already_completed else complete_hooks),
+                terminal_event_emitter=(self._tool_round_executor._emit_staged_terminal_fairly),
                 hooks_already_completed=hooks_already_completed,
             ):
+                if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
+                    self._tool_round_executor._terminal_publication_governor.published(
+                        session_id=session.id,
+                        event_id=event.id,
+                        published_at=self._clock(),
+                    )
+                    coordinator.terminal_published(event.id)
                 yield event, outcome
+        coordinator.seal_capacity()
 
     async def _fence_restarted_continuation_stages(
         self,
@@ -8727,6 +8771,7 @@ class RecoveryCoordinator:
         pending_approval_cleared = False
         clear_event: Event | None = None
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        publication_coordinator: _ToolRoundPublicationCoordinator | None = None
         expired = False
         original_resolution_decision = request.decision
         resolution_request_digest = approval_support.approval_resolution_request_digest(request)
@@ -9138,10 +9183,32 @@ class RecoveryCoordinator:
                     redactor=base_round_redactor,
                     execution_profile=execution_profile_snapshot.profile,
                     tool_exposure=publication_round.tool_exposure,
+                    publication_governor=(self._tool_round_executor._terminal_publication_governor),
+                    clock=self._clock,
+                    terminal_payload_limits=await _tool_terminal_payload_limits(
+                        registered_agent,
+                        round_tool_calls,
+                        publication_governor=(
+                            self._tool_round_executor._terminal_publication_governor
+                        ),
+                        runtime_hooks=(
+                            self._tool_round_executor._runtime_hooks
+                            if invocation_context is None
+                            else invocation_context.runtime_hooks
+                        ),
+                    ),
                 )
                 if defer_round_terminals
                 else None
             )
+            if publication_coordinator is not None:
+                await publication_coordinator.reserve_capacity()
+                await publication_coordinator.restore_staged_capacity(
+                    tool_round_recovery.checkpoint_staged_terminals(
+                        await self._session_store.load_checkpoint(session.id),
+                        tool_round_identity=tool_round_identity,
+                    )
+                )
             staged_hook_modes: dict[str, tuple[bool, bool]] = {}
 
             async def record_round_publication_snapshot(
@@ -9874,6 +9941,9 @@ class RecoveryCoordinator:
                 invocation_context=invocation_context,
             ):
                 yield event
+        finally:
+            if publication_coordinator is not None:
+                publication_coordinator.seal_capacity()
 
     async def _load_exact_approval_close_event(
         self,
@@ -14340,15 +14410,20 @@ class RecoveryCoordinator:
                     ),
                 )
                 quarantined_records.append(
-                    tool_round_recovery.StagedToolCallTerminal(
-                        tool_call_id=staged.tool_call_id,
-                        event=quarantined_event,
-                        hooks_state="completed",
+                    staged.model_copy(
+                        update={
+                            "event": quarantined_event,
+                            "hooks_state": "completed",
+                        },
+                        deep=True,
                     )
                 )
             recovery_staged_records = quarantined_records
         synthesized_by_id = {outcome.call.id: outcome for outcome in synthesized_outcomes}
-        staged_events_by_id = {item.tool_call_id: item.event for item in recovery_staged_records}
+        staged_records_by_id = {item.tool_call_id: item for item in recovery_staged_records}
+        staged_events_by_id = {
+            tool_call_id: item.event for tool_call_id, item in staged_records_by_id.items()
+        }
         staged_hook_states_by_id = {
             item.tool_call_id: item.hooks_state for item in recovery_staged_records
         }
@@ -14448,6 +14523,44 @@ class RecoveryCoordinator:
 
         emitted_events: list[Event] = []
         tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        recovery_publication_coordinator = _ToolRoundPublicationCoordinator(
+            session_id=session.id,
+            tool_round_identity=tool_round_identity,
+            session_store=self._session_store,
+            redactor=self._tool_round_executor.redactor_for_tool_calls(
+                registered_agent=registered_agent,
+                tool_calls=[item.call for item in planned_outcomes],
+            ),
+            execution_profile=execution_profile,
+            tool_exposure=pending_round.tool_exposure,
+            publication_governor=(self._tool_round_executor._terminal_publication_governor),
+            clock=self._clock,
+            terminal_payload_limits=await _tool_terminal_payload_limits(
+                registered_agent,
+                [
+                    approval_support.tool_call_request_from_pending(pending_call)
+                    for pending_call in pending_round.tool_calls
+                ],
+                publication_governor=(self._tool_round_executor._terminal_publication_governor),
+                runtime_hooks=(
+                    self._tool_round_executor._runtime_hooks
+                    if invocation_context is None
+                    else invocation_context.runtime_hooks
+                ),
+            ),
+        )
+        await recovery_publication_coordinator.reserve_capacity()
+        await recovery_publication_coordinator.restore_staged_capacity(recovery_staged_records)
+        for staged in recovery_staged_records:
+            if staged.tool_call_id not in durable_terminal_ids:
+                continue
+            self._tool_round_executor._terminal_publication_governor.published(
+                session_id=session.id,
+                event_id=staged.event.id,
+                published_at=self._clock(),
+            )
+            recovery_publication_coordinator.terminal_published(staged.event.id)
+        recovery_publication_coordinator.seal_capacity()
 
         async def complete_recovered_terminal_hooks(event: Event) -> Event:
             await self._session_store.transform_checkpoint(
@@ -14476,18 +14589,17 @@ class RecoveryCoordinator:
             strict=True,
         ):
             if expected_outcome.call.id in staged_events_by_id:
-                terminal_event = restore_staged_terminal_authority(
-                    terminal_event,
-                    session_id=session.id,
-                    tool_round_identity=tool_round_identity,
-                    tool_exposure=pending_round.tool_exposure,
-                )
-                terminal_event = web_access_results.restore_persisted_web_access_result_authority(
-                    terminal_event
+                staged_record = await recovery_publication_coordinator.start_publication(
+                    staged_records_by_id[expected_outcome.call.id]
                 )
                 terminal_event = (
-                    shared_artifact_results.restore_persisted_shared_artifact_result_authority(
-                        terminal_event
+                    await self._tool_round_executor._terminal_publication_governor.run_cpu(
+                        staged_record.payload_bytes or 0,
+                        lambda staged_record=staged_record: (
+                            recovery_publication_coordinator.restore_started_publication_authority(
+                                staged_record
+                            )
+                        ),
                     )
                 )
             expected_public_outcome = runtime_records.ToolCallOutcome(
@@ -14523,10 +14635,22 @@ class RecoveryCoordinator:
                     and expected_outcome.call.id in staged_events_by_id
                     else None
                 ),
+                terminal_event_emitter=(
+                    self._tool_round_executor._emit_staged_terminal_fairly
+                    if expected_outcome.call.id in staged_events_by_id
+                    else None
+                ),
                 hooks_already_completed=hooks_state == "completed",
                 invocation_context=invocation_context,
             ):
                 emitted_events.append(event)
+                if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
+                    self._tool_round_executor._terminal_publication_governor.published(
+                        session_id=session.id,
+                        event_id=event.id,
+                        published_at=self._clock(),
+                    )
+                    recovery_publication_coordinator.terminal_published(event.id)
                 if (
                     emitted_outcome is not None
                     and hooks_state != "pending"

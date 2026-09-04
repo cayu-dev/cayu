@@ -985,6 +985,13 @@ from cayu.runtime.tool_result_projection import (
     copy_tool_result_projection_policy,
 )
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
+from cayu.runtime.tool_terminal_publication import (
+    TOOL_TERMINAL_PUBLICATION_CAPACITY_BYTES,
+    TOOL_TERMINAL_PUBLICATION_MAX_OFFLOADS,
+    TOOL_TERMINAL_PUBLICATION_SLICE_BYTES,
+    TOOL_TERMINAL_STAGED_CAPACITY_BYTES,
+    ToolTerminalPublicationMetricsSnapshot,
+)
 from cayu.runtime.usage import (
     AggregateCacheUsageMetrics,
     AggregateHostedToolUsageMetrics,
@@ -1163,6 +1170,10 @@ __all__ = [
     "TOOL_POLICY_REAUTHORIZATION_METADATA_KEY",
     "TOOL_RESULT_ARTIFACT_TYPE",
     "TOOL_RESULT_TOKEN_ESTIMATION_METHOD",
+    "TOOL_TERMINAL_PUBLICATION_CAPACITY_BYTES",
+    "TOOL_TERMINAL_PUBLICATION_MAX_OFFLOADS",
+    "TOOL_TERMINAL_PUBLICATION_SLICE_BYTES",
+    "TOOL_TERMINAL_STAGED_CAPACITY_BYTES",
     "VIRTUAL_EGRESS_EVENT_TYPES",
     "VIRTUAL_EGRESS_RECONNECT_VERSION",
     "ActiveInvocationExecutionProfile",
@@ -1846,6 +1857,7 @@ __all__ = [
     "ToolResultProjectionStatus",
     "ToolRoundIdentity",
     "ToolRoundRecoveryRequest",
+    "ToolTerminalPublicationMetricsSnapshot",
     "TranscriptDigestCompactor",
     "TranscriptPage",
     "TranscriptQuery",

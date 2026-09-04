@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_object,
     freeze_json_value,
@@ -278,6 +279,11 @@ class ToolExecutionContract(BaseModel):
     hard_deadline_seconds: float | None = None
     protocol: str | None = None
     protocol_version: StrictInt | None = None
+    max_terminal_payload_bytes: StrictInt | None = Field(
+        default=None,
+        ge=64 * 1024,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
 
     @field_validator("adapter_identity", mode="before")
     @classmethod

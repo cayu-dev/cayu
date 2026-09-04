@@ -3462,6 +3462,10 @@ def test_pause_retry_reuses_a_staged_terminal_after_acknowledgement_loss(
             and event.payload.get("tool_call_id") == "call_sibling"
         ]
         assert len(sibling_terminals) == 1
+        publication_status = app.tool_terminal_publication_status()
+        assert publication_status.maximum_reserved_round_bytes > 0
+        assert publication_status.active_round_reservations == 0
+        assert publication_status.active_exclusive_rounds == 0
         if loss_boundary == "stage":
             assert sibling_starts == []
             assert sibling_terminals[0].type is EventType.TOOL_CALL_BLOCKED
@@ -4032,6 +4036,20 @@ def test_observational_stage_tracks_projected_result_after_lost_acknowledgement(
                     ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
                 ],
                 [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_later_one",
+                        name="external_large_staged_result",
+                        arguments={"value": "a", "resolve": False},
+                    ),
+                    ModelStreamEvent.tool_call(
+                        id="call_later_two",
+                        name="external_large_staged_result",
+                        arguments={"value": "b", "resolve": True},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
             ]
         )
         tool = ExternalLargeResultTool()
@@ -4106,6 +4124,23 @@ def test_observational_stage_tracks_projected_result_after_lost_acknowledgement(
             "outcome_unknown": True,
             "recovered": True,
         }
+        publication_status = app.tool_terminal_publication_status()
+        assert publication_status.active_round_reservations == 0
+        assert publication_status.active_exclusive_rounds == 0
+
+        later = await asyncio.wait_for(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"{session_id}-later",
+                    messages=[Message.text("user", "run later")],
+                ),
+            ),
+            timeout=2,
+        )
+        assert later[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == ["x", "y", "a", "b"]
 
     asyncio.run(run())
 

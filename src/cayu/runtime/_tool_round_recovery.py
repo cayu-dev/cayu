@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -1167,12 +1168,14 @@ def completed_staged_terminal_transform(
     *,
     tool_round_identity: ToolRoundIdentity,
     event: Event,
+    payload_bytes: int | None = None,
 ) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
     """Record that terminal hooks completed before public event append."""
 
     return _updated_staged_terminal_transform(
         tool_round_identity=tool_round_identity,
         event=event,
+        payload_bytes=payload_bytes,
         hooks_state="completed",
         operation="Hook completion",
     )
@@ -1182,21 +1185,87 @@ def projected_staged_terminal_transform(
     *,
     tool_round_identity: ToolRoundIdentity,
     event: Event,
+    payload_bytes: int | None = None,
 ) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
     """Persist a projected terminal without claiming its hooks completed."""
 
     return _updated_staged_terminal_transform(
         tool_round_identity=tool_round_identity,
         event=event,
+        payload_bytes=payload_bytes,
         hooks_state="preserve",
         operation="Projection",
     )
+
+
+def started_staged_terminal_publication_transform(
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    tool_call_id: str,
+    event: Event,
+    payload_bytes: int,
+    effect_completed_at: datetime,
+    staged_at: datetime,
+    publication_started_at: datetime,
+) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
+    """Persist exact public-event timing before its first append attempt."""
+
+    identity = copy_tool_round_identity(tool_round_identity)
+    copied_event = copy_event(event)
+
+    def transform(
+        _session: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+        if type(copied) is not dict:
+            raise AssertionError("Checkpoint copied as a non-object.")
+        existing = checkpoint_staged_terminals(copied, tool_round_identity=identity)
+        updated: list[StagedToolCallTerminal] = []
+        found = False
+        for item in existing:
+            if item.tool_call_id != tool_call_id:
+                updated.append(item)
+                continue
+            if item.event.id != copied_event.id:
+                raise RuntimeError("Publication timing conflicts with staged terminal evidence.")
+            found = True
+            if item.publication_started_at is not None:
+                if (
+                    item.publication_started_at != publication_started_at
+                    or item.event != copied_event
+                ):
+                    raise RuntimeError("Staged terminal has conflicting publication timing.")
+                updated.append(item)
+            else:
+                updated.append(
+                    item.model_copy(
+                        update={
+                            "event": copied_event,
+                            "payload_bytes": payload_bytes,
+                            "effect_completed_at": effect_completed_at,
+                            "staged_at": staged_at,
+                            "publication_started_at": publication_started_at,
+                        },
+                        deep=True,
+                    )
+                )
+        if not found:
+            raise RuntimeError("Publication timing has no staged terminal owner.")
+        return checkpoint_with_staged_terminals(
+            copied,
+            tool_round_identity=identity,
+            staged_terminals=updated,
+        )
+
+    return transform
 
 
 def _updated_staged_terminal_transform(
     *,
     tool_round_identity: ToolRoundIdentity,
     event: Event,
+    payload_bytes: int | None,
     hooks_state: Literal["preserve", "completed"],
     operation: str,
 ) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
@@ -1204,6 +1273,8 @@ def _updated_staged_terminal_transform(
 
     identity = copy_tool_round_identity(tool_round_identity)
     copied_event = copy_event(event)
+    if payload_bytes is not None and (type(payload_bytes) is not int or payload_bytes < 0):
+        raise ValueError("payload_bytes must be a non-negative integer or None.")
 
     def transform(
         _session: Session,
@@ -1229,10 +1300,15 @@ def _updated_staged_terminal_transform(
                 raise RuntimeError(f"{operation} conflicts with staged terminal evidence.")
             found = True
             staged.append(
-                StagedToolCallTerminal(
-                    tool_call_id=tool_call_id,
-                    event=copied_event,
-                    hooks_state=(item.hooks_state if hooks_state == "preserve" else "completed"),
+                item.model_copy(
+                    update={
+                        "event": copied_event,
+                        **({} if payload_bytes is None else {"payload_bytes": payload_bytes}),
+                        "hooks_state": (
+                            item.hooks_state if hooks_state == "preserve" else "completed"
+                        ),
+                    },
+                    deep=True,
                 )
             )
         if not found:
@@ -1293,10 +1369,12 @@ def _recovery_safe_staged_terminals(
             deep=True,
         )
         safe.append(
-            StagedToolCallTerminal(
-                tool_call_id=item.tool_call_id,
-                event=event,
-                hooks_state="finalized",
+            item.model_copy(
+                update={
+                    "event": event,
+                    "hooks_state": "finalized",
+                },
+                deep=True,
             )
         )
     return safe

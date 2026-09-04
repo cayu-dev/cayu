@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._validation import require_clean_nonblank, require_durable_text
 from cayu.core.events import Event, EventType
@@ -36,6 +37,10 @@ class StagedToolCallTerminal(BaseModel):
     tool_call_id: str
     event: Event
     hooks_state: Literal["pending", "finalized", "observational", "completed"] = "pending"
+    payload_bytes: StrictInt | None = Field(default=None, ge=0)
+    effect_completed_at: datetime | None = None
+    staged_at: datetime | None = None
+    publication_started_at: datetime | None = None
 
     @field_validator("tool_call_id")
     @classmethod
@@ -52,12 +57,36 @@ class StagedToolCallTerminal(BaseModel):
             raise TypeError("Staged terminal event must be an Event.")
         return value.model_copy(deep=True)
 
+    @field_validator("effect_completed_at", "staged_at", "publication_started_at")
+    @classmethod
+    def validate_timestamps(cls, value: datetime | None, info) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value
+
     @model_validator(mode="after")
     def validate_terminal_identity(self) -> StagedToolCallTerminal:
         if self.event.type not in _TOOL_ROUND_TERMINAL_EVENT_TYPES:
             raise ValueError("Staged terminal evidence requires a terminal tool event.")
         if self.event.payload.get("tool_call_id") != self.tool_call_id:
             raise ValueError("Staged terminal event conflicts with its tool-call identity.")
+        timing = (self.payload_bytes, self.effect_completed_at, self.staged_at)
+        if any(value is not None for value in timing) and any(value is None for value in timing):
+            raise ValueError("Staged terminal size and timing evidence must be complete together.")
+        if self.publication_started_at is not None and self.staged_at is None:
+            raise ValueError("Publication timing requires staged-terminal timing evidence.")
+        if (
+            self.effect_completed_at is not None
+            and self.staged_at is not None
+            and self.staged_at < self.effect_completed_at
+        ):
+            raise ValueError("A staged terminal cannot precede its completed effect.")
+        if (
+            self.publication_started_at is not None
+            and self.staged_at is not None
+            and self.publication_started_at < self.staged_at
+        ):
+            raise ValueError("Terminal publication cannot precede durable staging.")
         return self
 
 
