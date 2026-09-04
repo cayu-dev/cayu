@@ -29,6 +29,7 @@ from cayu.proxies import CredentialProxy
 from cayu.runners import Runner
 from cayu.vaults import ResolvedSecret, SecretRef, Vault, VaultError
 from cayu.workspaces import Workspace
+from cayu.workspaces.checkpoints import WorkspaceCheckpointPolicy
 
 if TYPE_CHECKING:
     from cayu.storage.memory import KnowledgeAccessScope, KnowledgeStore
@@ -57,6 +58,16 @@ class EnvironmentSpec(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
     lifecycle_policy: EnvironmentLifecyclePolicy | None = None
+    workspace_checkpoint_policy: WorkspaceCheckpointPolicy | None = None
+
+    @field_validator("workspace_checkpoint_policy", mode="before")
+    @classmethod
+    def copy_workspace_checkpoint_policy(cls, value: object) -> WorkspaceCheckpointPolicy | None:
+        if value is None:
+            return None
+        if isinstance(value, WorkspaceCheckpointPolicy):
+            value = value.model_dump(mode="json")
+        return WorkspaceCheckpointPolicy.model_validate(value)
 
     @field_validator("lifecycle_policy", mode="before")
     @classmethod
@@ -337,6 +348,7 @@ def copy_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
             spec.execution_profile_identity
         ),
         lifecycle_policy=copy_environment_lifecycle_policy(spec.lifecycle_policy),
+        workspace_checkpoint_policy=spec.workspace_checkpoint_policy,
     )
 
 

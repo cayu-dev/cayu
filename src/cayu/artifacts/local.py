@@ -14,7 +14,7 @@ import stat
 import sys
 import unicodedata
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from os import PathLike
 from pathlib import Path
 from typing import Any
@@ -267,6 +267,20 @@ class LocalArtifactStore(ArtifactStore):
             raise ArtifactStoreUnavailableError(
                 "Local artifact store could not list artifacts."
             ) from exc
+
+    @property
+    def supports_pins(self) -> bool:
+        return _supports_durable_publication()
+
+    async def pin(self, artifact_id: str, *, owner: str) -> None:
+        await asyncio.to_thread(
+            _change_artifact_pin, self.root, self._root_identity, artifact_id, owner, True
+        )
+
+    async def release_pin(self, artifact_id: str, *, owner: str) -> None:
+        await asyncio.to_thread(
+            _change_artifact_pin, self.root, self._root_identity, artifact_id, owner, False
+        )
 
     async def delete(self, artifact_id: str) -> None:
         try:
@@ -1194,10 +1208,14 @@ def _delete_artifact(
     ):
         try:
             with _open_artifact_directory(target, parent_fd=root_fd) as (
-                _,
+                directory_fd,
                 directory_identity,
             ):
-                pass
+                if any(
+                    name.startswith("pin_")
+                    for name in os.listdir(directory_fd if directory_fd is not None else target)
+                ):
+                    raise ValueError("Artifact is retained by a durable pin.")
         except FileNotFoundError:
             return
         _remove_artifact_directory_if_unchanged(
@@ -1519,3 +1537,45 @@ def _is_windows_reparse_point(value: os.stat_result) -> bool:
 
 def _is_unsafe_open_error(exc: OSError) -> bool:
     return exc.errno in {errno.ELOOP, errno.ENOTDIR}
+
+
+def _change_artifact_pin(
+    root: Path,
+    root_identity: tuple[int, int],
+    artifact_id: str,
+    owner: str,
+    acquire: bool,
+) -> None:
+    owner = require_unicode_scalar_text(require_clean_nonblank(owner, "pin.owner"), "pin.owner")
+    if len(owner.encode("utf-8")) > 1024:
+        raise ValueError("Artifact pin owner is too long.")
+    if not _supports_durable_publication():
+        raise ArtifactStoreUnavailableError("Artifact pins require durable publication support.")
+    name = "pin_" + hashlib.sha256(owner.encode("utf-8")).hexdigest()
+    target = _artifact_dir(root, artifact_id)
+    with (
+        _artifact_ownership_lock(root, target.name),
+        _open_store_root(root, root_identity) as root_fd,
+        _open_artifact_directory(target, parent_fd=root_fd) as (directory_fd, identity),
+    ):
+        if directory_fd is None:
+            raise ArtifactStoreUnavailableError("Artifact pins require directory handles.")
+        _load_metadata_from_directory(target, directory_fd, identity)
+        if acquire:
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | _OPEN_NOFOLLOW_FLAG,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+                    raise ArtifactStoreUnavailableError("Invalid artifact pin marker.")
+                _sync_descriptor(descriptor)
+            finally:
+                os.close(descriptor)
+        else:
+            with suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=directory_fd)
+        _sync_descriptor(directory_fd)

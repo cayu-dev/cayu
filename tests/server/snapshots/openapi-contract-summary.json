@@ -591,6 +591,18 @@
         "workspace_branch_lifecycle": {
           "$ref": "#/components/schemas/ApiWorkspaceBranchLifecycle"
         },
+        "workspace_checkpoint_policy": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workspace Checkpoint Policy"
+        },
         "workspace_id": {
           "anyOf": [
             {
@@ -877,6 +889,27 @@
           },
           "title": "Provider Names",
           "type": "array"
+        },
+        "queued_interaction_profile_handoff": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  }
+                ]
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Queued Interaction Profile Handoff"
         },
         "result_transcript_end": {
           "anyOf": [

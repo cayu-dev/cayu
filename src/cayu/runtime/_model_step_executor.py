@@ -9184,6 +9184,12 @@ class ModelStepRun:
         model_step_identity: ModelStepIdentity,
         request_variant: RequestVariant = RequestVariant.INITIAL,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+        if self._registered_environment is not None:
+            from cayu.runtime.workspace_checkpoints import ensure_workspace_checkpoint
+
+            await ensure_workspace_checkpoint(
+                self._executor._session_store, self._session, self._registered_environment
+            )
         if type(source_transcript_cursor) is not int:
             raise TypeError("source_transcript_cursor must be an int.")
         if source_transcript_cursor < 0:

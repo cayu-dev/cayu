@@ -329,6 +329,7 @@ class EnvironmentManifest(_ManifestModel):
     binding: str | None
     knowledge_store: str | None
     mcp_servers: tuple[str, ...]
+    workspace_checkpoint_policy: FrozenJsonObject | None = None
     lifecycle_policy: FrozenJsonObject | None
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
@@ -709,6 +710,11 @@ def _describe_environment(
         binding=_optional_type_name(environment.binding),
         knowledge_store=_optional_type_name(environment.knowledge_store),
         mcp_servers=mcp_servers,
+        workspace_checkpoint_policy=(
+            None
+            if registration.spec.workspace_checkpoint_policy is None
+            else registration.spec.workspace_checkpoint_policy.model_dump(mode="json")
+        ),
         lifecycle_policy=(
             None
             if registration.spec.lifecycle_policy is None

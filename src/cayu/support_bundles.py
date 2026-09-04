@@ -389,6 +389,7 @@ class EnvironmentComponentEvidence(_SupportModel):
     credential_proxy: str | None
     knowledge_store: str | None
     mcp_server_count: StrictInt = Field(ge=0)
+    workspace_checkpoint_policy: dict[str, Any] | None = None
     lifecycle_policy: EnvironmentLifecyclePolicy | None = None
 
 
@@ -1295,6 +1296,11 @@ async def _collect_manifest(context: SupportBundleContext) -> SupportCollectorOu
             credential_proxy=item.credential_proxy,
             knowledge_store=item.knowledge_store,
             mcp_server_count=len(item.mcp_servers),
+            workspace_checkpoint_policy=(
+                None
+                if item.workspace_checkpoint_policy is None
+                else dict(item.workspace_checkpoint_policy)
+            ),
             lifecycle_policy=(
                 None
                 if item.lifecycle_policy is None

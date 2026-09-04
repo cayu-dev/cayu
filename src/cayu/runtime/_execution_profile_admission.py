@@ -1950,6 +1950,15 @@ def _environment_identity_material(
                 ),
                 **(
                     {}
+                    if registered_environment.spec.workspace_checkpoint_policy is None
+                    else {
+                        "workspace_checkpoint_policy": registered_environment.spec.workspace_checkpoint_policy.model_dump(
+                            mode="json"
+                        )
+                    }
+                ),
+                **(
+                    {}
                     if registered_environment.spec.lifecycle_policy is None
                     else {
                         "lifecycle_policy": (

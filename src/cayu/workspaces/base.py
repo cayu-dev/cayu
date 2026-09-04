@@ -708,6 +708,19 @@ class Workspace(ABC):
         )
 
 
+class WorkspaceDirectoryPruner(ABC):
+    """Remove only directory trees with no files, links, or excluded paths."""
+
+    @abstractmethod
+    async def prune_empty_directories(self, path: str, *, max_directories: int) -> None:
+        """Remove an obstructing empty tree, bounded by ``max_directories``.
+
+        Missing paths and regular files are unchanged. Reject links, special
+        files, excluded descendants, and trees exceeding the bound. Callers
+        must hold exclusive writer isolation throughout restoration.
+        """
+
+
 class WorkspaceGitModeMutator(ABC):
     """Nominal capability for exact Git executable-mode mutations."""
 

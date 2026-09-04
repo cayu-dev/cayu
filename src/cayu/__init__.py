@@ -2817,6 +2817,16 @@ from cayu.workspaces import (
     WorkspaceWriterIsolationStatus,
     compare_workspace_revisions,
 )
+from cayu.workspaces.checkpoints import (
+    WorkspaceCheckpointError,
+    WorkspaceCheckpointManifest,
+    WorkspaceCheckpointPolicy,
+    capture_workspace_checkpoint,
+    load_workspace_checkpoint,
+    pin_workspace_checkpoint,
+    release_workspace_checkpoint,
+    restore_workspace_checkpoint,
+)
 
 __all__ = [
     "AGENT_BUNDLE_CONTAINER_EXTENSION",
@@ -5596,3 +5606,15 @@ def __getattr__(name: str):
 
         return getattr(postgres, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ += [
+    "WorkspaceCheckpointError",
+    "WorkspaceCheckpointManifest",
+    "WorkspaceCheckpointPolicy",
+    "capture_workspace_checkpoint",
+    "load_workspace_checkpoint",
+    "pin_workspace_checkpoint",
+    "release_workspace_checkpoint",
+    "restore_workspace_checkpoint",
+]

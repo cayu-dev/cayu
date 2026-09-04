@@ -9978,6 +9978,76 @@ finalization terminates. `CayuApp` creation through that example fails before th
 until Lambda MicroVM exposes an idempotent create-or-lookup allocation contract; direct calls own
 their allocation durability and cleanup obligations.
 
+## Durable mutable-workspace checkpoints
+
+Set `EnvironmentSpec(workspace_checkpoint_policy=WorkspaceCheckpointPolicy(...))`
+to require a durable revision before a workspace-mutating tool's successful
+terminal can be staged or exposed. The policy is part of execution-profile
+identity and appears in application/environment inspection and support bundles.
+Environments without this policy retain the existing observation-only behavior.
+
+Admission requires an `ArtifactStore` with durable pins and a binding whose
+`observe_writer_isolation()` proves exclusive ownership of the workspace.
+Serial tool dispatch alone is not exclusive ownership. The binding must hold
+its actual lease/isolation mechanism across the tool and checkpoint window;
+a changed generation, overlapping invocation, or unknown isolation fails closed.
+`LocalArtifactStore` implements pins using the same cross-process ownership lock
+as deletion and synchronizes pin state before acknowledging it. Other stores,
+including S3, currently decline this capability unless they implement the pin
+contract. Keep checkpoint storage outside the workspace projection and on storage
+whose durability covers the intended host-loss failure domain.
+
+Before dispatch, Runtime persists a mutation intent referencing the last durable
+revision. After a settled successful effect it publishes bounded, content-addressed
+regular-file artifacts and a complete manifest, pins them, reads them back, and
+independently verifies the live revision. A session-incarnation/epoch-fenced
+checkpoint transition binds the before/after revisions to the environment,
+interaction, tool call, and mutation window. Only then may successful tool
+publication proceed. File hashes, sizes, paths, and executable modes define the
+revision; identical content shares immutable artifacts. Default limits are 10,000
+paths, 64 MiB per file, 256 MiB per revision, a 4 MiB manifest, and 120 seconds.
+The deadline retains unsettled work under the environment mutation fence.
+
+Environment binding and subsequent model/tool admission verify the last durable
+revision. A fresh binding reconstructs it through the workspace API, using exact
+file modes and authenticated artifacts, without replaying the tool or relying on
+an old container. An existing binding with unexplained drift is rejected rather
+than silently rolled back. Partial restoration is repeatable and cannot admit
+model/tool execution until verification succeeds. A crash with only a mutation
+intent or incomplete checkpoint leaves an unknown effect and blocks recovery.
+A failed or interrupted mutating tool also requires explicit reconciliation.
+
+The revision covers the regular-file projection exposed by the workspace adapter.
+Adapter-excluded paths, empty directories, and non-file filesystem metadata are
+outside this projection. Symlinks, special files, unsafe paths, truncated reads,
+and limit violations fail closed. Local workspaces use conditional mode-aware
+mutations; runner workspaces use their guarded tar importer and final revision
+verification. Both implement `WorkspaceDirectoryPruner`: restoration removes
+obstructing directory-only trees without following links or touching excluded
+paths, bounded to `max_paths` directories per restored file. Regular files are
+removed only through the authenticated deletion pass. Adapters must implement
+this capability before checkpoint capture can be admitted. No reconstruction
+runs arbitrary tool code.
+
+`workspace.checkpoint.updated` events expose phase (`mutating`, `checkpointing`,
+`durable`), bytes, duration, tool/interaction linkage, the prior revision, and the
+last durable revision. The protected `workspace_checkpoints` checkpoint registry
+retains the authenticated manifest reference. Root checkpoint schema v8 reserves
+this authority; migration discards older application-owned lookalikes, and older
+staged writers cannot represent a live checkpoint revision.
+
+Runtime pins each baseline and mutation revision under a distinct owner and does
+not automatically release pins at session completion. This conservatively protects
+candidate descendants and snapshots after their source session terminates. Fork
+adoption acquires a child pin before publishing child ownership. Applications can
+use `pin_workspace_checkpoint()` to retain a revision for an additional task or
+`AgentSnapshot` component owner. Use a distinct owner for each retained revision.
+After all of an owner's dependent state is retired, `release_workspace_checkpoint()`
+releases that owner's pins; ordinary `ArtifactStore.delete()` then collects only
+unpinned artifacts. Other owners continue to block collection. Failed captures may
+leave conservative pins that must be reconciled before cleanup; elapsed time and
+process death never release them.
+
 ## Workspace
 
 Filesystem boundary. For coding agents this is often a target repo. For document/data agents this may be a working directory where tools create intermediate outputs.

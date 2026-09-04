@@ -3226,6 +3226,11 @@ def _serialize_environment(cayu_app: Any, record: Any) -> dict[str, Any]:
         "proxy_type": _object_type_name(environment.proxy),
         "knowledge_store_type": _object_type_name(environment.knowledge_store),
         "mcp_server_count": len(environment.mcp_servers),
+        "workspace_checkpoint_policy": (
+            None
+            if record.spec.workspace_checkpoint_policy is None
+            else record.spec.workspace_checkpoint_policy.model_dump(mode="json")
+        ),
         "lifecycle_policy": (
             None
             if record.spec.lifecycle_policy is None

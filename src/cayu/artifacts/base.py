@@ -387,6 +387,23 @@ class ArtifactStore(ABC):
         operational backend failures.
         """
 
+    @property
+    def supports_pins(self) -> bool:
+        """Whether durable pins serialize with deletion across processes."""
+        return False
+
+    async def pin(self, artifact_id: str, *, owner: str) -> None:
+        """Retain an existing artifact until this exact owner releases its pin.
+
+        Pinning an absent artifact must fail. Success must be durable and
+        serialize with delete; repeated acquisition by an owner is idempotent.
+        """
+        raise NotImplementedError("Artifact store does not support durable pins.")
+
+    async def release_pin(self, artifact_id: str, *, owner: str) -> None:
+        """Release only this owner. Callers must first retire dependent state."""
+        raise NotImplementedError("Artifact store does not support durable pins.")
+
     @abstractmethod
     async def delete(self, artifact_id: str) -> None:
         """Delete an artifact if it exists."""

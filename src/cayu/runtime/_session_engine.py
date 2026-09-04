@@ -4195,6 +4195,7 @@ def _replace_checkpoint_preserving_runtime_state(
         updated = copy_json_value(replacement, "checkpoint")
         updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
         for key, field_name in (
+            ("workspace_checkpoints", "workspace_checkpoints"),
             (
                 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
                 "active_invocation_execution_profile",

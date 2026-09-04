@@ -17,6 +17,7 @@ from cayu.workspaces._local_guard import (
     delete_regular_if_revision,
     move_regular_if_revision,
     open_regular_for_read,
+    prune_empty_directories,
     replace_regular_if_revision,
     require_absent_regular,
     restore_regular,
@@ -32,6 +33,7 @@ from cayu.workspaces._mutations import (
 )
 from cayu.workspaces.base import (
     Workspace,
+    WorkspaceDirectoryPruner,
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
     WorkspaceGitEntryObservationUnsupportedError,
@@ -67,7 +69,7 @@ from cayu.workspaces.branches import (
 )
 
 
-class LocalWorkspace(Workspace, WorkspaceGitModeMutator):
+class LocalWorkspace(Workspace, WorkspaceGitModeMutator, WorkspaceDirectoryPruner):
     """Filesystem workspace rooted at one local directory.
 
     ``excluded_directory_names`` and ``excluded_path_patterns`` remove matching
@@ -368,6 +370,20 @@ class LocalWorkspace(Workspace, WorkspaceGitModeMutator):
             expected_mode,
             replacement_mode,
         )
+
+    async def prune_empty_directories(self, path: str, *, max_directories: int) -> None:
+        relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
+        if type(max_directories) is not int or max_directories < 1:
+            raise ValueError("max_directories must be a positive integer.")
+
+        def prune():
+            with workspace_source_lock(self.root, exclusive=True):
+                prune_empty_directories(
+                    self.root, relative_path, max_directories, self._require_path_allowed
+                )
+
+        await asyncio.to_thread(prune)
 
     async def delete_if_revision(
         self,

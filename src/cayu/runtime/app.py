@@ -8547,6 +8547,7 @@ def _validate_environment_spec(
             field_name="environment_spec.execution_profile_identity",
         ),
         lifecycle_policy=spec.lifecycle_policy,
+        workspace_checkpoint_policy=spec.workspace_checkpoint_policy,
     )
 
 

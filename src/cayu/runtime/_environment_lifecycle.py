@@ -2564,6 +2564,41 @@ class EnvironmentLifecycle:
         invocation_context: InvocationContext | None = None,
         completion_finalization_recovery_state: dict[str, Any] | None = None,
     ) -> EnvironmentBindingResult:
+        result = await self._bind_workspace(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            started_event=started_event,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+            completion_finalization_recovery_state=completion_finalization_recovery_state,
+        )
+        if result.error is None and result.registered_environment is not None:
+            from cayu.runtime.workspace_checkpoints import ensure_workspace_checkpoint
+
+            try:
+                await ensure_workspace_checkpoint(
+                    self._session_store, session, result.registered_environment
+                )
+            except Exception as exc:
+                return EnvironmentBindingResult(
+                    registered_environment=result.registered_environment,
+                    events=result.events,
+                    error=exc,
+                )
+        return result
+
+    async def _bind_workspace(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        started_event: Event | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
+        completion_finalization_recovery_state: dict[str, Any] | None = None,
+    ) -> EnvironmentBindingResult:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or registered_agent is not invocation_context.registered_agent

@@ -16,7 +16,7 @@ import secrets
 import stat
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import BinaryIO, NoReturn
@@ -684,6 +684,52 @@ def delete_regular(root: Path, relative_path: str) -> None:
             _raise_workspace_path_error(exc, relative_path)
 
 
+def prune_empty_tree(
+    parent_fd: int,
+    name: str,
+    path: str,
+    max_directories: int,
+    require_allowed: Callable[[str], None],
+) -> None:
+    """Preflight a bounded directory-only tree, then remove it bottom-up."""
+    remaining = max_directories
+
+    def visit(parent: int, leaf: str, relative: str, remove: bool = False) -> None:
+        nonlocal remaining
+        require_allowed(relative)
+        info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Workspace restore refuses non-directory descendants.")
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError("Workspace restore exceeds directory policy.")
+        descriptor = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("Workspace restore directory identity changed.")
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    visit(descriptor, entry.name, relative + "/" + entry.name, remove)
+            if remove:
+                current = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ValueError("Workspace restore directory identity changed.")
+                os.rmdir(leaf, dir_fd=parent)
+        finally:
+            os.close(descriptor)
+
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(info.st_mode):
+        return
+    visit(parent_fd, name, path)
+    remaining = max_directories
+    visit(parent_fd, name, path, True)
+
+
 def delete_empty_directory(root: Path, relative_path: str) -> None:
     """Remove one empty directory without following any path component."""
 
@@ -712,4 +758,19 @@ def delete_regular_if_revision(
             os.unlink(name, dir_fd=parent_fd)
             return before
     except _LocalGuardPathError as exc:
+        _raise_workspace_path_error(exc, relative_path)
+
+
+def prune_empty_directories(
+    root: Path,
+    relative_path: str,
+    max_directories: int,
+    require_allowed: Callable[[str], None],
+) -> None:
+    try:
+        with _open_parent(root, relative_path) as (parent_fd, name):
+            prune_empty_tree(parent_fd, name, relative_path, max_directories, require_allowed)
+    except _LocalGuardPathError as exc:
+        if exc.status == "missing":
+            return
         _raise_workspace_path_error(exc, relative_path)

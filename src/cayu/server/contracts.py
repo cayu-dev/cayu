@@ -2360,6 +2360,7 @@ class ApiEnvironmentSummary(ApiBaseModel):
     proxy_type: str | None
     knowledge_store_type: str | None
     mcp_server_count: StrictInt = Field(ge=0)
+    workspace_checkpoint_policy: dict[str, Any] | None = None
     lifecycle_policy: EnvironmentLifecyclePolicy | None
     workspace_instructions: str | None
     bound_workspace: dict[str, Any] | None = None

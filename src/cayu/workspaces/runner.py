@@ -38,6 +38,7 @@ from cayu.workspaces.base import (
     TarStreamReadResult,
     TarStreamWriter,
     TarWriter,
+    WorkspaceDirectoryPruner,
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
     WorkspaceListResult,
@@ -714,6 +715,72 @@ def write_tar_stream_operation(root_fd):
         )
 
 
+def prune_empty_tree(parent_fd, name, path, max_directories, require_allowed):
+    # Preflight a bounded directory-only tree, then remove it bottom-up.
+    remaining = max_directories
+
+    def visit(parent, leaf, relative, remove=False):
+        nonlocal remaining
+        require_allowed(relative)
+        info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Workspace restore refuses non-directory descendants.")
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError("Workspace restore exceeds directory policy.")
+        descriptor = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("Workspace restore directory identity changed.")
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    visit(descriptor, entry.name, relative + "/" + entry.name, remove)
+            if remove:
+                current = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ValueError("Workspace restore directory identity changed.")
+                os.rmdir(leaf, dir_fd=parent)
+        finally:
+            os.close(descriptor)
+
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(info.st_mode):
+        return
+    visit(parent_fd, name, path)
+    remaining = max_directories
+    visit(parent_fd, name, path, True)
+
+
+def prune_empty_directories_operation(root_fd):
+    path = sys.argv[2]
+    limit = int(sys.argv[3])
+    if limit < 1:
+        raise ValueError("max_directories must be positive.")
+    excluded_names = frozenset(json.loads(sys.argv[4]))
+    excluded_patterns = tuple(re.compile(pattern) for pattern in json.loads(sys.argv[5]))
+
+    def require_allowed(relative):
+        if any(directory_name_key(part) in excluded_names for part in relative.split("/")):
+            raise ValueError("Workspace restore refuses excluded directories.")
+        if path_matches_excluded_pattern(relative, excluded_patterns):
+            raise ValueError("Workspace restore refuses excluded paths.")
+
+    parent_fd = None
+    try:
+        parent_fd, name = open_path(root_fd, path)
+        prune_empty_tree(parent_fd, name, path, limit, require_allowed)
+    except GuardPathError as exc:
+        if exc.status != "enoent":
+            raise
+    finally:
+        close_fd(parent_fd)
+    print(json.dumps({"ok": True}))
+
+
 def main():
     global _BINARY_STDOUT
     operation = sys.argv[1]
@@ -721,13 +788,15 @@ def main():
     root_fd = None
     try:
         root_fd = open_guard_root(".", operation in ("list", "git_entries"))
-        with workspace_source_lock(root_fd, False):
+        with workspace_source_lock(root_fd, operation == "prune_empty_directories"):
             if operation == "read":
                 read_operation(root_fd)
             elif operation == "write":
                 write_operation(root_fd)
             elif operation == "delete":
                 delete_operation(root_fd)
+            elif operation == "prune_empty_directories":
+                prune_empty_directories_operation(root_fd)
             elif operation == "list":
                 list_operation(root_fd)
             elif operation == "git_entries":
@@ -756,6 +825,7 @@ main()
 
 
 class RunnerWorkspace(
+    WorkspaceDirectoryPruner,
     RunnerBoundWorkspace,
     BoundedTarReader,
     TarWriter,
@@ -1151,6 +1221,19 @@ class RunnerWorkspace(
         if isinstance(validated, Exception):
             raise validated from None
         return validated
+
+    async def prune_empty_directories(self, path: str, *, max_directories: int) -> None:
+        path = _validate_relative_path(path)
+        self._require_path_allowed(path)
+        limit = _validate_required_limit(max_directories, "max_directories")
+        await self._run_json_operation(
+            "prune_empty_directories",
+            path,
+            str(limit),
+            json.dumps(tuple(sorted(self._excluded_directory_keys))),
+            json.dumps(self._excluded_path_regexes),
+            output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
+        )
 
     async def list_git_entries(self, *, limit: int) -> WorkspaceGitEntryListResult:
         effective_limit = _validate_required_limit(limit, "limit")

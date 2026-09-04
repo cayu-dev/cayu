@@ -267,6 +267,11 @@ from cayu.runtime.user_input import (
     public_pending_user_input_prompt,
     user_input_lifecycle_authority_from_checkpoint,
 )
+from cayu.runtime.workspace_checkpoints import (
+    begin_workspace_checkpoint_mutation,
+    complete_workspace_checkpoint_mutation,
+    ensure_workspace_checkpoint,
+)
 from cayu.runtime.workspace_mutation_attribution import (
     DirectWorkspaceMutationCollector,
     WorkspaceMutationWindow,
@@ -3336,6 +3341,8 @@ class ToolRoundExecutor:
         identity_payload = tool_round_identity.payload()
         tool_round_id = tool_round_identity.tool_round_id
         environment_name = _environment_name(registered_environment)
+        if registered_environment is not None:
+            await ensure_workspace_checkpoint(self._session_store, session, registered_environment)
         registered_tool = registered_agent.executable_tool(tool_call.name)
         if rejoin_targeted_invocation:
             rejoined_events = await self.rejoin_targeted_tool_call(
@@ -4466,6 +4473,14 @@ class ToolRoundExecutor:
                 tool_round_id=tool_round_identity.tool_round_id,
                 tool_call_id=tool_call.id,
             )
+            await begin_workspace_checkpoint_mutation(
+                self._session_store,
+                session,
+                registered_environment,
+                window_id=workspace_window_id,
+                tool_call_id=tool_call.id,
+                interaction_id=None if started_event is None else started_event.interaction_id,
+            )
             configured_workspace_id = _workspace_id(registered_environment)
             configured_observer = _workspace_revision_observer_name(registered_environment)
             configured_artifact_store_id = _artifact_store_id(registered_environment)
@@ -4657,6 +4672,20 @@ class ToolRoundExecutor:
                 nonlocal post_tool_cancellation
                 nonlocal workspace_events, workspace_lifecycle, workspace_capture_payload
 
+                if registered_environment is not None and workspace_window_id is not None:
+                    await complete_workspace_checkpoint_mutation(
+                        self._session_store,
+                        session,
+                        registered_environment,
+                        window_id=workspace_window_id,
+                        window_exclusive=lambda: not workspace_attribution_window.overlap_detected,
+                        successful=(
+                            event.type is EventType.TOOL_CALL_COMPLETED
+                            and not outcome.result.is_error
+                            and not snapshot.unsafe_output
+                            and workspace_settlement_failure is None
+                        ),
+                    )
                 staged_event = await deferred_terminal_stager(
                     event,
                     outcome,
