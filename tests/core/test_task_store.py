@@ -116,6 +116,70 @@ def test_task_stores_bound_continuation_scans_before_applying_query_filters(
     asyncio.run(run_store_operations())
 
 
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_claim_exact_interrupted_continuation(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            for task_id in ("exact-continuation-a", "exact-continuation-b"):
+                await store.create_task(TaskCreate(task_id=task_id, type="exact-continuation"))
+                claimed = await store.claim_task(
+                    f"prior-{task_id}",
+                    TaskQuery(type="exact-continuation"),
+                )
+                assert claimed is not None and claimed.id == task_id
+                attached = await store.attach_task(
+                    task_id,
+                    session_id=f"session-{task_id}",
+                    session_invocation=await task_backed_session_invocation(
+                        store,
+                        task_id,
+                        f"session-{task_id}",
+                    ),
+                    worker_id=claimed.worker_id,
+                    lease_expires_at=claimed.lease_expires_at,
+                )
+                await store.release_interrupted_task_worker(
+                    interrupted_task_handoff_request(attached, session_run_epoch=1)
+                )
+
+            handoff_id = str(uuid4())
+            page = await store.claim_interrupted_task_continuation(
+                "exact-continuation-worker",
+                handoff_id=handoff_id,
+                task_id="exact-continuation-b",
+                scan_limit=1,
+            )
+
+            assert page.task is not None
+            assert page.task.id == "exact-continuation-b"
+            untouched = await store.load_task("exact-continuation-a")
+            assert untouched is not None and untouched.worker_id is None
+            replay = await store.claim_interrupted_task_continuation(
+                "exact-continuation-worker",
+                handoff_id=handoff_id,
+                task_id="exact-continuation-b",
+                scan_limit=1,
+            )
+            assert replay.replayed is True
+            assert replay.task == page.task
+            with pytest.raises(TaskClaimLost):
+                await store.claim_interrupted_task_continuation(
+                    "exact-continuation-worker",
+                    handoff_id=handoff_id,
+                    task_id="exact-continuation-a",
+                    scan_limit=1,
+                )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
 def test_sqlite_consumed_continuation_generation_survives_restart(tmp_path) -> None:
     db_path = tmp_path / "tasks.sqlite"
 

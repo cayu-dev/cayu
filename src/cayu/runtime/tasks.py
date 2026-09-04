@@ -3166,6 +3166,7 @@ class TaskStore(ABC):
     supports_idempotent_terminalization: ClassVar[bool] = False
     supports_attached_task_recovery_terminalization: ClassVar[bool] = False
     supports_interrupted_task_handoffs: ClassVar[bool] = False
+    supports_exact_interrupted_task_handoffs: ClassVar[bool] = False
     supports_task_cancellation_reconciliation: ClassVar[bool] = False
     supports_task_retry_series: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
@@ -3818,19 +3819,32 @@ class TaskStore(ABC):
             "This TaskStore does not support interrupted-task handoff recovery."
         )
 
+    async def load_expired_interrupted_task_handoff_candidate(
+        self,
+        task_id: str,
+    ) -> Task | None:
+        """Load one exact expired attached owner using store-authoritative time."""
+
+        raise NotImplementedError(
+            "This TaskStore does not support exact interrupted-task handoff recovery."
+        )
+
     async def claim_interrupted_task_continuation(
         self,
         worker_id: str,
         query: TaskQuery | None = None,
         *,
         handoff_id: str,
+        task_id: str | None = None,
         lease_seconds: int = 300,
         after: tuple[datetime, str] | None = None,
         scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     ) -> InterruptedTaskContinuationClaimPage:
         """Scan one bounded page and lease its first authentic continuation.
 
-        ``handoff_id`` is a caller-generated, one-use claim generation. Supporting
+        ``handoff_id`` is a caller-generated, one-use claim generation. ``task_id``
+        is an optional exact selector available only from stores that advertise
+        ``supports_exact_interrupted_task_handoffs``. Supporting
         stores must first replay an exact still-live claim with the same worker and
         generation, making commit-before-ack loss recoverable without transferring
         authority. Otherwise they select only running attached tasks whose current
@@ -4077,6 +4091,7 @@ class InMemoryTaskStore(TaskStore):
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
     supports_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
@@ -6149,18 +6164,44 @@ class InMemoryTaskStore(TaskStore):
             )
             return [copy_task(task) for task in islice(candidates, limit)]
 
+    async def load_expired_interrupted_task_handoff_candidate(
+        self,
+        task_id: str,
+    ) -> Task | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            now = self._ownership_clock()
+            if not (
+                task.status is TaskStatus.RUNNING
+                and task.session_id is not None
+                and task.session_instance_id is not None
+                and task.worker_id is not None
+                and task.lease_expires_at is not None
+                and task.lease_expires_at <= now
+                and task.status_reason is None
+                and self._latest_admission_id_by_task.get(task.id) is None
+            ):
+                return None
+            return copy_task(task)
+
     async def claim_interrupted_task_continuation(
         self,
         worker_id: str,
         query: TaskQuery | None = None,
         *,
         handoff_id: str,
+        task_id: str | None = None,
         lease_seconds: int = 300,
         after: tuple[datetime, str] | None = None,
         scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     ) -> InterruptedTaskContinuationClaimPage:
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
+        if task_id is not None:
+            task_id = require_clean_nonblank(task_id, "task_id")
         handoff_id_sha256 = _interrupted_task_continuation_handoff_id_sha256(handoff_id)
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
@@ -6184,6 +6225,7 @@ class InMemoryTaskStore(TaskStore):
                     or existing.session_instance_id is None
                     or existing.lease_expires_at is None
                     or existing.lease_expires_at <= now
+                    or (task_id is not None and existing.id != task_id)
                     or not _task_matches_claim_filter(existing, query)
                 ):
                     raise TaskClaimLost(
@@ -6211,6 +6253,7 @@ class InMemoryTaskStore(TaskStore):
                 task
                 for task in self._tasks.values()
                 if task.interrupted_handoff_id is not None
+                and (task_id is None or task.id == task_id)
                 and task.status is TaskStatus.RUNNING
                 and task.session_id is not None
                 and task.session_instance_id is not None

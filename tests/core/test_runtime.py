@@ -233,6 +233,13 @@ from cayu.runtime import (
     PromptContributionManifest,
     Provenance,
     RecentTurnsContextPolicy,
+    RecoveryBlockerCode,
+    RecoveryDecision,
+    RecoveryExecutionRequest,
+    RecoveryItemExecutionStatus,
+    RecoveryPlanAction,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
     RequestFootprint,
     RequestFootprintConfig,
     RequestVariant,
@@ -29353,6 +29360,44 @@ def _crashed_tool_round_app(
     assert checkpoint is not None and "pending_tool_round" in checkpoint
     assert tool.calls == [{}]
     return app, store, tool, checkpoint
+
+
+def test_recovery_plan_requires_explicit_tool_effect_disposition() -> None:
+    session_id = "sess_tool_round_recovery_plan"
+    app, _store, tool, _checkpoint = _crashed_tool_round_app(session_id)
+
+    async def scenario() -> None:
+        plan = await app.plan_recovery(
+            RecoveryPlanRequest(selection=RecoveryPlanSelection(session_ids=(session_id,)))
+        )
+        item = plan.items[0]
+
+        assert len(item.pending_actions) == 1
+        assert RecoveryBlockerCode.TOOL_EFFECT_OUTCOME_UNKNOWN in {
+            blocker.code for blocker in item.blockers
+        }
+        assert RecoveryPlanAction.AUTOMATIC_REPAIR not in item.allowed_actions
+        assert RecoveryPlanAction.TOOL_MARK_COMPLETED in item.allowed_actions
+
+        receipt = await app.execute_recovery(
+            RecoveryExecutionRequest(
+                plan=plan,
+                execution_id="tool-effect-disposition",
+                decisions=(
+                    RecoveryDecision(
+                        item_id=item.item_id,
+                        action=RecoveryPlanAction.TOOL_MARK_COMPLETED,
+                        message="operator verified the external effect completed",
+                    ),
+                ),
+            )
+        )
+
+        assert receipt.items[0].status is RecoveryItemExecutionStatus.EXECUTED
+        assert receipt.items[0].final_session_status is SessionStatus.COMPLETED
+        assert tool.calls == [{}]
+
+    asyncio.run(scenario())
 
 
 def test_tool_round_recovery_rejects_profile_drift_before_provider_preflight() -> None:

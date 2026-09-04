@@ -7023,6 +7023,13 @@ class PendingActionQuery(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str | None = None
+    statuses: frozenset[SessionStatus] = frozenset(
+        {
+            SessionStatus.INTERRUPTED,
+            SessionStatus.FAILED,
+            SessionStatus.COMPLETED,
+        }
+    )
     kind: PendingActionKind | None = None
     agent_name: str | None = None
     environment_name: str | None = None
@@ -7034,6 +7041,19 @@ class PendingActionQuery(BaseModel):
         ge=1024,
         le=MAX_PENDING_ACTION_RESULT_BYTES,
     )
+
+    @field_validator("statuses", mode="before")
+    @classmethod
+    def validate_statuses(cls, value: object) -> frozenset[SessionStatus]:
+        if not isinstance(value, (set, frozenset, list, tuple)):
+            raise TypeError("statuses must be a collection of SessionStatus values.")
+        statuses = frozenset(
+            status if isinstance(status, SessionStatus) else SessionStatus(status)
+            for status in value
+        )
+        if not statuses:
+            raise ValueError("statuses must not be empty.")
+        return statuses
 
     @field_validator(
         "session_id",
@@ -18483,7 +18503,6 @@ class InMemorySessionStore(SessionStore):
     ) -> PendingActionListResult:
         from cayu.runtime.pending_actions import (
             PENDING_ACTION_CHECKPOINT_KEYS,
-            PENDING_ACTION_SESSION_STATUSES,
             pending_action_checkpoint_tool_call_count,
             pending_action_event_projection_bytes,
             pending_action_from_records,
@@ -18512,7 +18531,7 @@ class InMemorySessionStore(SessionStore):
                 session
                 for session_id in candidate_ids
                 if (session := self._sessions.get(session_id)) is not None
-                and session.status in PENDING_ACTION_SESSION_STATUSES
+                and session.status in query.statuses
                 and (query.agent_name is None or session.agent_name == query.agent_name)
                 and (
                     query.environment_name is None

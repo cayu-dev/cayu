@@ -40,6 +40,7 @@ from tests.core.test_provider_operation_offline_recovery import (
     assert_terminal_session_fails_closed_with_active_provider_operation,
     stage_provider_resolution_process_loss,
 )
+from tests.core.test_recovery_plans import assert_recovery_plan_store_conformance
 from tests.core.tool_result_projection_conformance import (
     assert_tool_result_projection_recovery_conformance,
     assert_tool_result_projection_session_store_conformance,
@@ -398,6 +399,10 @@ def test_postgres_session_store_preserves_projected_tool_results(
 
 def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_pending_action_store_conformance)
+
+
+def test_postgres_recovery_plan_store_conformance(postgres_dsn: str) -> None:
+    _run(postgres_dsn, assert_recovery_plan_store_conformance)
 
 
 def test_postgres_session_operation_fault_conformance(postgres_dsn: str) -> None:

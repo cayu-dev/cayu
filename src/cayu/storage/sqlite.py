@@ -11567,12 +11567,14 @@ class SQLiteSessionStore(SessionStore):
 
         inspected_candidate_limit = min(query.limit * 4, 800)
         candidate_limit = inspected_candidate_limit + 1
+        status_values = sorted(status.value for status in query.statuses)
+        status_placeholders = ", ".join("?" for _status in status_values)
         filters = [
-            "cayu_sessions.status IN ('interrupted', 'failed', 'completed')",
+            f"cayu_sessions.status IN ({status_placeholders})",
             "cayu_checkpoints.pending_action_metrics_ready = 1",
             "cayu_checkpoints.pending_action_flags <> 0",
         ]
-        params: list[Any] = []
+        params: list[Any] = list(status_values)
         if query.session_id is not None:
             filters.append("cayu_sessions.id = ?")
             params.append(query.session_id)
@@ -13630,6 +13632,7 @@ class SQLiteTaskStore(TaskStore):
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
     supports_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
@@ -17170,18 +17173,44 @@ class SQLiteTaskStore(TaskStore):
             ).fetchall()
             return [sqlite_support.task_from_row(row) for row in rows]
 
+    async def load_expired_interrupted_task_handoff_candidate(
+        self,
+        task_id: str,
+    ) -> Task | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM cayu_tasks WHERE id = ? AND status = ? "
+                "AND session_id IS NOT NULL AND session_instance_id IS NOT NULL "
+                "AND worker_id IS NOT NULL AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at <= ? AND status_reason IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM cayu_work_attempt_admissions "
+                "WHERE cayu_work_attempt_admissions.task_id = cayu_tasks.id"
+                ")",
+                (
+                    task_id,
+                    str(TaskStatus.RUNNING),
+                    sqlite_support.format_datetime(self._ownership_clock()),
+                ),
+            ).fetchone()
+            return None if row is None else sqlite_support.task_from_row(row)
+
     async def claim_interrupted_task_continuation(
         self,
         worker_id: str,
         query: TaskQuery | None = None,
         *,
         handoff_id: str,
+        task_id: str | None = None,
         lease_seconds: int = 300,
         after: tuple[datetime, str] | None = None,
         scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     ) -> InterruptedTaskContinuationClaimPage:
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
+        if task_id is not None:
+            task_id = require_clean_nonblank(task_id, "task_id")
         handoff_id_sha256 = _interrupted_task_continuation_handoff_id_sha256(handoff_id)
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
@@ -17219,6 +17248,7 @@ class SQLiteTaskStore(TaskStore):
                         or existing.session_instance_id is None
                         or existing.lease_expires_at is None
                         or existing.lease_expires_at <= now
+                        or (task_id is not None and existing.id != task_id)
                         or not _task_matches_claim_filter(existing, query)
                     ):
                         raise TaskClaimLost(
@@ -17260,16 +17290,20 @@ class SQLiteTaskStore(TaskStore):
                 if cursor is not None:
                     after_sql = "AND (created_at > ? OR (created_at = ? AND id > ?)) "
                     after_params = (cursor[0], cursor[0], cursor[1])
+                task_id_sql = "" if task_id is None else "AND id = ? "
+                task_id_params: tuple[str, ...] = () if task_id is None else (task_id,)
                 rows = self._connection.execute(
                     "SELECT * FROM cayu_tasks WHERE status = ? "
                     "AND session_id IS NOT NULL AND session_instance_id IS NOT NULL "
                     "AND status_reason IS NULL "
                     "AND worker_id IS NULL AND lease_expires_at IS NULL "
                     "AND interrupted_handoff_id IS NOT NULL "
+                    f"{task_id_sql}"
                     f"{after_sql}"
                     "ORDER BY created_at ASC, id ASC LIMIT ?",
                     (
                         str(TaskStatus.RUNNING),
+                        *task_id_params,
                         *after_params,
                         scan_limit,
                     ),

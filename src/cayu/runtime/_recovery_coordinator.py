@@ -1532,6 +1532,16 @@ def _incomplete_recovery_session_reservation_authority(
 class ModelCompletionManualRecoveryRequired(RuntimeError):
     """A model dispatch cannot be reconstructed safely without operator input."""
 
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            f"{message} Inspect the registered application with `cayu recovery plan` "
+            "before selecting an operator recovery decision."
+        )
+
+
+class _RecoveryPreflightMutationRequired(RuntimeError):
+    """Internal sentinel proving that recovery reached its first write boundary."""
+
 
 def _provider_cancellation_interrupt_payload(
     checkpoint: dict[str, Any] | None,
@@ -14973,6 +14983,23 @@ class RecoveryCoordinator:
             invocation_context=retained_invocation_context,
         )
 
+    async def interrupt_incomplete_session_for_manual_tool_recovery(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+    ) -> IncompleteSessionRecoveryResult:
+        """Fence a stale run and retain its pending tool effect for a typed decision."""
+
+        session = await self._session_store.load(request.session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {request.session_id}") from None
+        return await self._recover_incomplete_session_scoped(
+            session=session,
+            inactive_for_seconds=request.inactive_for_seconds,
+            reason=request.reason,
+            metadata=request.metadata,
+            interrupt_for_manual_tool_recovery=True,
+        )
+
     async def _finish_provider_operation_disposition_after_recovery(
         self,
         recovered: IncompleteSessionRecoveryResult,
@@ -15330,6 +15357,40 @@ class RecoveryCoordinator:
             next_cursor=None,
         )
 
+    async def preflight_incomplete_session(
+        self,
+        *,
+        session: Session,
+        inactive_for_seconds: int | None,
+    ) -> IncompleteSessionRecoveryResult | None:
+        """Validate one recovery path without acquiring claims or mutating state.
+
+        ``None`` means the exact current state reached the coordinator's guarded
+        mutation boundary. A returned result is a read-only disposition such as
+        an active owner, a pending approval, or already-complete terminal state.
+        The sentinel is raised only by the same ``before_mutation`` hook used by
+        verifier-aware recovery admission, so registration and execution-profile
+        incompatibilities are reported before an operator plan can authorize a
+        write.
+        """
+
+        if type(session) is not Session:
+            raise TypeError("session must be a Session.")
+
+        async def prevent_mutation() -> None:
+            raise _RecoveryPreflightMutationRequired
+
+        try:
+            return await self._recover_incomplete_session_scoped(
+                session=session.model_copy(deep=True),
+                inactive_for_seconds=inactive_for_seconds,
+                reason="operator_recovery_plan_preflight",
+                metadata={"source": "registered_application_recovery_plan"},
+                before_mutation=prevent_mutation,
+            )
+        except _RecoveryPreflightMutationRequired:
+            return None
+
     async def _recover_incomplete_session_fault_isolated(
         self,
         *,
@@ -15425,6 +15486,7 @@ class RecoveryCoordinator:
         provider_disposition_task_worker_id: str | None = None,
         provider_disposition_task_handoff_id: str | None = None,
         provider_disposition_after_admission: RecoveryMutationHook | None = None,
+        interrupt_for_manual_tool_recovery: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         reason = require_clean_nonblank(reason, "reason")
         metadata = copy_json_value(metadata, "metadata")
@@ -15453,6 +15515,7 @@ class RecoveryCoordinator:
             provider_disposition_task_worker_id=provider_disposition_task_worker_id,
             provider_disposition_task_handoff_id=provider_disposition_task_handoff_id,
             provider_disposition_after_admission=provider_disposition_after_admission,
+            interrupt_for_manual_tool_recovery=interrupt_for_manual_tool_recovery,
         )
 
     async def _recover_incomplete_session_owned(
@@ -15470,6 +15533,7 @@ class RecoveryCoordinator:
         provider_disposition_task_worker_id: str | None = None,
         provider_disposition_task_handoff_id: str | None = None,
         provider_disposition_after_admission: RecoveryMutationHook | None = None,
+        interrupt_for_manual_tool_recovery: bool = False,
     ) -> IncompleteSessionRecoveryResult:
 
         if (provider_disposition_task_id is None) != (
@@ -15872,6 +15936,7 @@ class RecoveryCoordinator:
                     provider_disposition_task_id=provider_disposition_task_id,
                     provider_disposition_task_worker_id=(provider_disposition_task_worker_id),
                     provider_disposition_task_handoff_id=(provider_disposition_task_handoff_id),
+                    interrupt_for_manual_tool_recovery=(interrupt_for_manual_tool_recovery),
                 ),
             )
         except BaseException as exc:
@@ -19395,6 +19460,7 @@ class RecoveryCoordinator:
         provider_disposition_task_id: str | None = None,
         provider_disposition_task_worker_id: str | None = None,
         provider_disposition_task_handoff_id: str | None = None,
+        interrupt_for_manual_tool_recovery: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         if (execution_profile_snapshot is None) != (invocation_context is None):
             raise RuntimeError(
@@ -19464,6 +19530,62 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
+            )
+
+        if interrupt_for_manual_tool_recovery:
+            if (
+                pending_tool_round is None
+                or pending_approval is not None
+                or pending_user_input is not None
+                or provider_interrupt_payload is not None
+            ):
+                raise RuntimeError(
+                    "Manual tool-recovery handoff requires one pending ordinary tool round."
+                )
+            if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
+                interrupt_payload = {
+                    **tool_round_recovery.pending_tool_round_identity(pending_tool_round).payload(),
+                    "reason": reason,
+                    "metadata": metadata,
+                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                    "recovered": True,
+                    "manual_recovery_required": True,
+                    "interruption_request_id": str(uuid4()),
+                }
+                session = await self._session_store.transition_status_and_checkpoint(
+                    session.id,
+                    from_statuses={session.status},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=self._pending_session_interrupt_checkpoint(
+                        interrupt_payload,
+                        self._clock(),
+                    ),
+                )
+            if session.status is SessionStatus.INTERRUPTING:
+                session = await self._finalize_interrupting_for_recovery(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    events=events,
+                    execution_profile=(
+                        None
+                        if execution_profile_snapshot is None
+                        else execution_profile_snapshot.profile
+                    ),
+                    invocation_context=invocation_context,
+                )
+            if session.status is not SessionStatus.INTERRUPTED:
+                raise RuntimeError(
+                    "Manual tool-recovery handoff did not reach an interrupted session."
+                )
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,),
+                events=tuple(events),
+                message="Fenced the stale run and retained its pending manual tool recovery.",
             )
 
         if provider_interrupt_payload is not None:

@@ -34618,12 +34618,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
         inspected_candidate_limit = min(query.limit * 4, 800)
         candidate_limit = inspected_candidate_limit + 1
+        status_values = sorted(status.value for status in query.statuses)
+        status_placeholders = ", ".join("%s" for _status in status_values)
         filters = [
-            "cayu_sessions.status IN ('interrupted', 'failed', 'completed')",
+            f"cayu_sessions.status IN ({status_placeholders})",
             "cayu_checkpoints.pending_action_metrics_ready",
             "cayu_checkpoints.pending_action_flags <> 0",
         ]
-        params: list[Any] = []
+        params: list[Any] = list(status_values)
         if query.session_id is not None:
             filters.append("cayu_sessions.id = %s")
             params.append(query.session_id)
@@ -36531,6 +36533,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
     supports_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
@@ -38422,18 +38425,53 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             rows = await cur.fetchall()
         return [pg_support.task_from_row(row) for row in rows]
 
+    async def load_expired_interrupted_task_handoff_candidate(
+        self,
+        task_id: str,
+    ) -> Task | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                        SELECT {_TASK_RETURNING_COLUMNS}
+                        FROM cayu_tasks AS task
+                        WHERE task.id = %s
+                          AND task.status = %s
+                          AND task.session_id IS NOT NULL
+                          AND task.session_instance_id IS NOT NULL
+                          AND task.worker_id IS NOT NULL
+                          AND task.lease_expires_at IS NOT NULL
+                          AND task.lease_expires_at <= transaction_timestamp()
+                          AND task.status_reason IS NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM cayu_work_attempt_admissions
+                              WHERE cayu_work_attempt_admissions.task_id = task.id
+                          )
+                    """,
+                ),
+                (task_id, str(TaskStatus.RUNNING)),
+            )
+            row = await cur.fetchone()
+        return None if row is None else pg_support.task_from_row(row)
+
     async def claim_interrupted_task_continuation(
         self,
         worker_id: str,
         query: TaskQuery | None = None,
         *,
         handoff_id: str,
+        task_id: str | None = None,
         lease_seconds: int = 300,
         after: tuple[datetime, str] | None = None,
         scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     ) -> InterruptedTaskContinuationClaimPage:
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
+        if task_id is not None:
+            task_id = require_clean_nonblank(task_id, "task_id")
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         lease_seconds = _validate_task_positive_int(lease_seconds, "lease_seconds")
@@ -38451,6 +38489,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 worker_id,
                 query=query,
                 handoff_id=handoff_id,
+                task_id=task_id,
                 lease_seconds=lease_seconds,
                 after=after,
                 scan_limit=scan_limit,
@@ -38465,6 +38504,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         *,
         query: TaskQuery,
         handoff_id: str,
+        task_id: str | None,
         lease_seconds: int,
         after: tuple[datetime, str] | None,
         scan_limit: int,
@@ -38508,6 +38548,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         or existing.session_instance_id is None
                         or existing.lease_expires_at is None
                         or existing.lease_expires_at <= now
+                        or (task_id is not None and existing.id != task_id)
                         or not _task_matches_claim_filter(existing, query)
                     ):
                         raise TaskClaimLost(
@@ -38548,6 +38589,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 if cursor is not None:
                     after_sql = "AND (created_at, id) > (%s, %s)"
                     after_params = [cursor[0], cursor[1]]
+                task_id_sql = "" if task_id is None else "AND task.id = %s"
+                task_id_params: list[object] = [] if task_id is None else [task_id]
                 await cur.execute(
                     f"""
                         SELECT {_TASK_RETURNING_COLUMNS}
@@ -38559,6 +38602,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                           AND worker_id IS NULL
                           AND lease_expires_at IS NULL
                           AND interrupted_handoff_id IS NOT NULL
+                          {task_id_sql}
                           {after_sql}
                         ORDER BY created_at ASC, id ASC
                         FOR UPDATE OF task
@@ -38566,6 +38610,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         """,
                     [
                         str(TaskStatus.RUNNING),
+                        *task_id_params,
                         *after_params,
                         scan_limit,
                     ],

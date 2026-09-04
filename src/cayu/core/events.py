@@ -50,6 +50,8 @@ def validate_public_custom_event_type(event_type: object) -> str:
 class EventType(StrEnum):
     SERVER_MUTATION_ACCEPTED = "server.mutation.accepted"
 
+    RECOVERY_PLAN_ITEM_EXECUTED = "recovery.plan.item.executed"
+
     SESSION_STARTED = "session.started"
     SESSION_RESUMED = "session.resumed"
     SESSION_COMPLETED = "session.completed"

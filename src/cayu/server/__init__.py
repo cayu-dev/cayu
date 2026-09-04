@@ -42,7 +42,14 @@ from cayu.project_control_plane import (
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest
+from cayu.runtime.recovery_plans import (
+    RecoveryExecutionRequest,
+    RecoveryPlan,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
+)
+
+_STARTUP_RECOVERY_MAX_CONCURRENCY = 8
 
 try:
     from fastapi import Request  # noqa: TC002 - FastAPI resolves endpoint annotations at runtime
@@ -240,22 +247,28 @@ def create_server(
     user_lifespan = resolved_fastapi_options.pop("lifespan", None)
     recovery_statuses = lifecycle.startup_recovery_statuses
 
-    async def recover_startup_state() -> IncompleteSessionsRecoveryRequest | None:
+    async def recover_startup_state() -> RecoveryPlanRequest | None:
         await _recover_persisted_event_side_effects_during_startup(
             app,
             timeout_s=lifecycle.event_side_effect_startup_timeout_seconds,
         )
-        continuation_request: IncompleteSessionsRecoveryRequest | None = None
+        continuation_request: RecoveryPlanRequest | None = None
         if recovery_statuses is not None:
-            request = IncompleteSessionsRecoveryRequest(
-                statuses=set(recovery_statuses),
-                inactive_for_seconds=lifecycle.recovery_inactive_after_seconds,
-                reason="server_startup_recovery",
-                metadata={"source": "create_server"},
+            request = RecoveryPlanRequest(
+                selection=RecoveryPlanSelection(
+                    statuses=recovery_statuses,
+                    inactive_for_seconds=lifecycle.recovery_inactive_after_seconds,
+                )
             )
-            page = await app.recover_incomplete_sessions(request)
-            if page.next_cursor is not None:
-                continuation_request = request.model_copy(update={"cursor": page.next_cursor})
+            plan = await _execute_incomplete_session_startup_recovery_page(app, request)
+            if plan.next_cursor is not None:
+                continuation_request = request.model_copy(
+                    update={
+                        "selection": request.selection.model_copy(
+                            update={"cursor": plan.next_cursor}
+                        )
+                    }
+                )
         await app.resume_pending_interruption_cascades(
             interrupting_inactive_for_seconds=(lifecycle.recovery_inactive_after_seconds)
         )
@@ -897,24 +910,43 @@ async def _recover_persisted_event_side_effects_forever(app: CayuApp) -> None:
 
 async def _continue_incomplete_session_startup_recovery(
     app: CayuApp,
-    request: IncompleteSessionsRecoveryRequest,
+    request: RecoveryPlanRequest,
 ) -> None:
-    seen_cursors = {request.cursor}
+    seen_cursors = {request.selection.cursor}
     while True:
-        page = await app.recover_incomplete_sessions(request)
-        if page.next_cursor is None:
+        plan = await _execute_incomplete_session_startup_recovery_page(app, request)
+        if plan.next_cursor is None:
             return
-        if page.next_cursor in seen_cursors:
+        if plan.next_cursor in seen_cursors:
             raise RuntimeError("Incomplete-session startup recovery returned a repeated cursor.")
-        seen_cursors.add(page.next_cursor)
-        request = request.model_copy(update={"cursor": page.next_cursor})
+        seen_cursors.add(plan.next_cursor)
+        request = request.model_copy(
+            update={"selection": request.selection.model_copy(update={"cursor": plan.next_cursor})}
+        )
         # A large durable backlog must not monopolize the server event loop.
         await asyncio.sleep(0)
 
 
+async def _execute_incomplete_session_startup_recovery_page(
+    app: CayuApp,
+    request: RecoveryPlanRequest,
+) -> RecoveryPlan:
+    """Inspect and execute one exact, bounded registered-app startup page."""
+
+    plan = await app.plan_recovery(request)
+    await app.execute_recovery(
+        RecoveryExecutionRequest(
+            plan=plan,
+            execution_id=f"server-startup:{plan.plan_id}",
+            max_concurrency=_STARTUP_RECOVERY_MAX_CONCURRENCY,
+        )
+    )
+    return plan
+
+
 async def _run_incomplete_session_startup_recovery(
     app: CayuApp,
-    request: IncompleteSessionsRecoveryRequest,
+    request: RecoveryPlanRequest,
 ) -> None:
     try:
         await _continue_incomplete_session_startup_recovery(app, request)
@@ -926,7 +958,7 @@ async def _run_incomplete_session_startup_recovery(
 
 def _start_incomplete_session_startup_recovery(
     app: CayuApp,
-    request: IncompleteSessionsRecoveryRequest | None,
+    request: RecoveryPlanRequest | None,
 ) -> asyncio.Task[None] | None:
     if request is None:
         return None

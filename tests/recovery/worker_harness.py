@@ -28,6 +28,11 @@ from cayu.runtime import (
     CayuApp,
     EventSink,
     IncompleteSessionRecoveryRequest,
+    RecoveryDecision,
+    RecoveryExecutionRequest,
+    RecoveryPlanAction,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
     ResolutionActor,
     ResolutionActorSource,
     ResumeRequest,
@@ -70,6 +75,7 @@ def _public_authority_alias_codec() -> PublicAuthorityAliasCodec:
 
 
 class RecoveryScenario(StrEnum):
+    MODEL = "model"
     ORDINARY_TOOL = "ordinary_tool"
     APPROVAL = "approval"
     BACKGROUND_SUBAGENT = "background_subagent"
@@ -81,6 +87,8 @@ class RecoveryAction(StrEnum):
     START = "start"
     AUTOMATIC = "automatic"
     MANUAL = "manual"
+    PLAN_MODEL_INTERRUPTED = "plan_model_interrupted"
+    PLAN_MANUAL = "plan_manual"
     APPROVE = "approve"
     DENY = "deny"
     RECOVER = "recover"
@@ -89,11 +97,20 @@ class RecoveryAction(StrEnum):
     RECOVER_UNATTACHED = "recover_unattached"
     RECOVER_ATTACHED = "recover_attached"
     RUN = "run"
+    PLAN_ATTACHED_MANUAL = "plan_attached_manual"
 
 
 _SCENARIO_ACTIONS = {
+    RecoveryScenario.MODEL: frozenset(
+        {RecoveryAction.START, RecoveryAction.PLAN_MODEL_INTERRUPTED}
+    ),
     RecoveryScenario.ORDINARY_TOOL: frozenset(
-        {RecoveryAction.START, RecoveryAction.AUTOMATIC, RecoveryAction.MANUAL}
+        {
+            RecoveryAction.START,
+            RecoveryAction.AUTOMATIC,
+            RecoveryAction.MANUAL,
+            RecoveryAction.PLAN_MANUAL,
+        }
     ),
     RecoveryScenario.APPROVAL: frozenset(
         {RecoveryAction.START, RecoveryAction.APPROVE, RecoveryAction.DENY}
@@ -105,6 +122,7 @@ _SCENARIO_ACTIONS = {
             RecoveryAction.START_ATTACHED,
             RecoveryAction.RECOVER_UNATTACHED,
             RecoveryAction.RECOVER_ATTACHED,
+            RecoveryAction.PLAN_ATTACHED_MANUAL,
         }
     ),
     RecoveryScenario.TERMINAL_RACE: frozenset({RecoveryAction.RUN}),
@@ -495,10 +513,19 @@ class _RecoveryProvider(ModelProvider):
             implementation_version="1",
         )
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, phase_path: Path | None = None) -> None:
         self.mode = mode
+        self.phase_path = phase_path
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        if self.mode == "model_start":
+            if self.phase_path is None:
+                raise AssertionError("model dispatch killpoint requires a phase path")
+            _write_json_atomic(
+                self.phase_path,
+                {"phase": "model_request_dispatched"},
+            )
+            await asyncio.Event().wait()
         if self.mode in {"ordinary_start", "approval_start", "task_start"}:
             yield ModelStreamEvent.tool_call(
                 id="call_side_effect",
@@ -811,6 +838,21 @@ def _ordinary_app(config: dict[str, Any], *, mode: str) -> CayuApp:
     return app
 
 
+def _model_app(config: dict[str, Any], *, initial: bool) -> CayuApp:
+    backend = BackendConfig.from_json(config["backend"])
+    store = _session_store(backend)
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(
+        _RecoveryProvider(
+            "model_start" if initial else "recovery",
+            Path(config["phase_path"]) if initial else None,
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name=_AGENT_NAME, model="recovery-model"))
+    return app
+
+
 def _approval_app(config: dict[str, Any], *, initial: bool) -> CayuApp:
     backend = BackendConfig.from_json(config["backend"])
     store = _session_store(backend)
@@ -978,7 +1020,90 @@ async def _run_ordinary_tool(config: dict[str, Any]) -> dict[str, Any]:
             ):
                 pass
             return {"manual_recovery": True}
+        if action == "plan_manual":
+            plan = await app.plan_recovery(
+                RecoveryPlanRequest(selection=RecoveryPlanSelection(session_ids=(session_id,)))
+            )
+            if len(plan.items) != 1:
+                raise AssertionError("registered recovery plan did not select one session")
+            item = plan.items[0]
+            if RecoveryPlanAction.TOOL_MARK_COMPLETED not in item.allowed_actions:
+                raise AssertionError(
+                    "registered recovery plan omitted the explicit tool decision: "
+                    f"{item.model_dump(mode='json')}"
+                )
+            request = RecoveryExecutionRequest(
+                plan=plan,
+                execution_id="fresh-process-plan-tool-recovery",
+                decisions=(
+                    RecoveryDecision(
+                        item_id=item.item_id,
+                        action=RecoveryPlanAction.TOOL_MARK_COMPLETED,
+                        message="External marker verified the side effect.",
+                    ),
+                ),
+            )
+            receipt = await app.execute_recovery(request)
+            replay = await app.execute_recovery(request)
+            return {
+                "receipt": receipt.model_dump(mode="json"),
+                "replay": replay.model_dump(mode="json"),
+            }
         raise ValueError(f"Unsupported ordinary tool action: {action}")
+    finally:
+        await app.session_store.close()
+
+
+async def _run_model(config: dict[str, Any]) -> dict[str, Any]:
+    action = config["action"]
+    session_id = config["session_id"]
+    app = _model_app(config, initial=action == "start")
+    try:
+        if action == "start":
+            async for _ in app.run(
+                RunRequest(
+                    agent_name=_AGENT_NAME,
+                    session_id=session_id,
+                    messages=[Message.text("user", "Wait at the model dispatch boundary.")],
+                )
+            ):
+                pass
+            raise AssertionError("model boundary start unexpectedly returned")
+
+        plan = await app.plan_recovery(
+            RecoveryPlanRequest(selection=RecoveryPlanSelection(session_ids=(session_id,)))
+        )
+        if len(plan.items) != 1:
+            raise AssertionError("registered recovery plan did not select one model stage")
+        item = plan.items[0]
+        if RecoveryPlanAction.MODEL_MARK_INTERRUPTED not in item.allowed_actions:
+            raise AssertionError(
+                "registered recovery plan omitted the explicit model decision: "
+                f"{item.model_dump(mode='json')}"
+            )
+        request = RecoveryExecutionRequest(
+            plan=plan,
+            execution_id="fresh-process-plan-model-recovery",
+            decisions=(
+                RecoveryDecision(
+                    item_id=item.item_id,
+                    action=RecoveryPlanAction.MODEL_MARK_INTERRUPTED,
+                ),
+            ),
+        )
+        receipt = await app.execute_recovery(request)
+        replay = await app.execute_recovery(request)
+        async for _ in app.resume(
+            ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", "Continue after model recovery.")],
+            )
+        ):
+            pass
+        return {
+            "receipt": receipt.model_dump(mode="json"),
+            "replay": replay.model_dump(mode="json"),
+        }
     finally:
         await app.session_store.close()
 
@@ -1184,6 +1309,43 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
                 )
             ):
                 pass
+        elif action == "plan_attached_manual":
+            if worker_b_claim is not None:
+                raise AssertionError("an attached task was incorrectly returned to the free queue")
+            plan = await app.plan_recovery(
+                RecoveryPlanRequest(selection=RecoveryPlanSelection(session_ids=(session_id,)))
+            )
+            if len(plan.items) != 1:
+                raise AssertionError("registered recovery plan did not select the task session")
+            item = plan.items[0]
+            if (
+                len(item.task_claims) != 1
+                or item.task_claims[0].ownership_status != "expired"
+                or RecoveryPlanAction.TOOL_MARK_COMPLETED not in item.allowed_actions
+            ):
+                raise AssertionError(
+                    "registered recovery plan did not expose expired task recovery: "
+                    f"{item.model_dump(mode='json')}"
+                )
+            request = RecoveryExecutionRequest(
+                plan=plan,
+                execution_id="fresh-process-attached-tool-plan",
+                decisions=(
+                    RecoveryDecision(
+                        item_id=item.item_id,
+                        action=RecoveryPlanAction.TOOL_MARK_COMPLETED,
+                        message="External marker verified the attached side effect.",
+                    ),
+                ),
+            )
+            receipt = await app.execute_recovery(request)
+            replay = await app.execute_recovery(request)
+            current_task = await task_store.load_task(task_id)
+            return {
+                "receipt": receipt.model_dump(mode="json"),
+                "replay": replay.model_dump(mode="json"),
+                "task": None if current_task is None else current_task.model_dump(mode="json"),
+            }
         else:
             raise ValueError(f"Unsupported task claim action: {action}")
 
@@ -1285,6 +1447,7 @@ async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
     if action not in _SCENARIO_ACTIONS[scenario]:
         raise ValueError(f"Action {action!r} is not valid for scenario {scenario!r}")
     handlers = {
+        RecoveryScenario.MODEL: _run_model,
         RecoveryScenario.ORDINARY_TOOL: _run_ordinary_tool,
         RecoveryScenario.APPROVAL: _run_approval,
         RecoveryScenario.BACKGROUND_SUBAGENT: _run_background_subagent,

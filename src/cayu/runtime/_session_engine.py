@@ -4247,6 +4247,10 @@ def _replace_checkpoint_preserving_runtime_state(
                 COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
                 "completion_result_event_publications",
             ),
+            (
+                "recovery_plan_execution",
+                "recovery_plan_execution",
+            ),
         ):
             updated.pop(key, None)
             if current is not None and key in current:
@@ -6006,6 +6010,97 @@ class SessionEngine:
         the next process to recover.
         """
         return await self._background_interruption_coordinator.drain(timeout_s=timeout_s)
+
+    async def resume_pending_interruption_cascade(
+        self,
+        session_id: str,
+        interrupting_inactive_for_seconds: int | None = None,
+    ) -> bool:
+        """Resume exactly one durable descendant-interruption cascade."""
+
+        if interrupting_inactive_for_seconds is not None and (
+            type(interrupting_inactive_for_seconds) is not int
+            or not 0 <= interrupting_inactive_for_seconds <= MAX_DURABLE_JSON_INTEGER
+        ):
+            raise ValueError(
+                "interrupting_inactive_for_seconds must be a non-negative durable integer."
+            )
+        session = await self._require_session(session_id)
+        if session.status not in {
+            SessionStatus.INTERRUPTING,
+            SessionStatus.INTERRUPTED,
+        } or (
+            session.status is SessionStatus.INTERRUPTING
+            and interrupting_inactive_for_seconds is None
+        ):
+            return False
+        marker = await self._load_pending_interruption_cascade(session.id)
+        if marker is None:
+            return False
+        if session.status is SessionStatus.INTERRUPTING:
+            (
+                requires_completion_decision,
+                admission_failure,
+            ) = await self._verifier_aware_task_execution_outcome(
+                None,
+                session_id=session.id,
+                admit_session=False,
+            )
+            if admission_failure is not None:
+                raise_task_store_operation_failure(admission_failure)
+            if requires_completion_decision:
+                return False
+
+        already_scheduled = self._background_interruption_coordinator.is_admitted(session.id)
+        if session.status is SessionStatus.INTERRUPTING:
+            recovery_session_id = session.id
+
+            async def admit_before_recovery_mutation() -> None:
+                (
+                    requires_completion_decision,
+                    admission_failure,
+                ) = await self._verifier_aware_task_execution_outcome(
+                    None,
+                    session_id=recovery_session_id,
+                )
+                if admission_failure is not None:
+                    raise_task_store_operation_failure(admission_failure)
+                if requires_completion_decision:
+                    raise TaskCompletionDecisionRequired(
+                        "Contracted tasks require the verifier-aware execution entrance."
+                    ) from None
+
+            with suppress_interruption_cascade():
+                recovery = await self._recovery_coordinator.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=session.id,
+                        inactive_for_seconds=interrupting_inactive_for_seconds,
+                        reason="interruption_cascade_operator_recovery",
+                        metadata={"source": "recovery_plan"},
+                    ),
+                    before_mutation=admit_before_recovery_mutation,
+                )
+            session = await self._require_session(session.id)
+            if session.status is not SessionStatus.INTERRUPTED:
+                raise RuntimeError(
+                    "Could not finalize the interruption-cascade parent during recovery: "
+                    f"{recovery.actions!r}."
+                )
+        if already_scheduled:
+            task = self._schedule_background_interruption_cascade(
+                parent_session_id=session.id,
+                interrupt_payload=marker["interrupt_payload"],
+                create_if_missing=False,
+            )
+            if task is not None:
+                await asyncio.shield(task)
+        else:
+            await self._background_interruption_coordinator.run_cascade(
+                parent_session_id=session.id,
+                interrupt_payload=marker["interrupt_payload"],
+                create_if_missing=False,
+            )
+        return not already_scheduled
 
     async def resume_pending_interruption_cascades(
         self,

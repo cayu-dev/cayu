@@ -176,6 +176,7 @@ from cayu.runtime._recovery_coordinator import (
     RecoveryTaskEventRequest,
     RecoveryTerminalEventRequest,
 )
+from cayu.runtime._recovery_plan_coordinator import RecoveryPlanCoordinator
 from cayu.runtime._run_limit_accounting import RunLimitAccountingContext
 from cayu.runtime._run_limits import (
     RunLimitController,
@@ -361,6 +362,12 @@ from cayu.runtime.recovery_cleanup import (
     RecoveryCleanupSupervisor,
     RecoveryCleanupSupervisorSnapshot,
     copy_recovery_cleanup_policy,
+)
+from cayu.runtime.recovery_plans import (
+    RecoveryExecutionRequest,
+    RecoveryPlan,
+    RecoveryPlanRequest,
+    RecoveryReceipt,
 )
 from cayu.runtime.request_footprints import (
     RequestFootprintConfig,
@@ -1482,6 +1489,22 @@ class CayuApp:
         )
         self._recovery_coordinator.bind_committed_runtime_task_failure_recovery(
             self._session_engine._recover_committed_runtime_task_failure
+        )
+        self._recovery_plan_coordinator = RecoveryPlanCoordinator(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            event_writer=self._event_writer,
+            recovery_coordinator=self._recovery_coordinator,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_provider=self._get_registered_provider,
+            resolve_registered_environment=self._get_registered_environment_for_session,
+            recover_incomplete_session=self._recover_incomplete_session_private,
+            recover_model_completion=self._recover_model_completion_stage_private,
+            recover_tool_round=self._recover_tool_round_private,
+            recover_interruption_cascade=(self._session_engine.resume_pending_interruption_cascade),
+            project_session_id=self.project_session_id_for_exposure,
+            resolve_session_id=self._resolve_public_session_id,
+            clock=self._clock,
         )
         self._durable_subagent_coordinator = DurableSubagentCoordinator(
             session_store=self.session_store,
@@ -4765,6 +4788,20 @@ class CayuApp:
         result = await recovery
         return await self._project_incomplete_recovery_result_for_public_api(result)
 
+    async def plan_recovery(self, request: RecoveryPlanRequest) -> RecoveryPlan:
+        """Build a bounded, read-only recovery plan for this registered app."""
+
+        if type(request) is not RecoveryPlanRequest:
+            raise TypeError("Recovery planning requires a RecoveryPlanRequest.")
+        return await self._recovery_plan_coordinator.plan_recovery(request)
+
+    async def execute_recovery(self, request: RecoveryExecutionRequest) -> RecoveryReceipt:
+        """Execute exact recovery-plan decisions with durable per-session receipts."""
+
+        if type(request) is not RecoveryExecutionRequest:
+            raise TypeError("Recovery execution requires a RecoveryExecutionRequest.")
+        return await self._recovery_plan_coordinator.execute_recovery(request)
+
     async def recover_model_completion_stage(
         self,
         request: ModelCompletionManualRecoveryRequest,
@@ -4780,6 +4817,13 @@ class CayuApp:
             request,
             session_id=session_id,
         )
+        return await self._recover_model_completion_stage_private(request)
+
+    async def _recover_model_completion_stage_private(
+        self,
+        request: ModelCompletionManualRecoveryRequest,
+    ) -> ModelCompletionManualRecoveryResult:
+        request = copy_model_completion_manual_recovery_request(request)
         (
             requires_completion_decision,
             admission_failure,

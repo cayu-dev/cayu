@@ -774,6 +774,38 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
             "deploy",
         ),
     )
+    await create(
+        "conformance_running_round_recovery",
+        status=SessionStatus.RUNNING,
+        events=[
+            Event(
+                id="conformance_running_round_started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="conformance_running_round_recovery",
+                tool_name="charge",
+                payload={
+                    **_tool_round_identity_payload(),
+                    "tool_call_id": "conformance_running_round_call",
+                    "arguments": {},
+                },
+            )
+        ],
+        checkpoint=_round_checkpoint(
+            _TOOL_ROUND_ID,
+            "conformance_running_round_call",
+        ),
+    )
+
+    running = await store.query_pending_actions(
+        PendingActionQuery(
+            session_id="conformance_running_round_recovery",
+            statuses=frozenset({SessionStatus.RUNNING}),
+        )
+    )
+    assert len(running.actions) == 1
+    assert running.actions[0].kind is PendingActionKind.MANUAL_RECOVERY
+    assert running.actions[0].tool_call_id == "conformance_running_round_call"
+    assert running.issues == []
 
     actions = []
     cursor: str | None = None

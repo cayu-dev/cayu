@@ -103,7 +103,6 @@ from cayu.runtime import (
     EventQuery,
     EventRecord,
     ForkSessionRequest,
-    IncompleteSessionsRecoveryPage,
     InMemoryEventSink,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -113,6 +112,8 @@ from cayu.runtime import (
     PendingActionListResult,
     PendingActionQuery,
     PersistedEventSideEffectStatus,
+    RecoveryExecutionRequest,
+    RecoveryPlan,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
@@ -13474,10 +13475,22 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         yield
         calls.append("user_stop")
 
-    async def recover(request):
-        calls.append("recover")
+    async def plan_recovery(request):
+        calls.append("plan_recovery")
         requests.append(request)
-        return IncompleteSessionsRecoveryPage()
+        return RecoveryPlan(
+            plan_id="startup-plan-one",
+            created_at=datetime.now(UTC),
+            request=request,
+            items=(),
+            inspected_session_count=0,
+        )
+
+    async def execute_recovery(request):
+        calls.append("execute_recovery")
+        assert isinstance(request, RecoveryExecutionRequest)
+        assert request.execution_id == f"server-startup:{request.plan.plan_id}"
+        assert request.max_concurrency == 8
 
     async def recover_event_side_effects(*, limit=1000):
         calls.append("recover_event_side_effects")
@@ -13499,7 +13512,8 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         assert interrupting_inactive_for_seconds == 60
         return 0
 
-    app.recover_incomplete_sessions = recover
+    app.plan_recovery = plan_recovery
+    app.execute_recovery = execute_recovery
     app.recover_persisted_event_side_effects = recover_event_side_effects
     app.drain_background_interruptions = drain_background_interruptions
     app.drain_provider_operation_cancellations = drain_provider_operation_cancellations
@@ -13526,14 +13540,16 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         assert calls == [
             "user_start",
             "recover_event_side_effects",
-            "recover",
+            "plan_recovery",
+            "execute_recovery",
             "resume_cascades",
         ]
 
     assert calls == [
         "user_start",
         "recover_event_side_effects",
-        "recover",
+        "plan_recovery",
+        "execute_recovery",
         "resume_cascades",
         "drain",
         "provider_cancellation_drain",
@@ -13541,7 +13557,7 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
     ]
     assert len(requests) == 1
     request = requests[0]
-    assert request.statuses == {
+    assert request.selection.statuses == {
         SessionStatus.PENDING,
         SessionStatus.RUNNING,
         SessionStatus.INTERRUPTING,
@@ -13549,9 +13565,7 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         SessionStatus.FAILED,
         SessionStatus.INTERRUPTED,
     }
-    assert request.reason == "server_startup_recovery"
-    assert request.metadata == {"source": "create_server"}
-    assert request.inactive_for_seconds == 60
+    assert request.selection.inactive_for_seconds == 60
 
 
 def test_create_server_startup_recovery_consumes_every_cursor_page() -> None:
@@ -13561,11 +13575,11 @@ def test_create_server_startup_recovery_consumes_every_cursor_page() -> None:
     continuation_started = threading.Event()
     continuation_finished = threading.Event()
 
-    async def recover(request):
+    async def plan_recovery(request):
         requests.append(request)
-        if request.cursor is None:
-            return IncompleteSessionsRecoveryPage(next_cursor="startup-page-2")
-        if request.cursor == "startup-page-2":
+        if request.selection.cursor is None:
+            next_cursor = "startup-page-2"
+        elif request.selection.cursor == "startup-page-2":
             continuation_started.set()
             for _ in range(100):
                 if server_is_ready.is_set():
@@ -13573,12 +13587,25 @@ def test_create_server_startup_recovery_consumes_every_cursor_page() -> None:
                 await asyncio.sleep(0.01)
             else:
                 raise AssertionError("Startup recovery continued before server readiness.")
-            return IncompleteSessionsRecoveryPage(next_cursor="startup-page-3")
-        assert request.cursor == "startup-page-3"
-        continuation_finished.set()
-        return IncompleteSessionsRecoveryPage()
+            next_cursor = "startup-page-3"
+        else:
+            assert request.selection.cursor == "startup-page-3"
+            continuation_finished.set()
+            next_cursor = None
+        return RecoveryPlan(
+            plan_id=f"startup-plan-{len(requests)}",
+            created_at=datetime.now(UTC),
+            request=request,
+            items=(),
+            inspected_session_count=0,
+            next_cursor=next_cursor,
+        )
 
-    app.recover_incomplete_sessions = recover
+    async def execute_recovery(_request):
+        return None
+
+    app.plan_recovery = plan_recovery
+    app.execute_recovery = execute_recovery
     server = create_server(
         app,
         config=ServerConfig.local_development(
@@ -13594,15 +13621,13 @@ def test_create_server_startup_recovery_consumes_every_cursor_page() -> None:
         assert continuation_started.wait(timeout=2.0)
         assert continuation_finished.wait(timeout=2.0)
 
-    assert [request.cursor for request in requests] == [
+    assert [request.selection.cursor for request in requests] == [
         None,
         "startup-page-2",
         "startup-page-3",
     ]
-    assert all(request.statuses == {SessionStatus.INTERRUPTED} for request in requests)
-    assert all(request.reason == "server_startup_recovery" for request in requests)
-    assert all(request.metadata == {"source": "create_server"} for request in requests)
-    assert len({request.inactive_for_seconds for request in requests}) == 1
+    assert all(request.selection.statuses == {SessionStatus.INTERRUPTED} for request in requests)
+    assert len({request.selection.inactive_for_seconds for request in requests}) == 1
 
 
 def test_create_server_stops_incomplete_recovery_continuation_on_shutdown() -> None:
@@ -13610,9 +13635,16 @@ def test_create_server_stops_incomplete_recovery_continuation_on_shutdown() -> N
     continuation_started = threading.Event()
     continuation_cancelled = threading.Event()
 
-    async def recover(request):
-        if request.cursor is None:
-            return IncompleteSessionsRecoveryPage(next_cursor="startup-page-2")
+    async def plan_recovery(request):
+        if request.selection.cursor is None:
+            return RecoveryPlan(
+                plan_id="startup-plan-one",
+                created_at=datetime.now(UTC),
+                request=request,
+                items=(),
+                inspected_session_count=0,
+                next_cursor="startup-page-2",
+            )
         continuation_started.set()
         try:
             await asyncio.Event().wait()
@@ -13620,7 +13652,11 @@ def test_create_server_stops_incomplete_recovery_continuation_on_shutdown() -> N
             continuation_cancelled.set()
             raise
 
-    app.recover_incomplete_sessions = recover
+    async def execute_recovery(_request):
+        return None
+
+    app.plan_recovery = plan_recovery
+    app.execute_recovery = execute_recovery
     server = create_server(
         app,
         config=ServerConfig.local_development(
@@ -13643,13 +13679,24 @@ def test_create_server_background_startup_recovery_rejects_cursor_cycles(
     cursors = []
     continuation_finished = threading.Event()
 
-    async def recover(request):
-        cursors.append(request.cursor)
-        if request.cursor is not None:
+    async def plan_recovery(request):
+        cursors.append(request.selection.cursor)
+        if request.selection.cursor is not None:
             continuation_finished.set()
-        return IncompleteSessionsRecoveryPage(next_cursor="repeated-startup-cursor")
+        return RecoveryPlan(
+            plan_id=f"startup-plan-{len(cursors)}",
+            created_at=datetime.now(UTC),
+            request=request,
+            items=(),
+            inspected_session_count=0,
+            next_cursor="repeated-startup-cursor",
+        )
 
-    app.recover_incomplete_sessions = recover
+    async def execute_recovery(_request):
+        return None
+
+    app.plan_recovery = plan_recovery
+    app.execute_recovery = execute_recovery
     server = create_server(
         app,
         config=ServerConfig.local_development(

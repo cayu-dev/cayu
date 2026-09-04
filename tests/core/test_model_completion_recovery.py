@@ -32,6 +32,13 @@ from cayu.runtime import (
     ModelCompletionStageDisposition,
     ModelPrice,
     PriceBook,
+    RecoveryBlockerCode,
+    RecoveryDecision,
+    RecoveryExecutionRequest,
+    RecoveryItemExecutionStatus,
+    RecoveryPlanAction,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
     ResumeRequest,
     RunLimits,
     RunRequest,
@@ -3028,3 +3035,57 @@ def test_incomplete_recovery_replays_lost_promotion_acknowledgement_exactly() ->
         )
         is not None
     )
+
+
+def test_recovery_plan_requires_explicit_model_terminal_disposition() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _RecordingProvider()
+
+        async def seed_crashed_stage() -> None:
+            await _stage_in_flight_model_boundary(
+                store,
+                session_id="model-recovery-plan-explicit-disposition",
+                provider_name=provider.name,
+                dispatched=True,
+                reservation_ids=(),
+            )
+
+        await asyncio.create_task(seed_crashed_stage())
+        app = _register_runtime(store, provider)
+        plan = await app.plan_recovery(
+            RecoveryPlanRequest(
+                selection=RecoveryPlanSelection(
+                    session_ids=("model-recovery-plan-explicit-disposition",)
+                )
+            )
+        )
+        item = plan.items[0]
+
+        assert item.active_model_stage is not None
+        assert item.active_model_stage.dispatched is True
+        assert RecoveryBlockerCode.MODEL_EFFECT_OUTCOME_UNKNOWN in {
+            blocker.code for blocker in item.blockers
+        }
+        assert RecoveryPlanAction.AUTOMATIC_REPAIR not in item.allowed_actions
+        assert RecoveryPlanAction.MODEL_MARK_INTERRUPTED in item.allowed_actions
+
+        receipt = await app.execute_recovery(
+            RecoveryExecutionRequest(
+                plan=plan,
+                execution_id="model-terminal-disposition",
+                decisions=(
+                    RecoveryDecision(
+                        item_id=item.item_id,
+                        action=RecoveryPlanAction.MODEL_MARK_INTERRUPTED,
+                    ),
+                ),
+            )
+        )
+
+        assert receipt.items[0].status is RecoveryItemExecutionStatus.EXECUTED
+        assert receipt.items[0].final_session_status is SessionStatus.INTERRUPTED
+        assert await store.load_active_model_completion_stage(item.session_id) is None
+        assert provider.requests == []
+
+    asyncio.run(run())

@@ -254,6 +254,33 @@ def task_store_interrupted_handoff_capability_is_complete(
     )
 
 
+def task_store_exact_interrupted_handoff_capability_is_complete(
+    task_store: TaskStore,
+) -> bool:
+    """Return positive proof for exact task-selected handoff and continuation."""
+
+    try:
+        declarations = type.__getattribute__(type(task_store), "__dict__")
+    except BaseException:
+        return False
+    return bool(
+        declarations.get("supports_exact_interrupted_task_handoffs") is True
+        and task_store_interrupted_handoff_capability_is_complete(task_store)
+        and _task_store_method_has_stable_concrete_implementation(
+            task_store,
+            "load_expired_interrupted_task_handoff_candidate",
+        )
+        and _task_store_method_has_stable_concrete_implementation(
+            task_store,
+            "claim_interrupted_task_continuation",
+        )
+        and task_store_mutation_is_cancellation_quiescent(
+            task_store,
+            "claim_interrupted_task_continuation",
+        )
+    )
+
+
 def task_store_cancellation_reconciliation_capability_is_complete(
     task_store: TaskStore,
 ) -> bool:

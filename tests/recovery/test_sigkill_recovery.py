@@ -99,13 +99,13 @@ def test_worker_failure_reports_durable_state_and_cleans_control_artifacts(tmp_p
 
 @pytest.mark.parametrize("recovery_action", ["automatic", "manual"])
 def test_sigkill_during_ordinary_tool_execution_recovers_without_reexecution(
-    tmp_path,
+    tmp_path: Path,
+    recovery_backend: BackendConfig,
     recovery_action: str,
 ) -> None:
-    backend = BackendConfig.sqlite(tmp_path)
     session_id = f"sigkill_tool_{recovery_action}"
 
-    with RecoveryHarness(tmp_path, backend) as harness:
+    with RecoveryHarness(tmp_path, recovery_backend) as harness:
         killed_worker = harness.launch(
             scenario="ordinary_tool",
             action="start",
@@ -184,15 +184,106 @@ def test_sigkill_during_ordinary_tool_execution_recovers_without_reexecution(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_sigkill_during_model_dispatch_recovers_through_registered_application_plan(
+    tmp_path: Path,
+    recovery_backend: BackendConfig,
+) -> None:
+    session_id = f"sigkill_plan_model_{uuid4().hex[:10]}"
+
+    with RecoveryHarness(tmp_path, recovery_backend) as harness:
+        killed_worker = harness.launch(
+            scenario="model",
+            action="start",
+            session_id=session_id,
+        )
+        killed_worker.wait_for_phase("model_request_dispatched")
+        before_kill = asyncio.run(harness.load_session_state(session_id))
+        assert before_kill.session is not None
+        assert before_kill.session.status is SessionStatus.RUNNING
+        assert any(event.type is EventType.MODEL_STARTED for event in before_kill.events)
+
+        killed_worker.sigkill()
+
+        recovery_worker = harness.launch(
+            scenario="model",
+            action="plan_model_interrupted",
+            session_id=session_id,
+        )
+        result = recovery_worker.wait_success()
+
+        receipt_item = result["receipt"]["items"][0]
+        assert receipt_item["status"] == "executed", receipt_item
+        assert receipt_item["final_session_status"] == "interrupted"
+        assert receipt_item["replayed"] is False
+        assert result["replay"]["items"][0]["replayed"] is True
+        recovered = asyncio.run(harness.load_session_state(session_id))
+        assert recovered.session is not None
+        assert recovered.session.status is SessionStatus.COMPLETED
+        assert (
+            sum(event.type is EventType.RECOVERY_PLAN_ITEM_EXECUTED for event in recovered.events)
+            == 1
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_sigkill_tool_effect_recovers_through_registered_application_plan(
+    tmp_path: Path,
+    recovery_backend: BackendConfig,
+) -> None:
+    session_id = f"sigkill_plan_tool_{uuid4().hex[:10]}"
+
+    with RecoveryHarness(tmp_path, recovery_backend) as harness:
+        killed_worker = harness.launch(
+            scenario="ordinary_tool",
+            action="start",
+            session_id=session_id,
+        )
+        killed_worker.wait_for_phase("tool_side_effect_recorded")
+        marker = harness.read_marker()
+        assert len(marker) == 1
+        killed_worker.sigkill()
+
+        recovery_worker = harness.launch(
+            scenario="ordinary_tool",
+            action="plan_manual",
+            session_id=session_id,
+        )
+        result = recovery_worker.wait_success()
+
+        receipt_item = result["receipt"]["items"][0]
+        assert receipt_item["status"] == "executed", receipt_item
+        assert receipt_item["replayed"] is False
+        assert result["replay"]["items"][0]["replayed"] is True
+        recovered = asyncio.run(harness.load_session_state(session_id))
+        assert recovered.session is not None
+        assert recovered.session.status is SessionStatus.COMPLETED
+        assert harness.read_marker() == marker
+        assert (
+            sum(event.type is EventType.RECOVERY_PLAN_ITEM_EXECUTED for event in recovered.events)
+            == 1
+        )
+        assert (
+            sum(
+                event.payload.get("tool_call_id") == "call_side_effect"
+                and event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+                for event in recovered.events
+            )
+            == 1
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("decision", ["approve", "deny"])
 def test_sigkill_after_durable_approval_request_preserves_resolution(
-    tmp_path,
+    tmp_path: Path,
+    recovery_backend: BackendConfig,
     decision: str,
 ) -> None:
-    backend = BackendConfig.sqlite(tmp_path)
     session_id = f"sigkill_approval_{decision}"
 
-    with RecoveryHarness(tmp_path, backend) as harness:
+    with RecoveryHarness(tmp_path, recovery_backend) as harness:
         killed_worker = harness.launch(
             scenario="approval",
             action="start",
@@ -279,11 +370,13 @@ def test_sigkill_after_durable_approval_request_preserves_resolution(
         }
 
 
-def test_sigkill_during_background_subagent_spawn_reattaches_one_child(tmp_path) -> None:
-    backend = BackendConfig.sqlite(tmp_path)
+def test_sigkill_during_background_subagent_spawn_reattaches_one_child(
+    tmp_path: Path,
+    recovery_backend: BackendConfig,
+) -> None:
     parent_session_id = "sigkill_subagent_parent"
 
-    with RecoveryHarness(tmp_path, backend) as harness:
+    with RecoveryHarness(tmp_path, recovery_backend) as harness:
         killed_worker = harness.launch(
             scenario="background_subagent",
             action="start",
@@ -513,3 +606,47 @@ def test_sigkill_preserves_attached_task_ownership_and_recovers_linked_session(
             < event_types.index(EventType.TASK_COMPLETED)
             < event_types.index(EventType.SESSION_COMPLETED)
         )
+
+
+def test_sigkill_recovers_attached_tool_through_registered_application_plan(
+    tmp_path: Path,
+    recovery_backend: BackendConfig,
+) -> None:
+    suffix = uuid4().hex[:10]
+    task_id = f"sigkill_plan_attached_task_{suffix}"
+    session_id = f"sigkill_plan_attached_session_{suffix}"
+    task_type = f"sigkill.plan.attached.{suffix}"
+
+    with RecoveryHarness(tmp_path, recovery_backend) as harness:
+        killed_worker = harness.launch(
+            scenario="task_claim",
+            action="start_attached",
+            session_id=session_id,
+            task_id=task_id,
+            task_type=task_type,
+        )
+        killed_worker.wait_for_phase("attached_tool_side_effect_recorded")
+        marker = harness.read_marker()
+        assert len(marker) == 1
+        killed_worker.sigkill()
+
+        recovery_worker = harness.launch(
+            scenario="task_claim",
+            action="plan_attached_manual",
+            session_id=session_id,
+            task_id=task_id,
+            task_type=task_type,
+        )
+        result = recovery_worker.wait_success()
+
+        receipt_item = result["receipt"]["items"][0]
+        assert receipt_item["status"] == "executed", receipt_item
+        assert receipt_item["final_session_status"] == "completed"
+        assert result["replay"]["items"][0]["replayed"] is True
+        assert result["task"]["status"] == "completed"
+        assert result["task"]["worker_id"] is None
+        assert result["task"]["lease_expires_at"] is None
+        assert result["task"]["interrupted_handoff_id"] is None
+        assert harness.read_marker() == marker
+
+    assert list(tmp_path.iterdir()) == []
