@@ -8,6 +8,7 @@ import pytest
 
 from cayu.environments import (
     Environment,
+    EnvironmentLifecyclePolicy,
     EnvironmentSpec,
     NativeBinding,
     WorkspaceInstructions,
@@ -45,12 +46,13 @@ def test_environment_rejects_invalid_binding() -> None:
 
 def test_copy_environment_preserves_binding_and_workspace_instructions() -> None:
     binding = NativeBinding(default_path="/workspace")
+    lifecycle_policy = EnvironmentLifecyclePolicy(lifecycle_timeout_seconds=20.0)
     workspace_instructions = WorkspaceInstructions(
         content="Use the project test runner.",
         sources=("AGENTS.md",),
     )
     environment = Environment(
-        EnvironmentSpec(name="local"),
+        EnvironmentSpec(name="local", lifecycle_policy=lifecycle_policy),
         binding=binding,
         workspace_instructions=workspace_instructions,
     )
@@ -59,6 +61,8 @@ def test_copy_environment_preserves_binding_and_workspace_instructions() -> None
 
     assert copied is not environment
     assert copied.binding is binding
+    assert copied.spec.lifecycle_policy == lifecycle_policy
+    assert copied.spec.lifecycle_policy is not lifecycle_policy
     assert copied.workspace_instructions == workspace_instructions
     assert copied.workspace_instructions is not workspace_instructions
 

@@ -528,6 +528,16 @@
           ],
           "title": "Knowledge Store Type"
         },
+        "lifecycle_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/EnvironmentLifecyclePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mcp_server_count": {
           "minimum": 0.0,
           "title": "Mcp Server Count",
@@ -618,6 +628,7 @@
         "proxy_type",
         "knowledge_store_type",
         "mcp_server_count",
+        "lifecycle_policy",
         "workspace_instructions"
       ],
       "title": "ApiEnvironmentSummary",
@@ -5055,6 +5066,64 @@
       "title": "EnqueueSessionMessageBody",
       "type": "object"
     },
+    "EnvironmentLifecyclePhase": {
+      "description": "Content-free phases shared by factories, bindings, and cleanup.",
+      "enum": [
+        "ownership_admission",
+        "factory_provisioning",
+        "factory_reconnect",
+        "source_observation",
+        "staging_admission",
+        "archive_preparation",
+        "transfer",
+        "target_materialization",
+        "execution_ready_publication",
+        "final_source_observation",
+        "final_target_observation",
+        "copy_back_conflict_preflight",
+        "copy_back_publication",
+        "environment_release",
+        "retained_cleanup"
+      ],
+      "title": "EnvironmentLifecyclePhase",
+      "type": "string"
+    },
+    "EnvironmentLifecyclePolicy": {
+      "additionalProperties": false,
+      "description": "Finite lifecycle, phase, and progress-volume ceilings for one environment.",
+      "properties": {
+        "lifecycle_timeout_seconds": {
+          "default": 3600.0,
+          "exclusiveMinimum": 0.0,
+          "maximum": 86400.0,
+          "title": "Lifecycle Timeout Seconds",
+          "type": "number"
+        },
+        "max_progress_events": {
+          "default": 128,
+          "maximum": 1024.0,
+          "minimum": 32.0,
+          "title": "Max Progress Events",
+          "type": "integer"
+        },
+        "phase_timeout_seconds": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Phase Timeout Seconds",
+          "type": "object"
+        },
+        "progress_min_interval_seconds": {
+          "default": 0.25,
+          "maximum": 60.0,
+          "minimum": 0.0,
+          "title": "Progress Min Interval Seconds",
+          "type": "number"
+        }
+      },
+      "title": "EnvironmentLifecyclePolicy",
+      "type": "object"
+    },
     "EnvironmentsResponse": {
       "additionalProperties": false,
       "properties": {
@@ -7173,7 +7242,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "43",
+          "default": "44",
           "title": "Contract Version",
           "type": "string"
         },
@@ -10954,7 +11023,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "43",
+          "default": "44",
           "title": "Contract Version",
           "type": "string"
         }

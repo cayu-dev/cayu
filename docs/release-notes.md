@@ -89,6 +89,26 @@ guard.
 
 ## Unreleased
 
+### Environment lifecycle work has bounded phase progress
+
+`EnvironmentSpec.lifecycle_policy` now configures finite lifecycle and per-phase ceilings,
+progress coalescing, and an event-volume cap. The policy is included in manifests, server
+environment inventory, support-bundle evidence, and execution-profile identity.
+Factory, binding, finalization, release, and retained-cleanup operations publish the typed,
+aggregate-only `environment.lifecycle.progress` event; `SyncBinding` distinguishes
+observation, staging, archive, transfer, materialization, conflict preflight, and copy-back
+work without exposing paths or content. Release timeouts publish explicit retained ownership
+instead of a clean terminal result. The public SDK exposes the policy, phase/status enums,
+progress parser, and callback-scoped reporter for custom adapters. Deadline enforcement is
+explicitly identified as cooperative at progress boundaries; retained ownership and cleanup
+fences remain the source of truth for mutation quiescence. The application-manifest/generator
+schema advances from 15 to 16, and the additive server environment projection advances the
+server contract from 43 to 44; independently deployed servers, dashboards, and generated
+clients should be upgraded together. Incomplete-session recovery fences a process-lost
+nonterminal lifecycle operation and publishes deterministic `orphaned_stale` retained
+evidence without replaying ambiguous filesystem work; exact acknowledgement-loss retries
+reuse that terminal evidence.
+
 ### Provider-operation cancellation drains before Runtime shutdown
 
 `CayuApp` now owns every provider-operation cancellation task under one bounded

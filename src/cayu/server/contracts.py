@@ -25,6 +25,7 @@ from pydantic import (
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu._validation import json_utf8_size_within_limit, require_unicode_scalar_text
 from cayu.core.events import EVENT_ID_MAX_CHARS
+from cayu.environments.lifecycle import EnvironmentLifecyclePolicy
 from cayu.evals.calibration import (
     EvalJudgeCalibrationDefinitionV1,
     EvalJudgeCalibrationDraftV1,
@@ -2359,6 +2360,7 @@ class ApiEnvironmentSummary(ApiBaseModel):
     proxy_type: str | None
     knowledge_store_type: str | None
     mcp_server_count: StrictInt = Field(ge=0)
+    lifecycle_policy: EnvironmentLifecyclePolicy | None
     workspace_instructions: str | None
     bound_workspace: dict[str, Any] | None = None
 

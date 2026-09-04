@@ -8532,6 +8532,7 @@ def _validate_environment_spec(
             redactor=redactor,
             field_name="environment_spec.execution_profile_identity",
         ),
+        lifecycle_policy=spec.lifecycle_policy,
     )
 
 

@@ -21,6 +21,9 @@ from tests.environments.sync_ownership_assertions import assert_sync_resources_o
 import cayu.environments.bindings as bindings_module
 from cayu.environments import (
     BoundWorkspace,
+    EnvironmentLifecycleDeadlineExceeded,
+    EnvironmentLifecyclePhase,
+    EnvironmentLifecycleProgressStatus,
     GitRepositoryBinding,
     NativeBinding,
     NoWorkspaceBinding,
@@ -4640,6 +4643,128 @@ def test_sync_binding_target_failure_releases_exact_staging_capacity(tmp_path) -
     assert snapshot.archive_references == 0
     assert snapshot.total_archive_builds == 1
     assert snapshot.total_archive_cleanups == 1
+
+
+@pytest.mark.parametrize(
+    ("failure_phase", "expected_archive_builds"),
+    [
+        (EnvironmentLifecyclePhase.STAGING_ADMISSION, 0),
+        (EnvironmentLifecyclePhase.ARCHIVE_PREPARATION, 1),
+    ],
+)
+def test_sync_binding_progress_failure_after_owned_admission_releases_capacity(
+    tmp_path,
+    monkeypatch,
+    failure_phase: EnvironmentLifecyclePhase,
+    expected_archive_builds: int,
+) -> None:
+    source_root = tmp_path / "source-progress-failure"
+    target_root = tmp_path / "target-progress-failure"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"runtime")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=64 * 1024)
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(
+            target_root,
+            workspace_id="target-progress-failure",
+        ),
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        max_archive_bytes=32 * 1024,
+        staging_capacity=capacity,
+    )
+
+    async def fail_after_staging_admission(
+        phase: EnvironmentLifecyclePhase,
+        status: EnvironmentLifecycleProgressStatus,
+        **_counters: int | None,
+    ) -> None:
+        if phase is failure_phase and status is EnvironmentLifecycleProgressStatus.COMPLETED:
+            raise EnvironmentLifecycleDeadlineExceeded(
+                operation_id="envop_progress_failure",
+                phase=phase,
+                scope="phase",
+            )
+
+    monkeypatch.setattr(
+        bindings_module,
+        "_report_sync_lifecycle",
+        fail_after_staging_admission,
+    )
+
+    with pytest.raises(EnvironmentLifecycleDeadlineExceeded):
+        asyncio.run(
+            binding.bind(
+                LocalWorkspace(source_root, workspace_id="source-progress-failure"),
+                None,
+                session_id="sess-progress-failure",
+            )
+        )
+
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.waiting_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.shared_archives == 0
+    assert snapshot.archive_references == 0
+    assert snapshot.total_archive_builds == expected_archive_builds
+    assert snapshot.total_archive_cleanups == expected_archive_builds
+
+
+def test_sync_binding_copy_back_progress_failure_is_not_a_source_conflict(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source-copy-back-progress-failure"
+    target_root = tmp_path / "target-copy-back-progress-failure"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"before")
+    source = LocalWorkspace(source_root, workspace_id="source-copy-back-progress-failure")
+    target = LocalWorkspace(target_root, workspace_id="target-copy-back-progress-failure")
+    binding = SyncBinding(
+        target_workspace=target,
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        source_conflict_policy="require_revision",
+    )
+
+    async def run() -> None:
+        bound = await binding.bind(
+            source,
+            None,
+            session_id="sess-copy-back-progress-failure",
+        )
+        await target.write_bytes("runtime.txt", b"after")
+
+        async def fail_after_source_mutation(
+            phase: EnvironmentLifecyclePhase,
+            status: EnvironmentLifecycleProgressStatus,
+            **_counters: int | None,
+        ) -> None:
+            if (
+                phase is EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION
+                and status is EnvironmentLifecycleProgressStatus.ADVANCED
+            ):
+                raise EnvironmentLifecycleDeadlineExceeded(
+                    operation_id="envop_copy_back_progress_failure",
+                    phase=phase,
+                    scope="phase",
+                )
+
+        monkeypatch.setattr(
+            bindings_module,
+            "_report_sync_lifecycle",
+            fail_after_source_mutation,
+        )
+        with pytest.raises(EnvironmentLifecycleDeadlineExceeded):
+            await binding.finalize(bound, outcome="completed")
+        assert binding.abandon(bound) is True
+
+    asyncio.run(run())
+
+    assert (source_root / "runtime.txt").read_bytes() == b"after"
 
 
 def test_sync_binding_bounds_stream_adapter_before_private_spool_growth(tmp_path) -> None:

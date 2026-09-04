@@ -7529,6 +7529,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
     REPAIRED_WORKSPACE_OBSERVATION = "repaired_workspace_observation"
     REPAIRED_WORKSPACE_FINALIZATION = "repaired_workspace_finalization"
+    RECONCILED_ENVIRONMENT_LIFECYCLE = "reconciled_environment_lifecycle"
     REPAIRED_PROVIDER_OPERATION_RESOLUTION = "repaired_provider_operation_resolution"
     INTERRUPTED_ABANDONED = "interrupted_abandoned"
     FINALIZED_INTERRUPT = "finalized_interrupt"

@@ -42,6 +42,7 @@ from cayu import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
+    EnvironmentLifecyclePolicy,
     EnvironmentSpec,
     InMemoryKnowledgeStore,
     InMemoryTaskStore,
@@ -1042,7 +1043,11 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
     )
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local-review", metadata={"tenant": "test"}),
+            EnvironmentSpec(
+                name="local-review",
+                metadata={"tenant": "test"},
+                lifecycle_policy=EnvironmentLifecyclePolicy(lifecycle_timeout_seconds=20.0),
+            ),
             artifact_store=artifact_store,
             workspace=workspace,
             workspace_instructions="Use local workspace instructions.",
@@ -1088,6 +1093,10 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
     assert environments_body["environments"][0]["name"] == "local-review"
     assert environments_body["environments"][0]["artifact_store_id"] == "test-artifacts"
     assert environments_body["environments"][0]["workspace_instructions"] == "inline"
+    assert (
+        environments_body["environments"][0]["lifecycle_policy"]["lifecycle_timeout_seconds"]
+        == 20.0
+    )
     assert environments_body["environments"][0]["workspace_branch_capabilities"] == {
         "detail_code": "process_local_workspace_branches",
         "isolation": True,

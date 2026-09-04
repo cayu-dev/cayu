@@ -50,6 +50,66 @@ admission always runs after binding because a binding may supply or replace the 
 `bind` runs before the first tool call; `finalize` runs when the session ends (completed,
 failed, or interrupted) and receives the `outcome` so it can decide what to persist.
 
+### Bounded lifecycle progress
+
+Set `EnvironmentSpec.lifecycle_policy` when operators need a content-free view of slow
+factory, binding, and finalization work:
+
+```python
+from cayu import EnvironmentLifecyclePhase, EnvironmentLifecyclePolicy, EnvironmentSpec
+
+spec = EnvironmentSpec(
+    name="hosted",
+    lifecycle_policy=EnvironmentLifecyclePolicy(
+        lifecycle_timeout_seconds=1800.0,
+        phase_timeout_seconds={EnvironmentLifecyclePhase.TRANSFER: 300.0},
+        progress_min_interval_seconds=1.0,
+        max_progress_events=128,
+    ),
+)
+```
+
+A partial `phase_timeout_seconds` mapping overrides the named phases and retains finite
+defaults for every other phase. The complete policy is part of the execution-environment
+profile and application manifest, so a resume fails before work when the configured bounds
+drift.
+
+Configured environments emit bounded `environment.lifecycle.progress` events for factory,
+binding, finalization, release, and retained-cleanup operations. The public
+`EnvironmentLifecycleProgress` projection reports only the operation and phase, status,
+aggregate item/byte or active/queued counts, elapsed time, deadline, event index, and opaque
+operation/binding-generation authority. It never accepts paths, file names, contents,
+commands, credentials, or adapter messages. Aggregate counters are limited to exact portable
+JSON integers, operation identities are deterministic for the same session, environment,
+invocation, operation, and binding generation, and the configured event cap always reserves
+room for one terminal observation.
+
+Incomplete-session recovery also inspects the latest progress record for the fenced
+interaction. If process loss left a nonterminal operation with no live owner, recovery
+appends one deterministic terminal `retained` record with
+`recovery_disposition="orphaned_stale"`; acknowledgement-loss retries reconcile that exact
+record. Recovery never replays the ambiguous filesystem operation. A successor recovery run
+uses its new run epoch in the opaque operation identity, so its progress cannot be confused
+with the retained predecessor.
+
+The shared phases cover ownership admission, factory provisioning/reconnect, source and
+target observations, staging admission, archive preparation, transfer/materialization,
+execution-ready publication, copy-back conflict preflight/publication, release, and retained
+cleanup. `SyncBinding` publishes aggregate progress for its built-in phases. Custom factories
+and bindings can obtain the runtime-owned reporter with
+`current_environment_lifecycle_progress_reporter()` while their lifecycle callback is active.
+Release callbacks run under the release reporter as well. When delegated cleanup remains
+owned after a release bound, the release operation terminates as `retained` and Cayu publishes
+an explicit terminal retained-cleanup owner rather than claiming a clean release.
+
+The current deadline mode is reported explicitly as `cooperative_progress_boundary`.
+Cayu records whether the lifecycle or phase bound expired and rejects the overrun when the
+runtime or adapter crosses a reporting boundary; it does not claim that a
+cancellation-resistant opaque provider call has been stopped. Existing mutation fencing and
+retained cleanup remain authoritative for deciding whether resources are safe to release. Do
+not treat a deadline event by itself as proof that an external allocation or filesystem
+mutation is quiescent.
+
 ## Writing an `EnvironmentFactory`
 
 `register_environment` attaches **one** pre-built environment shared by every session;

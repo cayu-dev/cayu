@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "15"
+APP_MANIFEST_SCHEMA_VERSION = "16"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -329,6 +329,7 @@ class EnvironmentManifest(_ManifestModel):
     binding: str | None
     knowledge_store: str | None
     mcp_servers: tuple[str, ...]
+    lifecycle_policy: FrozenJsonObject | None
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
 
@@ -390,7 +391,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["15"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["16"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -708,6 +709,11 @@ def _describe_environment(
         binding=_optional_type_name(environment.binding),
         knowledge_store=_optional_type_name(environment.knowledge_store),
         mcp_servers=mcp_servers,
+        lifecycle_policy=(
+            None
+            if registration.spec.lifecycle_policy is None
+            else registration.spec.lifecycle_policy.model_dump(mode="json")
+        ),
         registration_provenance=_registration_provenance(
             registration.registration_source,
             registration.registration_symbol,

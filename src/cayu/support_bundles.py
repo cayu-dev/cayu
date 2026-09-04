@@ -38,6 +38,11 @@ from pydantic import (
 
 from cayu._version import package_version
 from cayu.core.events import EventType
+from cayu.environments.lifecycle import (
+    EnvironmentLifecyclePolicy,
+    EnvironmentLifecycleProgress,
+    environment_lifecycle_progress_from_event,
+)
 from cayu.evals.store import EvalStore
 from cayu.runtime.app import CayuApp
 from cayu.runtime.checks import ProjectCheckReport
@@ -384,6 +389,7 @@ class EnvironmentComponentEvidence(_SupportModel):
     credential_proxy: str | None
     knowledge_store: str | None
     mcp_server_count: StrictInt = Field(ge=0)
+    lifecycle_policy: EnvironmentLifecyclePolicy | None = None
 
 
 class ManifestSummaryEvidence(_SupportModel):
@@ -471,6 +477,19 @@ class EventEnvelopeEvidence(_SupportModel):
         return value.astimezone(UTC)
 
 
+class EnvironmentLifecycleSummaryEvidence(_SupportModel):
+    sequence: StrictInt = Field(ge=1)
+    timestamp: datetime
+    progress: EnvironmentLifecycleProgress
+
+    @field_validator("timestamp")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("lifecycle progress timestamp must be timezone-aware.")
+        return value.astimezone(UTC)
+
+
 class SessionEventTailEvidence(_SupportModel):
     kind: Literal["session_event_tail"] = "session_event_tail"
     projection: Literal["redacted_envelope_only"] = "redacted_envelope_only"
@@ -484,6 +503,14 @@ class SessionEventTailEvidence(_SupportModel):
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
     events: tuple[EventEnvelopeEvidence, ...]
+    lifecycle_progress: tuple[EnvironmentLifecycleSummaryEvidence, ...] = ()
+    lifecycle_progress_inventory: BoundedInventory = Field(
+        default_factory=lambda: BoundedInventory(
+            total_count=0,
+            included_count=0,
+            truncated=False,
+        )
+    )
 
     @model_validator(mode="after")
     def validate_bounds(self) -> SessionEventTailEvidence:
@@ -508,6 +535,13 @@ class SessionEventTailEvidence(_SupportModel):
                 raise ValueError("complete event tails cannot report omissions.")
         elif self.omitted_count_lower_bound < 1 or self.omitted_count_exact:
             raise ValueError("incomplete event tails require a non-exact omission lower bound.")
+        lifecycle_sequences = tuple(item.sequence for item in self.lifecycle_progress)
+        if lifecycle_sequences != tuple(sorted(set(lifecycle_sequences))):
+            raise ValueError("lifecycle progress sequences must be unique and ascending.")
+        if any(sequence not in sequences for sequence in lifecycle_sequences):
+            raise ValueError("lifecycle progress must come from the returned event tail.")
+        if self.lifecycle_progress_inventory.included_count != len(self.lifecycle_progress):
+            raise ValueError("lifecycle progress inventory must match included summaries.")
         return self
 
 
@@ -1261,6 +1295,11 @@ async def _collect_manifest(context: SupportBundleContext) -> SupportCollectorOu
             credential_proxy=item.credential_proxy,
             knowledge_store=item.knowledge_store,
             mcp_server_count=len(item.mcp_servers),
+            lifecycle_policy=(
+                None
+                if item.lifecycle_policy is None
+                else EnvironmentLifecyclePolicy.model_validate(dict(item.lifecycle_policy))
+            ),
         )
         for item in manifest.environments[:limit]
     )
@@ -1457,6 +1496,7 @@ async def _collect_event_tail(
     truncated = len(records) > context.limits.event_limit
     selected = records[: context.limits.event_limit]
     envelopes: list[EventEnvelopeEvidence] = []
+    lifecycle_progress: list[EnvironmentLifecycleSummaryEvidence] = []
     for record in reversed(selected):
         projected = context.app._project_persisted_event_record_for_exposure(record)
         event_type = str(projected.event.type)
@@ -1469,6 +1509,16 @@ async def _collect_event_tail(
                 timestamp=projected.event.timestamp,
             )
         )
+        if projected.event.type == EventType.ENVIRONMENT_LIFECYCLE_PROGRESS:
+            lifecycle_progress.append(
+                EnvironmentLifecycleSummaryEvidence(
+                    sequence=projected.sequence,
+                    timestamp=projected.event.timestamp,
+                    progress=environment_lifecycle_progress_from_event(projected.event),
+                )
+            )
+    lifecycle_progress_total = len(lifecycle_progress)
+    lifecycle_progress = lifecycle_progress[-context.limits.max_items :]
     return collected(
         SessionEventTailEvidence(
             session_ordinal=ordinal,
@@ -1481,6 +1531,11 @@ async def _collect_event_tail(
             first_timestamp=None if not envelopes else envelopes[0].timestamp,
             last_timestamp=None if not envelopes else envelopes[-1].timestamp,
             events=tuple(envelopes),
+            lifecycle_progress=tuple(lifecycle_progress),
+            lifecycle_progress_inventory=_inventory(
+                lifecycle_progress_total,
+                len(lifecycle_progress),
+            ),
         )
     )
 

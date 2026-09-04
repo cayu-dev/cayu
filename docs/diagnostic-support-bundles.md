@@ -71,7 +71,8 @@ Built-in collectors report content-free operational evidence:
 - the complete structured `cayu check` report;
 - bounded agent/provider resolution, environment component and MCP server
   counts, MCP policy presence, capability summaries, and typed workspace branch
-  capabilities and attached lifecycle status;
+  capabilities and attached lifecycle status, including configured environment
+  lifecycle bounds;
 - an actor-free portable projection of the existing protected system-diagnostics
   response when a maintained service is selected, including access posture and
   capability readiness but no request actor or artifact-store identity;
@@ -86,6 +87,12 @@ Built-in collectors report content-free operational evidence:
   fingerprints, or listing or reading artifacts; and
 - installed/not-installed status and versions for Cayu's optional dependency
   families.
+
+When an explicitly selected session's bounded event tail contains
+`environment.lifecycle.progress`, Doctor adds a typed lifecycle summary derived from those
+same returned records. The summary contains only the fixed aggregate public projection and a
+bounded inventory; it does not widen the event query or copy arbitrary event payloads into
+the bundle.
 
 Built-in file-backed SQLite stores report `validated_compatible` only after
 their constructor-owned validation succeeds. Built-in PostgreSQL stores perform

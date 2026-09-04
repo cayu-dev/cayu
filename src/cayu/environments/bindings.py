@@ -41,6 +41,11 @@ from cayu.environments._sync_staging import (
     _CapacityLease,
     _SealedTarArchive,
 )
+from cayu.environments.lifecycle import (
+    EnvironmentLifecyclePhase,
+    EnvironmentLifecycleProgressStatus,
+    current_environment_lifecycle_progress_reporter,
+)
 from cayu.immutable_inputs import (
     ImmutableInputAdapterCapability,
     ImmutableInputProjectionCapability,
@@ -70,6 +75,16 @@ from cayu.workspaces.revisions import (
     observe_deterministic_workspace,
     unsupported_workspace_revision,
 )
+
+
+async def _report_sync_lifecycle(
+    phase: EnvironmentLifecyclePhase,
+    status: EnvironmentLifecycleProgressStatus,
+    **counters: int | None,
+) -> None:
+    reporter = current_environment_lifecycle_progress_reporter()
+    if reporter is not None:
+        await reporter.report(phase, status, **counters)
 
 
 @dataclass(frozen=True)
@@ -1697,6 +1712,10 @@ class SyncBinding(WorkspaceBinding):
         target_provision: SyncTargetWorkspaceProvisioner | None = None
         factory_source_claimed = self.target_workspace_plan_factory is not None
         try:
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.TARGET_MATERIALIZATION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
             if factory_source_claimed:
                 source_resource_key = _validated_workspace_resource_key(workspace)
                 _reserve_sync_factory_source(
@@ -1738,8 +1757,34 @@ class SyncBinding(WorkspaceBinding):
                     lambda: _run_sync_target_provisioner(target_provision),
                     operation="SyncBinding target provisioning",
                 )
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.TARGET_MATERIALIZATION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+            )
+            staging_before = self.staging_capacity.snapshot()
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.STAGING_ADMISSION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+                active_count=staging_before.active_transfers,
+                queued_count=staging_before.waiting_transfers,
+                bytes_completed=staging_before.staged_bytes,
+                bytes_total=staging_before.max_staged_bytes,
+            )
             staging_transfer = await self.staging_capacity._acquire_transfer()
             try:
+                staging_after = self.staging_capacity.snapshot()
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.STAGING_ADMISSION,
+                    EnvironmentLifecycleProgressStatus.COMPLETED,
+                    active_count=staging_after.active_transfers,
+                    queued_count=staging_after.waiting_transfers,
+                    bytes_completed=staging_after.staged_bytes,
+                    bytes_total=staging_after.max_staged_bytes,
+                )
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.SOURCE_OBSERVATION,
+                    EnvironmentLifecycleProgressStatus.STARTED,
+                )
                 source_paths = await _list_workspace_paths(
                     workspace,
                     self.pattern,
@@ -1758,6 +1803,16 @@ class SyncBinding(WorkspaceBinding):
                         staging_capacity=self.staging_capacity,
                     )
                     source_revisions = source_observation.revisions
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.SOURCE_OBSERVATION,
+                    EnvironmentLifecycleProgressStatus.COMPLETED,
+                    items_completed=len(source_paths),
+                    items_total=len(source_paths),
+                    bytes_completed=(
+                        None if source_observation is None else source_observation.logical_bytes
+                    ),
+                    bytes_total=self.max_total_bytes,
+                )
                 _require_sync_copy_staging_capacity(
                     source=workspace,
                     target=target,
@@ -1770,15 +1825,43 @@ class SyncBinding(WorkspaceBinding):
                 )
                 cleaned_paths: tuple[str, ...] = ()
                 if self.clean_target == "always":
+                    await _report_sync_lifecycle(
+                        EnvironmentLifecyclePhase.TARGET_MATERIALIZATION,
+                        EnvironmentLifecycleProgressStatus.STARTED,
+                    )
                     cleaned_paths = await _clear_workspace(target, max_files=self.max_files)
                     target_baseline_paths: tuple[str, ...] = ()
+                    await _report_sync_lifecycle(
+                        EnvironmentLifecyclePhase.TARGET_MATERIALIZATION,
+                        EnvironmentLifecycleProgressStatus.COMPLETED,
+                        items_completed=len(cleaned_paths),
+                        items_total=len(cleaned_paths),
+                    )
                 else:
+                    await _report_sync_lifecycle(
+                        EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+                        EnvironmentLifecycleProgressStatus.STARTED,
+                    )
                     target_baseline_paths = await _list_workspace_paths(
                         target,
                         self.pattern,
                         limit=self.max_files,
                         role="target",
                     )
+                    await _report_sync_lifecycle(
+                        EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+                        EnvironmentLifecycleProgressStatus.COMPLETED,
+                        items_completed=len(target_baseline_paths),
+                        items_total=len(target_baseline_paths),
+                    )
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.TRANSFER,
+                    EnvironmentLifecycleProgressStatus.STARTED,
+                    items_completed=0,
+                    items_total=len(source_paths),
+                    bytes_completed=0,
+                    bytes_total=self.max_total_bytes,
+                )
                 copied_bytes = await _copy_paths(
                     source=workspace,
                     target=target,
@@ -1795,7 +1878,21 @@ class SyncBinding(WorkspaceBinding):
                         target=target,
                     ),
                 )
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.TRANSFER,
+                    EnvironmentLifecycleProgressStatus.COMPLETED,
+                    items_completed=len(source_paths),
+                    items_total=len(source_paths),
+                    bytes_completed=copied_bytes,
+                    bytes_total=self.max_total_bytes,
+                )
                 if source_observation is not None:
+                    await _report_sync_lifecycle(
+                        EnvironmentLifecyclePhase.FINAL_SOURCE_OBSERVATION,
+                        EnvironmentLifecycleProgressStatus.STARTED,
+                        items_completed=0,
+                        items_total=len(source_revisions),
+                    )
                     await _verify_sync_source_revisions(
                         workspace,
                         source_revisions,
@@ -1803,6 +1900,12 @@ class SyncBinding(WorkspaceBinding):
                         max_total_bytes=cast("int", self.max_total_bytes),
                         preserve_git_modes=self.preserve_git_modes,
                         staging_capacity=self.staging_capacity,
+                    )
+                    await _report_sync_lifecycle(
+                        EnvironmentLifecyclePhase.FINAL_SOURCE_OBSERVATION,
+                        EnvironmentLifecycleProgressStatus.COMPLETED,
+                        items_completed=len(source_revisions),
+                        items_total=len(source_revisions),
                     )
             finally:
                 staging_transfer.release()
@@ -1954,6 +2057,14 @@ class SyncBinding(WorkspaceBinding):
         _reject_reserved_sync_finalize_metadata(finalize_metadata)
         _validate_sync_binding_metadata(bound)
         if not _should_sync_back(self.sync_back, outcome):
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+                items_completed=0,
+                items_total=0,
+                bytes_completed=0,
+                bytes_total=0,
+            )
             state_key, state = self._begin_sync_finalize(bound)
             self._complete_sync_finalize(
                 state_key,
@@ -1970,12 +2081,40 @@ class SyncBinding(WorkspaceBinding):
         state_key, state = self._begin_sync_finalize(bound)
         staging_transfer: _CapacityLease | None = None
         try:
+            staging_before = self.staging_capacity.snapshot()
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.STAGING_ADMISSION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+                active_count=staging_before.active_transfers,
+                queued_count=staging_before.waiting_transfers,
+                bytes_completed=staging_before.staged_bytes,
+                bytes_total=staging_before.max_staged_bytes,
+            )
             staging_transfer = await self.staging_capacity._acquire_transfer()
+            staging_after = self.staging_capacity.snapshot()
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.STAGING_ADMISSION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+                active_count=staging_after.active_transfers,
+                queued_count=staging_after.waiting_transfers,
+                bytes_completed=staging_after.staged_bytes,
+                bytes_total=staging_after.max_staged_bytes,
+            )
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
             target_paths = await _list_workspace_paths(
                 bound.workspace,
                 self.pattern,
                 limit=self.max_files,
                 role="target",
+            )
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+                items_completed=len(target_paths),
+                items_total=len(target_paths),
             )
             copy_back_paths = _sync_back_paths(
                 source_paths=state.source_paths,
@@ -1997,6 +2136,14 @@ class SyncBinding(WorkspaceBinding):
                     allow_idempotent_replay=state.recovered,
                 )
             else:
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
+                    EnvironmentLifecycleProgressStatus.STARTED,
+                    items_completed=0,
+                    items_total=len(copy_back_paths) + len(deleted_paths),
+                    bytes_completed=0,
+                    bytes_total=self.max_total_bytes,
+                )
                 copied_bytes = await _copy_paths(
                     source=bound.workspace,
                     target=source_workspace,
@@ -2015,6 +2162,14 @@ class SyncBinding(WorkspaceBinding):
                         operation=f"SyncBinding source delete for {path!r}",
                     )
                 source_revisions = state.source_revisions
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
+                    EnvironmentLifecycleProgressStatus.COMPLETED,
+                    items_completed=len(copy_back_paths) + len(deleted_paths),
+                    items_total=len(copy_back_paths) + len(deleted_paths),
+                    bytes_completed=copied_bytes,
+                    bytes_total=self.max_total_bytes,
+                )
             synced_source_paths = tuple(
                 sorted((set(state.source_paths) - set(deleted_paths)).union(copy_back_paths))
             )
@@ -2069,6 +2224,14 @@ class SyncBinding(WorkspaceBinding):
             members: dict[str, tarfile.TarInfo] = {}
             copied_bytes = 0
             if copy_back_paths:
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.ARCHIVE_PREPARATION,
+                    EnvironmentLifecycleProgressStatus.STARTED,
+                    items_completed=0,
+                    items_total=len(copy_back_paths),
+                    bytes_completed=0,
+                    bytes_total=self.max_total_bytes,
+                )
                 archive_reservation = _sync_archive_reservation_bound(
                     copy_back_paths,
                     max_file_bytes=max_file_bytes,
@@ -2091,6 +2254,14 @@ class SyncBinding(WorkspaceBinding):
                     preserve_git_modes=self.preserve_git_modes,
                 )
                 copied_bytes = archive.logical_bytes
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.ARCHIVE_PREPARATION,
+                    EnvironmentLifecycleProgressStatus.COMPLETED,
+                    items_completed=len(copy_back_paths),
+                    items_total=len(copy_back_paths),
+                    bytes_completed=copied_bytes,
+                    bytes_total=self.max_total_bytes,
+                )
                 archive_reader = archive.open_reader()
                 tar = tarfile.open(  # noqa: SIM115 - closed in the lifecycle finally below
                     fileobj=archive_reader,
@@ -2098,6 +2269,12 @@ class SyncBinding(WorkspaceBinding):
                 )
                 members = {member.name: member for member in tar}
             revision_map = {item.path: item for item in revisions}
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.COPY_BACK_CONFLICT_PREFLIGHT,
+                EnvironmentLifecycleProgressStatus.STARTED,
+                items_completed=0,
+                items_total=len(revisions),
+            )
             if not allow_idempotent_replay:
                 await _verify_sync_source_revisions(
                     source,
@@ -2107,8 +2284,22 @@ class SyncBinding(WorkspaceBinding):
                     preserve_git_modes=self.preserve_git_modes,
                     staging_capacity=None if archive is not None else staging_capacity,
                 )
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.COPY_BACK_CONFLICT_PREFLIGHT,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+                items_completed=len(revisions),
+                items_total=len(revisions),
+            )
             applied: list[str] = []
             operations = tuple(sorted(set(copy_back_paths).union(deleted_paths)))
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+                items_completed=0,
+                items_total=len(operations),
+                bytes_completed=0,
+                bytes_total=self.max_total_bytes,
+            )
             for path in operations:
                 try:
 
@@ -2237,6 +2428,22 @@ class SyncBinding(WorkspaceBinding):
                         path,
                         applied_paths=tuple(applied),
                     ) from exc
+                await _report_sync_lifecycle(
+                    EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
+                    EnvironmentLifecycleProgressStatus.ADVANCED,
+                    items_completed=len(applied),
+                    items_total=len(operations),
+                    bytes_completed=copied_bytes,
+                    bytes_total=self.max_total_bytes,
+                )
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+                items_completed=len(operations),
+                items_total=len(operations),
+                bytes_completed=copied_bytes,
+                bytes_total=self.max_total_bytes,
+            )
             return copied_bytes, tuple(sorted(revision_map.values(), key=lambda item: item.path))
         finally:
             if tar is not None:
@@ -3075,9 +3282,25 @@ async def _copy_paths(
         )
     else:
         cache_key = object()
+    await _report_sync_lifecycle(
+        EnvironmentLifecyclePhase.ARCHIVE_PREPARATION,
+        EnvironmentLifecycleProgressStatus.STARTED,
+        items_completed=0,
+        items_total=len(paths),
+        bytes_completed=0,
+        bytes_total=max_archive_bytes,
+    )
     reference = await staging_capacity._acquire_archive(cache_key, build_archive)
-    archive = reference.archive
     try:
+        archive = reference.archive
+        await _report_sync_lifecycle(
+            EnvironmentLifecyclePhase.ARCHIVE_PREPARATION,
+            EnvironmentLifecycleProgressStatus.COMPLETED,
+            items_completed=len(paths),
+            items_total=len(paths),
+            bytes_completed=archive.archive_bytes,
+            bytes_total=max_archive_bytes,
+        )
         if source_observation is not None and not reference.is_builder:
             await _verify_sync_source_revisions(
                 source,
@@ -3128,6 +3351,14 @@ async def _copy_paths(
                 transient_reserved=reference.is_builder,
                 preserve_git_modes=preserve_git_modes,
             )
+        await _report_sync_lifecycle(
+            EnvironmentLifecyclePhase.TRANSFER,
+            EnvironmentLifecycleProgressStatus.ADVANCED,
+            items_completed=len(paths),
+            items_total=len(paths),
+            bytes_completed=archive.logical_bytes,
+            bytes_total=max_total_bytes,
+        )
         return archive.logical_bytes
     finally:
         reference.release()
@@ -3144,7 +3375,7 @@ async def _copy_paths_per_file(
     staging_capacity: SyncBindingStagingCapacity,
 ) -> int:
     copied_bytes = 0
-    for path in paths:
+    for index, path in enumerate(paths, start=1):
         policy_read_limit, _, _ = _copy_read_limit(
             source,
             max_file_bytes=max_file_bytes,
@@ -3218,6 +3449,14 @@ async def _copy_paths_per_file(
                     operation=f"SyncBinding target write for {path!r}",
                 )
             copied_bytes += len(result.content)
+            await _report_sync_lifecycle(
+                EnvironmentLifecyclePhase.TRANSFER,
+                EnvironmentLifecycleProgressStatus.ADVANCED,
+                items_completed=index,
+                items_total=len(paths),
+                bytes_completed=copied_bytes,
+                bytes_total=max_total_bytes,
+            )
         finally:
             result = None
             read_lease.release()
@@ -3412,6 +3651,8 @@ async def _extract_tar_to_workspace(
     if preserve_git_modes and not isinstance(target, WorkspaceGitModeMutator):
         raise RuntimeError("SyncBinding Git-mode transfer requires a mode-aware target.")
     reader = archive.open_reader()
+    copied_items = 0
+    copied_bytes = 0
     try:
         with tarfile.open(fileobj=reader, mode="r") as tar:
             for member in tar:
@@ -3461,6 +3702,15 @@ async def _extract_tar_to_workspace(
                                 ),
                                 operation=f"SyncBinding target write for {member.name!r}",
                             )
+                        copied_items += 1
+                        copied_bytes += member.size
+                        await _report_sync_lifecycle(
+                            EnvironmentLifecyclePhase.TRANSFER,
+                            EnvironmentLifecycleProgressStatus.ADVANCED,
+                            items_completed=copied_items,
+                            bytes_completed=copied_bytes,
+                            bytes_total=archive.logical_bytes,
+                        )
                     finally:
                         # The next member read may allocate before assigning the
                         # next loop value. Drop this buffer while its byte lease

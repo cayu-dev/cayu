@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from tests._session_provenance import fixture_session_invocation
+from tests.core._execution_profile_fixtures import create_admitted_session
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -16,12 +18,19 @@ from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.environments import (
     BoundWorkspace,
     Environment,
+    EnvironmentLifecycleOperation,
+    EnvironmentLifecyclePhase,
+    EnvironmentLifecyclePolicy,
+    EnvironmentLifecycleProgress,
+    EnvironmentLifecycleProgressStatus,
     EnvironmentSpec,
     SyncBinding,
     SyncTargetWorkspacePlan,
     WorkspaceBinding,
     WorkspaceInstructions,
     WorkspaceSnapshot,
+    current_environment_lifecycle_progress_reporter,
+    environment_lifecycle_progress_from_event,
 )
 from cayu.environments.factory import (
     EnvironmentFactory,
@@ -34,6 +43,8 @@ from cayu.environments.factory import (
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InvocationContext,
     ResumeRequest,
@@ -80,6 +91,247 @@ def _lifecycle(store: InMemorySessionStore) -> EnvironmentLifecycle:
         ),
         checkpoint_transform=_preserve_session_control_state,
     )
+
+
+def test_environment_progress_operation_identity_is_retry_stable_and_scope_bounded() -> None:
+    spec = EnvironmentSpec(
+        name="dynamic",
+        lifecycle_policy=EnvironmentLifecyclePolicy(),
+    )
+    registered_environment = runtime_records.RegisteredEnvironment(
+        spec=spec,
+        environment=Environment(spec),
+        binding_generation_id="wbind_test_generation",
+    )
+    lifecycle = _lifecycle(InMemorySessionStore())
+
+    def reporter(scope: str, operation: EnvironmentLifecycleOperation) -> Any:
+        resolved = lifecycle._progress_reporter(
+            operation=operation,
+            session_id="stable-progress-session",
+            operation_scope_id=scope,
+            agent_name="assistant",
+            registered_environment=registered_environment,
+            execution_profile=None,
+            events=[],
+        )
+        assert resolved is not None
+        return resolved
+
+    original = reporter("interaction-1:1", EnvironmentLifecycleOperation.BINDING)
+    retry = reporter("interaction-1:1", EnvironmentLifecycleOperation.BINDING)
+    next_run = reporter("interaction-1:2", EnvironmentLifecycleOperation.BINDING)
+    finalization = reporter("interaction-1:1", EnvironmentLifecycleOperation.FINALIZATION)
+
+    assert original.operation_id == retry.operation_id
+    assert (
+        len(
+            {
+                original.operation_id,
+                next_run.operation_id,
+                finalization.operation_id,
+            }
+        )
+        == 3
+    )
+    assert "stable-progress-session" not in original.operation_id
+    assert "interaction-1" not in original.operation_id
+
+
+def test_orphaned_environment_progress_recovery_is_exact_and_ack_loss_safe() -> None:
+    class AckLossStore(InMemorySessionStore):
+        fail_recovery_ack = True
+
+        async def append_event(self, session_id: str, event: Event) -> None:
+            await super().append_event(session_id, event)
+            if (
+                self.fail_recovery_ack
+                and event.payload.get("recovery_disposition") == "orphaned_stale"
+            ):
+                self.fail_recovery_ack = False
+                raise RuntimeError("recovery append acknowledgement lost")
+
+    async def run() -> tuple[Event, list[Event]]:
+        session_id = "orphaned-environment-progress"
+        interaction_id = "interaction-before-process-loss"
+        store = AckLossStore()
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+        started = EnvironmentLifecycleProgress(
+            operation_id="envop_orphaned",
+            binding_generation_id="wbind_orphaned",
+            operation=EnvironmentLifecycleOperation.FINALIZATION,
+            phase=EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
+            status=EnvironmentLifecycleProgressStatus.STARTED,
+            event_index=1,
+            elapsed_ms=5,
+            phase_elapsed_ms=5,
+            lifecycle_timeout_seconds=60.0,
+            phase_timeout_seconds=30.0,
+            deadline=observed_at + timedelta(seconds=30),
+            last_progress_at=observed_at,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.ENVIRONMENT_LIFECYCLE_PROGRESS,
+                session_id=session_id,
+                interaction_id=interaction_id,
+                agent_name="assistant",
+                environment_name="dynamic",
+                payload=started.to_payload(),
+            ),
+        )
+        completed_release = EnvironmentLifecycleProgress(
+            operation_id="envop_later_release",
+            binding_generation_id="wbind_orphaned",
+            operation=EnvironmentLifecycleOperation.RELEASE,
+            phase=EnvironmentLifecyclePhase.ENVIRONMENT_RELEASE,
+            status=EnvironmentLifecycleProgressStatus.COMPLETED,
+            event_index=1,
+            elapsed_ms=1,
+            phase_elapsed_ms=1,
+            lifecycle_timeout_seconds=60.0,
+            phase_timeout_seconds=30.0,
+            deadline=observed_at + timedelta(seconds=31),
+            last_progress_at=observed_at + timedelta(seconds=1),
+            operation_terminal=True,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.ENVIRONMENT_LIFECYCLE_PROGRESS,
+                session_id=session_id,
+                interaction_id=interaction_id,
+                agent_name="assistant",
+                environment_name="dynamic",
+                payload=completed_release.to_payload(),
+            ),
+        )
+        lifecycle = _lifecycle(store)
+        assert await lifecycle.has_unsettled_progress(
+            session_id=session_id,
+            interaction_id=interaction_id,
+        )
+        recovered = await lifecycle.reconcile_orphaned_progress(
+            session_id=session_id,
+            interaction_id=interaction_id,
+            observed_at=observed_at + timedelta(seconds=45),
+        )
+        assert len(recovered) == 1
+        assert not await lifecycle.has_unsettled_progress(
+            session_id=session_id,
+            interaction_id=interaction_id,
+        )
+        assert (
+            await lifecycle.reconcile_orphaned_progress(
+                session_id=session_id,
+                interaction_id=interaction_id,
+                observed_at=observed_at + timedelta(seconds=46),
+            )
+            == ()
+        )
+        return recovered[0], await store.load_events(session_id)
+
+    recovered, events = asyncio.run(run())
+    progress = environment_lifecycle_progress_from_event(recovered)
+    assert progress.operation_id == "envop_orphaned"
+    assert progress.event_index == 2
+    assert progress.status is EnvironmentLifecycleProgressStatus.RETAINED
+    assert progress.operation_terminal is True
+    assert progress.retained_owner is True
+    assert progress.recovery_disposition == "orphaned_stale"
+    assert len(events) == 3
+    assert len({event.id for event in events}) == 3
+
+
+def test_incomplete_session_recovery_reconciles_orphaned_environment_progress() -> None:
+    async def run() -> tuple[Any, list[Event]]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(
+                    name="static",
+                    lifecycle_policy=EnvironmentLifecyclePolicy(),
+                )
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "orphaned-environment-progress-recovery"
+        request = RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[Message.text("user", "run")],
+            environment_name="static",
+        )
+        prepared = await app._session_engine._prepare_initial_run(
+            request,
+            admit_session=False,
+        )
+        assert prepared is not None
+        admitted = await create_admitted_session(
+            store,
+            request=prepared.request,
+            provider_name="fake",
+            model="fake-model",
+            execution_profile=prepared.execution_profile,
+            interaction_id="interaction-before-process-loss",
+            app=app,
+        )
+        interaction_id = admitted.active_invocation_profile.interaction_id
+        observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+        started = EnvironmentLifecycleProgress(
+            operation_id="envop_process_lost",
+            operation=EnvironmentLifecycleOperation.FINALIZATION,
+            phase=EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+            status=EnvironmentLifecycleProgressStatus.STARTED,
+            event_index=1,
+            elapsed_ms=1,
+            phase_elapsed_ms=1,
+            lifecycle_timeout_seconds=60.0,
+            phase_timeout_seconds=30.0,
+            deadline=observed_at + timedelta(seconds=30),
+            last_progress_at=observed_at,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.ENVIRONMENT_LIFECYCLE_PROGRESS,
+                session_id=session_id,
+                interaction_id=interaction_id,
+                agent_name="assistant",
+                environment_name="static",
+                payload=started.to_payload(),
+            ),
+        )
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        return recovered, await store.load_events(session_id)
+
+    recovered, events = asyncio.run(run())
+    assert IncompleteSessionRecoveryAction.RECONCILED_ENVIRONMENT_LIFECYCLE in recovered.actions
+    lifecycle_events = [
+        event for event in events if event.type == EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+    ]
+    assert len(lifecycle_events) == 2
+    terminal = environment_lifecycle_progress_from_event(lifecycle_events[-1])
+    assert terminal.operation_id == "envop_process_lost"
+    assert terminal.status is EnvironmentLifecycleProgressStatus.RETAINED
+    assert terminal.recovery_disposition == "orphaned_stale"
 
 
 def test_cancelled_factory_settlement_retires_owner_after_quiescence() -> None:
@@ -402,6 +654,516 @@ class _RecordingWorkspaceBinding(WorkspaceBinding):
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
+
+
+def test_configured_environment_projects_bounded_phase_progress() -> None:
+    class LifecycleRecordingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            del kwargs
+            reporter = current_environment_lifecycle_progress_reporter()
+            assert reporter is not None
+            await reporter.report(
+                EnvironmentLifecyclePhase.SOURCE_OBSERVATION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
+            await reporter.report(
+                EnvironmentLifecyclePhase.SOURCE_OBSERVATION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+                items_completed=0,
+                items_total=0,
+                bytes_completed=0,
+                bytes_total=0,
+            )
+            return BoundWorkspace(
+                workspace=workspace,
+                source_workspace=workspace,
+                runner=runner,
+                path="/bound",
+            )
+
+        async def finalize(self, bound, **kwargs):  # type: ignore[no-untyped-def]
+            del bound, kwargs
+            reporter = current_environment_lifecycle_progress_reporter()
+            assert reporter is not None
+            await reporter.report(
+                EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+                items_completed=0,
+                items_total=0,
+                bytes_completed=0,
+                bytes_total=0,
+            )
+            return None
+
+    async def run() -> list[Event]:
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(
+                    name="local",
+                    lifecycle_policy=EnvironmentLifecyclePolicy(
+                        progress_min_interval_seconds=0.0,
+                        max_progress_events=32,
+                    ),
+                ),
+                binding=LifecycleRecordingBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="environment-lifecycle-progress",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return await app.session_store.load_events("environment-lifecycle-progress")
+
+    events = asyncio.run(run())
+    progress = [
+        environment_lifecycle_progress_from_event(event)
+        for event in events
+        if event.type == EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+    ]
+
+    assert {item.operation for item in progress} == {
+        EnvironmentLifecycleOperation.BINDING,
+        EnvironmentLifecycleOperation.FINALIZATION,
+        EnvironmentLifecycleOperation.RELEASE,
+    }
+    binding = [item for item in progress if item.operation is EnvironmentLifecycleOperation.BINDING]
+    finalization = [
+        item for item in progress if item.operation is EnvironmentLifecycleOperation.FINALIZATION
+    ]
+    release = [item for item in progress if item.operation is EnvironmentLifecycleOperation.RELEASE]
+    assert [item.event_index for item in binding] == list(range(1, len(binding) + 1))
+    assert [item.event_index for item in finalization] == list(range(1, len(finalization) + 1))
+    assert len({item.operation_id for item in binding}) == 1
+    assert len({item.operation_id for item in finalization}) == 1
+    assert binding[0].operation_id != finalization[0].operation_id
+    assert all("environment-lifecycle-progress" not in item.operation_id for item in progress)
+    assert binding[-1].status is EnvironmentLifecycleProgressStatus.COMPLETED
+    assert finalization[-1].status is EnvironmentLifecycleProgressStatus.COMPLETED
+    assert release[-1].status is EnvironmentLifecycleProgressStatus.COMPLETED
+    assert binding[-1].operation_terminal is True
+    assert finalization[-1].operation_terminal is True
+    assert release[-1].operation_terminal is True
+    assert EnvironmentLifecyclePhase.SOURCE_OBSERVATION in {item.phase for item in binding}
+    assert EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION in {item.phase for item in binding}
+    assert EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION in {item.phase for item in finalization}
+    assert all(item.binding_generation_id is not None for item in progress)
+    assert len(progress) <= 64
+
+
+@pytest.mark.stress
+def test_100_concurrent_runtime_environment_operations_reach_typed_terminal_state() -> None:
+    class YieldingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            del kwargs
+            await asyncio.sleep(0)
+            return BoundWorkspace(
+                workspace=workspace,
+                source_workspace=workspace,
+                runner=runner,
+                path="/virtual",
+            )
+
+        async def finalize(self, bound, **kwargs):  # type: ignore[no-untyped-def]
+            del bound, kwargs
+            await asyncio.sleep(0)
+            return None
+
+    async def run() -> tuple[list[list[Event]], int]:
+        session_environments = [
+            (
+                f"concurrent-environment-lifecycle-{index}",
+                f"concurrent-environment-{index}",
+            )
+            for index in range(100)
+        ]
+        provider = _FakeProvider(
+            [
+                [ModelStreamEvent.completed({"finish_reason": "stop"})]
+                for _session_id, _environment_name in session_environments
+            ]
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        for _session_id, environment_name in session_environments:
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(
+                        name=environment_name,
+                        lifecycle_policy=EnvironmentLifecyclePolicy(
+                            progress_min_interval_seconds=0.0,
+                            max_progress_events=32,
+                        ),
+                    ),
+                    binding=YieldingBinding(),
+                ),
+            )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await asyncio.gather(
+            *(
+                _collect_events(
+                    app,
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "run")],
+                        environment_name=environment_name,
+                    ),
+                )
+                for session_id, environment_name in session_environments
+            )
+        )
+        return (
+            await asyncio.gather(
+                *(
+                    app.session_store.load_events(session_id)
+                    for session_id, _environment_name in session_environments
+                )
+            ),
+            len(provider.requests),
+        )
+
+    event_groups, provider_request_count = asyncio.run(run())
+    progress_groups = [
+        [
+            environment_lifecycle_progress_from_event(event)
+            for event in events
+            if event.type == EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+        ]
+        for events in event_groups
+    ]
+    assert provider_request_count == 100
+    assert all(
+        {item.operation for item in progress}
+        == {
+            EnvironmentLifecycleOperation.BINDING,
+            EnvironmentLifecycleOperation.FINALIZATION,
+            EnvironmentLifecycleOperation.RELEASE,
+        }
+        for progress in progress_groups
+    )
+    operations = {item.operation_id: [] for progress in progress_groups for item in progress}
+    for progress in progress_groups:
+        for item in progress:
+            operations[item.operation_id].append(item)
+    assert len(operations) == 300
+    assert all(len(items) <= 32 for items in operations.values())
+    assert all(items[-1].operation_terminal for items in operations.values())
+    assert all(
+        items[-1].status is EnvironmentLifecycleProgressStatus.COMPLETED
+        for items in operations.values()
+    )
+
+
+def test_factory_binding_failure_projects_release_and_retained_cleanup() -> None:
+    class FailingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            del workspace, runner, kwargs
+            raise RuntimeError("bind failed")
+
+        async def finalize(self, bound, **kwargs):  # type: ignore[no-untyped-def]
+            del bound, kwargs
+            raise AssertionError("An unbound workspace must not be finalized.")
+
+    class BlockingReleaseFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                assert action is EnvironmentFactoryReleaseAction.PRESERVE
+                reporter = current_environment_lifecycle_progress_reporter()
+                assert reporter is not None
+                await reporter.report(
+                    EnvironmentLifecyclePhase.ENVIRONMENT_RELEASE,
+                    EnvironmentLifecycleProgressStatus.ADVANCED,
+                    active_count=1,
+                    queued_count=0,
+                )
+                self.release_started.set()
+                await self.allow_release.wait()
+
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    binding=FailingBinding(),
+                ),
+                release=release,
+                release_timeout_s=0.005,
+            )
+
+    async def run() -> tuple[list[Event], BlockingReleaseFactory, CayuApp]:
+        factory = BlockingReleaseFactory()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(
+                name="dynamic",
+                lifecycle_policy=EnvironmentLifecyclePolicy(progress_min_interval_seconds=0.0),
+            ),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="environment-release-progress",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        assert factory.release_started.is_set()
+        return events, factory, app
+
+    async def scenario() -> list[Event]:
+        events, factory, app = await run()
+        factory.allow_release.set()
+        assert await app.drain_environment_cleanups(timeout_s=1.0) is True
+        return events
+
+    events = asyncio.run(scenario())
+    progress = [
+        environment_lifecycle_progress_from_event(event)
+        for event in events
+        if event.type == EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+    ]
+    release = [item for item in progress if item.operation is EnvironmentLifecycleOperation.RELEASE]
+    retained = [
+        item
+        for item in progress
+        if item.operation is EnvironmentLifecycleOperation.RETAINED_CLEANUP
+    ]
+
+    assert [item.status for item in release] == [
+        EnvironmentLifecycleProgressStatus.STARTED,
+        EnvironmentLifecycleProgressStatus.ADVANCED,
+        EnvironmentLifecycleProgressStatus.RETAINED,
+    ]
+    assert release[-1].operation_terminal is True
+    assert release[-1].retained_owner is True
+    assert [item.status for item in retained] == [
+        EnvironmentLifecycleProgressStatus.STARTED,
+        EnvironmentLifecycleProgressStatus.RETAINED,
+    ]
+    assert retained[-1].operation_terminal is True
+    assert retained[-1].retained_owner is True
+
+
+def test_sync_binding_projects_transfer_staging_and_explicit_no_sync_progress(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "input.txt").write_text("safe aggregate progress")
+
+    async def run() -> list[Event]:
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(
+                    name="sync",
+                    lifecycle_policy=EnvironmentLifecyclePolicy(progress_min_interval_seconds=0.0),
+                ),
+                workspace=LocalWorkspace(source_root, workspace_id="source"),
+                binding=SyncBinding(
+                    target_workspace=LocalWorkspace(target_root, workspace_id="target"),
+                    sync_back="never",
+                ),
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        return await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sync-environment-lifecycle-progress",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+
+    events = asyncio.run(run())
+    progress = [
+        environment_lifecycle_progress_from_event(event)
+        for event in events
+        if event.type == EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+    ]
+
+    assert (target_root / "input.txt").read_text() == "safe aggregate progress"
+    assert {
+        EnvironmentLifecyclePhase.STAGING_ADMISSION,
+        EnvironmentLifecyclePhase.ARCHIVE_PREPARATION,
+        EnvironmentLifecyclePhase.TRANSFER,
+        EnvironmentLifecyclePhase.SOURCE_OBSERVATION,
+        EnvironmentLifecyclePhase.TARGET_MATERIALIZATION,
+    }.issubset({item.phase for item in progress})
+    no_sync = [
+        item
+        for item in progress
+        if item.operation is EnvironmentLifecycleOperation.FINALIZATION
+        and item.phase is EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION
+        and not item.operation_terminal
+    ]
+    assert len(no_sync) == 1
+    assert no_sync[0].status is EnvironmentLifecycleProgressStatus.COMPLETED
+    assert no_sync[0].items_completed == no_sync[0].items_total == 0
+    assert no_sync[0].bytes_completed == no_sync[0].bytes_total == 0
+
+
+def test_environment_phase_deadline_fails_at_adapter_progress_boundary() -> None:
+    class SlowReportingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            del workspace, runner, kwargs
+            reporter = current_environment_lifecycle_progress_reporter()
+            assert reporter is not None
+            await reporter.report(
+                EnvironmentLifecyclePhase.TRANSFER,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
+            await asyncio.sleep(0.02)
+            await reporter.report(
+                EnvironmentLifecyclePhase.TRANSFER,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+            )
+            raise AssertionError("A late binding must fail at its progress boundary.")
+
+        async def finalize(self, bound, **kwargs):  # type: ignore[no-untyped-def]
+            del bound, kwargs
+            raise AssertionError("An unbound workspace must not be finalized.")
+
+    async def run() -> tuple[list[Event], CayuApp, _FakeProvider]:
+        provider = _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(
+                    name="slow",
+                    lifecycle_policy=EnvironmentLifecyclePolicy(
+                        lifecycle_timeout_seconds=10.0,
+                        phase_timeout_seconds={EnvironmentLifecyclePhase.TRANSFER: 0.005},
+                        progress_min_interval_seconds=0.0,
+                    ),
+                ),
+                binding=SlowReportingBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="environment-phase-deadline",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, app, provider
+
+    events, app, provider = asyncio.run(run())
+    progress = [
+        environment_lifecycle_progress_from_event(event)
+        for event in events
+        if event.type == EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+    ]
+
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert provider.requests == []
+    assert progress[-1].operation is EnvironmentLifecycleOperation.BINDING
+    assert progress[-1].phase is EnvironmentLifecyclePhase.TRANSFER
+    assert progress[-1].status is EnvironmentLifecycleProgressStatus.DEADLINE_EXCEEDED
+    assert progress[-1].operation_terminal is True
+    assert app._environment_lifecycle._active_environment_setups == {}
+
+
+def test_factory_phase_deadline_releases_returned_result() -> None:
+    class SlowFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            await asyncio.sleep(0.02)
+
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                self.release_actions.append(action)
+
+            return EnvironmentFactoryResult(
+                Environment(EnvironmentSpec(name=request.environment_name)),
+                release=release,
+            )
+
+    async def run() -> tuple[list[Event], CayuApp, SlowFactory, _FakeProvider]:
+        provider = _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+        factory = SlowFactory()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(
+                name="slow-factory",
+                lifecycle_policy=EnvironmentLifecyclePolicy(
+                    lifecycle_timeout_seconds=10.0,
+                    phase_timeout_seconds={
+                        EnvironmentLifecyclePhase.FACTORY_PROVISIONING: 0.005,
+                    },
+                    progress_min_interval_seconds=0.0,
+                ),
+            ),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="factory-result-deadline-ownership",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, app, factory, provider
+
+    events, app, factory, provider = asyncio.run(run())
+    progress = [
+        environment_lifecycle_progress_from_event(event)
+        for event in events
+        if event.type == EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+    ]
+
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert provider.requests == []
+    assert factory.release_actions == [EnvironmentFactoryReleaseAction.DISCARD]
+    assert any(
+        item.operation is EnvironmentLifecycleOperation.FACTORY
+        and item.phase is EnvironmentLifecyclePhase.FACTORY_PROVISIONING
+        and item.status is EnvironmentLifecycleProgressStatus.DEADLINE_EXCEEDED
+        for item in progress
+    )
+    assert app._environment_lifecycle._active_environment_setups == {}
 
 
 def test_checkpoint_preserves_factory_reconnect_state_and_current_control_state() -> None:

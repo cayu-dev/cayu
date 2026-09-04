@@ -173,6 +173,7 @@ class EventType(StrEnum):
     ENVIRONMENT_FACTORY_STARTED = "environment.factory.started"
     ENVIRONMENT_FACTORY_COMPLETED = "environment.factory.completed"
     ENVIRONMENT_FACTORY_FAILED = "environment.factory.failed"
+    ENVIRONMENT_LIFECYCLE_PROGRESS = "environment.lifecycle.progress"
 
     WORKSPACE_REVISION_OBSERVED = "workspace.revision.observed"
     WORKSPACE_MUTATION_RECORDED = "workspace.mutation.recorded"

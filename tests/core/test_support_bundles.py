@@ -20,8 +20,13 @@ import cayu.support_bundles as support_bundles
 from cayu import (
     CayuApp,
     Environment,
+    EnvironmentLifecycleOperation,
+    EnvironmentLifecyclePhase,
+    EnvironmentLifecycleProgress,
+    EnvironmentLifecycleProgressStatus,
     EnvironmentSpec,
     Event,
+    EventType,
     InMemoryTaskStore,
     LocalArtifactStore,
     McpManifestPolicy,
@@ -1090,6 +1095,68 @@ def test_explicit_event_tail_is_envelope_only_and_bounded() -> None:
     assert "model-text-canary" not in serialized
     assert "tool-secret-canary" not in serialized
     assert "secret-type" not in serialized
+
+
+def test_event_tail_includes_typed_content_free_environment_lifecycle_summary() -> None:
+    session_id = "lifecycle-summary-session"
+    timestamp = datetime(2026, 1, 2, tzinfo=UTC)
+    progress = EnvironmentLifecycleProgress(
+        operation_id="envop_summary",
+        binding_generation_id="envbind_summary",
+        operation=EnvironmentLifecycleOperation.BINDING,
+        phase=EnvironmentLifecyclePhase.TRANSFER,
+        status=EnvironmentLifecycleProgressStatus.ADVANCED,
+        event_index=1,
+        elapsed_ms=50,
+        phase_elapsed_ms=40,
+        lifecycle_timeout_seconds=60.0,
+        phase_timeout_seconds=10.0,
+        deadline=timestamp,
+        last_progress_at=timestamp,
+        items_completed=2,
+        items_total=3,
+        bytes_completed=100,
+        bytes_total=200,
+    )
+
+    async def collect_tail() -> SupportBundleReport:
+        store = InMemorySessionStore()
+        await store.create(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                environment_name="local",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake"),
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.ENVIRONMENT_LIFECYCLE_PROGRESS,
+                session_id=session_id,
+                timestamp=timestamp,
+                payload=progress.to_payload(),
+            ),
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        return await collect_support_bundle(
+            _context(app=app),
+            builtin_support_collectors(session_selectors=(session_id,)),
+        )
+
+    report = asyncio.run(collect_tail())
+
+    tail_result = next(item for item in report.collectors if item.name == "session_events.1")
+    assert tail_result.disposition is CollectorDisposition.COLLECTED
+    assert isinstance(tail_result.evidence, SessionEventTailEvidence)
+    assert tail_result.evidence.lifecycle_progress_inventory.total_count == 1
+    assert tail_result.evidence.lifecycle_progress_inventory.included_count == 1
+    assert tail_result.evidence.lifecycle_progress[0].progress == progress
+    serialized = tail_result.evidence.model_dump_json()
+    assert "path" not in serialized
+    assert "filename" not in serialized
+    assert "command" not in serialized
 
 
 def test_event_tail_maximum_keeps_one_record_for_completeness_proof() -> None:

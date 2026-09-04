@@ -20,6 +20,10 @@ from cayu.core.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.environments.bindings import WorkspaceBinding
+from cayu.environments.lifecycle import (
+    EnvironmentLifecyclePolicy,
+    copy_environment_lifecycle_policy,
+)
 from cayu.mcp.base import McpServerSpec, copy_mcp_server_spec
 from cayu.proxies import CredentialProxy
 from cayu.runners import Runner
@@ -52,6 +56,16 @@ class EnvironmentSpec(BaseModel):
     name: str
     metadata: dict[str, Any] = Field(default_factory=dict)
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
+    lifecycle_policy: EnvironmentLifecyclePolicy | None = None
+
+    @field_validator("lifecycle_policy", mode="before")
+    @classmethod
+    def copy_lifecycle_policy(cls, value: object) -> EnvironmentLifecyclePolicy | None:
+        if value is None:
+            return None
+        if isinstance(value, EnvironmentLifecyclePolicy):
+            value = value.model_dump(mode="json")
+        return EnvironmentLifecyclePolicy.model_validate(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -322,6 +336,7 @@ def copy_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
         execution_profile_identity=copy_execution_profile_behavior_identity(
             spec.execution_profile_identity
         ),
+        lifecycle_policy=copy_environment_lifecycle_policy(spec.lifecycle_policy),
     )
 
 

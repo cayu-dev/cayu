@@ -936,6 +936,16 @@
             ],
             "title": "Knowledge Store Type"
           },
+          "lifecycle_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EnvironmentLifecyclePolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "mcp_server_count": {
             "minimum": 0.0,
             "title": "Mcp Server Count",
@@ -1026,6 +1036,7 @@
           "proxy_type",
           "knowledge_store_type",
           "mcp_server_count",
+          "lifecycle_policy",
           "workspace_instructions"
         ],
         "title": "ApiEnvironmentSummary",
@@ -4117,8 +4128,8 @@
             "$ref": "#/components/schemas/RuntimeManifest"
           },
           "schema_version": {
-            "const": "14",
-            "default": "14",
+            "const": "16",
+            "default": "16",
             "title": "Schema Version",
             "type": "string"
           },
@@ -8719,6 +8730,115 @@
         "title": "CostSessionTotals",
         "type": "object"
       },
+      "DurableOperationOwnership": {
+        "additionalProperties": false,
+        "description": "Bounded fencing authority embedded in one feature-owned record.",
+        "properties": {
+          "acquired_at": {
+            "format": "date-time",
+            "title": "Acquired At",
+            "type": "string"
+          },
+          "claim_id": {
+            "maxLength": 256,
+            "title": "Claim Id",
+            "type": "string"
+          },
+          "generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "operation_id": {
+            "maxLength": 256,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "owner_id": {
+            "maxLength": 256,
+            "title": "Owner Id",
+            "type": "string"
+          },
+          "record_type": {
+            "const": "cayu.durable-operation-ownership",
+            "default": "cayu.durable-operation-ownership",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "released_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Released At"
+          },
+          "renewed_at": {
+            "format": "date-time",
+            "title": "Renewed At",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "settled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settled At"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DurableOperationOwnershipState",
+            "default": "active"
+          }
+        },
+        "required": [
+          "operation_id",
+          "claim_id",
+          "owner_id",
+          "generation",
+          "acquired_at",
+          "renewed_at",
+          "lease_expires_at"
+        ],
+        "title": "DurableOperationOwnership",
+        "type": "object"
+      },
+      "DurableOperationOwnershipState": {
+        "enum": [
+          "active",
+          "released",
+          "settled"
+        ],
+        "title": "DurableOperationOwnershipState",
+        "type": "string"
+      },
       "EgressAuthorityBindingIdentity": {
         "additionalProperties": false,
         "description": "One destination/credential class bound to a named policy.",
@@ -8978,6 +9098,64 @@
         "title": "EnqueueSessionMessageBody",
         "type": "object"
       },
+      "EnvironmentLifecyclePhase": {
+        "description": "Content-free phases shared by factories, bindings, and cleanup.",
+        "enum": [
+          "ownership_admission",
+          "factory_provisioning",
+          "factory_reconnect",
+          "source_observation",
+          "staging_admission",
+          "archive_preparation",
+          "transfer",
+          "target_materialization",
+          "execution_ready_publication",
+          "final_source_observation",
+          "final_target_observation",
+          "copy_back_conflict_preflight",
+          "copy_back_publication",
+          "environment_release",
+          "retained_cleanup"
+        ],
+        "title": "EnvironmentLifecyclePhase",
+        "type": "string"
+      },
+      "EnvironmentLifecyclePolicy": {
+        "additionalProperties": false,
+        "description": "Finite lifecycle, phase, and progress-volume ceilings for one environment.",
+        "properties": {
+          "lifecycle_timeout_seconds": {
+            "default": 3600.0,
+            "exclusiveMinimum": 0.0,
+            "maximum": 86400.0,
+            "title": "Lifecycle Timeout Seconds",
+            "type": "number"
+          },
+          "max_progress_events": {
+            "default": 128,
+            "maximum": 1024.0,
+            "minimum": 32.0,
+            "title": "Max Progress Events",
+            "type": "integer"
+          },
+          "phase_timeout_seconds": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "title": "Phase Timeout Seconds",
+            "type": "object"
+          },
+          "progress_min_interval_seconds": {
+            "default": 0.25,
+            "maximum": 60.0,
+            "minimum": 0.0,
+            "title": "Progress Min Interval Seconds",
+            "type": "number"
+          }
+        },
+        "title": "EnvironmentLifecyclePolicy",
+        "type": "object"
+      },
       "EnvironmentManifest": {
         "additionalProperties": false,
         "properties": {
@@ -9035,6 +9213,18 @@
               }
             ],
             "title": "Knowledge Store"
+          },
+          "lifecycle_policy": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lifecycle Policy"
           },
           "mcp_servers": {
             "items": {
@@ -9108,6 +9298,7 @@
           "binding",
           "knowledge_store",
           "mcp_servers",
+          "lifecycle_policy",
           "registration_provenance",
           "implementation_provenance"
         ],
@@ -19372,29 +19563,15 @@
             ],
             "title": "Runtime Deadline At"
           },
-          "runtime_dispatch_lease_expires_at": {
+          "runtime_dispatch_ownership": {
             "anyOf": [
               {
-                "format": "date-time",
-                "type": "string"
+                "$ref": "#/components/schemas/DurableOperationOwnership"
               },
               {
                 "type": "null"
               }
-            ],
-            "title": "Runtime Dispatch Lease Expires At"
-          },
-          "runtime_dispatch_owner_id": {
-            "anyOf": [
-              {
-                "maxLength": 128,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Runtime Dispatch Owner Id"
+            ]
           },
           "runtime_evidence_fingerprint": {
             "anyOf": [
@@ -19438,16 +19615,15 @@
             "title": "Runtime Runner Fingerprint",
             "type": "string"
           },
-          "runtime_session_claim_id": {
+          "runtime_session_create_claim": {
             "anyOf": [
               {
-                "type": "string"
+                "$ref": "#/components/schemas/RuntimeSessionCreateClaimReference"
               },
               {
                 "type": "null"
               }
-            ],
-            "title": "Runtime Session Claim Id"
+            ]
           },
           "runtime_timeout_observed": {
             "default": false,
@@ -19455,8 +19631,8 @@
             "type": "boolean"
           },
           "schema_version": {
-            "const": 1,
-            "default": 1,
+            "const": 2,
+            "default": 2,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -26144,6 +26320,30 @@
         "title": "RecallItemSelectionReason",
         "type": "string"
       },
+      "RecoveryCleanupPolicyManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "max_supervised_tasks": {
+            "title": "Max Supervised Tasks",
+            "type": "integer"
+          },
+          "overall_timeout_seconds": {
+            "title": "Overall Timeout Seconds",
+            "type": "number"
+          },
+          "step_timeout_seconds": {
+            "title": "Step Timeout Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "step_timeout_seconds",
+          "overall_timeout_seconds",
+          "max_supervised_tasks"
+        ],
+        "title": "RecoveryCleanupPolicyManifest",
+        "type": "object"
+      },
       "RegistrationProvenance": {
         "additionalProperties": false,
         "properties": {
@@ -26914,6 +27114,9 @@
             ],
             "title": "Mcp Manifest Policy"
           },
+          "recovery_cleanup_policy": {
+            "$ref": "#/components/schemas/RecoveryCleanupPolicyManifest"
+          },
           "request_footprint": {
             "$ref": "#/components/schemas/RequestFootprintConfigManifest"
           },
@@ -26973,9 +27176,64 @@
           "max_file_attachments_per_request",
           "tool_timeout_seconds",
           "max_parallel_tool_calls",
-          "max_environment_lifecycle_owners"
+          "max_environment_lifecycle_owners",
+          "recovery_cleanup_policy"
         ],
         "title": "RuntimeManifest",
+        "type": "object"
+      },
+      "RuntimeSessionCreateClaimReference": {
+        "additionalProperties": false,
+        "description": "Secret-free keyed identity for reconstructing one private create claim.",
+        "properties": {
+          "claim_id": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Claim Id",
+            "type": "string"
+          },
+          "operation_id": {
+            "maxLength": 256,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "record_type": {
+            "const": "cayu.runtime-session-create-claim-reference",
+            "default": "cayu.runtime-session-create-claim-reference",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "request_authority_hmac_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Request Authority Hmac Sha256",
+            "type": "string"
+          },
+          "request_authority_key_id": {
+            "maxLength": 256,
+            "title": "Request Authority Key Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "session_id": {
+            "maxLength": 512,
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "operation_id",
+          "request_authority_key_id",
+          "request_authority_hmac_sha256",
+          "claim_id"
+        ],
+        "title": "RuntimeSessionCreateClaimReference",
         "type": "object"
       },
       "SavingsPercentageState": {
@@ -27931,7 +28189,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "43",
+            "default": "44",
             "title": "Contract Version",
             "type": "string"
           },
@@ -32560,7 +32818,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "43",
+            "default": "44",
             "title": "Contract Version",
             "type": "string"
           }

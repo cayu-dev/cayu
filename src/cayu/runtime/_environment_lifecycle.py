@@ -11,11 +11,13 @@ import asyncio
 import hashlib
 import inspect
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from hashlib import sha256
 from math import isfinite
 from typing import Any
+from uuid import UUID, uuid5
 
 from cayu._coding_product_authority import (
     CODING_PRODUCT_FINAL_GIT_RECEIPT_SCHEMA,
@@ -43,7 +45,14 @@ from cayu._workspace_mutation import (
     WorkspaceMutationSettlementError,
     workspace_mutation_task_settlement_probe,
 )
-from cayu.core.events import Event, EventType, copy_event, event_with_runtime_payload_authority
+from cayu.core.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.environments import (
     BoundWorkspace,
     DockerCodingWorkspaceBinding,
@@ -78,6 +87,17 @@ from cayu.environments.factory import (
     environment_factory_cleanup_settlement_tasks,
     register_environment_factory_cleanup_retry,
     retry_environment_factory_cleanup_settlement_task,
+)
+from cayu.environments.lifecycle import (
+    MAX_ENVIRONMENT_PROGRESS_EVENTS,
+    EnvironmentLifecycleOperation,
+    EnvironmentLifecyclePhase,
+    EnvironmentLifecycleProgress,
+    EnvironmentLifecycleProgressStatus,
+    RuntimeEnvironmentLifecycleProgressReporter,
+    _reset_environment_lifecycle_progress_reporter,
+    _set_environment_lifecycle_progress_reporter,
+    environment_lifecycle_progress_from_event,
 )
 from cayu.runners import Runner
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
@@ -146,6 +166,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
     event_with_execution_profile_authority,
+    event_with_execution_profile_fingerprint_authority,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.sessions import (
@@ -205,6 +226,51 @@ _RunFenceReleaseKey = tuple[str, int]
 logger = logging.getLogger(__name__)
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
+_ENVIRONMENT_LIFECYCLE_RECOVERY_EVENT_NAMESPACE = UUID("0a916d45-7be8-4ca3-b66a-00d2c63d1f38")
+_ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_BATCH_SIZE = 5000
+_ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_LIMIT = (
+    len(EnvironmentLifecycleOperation) * MAX_ENVIRONMENT_PROGRESS_EVENTS
+)
+
+
+async def _await_with_environment_lifecycle_reporter(
+    reporter: RuntimeEnvironmentLifecycleProgressReporter | None,
+    operation: Callable[[], Awaitable[Any]],
+) -> Any:
+    if reporter is None:
+        return await operation()
+    token = _set_environment_lifecycle_progress_reporter(reporter)
+    try:
+        return await operation()
+    finally:
+        _reset_environment_lifecycle_progress_reporter(token)
+
+
+async def _report_environment_lifecycle(
+    reporter: RuntimeEnvironmentLifecycleProgressReporter | None,
+    phase: EnvironmentLifecyclePhase,
+    status: EnvironmentLifecycleProgressStatus,
+    **counters: int | None,
+) -> EnvironmentLifecycleProgress | None:
+    if reporter is None:
+        return None
+    return await reporter.report(phase, status, **counters)
+
+
+async def _finish_environment_lifecycle(
+    reporter: RuntimeEnvironmentLifecycleProgressReporter | None,
+    *,
+    status: EnvironmentLifecycleProgressStatus,
+    phase: EnvironmentLifecyclePhase | None = None,
+    retained_owner: bool = False,
+) -> EnvironmentLifecycleProgress | None:
+    if reporter is None:
+        return None
+    return await reporter.finish(
+        status=status,
+        phase=phase,
+        retained_owner=retained_owner,
+    )
 
 
 def _live_allocation_fingerprint(
@@ -468,6 +534,215 @@ class EnvironmentLifecycle:
         self._deferred_run_fence_release_tasks: dict[_RunFenceReleaseKey, asyncio.Task[None]] = {}
         self._final_workspace_observation_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS
+        )
+
+    def _progress_reporter(
+        self,
+        *,
+        operation: EnvironmentLifecycleOperation,
+        session_id: str,
+        operation_scope_id: str,
+        agent_name: str | None,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity | None,
+        events: list[Event],
+    ) -> RuntimeEnvironmentLifecycleProgressReporter | None:
+        policy = registered_environment.spec.lifecycle_policy
+        if policy is None:
+            return None
+        binding_generation_id = (
+            registered_environment.binding_generation_id
+            if operation
+            in {
+                EnvironmentLifecycleOperation.BINDING,
+                EnvironmentLifecycleOperation.FINALIZATION,
+                EnvironmentLifecycleOperation.RELEASE,
+                EnvironmentLifecycleOperation.RETAINED_CLEANUP,
+            }
+            else None
+        )
+
+        async def publish(progress: EnvironmentLifecycleProgress) -> None:
+            progress_event = event_with_execution_profile_authority(
+                Event(
+                    type=EventType.ENVIRONMENT_LIFECYCLE_PROGRESS,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    environment_name=registered_environment.spec.name,
+                    payload=progress.to_payload(),
+                ),
+                execution_profile,
+            )
+            if progress.binding_generation_id is not None:
+                progress_event = _event_with_binding_generation_authority(progress_event)
+            events.append(await self._event_writer.emit(progress_event))
+
+        return RuntimeEnvironmentLifecycleProgressReporter(
+            operation=operation,
+            policy=policy,
+            publish=publish,
+            binding_generation_id=binding_generation_id,
+            operation_id=(
+                "envop_"
+                + sha256(
+                    "\x00".join(
+                        (
+                            session_id,
+                            operation_scope_id,
+                            registered_environment.spec.name,
+                            operation.value,
+                            binding_generation_id or "",
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()[:32]
+            ),
+        )
+
+    async def has_unsettled_progress(
+        self,
+        *,
+        session_id: str,
+        interaction_id: str | None,
+    ) -> bool:
+        """Return whether any bounded operation lacks terminal durable evidence."""
+
+        return bool(
+            await self._unsettled_environment_lifecycle_progress(
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+        )
+
+    async def reconcile_orphaned_progress(
+        self,
+        *,
+        session_id: str,
+        interaction_id: str | None,
+        observed_at: datetime,
+    ) -> tuple[Event, ...]:
+        """Retain a fenced predecessor operation without replaying its effects."""
+
+        unsettled = await self._unsettled_environment_lifecycle_progress(
+            session_id=session_id,
+            interaction_id=interaction_id,
+        )
+        if not unsettled:
+            return ()
+        persisted_events: list[Event] = []
+        for source_event, source_progress in unsettled:
+            terminal_progress = EnvironmentLifecycleProgress.model_validate(
+                {
+                    **source_progress.model_dump(mode="json"),
+                    "status": EnvironmentLifecycleProgressStatus.RETAINED,
+                    "event_index": source_progress.event_index + 1,
+                    "deadline_scope": None,
+                    "recovery_disposition": "orphaned_stale",
+                    "operation_terminal": True,
+                    "retained_owner": True,
+                }
+            )
+            event_id = str(
+                uuid5(
+                    _ENVIRONMENT_LIFECYCLE_RECOVERY_EVENT_NAMESPACE,
+                    "\0".join(
+                        (
+                            session_id,
+                            source_event.interaction_id or "",
+                            source_progress.operation_id,
+                            "orphaned_stale",
+                        )
+                    ),
+                )
+            )
+            event = event_with_runtime_generated_id(
+                Event(
+                    id=event_id,
+                    type=EventType.ENVIRONMENT_LIFECYCLE_PROGRESS,
+                    session_id=session_id,
+                    interaction_id=source_event.interaction_id,
+                    timestamp=observed_at,
+                    agent_name=source_event.agent_name,
+                    environment_name=source_event.environment_name,
+                    payload=terminal_progress.to_payload(),
+                )
+            )
+            event = event_with_runtime_envelope_authority(event, "session_id")
+            if event.interaction_id is not None:
+                event = event_with_runtime_envelope_authority(event, "interaction_id")
+            if terminal_progress.binding_generation_id is not None:
+                event = _event_with_binding_generation_authority(event)
+            profile_fingerprint = source_event.payload.get("execution_profile_fingerprint")
+            if profile_fingerprint is not None:
+                if type(profile_fingerprint) is not str:
+                    raise ValueError(
+                        "Environment lifecycle execution profile authority is invalid."
+                    )
+                event = event_with_execution_profile_fingerprint_authority(
+                    event,
+                    profile_fingerprint,
+                )
+            persisted_events.append(await self._event_writer.persist_exact_replay(event))
+        try:
+            delivered = await self._event_writer.fan_out_persisted(persisted_events)
+        except Exception as exc:
+            logger.warning(
+                "Environment lifecycle recovery evidence is durable but side-effect "
+                "delivery remains pending: session_id=%s event_ids=%s error_type=%s",
+                session_id,
+                ",".join(event.id for event in persisted_events),
+                type(exc).__name__,
+            )
+            return tuple(persisted_events)
+        return tuple(delivered)
+
+    async def _unsettled_environment_lifecycle_progress(
+        self,
+        *,
+        session_id: str,
+        interaction_id: str | None,
+    ) -> tuple[tuple[Event, EnvironmentLifecycleProgress], ...]:
+        latest_by_operation: dict[
+            str,
+            tuple[int, Event, EnvironmentLifecycleProgress],
+        ] = {}
+        remaining = _ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_LIMIT
+        before_sequence: int | None = None
+        while remaining > 0:
+            batch_limit = min(
+                remaining,
+                _ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_BATCH_SIZE,
+            )
+            batch = await self._session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                    event_type=EventType.ENVIRONMENT_LIFECYCLE_PROGRESS,
+                    before_sequence=before_sequence,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=batch_limit,
+                )
+            )
+            for record in batch:
+                progress = environment_lifecycle_progress_from_event(record.event)
+                latest_by_operation.setdefault(
+                    progress.operation_id,
+                    (record.sequence, copy_event(record.event), progress),
+                )
+            remaining -= len(batch)
+            if len(batch) < batch_limit or remaining == 0:
+                break
+            before_sequence = batch[-1].sequence
+
+        return tuple(
+            (event, progress)
+            for _sequence, event, progress in sorted(
+                (
+                    item
+                    for item in latest_by_operation.values()
+                    if not item[2].operation_terminal
+                ),
+                key=lambda item: item[0],
+            )
         )
 
     def _retain_deferred_factory_cleanup_execution_profile(
@@ -1191,6 +1466,57 @@ class EnvironmentLifecycle:
             registered_environment=registered_environment,
         )
         events: list[Event] = []
+        progress_reporter = self._progress_reporter(
+            operation=EnvironmentLifecycleOperation.FACTORY,
+            session_id=session.id,
+            operation_scope_id=(
+                f"{session.instance_id}:{session.run_epoch}"
+                if invocation_context is None
+                else (
+                    f"{invocation_context.binding.interaction_id}:"
+                    f"{invocation_context.binding.run_epoch}"
+                )
+            ),
+            agent_name=registered_agent.spec.name,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            events=events,
+        )
+
+        async def invoke_factory(
+            operation_factory: Callable[[], Awaitable[EnvironmentFactoryResult]],
+            *,
+            phase: EnvironmentLifecyclePhase,
+            operation_name: str,
+        ) -> EnvironmentFactoryResult:
+            nonlocal result
+            await _report_environment_lifecycle(
+                progress_reporter,
+                phase,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
+            resolved = await _await_with_environment_lifecycle_reporter(
+                progress_reporter,
+                lambda: environment_operation_boundary.await_environment_operation(
+                    operation_factory,
+                    operation_name=operation_name,
+                    redactor=self._secret_redactor,
+                ),
+            )
+            if type(resolved) is not EnvironmentFactoryResult:
+                raise TypeError(
+                    "Environment factory resolution must return EnvironmentFactoryResult."
+                )
+            # Transfer the exact returned owner before any progress publication
+            # can fail on a lifecycle or phase deadline.
+            result = resolved
+            await _report_environment_lifecycle(
+                progress_reporter,
+                phase,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+            )
+            return resolved
+
         result: EnvironmentFactoryResult | None = adopted_factory_result
         environment: Environment | None = None
         allocation_context: DurableEnvironmentAllocationContext | None = None
@@ -1198,6 +1524,11 @@ class EnvironmentLifecycle:
         allocation_checkpoint_may_be_committed = False
         effective_operation = operation
         try:
+            await _report_environment_lifecycle(
+                progress_reporter,
+                EnvironmentLifecyclePhase.OWNERSHIP_ADMISSION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
             parent_session_id = environment_allocation_parent_session_id(session)
             source_allocation_owner_session_id = environment_allocation_source_owner_session_id(
                 session,
@@ -1272,6 +1603,11 @@ class EnvironmentLifecycle:
                 evidence=None if admission_candidate is None else admission_candidate.evidence,
                 stage="pre_create",
             ).require_admitted()
+            await _report_environment_lifecycle(
+                progress_reporter,
+                EnvironmentLifecyclePhase.OWNERSHIP_ADMISSION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+            )
             if adopted_factory_result is not None:
                 if operation is not EnvironmentFactoryOperation.RECONNECT:
                     raise ValueError(
@@ -1307,10 +1643,10 @@ class EnvironmentLifecycle:
                             "Environment factory has a published remote allocation receipt "
                             "but no longer declares its durable allocation scope."
                         )
-                    result = await environment_operation_boundary.await_environment_operation(
+                    result = await invoke_factory(
                         lambda: factory.create(request),
+                        phase=EnvironmentLifecyclePhase.FACTORY_PROVISIONING,
                         operation_name="Environment factory creation",
-                        redactor=self._secret_redactor,
                     )
                 else:
                     allocation_context = self._allocation_coordinator.context(
@@ -1320,10 +1656,10 @@ class EnvironmentLifecycle:
                         scope=allocation_scope,
                         existing=allocation_record,
                     )
-                    result = await environment_operation_boundary.await_environment_operation(
+                    result = await invoke_factory(
                         lambda: factory.create_recoverable(request, allocation_context),
+                        phase=EnvironmentLifecyclePhase.FACTORY_PROVISIONING,
                         operation_name="Recoverable environment factory creation",
-                        redactor=self._secret_redactor,
                     )
             else:
                 if allocation_record is not None:
@@ -1331,10 +1667,10 @@ class EnvironmentLifecycle:
                         "Environment factory reconnect state conflicts with an incomplete "
                         "remote allocation intent."
                     )
-                result = await environment_operation_boundary.await_environment_operation(
+                result = await invoke_factory(
                     lambda: factory.create(request),
+                    phase=EnvironmentLifecyclePhase.FACTORY_RECONNECT,
                     operation_name="Environment factory reconnect",
-                    redactor=self._secret_redactor,
                 )
             if type(result) is not EnvironmentFactoryResult:
                 raise TypeError(
@@ -1444,6 +1780,10 @@ class EnvironmentLifecycle:
                 raise RuntimeError("Environment factory did not return an owned result.")
             if environment is None:
                 raise RuntimeError("Environment factory did not produce an environment.")
+            await _finish_environment_lifecycle(
+                progress_reporter,
+                status=EnvironmentLifecycleProgressStatus.COMPLETED,
+            )
             resolved_environment = runtime_records.RegisteredEnvironment(
                 spec=registered_environment.spec,
                 environment=environment,
@@ -1484,6 +1824,17 @@ class EnvironmentLifecycle:
                 ),
             )
         except BaseException as exc:
+            try:
+                await _finish_environment_lifecycle(
+                    progress_reporter,
+                    status=EnvironmentLifecycleProgressStatus.FAILED,
+                )
+            except BaseException as progress_error:
+                _add_exception_note_safely(
+                    exc,
+                    "Environment lifecycle failure progress publication also failed: "
+                    f"{type(progress_error).__name__}.",
+                )
             self._adopt_deferred_factory_cleanup(
                 session_id=session.id,
                 error=exc,
@@ -1519,11 +1870,23 @@ class EnvironmentLifecycle:
                             # deleting the now-durable provider resource.
                             release_action = EnvironmentFactoryReleaseAction.PRESERVE
                 try:
-                    release_payload = await _release_unclaimed_factory_result(
+                    release_payload = await self._release_factory_result_with_progress(
                         result,
                         action=release_action,
                         original_error=exc,
-                        redactor=self._secret_redactor,
+                        session_id=session.id,
+                        operation_scope_id=(
+                            f"{session.instance_id}:{session.run_epoch}"
+                            if invocation_context is None
+                            else (
+                                f"{invocation_context.binding.interaction_id}:"
+                                f"{invocation_context.binding.run_epoch}"
+                            )
+                        ),
+                        agent_name=registered_agent.spec.name,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                        events=events,
                     )
                 finally:
                     self._adopt_deferred_factory_cleanup(
@@ -1964,11 +2327,180 @@ class EnvironmentLifecycle:
             runner=registered_environment.environment.runner,
         )
 
+    async def _record_retained_cleanup_owner(
+        self,
+        *,
+        session_id: str,
+        operation_scope_id: str,
+        agent_name: str | None,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity | None,
+        events: list[Event],
+    ) -> None:
+        reporter = self._progress_reporter(
+            operation=EnvironmentLifecycleOperation.RETAINED_CLEANUP,
+            session_id=session_id,
+            operation_scope_id=operation_scope_id,
+            agent_name=agent_name,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            events=events,
+        )
+        await _report_environment_lifecycle(
+            reporter,
+            EnvironmentLifecyclePhase.RETAINED_CLEANUP,
+            EnvironmentLifecycleProgressStatus.STARTED,
+        )
+        await _finish_environment_lifecycle(
+            reporter,
+            status=EnvironmentLifecycleProgressStatus.RETAINED,
+            phase=EnvironmentLifecyclePhase.RETAINED_CLEANUP,
+            retained_owner=True,
+        )
+
+    async def _release_factory_result_with_progress(
+        self,
+        result: EnvironmentFactoryResult,
+        *,
+        action: EnvironmentFactoryReleaseAction,
+        original_error: BaseException,
+        session_id: str,
+        operation_scope_id: str,
+        agent_name: str | None,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity | None,
+        events: list[Event],
+        on_quiescent: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        reporter = self._progress_reporter(
+            operation=EnvironmentLifecycleOperation.RELEASE,
+            session_id=session_id,
+            operation_scope_id=operation_scope_id,
+            agent_name=agent_name,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            events=events,
+        )
+        progress_error: BaseException | None = None
+        try:
+            await _report_environment_lifecycle(
+                reporter,
+                EnvironmentLifecyclePhase.ENVIRONMENT_RELEASE,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
+        except BaseException as exc:
+            # The exact release owner must still run even when the diagnostic
+            # start cannot be persisted.
+            progress_error = exc
+            reporter = None
+        try:
+            payload = await _await_with_environment_lifecycle_reporter(
+                reporter,
+                lambda: _release_unclaimed_factory_result(
+                    result,
+                    action=action,
+                    original_error=original_error,
+                    redactor=self._secret_redactor,
+                    on_quiescent=on_quiescent,
+                ),
+            )
+        except BaseException as exc:
+            retained = environment_factory_cleanup_settlement_task(original_error) is not None
+            try:
+                if reporter is None or not reporter.finished:
+                    await _finish_environment_lifecycle(
+                        reporter,
+                        status=(
+                            EnvironmentLifecycleProgressStatus.RETAINED
+                            if retained
+                            else EnvironmentLifecycleProgressStatus.FAILED
+                        ),
+                        phase=EnvironmentLifecyclePhase.ENVIRONMENT_RELEASE,
+                        retained_owner=retained,
+                    )
+                if retained:
+                    await self._record_retained_cleanup_owner(
+                        session_id=session_id,
+                        operation_scope_id=operation_scope_id,
+                        agent_name=agent_name,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                        events=events,
+                    )
+            except BaseException as terminal_progress_error:
+                _add_exception_note_safely(
+                    exc,
+                    "Environment release lifecycle failure publication also failed: "
+                    f"{type(terminal_progress_error).__name__}.",
+                )
+            if progress_error is not None:
+                _add_exception_note_safely(
+                    exc,
+                    "Environment release lifecycle start publication failed: "
+                    f"{type(progress_error).__name__}.",
+                )
+            raise
+
+        completed = payload.get("completed") is True
+        retained = not completed and (
+            action is EnvironmentFactoryReleaseAction.PRESERVE
+            or environment_factory_cleanup_settlement_task(original_error) is not None
+        )
+        try:
+            if reporter is None or not reporter.finished:
+                await _finish_environment_lifecycle(
+                    reporter,
+                    status=(
+                        EnvironmentLifecycleProgressStatus.COMPLETED
+                        if completed
+                        else EnvironmentLifecycleProgressStatus.RETAINED
+                        if retained
+                        else EnvironmentLifecycleProgressStatus.FAILED
+                    ),
+                    phase=EnvironmentLifecyclePhase.ENVIRONMENT_RELEASE,
+                    retained_owner=retained,
+                )
+            if retained:
+                await self._record_retained_cleanup_owner(
+                    session_id=session_id,
+                    operation_scope_id=operation_scope_id,
+                    agent_name=agent_name,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    events=events,
+                )
+        except BaseException as terminal_progress_error:
+            if progress_error is None:
+                progress_error = terminal_progress_error
+            else:
+                _add_exception_note_safely(
+                    progress_error,
+                    "Environment release terminal progress publication also failed: "
+                    f"{type(terminal_progress_error).__name__}.",
+                )
+        if progress_error is not None:
+            _add_exception_note_safely(
+                original_error,
+                "Environment release progress publication failed after cleanup settlement: "
+                f"{type(progress_error).__name__}.",
+            )
+            fatal_signal = binding_finalize_fatal_signal(progress_error)
+            if fatal_signal is not None:
+                raise fatal_signal from original_error
+            if binding_finalize_explicit_cancellation(progress_error) is not None:
+                raise progress_error from original_error
+        return payload
+
     async def _release_unexposed_factory_environment(
         self,
         registered_environment: runtime_records.RegisteredEnvironment,
         *,
         error: BaseException,
+        session_id: str,
+        operation_scope_id: str,
+        agent_name: str | None,
+        execution_profile: ExecutionProfileIdentity | None,
+        events: list[Event],
         release_failed_binding_reservations: Callable[[], None] | None = None,
     ) -> tuple[runtime_records.RegisteredEnvironment, dict[str, Any] | None]:
         result = registered_environment.unclaimed_factory_result
@@ -1977,11 +2509,16 @@ class EnvironmentLifecycle:
         # Resolution checkpoints every factory result before returning it to
         # binding. Once committed, release may detach live handles but must not
         # destroy the durable allocation that a later resume will reconnect.
-        release_payload = await _release_unclaimed_factory_result(
+        release_payload = await self._release_factory_result_with_progress(
             result,
             action=EnvironmentFactoryReleaseAction.PRESERVE,
             original_error=error,
-            redactor=self._secret_redactor,
+            session_id=session_id,
+            operation_scope_id=operation_scope_id,
+            agent_name=agent_name,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            events=events,
             on_quiescent=(release_failed_binding_reservations),
         )
         _attach_environment_factory_release_payload(error, release_payload)
@@ -2062,6 +2599,7 @@ class EnvironmentLifecycle:
                     registered_environment=registered_environment,
                 )
             except Exception as exc:
+                release_events: list[Event] = []
                 try:
                     (
                         registered_environment,
@@ -2069,6 +2607,18 @@ class EnvironmentLifecycle:
                     ) = await self._release_unexposed_factory_environment(
                         registered_environment,
                         error=exc,
+                        session_id=session.id,
+                        operation_scope_id=(
+                            f"{session.instance_id}:{session.run_epoch}"
+                            if invocation_context is None
+                            else (
+                                f"{invocation_context.binding.interaction_id}:"
+                                f"{invocation_context.binding.run_epoch}"
+                            )
+                        ),
+                        agent_name=registered_agent.spec.name,
+                        execution_profile=execution_profile,
+                        events=release_events,
                     )
                 finally:
                     self._transfer_deferred_factory_cleanup(
@@ -2078,7 +2628,7 @@ class EnvironmentLifecycle:
                 self._active_environment_setups.pop(session.id, None)
                 return EnvironmentBindingResult(
                     registered_environment=registered_environment,
-                    events=[],
+                    events=release_events,
                     error=exc,
                 )
             adopted_environment = (
@@ -2099,6 +2649,22 @@ class EnvironmentLifecycle:
 
         environment_name = _environment_name(registered_environment)
         events: list[Event] = []
+        progress_reporter = self._progress_reporter(
+            operation=EnvironmentLifecycleOperation.BINDING,
+            session_id=session.id,
+            operation_scope_id=(
+                f"{session.instance_id}:{session.run_epoch}"
+                if invocation_context is None
+                else (
+                    f"{invocation_context.binding.interaction_id}:"
+                    f"{invocation_context.binding.run_epoch}"
+                )
+            ),
+            agent_name=registered_agent.spec.name,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            events=events,
+        )
         base_payload = _binding_base_payload(
             registered_environment,
             session_id=session.id,
@@ -2119,33 +2685,49 @@ class EnvironmentLifecycle:
         self._release_pending_environment_owner_admission(session.id)
         release_failed_binding_reservations: Callable[[], None] | None = None
         try:
+            await _report_environment_lifecycle(
+                progress_reporter,
+                EnvironmentLifecyclePhase.OWNERSHIP_ADMISSION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
+            await _report_environment_lifecycle(
+                progress_reporter,
+                EnvironmentLifecyclePhase.OWNERSHIP_ADMISSION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
+            )
             if completion_finalization_recovery_state is not None:
-                bound = await environment_operation_boundary.await_environment_operation(
-                    lambda: binding._recover_completion_finalization(
-                        registered_environment.environment.workspace,
-                        registered_environment.environment.runner,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        recovery_state=completion_finalization_recovery_state,
-                    ),
-                    operation_name="Environment workspace completion recovery",
-                    redactor=self._secret_redactor,
-                )
-            elif registered_environment.unclaimed_factory_result is not None:
-                attempt = _EnvironmentLifecycleBindAttempt()
-                try:
-                    bound = await environment_operation_boundary.await_environment_operation(
-                        lambda: binding._bind_for_environment_lifecycle(
+                bound = await _await_with_environment_lifecycle_reporter(
+                    progress_reporter,
+                    lambda: environment_operation_boundary.await_environment_operation(
+                        lambda: binding._recover_completion_finalization(
                             registered_environment.environment.workspace,
                             registered_environment.environment.runner,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
                             environment_name=environment_name,
-                            _attempt=attempt,
+                            recovery_state=completion_finalization_recovery_state,
                         ),
-                        operation_name="Environment workspace binding",
+                        operation_name="Environment workspace completion recovery",
                         redactor=self._secret_redactor,
+                    ),
+                )
+            elif registered_environment.unclaimed_factory_result is not None:
+                attempt = _EnvironmentLifecycleBindAttempt()
+                try:
+                    bound = await _await_with_environment_lifecycle_reporter(
+                        progress_reporter,
+                        lambda: environment_operation_boundary.await_environment_operation(
+                            lambda: binding._bind_for_environment_lifecycle(
+                                registered_environment.environment.workspace,
+                                registered_environment.environment.runner,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                _attempt=attempt,
+                            ),
+                            operation_name="Environment workspace binding",
+                            redactor=self._secret_redactor,
+                        ),
                     )
                 finally:
                     release_failed_binding_reservations = attempt.release_failed_reservations
@@ -2153,18 +2735,32 @@ class EnvironmentLifecycle:
                         release_failed_binding_reservations
                     )
             else:
-                bound = await environment_operation_boundary.await_environment_operation(
-                    lambda: binding.bind(
-                        registered_environment.environment.workspace,
-                        registered_environment.environment.runner,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
+                bound = await _await_with_environment_lifecycle_reporter(
+                    progress_reporter,
+                    lambda: environment_operation_boundary.await_environment_operation(
+                        lambda: binding.bind(
+                            registered_environment.environment.workspace,
+                            registered_environment.environment.runner,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                        ),
+                        operation_name="Environment workspace binding",
+                        redactor=self._secret_redactor,
                     ),
-                    operation_name="Environment workspace binding",
-                    redactor=self._secret_redactor,
                 )
         except BaseException as exc:
+            try:
+                await _finish_environment_lifecycle(
+                    progress_reporter,
+                    status=EnvironmentLifecycleProgressStatus.FAILED,
+                )
+            except BaseException as progress_error:
+                _add_exception_note_safely(
+                    exc,
+                    "Environment binding lifecycle failure publication also failed: "
+                    f"{type(progress_error).__name__}.",
+                )
             cleanup_status = binding_cleanup_status(exc)
             retry_error: BaseException | None = None
             if cleanup_status is not None:
@@ -2209,6 +2805,18 @@ class EnvironmentLifecycle:
                 ) = await self._release_unexposed_factory_environment(
                     registered_environment,
                     error=exc,
+                    session_id=session.id,
+                    operation_scope_id=(
+                        f"{session.instance_id}:{session.run_epoch}"
+                        if invocation_context is None
+                        else (
+                            f"{invocation_context.binding.interaction_id}:"
+                            f"{invocation_context.binding.run_epoch}"
+                        )
+                    ),
+                    agent_name=registered_agent.spec.name,
+                    execution_profile=execution_profile,
+                    events=events,
                     release_failed_binding_reservations=(release_failed_binding_reservations),
                 )
             finally:
@@ -2322,6 +2930,11 @@ class EnvironmentLifecycle:
         # leave cleanup using the stale pre-bound value.
         setup_owner.release_failed_binding_reservations = None
         _advance_cleanup_environment(setup_owner, bound_registered_environment)
+        await _report_environment_lifecycle(
+            progress_reporter,
+            EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION,
+            EnvironmentLifecycleProgressStatus.STARTED,
+        )
         events.append(
             await self._event_writer.emit(
                 _event_with_binding_generation_authority(
@@ -2354,6 +2967,11 @@ class EnvironmentLifecycle:
                 registered_environment=bound_registered_environment,
             )
         except Exception as exc:
+            await _finish_environment_lifecycle(
+                progress_reporter,
+                status=EnvironmentLifecycleProgressStatus.FAILED,
+                phase=EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION,
+            )
             return EnvironmentBindingResult(
                 registered_environment=bound_registered_environment,
                 events=events,
@@ -2364,6 +2982,15 @@ class EnvironmentLifecycle:
             preserve_factory_allocation=False,
         )
         _advance_cleanup_environment(setup_owner, adopted_environment)
+        await _report_environment_lifecycle(
+            progress_reporter,
+            EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION,
+            EnvironmentLifecycleProgressStatus.COMPLETED,
+        )
+        await _finish_environment_lifecycle(
+            progress_reporter,
+            status=EnvironmentLifecycleProgressStatus.COMPLETED,
+        )
         return EnvironmentBindingResult(
             registered_environment=adopted_environment,
             events=events,
@@ -2434,9 +3061,18 @@ class EnvironmentLifecycle:
                 async with asyncio.timeout(remaining):
                     await self._settle_retained_environment_cleanups()
             except TimeoutError:
-                return False
-            if fence_unavailable:
-                return False
+                # The timeout callback can win the scheduling race after the
+                # exact owners have retired but before this coroutine returns.
+                # Re-read authoritative state rather than reporting a stale
+                # timeout for cleanup that has already converged.
+                return (
+                    not any(
+                        owner.cleanup_started and owner.cleanup_finished
+                        for owner in self._active_environment_setups.values()
+                    )
+                    and not self._deferred_factory_cleanup_tasks
+                    and not self._deferred_run_fence_release_tasks
+                )
             if (
                 not any(
                     owner.cleanup_started and owner.cleanup_finished
@@ -2446,6 +3082,8 @@ class EnvironmentLifecycle:
                 and not self._deferred_run_fence_release_tasks
             ):
                 return True
+            if fence_unavailable:
+                return False
             if (
                 not any(
                     owner.cleanup_started and owner.cleanup_finished
@@ -2566,6 +3204,7 @@ class EnvironmentLifecycle:
                 return EnvironmentBindingFinalizeResult(event=event, events=[])
             setup_owner.cleanup_started = True
             registered_environment = setup_owner.registered_environment
+        events: list[Event] = []
         if (
             registered_environment is not None
             and registered_environment.unclaimed_factory_result is not None
@@ -2580,6 +3219,15 @@ class EnvironmentLifecycle:
                 ) = await self._release_unexposed_factory_environment(
                     registered_environment,
                     error=setup_error,
+                    session_id=session.id,
+                    operation_scope_id=(
+                        f"{session.instance_id}:{session.run_epoch}"
+                        if event.interaction_id is None
+                        else f"{event.interaction_id}:{session.run_epoch}"
+                    ),
+                    agent_name=event.agent_name,
+                    execution_profile=execution_profile,
+                    events=events,
                     release_failed_binding_reservations=(
                         None
                         if setup_owner is None
@@ -2596,10 +3244,10 @@ class EnvironmentLifecycle:
                 terminal_payload["environment_factory_release"] = release_payload
                 event = _copy_event_with_payload(event, terminal_payload)
         if registered_environment is None or registered_environment.bound_workspace is None:
-            return EnvironmentBindingFinalizeResult(event=event, events=[])
+            return EnvironmentBindingFinalizeResult(event=event, events=events)
         binding = registered_environment.environment.binding
         if binding is None:
-            return EnvironmentBindingFinalizeResult(event=event, events=[])
+            return EnvironmentBindingFinalizeResult(event=event, events=events)
         bound_workspace = registered_environment.bound_workspace
 
         terminal_outcome = _binding_outcome_for_terminal_event(event.type)
@@ -2689,7 +3337,19 @@ class EnvironmentLifecycle:
         elif preserve_factory_allocation:
             base_payload["terminal_outcome"] = terminal_outcome
             base_payload["factory_allocation_action"] = "preserve"
-        events: list[Event] = []
+        progress_reporter = self._progress_reporter(
+            operation=EnvironmentLifecycleOperation.FINALIZATION,
+            session_id=session.id,
+            operation_scope_id=(
+                f"{session.instance_id}:{session.run_epoch}"
+                if event.interaction_id is None
+                else f"{event.interaction_id}:{session.run_epoch}"
+            ),
+            agent_name=event.agent_name,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            events=events,
+        )
         start_publication_error: BaseException | None = None
         try:
             events.append(
@@ -2714,6 +3374,11 @@ class EnvironmentLifecycle:
         final_revision: WorkspaceRevisionObservation | None = None
         finalization_delta: dict[str, Any] | None = None
         try:
+            await _report_environment_lifecycle(
+                progress_reporter,
+                EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+                EnvironmentLifecycleProgressStatus.STARTED,
+            )
             final_revision = await environment_operation_boundary.await_environment_operation(
                 lambda: _observe_final_workspace_revision(
                     registered_environment,
@@ -2723,6 +3388,11 @@ class EnvironmentLifecycle:
                 ),
                 operation_name="Final workspace revision observation",
                 redactor=self._secret_redactor,
+            )
+            await _report_environment_lifecycle(
+                progress_reporter,
+                EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+                EnvironmentLifecycleProgressStatus.COMPLETED,
             )
             finalization_delta = await _final_workspace_delta_payload(
                 session_store=self._session_store,
@@ -2780,17 +3450,35 @@ class EnvironmentLifecycle:
                 final_snapshot,
                 parking_cancellation,
                 parking_cancellation_requests,
-            ) = await environment_operation_boundary.await_environment_operation(
-                finalize_and_transfer_parked_allocation,
-                operation_name="Environment binding finalization",
-                redactor=self._secret_redactor,
+            ) = await _await_with_environment_lifecycle_reporter(
+                progress_reporter,
+                lambda: environment_operation_boundary.await_environment_operation(
+                    finalize_and_transfer_parked_allocation,
+                    operation_name="Environment binding finalization",
+                    redactor=self._secret_redactor,
+                ),
             )
             if setup_owner is not None:
                 # The binding reached its own terminal boundary. Any retained
                 # exact-owner retry state is now safe to discard even if
                 # validating or publishing the resulting snapshot later fails.
                 setup_owner.cleanup_release_safe = True
+            await _finish_environment_lifecycle(
+                progress_reporter,
+                status=EnvironmentLifecycleProgressStatus.COMPLETED,
+            )
         except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
+            try:
+                await _finish_environment_lifecycle(
+                    progress_reporter,
+                    status=EnvironmentLifecycleProgressStatus.FAILED,
+                )
+            except BaseException as progress_error:
+                _add_exception_note_safely(
+                    exc,
+                    "Environment finalization lifecycle failure publication also failed: "
+                    f"{type(progress_error).__name__}.",
+                )
             if (
                 parking_reservation is not None
                 and not parking_reservation.ready
@@ -3097,14 +3785,148 @@ class EnvironmentLifecycle:
             ):
                 raise RuntimeError("Environment abort substituted its execution profile.")
             execution_profile = invocation_context.profile
-        try:
-            await self._abort_environment_setup_once(
-                session_id=session_id,
-                original_error=original_error,
-                allow_deferred_settlement=allow_deferred_settlement,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
+        operation_scope_id = (
+            (f"{invocation_context.binding.interaction_id}:{invocation_context.binding.run_epoch}")
+            if invocation_context is not None
+            else (
+                setup_owner.registered_environment.binding_generation_id
+                if setup_owner is not None
+                else session_id
             )
+        )
+        cleanup_progress: RuntimeEnvironmentLifecycleProgressReporter | None = None
+        progress_start_error: BaseException | None = None
+        cleanup_events: list[Event] = []
+        cleanup_operation = EnvironmentLifecycleOperation.RETAINED_CLEANUP
+        cleanup_phase = EnvironmentLifecyclePhase.RETAINED_CLEANUP
+        if (
+            setup_owner is not None
+            and setup_owner.cleanup_started
+            and setup_owner.cleanup_finished
+            and setup_owner.cleanup_error is None
+            and not setup_owner.cleanup_settlement_deferred
+            and not setup_owner.cleanup_requires_finalize_retry
+            and setup_owner.pending_finalize_failure_event is None
+        ):
+            cleanup_operation = EnvironmentLifecycleOperation.RELEASE
+            cleanup_phase = EnvironmentLifecyclePhase.ENVIRONMENT_RELEASE
+        if (
+            setup_owner is not None
+            and setup_owner.registered_environment.unclaimed_factory_result is None
+        ):
+            cleanup_progress = self._progress_reporter(
+                operation=cleanup_operation,
+                session_id=session_id,
+                operation_scope_id=operation_scope_id,
+                agent_name=(
+                    None
+                    if invocation_context is None
+                    else invocation_context.registered_agent.spec.name
+                ),
+                registered_environment=setup_owner.registered_environment,
+                execution_profile=execution_profile,
+                events=cleanup_events,
+            )
+            try:
+                await _report_environment_lifecycle(
+                    cleanup_progress,
+                    cleanup_phase,
+                    EnvironmentLifecycleProgressStatus.STARTED,
+                )
+            except BaseException as exc:
+                # Cleanup remains mandatory even when its diagnostic start
+                # cannot be published. Surface that failure only after the
+                # exact owner has reached a safe settlement boundary.
+                progress_start_error = exc
+                cleanup_progress = None
+        try:
+            try:
+                await _await_with_environment_lifecycle_reporter(
+                    cleanup_progress,
+                    lambda: self._abort_environment_setup_once(
+                        session_id=session_id,
+                        operation_scope_id=operation_scope_id,
+                        original_error=original_error,
+                        allow_deferred_settlement=allow_deferred_settlement,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                    ),
+                )
+            except BaseException as exc:
+                retained = self._has_retained_environment_cleanup(session_id)
+                if cleanup_progress is not None:
+                    try:
+                        await _finish_environment_lifecycle(
+                            cleanup_progress,
+                            status=(
+                                EnvironmentLifecycleProgressStatus.RETAINED
+                                if retained
+                                else EnvironmentLifecycleProgressStatus.FAILED
+                            ),
+                            phase=cleanup_phase,
+                            retained_owner=retained,
+                        )
+                        if (
+                            retained
+                            and cleanup_operation is EnvironmentLifecycleOperation.RELEASE
+                            and setup_owner is not None
+                        ):
+                            await self._record_retained_cleanup_owner(
+                                session_id=session_id,
+                                operation_scope_id=operation_scope_id,
+                                agent_name=(
+                                    None
+                                    if invocation_context is None
+                                    else invocation_context.registered_agent.spec.name
+                                ),
+                                registered_environment=setup_owner.registered_environment,
+                                execution_profile=execution_profile,
+                                events=cleanup_events,
+                            )
+                    except BaseException as progress_error:
+                        _add_exception_note_safely(
+                            exc,
+                            "Environment retained-cleanup lifecycle failure publication "
+                            f"also failed: {type(progress_error).__name__}.",
+                        )
+                if progress_start_error is not None:
+                    _add_exception_note_safely(
+                        exc,
+                        "Environment retained-cleanup lifecycle start publication failed: "
+                        f"{type(progress_start_error).__name__}.",
+                    )
+                raise
+            retained = self._has_retained_environment_cleanup(session_id)
+            if cleanup_progress is not None:
+                await _finish_environment_lifecycle(
+                    cleanup_progress,
+                    status=(
+                        EnvironmentLifecycleProgressStatus.RETAINED
+                        if retained
+                        else EnvironmentLifecycleProgressStatus.COMPLETED
+                    ),
+                    phase=cleanup_phase,
+                    retained_owner=retained,
+                )
+                if (
+                    retained
+                    and cleanup_operation is EnvironmentLifecycleOperation.RELEASE
+                    and setup_owner is not None
+                ):
+                    await self._record_retained_cleanup_owner(
+                        session_id=session_id,
+                        operation_scope_id=operation_scope_id,
+                        agent_name=(
+                            None
+                            if invocation_context is None
+                            else invocation_context.registered_agent.spec.name
+                        ),
+                        registered_environment=setup_owner.registered_environment,
+                        execution_profile=execution_profile,
+                        events=cleanup_events,
+                    )
+            if progress_start_error is not None:
+                raise progress_start_error
         finally:
             self._signal_environment_cleanup_state_changed(session_id)
 
@@ -3112,6 +3934,7 @@ class EnvironmentLifecycle:
         self,
         *,
         session_id: str,
+        operation_scope_id: str,
         original_error: BaseException | None,
         allow_deferred_settlement: bool = False,
         execution_profile: ExecutionProfileIdentity | None = None,
@@ -3346,11 +4169,21 @@ class EnvironmentLifecycle:
         if original_error is None:
             original_error = RuntimeError("Environment setup ended without terminal cleanup.")
         if registered_environment.unclaimed_factory_result is not None:
+            cleanup_events: list[Event] = []
             try:
                 try:
                     await self._release_unexposed_factory_environment(
                         registered_environment,
                         error=original_error,
+                        session_id=session_id,
+                        operation_scope_id=operation_scope_id,
+                        agent_name=(
+                            None
+                            if setup_owner.invocation_context is None
+                            else setup_owner.invocation_context.registered_agent.spec.name
+                        ),
+                        execution_profile=execution_profile,
+                        events=cleanup_events,
                         release_failed_binding_reservations=(
                             setup_owner.release_failed_binding_reservations
                         ),

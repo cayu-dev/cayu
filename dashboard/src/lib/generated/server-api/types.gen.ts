@@ -535,6 +535,7 @@ export type ApiEnvironmentSummary = {
      * Knowledge Store Type
      */
     knowledge_store_type: string | null;
+    lifecycle_policy: EnvironmentLifecyclePolicy | null;
     /**
      * Mcp Server Count
      */
@@ -2062,7 +2063,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '14';
+    schema_version?: '16';
     stores: StoreManifest;
 };
 
@@ -4309,6 +4310,64 @@ export type CostSessionTotals = {
 };
 
 /**
+ * DurableOperationOwnership
+ *
+ * Bounded fencing authority embedded in one feature-owned record.
+ */
+export type DurableOperationOwnership = {
+    /**
+     * Acquired At
+     */
+    acquired_at: string;
+    /**
+     * Claim Id
+     */
+    claim_id: string;
+    /**
+     * Generation
+     */
+    generation: number;
+    /**
+     * Lease Expires At
+     */
+    lease_expires_at: string | null;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    /**
+     * Owner Id
+     */
+    owner_id: string;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.durable-operation-ownership';
+    /**
+     * Released At
+     */
+    released_at?: string | null;
+    /**
+     * Renewed At
+     */
+    renewed_at: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Settled At
+     */
+    settled_at?: string | null;
+    state?: DurableOperationOwnershipState;
+};
+
+/**
+ * DurableOperationOwnershipState
+ */
+export type DurableOperationOwnershipState = 'active' | 'released' | 'settled';
+
+/**
  * EgressAuthorityBindingIdentity
  *
  * One destination/credential class bound to a named policy.
@@ -4462,6 +4521,39 @@ export type EnqueueSessionMessageBody = {
 };
 
 /**
+ * EnvironmentLifecyclePhase
+ *
+ * Content-free phases shared by factories, bindings, and cleanup.
+ */
+export type EnvironmentLifecyclePhase = 'ownership_admission' | 'factory_provisioning' | 'factory_reconnect' | 'source_observation' | 'staging_admission' | 'archive_preparation' | 'transfer' | 'target_materialization' | 'execution_ready_publication' | 'final_source_observation' | 'final_target_observation' | 'copy_back_conflict_preflight' | 'copy_back_publication' | 'environment_release' | 'retained_cleanup';
+
+/**
+ * EnvironmentLifecyclePolicy
+ *
+ * Finite lifecycle, phase, and progress-volume ceilings for one environment.
+ */
+export type EnvironmentLifecyclePolicy = {
+    /**
+     * Lifecycle Timeout Seconds
+     */
+    lifecycle_timeout_seconds?: number;
+    /**
+     * Max Progress Events
+     */
+    max_progress_events?: number;
+    /**
+     * Phase Timeout Seconds
+     */
+    phase_timeout_seconds?: {
+        [key: string]: number;
+    };
+    /**
+     * Progress Min Interval Seconds
+     */
+    progress_min_interval_seconds?: number;
+};
+
+/**
  * EnvironmentManifest
  */
 export type EnvironmentManifest = {
@@ -4490,6 +4582,12 @@ export type EnvironmentManifest = {
      * Knowledge Store
      */
     knowledge_store: string | null;
+    /**
+     * Lifecycle Policy
+     */
+    lifecycle_policy: {
+        [key: string]: unknown;
+    } | null;
     /**
      * Mcp Servers
      */
@@ -9727,14 +9825,7 @@ export type MemoryInterventionExecutionRecord = {
      * Runtime Deadline At
      */
     runtime_deadline_at?: string | null;
-    /**
-     * Runtime Dispatch Lease Expires At
-     */
-    runtime_dispatch_lease_expires_at?: string | null;
-    /**
-     * Runtime Dispatch Owner Id
-     */
-    runtime_dispatch_owner_id?: string | null;
+    runtime_dispatch_ownership?: DurableOperationOwnership | null;
     /**
      * Runtime Evidence Fingerprint
      */
@@ -9757,10 +9848,7 @@ export type MemoryInterventionExecutionRecord = {
      * Runtime Runner Fingerprint
      */
     runtime_runner_fingerprint: string;
-    /**
-     * Runtime Session Claim Id
-     */
-    runtime_session_claim_id?: string | null;
+    runtime_session_create_claim?: RuntimeSessionCreateClaimReference | null;
     /**
      * Runtime Timeout Observed
      */
@@ -9768,7 +9856,7 @@ export type MemoryInterventionExecutionRecord = {
     /**
      * Schema Version
      */
-    schema_version?: 1;
+    schema_version?: 2;
     /**
      * Session Id
      */
@@ -13098,6 +13186,24 @@ export type RecallItemAdmission = 'admitted' | 'offered';
 export type RecallItemSelectionReason = 'calibrated_strong_match' | 'calibrated_plausible_match' | 'duplicate_strong_reference' | 'strong_match_not_focused' | 'strong_match_offered_by_mode' | 'explicit_application_selection';
 
 /**
+ * RecoveryCleanupPolicyManifest
+ */
+export type RecoveryCleanupPolicyManifest = {
+    /**
+     * Max Supervised Tasks
+     */
+    max_supervised_tasks: number;
+    /**
+     * Overall Timeout Seconds
+     */
+    overall_timeout_seconds: number;
+    /**
+     * Step Timeout Seconds
+     */
+    step_timeout_seconds: number;
+};
+
+/**
  * RegistrationProvenance
  */
 export type RegistrationProvenance = {
@@ -13505,6 +13611,7 @@ export type RuntimeManifest = {
      * Mcp Manifest Policy
      */
     mcp_manifest_policy: string | null;
+    recovery_cleanup_policy: RecoveryCleanupPolicyManifest;
     request_footprint: RequestFootprintConfigManifest;
     /**
      * Retry Policy
@@ -13519,6 +13626,42 @@ export type RuntimeManifest = {
      * Tool Timeout Seconds
      */
     tool_timeout_seconds: number | null;
+};
+
+/**
+ * RuntimeSessionCreateClaimReference
+ *
+ * Secret-free keyed identity for reconstructing one private create claim.
+ */
+export type RuntimeSessionCreateClaimReference = {
+    /**
+     * Claim Id
+     */
+    claim_id: string;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.runtime-session-create-claim-reference';
+    /**
+     * Request Authority Hmac Sha256
+     */
+    request_authority_hmac_sha256: string;
+    /**
+     * Request Authority Key Id
+     */
+    request_authority_key_id: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Session Id
+     */
+    session_id: string;
 };
 
 /**

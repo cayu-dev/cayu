@@ -17,6 +17,8 @@ from cayu import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
+    EnvironmentLifecyclePhase,
+    EnvironmentLifecyclePolicy,
     EnvironmentSpec,
     ExecCommandTool,
     ExecutionRequirements,
@@ -158,7 +160,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "15"
+    assert manifest.schema_version == "16"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -195,6 +197,33 @@ def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:
 
     assert first.runtime.max_environment_lifecycle_owners == 1
     assert second.runtime.max_environment_lifecycle_owners == 2
+    assert first.fingerprint != second.fingerprint
+
+
+def test_environment_lifecycle_policy_is_manifested_and_fingerprinted() -> None:
+    def described(timeout_seconds: float):
+        app = CayuApp(enable_logging=False)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(
+                    name="sandbox",
+                    lifecycle_policy=EnvironmentLifecyclePolicy(
+                        lifecycle_timeout_seconds=timeout_seconds,
+                        phase_timeout_seconds={EnvironmentLifecyclePhase.TRANSFER: 3.0},
+                    ),
+                )
+            ),
+            default=True,
+        )
+        return app.describe()
+
+    first = described(20.0)
+    second = described(21.0)
+
+    policy = first.environments[0].lifecycle_policy
+    assert policy is not None
+    assert policy["lifecycle_timeout_seconds"] == 20.0
+    assert policy["phase_timeout_seconds"]["transfer"] == 3.0
     assert first.fingerprint != second.fingerprint
 
 
@@ -610,7 +639,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "15"
+    assert schema["properties"]["schema_version"]["const"] == "16"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -719,7 +748,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "15",
+                "schema_version": "16",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {

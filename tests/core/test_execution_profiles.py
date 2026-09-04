@@ -59,6 +59,7 @@ from cayu import (
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
+    EnvironmentLifecyclePolicy,
     EnvironmentSpec,
     Event,
     EventType,
@@ -4861,6 +4862,59 @@ def test_public_resume_rejects_changed_environment_identity_before_work() -> Non
                     ResumeRequest(
                         session_id=session_id,
                         messages=[Message.text("user", "changed environment")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        )
+        assert replacement_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_public_resume_rejects_changed_environment_lifecycle_policy_before_work() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-environment-lifecycle-policy"
+        store = InMemorySessionStore()
+
+        def configured_app(timeout_seconds: float) -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(
+                        name="sandbox",
+                        lifecycle_policy=EnvironmentLifecyclePolicy(
+                            lifecycle_timeout_seconds=timeout_seconds
+                        ),
+                    )
+                ),
+                default=True,
+            )
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app, provider
+
+        original_app, _original_provider = configured_app(20.0)
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        replacement_app, replacement_provider = configured_app(21.0)
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed lifecycle policy")],
                     )
                 )
             )

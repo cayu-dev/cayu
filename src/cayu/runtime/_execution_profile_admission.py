@@ -1961,6 +1961,15 @@ def _environment_identity_material(
                     if factory_managed
                     else ("present" if environment.runner is not None else "none")
                 ),
+                **(
+                    {}
+                    if registered_environment.spec.lifecycle_policy is None
+                    else {
+                        "lifecycle_policy": (
+                            registered_environment.spec.lifecycle_policy.model_dump(mode="json")
+                        )
+                    }
+                ),
             },
             "execution_requirements": execution_requirements,
         },

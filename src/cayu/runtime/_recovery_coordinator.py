@@ -15617,6 +15617,14 @@ class RecoveryCoordinator:
             raise RuntimeError(
                 "Active invocation execution profile does not match the recovery epoch."
             )
+        unsettled_environment_lifecycle = await self._environment_lifecycle.has_unsettled_progress(
+            session_id=session.id,
+            interaction_id=(
+                None
+                if active_invocation_profile is None
+                else active_invocation_profile.interaction_id
+            ),
+        )
         durable_child_guard = await self._pending_durable_subagent_recovery_guard(
             session=session,
             checkpoint=checkpoint,
@@ -15667,6 +15675,7 @@ class RecoveryCoordinator:
                 or bool(workspace_observations)
                 or pending_provider_disposition is not None
                 or pending_completion_finalization is not None
+                or unsettled_environment_lifecycle
             )
             if not terminal_repair and not has_pending_work:
                 if active_invocation_profile is not None and not (
@@ -15759,6 +15768,7 @@ class RecoveryCoordinator:
             and active_model_completion is None
             and not workspace_observations
             and pending_provider_disposition is None
+            and not unsettled_environment_lifecycle
             and EXECUTION_PROFILE_METADATA_KEY in session.metadata
         ):
             interaction_records = await self._session_store.query_events(
@@ -15917,9 +15927,18 @@ class RecoveryCoordinator:
                 )
             if provider_disposition_after_admission is not None:
                 await provider_disposition_after_admission()
-            return await self._recover_incomplete_session_with_heartbeat(
-                claim=claim,
-                recovery=lambda: self._recover_incomplete_session(
+
+            async def recover_claimed_session() -> IncompleteSessionRecoveryResult:
+                lifecycle_events = await self._environment_lifecycle.reconcile_orphaned_progress(
+                    session_id=claim.session.id,
+                    interaction_id=(
+                        None
+                        if active_invocation_profile is None
+                        else active_invocation_profile.interaction_id
+                    ),
+                    observed_at=self._clock(),
+                )
+                recovered = await self._recover_incomplete_session(
                     session=claim.session,
                     session_before_fence=claim.session_before_fence,
                     previous_status=previous_status,
@@ -15937,7 +15956,32 @@ class RecoveryCoordinator:
                     provider_disposition_task_worker_id=(provider_disposition_task_worker_id),
                     provider_disposition_task_handoff_id=(provider_disposition_task_handoff_id),
                     interrupt_for_manual_tool_recovery=(interrupt_for_manual_tool_recovery),
-                ),
+                )
+                if not lifecycle_events:
+                    return recovered
+                retained_actions = tuple(
+                    action
+                    for action in recovered.actions
+                    if action is not IncompleteSessionRecoveryAction.SKIPPED_TERMINAL
+                )
+                return recovered.model_copy(
+                    update={
+                        "actions": (
+                            IncompleteSessionRecoveryAction.RECONCILED_ENVIRONMENT_LIFECYCLE,
+                            *retained_actions,
+                        ),
+                        "events": (*lifecycle_events, *recovered.events),
+                        "message": (
+                            "Reconciled orphaned environment lifecycle progress. "
+                            + recovered.message
+                        ),
+                    },
+                    deep=True,
+                )
+
+            return await self._recover_incomplete_session_with_heartbeat(
+                claim=claim,
+                recovery=recover_claimed_session,
             )
         except BaseException as exc:
             authoritative_failure = exc
