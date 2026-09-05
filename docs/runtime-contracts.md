@@ -7715,6 +7715,33 @@ sanitizing secrets.
 
 Model providers translate model-specific APIs into Cayu runtime contracts.
 
+OpenAI Responses protocol failures emitted by `OpenAIProvider.stream()` retain
+credential-safe diagnostics in the error payload and persisted/public
+`model.error` events:
+
+| Field | Contract |
+| --- | --- |
+| `provider_protocol_reason` | Stable allowlisted validation code, at most 128 ASCII characters. `unspecified` means the exception supplied no recognized identity (including legacy/custom transports and shared HTTP/SSE decoding failures). |
+| `provider_protocol_stage` | Static validator category: `response`, `stream`, `hosted_tool`, `recovery`, `request`, or `unknown`. This is not a copied wire event type. |
+| `provider_protocol_field` | Optional static schema path, such as `output[].action.type`; `[]` stands for any array index. Omitted when the validator cannot identify one safe path. |
+
+For example, an unsupported hosted-search action produces
+`web_search_action_type_is_unsupported`, while a conflicting streamed response ID
+produces `stream_emitted_conflicting_response_identities`. The complete allowlist
+is maintained in [`_openai_protocol.py`](../src/cayu/providers/_openai_protocol.py).
+Existing codes remain stable when parser messages change; applications should
+accept new codes and missing fields on older events. Direct `OpenAIProtocolError`
+instances expose `reason_code`; only the allowlisted event projection is safe to
+persist. Exception messages, provider values, URLs, queries, prompts, credentials,
+and encrypted reasoning never populate these diagnostic fields.
+
+These fields identify Cayu's rejected validation check, not whether the provider
+or adapter caused the incompatibility. They do not affect
+`provider_error_type="protocol_error"`, bounded `unknown_provider` retries, or
+hosted-tool `outcome_unknown` accounting. The generic error message and existing
+post-completion failure handling remain unchanged.
+
+
 Provider adapters must:
 
 - receive a copied `ModelRequest`

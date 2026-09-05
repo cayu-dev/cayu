@@ -8304,3 +8304,187 @@ def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert [message.role for message in transcript] == ["user", "assistant"]
     assert transcript[-1] == Message.text("assistant", "ok")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("failure", "reason", "stage", "field"),
+    [
+        (
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_safe",
+                    "status": "completed",
+                    "action": {"type": "sk-secret-malicious-action"},
+                },
+            },
+            "web_search_action_type_is_unsupported",
+            "hosted_tool",
+            "output[].action.type",
+        ),
+        (
+            {
+                "type": "response.web_search_call.searching",
+                "output_index": 0,
+                "item_id": "sk-secret-malicious-identity",
+            },
+            "web_search_lifecycle_item_id_mismatch",
+            "stream",
+            None,
+        ),
+        (
+            {"type": "response.created", "response": {"id": "sk-secret-other-response"}},
+            "stream_emitted_conflicting_response_identities",
+            "stream",
+            None,
+        ),
+    ],
+)
+async def test_openai_protocol_diagnostics_survive_sqlite_and_unknown_retries(
+    tmp_path,
+    failure,
+    reason,
+    stage,
+    field,
+) -> None:
+    from cayu import OpenAIWebSearch
+
+    raw = [
+        {"type": "response.created", "response": {"id": "resp_safe"}},
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_safe", "status": "in_progress"},
+        },
+        failure,
+    ]
+    provider = OpenAIProvider(
+        api_key="sk-secret",
+        transport=RecordingTransport(stream_events=[raw]),
+    )
+    public = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="gpt-5.6",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+    ]
+    public_error = next(event for event in public if event.type == ModelStreamEventType.ERROR)
+    expected = {"provider_protocol_reason": reason, "provider_protocol_stage": stage}
+    if field is not None:
+        expected["provider_protocol_field"] = field
+    assert {
+        key: value
+        for key, value in public_error.payload.items()
+        if key.startswith("provider_protocol_")
+    } == expected
+    assert "sk-secret" not in repr(public_error.payload)
+
+    database = tmp_path / "protocol.sqlite3"
+    store = SQLiteSessionStore(database)
+    transport = RecordingTransport(stream_events=[raw, raw])
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(OpenAIProvider(api_key="sk-secret", transport=transport), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"), hosted_tools=[OpenAIWebSearch()]
+    )
+    events = await _collect_events(
+        app,
+        RunRequest(
+            agent_name="assistant",
+            session_id="protocol-diagnostics",
+            messages=[Message.text("user", "hello")],
+            retry_policy=RetryPolicy(max_attempts=5, max_unknown_attempts=2, initial_delay_s=0),
+        ),
+    )
+    assert len(transport.calls) == 2
+    retries = [event for event in events if event.type == EventType.MODEL_RETRY]
+    assert len(retries) == 1
+    assert retries[0].payload["reason"] == "unknown_provider"
+    persisted = await SQLiteSessionStore(database).load_events("protocol-diagnostics")
+    errors = [event for event in persisted if event.type == EventType.MODEL_ERROR]
+    assert len(errors) == 2
+    public_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    assert len(public_errors) == 2
+    for event in [*errors, *public_errors]:
+        assert event.payload["provider_error_type"] == "protocol_error"
+        assert event.payload["effective_max_attempts"] == 2
+        assert {
+            key: value
+            for key, value in event.payload.items()
+            if key.startswith("provider_protocol_")
+        } == expected
+        assert "sk-secret" not in repr(event.payload)
+    hosted = [event for event in persisted if event.type == EventType.MODEL_HOSTED_TOOL_CALL]
+    assert [event.payload["status"] for event in hosted] == [
+        "in_progress",
+        "outcome_unknown",
+        "in_progress",
+        "outcome_unknown",
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reason", ["sk-secret", "x" * 10000, ["unhashable"], None])
+async def test_openai_protocol_diagnostics_reject_untrusted_exception_attributes(reason) -> None:
+    class MaliciousTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs):
+            error = OpenAIProtocolError("sk-secret prompt encrypted reasoning body")
+            error.reason_code = reason
+            error.provider_protocol_stage = "sk-secret"
+            error.provider_protocol_field = "sk-secret"
+            raise error
+            yield {}
+
+    provider = OpenAIProvider(api_key="sk-secret", transport=MaliciousTransport())
+    events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="gpt-5.6",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+    ]
+    assert len(events) == 1
+    assert events[0].payload == {
+        "error": "OpenAIProtocolError: OpenAI provider failed",
+        "error_type": "OpenAIProtocolError",
+        "provider_error_type": "protocol_error",
+        "provider_protocol_reason": "unspecified",
+        "provider_protocol_stage": "unknown",
+    }
+
+
+@pytest.mark.anyio
+async def test_openai_protocol_diagnostics_reject_string_subclass_without_inspecting_it() -> None:
+    class UntrustedReason(str):
+        def __hash__(self):
+            raise AssertionError("Untrusted reason must not be hashed")
+
+        def __str__(self):
+            raise AssertionError("Untrusted reason must not be stringified")
+
+    class FailingTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs):
+            raise OpenAIProtocolError(
+                "secret response body",
+                reason_code=UntrustedReason("web_search_action_type_is_unsupported"),
+            )
+            yield {}
+
+    provider = OpenAIProvider(api_key="secret", transport=FailingTransport())
+    events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(model="gpt-test", messages=[Message.text("user", "hello")])
+        )
+    ]
+    assert events[0].payload["provider_protocol_reason"] == "unspecified"
+    assert events[0].payload["provider_protocol_stage"] == "unknown"
+    assert "secret" not in repr(events[0].payload)
