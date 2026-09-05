@@ -9564,6 +9564,44 @@ evidence transitions to `reconstruction_required`; baseline drift is a source
 conflict. The complete state vocabulary and generated application ownership are
 documented in [Maintained coding product](coding-product.md).
 
+### Approved remote Git delivery
+
+`RemoteGitDeliveryBroker` is the optional provider-independent delivery layer
+above an accepted coding-product publication. Its immutable request binds the
+source, diff, check, repository, configured remote alias, exact base commit,
+new namespaced destination branch, commit metadata, broker behavior, policy,
+credential and egress profile identities, limits, and idempotency key. The
+application maps the public alias to a remote URL and vault-backed credential
+refs in `RemoteGitBrokerProfile`; none of that host authority is model input or
+coding-environment state. Request repository and broker-repository identities
+must exactly match the profile before preparation.
+
+Preparation revalidates the durable coding-product result, complete source
+manifest, retained diff and checks, fresh base and destination state, then
+materializes an isolated broker-owned repository. The broker rejects protected
+paths, links, submodules, unresolved index stages, and staged bytes changed by
+attributes or filters. It publishes the exact tree before commit or remote
+write. A separate durable approval must match the request, tree, and policy
+fingerprints and explicitly authorize both commit and push effects.
+
+Structured Git invocations use the profile's exact executable with isolated
+home/config, disabled hooks, helpers, prompting, external diff, signing, editor,
+pager, submodule recursion, and ambient SSH state. Remote credentials are
+resolved only for the subprocess and output is secret-redacted before step
+evidence. The push is one exact commit to one new branch with an empty
+expected-value lease; default-branch, existing-ref, force, delete, tag, merge,
+and multi-ref effects are not representable in v1. Applications separately
+enforce the declared egress profile around this trusted host process.
+
+`pushed` requires a fresh remote observation equal to the exact verified commit
+and successful broker-root cleanup. Its result alone exposes the `next_commit`
+and `next_ref` authority that a later forge connector may consume. Durable
+lifecycle and result evidence distinguish approval-required, denial, conflict,
+local commit, pushing, failure, cancellation, partial cleanup, ambiguous
+acknowledgement, and reconstruction. Recovery observes the remote before retry,
+reuses only the retained exact commit, and never broadens or duplicates an
+uncertain write. See [Approved remote Git delivery](remote-git-delivery.md).
+
 An isolation boundary separates guest execution from the host or control
 plane. Network denial restricts reachable destinations but does not itself
 create that boundary. Real-secret non-possession means the workload never

@@ -634,6 +634,25 @@ captured/fresh/judged artifacts, explicit candidate/judge work and cost
 thresholds, and stable comparison exits. CI selection now fails open for all
 package guide and Evals live-acceptance inputs.
 
+### Approved host-side remote Git delivery
+
+Docker coding applications may select `cayu new --with remote-git-delivery` to
+generate a separate application-owned integration seam. The maintained broker
+consumes only an accepted immutable coding-product result, verifies an exact
+source tree and configured remote base, publishes that tree for durable
+approval, and then creates and pushes one exact commit to a new namespaced
+branch with an empty expected-value lease. The coding agent never receives the
+remote URL, credentials, broker repository, or network authority.
+
+Vault-backed HTTPS credentials are resolved only at the structured Git process
+boundary and are redacted from evidence. Inherited Git configuration, hooks,
+helpers, filters, protected paths, links, submodules, default-branch writes,
+existing-ref updates, deletion, tags, and merge are rejected. Fresh remote
+observation and broker cleanup are both required for `pushed`; durable states
+distinguish conflicts, rejection, cancellation, partial cleanup, ambiguous
+acknowledgements, and reconstruction requirements. Pull-request, checks, and
+merge behavior remain outside this provider-independent layer.
+
 ### `cayu new` emits the complete Cayu application convention
 
 Normal generated projects now begin with stable homes for configuration,

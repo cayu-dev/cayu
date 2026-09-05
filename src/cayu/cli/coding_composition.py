@@ -2194,6 +2194,87 @@ class CodingProductApplication:
 '''
 
 
+_REMOTE_GIT_INTEGRATION_PY = '''"""Optional approved host-side Git delivery boundary."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from cayu import (
+    ArtifactStore,
+    CodingProductArtifactRepository,
+    RemoteGitBrokerProfile,
+    RemoteGitDeliveryBroker,
+    RemoteGitDeliveryRepository,
+    RemoteGitRemoteConfig,
+    remote_git_broker_behavior_fingerprint,
+)
+
+REMOTE_GIT_DELIVERY_ENABLED = __REMOTE_GIT_ENABLED__
+
+
+def build_remote_git_delivery_broker(
+    *,
+    artifact_store: ArtifactStore,
+    broker_root: str | Path,
+    git_executable: str,
+    repository_id: str,
+    broker_repository_id: str,
+    remote_url: str,
+    remote_identity: str,
+    default_branch_ref: str,
+) -> RemoteGitDeliveryBroker:
+    """Construct the separate no-credential default delivery integration.
+
+    Extend this application-owned seam with RemoteGitHttpCredentials and a
+    SecretResolver when the admitted remote requires authentication. Never pass
+    the resulting broker, remote URL, credential refs, or network authority to
+    the coding agent or its Docker environment.
+    """
+
+    if not REMOTE_GIT_DELIVERY_ENABLED:
+        raise RuntimeError(
+            "Remote Git delivery is disabled; regenerate with "
+            "--with remote-git-delivery or make an explicit application decision."
+        )
+    coding_repository = CodingProductArtifactRepository(artifact_store)
+    remote = RemoteGitRemoteConfig(
+        alias="origin",
+        remote_identity=remote_identity,
+        url=remote_url,
+        default_branch_ref=default_branch_ref,
+    )
+    profile = RemoteGitBrokerProfile(
+        broker_id="__PROJECT_NAME__-remote-git",
+        repository_id=repository_id,
+        broker_repository_id=broker_repository_id,
+        root=Path(broker_root),
+        git_executable=git_executable,
+        behavior_fingerprint=remote_git_broker_behavior_fingerprint(),
+        remotes={"origin": remote},
+    )
+    return RemoteGitDeliveryBroker(
+        profile,
+        repository=RemoteGitDeliveryRepository(artifact_store),
+        coding_repository=coding_repository,
+    )
+'''
+
+
+_REMOTE_GIT_README_APPEND = """
+
+## Optional remote Git delivery
+
+This scaffold selected `--with remote-git-delivery`. The coding container still
+has no remote, network, host `.git`, or credential authority. Construct the
+host-side broker through `integrations/remote_git.py`, prepare an exact tree,
+obtain durable application approval for that prepared tree, and only then call
+the broker with the same immutable request. The v1 destination is a new branch
+under the configured `refs/heads/cayu/` namespace; force updates, default-branch
+writes, deletion, tags, merge, and pull-request effects are forbidden.
+"""
+
+
 _DOCKER_PRIMARY_AGENT_PY = '''"""Primary Docker coding agent for __PROJECT_NAME__."""
 
 from cayu import AgentSpec, ExecutionProfileBehaviorIdentity
@@ -5868,6 +5949,12 @@ def coding_project_files(
                 "operations/coding.py": coding_render(_docker_composition_source(_COMPOSITION_PY)),
                 "domain/coding_product.py": _CODING_PRODUCT_DOMAIN_PY,
                 "workflows/coding_product.py": _CODING_PRODUCT_WORKFLOW_PY,
+                "integrations/remote_git.py": coding_render(
+                    _REMOTE_GIT_INTEGRATION_PY.replace(
+                        "__REMOTE_GIT_ENABLED__",
+                        repr("remote-git-delivery" in selected),
+                    )
+                ),
                 "prompts/coding.py": coding_render(_DOCKER_CODING_PROMPTS_PY),
                 "agents/agent.py": coding_render(_DOCKER_PRIMARY_AGENT_PY),
                 "tests/test_coding_composition.py": coding_render(
@@ -5879,5 +5966,7 @@ def coding_project_files(
             }
         )
         coding_files["README.md"] += coding_render(_DOCKER_README_APPEND)
+        if "remote-git-delivery" in selected:
+            coding_files["README.md"] += coding_render(_REMOTE_GIT_README_APPEND)
         coding_files["AGENTS.md"] += coding_render(_DOCKER_AGENTS_APPEND)
     return coding_files

@@ -179,4 +179,6 @@ projects must not parse Cayu's private authority metadata or import private
 External delivery is a separate optional composition. It should consume only an
 accepted immutable coding-product artifact, establish its own credentials,
 idempotency, provider authority, and receipts, and retain commit/push/PR/CI/merge
-state independently.
+state independently. Cayu's maintained first layer is the
+[approved remote Git delivery](remote-git-delivery.md) broker, selected in a
+generated Docker coding application with `--with remote-git-delivery`.

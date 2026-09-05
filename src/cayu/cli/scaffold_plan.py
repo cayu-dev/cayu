@@ -307,6 +307,15 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         files=("configuration/runtime.py", "observability/"),
         verification=("uv run --no-sync cayu inspect --json", "uv run --no-sync pytest"),
     ),
+    CapabilitySpec(
+        name="remote-git-delivery",
+        summary="Approved host-side commit and push of an exact patch-ready result.",
+        status="selectable",
+        supported_presets=("coding",),
+        supported_executions=("docker",),
+        files=("integrations/remote_git.py",),
+        verification=("uv run --no-sync pytest -q tests/test_coding_composition.py",),
+    ),
 )
 
 _PRESET_BY_NAME = {spec.name: spec for spec in PRESETS}

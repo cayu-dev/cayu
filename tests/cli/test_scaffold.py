@@ -529,6 +529,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         "docker-coding-build.json",
         "docker-coding-image.json",
         "domain/coding_product.py",
+        "integrations/remote_git.py",
         "tests/test_project.py",
         "workflows/coding_product.py",
     }
@@ -558,6 +559,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     readme = (project / "README.md").read_text(encoding="utf-8")
     domain_source = (project / "domain" / "coding_product.py").read_text(encoding="utf-8")
     workflow_source = (project / "workflows" / "coding_product.py").read_text(encoding="utf-8")
+    remote_git_source = (project / "integrations" / "remote_git.py").read_text(encoding="utf-8")
     assert "DockerCodingEnvironmentFactory" in composition_source
     assert "DockerWorkspaceTransferLimits" in composition_source
     assert "RunCheckTool" in composition_source
@@ -595,6 +597,8 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert "source_git_authority_validator=self._validate_source_git_authority" in workflow_source
     assert "admit_or_recover_coding_product_request" in workflow_source
     assert "register_coding_product_contract" in workflow_source
+    assert "REMOTE_GIT_DELIVERY_ENABLED = False" in remote_git_source
+    assert "RemoteGitDeliveryBroker" in remote_git_source
     assert json.loads((project / "docker-coding-image.json").read_text())["content_digest"] is None
     build_configuration = json.loads((project / "docker-coding-build.json").read_text())
     assert build_configuration["cayu_wheel"] is None

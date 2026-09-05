@@ -139,6 +139,12 @@ inspection, and configured review gates settle. It performs no commit, push,
 pull-request, CI, or merge effect. See the
 [maintained coding product](docs/coding-product.md).
 
+Add `--with remote-git-delivery` to generate the optional host-side broker seam.
+It prepares the exact patch-ready tree for application approval, then can create
+and push one exact commit to a new configured branch without exposing remote or
+credential authority to the coding agent. See
+[approved remote Git delivery](docs/remote-git-delivery.md).
+
 The generated repository starts from a clean Git commit, and each new product
 run requires a clean committed Git source baseline. It also requires `git`,
 `rg`, and the POSIX descriptor-relative filesystem primitives used by secure
@@ -587,6 +593,7 @@ Start with the document that matches the job:
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
 | Produce a durable checked patch without external delivery | [Maintained coding product](docs/coding-product.md) |
+| Deliver an approved exact patch to a new remote Git branch | [Approved remote Git delivery](docs/remote-git-delivery.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
 | Contain a non-cooperative trusted host dependency behind a hard deadline | [Process-isolated host tools](https://github.com/cayu-tech/cayu/blob/main/docs/process-isolated-tools.md) |
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |

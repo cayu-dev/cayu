@@ -136,6 +136,13 @@ review gates settled under exact admitted authority. It does not mean Cayu
 committed, pushed, opened a pull request, waited for CI, or merged. See
 [Maintained coding product](coding-product.md).
 
+Selecting `--with remote-git-delivery` additionally activates
+`integrations/remote_git.py`. This is a separate application-host broker that
+consumes only an immutable patch-ready publication, prepares an exact tree for
+durable approval, and can push one exact commit to a new configured branch. It
+does not expose Git remotes, credentials, or network authority to the coding
+agent. See [Approved remote Git delivery](remote-git-delivery.md).
+
 The composition selects concrete implementations; selection is not authority.
 The registered exposure policy separately decides which tools are model-visible,
 and ordinary tool policy, approval policy, and runtime gates independently
