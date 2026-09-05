@@ -42,6 +42,50 @@ schema, HTTP, storage, embedding, and operational reference.
 
 ## Minimal Example
 
+### Multiple CPU cores from the CLI
+
+For a project with a configured native `EvalPlan` factory:
+
+```bash
+cayu eval run --processes 32 --max-concurrency 100 \
+  --process-directory .cayu/evals/campaign-001 --output results.json
+```
+
+Process mode constructs the target independently in fresh Python processes.
+`--max-concurrency` is the total trial limit, divided across processes; it is
+not multiplied by `--processes`. At most `min(processes, max_concurrency)`
+workers start. Each receives a fixed, disjoint round-robin case subset. This
+removes the single-interpreter CPU bottleneck, though provider limits, shared
+storage contention, and uneven case durations can still limit throughput.
+Finished workers do not steal another worker's remaining cases.
+
+Before dispatch, every worker must agree on the complete suite, requests,
+assertions, application manifest, execution profiles, and workflow target
+identity. Factories must produce consistent definitions across processes.
+Custom assertions require an explicit `assertion_revision`; built-in assertions
+without a revision must have JSON-representable state. Workflow targets require
+`per_trial` instance scope. This initial mode supports direct agent and workflow
+suites on POSIX; corpus execution and Windows are unsupported. Ordinary
+single-process SDK and CLI behavior is unchanged.
+
+The process directory must be new. It retains private admission records, worker
+logs, and native child results; report output belongs outside that directory.
+If omitted, a fresh directory is created under `.cayu/evals/process-runs/`.
+Successful aggregation preserves case order and trial evidence and includes
+worker PIDs, child run IDs, assignments, and a plan fingerprint under
+`metadata.cayu_process_execution`. Missing or inconsistent worker results fail
+the command instead of producing a partial successful report.
+
+Worker failure or interruption stops siblings and marks the campaign incomplete.
+There is no automatic restart or replay: effects may already have occurred, and
+an interrupted worker may not have published its native result yet. Retain the
+directory and application stores for investigation. Admission waits at most
+120 seconds and shutdown allows 30 seconds of cooperative cleanup before forced
+termination. This is process supervision, not a sandbox or crash-resumable eval
+queue. For general claimed work, see [project workers](project-workers.md).
+
+### Single-process SDK example
+
 ```python
 from cayu import (
     AgentSpec,

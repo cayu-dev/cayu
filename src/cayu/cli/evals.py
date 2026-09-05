@@ -54,6 +54,7 @@ from cayu.evals import (
     render_memory_experiment_report_html,
     run_eval_plan,
 )
+from cayu.runtime._process_workers import positive_process_count
 from cayu.runtime.app import CayuApp
 
 
@@ -102,6 +103,18 @@ def add_eval_parser(subparsers: Any) -> None:
         default=1,
         metavar="COUNT",
         help="Maximum concurrently executing cases (default: 1).",
+    )
+    run.add_argument(
+        "--processes",
+        type=positive_process_count,
+        default=1,
+        metavar="COUNT",
+        help="Fresh Python worker processes for native direct suites (default: 1).",
+    )
+    run.add_argument(
+        "--process-directory",
+        metavar="DIRECTORY",
+        help="New private directory for process admission, logs, and worker results.",
     )
     run.add_argument(
         "--case-timeout-seconds",
@@ -244,6 +257,37 @@ async def _run(args: argparse.Namespace) -> int:
             ),
             protected=(("--corpus", args.corpus),),
         )
+        if getattr(args, "processes", 1) > 1:
+            if args.corpus is not None or args.suite is not None:
+                raise ValueError("Process eval execution currently supports native direct suites.")
+            from uuid import uuid4
+
+            from cayu.cli._eval_processes import run_process_eval
+
+            directory = Path(
+                getattr(args, "process_directory", None) or f".cayu/evals/process-runs/{uuid4()}"
+            ).resolve()
+            for output_path in (args.output, args.html_output):
+                if output_path is not None and Path(output_path).resolve().is_relative_to(
+                    directory
+                ):
+                    raise ValueError(
+                        "Eval report output must be outside its private process directory."
+                    )
+            run = await run_process_eval(
+                target=project.target,
+                project_root=project.root,
+                directory=directory,
+                processes=args.processes,
+                max_concurrency=args.max_concurrency,
+                case_timeout_seconds=args.case_timeout_seconds,
+            )
+            _write_or_print(eval_run_to_json(run), args.output)
+            if args.html_output is not None:
+                Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
+            return _status_exit_code(run.status)
+        if getattr(args, "process_directory", None) is not None:
+            raise ValueError("--process-directory requires --processes greater than one.")
         plan = await _load_eval_plan(project.target, label=label)
         if args.corpus is None:
             if plan.corpus_target is not None or (

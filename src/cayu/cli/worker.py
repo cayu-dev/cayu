@@ -20,6 +20,14 @@ from cayu.cli.project import (
     build_project_app,
     project_context,
 )
+from cayu.runtime._process_workers import (
+    ProcessWorkerCommand,
+    positive_process_count,
+    process_worker_environment,
+    supervise_process_workers,
+    supervisor_watchdog,
+    watch_supervisor,
+)
 from cayu.runtime.app import CayuApp
 
 
@@ -45,6 +53,12 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("name", help="Worker name from [tool.cayu.workers].")
     parser.add_argument(
+        "--processes",
+        type=positive_process_count,
+        default=1,
+        help="Independent worker processes; each constructs its own app (default: 1).",
+    )
+    parser.add_argument(
         "--shutdown-grace-seconds",
         type=_positive_seconds,
         default=30.0,
@@ -53,8 +67,37 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run_worker(args: argparse.Namespace) -> int:
+    with supervisor_watchdog(args.shutdown_grace_seconds):
+        return _run_worker(args)
+
+
+def _run_worker(args: argparse.Namespace) -> int:
     try:
         project = _resolve_worker_project(args.name)
+        processes = getattr(args, "processes", 1)
+        if processes > 1:
+            outcome = asyncio.run(
+                supervise_process_workers(
+                    [
+                        ProcessWorkerCommand(
+                            argv=(
+                                sys.executable,
+                                "-m",
+                                "cayu",
+                                "worker",
+                                args.name,
+                                "--shutdown-grace-seconds",
+                                str(args.shutdown_grace_seconds),
+                            ),
+                            cwd=project.root,
+                            environment=process_worker_environment(index, processes),
+                        )
+                        for index in range(processes)
+                    ],
+                    shutdown_grace_seconds=args.shutdown_grace_seconds + 1,
+                )
+            )
+            return outcome.exit_code
         with project_context(project.root):
             try:
                 target = _load_worker_target(project.worker_target, name=args.name)
@@ -182,6 +225,7 @@ async def _invoke_worker(
 
     worker_task: asyncio.Future[Any] | None = None
     signal_wait: asyncio.Task[bool] | None = None
+    supervisor_watch = asyncio.create_task(watch_supervisor(request_stop))
     try:
         result = target(app, stop)
         if not inspect.isawaitable(result):
@@ -216,6 +260,9 @@ async def _invoke_worker(
             )
         return 128 + received_signal
     finally:
+        supervisor_watch.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await supervisor_watch
         if signal_wait is not None and not signal_wait.done():
             signal_wait.cancel()
             with contextlib.suppress(asyncio.CancelledError):

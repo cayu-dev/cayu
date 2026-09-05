@@ -98,6 +98,34 @@ boundary, or recovery policy. Configure those in the factory or named
 entrypoint. In particular, `cayu worker` performs no implicit incomplete-session
 recovery.
 
+## Use multiple CPU cores
+
+```bash
+cayu worker dispatch --processes 16 --shutdown-grace-seconds 45
+```
+
+On POSIX hosts, `--processes` starts independent Python interpreters, each with
+its own application factory call and event loop. This allows Python runtime
+work to use multiple cores. The default remains one process; the explicit
+range is 1–256. The supervising process does not construct an application.
+Workers receive zero-based `CAYU_WORKER_INDEX` and total `CAYU_WORKER_COUNT`
+environment variables for process-specific configuration.
+
+Configure all workers to use the same durable stores and unique worker IDs
+(as in the example above). Existing task claims and lease fences coordinate
+ownership. In-memory stores are separate in each process. Starting more
+processes does not automatically partition an arbitrary worker entrypoint:
+an entrypoint that unconditionally launches the same request will do so in
+every process. Use the existing dispatcher or fresh-task loop for claimed work.
+Concurrency limits configured inside an entrypoint apply per process.
+
+A failed child stops its siblings. Signals request cooperative shutdown;
+children that exceed the grace period are killed and reaped. Child processes
+also watch for supervisor loss, including during project startup. Workers are
+never automatically restarted: durable recovery remains an explicit store and
+entrypoint policy. The supervisor controls process lifecycle, not external
+container cleanup or sandbox isolation. Windows process mode is unsupported.
+
 SIGINT and SIGTERM set the cooperative event and allow the configured grace
 period. Normal completion exits `0`, SIGINT after cooperative shutdown exits
 `130`, SIGTERM exits `143`, validation or startup failure exits `1`, and a
