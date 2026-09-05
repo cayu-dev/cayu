@@ -22,6 +22,7 @@ from pydantic import (
 from cayu._validation import (
     canonical_durable_json_bytes,
     collision_safe_json_object,
+    copy_durable_json_object,
     copy_json_value,
     require_durable_clean_nonblank,
 )
@@ -484,9 +485,9 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     )
     runtime = RuntimeManifest(
         configuration=RuntimeConfigurationManifest(
-            values=app._config.model_dump(
-                mode="json",
-                warnings=False,
+            values=copy_durable_json_object(
+                app._config.model_dump(mode="json", warnings=False),
+                "runtime configuration",
             ),
             provenance=tuple(
                 ConfigurationFieldProvenanceManifest(
@@ -498,7 +499,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
             ),
         ),
         dispatcher=_type_name(app.dispatcher),
-        retry_policy=_optional_type_name(app._default_retry_policy),
+        retry_policy=_optional_type_name(app._config.run.retry_policy),
         budget_policy=_optional_type_name(app.budget_policy),
         runtime_hooks=tuple(_type_name(item.hook) for item in app._runtime_hooks),
         loop_policies=tuple(_type_name(item) for item in app._loop_policies),

@@ -697,18 +697,16 @@ _PYPROJECT = """[project]
 name = "__PROJECT_NAME__"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["cayu==__CAYU_VERSION__"]
+dependencies = __RUNTIME_DEPENDENCIES__
 
 [project.optional-dependencies]
-dev = ["cayu[server]==__CAYU_VERSION__", "pytest"]
+dev = __DEV_DEPENDENCIES__
 
 [tool.cayu]
 factory = "app:build_app"
-eval_target = "evals.agent:build_eval"
-
+__SERVICE_FACTORY____EVAL_TARGET__
 [tool.cayu.session_store]
-backend = "sqlite"
-path = "data/cayu.db"
+__SESSION_STORE__
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -3401,9 +3399,19 @@ def project_files(
         and coding_command_authority != plan.coding_command_authority
     ):
         raise ValueError("coding_command_authority conflicts with the normalized plan.")
-    coding_toolchain = plan.coding_toolchain
-    coding_command_authority = plan.coding_command_authority
     reviewer_name = f"{resolved_agent_name}-reviewer"
+    version = _installed_cayu_version()
+    runtime_extra = (
+        "[server]"
+        if plan.preset == "service"
+        else ("[postgres]" if plan.database == "postgres" else "")
+    )
+    dev_dependencies = ["pytest"]
+    if plan.preset != "service":
+        dev_extra = "postgres,server" if plan.database == "postgres" else "server"
+        dev_dependencies.insert(0, f"cayu[{dev_extra}]=={version}")
+    if plan.preset == "service" or plan.execution == "docker":
+        dev_dependencies.append("ruff>=0.15.15,<0.16")
 
     def render(
         template: str,
@@ -3482,7 +3490,20 @@ def project_files(
             ),
             "__AGENT_NAME__": resolved_agent_name,
             "__REVIEWER_NAME__": reviewer_name,
-            "__CAYU_VERSION__": _installed_cayu_version(),
+            "__CAYU_VERSION__": version,
+            "__RUNTIME_DEPENDENCIES__": json.dumps([f"cayu{runtime_extra}=={version}"]),
+            "__DEV_DEPENDENCIES__": json.dumps(dev_dependencies),
+            "__SERVICE_FACTORY__": (
+                'service_factory = "service:build_service"\n' if plan.preset == "service" else ""
+            ),
+            "__EVAL_TARGET__": (
+                'eval_target = "evals.agent:build_eval"\n' if "evals" in plan.capabilities else ""
+            ),
+            "__SESSION_STORE__": (
+                'backend = "postgres"\nenv = "CAYU_DATABASE_URL"'
+                if plan.database == "postgres"
+                else 'backend = "sqlite"\npath = "data/cayu.db"'
+            ),
             "__PROVIDER_DISPLAY__": provider_display,
             "__PROVIDER_LITERAL__": provider_literal,
             "__PROVIDER_GUIDE_POINTER__": _PROVIDER_GUIDE_POINTER,
@@ -3533,32 +3554,11 @@ def project_files(
     files["AGENTS.md"] += application_guidance(plan)
     if "evals" not in plan.capabilities:
         files.pop("evals/agent.py", None)
-        files["pyproject.toml"] = files["pyproject.toml"].replace(
-            'eval_target = "evals.agent:build_eval"\n',
-            "",
-        )
         for guidance_name in ("README.md", "AGENTS.md"):
             files[guidance_name] = files[guidance_name].replace(
                 "uv run --no-sync cayu eval run",
                 "evals are not configured in this profile",
             )
-    if plan.database == "postgres":
-        files["pyproject.toml"] = files["pyproject.toml"].replace(
-            '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"',
-            '[tool.cayu.session_store]\nbackend = "postgres"\nenv = "CAYU_DATABASE_URL"',
-        )
-    if plan.database == "postgres":
-        files["pyproject.toml"] = (
-            files["pyproject.toml"]
-            .replace(
-                f"cayu=={_installed_cayu_version()}",
-                f"cayu[postgres]=={_installed_cayu_version()}",
-            )
-            .replace(
-                f"cayu[server]=={_installed_cayu_version()}",
-                f"cayu[postgres,server]=={_installed_cayu_version()}",
-            )
-        )
     if plan.preset == "coding":
         from cayu.cli.coding_composition import coding_project_files
 
@@ -3566,38 +3566,12 @@ def project_files(
             coding_project_files(
                 files=files,
                 render=render,
-                execution=None if plan.execution == "none" else plan.execution,
-                toolchain=coding_toolchain,
-                command_authority=coding_command_authority,
-                database=plan.database,
-                capabilities=plan.capabilities,
+                plan=plan,
             )
         )
         return files
     if plan.preset == "agent":
         return files
-    version = _installed_cayu_version()
-    selected_extra = "postgres" if plan.database == "postgres" else None
-    current_dependency = (
-        f"cayu[{selected_extra}]=={version}" if selected_extra else f"cayu=={version}"
-    )
-    service_extra = "postgres,server" if plan.database == "postgres" else "server"
-    service_dependency = f"cayu[{service_extra}]=={version}"
-    service_pyproject = (
-        files["pyproject.toml"]
-        .replace(
-            f'dependencies = ["{current_dependency}"]',
-            f'dependencies = ["{service_dependency}"]',
-        )
-        .replace(
-            f'dev = ["{service_dependency}", "pytest"]',
-            'dev = ["pytest", "ruff>=0.15.15,<0.16"]',
-        )
-    )
-    service_pyproject = service_pyproject.replace(
-        'factory = "app:build_app"\n',
-        'factory = "app:build_app"\nservice_factory = "service:build_service"\n',
-    )
     files.update(
         {
             "configuration/settings.py": (
@@ -3606,7 +3580,6 @@ def project_files(
             "service.py": render(_SERVICE_PY),
             "product_store.py": _PRODUCT_STORE_PY,
             "tests/test_public_service_security.py": _SERVICE_SECURITY_TEST_PY,
-            "pyproject.toml": service_pyproject,
             "README.md": files["README.md"] + _SERVICE_GUIDANCE,
             "AGENTS.md": files["AGENTS.md"] + _SERVICE_AGENTS_GUIDANCE,
         }

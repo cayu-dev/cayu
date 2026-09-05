@@ -782,12 +782,6 @@ async def run_workflow_eval_suite(
         raise TypeError("run_workflow_eval_suite requires an exact WorkflowEvalTarget.")
     if trial_policy is not None and type(trial_policy) is not EvalSuiteTrialPolicyV1:
         raise TypeError("trial_policy must be an exact policy or None.")
-    if max_concurrency is None:
-        max_concurrency = (
-            trial_policy.max_concurrency
-            if trial_policy is not None
-            else target.app.config.evals.max_concurrency
-        )
     target_identity = target.identity()
     app_manifest_fingerprint = target.app.describe().fingerprint
     try:
@@ -864,16 +858,6 @@ async def run_eval_suite(
     evaluated. It cannot be combined with trajectory retention because a retained
     trajectory must remain lossless.
     """
-    if not isinstance(app, CayuApp):
-        raise TypeError("run_eval_suite requires a CayuApp.")
-    if trial_policy is not None and type(trial_policy) is not EvalSuiteTrialPolicyV1:
-        raise TypeError("run_eval_suite trial_policy must be an exact policy or None.")
-    if max_concurrency is None:
-        max_concurrency = (
-            trial_policy.max_concurrency
-            if trial_policy is not None
-            else app.config.evals.max_concurrency
-        )
     run, _ = await _run_eval_suite(
         app,
         suite,
@@ -940,7 +924,7 @@ async def _run_eval_suite(
     *,
     retain_trajectory: bool,
     retain_final_output: bool,
-    max_concurrency: int,
+    max_concurrency: int | None,
     case_timeout_seconds: float | None,
     trials: int,
     trial_policy: EvalSuiteTrialPolicyV1 | None,
@@ -960,6 +944,14 @@ async def _run_eval_suite(
     if type(suite) is not EvalSuite:
         raise TypeError("run_eval_suite requires an EvalSuite.")
     suite = _detach_eval_suite(suite)
+    if trial_policy is not None and type(trial_policy) is not EvalSuiteTrialPolicyV1:
+        raise TypeError("run_eval_suite trial_policy must be an exact policy or None.")
+    if max_concurrency is None:
+        max_concurrency = (
+            trial_policy.max_concurrency
+            if trial_policy is not None
+            else app.config.evals.max_concurrency
+        )
     if type(max_concurrency) is not int:
         raise TypeError("run_eval_suite max_concurrency must be an int.")
     if max_concurrency < 1:
@@ -982,12 +974,10 @@ async def _run_eval_suite(
             trial_count=trials,
             max_concurrency=max_concurrency,
         )
-    elif type(trial_policy) is EvalSuiteTrialPolicyV1:
+    else:
         validated_trial_policy = EvalSuiteTrialPolicyV1.model_validate(
             trial_policy.model_dump(mode="json")
         )
-    else:
-        raise TypeError("run_eval_suite trial_policy must be an exact policy or None.")
     if validated_trial_policy.trial_count != trials:
         raise ValueError("run_eval_suite trial_policy must match trials.")
     if max_concurrency > validated_trial_policy.max_concurrency:

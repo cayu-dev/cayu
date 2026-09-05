@@ -36,6 +36,8 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
+from cayu._validation import copy_durable_json_object
+from cayu.evals import EvaluationTargetIdentity
 
 
 class _SchemaTool(Tool):
@@ -185,6 +187,19 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     assert manifest.model_dump(mode="json") == reversed_manifest.model_dump(mode="json")
     assert manifest.fingerprint == reversed_manifest.fingerprint
     assert len(manifest.fingerprint) == 64
+
+
+def test_manifest_fingerprint_survives_durable_json_round_trip() -> None:
+    target = EvaluationTargetIdentity(
+        target_key="manifest-target",
+        application_release_id="manifest-release",
+        app_manifest=CayuApp(enable_logging=False).describe(),
+    )
+    stored = copy_durable_json_object(target.model_dump(mode="json"), "eval target")
+
+    restored = EvaluationTargetIdentity.model_validate(stored)
+
+    assert restored == target
 
 
 def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:

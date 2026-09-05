@@ -200,7 +200,7 @@ def _source_diagnostics(
             )
 
     diagnostics.extend(_check_selected_plan_source(root, document, plan))
-    diagnostics.extend(_check_composition_root(root, complete=True))
+    diagnostics.extend(_check_composition_root(root))
     diagnostics.extend(_check_import_inertness(root))
     return tuple(diagnostics), True
 
@@ -442,11 +442,7 @@ def _scaffold_contract(document: object) -> Mapping[str, object] | None:
     return cast("Mapping[str, object]", scaffold) if isinstance(scaffold, Mapping) else None
 
 
-def _check_composition_root(
-    root: Path,
-    *,
-    complete: bool,
-) -> tuple[ProjectDiagnostic, ...]:
+def _check_composition_root(root: Path) -> tuple[ProjectDiagnostic, ...]:
     app_path = root / "app.py"
     if not app_path.is_file():
         return ()
@@ -475,7 +471,7 @@ def _check_composition_root(
             )
         )
     unexpected_functions = [name for name in functions if name != "build_app"]
-    if complete and (classes or unexpected_functions):
+    if classes or unexpected_functions:
         diagnostics.append(
             _diagnostic(
                 code="SCAFFOLD_APP_COMPOSITION_DRIFT",

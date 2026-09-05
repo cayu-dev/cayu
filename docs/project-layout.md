@@ -119,8 +119,7 @@ repository-coding application. It populates `tools/coding.py`,
 `policies/coding.py`, `environments/coding.py`, `operations/coding.py`,
 `knowledge/coding.py`, `prompts/coding.py`, and `agents/registration.py`; the
 Docker product variant also populates `domain/coding_product.py` and
-`workflows/coding_product.py`. Root
-`composition.py` is only a compatibility import. Those modules register existing
+`workflows/coding_product.py`. Those modules register existing
 public APIs for bounded file inspection and mutation, `rg` search, Git change
 review, local artifacts, selected SQLite or Postgres knowledge with pending
 writes, a bounded background reviewer plus result recovery, and human-input
@@ -149,8 +148,8 @@ generated `LocalWorkspace` and minimal-environment `LocalRunner` are trusted-hos
 development adapters, not a sandbox. With `inherit_env=False`, the runner still
 forwards Cayu's operational allow-list for command resolution, home, locale, and
 temporary-directory behavior; it does not inherit arbitrary host variables. The
-composition is ordinary editable Python; do not collapse it into the root
-compatibility module or replace it with an implicit agent kind, registry,
+composition is ordinary editable Python; do not collapse it into `app.py`
+or replace it with an implicit agent kind, registry,
 permission grant, or post-start mutation.
 
 ## Large User Project

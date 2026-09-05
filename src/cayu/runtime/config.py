@@ -24,7 +24,7 @@ from cayu.runtime.recovery_cleanup import (
     copy_recovery_cleanup_policy,
 )
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.runtime.stop_policy import RunLimits
 
 DEFAULT_MAX_STEPS = 64
 MAX_STEPS = 256
@@ -84,9 +84,7 @@ class RunDefaults(BaseModel):
     def copy_limits(self) -> RunLimits:
         """Return ordinary mutable request limits detached from this config."""
 
-        return copy_run_limits(
-            RunLimits.model_validate(self.limits.model_dump(mode="python", warnings=False)),
-        )
+        return RunLimits.model_validate(self.limits.model_dump(mode="python", warnings=False))
 
 
 class ToolExecutionConfig(BaseModel):

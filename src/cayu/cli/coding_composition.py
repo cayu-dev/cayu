@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from cayu.cli.scaffold_plan import ApplicationPlan
+
 _COMMAND_PROBE_PY = r'''"""Project-owned bounded command probes for coding dependencies."""
 
 from __future__ import annotations
@@ -5766,28 +5768,11 @@ def coding_project_files(
     *,
     files: dict[str, str],
     render: Callable[[str], str],
-    execution: str | None = None,
-    toolchain: str | None = None,
-    command_authority: str | None = None,
-    database: str = "sqlite",
-    capabilities: tuple[str, ...] = (),
+    plan: ApplicationPlan,
 ) -> dict[str, str]:
-    """Return the explicit overlay for the opt-in coding composition."""
+    """Render the coding files from the normalized application plan."""
 
-    if execution not in {None, "docker"}:
-        raise ValueError("coding execution must be 'docker' or omitted.")
-    if toolchain is not None and execution != "docker":
-        raise ValueError("coding toolchain requires Docker execution.")
-    if command_authority is not None and execution != "docker":
-        raise ValueError("coding command authority requires Docker execution.")
-    if toolchain not in {None, "python"}:
-        raise ValueError("coding toolchain must be 'python' or omitted.")
-    if command_authority not in {None, "structured"}:
-        raise ValueError("coding command authority must be 'structured' or omitted.")
-    if database not in {"sqlite", "postgres"}:
-        raise ValueError("coding database must be 'sqlite' or 'postgres'.")
-
-    selected = frozenset(capabilities)
+    selected = frozenset(plan.capabilities)
     coding_profile = "-".join(sorted(selected)) or "minimal"
 
     def coding_render(template: str) -> str:
@@ -5848,81 +5833,51 @@ def coding_project_files(
         return render(configured)
 
     coding_storage = (
-        _POSTGRES_CODING_STORAGE_PY if database == "postgres" else _SQLITE_CODING_STORAGE_PY
+        _POSTGRES_CODING_STORAGE_PY if plan.database == "postgres" else _SQLITE_CODING_STORAGE_PY
     )
-    if execution is None:
-        return {
-            ".gitignore": files[".gitignore"],
-            "app.py": _coding_app_source(files["app.py"]),
-            "configuration/settings.py": (
-                files["configuration/settings.py"] + _CODING_SETTINGS_APPEND
-            ),
-            "configuration/coding_storage.py": coding_storage,
-            "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
-            "environments/coding.py": _CODING_ENVIRONMENT_PY,
-            "operations/coding.py": coding_render(_COMPOSITION_PY),
-            "operations/delegation.py": _CODING_DELEGATION_PY,
-            "knowledge/coding.py": _CODING_KNOWLEDGE_PY,
-            "policies/coding.py": _CODING_POLICY_PY,
-            "tools/coding.py": coding_render(_CODING_TOOLS_PY),
-            "prompts/coding.py": coding_render(_CODING_PROMPTS_PY),
-            "agents/agent.py": coding_render(_PRIMARY_AGENT_PY),
-            "agents/reviewer.py": coding_render(_REVIEWER_AGENT_PY),
-            "agents/registration.py": _CODING_AGENT_REGISTRATION_PY,
-            "tests/test_coding_composition.py": coding_render(
-                _SMOKE_TEST_PY if "knowledge" in selected else _REDUCED_SMOKE_TEST_PY
-            ),
-            "README.md": files["README.md"] + coding_render(_README_APPEND),
-            "AGENTS.md": files["AGENTS.md"] + coding_render(_AGENTS_APPEND),
-        }
-
-    pyproject = files["pyproject.toml"].replace(
-        'dev = ["cayu[server]>=__CAYU_VERSION__", "pytest"]',
-        'dev = ["cayu[server]>=__CAYU_VERSION__", "pytest", "ruff>=0.15.15,<0.16"]',
-    )
-    # ``files`` is already rendered, so replace the installed concrete version form.
-    if pyproject == files["pyproject.toml"]:
-        pyproject = pyproject.replace(
-            '", "pytest"]\n\n[tool.cayu]',
-            '", "pytest", "ruff>=0.15.15,<0.16"]\n\n[tool.cayu]',
-            1,
-        )
-    return {
-        ".gitignore": files[".gitignore"],
-        ".dockerignore": _DOCKERIGNORE,
-        "Dockerfile.coding": _DOCKERFILE,
-        "docker-coding-build.json": coding_render(_DOCKER_BUILD_CONFIG),
-        "docker-coding-image.json": coding_render(_DOCKER_IMAGE_CONFIG),
-        "build_coding_image.py": coding_render(_DOCKER_BUILD_IMAGE_PY),
-        "app.py": _docker_coding_app_source(files["app.py"]),
+    coding_files = {
+        "app.py": _coding_app_source(files["app.py"]),
         "configuration/settings.py": (files["configuration/settings.py"] + _CODING_SETTINGS_APPEND),
         "configuration/coding_storage.py": coding_storage,
         "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
         "environments/coding.py": _CODING_ENVIRONMENT_PY,
-        "operations/coding.py": coding_render(_docker_composition_source(_COMPOSITION_PY)),
-        "domain/coding_product.py": _CODING_PRODUCT_DOMAIN_PY,
-        "workflows/coding_product.py": _CODING_PRODUCT_WORKFLOW_PY,
+        "operations/coding.py": coding_render(_COMPOSITION_PY),
         "operations/delegation.py": _CODING_DELEGATION_PY,
         "knowledge/coding.py": _CODING_KNOWLEDGE_PY,
         "policies/coding.py": _CODING_POLICY_PY,
         "tools/coding.py": coding_render(_CODING_TOOLS_PY),
-        "prompts/coding.py": coding_render(_DOCKER_CODING_PROMPTS_PY),
-        "agents/agent.py": coding_render(_DOCKER_PRIMARY_AGENT_PY),
+        "prompts/coding.py": coding_render(_CODING_PROMPTS_PY),
+        "agents/agent.py": coding_render(_PRIMARY_AGENT_PY),
         "agents/reviewer.py": coding_render(_REVIEWER_AGENT_PY),
         "agents/registration.py": _CODING_AGENT_REGISTRATION_PY,
         "tests/test_coding_composition.py": coding_render(
-            _DOCKER_SMOKE_TEST_PY if "knowledge" in selected else _REDUCED_DOCKER_SMOKE_TEST_PY
+            _SMOKE_TEST_PY if "knowledge" in selected else _REDUCED_SMOKE_TEST_PY
         ),
-        "tests/test_project.py": _DOCKER_PROJECT_TEST_PY,
-        "pyproject.toml": pyproject,
-        "README.md": (
-            files["README.md"]
-            + coding_render(_README_APPEND)
-            + coding_render(_DOCKER_README_APPEND)
-        ),
-        "AGENTS.md": (
-            files["AGENTS.md"]
-            + coding_render(_AGENTS_APPEND)
-            + coding_render(_DOCKER_AGENTS_APPEND)
-        ),
+        "README.md": files["README.md"] + coding_render(_README_APPEND),
+        "AGENTS.md": files["AGENTS.md"] + coding_render(_AGENTS_APPEND),
     }
+    if plan.execution == "docker":
+        coding_files.update(
+            {
+                ".dockerignore": _DOCKERIGNORE,
+                "Dockerfile.coding": _DOCKERFILE,
+                "docker-coding-build.json": coding_render(_DOCKER_BUILD_CONFIG),
+                "docker-coding-image.json": coding_render(_DOCKER_IMAGE_CONFIG),
+                "build_coding_image.py": coding_render(_DOCKER_BUILD_IMAGE_PY),
+                "app.py": _docker_coding_app_source(files["app.py"]),
+                "operations/coding.py": coding_render(_docker_composition_source(_COMPOSITION_PY)),
+                "domain/coding_product.py": _CODING_PRODUCT_DOMAIN_PY,
+                "workflows/coding_product.py": _CODING_PRODUCT_WORKFLOW_PY,
+                "prompts/coding.py": coding_render(_DOCKER_CODING_PROMPTS_PY),
+                "agents/agent.py": coding_render(_DOCKER_PRIMARY_AGENT_PY),
+                "tests/test_coding_composition.py": coding_render(
+                    _DOCKER_SMOKE_TEST_PY
+                    if "knowledge" in selected
+                    else _REDUCED_DOCKER_SMOKE_TEST_PY
+                ),
+                "tests/test_project.py": _DOCKER_PROJECT_TEST_PY,
+            }
+        )
+        coding_files["README.md"] += coding_render(_DOCKER_README_APPEND)
+        coding_files["AGENTS.md"] += coding_render(_DOCKER_AGENTS_APPEND)
+    return coding_files

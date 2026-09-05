@@ -1318,7 +1318,6 @@ class CayuApp:
                 secret_redactor=self._secret_redactor,
             )
         )
-        self._default_retry_policy = copy_retry_policy(resolved_config.run.retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
         self._loop_policy_execution_profile_identities = policy_execution_profile_identities
@@ -3541,7 +3540,7 @@ class CayuApp:
     def _effective_retry_policy(self, request_policy: RetryPolicy | None) -> RetryPolicy:
         if request_policy is not None:
             return copy_retry_policy(request_policy)
-        return copy_retry_policy(self._default_retry_policy)
+        return copy_retry_policy(self._config.run.retry_policy)
 
     @property
     def config(self) -> CayuConfig:
