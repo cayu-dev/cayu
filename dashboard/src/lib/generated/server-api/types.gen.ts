@@ -2063,7 +2063,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '16';
+    schema_version?: '17';
     stores: StoreManifest;
 };
 

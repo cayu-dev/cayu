@@ -4128,8 +4128,8 @@
             "$ref": "#/components/schemas/RuntimeManifest"
           },
           "schema_version": {
-            "const": "16",
-            "default": "16",
+            "const": "17",
+            "default": "17",
             "title": "Schema Version",
             "type": "string"
           },

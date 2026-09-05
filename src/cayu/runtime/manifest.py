@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import json
 import re
 from collections.abc import Mapping
 from fnmatch import fnmatchcase
@@ -21,6 +20,7 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    canonical_durable_json_bytes,
     collision_safe_json_object,
     copy_json_value,
     require_durable_clean_nonblank,
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "16"
+APP_MANIFEST_SCHEMA_VERSION = "17"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -407,7 +407,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["16"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["17"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -432,13 +432,10 @@ def _app_manifest_fingerprint(payload: dict[str, object]) -> str:
             else environment
             for environment in environments
         ]
-    canonical = json.dumps(
-        structural_payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    # Schema 17 hashes numeric values, including untyped configuration/schema
+    # mappings, identically before and after durable JSON/JSONB normalization.
+    canonical = canonical_durable_json_bytes(structural_payload, "app manifest")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> AppManifest:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import threading
 from datetime import UTC, datetime
@@ -87,7 +86,7 @@ from cayu.runtime.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
 )
-from cayu.runtime.manifest import AppManifest, ToolManifest
+from cayu.runtime.manifest import AppManifest, ToolManifest, _app_manifest_fingerprint
 from cayu.runtime.stop_policy import RunLimits
 from cayu.vaults.redaction import SecretRedactor
 
@@ -242,13 +241,7 @@ def _result_with_secret_manifest_key(
     document = manifest.model_dump(mode="json")
     document["agents"][0]["tools"] = [tool.model_dump(mode="json")]
     document.pop("fingerprint")
-    canonical = json.dumps(
-        document,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    document["fingerprint"] = hashlib.sha256(canonical).hexdigest()
+    document["fingerprint"] = _app_manifest_fingerprint(document)
     target = EvaluationTargetIdentity(
         target_key=result.target.target_key,
         application_release_id=result.target.application_release_id,

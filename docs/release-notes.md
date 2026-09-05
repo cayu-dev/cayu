@@ -93,6 +93,26 @@ guard.
 
 ## Unreleased
 
+### Application fingerprints survive durable numeric normalization
+
+Application manifests and generator plans advance from schema 16 to 17.
+Manifest fingerprints now use Cayu's canonical durable JSON encoding: integral
+floats and equivalent integers (including signed zero and exponent notation)
+have the same identity, recursively through configuration and other manifest
+mappings. Non-integral numbers retain their value; boolean, string, and numeric
+values remain distinct. Genuine configuration changes still fail fingerprint
+validation. Numeric values must fit the existing portable durable JSON domain.
+
+This is an explicit identity compatibility boundary. Schema-16 manifests,
+generator plans, and saved corpus results containing schema-16 targets are
+rejected by schema validation, whether or not storage normalized their numbers.
+There is no automatic rehash, fallback fingerprint, or storage migration.
+Keep old results and their matching Runtime pin for historical inspection;
+regenerate manifests/plans and create fresh evaluation identities when upgrading.
+Do not retry an old scientific run under a rewritten manifest or reuse its
+receipt as evidence for the new identity. Existing corpus-result schema 3 and
+SQLite/PostgreSQL table schemas are unchanged.
+
 ### Environment lifecycle work has bounded phase progress
 
 `EnvironmentSpec.lifecycle_policy` now configures finite lifecycle and per-phase ceilings,

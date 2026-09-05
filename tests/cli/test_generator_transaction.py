@@ -37,7 +37,7 @@ def _request(
     slice_name: str = "transaction_test",
 ) -> GeneratorTransactionRequest:
     return GeneratorTransactionRequest(
-        schema_version="16",
+        schema_version="17",
         slice_name=slice_name,
         tool_name="transaction_test",
         effect="none",

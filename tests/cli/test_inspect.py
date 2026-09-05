@@ -66,7 +66,7 @@ def build_app():
     assert main(["inspect"]) == 0
 
     output = json.loads(capsys.readouterr().out)
-    assert output["schema_version"] == "16"
+    assert output["schema_version"] == "17"
     assert output["agents"][0]["name"] == "reviewer"
     assert output["agents"][0]["resolved_provider"] == "scripted"
     assert output["defaults"]["environment"] is None
@@ -131,7 +131,7 @@ def build_app():
 
     assert main(["inspect", "--environment", "missing", "--json"]) == 1
     error = json.loads(capsys.readouterr().out)
-    assert error["schema_version"] == "16"
+    assert error["schema_version"] == "17"
     assert error["error"] == {
         "code": "SUBJECT_NOT_FOUND",
         "message": "Environment not found: missing.",
@@ -159,7 +159,7 @@ def test_inspect_factory_failure_uses_current_manifest_schema_version(
 
     output = json.loads(capsys.readouterr().out)
     assert output == {
-        "schema_version": "16",
+        "schema_version": "17",
         "error": {
             "code": "PROJECT_BOOT_FAILED",
             "message": "Application factory failed (RuntimeError): boot exploded",
