@@ -88,7 +88,7 @@ from cayu.evals import browser_acceptance as acceptance_module
 from cayu.evals.corpus import _content_revision
 from cayu.evals.internal import browser_acceptance as internal_acceptance
 from cayu.evals.internal.browser_acceptance import build as build_internal_browser_acceptance
-from cayu.providers import ModelStreamEvent
+from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runners import (
     PINNED_BROWSER_SESSION_WORKLOAD,
     ExecCommand,
@@ -157,7 +157,6 @@ class _ProtocolBrowserRunner(Runner):
         self._revision += 1
         self._total_observations += 1
         page["observation_count"] += 1
-        page["ref_count"] += 22
         session_component = hashlib.sha256(page["session_id"].encode("utf-8")).hexdigest()[:16]
         page["revision"] = f"br_acceptance_{session_component}_{self._revision}"
         page["last_observation_revision"] = page["revision"]
@@ -185,6 +184,9 @@ class _ProtocolBrowserRunner(Runner):
             "Save",
             "Unavailable",
         )
+        if urlsplit(page["url"]).path == "/upload":
+            names += ("Upload file",)
+        page["ref_count"] += len(names)
         refs = [
             {
                 "ref": "ref_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:16],
@@ -193,6 +195,9 @@ class _ProtocolBrowserRunner(Runner):
             }
             for name in names
         ]
+        for item in refs:
+            if item["name"] == "Upload file":
+                item.update(element_type="file_input", allows_multiple_files=False)
         return {
             "session_id": page["session_id"],
             "page_id": page["page_id"],
@@ -215,7 +220,7 @@ class _ProtocolBrowserRunner(Runner):
                 "browser": "chromium",
                 "browser_version": "acceptance-fixture",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "8",
+                "worker_version": "9",
             },
         }
 
@@ -238,7 +243,7 @@ class _ProtocolBrowserRunner(Runner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "8",
+                        "worker_version": "9",
                         "playwright_version": "1.62.0",
                         "kind": "profile_restore",
                         "allocation_disposition": "live",
@@ -257,7 +262,7 @@ class _ProtocolBrowserRunner(Runner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "8",
+                        "worker_version": "9",
                         "playwright_version": "1.62.0",
                         "kind": "profile_checkpoint",
                         "allocation_disposition": "live",
@@ -271,7 +276,7 @@ class _ProtocolBrowserRunner(Runner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "8",
+                        "worker_version": "9",
                         "playwright_version": "1.62.0",
                         "kind": "closed",
                         "allocation_disposition": "retired",
@@ -386,7 +391,7 @@ class _ProtocolBrowserRunner(Runner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "8",
+                        "worker_version": "9",
                         "playwright_version": "1.62.0",
                         "kind": "success",
                         "allocation_disposition": "retired",
@@ -515,7 +520,7 @@ class _ProtocolBrowserRunner(Runner):
         page_set = self._page_set()
         payload: dict[str, Any] = {
             "protocol_version": "cayu.browser-session.v4",
-            "worker_version": "8",
+            "worker_version": "9",
             "playwright_version": "1.62.0",
             "kind": "error" if failure is not None else "success",
             "allocation_disposition": "live",
@@ -528,6 +533,26 @@ class _ProtocolBrowserRunner(Runner):
             payload["error"] = failure
         elif observation is not None:
             payload["observation"] = observation
+        if operation == "upload":
+            files = request["upload_files"]
+            assert len(files) == 1
+            assert base64.b64decode(files[0]["content_base64"]) == (
+                b"bounded browser acceptance upload\n"
+            )
+            payload["operation_evidence"] = {
+                "operation": "upload",
+                "selection_state": "selected",
+                "selected_file_count": 1,
+            }
+            upstream = urlsplit(self._upstream_origin)
+            connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=2)
+            try:
+                connection.request("GET", "/effect/upload-selected")
+                response = connection.getresponse()
+                assert response.status == 204
+                response.read()
+            finally:
+                connection.close()
         return ExecResult(stdout=json.dumps(payload))
 
     def _record_evidence(self, operation: str, **fields: object) -> None:
@@ -676,7 +701,7 @@ def _run_browser_profile_acceptance_process(
                     ("https://docs.browser.test",)
                 ),
                 browser_protocol="cayu.browser-session.v4",
-                browser_worker_version="8",
+                browser_worker_version="9",
                 store=profile_store,
                 key_authority=AESGCMBrowserProfileKeyAuthority(
                     authority_id="browser-acceptance-key-v1",
@@ -868,14 +893,14 @@ def _plan(
         oracle_parameters={"required_operations": ["navigate"]},
     )
     unsupported = BrowserAcceptanceCaseV1.build(
-        case_id="reload",
+        case_id="unsupported-script",
         category=BrowserAcceptanceCaseCategory.CAPABILITY,
         expected_state=BrowserAcceptanceState.UNSUPPORTED,
         semantic_oracle=BrowserAcceptanceSemanticOracle.PUBLIC_SCHEMA_UNSUPPORTED,
         semantic_success_required=False,
         required=True,
-        operations=("reload",),
-        oracle_parameters={"operation": "reload"},
+        operations=("evaluate_script",),
+        oracle_parameters={"operation": "evaluate_script"},
     )
     cases = (executable, unsupported)
     manifest = BrowserAcceptanceManifestV1.build(
@@ -1050,7 +1075,7 @@ def test_browser_acceptance_runs_through_public_app_webbridge_and_runner(tmp_pat
     assert report.runtime_identity.provider_name == "scripted"
     assert report.runtime_identity.model == "scripted-browser-v1"
     assert report.runtime_identity.execution_profile_fingerprint != "7" * 64
-    assert unsupported.case_id == "reload"
+    assert unsupported.case_id == "unsupported-script"
     assert unsupported.observed_state.value == "unsupported"
     assert unsupported.diagnostic.state.value == "not_requested"
 
@@ -1248,10 +1273,25 @@ def test_recovered_browser_planner_accepts_immutable_durable_json_wrappers() -> 
 
 
 def test_cayu_owned_deterministic_target_binds_every_executable_manifest_case() -> None:
+    async def raw_profile_fingerprints(plan: BrowserAcceptancePlanV1) -> tuple[str, ...]:
+        assert plan.eval_plan.app is not None
+        assert plan.eval_plan.suite is not None
+        fingerprints: list[str] = []
+        for case in plan.eval_plan.suite.cases:
+            fingerprints.append(
+                await plan.eval_plan.app.inspect_run_execution_profile(case.request)
+            )
+        return tuple(fingerprints)
+
     with BrowserAcceptanceFixtureV1() as fixture:
         plan = asyncio.run(build_internal_browser_acceptance(fixture))
+        case_profile_fingerprints = asyncio.run(raw_profile_fingerprints(plan))
+        runtime_identity = asyncio.run(inspect_browser_acceptance_runtime_identity(plan))
 
     assert plan.eval_plan.suite is not None
+    assert len(set(case_profile_fingerprints)) > 1
+    assert len(runtime_identity.execution_profile_fingerprint) == 64
+    assert runtime_identity.execution_profile_fingerprint not in case_profile_fingerprints
     expected = tuple(
         case.case_id
         for case in plan.manifest.cases
@@ -1306,7 +1346,21 @@ def test_cayu_owned_deterministic_target_binds_each_case_execution_profile() -> 
 
 @pytest.mark.parametrize(
     "action",
-    ["click", "download", "fill", "press", "screenshot", "select", "wait"],
+    [
+        "back",
+        "click",
+        "download",
+        "fill",
+        "forward",
+        "hover",
+        "press",
+        "reload",
+        "screenshot",
+        "scroll",
+        "select",
+        "upload",
+        "wait",
+    ],
 )
 def test_stale_reference_cases_reuse_pre_action_revision_and_reference(action: str) -> None:
     case = next(
@@ -1314,38 +1368,257 @@ def test_stale_reference_cases_reuse_pre_action_revision_and_reference(action: s
         for item in deterministic_browser_acceptance_manifest().cases
         if item.case_id == f"revision-stale-ref-after-{action}"
     )
-    before = {
-        "session_id": "browser-session",
-        "page_id": "browser-page",
-        "revision": "before-action",
-        "control_epoch": 1,
-        "refs": [
-            {"name": "Save", "ref": "save-before"},
-            {"name": "Name", "ref": "name-before"},
-            {"name": "Region", "ref": "region-before"},
-            {"name": "Download report", "ref": "download-before"},
-        ],
-    }
-    after = {
-        **before,
-        "revision": "after-action",
-        "control_epoch": 2,
-        "refs": [
-            {"name": "Save", "ref": "save-after"},
-            {"name": "Download report", "ref": "download-after"},
-        ],
-    }
+    result_count = len(case.operations) - 1
+    results = tuple(
+        {
+            "session_id": "browser-session",
+            "page_id": "browser-page",
+            "revision": f"revision-{index}",
+            "control_epoch": index + 1,
+            "refs": [
+                {"name": "Save", "ref": f"save-{index}"},
+                {"name": "Name", "ref": f"name-{index}"},
+                {"name": "Region", "ref": f"region-{index}"},
+                {"name": "Download report", "ref": f"download-{index}"},
+                {"name": "Forward destination", "ref": f"forward-{index}"},
+                {"name": "Back destination", "ref": f"back-{index}"},
+                {"name": "Hover target", "ref": f"hover-{index}"},
+                {"name": "Reload anchor", "ref": f"reload-{index}"},
+                {"name": "Upload file", "ref": f"upload-{index}"},
+            ],
+        }
+        for index in range(result_count)
+    )
+    stale_index = {"back": 1, "forward": 2}.get(action, 0)
+    expected_ref = {
+        "back": f"forward-{stale_index}",
+        "download": f"download-{stale_index}",
+        "forward": f"back-{stale_index}",
+        "hover": f"hover-{stale_index}",
+        "reload": f"reload-{stale_index}",
+    }.get(action, f"save-{stale_index}")
 
     stale_arguments = internal_acceptance._operation_arguments(
         case_id=case.case_id,
-        operation=case.operations[2],
-        operation_index=2,
+        operation=case.operations[-1],
+        operation_index=len(case.operations) - 1,
         fixture_route=case.fixture_route,
-        results=(before, after),
+        results=results,
     )
 
-    assert stale_arguments["expected_revision"] == "before-action"
-    assert stale_arguments["ref"] in {"save-before", "download-before"}
+    assert stale_arguments["expected_revision"] == f"revision-{stale_index}"
+    assert stale_arguments["ref"] == expected_ref
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "artifact-upload",
+        "artifact-upload-missing",
+        "artifact-upload-wrong-session",
+        "navigation-scroll-over-limit",
+    ],
+)
+def test_public_acceptance_enforces_upload_authority_and_scroll_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case_id: str
+) -> None:
+    async def scenario(fixture: BrowserAcceptanceFixtureV1) -> None:
+        manifest = deterministic_browser_acceptance_manifest()
+        case = next(case for case in manifest.cases if case.case_id == case_id)
+        material = {name: getattr(manifest, name) for name in type(manifest).model_fields}
+        material.pop("revision")
+        material["cases"] = (case,)
+        selected = BrowserAcceptanceManifestV1.build(**material)
+        monkeypatch.setattr(
+            internal_acceptance, "deterministic_browser_acceptance_manifest", lambda: selected
+        )
+        monkeypatch.setattr(
+            internal_acceptance,
+            "DockerEgressAdapter",
+            lambda **kwargs: _ProtocolEgressAdapter(fixture.upstream_origin),
+        )
+        plan = await build_internal_browser_acceptance(fixture)
+        report = await run_browser_acceptance(
+            plan, deterministic_fixture=fixture, receipt_directory=tmp_path / "receipts"
+        )
+        assert report.aggregate.overall_status.value == "passed", report.rows
+        assert report.rows[0].completion_state.value == "complete"
+        assert report.rows[0].observed_state is case.expected_state
+        if case_id == "navigation-scroll-over-limit":
+            assert report.rows[0].diagnostic.browser_dispatches == 1
+            assert (
+                report.rows[0].diagnostic.operations[-1].state.value == "operation_not_dispatched"
+            )
+        assert fixture.request_counts().get("/effect/upload-selected", 0) == (
+            1 if case_id == "artifact-upload" else 0
+        )
+
+    with BrowserAcceptanceFixtureV1() as fixture:
+        asyncio.run(scenario(fixture))
+
+
+@pytest.mark.parametrize(
+    ("phase", "scenario", "state", "error", "stage"),
+    [
+        (
+            "disconnection",
+            BrowserAcceptanceFaultScenario.BROWSER_UPLOAD_DISCONNECTION,
+            BrowserAcceptanceState.FAILED,
+            "browser_crash",
+            "upload_disconnection",
+        ),
+        (
+            "acknowledgement-loss",
+            BrowserAcceptanceFaultScenario.BROWSER_UPLOAD_ACKNOWLEDGEMENT_LOSS,
+            BrowserAcceptanceState.AMBIGUOUS,
+            "outcome_ambiguous",
+            "upload_acknowledgement_loss",
+        ),
+    ],
+)
+def test_upload_failure_corpus_binds_exact_fault_boundary_and_effect(
+    phase: str,
+    scenario: BrowserAcceptanceFaultScenario,
+    state: BrowserAcceptanceState,
+    error: str,
+    stage: str,
+) -> None:
+    case = next(
+        case
+        for case in deterministic_browser_acceptance_manifest().cases
+        if case.case_id == f"artifact-upload-{phase}"
+    )
+    assert case.operations == ("navigate", "upload")
+    assert case.fault_scenario is scenario
+    assert case.expected_state is state
+    assert case.oracle_parameters["expected_browser_dispatches"] == 2
+    assert case.oracle_parameters["error"] == error
+    assert case.oracle_parameters["expected_effects"] == {"upload-selected": 1}
+    assert case.oracle_parameters["allocation_disposition"] == "uncertain"
+    assert internal_acceptance._scenario_stage(case.fault_scenario) == (
+        "browser",
+        stage,
+    )
+
+
+def test_upload_fixture_uses_isolated_trial_session_not_authored_session() -> None:
+    from cayu.evals.runner import _isolated_trial_request
+
+    case = next(
+        case
+        for case in deterministic_browser_acceptance_manifest().cases
+        if case.case_id == "artifact-upload"
+    )
+    planned = internal_acceptance._case_request(case, session_id="authored-session")
+    isolated = _isolated_trial_request(planned)
+    bound = internal_acceptance.bind_trial_session("suite", case.case_id, 1, isolated)
+    assert bound.session_id != planned.session_id
+    assert bound.limits == planned.limits
+    assert bound.max_steps == planned.max_steps
+    assert bound.messages != planned.messages
+    model_request = ModelRequest(model="scripted", messages=bound.messages)
+    assert internal_acceptance._parent_session_id(model_request) == bound.session_id
+    assert internal_acceptance._case_id(model_request) == case.case_id
+
+
+def test_deterministic_planner_emits_closed_scroll_hover_and_upload_arguments() -> None:
+    state = {
+        "control_epoch": 1,
+        "session_id": "browser-session",
+        "page_id": "browser-page",
+        "revision": "revision-1",
+        "refs": [
+            {"name": "Hover target", "ref": "hover-ref"},
+            {"name": "Upload file", "ref": "upload-ref"},
+        ],
+    }
+    scroll = internal_acceptance._operation_arguments(
+        case_id="navigation-scroll-dependent-control",
+        operation="scroll",
+        operation_index=1,
+        fixture_route="/scroll",
+        results=(state,),
+    )
+    hover = internal_acceptance._operation_arguments(
+        case_id="action-strict-hover",
+        operation="hover",
+        operation_index=1,
+        fixture_route="/hover",
+        results=(state,),
+    )
+    upload = internal_acceptance._operation_arguments(
+        case_id="artifact-upload",
+        operation="upload",
+        operation_index=1,
+        fixture_route="/upload",
+        results=(state,),
+        upload_artifact_id="art_0123456789abcdef0123456789abcdef",
+    )
+
+    assert scroll == {
+        "expected_control_epoch": 1,
+        "operation": "scroll",
+        "session_id": "browser-session",
+        "operation_id": "navigation-scroll-dependent-control:2:scroll",
+        "page_id": "browser-page",
+        "expected_revision": "revision-1",
+        "direction": "down",
+        "amount": "page",
+        "repeat_count": 2,
+    }
+    assert hover["ref"] == "hover-ref"
+    assert upload["ref"] == "upload-ref"
+    assert upload["artifact_ids"] == ["art_0123456789abcdef0123456789abcdef"]
+
+
+def test_deterministic_planner_uses_browser_history_operations_not_navigation_substitutes() -> None:
+    initial = internal_acceptance._operation_arguments(
+        case_id="navigation-history-forward",
+        operation="navigate",
+        operation_index=0,
+        fixture_route="/history-start",
+        results=(),
+    )
+    start_state = {
+        "control_epoch": 1,
+        "session_id": "browser-session",
+        "page_id": "browser-page",
+        "revision": "revision-start",
+        "refs": [{"name": "Next destination", "ref": "next-ref"}],
+    }
+    click = internal_acceptance._operation_arguments(
+        case_id="navigation-history-forward",
+        operation="click",
+        operation_index=1,
+        fixture_route="/history-start",
+        results=(start_state,),
+    )
+    next_state = {
+        **start_state,
+        "revision": "revision-next",
+        "refs": [{"name": "Forward destination", "ref": "forward-ref"}],
+    }
+    back = internal_acceptance._operation_arguments(
+        case_id="navigation-history-forward",
+        operation="back",
+        operation_index=2,
+        fixture_route="/history-start",
+        results=(start_state, next_state),
+    )
+    forward = internal_acceptance._operation_arguments(
+        case_id="navigation-history-forward",
+        operation="forward",
+        operation_index=3,
+        fixture_route="/history-start",
+        results=(start_state, next_state, start_state),
+    )
+
+    assert initial["url"] == "https://docs.browser.test/history-start"
+    assert click["ref"] == "next-ref"
+    assert back["operation"] == "back"
+    assert "url" not in back
+    assert forward["operation"] == "forward"
+    assert "url" not in forward
 
 
 @pytest.mark.parametrize(

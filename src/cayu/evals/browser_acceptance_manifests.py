@@ -62,6 +62,35 @@ def _unsupported(case_id: str, operation: str) -> BrowserAcceptanceCaseV1:
     )
 
 
+def _stale_ref_case(operation: str) -> BrowserAcceptanceCaseV1:
+    operation_flow, route = {
+        "back": (("navigate", "click", "back", "click"), "/history-start"),
+        "forward": (
+            ("navigate", "click", "back", "forward", "click"),
+            "/history-start",
+        ),
+        "hover": (("navigate", "hover", "click"), "/hover"),
+        "reload": (("navigate", "reload", "click"), "/reload"),
+        "scroll": (("navigate", "scroll", "click"), "/forms"),
+        "upload": (("navigate", "upload", "click"), "/upload"),
+    }.get(
+        operation,
+        (
+            ("navigate", operation, "download" if operation == "download" else "click"),
+            "/download" if operation == "download" else "/forms",
+        ),
+    )
+    return _case(
+        f"revision-stale-ref-after-{operation}",
+        category=BrowserAcceptanceCaseCategory.REFUSAL,
+        state=BrowserAcceptanceState.REFUSED,
+        operations=operation_flow,
+        route=route,
+        oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+        parameters={"error": "stale_observation"},
+    )
+
+
 def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
     """Return the immutable credential-free v1 conformance manifest."""
 
@@ -264,7 +293,17 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                     parameters={"kind": "screenshot"},
                     checkpoints=("after-navigation",),
                 ),
-                _unsupported("artifact-upload", "upload"),
+                _case(
+                    "artifact-upload",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "upload"),
+                    route="/upload",
+                    oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                    parameters={
+                        "required_operations": ["navigate", "upload"],
+                        "expected_effects": {"upload-selected": 1},
+                    },
+                ),
                 _unsupported("artifact-trace", "trace"),
                 _unsupported("artifact-video", "video"),
                 _case(
@@ -469,9 +508,133 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                     oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
                     parameters={"error": "oversized_snapshot"},
                 ),
-                _unsupported("navigation-history-back", "go_back"),
-                _unsupported("navigation-history-forward", "go_forward"),
-                _unsupported("navigation-reload", "reload"),
+                _case(
+                    "navigation-history-back",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "click", "back", "click"),
+                    route="/history-start",
+                    oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                    parameters={
+                        "required_operations": ["navigate", "click", "back", "click"],
+                        "expected_effects": {"history-back-confirmed": 1},
+                    },
+                ),
+                _case(
+                    "navigation-forward-unavailable",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.REFUSED,
+                    operations=("navigate", "forward"),
+                    route="/basic",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={"error": "history_unavailable"},
+                ),
+                _case(
+                    "navigation-reload-dialog-refused",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.REFUSED,
+                    operations=("navigate", "reload"),
+                    route="/reload-dialog",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={
+                        "error": "unsafe_reload",
+                        "expected_effects": {},
+                    },
+                ),
+                *(
+                    _case(
+                        f"artifact-upload-{suffix}",
+                        category=BrowserAcceptanceCaseCategory.REFUSAL,
+                        state=BrowserAcceptanceState.REFUSED,
+                        operations=("navigate", "upload"),
+                        route="/upload",
+                        oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                        parameters={"error": error, "expected_effects": {}},
+                    )
+                    for suffix, error in (
+                        ("missing", "artifact_unavailable"),
+                        ("wrong-session", "artifact_refused"),
+                        ("too-large", "upload_too_large"),
+                        ("incompatible-target", "incompatible_upload_target"),
+                    )
+                ),
+                *(
+                    _case(
+                        f"artifact-upload-{phase}",
+                        category=BrowserAcceptanceCaseCategory.CRASH,
+                        state=state,
+                        operations=("navigate", "upload"),
+                        route="/upload",
+                        oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                        parameters={
+                            "error": error,
+                            "expected_browser_dispatches": 2,
+                            "expected_effects": effects,
+                            "allocation_disposition": disposition,
+                        },
+                        fault_scenario=scenario,
+                    )
+                    for phase, scenario, effects, disposition, error, state in (
+                        (
+                            "disconnection",
+                            BrowserAcceptanceFaultScenario.BROWSER_UPLOAD_DISCONNECTION,
+                            {"upload-selected": 1},
+                            "uncertain",
+                            "browser_crash",
+                            BrowserAcceptanceState.FAILED,
+                        ),
+                        (
+                            "acknowledgement-loss",
+                            BrowserAcceptanceFaultScenario.BROWSER_UPLOAD_ACKNOWLEDGEMENT_LOSS,
+                            {"upload-selected": 1},
+                            "uncertain",
+                            "outcome_ambiguous",
+                            BrowserAcceptanceState.AMBIGUOUS,
+                        ),
+                    )
+                ),
+                *(
+                    _case(
+                        f"action-hover-{suffix}",
+                        category=BrowserAcceptanceCaseCategory.REFUSAL,
+                        state=BrowserAcceptanceState.REFUSED,
+                        operations=("navigate", "hover"),
+                        route=route,
+                        oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                        parameters={"error": error, "expected_effects": {}},
+                    )
+                    for suffix, route, error in (
+                        ("detached", "/detached", "actionability_failed"),
+                        ("occluded", "/occluded", "actionability_failed"),
+                    )
+                ),
+                _case(
+                    "navigation-history-forward",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "click", "back", "forward", "click"),
+                    route="/history-start",
+                    oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                    parameters={
+                        "required_operations": [
+                            "navigate",
+                            "click",
+                            "back",
+                            "forward",
+                            "click",
+                        ],
+                        "expected_effects": {"history-forward-confirmed": 1},
+                    },
+                ),
+                _case(
+                    "navigation-reload",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "reload", "click"),
+                    route="/reload",
+                    oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                    parameters={
+                        "required_operations": ["navigate", "reload", "click"],
+                        "expected_effects": {"reload-confirmed": 1},
+                    },
+                ),
                 _case(
                     "navigation-redirect",
                     category=BrowserAcceptanceCaseCategory.SUCCESS,
@@ -484,12 +647,32 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 _case(
                     "navigation-scroll-dependent-control",
                     category=BrowserAcceptanceCaseCategory.SUCCESS,
-                    operations=("navigate", "click"),
-                    route="/long-page",
+                    operations=("navigate", "scroll", "click"),
+                    route="/scroll",
                     oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
                     parameters={
-                        "required_operations": ["navigate", "click"],
+                        "required_operations": ["navigate", "scroll", "click"],
                         "expected_effects": {"bottom-clicked": 1},
+                    },
+                ),
+                _case(
+                    "navigation-scroll-over-limit",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.FAILED,
+                    operations=("navigate", "scroll"),
+                    route="/basic",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={"error": "invalid_arguments", "expected_effects": {}},
+                ),
+                _case(
+                    "action-strict-hover",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "hover"),
+                    route="/hover",
+                    oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                    parameters={
+                        "required_operations": ["navigate", "hover"],
+                        "expected_effects": {"hover-observed": 1},
                     },
                 ),
                 _case(
@@ -699,26 +882,20 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                     fault_scenario=BrowserAcceptanceFaultScenario.PROCESS_AFTER_INTENT,
                 ),
                 *(
-                    _case(
-                        f"revision-stale-ref-after-{operation}",
-                        category=BrowserAcceptanceCaseCategory.REFUSAL,
-                        state=BrowserAcceptanceState.REFUSED,
-                        operations=(
-                            "navigate",
-                            operation,
-                            "download" if operation == "download" else "click",
-                        ),
-                        route="/download" if operation == "download" else "/forms",
-                        oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
-                        parameters={"error": "stale_observation"},
-                    )
+                    _stale_ref_case(operation)
                     for operation in (
+                        "back",
                         "click",
                         "download",
                         "fill",
+                        "forward",
+                        "hover",
                         "press",
+                        "reload",
                         "screenshot",
+                        "scroll",
                         "select",
+                        "upload",
                         "wait",
                     )
                 ),

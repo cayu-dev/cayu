@@ -33,6 +33,12 @@ def test_browser_acceptance_fixture_routes_both_logical_hosts_locally(
         docs = _fetch(fixture, "/basic")
         static = _fetch(fixture, "/frame-controls")
         form = _fetch(fixture, "/forms")
+        history_start = _fetch(fixture, "/history-start")
+        history_next = _fetch(fixture, "/history-next")
+        hover = _fetch(fixture, "/hover")
+        reload_page = _fetch(fixture, "/reload")
+        scroll = _fetch(fixture, "/scroll")
+        upload = _fetch(fixture, "/upload")
         detached = _fetch(fixture, "/detached")
         challenge = _fetch(fixture, "/challenge")
         popup = _fetch(fixture, "/popup")
@@ -48,6 +54,12 @@ def test_browser_acceptance_fixture_routes_both_logical_hosts_locally(
         assert static.status == 200
         assert b"Frame value" in static.read()
         assert b"required" in form.read()
+        assert b"Back destination" in history_start.read()
+        assert b"Forward destination" in history_next.read()
+        assert b"Hover target" in hover.read()
+        assert b"Reload confirmed" in reload_page.read()
+        assert b"after-scroll" in scroll.read()
+        assert b'type="file"' in upload.read()
         assert b"getElementById('target').remove()" in detached.read()
         assert challenge.headers["x-cayu-access-block"] == "bot_challenge"
         assert b"window.open('https://docs.browser.test/basic')" in popup.read()
@@ -60,6 +72,12 @@ def test_browser_acceptance_fixture_routes_both_logical_hosts_locally(
             "/forms": 1,
             "/frame-controls": 1,
             "/popup": 1,
+            "/history-next": 1,
+            "/history-start": 1,
+            "/hover": 1,
+            "/reload": 1,
+            "/scroll": 1,
+            "/upload": 1,
         }
 
     with pytest.raises(RuntimeError, match="not running"):

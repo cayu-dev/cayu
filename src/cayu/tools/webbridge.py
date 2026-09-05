@@ -117,6 +117,14 @@ _INTERACTIVE_OPTION_NAMES = frozenset(
         "max_artifacts_per_page",
         "max_total_artifacts",
         "max_page_cleanup_operations",
+        "max_scroll_repeats",
+        "max_upload_files",
+        "max_upload_file_bytes",
+        "max_upload_total_bytes",
+        "max_upload_filename_bytes",
+        "max_upload_materialization_ms",
+        "allowed_upload_content_types",
+        "allowed_upload_taint_labels",
     }
 )
 

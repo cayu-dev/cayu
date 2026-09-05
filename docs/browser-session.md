@@ -21,8 +21,8 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:8-playwright-1.62.0` image, the
-`cayu.browser-session.v4` protocol and worker version 8, brokered deny-by-default egress,
+`cayu-browser-fetch:9-playwright-1.62.0` image, the
+`cayu.browser-session.v4` protocol and worker version 9, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -152,8 +152,14 @@ verify the committed result without another click.
 
 ## Model contract
 
+The provider-facing schema is a closed object without top-level conditional
+combinators, so OpenAI can accept the tool definition. Operation-specific required
+and forbidden fields remain enforced by Cayu before durable browser admission or
+browser dispatch; the tool description explains those requirements.
+
 One ordinary `browser_session` tool exposes only `navigate`, `observe`,
-`click`, `fill`, `select`, `press`, bounded `wait`, `screenshot`, `download`,
+`click`, `fill`, `select`, `press`, bounded `wait`, `back`, `forward`, safe `reload`, semantic `scroll`,
+strict `hover`, artifact-backed `upload`, `screenshot`, `download`,
 `list_pages`, `switch_page`, `close_page`, and `close`. Visual operations
 (`observe_visual`, `click_visual_target`, and `click_visual_point`) require a
 separate application policy; they are refused by default. The first navigation
@@ -178,6 +184,40 @@ action fails; observe again before interacting. Switching pages invalidates
 both the prior and selected page namespaces and returns a fresh observation for
 the selected page. Closing a page invalidates that page and deterministically
 selects the earliest surviving admitted page when possible.
+
+`back` and `forward` traverse Chromium's existing history rather than
+synthesizing a URL navigation. `reload` is admitted only when the current main
+document is positively known to have used `GET` or `HEAD`, so Cayu does not
+silently resubmit a form. Method evidence is bound to Chromium's committed
+main-frame loader, not merely an observed response: a noncommitting response
+such as HTTP 204 cannot relabel the retained document. Reload dispatch is bound
+to that validated loader; Chromium refuses it if another document commits first.
+Dialogs are dismissed but make history and reload fail
+closed, and navigation is not retried after an ambiguous acknowledgement. Every
+main document and subresource continues through the same deny-by-default broker
+policy.
+
+`scroll` accepts only `up`, `down`, `left`, or `right`, a `line` or `page`
+amount, and an application-bounded repeat count. Its result reports only whether
+the selected axis moved and whether the requested edge was reached; it does not
+claim that the whole document was observed. `hover` resolves only the exact
+current revision-bound ARIA ref and has no selector, coordinate, script, or
+fallback entrance.
+
+`upload` accepts only a current file-input ref and a bounded list of opaque
+ArtifactStore IDs. Before browser dispatch, Cayu requires exact session scope,
+compatible optional agent/environment ownership, an allowed media type and
+taint set, bounded file and aggregate sizes, one safe basename, a stable
+secret-redaction revision, and secret-free bytes. The durable operation identity
+includes artifact IDs and content fingerprints. Raw bytes and private guest
+paths are never durable or model-visible. The guest revalidates content and the
+file-input/multiple contract, then transfers bounded in-memory file payloads to
+Chromium with the admitted filename and MIME type. No temporary upload files
+are created or removed on the guest event loop. Selected contents remain available
+for later page reads and submission until the browser releases them; outer
+allocation teardown remains the process-loss cleanup boundary. Success proves
+browser file selection only,
+not remote acceptance or form submission.
 
 The default remains single-page mode. Its pre-document guard denies explicit
 and inherited browsing-context targets and both ordinary and prototype
@@ -279,7 +319,9 @@ settings. `max_refs` bounds one observation, while `max_refs_per_page` and
 Per-page and page-set `ref_count` values are cumulative allocation
 consumption counters rather than the number of refs still actionable; only refs
 from the active page's exact latest returned observation carry action authority.
-DOM-node and
+Upload file count, per-file and aggregate bytes, filename bytes, materialization
+time, media types, taint labels, and scroll repeats are also application-owned
+and execution-profile-bound. DOM-node and
 accessibility-source admission share one script-and-animation-frozen page window before
 Playwright materializes the depth-bounded AI snapshot. Cayu also applies a
 conservative aggregate expansion ceiling across nodes, source-derived names,
@@ -318,8 +360,10 @@ changes during dispatch; Cayu does not attempt to redact secrets from rendered
 pixels or downloaded bytes. Browser exceptions and stderr are not published;
 callers receive stable bounded codes such as `destination_denied`,
 `fetch_failed`, `stale_observation`, `unknown_element`, `actionability_failed`,
-`navigation_timeout`, `download_failed`, `browser_crash`, `cleanup_failed`, or
-`outcome_ambiguous`.
+`navigation_timeout`, `history_unavailable`, `unsafe_reload`, `invalid_scroll`,
+`incompatible_upload_target`, `artifact_refused`, `artifact_unavailable`,
+`upload_too_large`, `upload_materialization_failed`, `upload_cleanup_failed`,
+`download_failed`, `browser_crash`, `cleanup_failed`, or `outcome_ambiguous`.
 
 Credentials remain application-owned credential/egress authority. Runner
 handles expose only a tri-state secret-presence declaration for this admission
@@ -357,7 +401,8 @@ otherwise operates a page. A recovered `observe` is a new admitted operation
 with a new identity. The durable continuity/session records contain only opaque
 identities, bounded safe status and counters, revisions, and refs—not cookies,
 local/session storage, profile files, credentials, page content, history,
-screenshots, downloads, or Chromium identifiers. A sealed terminal operation
+screenshots, downloads, or Chromium identifiers. Upload operation records retain only bounded artifact identity,
+basename/media metadata, size, and content fingerprint. A sealed terminal operation
 receipt necessarily retains its bounded `ToolResult`, including bounded URL,
 title, snapshot, and refs needed for exact replay; it never retains raw binary
 artifact bytes or browser-profile contents.

@@ -60,7 +60,7 @@ from cayu.evals.evidence import (
     project_assertion_evidence_view,
 )
 from cayu.evals.models import EvalStatus, EvalTrialResult
-from cayu.evals.runner import EvalPlan, EvalSuite, run_eval_suite
+from cayu.evals.runner import EvalPlan, EvalSuite, _run_eval_suite, run_eval_suite
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.runtime.costs import PriceBook
@@ -90,10 +90,14 @@ _REFUSAL_ERRORS = VISUAL_FAILURE_CODES | frozenset(
     {
         "access_blocked",
         "actionability_failed",
+        "artifact_refused",
+        "artifact_unavailable",
         "authority_expired",
         "destination_denied",
         "fetch_failed",
+        "history_unavailable",
         "incompatible_profile",
+        "incompatible_upload_target",
         "missing_element",
         "operation_conflict",
         "operation_not_dispatched",
@@ -106,6 +110,8 @@ _REFUSAL_ERRORS = VISUAL_FAILURE_CODES | frozenset(
         "unknown_element",
         "unknown_page",
         "unknown_session",
+        "unsafe_reload",
+        "upload_too_large",
     }
 )
 
@@ -322,6 +328,8 @@ class BrowserAcceptanceFaultScenario(StrEnum):
     BROWSER_DURING_CLEANUP = "browser_during_cleanup"
     BROWSER_ACTIVE_PAGE_CRASH = "browser_active_page_crash"
     BROWSER_BACKGROUND_PAGE_CRASH = "browser_background_page_crash"
+    BROWSER_UPLOAD_DISCONNECTION = "browser_upload_disconnection"
+    BROWSER_UPLOAD_ACKNOWLEDGEMENT_LOSS = "browser_upload_acknowledgement_loss"
     ACKNOWLEDGEMENT_LOSS = "acknowledgement_loss"
 
 
@@ -2778,14 +2786,34 @@ async def _run_browser_acceptance_locked(
             execution_app = app
             try:
                 if case.fault_scenario is None:
-                    run = await run_eval_suite(
-                        app,
-                        EvalSuite(id=suite.id, cases=[eval_case], metadata=suite.metadata),
-                        retain_trajectory=True,
-                        max_concurrency=1,
-                        case_timeout_seconds=max(campaign_deadline - loop.time(), 0.001),
-                        trials=1,
-                    )
+                    trial_suite = EvalSuite(id=suite.id, cases=[eval_case], metadata=suite.metadata)
+                    if (
+                        plan.manifest.mode is BrowserAcceptanceMode.DETERMINISTIC
+                        and "upload" in case.operations
+                    ):
+                        from cayu.evals.internal.browser_acceptance import bind_trial_session
+
+                        run, _ = await _run_eval_suite(
+                            app,
+                            trial_suite,
+                            retain_trajectory=True,
+                            retain_final_output=True,
+                            max_concurrency=1,
+                            case_timeout_seconds=max(campaign_deadline - loop.time(), 0.001),
+                            trials=1,
+                            trial_policy=None,
+                            public_output_preview_bytes=None,
+                            trial_request_transform=bind_trial_session,
+                        )
+                    else:
+                        run = await run_eval_suite(
+                            app,
+                            trial_suite,
+                            retain_trajectory=True,
+                            max_concurrency=1,
+                            case_timeout_seconds=max(campaign_deadline - loop.time(), 0.001),
+                            trials=1,
+                        )
                     trial = run.cases[0].trials[0].model_copy(update={"trial_number": trial_number})
                     trial_started_at = run.started_at
                     trial_completed_at = run.completed_at
@@ -3711,6 +3739,17 @@ def _semantic_state(
         )
     if case.semantic_oracle is BrowserAcceptanceSemanticOracle.STABLE_ERROR:
         expected_error = parameters.get("error")
+        if "expected_effects" in parameters:
+            expected_effects = parameters["expected_effects"]
+            if (
+                not isinstance(expected_effects, dict)
+                or any(
+                    type(key) is not str or type(value) is not int
+                    for key, value in expected_effects.items()
+                )
+                or diagnostic.fixture_effects != expected_effects
+            ):
+                return BrowserAcceptanceSemanticState.FAILED
         errors = tuple(
             item.error_category for item in diagnostic.operations if item.error_category is not None
         )

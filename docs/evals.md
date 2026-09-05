@@ -2655,20 +2655,24 @@ The command owns the deterministic fixture for the complete run and the scorecar
 fails any relative-route case unless the fixture actually observed the route. The
 deterministic profile is credential-free and uses only the two pinned local fixture
 origins and Cayu's checked-in deterministic provider; no live model is called. It
-covers navigation and redirect behavior; supported form and
+covers navigation, redirect, back, forward, and reload behavior; semantic scroll;
+strict reference-bound hover; artifact-backed file-input upload; supported form and
 action operations; delayed, replaced, hidden, detached, occluded, duplicate, stale,
-scroll-dependent, frame, popup, truncation, artifact, denial, hostile-content,
-capacity, cancellation, crash, acknowledgement-loss, replay, conflict, and cleanup
-cases. History navigation, reload, upload, trace/video capture, multiple-page control,
-and visual-only interaction are explicit `unsupported` rows in schema V1. Absence of
-a required case, trial, semantic oracle, diagnostic, or terminal allocation
-disposition can never be reported as a pass.
+frame, popup, truncation, artifact, denial, hostile-content, capacity, cancellation,
+crash, acknowledgement-loss, replay, conflict, and cleanup cases. Trace/video
+capture, multiple-page control, and visual-only interaction remain explicit
+`unsupported` rows in schema V1. Absence of a required case, trial, semantic oracle,
+diagnostic, or terminal allocation disposition can never be reported as a pass.
 
 Redirect conformance binds the final browser-observed destination rather than only
 the submitted navigation target. Stale-observation coverage retains a pre-action
-revision across each admitted state-invalidating operation: click, fill, select,
-press, wait, screenshot, and download. Missing, malformed, or contradictory browser
-execution evidence is incomplete and cannot be inferred as a pre-dispatch intent.
+revision across each admitted state-invalidating operation: back, forward, reload,
+scroll, hover, upload, click, fill, select, press, wait, screenshot, and download.
+Upload rows seed a bounded session-scoped fixture artifact and submit only its durable
+artifact reference to the public `browser_session` tool; the fixture confirms file
+selection without treating selection as proof that any remote form accepted the file.
+Missing, malformed, or contradictory browser execution evidence is incomplete and
+cannot be inferred as a pre-dispatch intent.
 
 Cancellation and process-loss rows are executable scenarios, not labels applied to
 ordinary successful runs. Each row binds the injected lifecycle boundary, delivered

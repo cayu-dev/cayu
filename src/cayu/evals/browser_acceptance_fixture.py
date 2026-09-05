@@ -28,9 +28,12 @@ _FIXTURE_PAGE_ROUTES = (
     "/duplicate-labels",
     "/forms",
     "/frame-controls",
+    "/history-next",
+    "/history-start",
     "/hidden",
     "/hostile",
     "/long-observation",
+    "/hover",
     "/long-page",
     "/occluded",
     "/oversized",
@@ -44,7 +47,9 @@ _FIXTURE_PAGE_ROUTES = (
     "/popup-opener-child",
     "/popup-opener-navigation",
     "/popup-redirect",
+    "/reload-dialog",
     "/replaced",
+    "/reload",
     "/same-origin-frame",
     "/visual-canvas",
     "/visual-image",
@@ -56,10 +61,13 @@ _FIXTURE_PAGE_ROUTES = (
     "/visual-moved",
     "/visual-overlay",
     "/visual-scroll",
+    "/scroll",
+    "/upload",
 )
 _FIXTURE_OVERSIZED_DOWNLOAD_BYTES = (4 * 1024 * 1024) + 1
 _FIXTURE_LONG_OBSERVATION_BLOCKS = 2
 _FIXTURE_LONG_OBSERVATION_TEXT = "bounded observation " * 2_000
+BROWSER_ACCEPTANCE_FIXTURE_UPLOAD_BYTES = b"bounded browser acceptance upload\n"
 
 
 def _fixture_pages() -> dict[str, str]:
@@ -134,6 +142,40 @@ def _fixture_pages() -> dict[str, str]:
             profile.onsubmit=(event)=>{event.preventDefault();result.textContent='Saved';
             document.title='Saved';fetch('/effect/form-saved');}</script>
             </main>""",
+        "/history-start": """<!doctype html><title>History start</title><main>
+            <h1>History start</h1><a href="/history-next">Next destination</a><button
+            onclick="fetch('/effect/history-back-confirmed')">Back destination</button>
+            </main>""",
+        "/reload-dialog": """<!doctype html><title>Dialog navigation</title><main>Ready</main>
+            <script>if(sessionStorage.getItem('reload-dialog'))alert('fixture dialog');
+            sessionStorage.setItem('reload-dialog','visited')</script>""",
+        "/history-next": """<!doctype html><title>History next</title><main>
+            <h1>History next</h1><button
+            onclick="fetch('/effect/history-forward-confirmed')">Forward destination</button>
+            </main>""",
+        "/reload": """<!doctype html><title>Reload fixture</title><main>
+            <button onclick="fetch('/effect/reload-anchor')">Reload anchor</button>
+            <button id="confirmed" hidden
+            onclick="fetch('/effect/reload-confirmed')">Reload confirmed</button></main>
+            <script>const key='cayu-browser-acceptance-reloads';
+            const count=Number(sessionStorage.getItem(key)||'0')+1;
+            sessionStorage.setItem(key,String(count));if(count>1){confirmed.hidden=false}</script>""",
+        "/scroll": """<!doctype html><title>Semantic scroll</title>
+            <main style="height:3000px"><p>top</p><button id="after-scroll" hidden
+            style="position:absolute;top:1200px"
+            onclick="fetch('/effect/bottom-clicked')">Bottom action</button></main>
+            <script>addEventListener('scroll',()=>{if(scrollY>=500){
+            document.getElementById('after-scroll').hidden=false}})</script>""",
+        "/hover": """<!doctype html><title>Strict hover</title><main>
+            <button onmouseenter="fetch('/effect/hover-observed')">Hover target</button>
+            </main>""",
+        "/upload": """<!doctype html><title>Artifact upload</title><main>
+            <label>Upload file <input id="upload" type="file" aria-label="Upload file"></label>
+            <button onclick="fetch('/effect/upload-save')">Save</button></main>
+            <script>upload.onchange=async()=>{const files=upload.files;
+            const accepted=files.length===1&&files[0].name==='acceptance-upload.txt'&&
+            await files[0].text()==='bounded browser acceptance upload\\n';
+            fetch(accepted?'/effect/upload-selected':'/effect/upload-invalid')}</script>""",
         "/delayed": """<!doctype html><title>Delayed control</title><main id="root">waiting</main>
             <script>setTimeout(()=>{root.innerHTML='<button id="continue">Continue</button>';
             document.getElementById('continue').onclick=()=>fetch('/effect/delayed-clicked')},150)
@@ -263,6 +305,15 @@ BROWSER_ACCEPTANCE_FIXTURE_REVISION = _content_revision(
             },
         },
         "artifacts": {
+            "session_scoped_upload": {
+                "filename": "acceptance-upload.txt",
+                "content_type": "text/plain",
+                "size_bytes": len(BROWSER_ACCEPTANCE_FIXTURE_UPLOAD_BYTES),
+                "content_revision": _content_revision(
+                    {"content": BROWSER_ACCEPTANCE_FIXTURE_UPLOAD_BYTES.decode("ascii")},
+                    "browser acceptance upload fixture",
+                ),
+            },
             "/download/report.txt": {
                 "filename": "report.txt",
                 "size_bytes": len(b"bounded browser acceptance download\n"),
@@ -524,4 +575,8 @@ def _fixture_address() -> str:
     return address
 
 
-__all__ = ["BROWSER_ACCEPTANCE_FIXTURE_REVISION", "BrowserAcceptanceFixtureV1"]
+__all__ = [
+    "BROWSER_ACCEPTANCE_FIXTURE_REVISION",
+    "BROWSER_ACCEPTANCE_FIXTURE_UPLOAD_BYTES",
+    "BrowserAcceptanceFixtureV1",
+]

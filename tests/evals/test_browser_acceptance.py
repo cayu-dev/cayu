@@ -119,7 +119,7 @@ def _runtime_identity() -> BrowserAcceptanceRuntimeIdentityV1:
     return BrowserAcceptanceRuntimeIdentityV1.build(
         runtime_build_provenance=build,
         browser_protocol="cayu.browser-session.v4",
-        browser_worker_version="8",
+        browser_worker_version="9",
         playwright_version="1.62.0",
         chromium_identity="chromium-fixture",
         runner_fingerprint="3" * 64,
@@ -553,6 +553,40 @@ def test_checked_browser_manifests_cover_required_categories_and_modes() -> None
         "visual-canvas",
     ):
         assert any(required_fragment in case_id for case_id in deterministic_ids)
+    executable_operations = {
+        operation
+        for case in deterministic.cases
+        if case.expected_state is not BrowserAcceptanceState.UNSUPPORTED
+        for operation in case.operations
+    }
+    assert {"back", "forward", "reload", "scroll", "hover", "upload"}.issubset(
+        executable_operations
+    )
+    assert (
+        next(
+            case for case in deterministic.cases if case.case_id == "artifact-upload"
+        ).expected_state
+        is BrowserAcceptanceState.PASSED
+    )
+    expected_operation_flows = {
+        "navigation-history-back": ("navigate", "click", "back", "click"),
+        "navigation-history-forward": (
+            "navigate",
+            "click",
+            "back",
+            "forward",
+            "click",
+        ),
+        "navigation-reload": ("navigate", "reload", "click"),
+        "navigation-scroll-dependent-control": ("navigate", "scroll", "click"),
+        "action-strict-hover": ("navigate", "hover"),
+        "artifact-upload": ("navigate", "upload"),
+    }
+    assert {
+        case.case_id: case.operations
+        for case in deterministic.cases
+        if case.case_id in expected_operation_flows
+    } == expected_operation_flows
     assert live.mode is BrowserAcceptanceMode.LIVE_PUBLIC
     assert live.trial_count > 1
     assert live.limits.max_model_steps == (
@@ -574,7 +608,21 @@ def test_checked_browser_manifests_cover_required_categories_and_modes() -> None
         case.case_id.removeprefix("revision-stale-ref-after-")
         for case in deterministic.cases
         if case.case_id.startswith("revision-stale-ref-after-")
-    } == {"click", "download", "fill", "press", "screenshot", "select", "wait"}
+    } == {
+        "back",
+        "click",
+        "download",
+        "fill",
+        "forward",
+        "hover",
+        "press",
+        "reload",
+        "screenshot",
+        "scroll",
+        "select",
+        "upload",
+        "wait",
+    }
 
 
 def test_redirect_oracle_requires_the_final_observed_destination() -> None:
@@ -844,6 +892,45 @@ def test_browser_acceptance_requires_exact_request_outcome_evidence() -> None:
             public_operations=frozenset({"navigate"}),
         )
         is BrowserAcceptanceSemanticState.FAILED
+    )
+
+
+@pytest.mark.parametrize("effects", [{}, {"upload-selected": 1}])
+def test_upload_refusal_oracle_requires_absence_of_fixture_effects(effects: dict[str, int]) -> None:
+    case = next(
+        case
+        for case in deterministic_browser_acceptance_manifest().cases
+        if case.case_id == "artifact-upload-wrong-session"
+    )
+    diagnostic = BrowserAcceptanceDiagnosticV1(
+        state=BrowserAcceptanceDiagnosticState.CAPTURED,
+        fixture_route_observed=True,
+        fixture_effects=effects,
+        fixture_route_request_count=1,
+        operations=(
+            BrowserAcceptanceOperationEvidenceV1(
+                sequence=1,
+                invocation_revision="sha256:" + "1" * 64,
+                operation="navigate",
+                state=BrowserAcceptanceOperationState.TERMINAL,
+                allocation_disposition=BrowserAllocationDisposition.LIVE,
+                target_revision=_content_revision(
+                    {"url": "https://docs.browser.test/upload"},
+                    "browser acceptance operation target",
+                ),
+            ),
+            BrowserAcceptanceOperationEvidenceV1(
+                sequence=2,
+                invocation_revision="sha256:" + "2" * 64,
+                operation="upload",
+                state=BrowserAcceptanceOperationState.OPERATION_NOT_DISPATCHED,
+                error_category="artifact_refused",
+                allocation_disposition=BrowserAllocationDisposition.UNAVAILABLE,
+            ),
+        ),
+    )
+    assert _semantic_state(case, diagnostic, public_operations=frozenset({"upload"})) is (
+        BrowserAcceptanceSemanticState.FAILED if effects else BrowserAcceptanceSemanticState.PASSED
     )
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import hashlib
 import importlib.metadata
@@ -63,7 +64,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "8"
+INTERACTIVE_WORKER_VERSION = "9"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -147,8 +148,21 @@ _INTERACTIVE_POPUP_EFFECT_OPERATIONS = frozenset(
         "download",
         "click_visual_target",
         "click_visual_point",
+        "back",
+        "forward",
+        "reload",
+        "scroll",
+        "hover",
+        "upload",
     }
 )
+_INTERACTIVE_MAX_SCROLL_REPEATS = 16
+_INTERACTIVE_MAX_UPLOAD_FILES = 16
+_INTERACTIVE_MAX_UPLOAD_FILE_BYTES = 32 * 1024 * 1024
+_INTERACTIVE_MAX_UPLOAD_TOTAL_BYTES = 32 * 1024 * 1024
+_INTERACTIVE_MAX_UPLOAD_FILENAME_BYTES = 255
+_INTERACTIVE_MAX_UPLOAD_MATERIALIZATION_MS = 120_000
+_INTERACTIVE_MAX_UPLOAD_CONTENT_TYPE_BYTES = 255
 _INTERACTIVE_OPERATION_LEDGER_BYTES = 16 * 1024 * 1024
 _OBSERVATION_GUARD_SETTLEMENT_SECONDS = 1.0
 _INTERACTIVE_MAX_ELEMENT_TEXT_BYTES = 2 * 1024
@@ -324,6 +338,9 @@ _INTERACTIVE_MAX_MESSAGE_BYTES = (
     * (6 * (_MAX_URL_LENGTH + _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES + 256) + 4_096)
     + 7 * _INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES
     + _INTERACTIVE_RESPONSE_FIXED_BYTES
+)
+_INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES = (
+    4 * ((_INTERACTIVE_MAX_UPLOAD_TOTAL_BYTES + 2) // 3) + _INTERACTIVE_MAX_REQUEST_BYTES
 )
 _INTERACTIVE_REF_PATTERN = re.compile(
     r"(?P<prefix>(?:[ \t]+\[(?:checked(?:=mixed)?|disabled|expanded|active|"
@@ -656,6 +673,13 @@ class _InteractiveLimits:
     max_total_artifacts: int
     max_page_cleanup_operations: int
 
+    max_scroll_repeats: int
+    max_upload_files: int
+    max_upload_file_bytes: int
+    max_upload_total_bytes: int
+    max_upload_filename_bytes: int
+    max_upload_materialization_ms: int
+
 
 @dataclass(frozen=True)
 class _InteractivePopupPolicy:
@@ -663,6 +687,25 @@ class _InteractivePopupPolicy:
     allowed_operations: tuple[str, ...]
     allowed_opener_origins: tuple[str, ...]
     allowed_destination_origins: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _InteractiveUploadFile:
+    artifact_id: str
+    content_sha256: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    content: bytes
+
+    def fingerprint_material(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "content_sha256": self.content_sha256,
+            "filename": self.filename,
+            "content_type": self.content_type,
+            "size_bytes": self.size_bytes,
+        }
 
 
 @dataclass(frozen=True)
@@ -683,6 +726,12 @@ class _InteractiveRequest:
         "list_pages",
         "switch_page",
         "close_page",
+        "back",
+        "forward",
+        "reload",
+        "scroll",
+        "hover",
+        "upload",
         "close",
         "profile_restore",
         "profile_checkpoint",
@@ -698,6 +747,10 @@ class _InteractiveRequest:
     key: str | None
     wait_ms: int | None
     full_page: bool
+    direction: Literal["up", "down", "left", "right"] | None
+    amount: Literal["line", "page"] | None
+    repeat_count: int | None
+    upload_files: tuple[_InteractiveUploadFile, ...]
     limits: _InteractiveLimits
     multi_page: bool
     popup_policy: _InteractivePopupPolicy
@@ -779,6 +832,10 @@ class _InteractivePage:
     denied_code: str | None = None
     access_evidence: dict[str, Any] | None = None
     limit_abort_task: asyncio.Task[bool] | None = None
+    current_document_method: str | None = None
+    document_methods: dict[str, str] = field(default_factory=dict)
+    history_methods: dict[int, str] = field(default_factory=dict)
+    dialog_observed: bool = False
     cleanup_task: asyncio.Task[None] | None = None
     unexpected_download_task: asyncio.Task[bool] | None = None
     authorized_download_operation_id_sha256: str | None = None
@@ -1039,6 +1096,12 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             "select",
             "press",
             "wait",
+            "back",
+            "forward",
+            "reload",
+            "scroll",
+            "hover",
+            "upload",
             "screenshot",
             "download",
             "list_pages",
@@ -1073,6 +1136,12 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "select": revision | {"ref", "value"},
         "press": revision | {"key", "ref"},
         "wait": revision | {"wait_ms"},
+        "back": revision,
+        "forward": revision,
+        "reload": revision,
+        "scroll": revision | {"amount", "direction", "repeat_count"},
+        "hover": revision | {"ref"},
+        "upload": revision | {"artifact_ids", "ref", "upload_files"},
         "screenshot": revision,
         "download": revision | {"ref"},
         "list_pages": base | {"operation_id"},
@@ -1115,10 +1184,16 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "max_artifacts_per_page",
         "max_total_artifacts",
         "max_page_cleanup_operations",
+        "max_scroll_repeats",
         "max_snapshot_bytes",
         "max_dom_nodes",
         "max_wait_ms",
         "idle_timeout_seconds",
+        "max_upload_files",
+        "max_upload_file_bytes",
+        "max_upload_total_bytes",
+        "max_upload_filename_bytes",
+        "max_upload_materialization_ms",
     }:
         raise _GuestFailure("incompatible_browser")
     limits = _InteractiveLimits(
@@ -1186,6 +1261,36 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             raw_limits["max_operations"],
             minimum=1,
             maximum=_INTERACTIVE_MAX_OPERATIONS,
+        ),
+        max_scroll_repeats=_bounded_int(
+            raw_limits["max_scroll_repeats"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_SCROLL_REPEATS,
+        ),
+        max_upload_files=_bounded_int(
+            raw_limits["max_upload_files"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_UPLOAD_FILES,
+        ),
+        max_upload_file_bytes=_bounded_int(
+            raw_limits["max_upload_file_bytes"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_UPLOAD_FILE_BYTES,
+        ),
+        max_upload_total_bytes=_bounded_int(
+            raw_limits["max_upload_total_bytes"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_UPLOAD_TOTAL_BYTES,
+        ),
+        max_upload_filename_bytes=_bounded_int(
+            raw_limits["max_upload_filename_bytes"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_UPLOAD_FILENAME_BYTES,
+        ),
+        max_upload_materialization_ms=_bounded_int(
+            raw_limits["max_upload_materialization_ms"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_UPLOAD_MATERIALIZATION_MS,
         ),
         max_pages=_bounded_int(raw_limits["max_pages"], minimum=1, maximum=_INTERACTIVE_MAX_PAGES),
         max_provisional_pages=_bounded_int(
@@ -1318,7 +1423,8 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
     ):
         raise _GuestFailure("incompatible_browser")
     if (
-        (multi_page and limits.max_pages < 2)
+        limits.max_upload_file_bytes > limits.max_upload_total_bytes
+        or (multi_page and limits.max_pages < 2)
         or limits.max_provisional_pages > limits.max_pages
         or limits.max_page_creations_per_operation > limits.max_provisional_pages
         or limits.max_total_page_creations < limits.max_pages
@@ -1441,6 +1547,42 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
     for axis in ("x", "y"):
         if axis in raw and (type(raw[axis]) not in {int, float} or not 0 <= raw[axis] < 1):
             raise _GuestFailure("visual_point_outside_viewport")
+    direction = raw.get("direction")
+    amount = raw.get("amount")
+    repeat_count = raw.get("repeat_count")
+    if operation == "scroll":
+        if direction not in {"up", "down", "left", "right"}:
+            raise _GuestFailure("invalid_scroll", allocation_disposition="live")
+        if amount not in {"line", "page"}:
+            raise _GuestFailure("invalid_scroll", allocation_disposition="live")
+        try:
+            repeat_count = _bounded_int(
+                repeat_count,
+                minimum=1,
+                maximum=limits.max_scroll_repeats,
+            )
+        except _GuestFailure as exc:
+            raise _GuestFailure("invalid_scroll", allocation_disposition="live") from exc
+    elif direction is not None or amount is not None or repeat_count is not None:
+        raise _GuestFailure("incompatible_browser")
+    upload_files = (
+        _interactive_upload_files(
+            raw.get("upload_files"),
+            limits,
+            require_content=not reconcile_only,
+        )
+        if operation == "upload"
+        else ()
+    )
+    if operation == "upload":
+        raw_artifact_ids = raw.get("artifact_ids")
+        if (
+            type(raw_artifact_ids) is not list
+            or len(raw_artifact_ids) != len(upload_files)
+            or tuple(_interactive_identifier(item) for item in raw_artifact_ids)
+            != tuple(item.artifact_id for item in upload_files)
+        ):
+            raise _GuestFailure("artifact_refused")
     return _InteractiveRequest(
         operation=operation,
         session_id=session_id,
@@ -1454,6 +1596,10 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         key=key,
         wait_ms=wait_ms,
         full_page=full_page,
+        direction=direction,
+        amount=amount,
+        repeat_count=repeat_count,
+        upload_files=upload_files,
         limits=limits,
         multi_page=multi_page,
         popup_policy=_InteractivePopupPolicy(
@@ -1696,6 +1842,102 @@ def _bounded_interactive_profile_private_values(
     return protected_values
 
 
+def _interactive_upload_files(
+    raw: Any,
+    limits: _InteractiveLimits,
+    *,
+    require_content: bool = True,
+) -> tuple[_InteractiveUploadFile, ...]:
+    if type(raw) is not list or not 0 < len(raw) <= limits.max_upload_files:
+        raise _GuestFailure("artifact_refused")
+    files: list[_InteractiveUploadFile] = []
+    total_size = 0
+    seen_artifacts: set[str] = set()
+    for item in raw:
+        expected_fields = {
+            "artifact_id",
+            "content_sha256",
+            "content_type",
+            "filename",
+            "size_bytes",
+        }
+        if require_content:
+            expected_fields.add("content_base64")
+        if type(item) is not dict or set(item) != expected_fields:
+            raise _GuestFailure("artifact_refused")
+        artifact_id = _interactive_identifier(item.get("artifact_id"))
+        if artifact_id in seen_artifacts:
+            raise _GuestFailure("artifact_refused")
+        seen_artifacts.add(artifact_id)
+        content_sha256 = item.get("content_sha256")
+        if (
+            type(content_sha256) is not str
+            or len(content_sha256) != 64
+            or re.fullmatch(r"[0-9a-f]{64}", content_sha256) is None
+        ):
+            raise _GuestFailure("artifact_refused")
+        filename = _interactive_upload_filename(
+            item.get("filename"),
+            maximum=limits.max_upload_filename_bytes,
+        )
+        content_type = item.get("content_type")
+        if (
+            type(content_type) is not str
+            or not content_type
+            or len(content_type.encode("ascii", errors="ignore")) != len(content_type)
+            or len(content_type) > _INTERACTIVE_MAX_UPLOAD_CONTENT_TYPE_BYTES
+            or re.fullmatch(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*", content_type)
+            is None
+        ):
+            raise _GuestFailure("artifact_refused")
+        size_bytes = item.get("size_bytes")
+        if (
+            type(size_bytes) is not int
+            or size_bytes < 0
+            or size_bytes > limits.max_upload_file_bytes
+        ):
+            raise _GuestFailure("upload_too_large", allocation_disposition="live")
+        total_size += size_bytes
+        if total_size > limits.max_upload_total_bytes:
+            raise _GuestFailure("upload_too_large", allocation_disposition="live")
+        encoded = item.get("content_base64", "")
+        if type(encoded) is not str or len(encoded) > 4 * ((limits.max_upload_file_bytes + 2) // 3):
+            raise _GuestFailure("upload_too_large", allocation_disposition="live")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise _GuestFailure("artifact_refused") from exc
+        if require_content and len(content) != size_bytes:
+            raise _GuestFailure("artifact_refused")
+        if require_content and hashlib.sha256(content).hexdigest() != content_sha256:
+            raise _GuestFailure("artifact_refused")
+        files.append(
+            _InteractiveUploadFile(
+                artifact_id=artifact_id,
+                content_sha256=content_sha256,
+                filename=filename,
+                content_type=content_type,
+                size_bytes=size_bytes,
+                content=content,
+            )
+        )
+    return tuple(files)
+
+
+def _interactive_upload_filename(value: Any, *, maximum: int) -> str:
+    if type(value) is not str or not value or "\x00" in value:
+        raise _GuestFailure("artifact_refused")
+    if value in {".", ".."} or Path(value).name != value or "/" in value or "\\" in value:
+        raise _GuestFailure("artifact_refused")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _GuestFailure("artifact_refused") from exc
+    if len(encoded) > maximum:
+        raise _GuestFailure("artifact_refused")
+    return value
+
+
 def _interactive_identifier(value: Any) -> str:
     if (
         type(value) is not str
@@ -1900,7 +2142,6 @@ async def _start_temporary_profile_owner(
     startup_timeout_seconds: float | None = None,
     existing_home: Path | None = None,
 ) -> _TemporaryProfileOwner:
-    created_home = existing_home is None
     if existing_home is None:
         try:
             home = Path(
@@ -1913,13 +2154,10 @@ async def _start_temporary_profile_owner(
             raise _GuestFailure("cleanup_failed") from exc
     else:
         home = existing_home
-    try:
-        _validate_temporary_profile_home(home)
-    except BaseException:
-        if created_home:
-            with contextlib.suppress(OSError):
-                shutil.rmtree(home)
-        raise
+    # Until the cleanup owner starts, retain failed setup material for the
+    # allocation's outer teardown. Recursive deletion here is unbounded, and
+    # rejected ownership evidence must never authorize deletion.
+    _validate_temporary_profile_home(home)
     cleanup_timeout_seconds = max(
         0.001,
         min(
@@ -1937,9 +2175,6 @@ async def _start_temporary_profile_owner(
         for descriptor in descriptors:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
-        if created_home:
-            with contextlib.suppress(OSError):
-                shutil.rmtree(home)
         raise _GuestFailure("cleanup_failed") from exc
     try:
         command = _temporary_profile_cleanup_command(
@@ -1963,9 +2198,6 @@ async def _start_temporary_profile_owner(
         for descriptor in (control_read, control_write, ready_read, ready_write):
             with contextlib.suppress(OSError):
                 os.close(descriptor)
-        if created_home:
-            with contextlib.suppress(OSError):
-                shutil.rmtree(home)
         # No synchronous fallback is safe here: filesystem deletion is exactly
         # the operation that must not be allowed to block the worker deadline.
         raise _GuestFailure("cleanup_failed") from exc
@@ -4027,7 +4259,7 @@ async def _interactive_send(socket_path: Path, raw: Any) -> dict[str, Any] | Non
         return None
     try:
         encoded = json.dumps(raw, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if len(encoded) > _INTERACTIVE_MAX_REQUEST_BYTES:
+        if len(encoded) > _INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES:
             raise _GuestFailure("incompatible_browser")
         writer.write(encoded + b"\n")
         await writer.drain()
@@ -4150,7 +4382,7 @@ class _InteractiveDaemon:
                     "--disable-default-apps",
                     "--disable-dev-shm-usage",
                     "--disable-domain-reliability",
-                    "--disable-features=AutofillServerCommunication,MediaRouter",
+                    "--disable-features=AutofillServerCommunication,MediaRouter,BackForwardCache",
                     "--disable-quic",
                     "--disable-sync",
                     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
@@ -6016,6 +6248,10 @@ class _InteractiveDaemon:
         main_frame_id = frame_tree["frameTree"]["frame"]["id"]
         if type(main_frame_id) is not str:
             raise _GuestFailure("browser_crash")
+        state.cdp.on(
+            "Network.requestWillBeSent",
+            lambda params: _retain_document_request(state, main_frame_id, params),
+        )
         # Request URLs omit fragments. After aborting an unguarded initial
         # navigation, Chromium retains the full target on this exact frame.
         # Restore only a fragment; never replace request authority with an
@@ -6201,6 +6437,13 @@ class _InteractiveDaemon:
         page.on("framenavigated", lambda frame: self._mark_page_navigated(state, frame))
         page.on("close", lambda: self._mark_page_closed(state, "closed_by_page"))
         page.on("crash", lambda: self._mark_page_crashed(state))
+
+        async def dialog_observed(dialog: Any) -> None:
+            state.dialog_observed = True
+            with contextlib.suppress(Exception):
+                await dialog.dismiss()
+
+        page.on("dialog", dialog_observed)
         state.configured = True
 
     def _mark_page_navigated(self, state: _InteractivePage, frame: Any) -> None:
@@ -6244,6 +6487,7 @@ class _InteractiveDaemon:
         request: _InteractiveRequest,
     ) -> dict[str, Any]:
         page = state.page
+        operation_evidence: dict[str, Any] | None = None
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
@@ -6256,9 +6500,12 @@ class _InteractiveDaemon:
                 or request.expected_control_epoch != state.control_epoch - 1
             ):
                 raise _GuestFailure("incompatible_browser")
+            admitted_refs = state.refs
+            state.revision = None
+            state.refs = {}
             internal_ref = None
             if request.ref is not None:
-                internal_ref = state.refs.get(request.ref)
+                internal_ref = admitted_refs.get(request.ref)
                 if internal_ref is None:
                     raise _GuestFailure("missing_element")
                 navigation_epoch = state.navigation_epoch
@@ -6279,6 +6526,8 @@ class _InteractiveDaemon:
                             "element => element.isConnected"
                         )
                     except Exception as exc:
+                        if request.operation == "upload":
+                            raise
                         raise _GuestFailure("actionability_failed") from exc
                     if target_connected is not True:
                         raise _GuestFailure("actionability_failed")
@@ -6287,6 +6536,7 @@ class _InteractiveDaemon:
                 state.clear_refs()
         if state.visual_owner is not None and not visual_action:
             state.visual_owner.invalidate()
+        _raise_interactive_dialog_failure(state, request.operation)
         guard_effect = request.multi_page and request.operation in (
             _INTERACTIVE_POPUP_EFFECT_OPERATIONS
         )
@@ -6331,12 +6581,31 @@ class _InteractiveDaemon:
                 await action_target.press(request.key)
             elif request.operation == "wait":
                 await page.wait_for_timeout(request.wait_ms)
+            elif request.operation == "back":
+                await _interactive_history_traversal(state, request, offset=-1)
+            elif request.operation == "forward":
+                await _interactive_history_traversal(state, request, offset=1)
+            elif request.operation == "reload":
+                await _interactive_safe_reload(state, request)
+            elif request.operation == "scroll":
+                operation_evidence = await _interactive_semantic_scroll(state, request)
+            elif request.operation == "hover":
+                if action_target is None:  # pragma: no cover - parser invariant
+                    raise _GuestFailure("incompatible_browser")
+                await action_target.hover()
+            elif request.operation == "upload":
+                if action_target is None:  # pragma: no cover - parser invariant
+                    raise _GuestFailure("incompatible_browser")
+                operation_evidence = await self._upload_files(
+                    state, request, action_target, internal_ref
+                )
             elif request.operation == "download":
                 if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
                 return await self._download_and_observe(state, request, action_target)
             elif request.operation not in {"observe", "screenshot", "observe_visual"}:
                 raise _GuestFailure("incompatible_browser")
+            _raise_interactive_dialog_failure(state, request.operation)
         except BaseException as exc:
             primary_failure = exc
             raise
@@ -6358,6 +6627,11 @@ class _InteractiveDaemon:
                             primary_failure.__cause__, (cleanup_failure,)
                         )
                     raise
+        # Associate request methods only with the loader actually installed in
+        # the main frame. Before the first document request, there is no method
+        # authority to associate (nor necessarily a browser history entry).
+        if state.document_methods:
+            await _synchronize_interactive_history_method(state)
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
@@ -6403,12 +6677,15 @@ class _InteractiveDaemon:
             self.total_artifacts += 1
         else:
             observation = await self._observe_page(state, request.limits)
+        if request.operation == "observe":
+            state.dialog_observed = False
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
         return _interactive_success_payload(
             observation,
             artifact=artifact,
+            operation_evidence=operation_evidence,
             profile_output_protected=self.profile_output_values is not None,
         )
 
@@ -6632,6 +6909,45 @@ class _InteractiveDaemon:
         if primary is not None:
             raise primary
 
+    async def _upload_files(
+        self,
+        state: _InteractivePage,
+        request: _InteractiveRequest,
+        locator: Any,
+        internal_ref: str | None,
+    ) -> dict[str, Any]:
+        if internal_ref is None or self.home is None or not request.upload_files:
+            raise _GuestFailure("incompatible_browser")
+        target = await locator.evaluate(
+            """element => ({
+                is_file_input: element instanceof HTMLInputElement &&
+                    element.type.toLowerCase() === "file",
+                multiple: element instanceof HTMLInputElement && element.multiple,
+            })"""
+        )
+        if (
+            type(target) is not dict
+            or set(target) != {"is_file_input", "multiple"}
+            or type(target.get("is_file_input")) is not bool
+            or type(target.get("multiple")) is not bool
+            or not target["is_file_input"]
+            or (len(request.upload_files) > 1 and not target["multiple"])
+        ):
+            raise _GuestFailure("incompatible_upload_target", allocation_disposition="live")
+        # File paths remain browser-backed after selection. Transfer bounded
+        # admitted bytes instead, so later submission cannot outlive a temp file.
+        await locator.set_input_files(
+            [
+                {"name": upload.filename, "mimeType": upload.content_type, "buffer": upload.content}
+                for upload in request.upload_files
+            ]
+        )
+        return {
+            "operation": "upload",
+            "selected_file_count": len(request.upload_files),
+            "selection_state": "selected",
+        }
+
     async def close(self, *, timeout_seconds: float = 5.0) -> bool:
         deadline = asyncio.get_running_loop().time() + max(0.001, timeout_seconds)
 
@@ -6826,6 +7142,215 @@ class _InteractiveDaemon:
         if process_control is not None:
             raise process_control
         return cleanup_ok
+
+
+def _raise_interactive_dialog_failure(state: _InteractivePage, operation: str) -> None:
+    if not state.dialog_observed:
+        return
+    state.dialog_observed = False
+    if operation == "reload":
+        raise _GuestFailure("unsafe_reload", allocation_disposition="live")
+    if operation in {"back", "forward"}:
+        raise _GuestFailure("history_unavailable", allocation_disposition="live")
+    raise _GuestFailure("actionability_failed")
+
+
+def _retain_document_request(
+    state: _InteractivePage, main_frame_id: str, params: dict[str, Any]
+) -> None:
+    # Request/response arrival is not document commitment (e.g. HTTP 204).
+    # Only the loader currently installed in the main frame can authorize reuse.
+    if params.get("type") != "Document" or params.get("frameId") != main_frame_id:
+        return
+    loader_id = params.get("loaderId")
+    request = params.get("request")
+    if type(loader_id) is not str or not loader_id or type(request) is not dict:
+        return
+    method = request.get("method")
+    state.document_methods.pop(loader_id, None)
+    if type(method) is str and method:
+        state.document_methods[loader_id] = method.upper()
+    # Evicted history loses positive method evidence and fails closed.
+    while len(state.document_methods) > 128:
+        del state.document_methods[next(iter(state.document_methods))]
+
+
+async def _committed_document_identity(state: _InteractivePage) -> tuple[str, str]:
+    raw = await state.cdp.send("Page.getFrameTree")
+    try:
+        frame = raw["frameTree"]["frame"]
+        identity = (frame["id"], frame["loaderId"])
+    except (KeyError, TypeError) as exc:
+        raise _GuestFailure("browser_crash") from exc
+    if any(type(value) is not str or not value for value in identity):
+        raise _GuestFailure("browser_crash")
+    return identity
+
+
+async def _interactive_navigation_history(state: _InteractivePage) -> tuple[int, tuple[int, ...]]:
+    if state.cdp is None:
+        raise _GuestFailure("browser_crash")
+    raw = await state.cdp.send("Page.getNavigationHistory")
+    if (
+        type(raw) is not dict
+        or type(raw.get("currentIndex")) is not int
+        or type(raw.get("entries")) is not list
+    ):
+        raise _GuestFailure("browser_crash")
+    entries: list[int] = []
+    for item in raw["entries"]:
+        if type(item) is not dict or type(item.get("id")) is not int:
+            raise _GuestFailure("browser_crash")
+        entries.append(item["id"])
+    current_index = raw["currentIndex"]
+    if current_index < 0 or current_index >= len(entries) or len(set(entries)) != len(entries):
+        raise _GuestFailure("browser_crash")
+    return current_index, tuple(entries)
+
+
+async def _synchronize_interactive_history_method(state: _InteractivePage) -> tuple[str, str]:
+    document = await _committed_document_identity(state)
+    current_index, entries = await _interactive_navigation_history(state)
+    if await _committed_document_identity(state) != document:
+        raise _GuestFailure("navigation_timeout")
+    current_entry = entries[current_index]
+    method = state.document_methods.get(document[1])
+    state.history_methods.pop(current_entry, None)
+    if method is not None:
+        state.history_methods[current_entry] = method
+    state.current_document_method = method
+    return document
+
+
+async def _interactive_history_traversal(
+    state: _InteractivePage,
+    request: _InteractiveRequest,
+    *,
+    offset: Literal[-1, 1],
+) -> None:
+    await _synchronize_interactive_history_method(state)
+    current_index, entries = await _interactive_navigation_history(state)
+    target_index = current_index + offset
+    if target_index < 0 or target_index >= len(entries):
+        raise _GuestFailure("history_unavailable", allocation_disposition="live")
+    target_method = state.history_methods.get(entries[target_index])
+    if target_method not in {"GET", "HEAD"}:
+        raise _GuestFailure("history_unavailable", allocation_disposition="live")
+    operation = state.page.go_back if offset < 0 else state.page.go_forward
+    await operation(
+        wait_until="load",
+        timeout=max(1_000, request.limits.max_wait_ms),
+    )
+    final_index, final_entries = await _interactive_navigation_history(state)
+    if final_index != target_index:
+        raise _GuestFailure("history_unavailable", allocation_disposition="live")
+    state.current_document_method = state.history_methods.get(
+        final_entries[final_index],
+        target_method,
+    )
+
+
+async def _interactive_safe_reload(
+    state: _InteractivePage,
+    request: _InteractiveRequest,
+) -> None:
+    document = await _synchronize_interactive_history_method(state)
+    if state.current_document_method not in {"GET", "HEAD"}:
+        raise _GuestFailure("unsafe_reload", allocation_disposition="live")
+    current_index, _entries = await _interactive_navigation_history(state)
+    timeout_ms = max(1_000, request.limits.max_wait_ms)
+    # Bind dispatch in Chromium, not another read/check: an autonomous POST can
+    # commit after method validation and must never become the reload target.
+    async with asyncio.timeout(timeout_ms / 1_000):
+        async with state.page.expect_navigation(wait_until="load", timeout=timeout_ms):
+            try:
+                await state.cdp.send("Page.reload", {"loaderId": document[1]})
+            except Exception as exc:
+                if str(exc) == (
+                    "CDPSession.send: Protocol error (Page.reload): "
+                    "Reload was discarded because the page already navigated"
+                ):
+                    raise _GuestFailure("unsafe_reload", allocation_disposition="live") from exc
+                raise
+    final_index, _final_entries = await _interactive_navigation_history(state)
+    if final_index != current_index:
+        raise _GuestFailure("unsafe_reload", allocation_disposition="live")
+
+
+async def _interactive_semantic_scroll(
+    state: _InteractivePage,
+    request: _InteractiveRequest,
+) -> dict[str, Any]:
+    if (
+        state.cdp is None
+        or request.direction not in {"up", "down", "left", "right"}
+        or request.amount not in {"line", "page"}
+        or type(request.repeat_count) is not int
+        or request.repeat_count < 1
+        or request.repeat_count > request.limits.max_scroll_repeats
+    ):
+        raise _GuestFailure("invalid_scroll", allocation_disposition="live")
+    frame_tree = await state.cdp.send("Page.getFrameTree")
+    if type(frame_tree) is not dict or type(frame_tree.get("frameTree")) is not dict:
+        raise _GuestFailure("browser_crash")
+    frame = frame_tree["frameTree"].get("frame")
+    if type(frame) is not dict or type(frame.get("id")) is not str:
+        raise _GuestFailure("browser_crash")
+    context_id = await _create_isolated_world(state.cdp, frame["id"])
+    projection = await state.cdp.send(
+        "Runtime.evaluate",
+        {
+            "contextId": context_id,
+            "expression": """(() => {
+                const direction = __CAYU_DIRECTION__;
+                const amount = __CAYU_AMOUNT__;
+                const repeats = __CAYU_REPEATS__;
+                const horizontal = direction === "left" || direction === "right";
+                const sign = direction === "up" || direction === "left" ? -1 : 1;
+                const viewport = horizontal ? window.innerWidth : window.innerHeight;
+                const unit = amount === "line" ? 40 : Math.max(1, Math.floor(viewport * 0.875));
+                const before = horizontal ? window.scrollX : window.scrollY;
+                window.scrollBy({
+                    left: horizontal ? sign * unit * repeats : 0,
+                    top: horizontal ? 0 : sign * unit * repeats,
+                    behavior: "instant",
+                });
+                const after = horizontal ? window.scrollX : window.scrollY;
+                const root = document.documentElement;
+                const body = document.body;
+                const extent = horizontal
+                    ? Math.max(root?.scrollWidth || 0, body?.scrollWidth || 0)
+                    : Math.max(root?.scrollHeight || 0, body?.scrollHeight || 0);
+                const maximum = Math.max(0, extent - viewport);
+                const atStart = after <= 0;
+                const atEnd = after >= maximum;
+                return {
+                    moved: after !== before,
+                    edge: sign < 0 && atStart ? "start" : sign > 0 && atEnd ? "end" : "none",
+                };
+            })()""".replace("__CAYU_DIRECTION__", json.dumps(request.direction))
+            .replace("__CAYU_AMOUNT__", json.dumps(request.amount))
+            .replace("__CAYU_REPEATS__", str(request.repeat_count)),
+            "returnByValue": True,
+            "awaitPromise": False,
+            "userGesture": True,
+        },
+    )
+    if (
+        type(projection) is not dict
+        or projection.get("exceptionDetails") is not None
+        or type(projection.get("result")) is not dict
+        or type(projection["result"].get("value")) is not dict
+    ):
+        raise _GuestFailure("browser_crash")
+    evidence = projection["result"]["value"]
+    if (
+        set(evidence) != {"edge", "moved"}
+        or type(evidence.get("moved")) is not bool
+        or evidence.get("edge") not in {"start", "end", "none"}
+    ):
+        raise _GuestFailure("browser_crash")
+    return {"operation": "scroll", **evidence}
 
 
 async def _interactive_screenshot(
@@ -7184,6 +7709,7 @@ async def _interactive_observation(
                 if target is None:
                     raise _GuestFailure("browser_crash")
                 ref_targets[opaque] = target
+        ref_input_evidence = await _interactive_file_input_evidence(ref_targets)
         url = state.public_url if blocked else page.url
         if type(url) is not str:
             raise _GuestFailure("browser_crash")
@@ -7349,6 +7875,10 @@ async def _interactive_observation(
                 "ref": opaque,
                 "role": ref_metadata[opaque][0],
                 "name": ref_metadata[opaque][1],
+                "element_type": (
+                    "file_input" if ref_input_evidence[opaque] is not None else "element"
+                ),
+                "allows_multiple_files": ref_input_evidence[opaque],
             }
             for opaque in refs
         ],
@@ -7366,6 +7896,29 @@ async def _interactive_observation(
             "worker_version": INTERACTIVE_WORKER_VERSION,
         },
     }
+
+
+async def _interactive_file_input_evidence(
+    targets: Mapping[str, Any],
+) -> dict[str, bool | None]:
+    evidence: dict[str, bool | None] = {}
+    for opaque, target in targets.items():
+        raw = await target.evaluate(
+            """element => ({
+                is_file_input: element instanceof HTMLInputElement &&
+                    element.type.toLowerCase() === "file",
+                multiple: element instanceof HTMLInputElement && element.multiple,
+            })"""
+        )
+        if (
+            type(raw) is not dict
+            or set(raw) != {"is_file_input", "multiple"}
+            or type(raw.get("is_file_input")) is not bool
+            or type(raw.get("multiple")) is not bool
+        ):
+            raise _GuestFailure("browser_crash")
+        evidence[opaque] = raw["multiple"] if raw["is_file_input"] else None
+    return evidence
 
 
 async def _restore_interactive_observation_guards(
@@ -7478,6 +8031,7 @@ def _interactive_success_payload(
     page_set: dict[str, Any] | None = None,
     page_delta: dict[str, Any] | None = None,
     profile_output_protected: bool = False,
+    operation_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "protocol_version": INTERACTIVE_PROTOCOL_VERSION,
@@ -7494,6 +8048,8 @@ def _interactive_success_payload(
         payload["page_set"] = page_set
     if page_delta is not None:
         payload["page_delta"] = page_delta
+    if operation_evidence is not None:
+        payload["operation_evidence"] = operation_evidence
     return payload
 
 
@@ -7526,7 +8082,10 @@ def _interactive_error_payload(
         "destination_denied",
         "download_failed",
         "fetch_failed",
+        "history_unavailable",
         "incompatible_browser",
+        "incompatible_upload_target",
+        "invalid_scroll",
         "missing_element",
         "navigation_timeout",
         "operation_conflict",
@@ -7540,6 +8099,12 @@ def _interactive_error_payload(
         "resource_exhausted",
         "session_closed",
         "timeout",
+        "unsafe_reload",
+        "artifact_refused",
+        "artifact_unavailable",
+        "upload_cleanup_failed",
+        "upload_materialization_failed",
+        "upload_too_large",
     }:
         stable = "browser_crash"
     payload: dict[str, Any] = {
@@ -7561,6 +8126,7 @@ def _interactive_error_payload(
 def _interactive_operation_fingerprint(request: _InteractiveRequest) -> str:
     material = asdict(request)
     material.pop("reconcile_only", None)
+    material["upload_files"] = [item.fingerprint_material() for item in request.upload_files]
     encoded = json.dumps(
         material,
         ensure_ascii=False,
@@ -7579,10 +8145,15 @@ def _interactive_playwright_error(operation: str, error: BaseException) -> _Gues
     is_timeout = isinstance(error, TimeoutError) or (
         type(error).__name__ == "TimeoutError" and type(error).__module__.startswith("playwright")
     )
-    if operation == "navigate" and is_timeout:
+    if operation in {"navigate", "back", "forward", "reload"} and is_timeout:
         return _GuestFailure("navigation_timeout")
-    if operation in {"click", "fill", "select", "press"}:
+    if operation == "scroll" and is_timeout:
+        return _GuestFailure("timeout")
+    if operation in {"click", "fill", "select", "press", "hover"}:
         return _GuestFailure("actionability_failed")
+    if operation == "upload":
+        # Selection can run page handlers before an acknowledgement is lost.
+        return _GuestFailure("outcome_ambiguous")
     if operation == "download":
         return _GuestFailure("download_failed")
     if operation == "wait" and is_timeout:
@@ -7660,7 +8231,7 @@ async def _interactive_daemon_main(session_id: str) -> int:
         async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
                 raw_line = await reader.readuntil(b"\n")
-                if len(raw_line) > _INTERACTIVE_MAX_REQUEST_BYTES:
+                if len(raw_line) > _INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES:
                     raise _GuestFailure("incompatible_browser")
                 raw = json.loads(raw_line.decode("utf-8"))
                 request = _interactive_request_from_json(raw)
@@ -7699,7 +8270,7 @@ async def _interactive_daemon_main(session_id: str) -> int:
         server = await asyncio.start_unix_server(
             handle,
             path=str(socket_path),
-            limit=_INTERACTIVE_MAX_REQUEST_BYTES + 1,
+            limit=_INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES + 1,
         )
         os.chmod(socket_path, 0o600)
         daemon.last_activity = asyncio.get_running_loop().time()
@@ -7798,8 +8369,8 @@ def main() -> int:
         result = _error_payload(_GuestFailure("incompatible_browser"))
     else:
         try:
-            raw_stdin = sys.stdin.buffer.read(_INTERACTIVE_MAX_REQUEST_BYTES + 1)
-            if len(raw_stdin) > _INTERACTIVE_MAX_REQUEST_BYTES:
+            raw_stdin = sys.stdin.buffer.read(_INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES + 1)
+            if len(raw_stdin) > _INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES:
                 raise _GuestFailure("incompatible_browser")
             raw_request = json.loads(raw_stdin.decode("utf-8"))
             if (

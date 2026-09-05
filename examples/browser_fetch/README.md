@@ -51,9 +51,13 @@ Build from the repository root:
 ```bash
 docker build \
   --file examples/browser_fetch/Dockerfile \
-  --tag cayu-browser-fetch:8-playwright-1.62.0 \
+  --tag cayu-browser-fetch:9-playwright-1.62.0 \
   .
 ```
+
+The one-shot fetch profile selects the version-6 tag. The stateful interactive
+session profile selects the version-7 tag; both names refer to this one image,
+which carries the current worker handshake for each closed protocol.
 
 The Python slim base is pinned by multi-platform manifest digest. A multi-stage
 build extracts the setuid sandbox helper from Playwright's matching full
@@ -99,7 +103,7 @@ Pass `policies={"product-docs": browser_policy}`,
 `approved_destinations=approved_destinations`, `credentials=[]`, an adapter
 constructed with
 `DockerEgressAdapter(seccomp_profile="/absolute/path/to/examples/browser_fetch/seccomp_profile.json")`,
-and `image="cayu-browser-fetch:8-playwright-1.62.0"` to
+and `image="cayu-browser-fetch:9-playwright-1.62.0"` to
 `VirtualEgressEnvironmentFactory`. Plain Docker proves the enforced networking
 path for trusted development and CI; it is not Cayu's untrusted-code isolation
 boundary. Applications that require a stronger boundary use the same adapter

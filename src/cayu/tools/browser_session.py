@@ -10,13 +10,21 @@ import json
 import re
 import secrets
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -26,6 +34,7 @@ from cayu._validation import (
 )
 from cayu.artifacts import (
     ArtifactMetadata,
+    ArtifactReadResult,
     ArtifactScope,
     copy_artifact_read_result,
 )
@@ -60,7 +69,12 @@ from cayu.runners import (
     RunnerUnavailableError,
     RunnerWorkloadAuthority,
 )
-from cayu.tools._redaction import InvocationRedactorSnapshot, active_secret_redactor_snapshot
+from cayu.runtime.tool_policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
+from cayu.tools._redaction import (
+    InvocationRedactorSnapshot,
+    active_secret_redactor_snapshot,
+    await_revision_stable_secret_output,
+)
 from cayu.tools.browser import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
     DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
@@ -126,6 +140,22 @@ DEFAULT_BROWSER_SESSION_MAX_TOTAL_REQUESTS = 2_048
 DEFAULT_BROWSER_SESSION_MAX_ARTIFACTS_PER_PAGE = 64
 DEFAULT_BROWSER_SESSION_MAX_TOTAL_ARTIFACTS = 256
 DEFAULT_BROWSER_SESSION_MAX_PAGE_CLEANUP_OPERATIONS = 64
+DEFAULT_BROWSER_SESSION_MAX_SCROLL_REPEATS = 4
+DEFAULT_BROWSER_SESSION_MAX_UPLOAD_FILES = 4
+DEFAULT_BROWSER_SESSION_MAX_UPLOAD_FILE_BYTES = 8 * 1024 * 1024
+DEFAULT_BROWSER_SESSION_MAX_UPLOAD_TOTAL_BYTES = 16 * 1024 * 1024
+DEFAULT_BROWSER_SESSION_MAX_UPLOAD_FILENAME_BYTES = 255
+DEFAULT_BROWSER_SESSION_MAX_UPLOAD_MATERIALIZATION_MS = 30_000
+DEFAULT_BROWSER_SESSION_UPLOAD_CONTENT_TYPES = (
+    "application/octet-stream",
+    "application/pdf",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "text/csv",
+    "text/plain",
+)
 MAX_BROWSER_SESSION_MAX_SNAPSHOT_BYTES = 256 * 1024
 MAX_BROWSER_SESSION_MAX_DOM_NODES = MAX_BROWSER_FETCH_MAX_DOM_NODES
 MAX_BROWSER_SESSION_MAX_REFS = 1_024
@@ -155,6 +185,12 @@ MAX_BROWSER_SESSION_MAX_TOTAL_REQUESTS = 65_536
 MAX_BROWSER_SESSION_MAX_ARTIFACTS_PER_PAGE = 16_384
 MAX_BROWSER_SESSION_MAX_TOTAL_ARTIFACTS = 16_384
 MAX_BROWSER_SESSION_MAX_PAGE_CLEANUP_OPERATIONS = 16_384
+MAX_BROWSER_SESSION_MAX_SCROLL_REPEATS = 16
+MAX_BROWSER_SESSION_MAX_UPLOAD_FILES = 16
+MAX_BROWSER_SESSION_MAX_UPLOAD_FILE_BYTES = 32 * 1024 * 1024
+MAX_BROWSER_SESSION_MAX_UPLOAD_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_BROWSER_SESSION_MAX_UPLOAD_FILENAME_BYTES = 255
+MAX_BROWSER_SESSION_MAX_UPLOAD_MATERIALIZATION_MS = 120_000
 
 _MAX_BROWSER_ID_LENGTH = 128
 _MAX_OPERATION_ID_LENGTH = 128
@@ -164,6 +200,7 @@ _MAX_TITLE_BYTES = 4 * 1024
 _MAX_PAGE_REASON_BYTES = 256
 _MAX_POPUP_POLICY_ORIGINS = 64
 _MAX_PAGE_COUNTER = 2**63 - 1
+_UPLOAD_CONTENT_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*")
 _BROWSER_SESSION_RESPONSE_FIXED_BYTES = 1024 * 1024
 _BROWSER_SESSION_REF_ENVELOPE_BYTES = (
     6 * _MAX_REF_LENGTH + 6 * 128 + 6 * _MAX_ELEMENT_TEXT_BYTES + 256
@@ -210,7 +247,10 @@ _BACKEND_FAILURE_CODES = VISUAL_FAILURE_CODES | frozenset(
         "destination_denied",
         "download_failed",
         "fetch_failed",
+        "history_unavailable",
         "incompatible_browser",
+        "incompatible_upload_target",
+        "invalid_scroll",
         "missing_element",
         "navigation_timeout",
         "operation_conflict",
@@ -225,6 +265,12 @@ _BACKEND_FAILURE_CODES = VISUAL_FAILURE_CODES | frozenset(
         "restoration_required",
         "session_closed",
         "timeout",
+        "unsafe_reload",
+        "artifact_refused",
+        "artifact_unavailable",
+        "upload_cleanup_failed",
+        "upload_materialization_failed",
+        "upload_too_large",
     }
 )
 _ERROR_MESSAGES = {
@@ -250,9 +296,12 @@ _ERROR_MESSAGES = {
     "destination_denied": "The destination was denied by the browser egress policy.",
     "download_failed": "The browser download could not be captured safely.",
     "fetch_failed": "The browser request failed at the proxy or transport boundary.",
+    "history_unavailable": "The requested browser history traversal is unavailable.",
     "incompatible_browser": "The interactive browser worker is incompatible.",
     "incompatible_profile": "The browser session belongs to a different execution profile.",
+    "incompatible_upload_target": "The referenced element is not a compatible file input.",
     "invalid_arguments": "The browser operation arguments are invalid.",
+    "invalid_scroll": "The browser scroll request is outside the configured semantic bounds.",
     "missing_artifact_store": "This browser operation requires a configured artifact store.",
     "missing_element": "The browser element no longer exists.",
     "navigation_timeout": "The browser navigation timed out.",
@@ -274,6 +323,12 @@ _ERROR_MESSAGES = {
     "session_closed": "The browser session is closed.",
     "stale_observation": "The browser observation is stale; observe the page again.",
     "timeout": "The browser operation timed out.",
+    "unsafe_reload": "The current document cannot be safely reloaded without resubmission.",
+    "artifact_refused": "The selected artifact is not admitted for browser upload.",
+    "artifact_unavailable": "The selected artifact is unavailable.",
+    "upload_cleanup_failed": "The browser upload temporary material could not be removed safely.",
+    "upload_materialization_failed": "The browser upload could not be materialized safely.",
+    "upload_too_large": "The browser upload exceeds its configured limits.",
     "unknown_element": "The element reference is not present in the current observation.",
     "unknown_page": "The browser page is not owned by this Cayu session.",
     "unknown_session": "The browser session is not owned by this Cayu session.",
@@ -572,7 +627,7 @@ class BrowserBackendIdentity(BaseModel):
     browser: str = Field(min_length=1, max_length=64)
     browser_version: str = Field(min_length=1, max_length=128)
     worker_protocol: Literal["cayu.browser-session.v4"]
-    worker_version: Literal["8"]
+    worker_version: Literal["9"]
 
     @field_validator("backend", "backend_version", "browser", "browser_version")
     @classmethod
@@ -588,6 +643,8 @@ class BrowserElementRef(BaseModel):
     ref: str = Field(min_length=1, max_length=_MAX_REF_LENGTH)
     role: str = Field(min_length=1, max_length=128)
     name: str = Field(default="", max_length=_MAX_ELEMENT_TEXT_BYTES)
+    element_type: Literal["element", "file_input"] = "element"
+    allows_multiple_files: StrictBool | None = None
 
     @field_validator("ref", "role")
     @classmethod
@@ -598,6 +655,45 @@ class BrowserElementRef(BaseModel):
     @classmethod
     def validate_name(cls, value: str) -> str:
         return require_durable_text(value, "name")
+
+    @model_validator(mode="after")
+    def validate_file_input_evidence(self) -> BrowserElementRef:
+        if self.element_type == "file_input":
+            if type(self.allows_multiple_files) is not bool:
+                raise ValueError("File-input refs require exact multiple-file evidence.")
+        elif self.allows_multiple_files is not None:
+            raise ValueError("Ordinary refs cannot carry file-input evidence.")
+        return self
+
+
+class BrowserOperationEvidence(BaseModel):
+    """Bounded result evidence for operations not represented by page content alone."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    operation: Literal["scroll", "upload"]
+    moved: StrictBool | None = None
+    edge: Literal["start", "end", "none"] | None = None
+    selected_file_count: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_BROWSER_SESSION_MAX_UPLOAD_FILES,
+    )
+    selection_state: Literal["selected"] | None = None
+
+    @model_validator(mode="after")
+    def validate_operation_shape(self) -> BrowserOperationEvidence:
+        if self.operation == "scroll":
+            if type(self.moved) is not bool or self.edge is None:
+                raise ValueError("Scroll evidence requires bounded movement and edge evidence.")
+            if self.selected_file_count is not None or self.selection_state is not None:
+                raise ValueError("Scroll evidence cannot carry upload evidence.")
+        else:
+            if self.selected_file_count is None or self.selection_state != "selected":
+                raise ValueError("Upload evidence requires exact file-selection evidence.")
+            if self.moved is not None or self.edge is not None:
+                raise ValueError("Upload evidence cannot carry scroll evidence.")
+        return self
 
 
 class BrowserBackendObservation(BaseModel):
@@ -720,6 +816,7 @@ class BrowserBackendResponse:
     page_set: BrowserPageSetState | None = None
     page_delta: BrowserPageSetDelta = field(default_factory=BrowserPageSetDelta)
     artifacts: tuple[BrowserArtifactPayload, ...] = ()
+    operation_evidence: BrowserOperationEvidence | None = None
     failure: BrowserBackendFailure | None = None
     closed: bool = False
     allocation_disposition: Literal["live", "retired", "uncertain"] | None = None
@@ -746,6 +843,8 @@ class BrowserBackendResponse:
                 raise ValueError("Browser observation must belong to the active page.")
         if self.page_set is None and self.page_delta != BrowserPageSetDelta():
             raise ValueError("Browser page deltas require a page registry.")
+        if self.operation_evidence is not None and self.observation is None:
+            raise ValueError("Browser operation evidence requires a post-operation observation.")
         if type(self.closed) is not bool:
             raise TypeError("closed must be a boolean.")
         if type(self.profile_output_protected) is not bool:
@@ -822,6 +921,7 @@ class _PageAuthority:
     refs: frozenset[str]
     lifecycle: str = "active"
     summary: BrowserPageSummary | None = None
+    file_input_refs: Mapping[str, bool] = field(default_factory=dict)
     valid: bool = True
     visual: BrowserVisualAuthority | None = None
 
@@ -858,6 +958,37 @@ class _OperationRecord:
     invocation_identity: _DurableBrowserOperationIdentity | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedUploadFile:
+    artifact_id: str
+    content_sha256: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    content: bytes
+
+    def durable_evidence(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "content_sha256": self.content_sha256,
+            "filename": self.filename,
+            "content_type": self.content_type,
+            "size_bytes": self.size_bytes,
+        }
+
+
+class _UploadRefusal(RuntimeError):
+    def __init__(self, code: str) -> None:
+        if code not in {
+            "artifact_refused",
+            "artifact_unavailable",
+            "upload_too_large",
+        }:
+            raise ValueError("Upload refusal code is invalid.")
+        self.code = code
+        super().__init__(code)
+
+
 @dataclass(frozen=True)
 class _DurableBrowserParentState:
     operation_count: int = 0
@@ -867,6 +998,7 @@ class _DurableBrowserParentState:
 
 @dataclass(frozen=True)
 class _DurableBrowserOperationIdentity:
+    operation: str
     operation_id_sha256: str
     fingerprint: str
     parent_session_id: str
@@ -880,11 +1012,13 @@ class _DurableBrowserOperationIdentity:
     tool_call_id: str
     idempotency_key: str
     effective_arguments_sha256: str
+    upload_artifacts_sha256: str | None
 
     def record_fields(self) -> dict[str, Any]:
         return {
             "record_type": _DURABLE_BROWSER_OPERATION_RECORD_TYPE,
             "schema_version": 1,
+            "operation": self.operation,
             "operation_id_sha256": self.operation_id_sha256,
             "fingerprint": self.fingerprint,
             "parent_session_id": self.parent_session_id,
@@ -898,6 +1032,7 @@ class _DurableBrowserOperationIdentity:
             "tool_call_id": self.tool_call_id,
             "idempotency_key": self.idempotency_key,
             "effective_arguments_sha256": self.effective_arguments_sha256,
+            "upload_artifacts_sha256": self.upload_artifacts_sha256,
         }
 
 
@@ -979,6 +1114,12 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         max_total_artifacts: int,
         max_page_cleanup_operations: int,
         visual_policy: BrowserVisualPolicy | None = None,
+        max_scroll_repeats: int,
+        max_upload_files: int,
+        max_upload_file_bytes: int,
+        max_upload_total_bytes: int,
+        max_upload_filename_bytes: int,
+        max_upload_materialization_ms: int,
     ) -> None:
         self.expected_runner_candidate = _expected_runner_candidate(expected_runner_candidate)
         self.expected_environment_authority = _expected_environment_authority(
@@ -1018,6 +1159,12 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         self.max_total_artifacts = max_total_artifacts
         self.max_page_cleanup_operations = max_page_cleanup_operations
         self.visual_policy = visual_policy
+        self.max_scroll_repeats = max_scroll_repeats
+        self.max_upload_files = max_upload_files
+        self.max_upload_file_bytes = max_upload_file_bytes
+        self.max_upload_total_bytes = max_upload_total_bytes
+        self.max_upload_filename_bytes = max_upload_filename_bytes
+        self.max_upload_materialization_ms = max_upload_materialization_ms
 
     async def preflight(
         self,
@@ -1026,7 +1173,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
     ) -> BrowserBackendFailure | None:
         """Exercise the runner-owned side-effect-free seam before reserving capacity."""
 
-        prepared = self._prepare_dispatch(ctx, request)
+        prepared = self._prepare_dispatch(ctx, request, include_upload_content=False)
         if isinstance(prepared, BrowserBackendResponse):
             return prepared.failure
         runner, payload, output_limit, timeout_seconds = prepared
@@ -1053,7 +1200,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         ctx: ToolContext,
         request: dict[str, Any],
     ) -> BrowserBackendResponse:
-        prepared = self._prepare_dispatch(ctx, request)
+        prepared = self._prepare_dispatch(ctx, request, include_upload_content=True)
         if isinstance(prepared, BrowserBackendResponse):
             return prepared
         runner, payload, output_limit, timeout_seconds = prepared
@@ -1307,6 +1454,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         ctx: ToolContext,
         request: dict[str, Any],
         *,
+        include_upload_content: bool = False,
         restore_state: BrowserProfileStateV1 | None = None,
         capture_profile: bool = False,
         profile_plaintext_limit: int = BROWSER_PROFILE_MAX_PLAINTEXT_BYTES,
@@ -1337,11 +1485,32 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
                     else browser_profile_state_to_playwright(restore_state)
                 ),
             }
+        wire_request = dict(request)
+        durable_uploads = wire_request.pop("upload_artifacts", None)
+        private_uploads = wire_request.pop("_upload_payloads", ())
+        if private_uploads and include_upload_content:
+            if type(private_uploads) is not tuple or any(
+                type(item) is not _PreparedUploadFile for item in private_uploads
+            ):
+                return _pre_dispatch_backend_failure(request, "capability_refused")
+            if durable_uploads != [item.durable_evidence() for item in private_uploads]:
+                return _pre_dispatch_backend_failure(request, "capability_refused")
+            wire_request["upload_files"] = [
+                {
+                    **item.durable_evidence(),
+                    "content_base64": base64.b64encode(item.content).decode("ascii"),
+                }
+                for item in private_uploads
+            ]
+        elif request.get("operation") == "upload" and include_upload_content:
+            return _pre_dispatch_backend_failure(request, "capability_refused")
+        elif request.get("operation") == "upload" and request.get("reconcile_only") is True:
+            wire_request["upload_files"] = durable_uploads
         payload_document: dict[str, object] = {
             "protocol_version": BROWSER_SESSION_PROTOCOL_VERSION,
             "worker_version": BROWSER_SESSION_WORKER_VERSION,
             "expected_playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
-            **request,
+            **wire_request,
             "limits": {
                 "max_snapshot_bytes": self.max_snapshot_bytes,
                 "max_dom_nodes": self.max_dom_nodes,
@@ -1370,6 +1539,12 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
                 "max_artifacts_per_page": self.max_artifacts_per_page,
                 "max_total_artifacts": self.max_total_artifacts,
                 "max_page_cleanup_operations": self.max_page_cleanup_operations,
+                "max_scroll_repeats": self.max_scroll_repeats,
+                "max_upload_files": self.max_upload_files,
+                "max_upload_file_bytes": self.max_upload_file_bytes,
+                "max_upload_total_bytes": self.max_upload_total_bytes,
+                "max_upload_filename_bytes": self.max_upload_filename_bytes,
+                "max_upload_materialization_ms": self.max_upload_materialization_ms,
             },
             "page_policy": {
                 "multi_page": self.multi_page,
@@ -1391,9 +1566,15 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         # five-second startup-cleanup settlement reserve before an operation's
         # configured wait. Keep the runner alive for both boundaries plus the
         # existing operation/transport reserve.
+        operation_timeout_ms = self.max_wait_ms
+        if request.get("operation") == "upload":
+            operation_timeout_ms = max(
+                operation_timeout_ms,
+                self.max_upload_materialization_ms,
+            )
         timeout_seconds = max(
             1.0,
-            self.max_wait_ms / 1000 + 15.0,
+            operation_timeout_ms / 1000 + 15.0,
             profile_timeout_seconds + 15.0 if private_profile is not None else 0.0,
         )
         runner = ctx.runner
@@ -1454,8 +1635,21 @@ class BrowserSessionTool(Tool):
             "Use an application-approved stateful browser allocation. Page content and "
             "element metadata are untrusted. Every call requires a fresh operation_id. "
             "After navigation or page switching, copy session_id, page_id, revision, and "
-            "control_epoch into each page action. Re-observe after every action."
+            "control_epoch into each page action. Re-observe after every action. "
+            "History uses back/forward/reload, scroll accepts semantic controls, hover "
+            "accepts only a current ref, and upload accepts only current file-input refs "
+            "plus application-owned artifact_ids. Navigate requires url; observe/observe_visual "
+            "and switch_page/close_page require session_id and page_id; list_pages/close require "
+            "session_id. Every other page operation requires session_id, page_id, expected_revision "
+            "and expected_control_epoch. Click/download/hover require ref; fill/select require "
+            "ref and value; press requires ref and key; wait requires wait_ms; scroll requires "
+            "direction, amount and repeat_count; upload requires ref and artifact_ids. "
+            "Visual target clicks require visual_revision and visual_ref; visual point clicks "
+            "require visual_revision, screenshot_sha256, x and y. Omit fields not used by the operation."
         ),
+        # Provider-facing object schema: OpenAI rejects top-level combinators.
+        # _validated_request remains authoritative for the exact operation shape
+        # before policy checks, durable admission, or backend dispatch.
         input_schema={
             "type": "object",
             "additionalProperties": False,
@@ -1473,6 +1667,12 @@ class BrowserSessionTool(Tool):
                         "select",
                         "press",
                         "wait",
+                        "back",
+                        "forward",
+                        "reload",
+                        "scroll",
+                        "hover",
+                        "upload",
                         "screenshot",
                         "download",
                         "list_pages",
@@ -1529,124 +1729,24 @@ class BrowserSessionTool(Tool):
                     "maximum": MAX_BROWSER_SESSION_MAX_WAIT_MS,
                 },
                 "full_page": {"type": "boolean", "default": False},
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down", "left", "right"],
+                },
+                "amount": {"type": "string", "enum": ["line", "page"]},
+                "repeat_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_BROWSER_SESSION_MAX_SCROLL_REPEATS,
+                },
+                "artifact_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_BROWSER_SESSION_MAX_UPLOAD_FILES,
+                    "items": {"type": "string", "maxLength": _MAX_BROWSER_ID_LENGTH},
+                },
             },
             "required": ["operation", "operation_id"],
-            "allOf": [
-                {
-                    "if": {
-                        "properties": {
-                            "operation": {"enum": ["click_visual_target", "click_visual_point"]}
-                        },
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["visual_revision"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"const": "click_visual_target"}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["visual_ref"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"const": "click_visual_point"}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["screenshot_sha256", "x", "y"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"const": "navigate"}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["url"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"enum": ["observe", "observe_visual"]}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["session_id", "page_id"]},
-                },
-                {
-                    "if": {
-                        "properties": {
-                            "operation": {
-                                "enum": [
-                                    "click",
-                                    "click_visual_target",
-                                    "click_visual_point",
-                                    "fill",
-                                    "select",
-                                    "press",
-                                    "wait",
-                                    "screenshot",
-                                    "download",
-                                ]
-                            }
-                        },
-                        "required": ["operation"],
-                    },
-                    "then": {
-                        "required": [
-                            "session_id",
-                            "page_id",
-                            "expected_revision",
-                            "expected_control_epoch",
-                        ]
-                    },
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"enum": ["click", "download"]}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["ref"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"enum": ["fill", "select"]}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["ref", "value"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"const": "press"}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["ref", "key"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"const": "wait"}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["wait_ms"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"const": "list_pages"}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["session_id"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"enum": ["switch_page", "close_page"]}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["session_id", "page_id"]},
-                },
-                {
-                    "if": {
-                        "properties": {"operation": {"const": "close"}},
-                        "required": ["operation"],
-                    },
-                    "then": {"required": ["session_id"]},
-                },
-            ],
         },
     )
 
@@ -1684,6 +1784,14 @@ class BrowserSessionTool(Tool):
         max_artifacts_per_page: int | None = None,
         max_total_artifacts: int = DEFAULT_BROWSER_SESSION_MAX_TOTAL_ARTIFACTS,
         max_page_cleanup_operations: int = (DEFAULT_BROWSER_SESSION_MAX_PAGE_CLEANUP_OPERATIONS),
+        max_scroll_repeats: int = DEFAULT_BROWSER_SESSION_MAX_SCROLL_REPEATS,
+        max_upload_files: int = DEFAULT_BROWSER_SESSION_MAX_UPLOAD_FILES,
+        max_upload_file_bytes: int = DEFAULT_BROWSER_SESSION_MAX_UPLOAD_FILE_BYTES,
+        max_upload_total_bytes: int = DEFAULT_BROWSER_SESSION_MAX_UPLOAD_TOTAL_BYTES,
+        max_upload_filename_bytes: int = DEFAULT_BROWSER_SESSION_MAX_UPLOAD_FILENAME_BYTES,
+        max_upload_materialization_ms: int = DEFAULT_BROWSER_SESSION_MAX_UPLOAD_MATERIALIZATION_MS,
+        allowed_upload_content_types: Sequence[str] = DEFAULT_BROWSER_SESSION_UPLOAD_CONTENT_TYPES,
+        allowed_upload_taint_labels: Sequence[str] = (),
         expected_runner_candidate: str | None = None,
         expected_environment_authority: ExecutionEnvironmentAuthority | None = None,
         expected_workload_authority: RunnerWorkloadAuthority = PINNED_BROWSER_SESSION_WORKLOAD,
@@ -1932,6 +2040,40 @@ class BrowserSessionTool(Tool):
             raise ValueError("Per-page requests cannot exceed aggregate requests.")
         if self.max_artifacts_per_page > self.max_total_artifacts:
             raise ValueError("Per-page artifacts cannot exceed aggregate artifacts.")
+        self.max_scroll_repeats = _bounded_configuration(
+            max_scroll_repeats,
+            "max_scroll_repeats",
+            maximum=MAX_BROWSER_SESSION_MAX_SCROLL_REPEATS,
+        )
+        self.max_upload_files = _bounded_configuration(
+            max_upload_files,
+            "max_upload_files",
+            maximum=MAX_BROWSER_SESSION_MAX_UPLOAD_FILES,
+        )
+        self.max_upload_file_bytes = _bounded_configuration(
+            max_upload_file_bytes,
+            "max_upload_file_bytes",
+            maximum=MAX_BROWSER_SESSION_MAX_UPLOAD_FILE_BYTES,
+        )
+        self.max_upload_total_bytes = _bounded_configuration(
+            max_upload_total_bytes,
+            "max_upload_total_bytes",
+            maximum=MAX_BROWSER_SESSION_MAX_UPLOAD_TOTAL_BYTES,
+        )
+        if self.max_upload_file_bytes > self.max_upload_total_bytes:
+            raise ValueError("max_upload_file_bytes cannot exceed max_upload_total_bytes.")
+        self.max_upload_filename_bytes = _bounded_configuration(
+            max_upload_filename_bytes,
+            "max_upload_filename_bytes",
+            maximum=MAX_BROWSER_SESSION_MAX_UPLOAD_FILENAME_BYTES,
+        )
+        self.max_upload_materialization_ms = _bounded_configuration(
+            max_upload_materialization_ms,
+            "max_upload_materialization_ms",
+            maximum=MAX_BROWSER_SESSION_MAX_UPLOAD_MATERIALIZATION_MS,
+        )
+        self.allowed_upload_content_types = _upload_content_types(allowed_upload_content_types)
+        self.allowed_upload_taint_labels = _upload_taint_labels(allowed_upload_taint_labels)
         self.expected_artifact_store_id = (
             None
             if expected_artifact_store_id is None
@@ -2008,6 +2150,12 @@ class BrowserSessionTool(Tool):
             max_total_artifacts=self.max_total_artifacts,
             max_page_cleanup_operations=self.max_page_cleanup_operations,
             visual_policy=self.visual_policy,
+            max_scroll_repeats=self.max_scroll_repeats,
+            max_upload_files=self.max_upload_files,
+            max_upload_file_bytes=self.max_upload_file_bytes,
+            max_upload_total_bytes=self.max_upload_total_bytes,
+            max_upload_filename_bytes=self.max_upload_filename_bytes,
+            max_upload_materialization_ms=self.max_upload_materialization_ms,
         )
         self._states: dict[str, _ParentBrowserState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -2076,6 +2224,12 @@ class BrowserSessionTool(Tool):
             backend.max_artifacts_per_page,
             backend.max_total_artifacts,
             backend.max_page_cleanup_operations,
+            backend.max_scroll_repeats,
+            backend.max_upload_files,
+            backend.max_upload_file_bytes,
+            backend.max_upload_total_bytes,
+            backend.max_upload_filename_bytes,
+            backend.max_upload_materialization_ms,
         )
         tool_configuration = (
             self.expected_runner_candidate,
@@ -2110,6 +2264,12 @@ class BrowserSessionTool(Tool):
             self.max_artifacts_per_page,
             self.max_total_artifacts,
             self.max_page_cleanup_operations,
+            self.max_scroll_repeats,
+            self.max_upload_files,
+            self.max_upload_file_bytes,
+            self.max_upload_total_bytes,
+            self.max_upload_filename_bytes,
+            self.max_upload_materialization_ms,
         )
         if backend_configuration != tool_configuration:
             return None
@@ -2152,6 +2312,14 @@ class BrowserSessionTool(Tool):
             "max_artifacts_per_page": self.max_artifacts_per_page,
             "max_total_artifacts": self.max_total_artifacts,
             "max_page_cleanup_operations": self.max_page_cleanup_operations,
+            "max_scroll_repeats": self.max_scroll_repeats,
+            "max_upload_files": self.max_upload_files,
+            "max_upload_file_bytes": self.max_upload_file_bytes,
+            "max_upload_total_bytes": self.max_upload_total_bytes,
+            "max_upload_filename_bytes": self.max_upload_filename_bytes,
+            "max_upload_materialization_ms": self.max_upload_materialization_ms,
+            "allowed_upload_content_types": list(self.allowed_upload_content_types),
+            "allowed_upload_taint_labels": list(self.allowed_upload_taint_labels),
             "expected_workload_authority": _workload_authority_material(
                 self.expected_workload_authority
             ),
@@ -2189,7 +2357,12 @@ class BrowserSessionTool(Tool):
             ):
                 return _error_result("capability_refused", dispatch="not_started")
         try:
-            request = _validated_request(args, max_wait_ms=self.max_wait_ms)
+            request = _validated_request(
+                args,
+                max_wait_ms=self.max_wait_ms,
+                max_scroll_repeats=self.max_scroll_repeats,
+                max_upload_files=self.max_upload_files,
+            )
         except (TypeError, ValueError):
             return _error_result("invalid_arguments", dispatch="not_started")
         if request["operation"] in VISUAL_OPERATIONS:
@@ -2373,7 +2546,12 @@ class BrowserSessionTool(Tool):
 
         del started, recovery_authority
         try:
-            request = _validated_request(arguments, max_wait_ms=self.max_wait_ms)
+            request = _validated_request(
+                arguments,
+                max_wait_ms=self.max_wait_ms,
+                max_scroll_repeats=self.max_scroll_repeats,
+                max_upload_files=self.max_upload_files,
+            )
         except (TypeError, ValueError):
             return _error_result("authority_expired", dispatch="not_started")
         operation_id = request.get("operation_id")
@@ -2417,7 +2595,9 @@ class BrowserSessionTool(Tool):
             }
             operation_storage_key = locator.get("operation_storage_key")
             if any(locator.get(key) != value for key, value in expected_locator.items()) or (
-                type(operation_storage_key) is not str
+                locator.get("operation")
+                not in BrowserSessionTool.spec.input_schema["properties"]["operation"]["enum"]
+                or type(operation_storage_key) is not str
                 or not operation_storage_key.startswith("browser-operation:v1:")
                 or not _is_sha256_hexdigest(
                     operation_storage_key.removeprefix("browser-operation:v1:")
@@ -2425,6 +2605,10 @@ class BrowserSessionTool(Tool):
                 or not _is_sha256_hexdigest(locator.get("allocation_fingerprint"))
                 or not _is_sha256_hexdigest(locator.get("effective_arguments_sha256"))
                 or not _is_sha256_hexdigest(locator.get("fingerprint"))
+                or (
+                    locator.get("upload_artifacts_sha256") is not None
+                    and not _is_sha256_hexdigest(locator.get("upload_artifacts_sha256"))
+                )
             ):
                 if locator.get("execution_profile_fingerprint") != execution_profile_fingerprint:
                     return _error_result("incompatible_profile", dispatch="not_started")
@@ -2441,6 +2625,7 @@ class BrowserSessionTool(Tool):
                 return _error_result("restoration_required", dispatch="not_started")
             operation_id_sha256 = _browser_operation_id_sha256(operation_id)
             operation_fingerprint = _request_fingerprint(request)
+            operation = request["operation"]
             allocation_fingerprint = environment_allocation_fingerprint
             effective_arguments_sha256 = hashlib.sha256(
                 canonical_durable_json_bytes(arguments, "browser_recovery_arguments")
@@ -2448,9 +2633,14 @@ class BrowserSessionTool(Tool):
         else:
             operation_id_sha256 = operation_storage_key.removeprefix("browser-operation:v1:")
             operation_fingerprint = locator["fingerprint"]
+            operation = locator["operation"]
             allocation_fingerprint = locator["allocation_fingerprint"]
             effective_arguments_sha256 = locator["effective_arguments_sha256"]
+            upload_artifacts_sha256 = locator.get("upload_artifacts_sha256")
+        if locator is None:
+            upload_artifacts_sha256 = _upload_artifacts_sha256(request)
         identity = _DurableBrowserOperationIdentity(
+            operation=operation,
             operation_id_sha256=operation_id_sha256,
             fingerprint=operation_fingerprint,
             parent_session_id=parent_session_id,
@@ -2464,6 +2654,7 @@ class BrowserSessionTool(Tool):
             tool_call_id=tool_call_id,
             idempotency_key=idempotency_key,
             effective_arguments_sha256=effective_arguments_sha256,
+            upload_artifacts_sha256=upload_artifacts_sha256,
         )
         validated = _validate_durable_browser_operation_record(
             record,
@@ -2473,6 +2664,11 @@ class BrowserSessionTool(Tool):
             max_page_records=self.max_total_page_creations,
             max_page_creations_per_operation=self.max_page_creations_per_operation,
             page_set_limits=self._page_set_limits(),
+            max_upload_files=self.max_upload_files,
+            max_upload_file_bytes=self.max_upload_file_bytes,
+            max_upload_total_bytes=self.max_upload_total_bytes,
+            max_upload_filename_bytes=self.max_upload_filename_bytes,
+            allowed_upload_content_types=self.allowed_upload_content_types,
         )
         if validated is None:
             if (
@@ -2523,6 +2719,119 @@ class BrowserSessionTool(Tool):
                 self._locks.pop(parent_session_id, None)
                 return
 
+    async def _prepare_upload_files(
+        self,
+        ctx: ToolContext,
+        artifact_ids: list[str],
+    ) -> tuple[tuple[_PreparedUploadFile, ...], InvocationRedactorSnapshot]:
+        """Capture exact, secret-free session artifacts before durable browser intent."""
+
+        try:
+            artifact_store = _screenshot_artifact_store(ctx)
+        except TypeError:
+            artifact_store = None
+        if artifact_store is None or ctx.artifact_store_id != artifact_store.id:
+            raise _UploadRefusal("artifact_unavailable")
+        if (
+            self.expected_artifact_store_id is not None
+            and artifact_store.id != self.expected_artifact_store_id
+        ):
+            raise _UploadRefusal("artifact_refused")
+
+        async def capture(redactor: Any) -> tuple[_PreparedUploadFile, ...]:
+            prepared: list[_PreparedUploadFile] = []
+            total_bytes = 0
+            for artifact_id in artifact_ids:
+                try:
+                    result = _copy_upload_artifact_read_result(
+                        await artifact_store.read_bytes(
+                            artifact_id,
+                            max_bytes=self.max_upload_file_bytes + 1,
+                        ),
+                        expected_artifact_id=artifact_id,
+                        max_content_bytes=self.max_upload_file_bytes + 1,
+                    )
+                except FileNotFoundError:
+                    raise _UploadRefusal("artifact_unavailable") from None
+                except _UploadRefusal:
+                    raise
+                except Exception:
+                    raise _UploadRefusal("artifact_unavailable") from None
+                metadata = result.metadata
+                if (
+                    result.truncated
+                    or result.redaction_truncated
+                    or result.total_bytes != len(result.content)
+                    or result.total_bytes > self.max_upload_file_bytes
+                ):
+                    raise _UploadRefusal("upload_too_large")
+                total_bytes += result.total_bytes
+                if total_bytes > self.max_upload_total_bytes:
+                    raise _UploadRefusal("upload_too_large")
+                filename = metadata.filename
+                if (
+                    filename in {".", ".."}
+                    or "/" in filename
+                    or "\\" in filename
+                    or len(filename.encode("utf-8")) > self.max_upload_filename_bytes
+                ):
+                    raise _UploadRefusal("artifact_refused")
+                content_type = metadata.content_type.lower()
+                if (
+                    content_type != metadata.content_type
+                    or content_type not in self.allowed_upload_content_types
+                ):
+                    raise _UploadRefusal("artifact_refused")
+                try:
+                    artifact_taints = taint_labels_from_metadata(metadata.metadata)
+                except (TypeError, ValueError):
+                    raise _UploadRefusal("artifact_refused") from None
+                if not artifact_taints.issubset(self.allowed_upload_taint_labels):
+                    raise _UploadRefusal("artifact_refused")
+                if (
+                    metadata.scope is not ArtifactScope.SESSION
+                    or metadata.session_id != ctx.session_id
+                    or (metadata.agent_name is not None and metadata.agent_name != ctx.agent_name)
+                    or (
+                        metadata.environment_name is not None
+                        and metadata.environment_name != ctx.environment_name
+                    )
+                ):
+                    raise _UploadRefusal("artifact_refused")
+                public_metadata = {
+                    "artifact_id": metadata.id,
+                    "filename": filename,
+                    "content_type": content_type,
+                    "session_id": metadata.session_id,
+                    "agent_name": metadata.agent_name,
+                    "environment_name": metadata.environment_name,
+                    "taint_labels": sorted(artifact_taints),
+                }
+                if redactor.redact_json(
+                    public_metadata
+                ) != public_metadata or redactor.contains_secret_bytes(result.content):
+                    raise _UploadRefusal("artifact_refused")
+                prepared.append(
+                    _PreparedUploadFile(
+                        artifact_id=artifact_id,
+                        content_sha256=hashlib.sha256(result.content).hexdigest(),
+                        filename=filename,
+                        content_type=content_type,
+                        size_bytes=result.total_bytes,
+                        content=result.content,
+                    )
+                )
+            return tuple(prepared)
+
+        try:
+            async with asyncio.timeout(self.max_upload_materialization_ms / 1000):
+                captured = await await_revision_stable_secret_output(ctx, capture)
+        except TimeoutError:
+            raise _UploadRefusal("artifact_unavailable") from None
+        if captured is None:
+            raise _UploadRefusal("artifact_refused")
+        return captured
+
     async def _run_locked(
         self,
         ctx: ToolContext,
@@ -2531,7 +2840,56 @@ class BrowserSessionTool(Tool):
         *,
         durable_authority: Any | None,
     ) -> ToolResult:
-        fingerprint = _request_fingerprint(request)
+        prepared_uploads: tuple[_PreparedUploadFile, ...] = ()
+        upload_secret_snapshot: InvocationRedactorSnapshot | None = None
+        durable_request = dict(request)
+        if request["operation"] == "upload":
+            materialization_task = asyncio.current_task()
+            materialization_cancellations = (
+                0 if materialization_task is None else materialization_task.cancelling()
+            )
+            materialization_cancellation_pending = bool(
+                materialization_task is not None
+                and getattr(materialization_task, "_must_cancel", False)
+            )
+            try:
+                prepared_uploads, upload_secret_snapshot = await self._prepare_upload_files(
+                    ctx,
+                    cast("list[str]", request["artifact_ids"]),
+                )
+            except _UploadRefusal as refusal:
+                if _task_received_cancellation(
+                    materialization_task,
+                    cancellations_before=materialization_cancellations,
+                    cancellation_pending_before=materialization_cancellation_pending,
+                ):
+                    raise asyncio.CancelledError from None
+                return _error_result(refusal.code, dispatch="not_started", request=request)
+            except BaseException as failure:
+                if _failure_contains_process_control(failure) or _failure_is_current_cancellation(
+                    failure,
+                    current_task=materialization_task,
+                    cancellation_requests_before=materialization_cancellations,
+                    cancellation_pending_before=materialization_cancellation_pending,
+                ):
+                    raise
+                if _failure_tree_contains(failure, asyncio.CancelledError):
+                    return _error_result(
+                        "artifact_unavailable",
+                        dispatch="not_started",
+                        request=request,
+                    )
+                raise
+            if _task_received_cancellation(
+                materialization_task,
+                cancellations_before=materialization_cancellations,
+                cancellation_pending_before=materialization_cancellation_pending,
+            ):
+                raise asyncio.CancelledError
+            durable_request["upload_artifacts"] = [
+                item.durable_evidence() for item in prepared_uploads
+            ]
+        fingerprint = _request_fingerprint(durable_request)
         operation_id = request.get("operation_id")
         current_allocation_authority = _live_browser_allocation_authority(
             ctx,
@@ -2543,6 +2901,8 @@ class BrowserSessionTool(Tool):
             else _durable_browser_operation_identity(
                 ctx=ctx,
                 authority=durable_authority,
+                operation=durable_request["operation"],
+                upload_artifacts_sha256=_upload_artifacts_sha256(durable_request),
                 operation_id=operation_id,
                 fingerprint=fingerprint,
             )
@@ -2570,7 +2930,7 @@ class BrowserSessionTool(Tool):
             if request["operation"] == "close_page"
             else parent_state.operations
         )
-        dispatched_request = dict(request)
+        dispatched_request = dict(durable_request)
         if request["operation"] == "navigate":
             # Browser and page identities are opaque random capabilities, not
             # derivations of caller/runtime authority.  A durable retry learns
@@ -2603,19 +2963,28 @@ class BrowserSessionTool(Tool):
                     existing,
                     ctx=ctx,
                     authority=durable_authority,
+                    operation=dispatched_request["operation"],
                     operation_id=operation_id,
                     fingerprint=fingerprint,
+                    upload_artifacts_sha256=_upload_artifacts_sha256(dispatched_request),
                     max_snapshot_bytes=self.max_snapshot_bytes,
                     max_refs=self.max_refs,
                     max_page_records=self.max_total_page_creations,
                     max_page_creations_per_operation=(self.max_page_creations_per_operation),
                     page_set_limits=self._page_set_limits(),
+                    max_upload_files=self.max_upload_files,
+                    max_upload_file_bytes=self.max_upload_file_bytes,
+                    max_upload_total_bytes=self.max_upload_total_bytes,
+                    max_upload_filename_bytes=self.max_upload_filename_bytes,
+                    allowed_upload_content_types=self.allowed_upload_content_types,
                 )
                 validated_existing = _validate_durable_browser_operation_record(
                     existing,
                     identity=_durable_browser_operation_identity(
                         ctx=ctx,
                         authority=durable_authority,
+                        operation=dispatched_request["operation"],
+                        upload_artifacts_sha256=_upload_artifacts_sha256(dispatched_request),
                         operation_id=operation_id,
                         fingerprint=fingerprint,
                     ),
@@ -2624,6 +2993,11 @@ class BrowserSessionTool(Tool):
                     max_page_records=self.max_total_page_creations,
                     max_page_creations_per_operation=(self.max_page_creations_per_operation),
                     page_set_limits=self._page_set_limits(),
+                    max_upload_files=self.max_upload_files,
+                    max_upload_file_bytes=self.max_upload_file_bytes,
+                    max_upload_total_bytes=self.max_upload_total_bytes,
+                    max_upload_filename_bytes=self.max_upload_filename_bytes,
+                    allowed_upload_content_types=self.allowed_upload_content_types,
                 )
                 if validated_existing is None or validated_existing[0].get("state") != "dispatched":
                     return self._visual_replay_result(ctx, request, replay)
@@ -2721,6 +3095,9 @@ class BrowserSessionTool(Tool):
             if secret_snapshot.redactor.has_values:
                 return _error_result("policy_denied", dispatch="not_started")
 
+        backend_request = dict(dispatched_request)
+        if prepared_uploads:
+            backend_request["_upload_payloads"] = prepared_uploads
         backend_preflight_failure = await self._backend.preflight(ctx, dispatched_request)
         if backend_preflight_failure is not None:
             result = _error_result(
@@ -2733,6 +3110,20 @@ class BrowserSessionTool(Tool):
                     fingerprint,
                     result,
                     current_invocation_identity,
+                )
+            return result
+        if upload_secret_snapshot is not None and not _secret_snapshot_is_current(
+            ctx,
+            upload_secret_snapshot,
+        ):
+            result = _error_result(
+                "artifact_refused",
+                dispatch="not_started",
+                request=dispatched_request,
+            )
+            if operation_id is not None:
+                operation_records[operation_id] = _OperationRecord(
+                    fingerprint, result, current_invocation_identity
                 )
             return result
 
@@ -2872,6 +3263,8 @@ class BrowserSessionTool(Tool):
                 authority=durable_authority,
                 operation_storage_key=durable_operation_key,
                 fingerprint=fingerprint,
+                operation=dispatched_request["operation"],
+                upload_artifacts_sha256=_upload_artifacts_sha256(dispatched_request),
             )
             try:
                 await durable_authority.compare_and_set_durable_operation(
@@ -2932,15 +3325,56 @@ class BrowserSessionTool(Tool):
                         persisted,
                         ctx=ctx,
                         authority=durable_authority,
+                        operation=dispatched_request["operation"],
                         operation_id=operation_id,
                         fingerprint=fingerprint,
+                        upload_artifacts_sha256=_upload_artifacts_sha256(dispatched_request),
                         max_snapshot_bytes=self.max_snapshot_bytes,
                         max_refs=self.max_refs,
                         max_page_records=self.max_total_page_creations,
                         max_page_creations_per_operation=(self.max_page_creations_per_operation),
                         page_set_limits=self._page_set_limits(),
+                        max_upload_files=self.max_upload_files,
+                        max_upload_file_bytes=self.max_upload_file_bytes,
+                        max_upload_total_bytes=self.max_upload_total_bytes,
+                        max_upload_filename_bytes=self.max_upload_filename_bytes,
+                        allowed_upload_content_types=self.allowed_upload_content_types,
                     )
                 return _error_result("authority_expired", dispatch="not_started")
+        if upload_secret_snapshot is not None and not _secret_snapshot_is_current(
+            ctx,
+            upload_secret_snapshot,
+        ):
+            result = _error_result(
+                "artifact_refused",
+                dispatch="not_started",
+                request=dispatched_request,
+                allocation_disposition="live",
+            )
+            if (
+                durable_authority is not None
+                and durable_operation_key is not None
+                and durable_dispatched is not None
+                and durable_parent_dispatched is not None
+                and durable_parent_state is not None
+            ):
+                result = await self._publish_durable_terminal(
+                    ctx,
+                    durable_authority,
+                    operation_key=durable_operation_key,
+                    request=dispatched_request,
+                    fingerprint=fingerprint,
+                    result=result,
+                    allocation_disposition="live",
+                    parent_state=parent_state,
+                    expected_parent=durable_parent_dispatched,
+                    durable_parent_state=durable_parent_state,
+                )
+            if operation_id is not None:
+                operation_records[operation_id] = _OperationRecord(
+                    fingerprint, result, current_invocation_identity
+                )
+            return result
         _invalidate_before_dispatch(parent_state, request)
         if request["operation"] == "navigate":
             # Reserve capacity before the first mutating external await. The
@@ -3033,7 +3467,7 @@ class BrowserSessionTool(Tool):
                     allocation_disposition="retired",
                 )
             else:
-                response = await self._backend.execute(ctx, dispatched_request)
+                response = await self._backend.execute(ctx, backend_request)
             if profile_binding is not None and not _browser_profile_response_is_protected(
                 response,
                 profile_material.state if profile_material is not None else BrowserProfileStateV1(),
@@ -3409,6 +3843,8 @@ class BrowserSessionTool(Tool):
                 _durable_browser_operation_identity(
                     ctx=ctx,
                     authority=durable_authority,
+                    operation=request["operation"],
+                    upload_artifacts_sha256=_upload_artifacts_sha256(request),
                     operation_id=operation_id,
                     fingerprint=fingerprint,
                 ),
@@ -3935,6 +4371,21 @@ class BrowserSessionTool(Tool):
             observation = BrowserBackendObservation.model_validate(
                 observation.model_dump(mode="python", warnings=False)
             )
+            operation_evidence = _copy_browser_operation_evidence(response.operation_evidence)
+            if request["operation"] in {"scroll", "upload"}:
+                if (
+                    operation_evidence is None
+                    or operation_evidence.operation != request["operation"]
+                ):
+                    raise ValueError("Browser operation evidence conflicts with the request.")
+                if request[
+                    "operation"
+                ] == "upload" and operation_evidence.selected_file_count != len(
+                    cast("list[str]", request["artifact_ids"])
+                ):
+                    raise ValueError("Browser upload evidence conflicts with admitted artifacts.")
+            elif operation_evidence is not None:
+                raise ValueError("Unexpected browser operation evidence.")
         except (TypeError, ValueError):
             return _error_result(
                 "browser_crash",
@@ -3999,6 +4450,11 @@ class BrowserSessionTool(Tool):
             visual=None
             if observation.visual is None
             else BrowserVisualAuthority.from_observation(observation.visual),
+            file_input_refs={
+                item.ref: cast("bool", item.allows_multiple_files)
+                for item in observation.refs
+                if item.element_type == "file_input"
+            },
         )
         live.active_page_id = observation.page_id
         live.page_set = page_set
@@ -4039,6 +4495,8 @@ class BrowserSessionTool(Tool):
                 "visual_revision": request["visual_revision"],
                 "semantic_success_proven": False,
             }
+        if operation_evidence is not None:
+            structured["operation_evidence"] = operation_evidence.model_dump(mode="json")
         structured["portable_result_evidence"] = _browser_portable_result_evidence(structured)
         browser_state = json.dumps(
             {
@@ -4192,7 +4650,13 @@ class BrowserSessionTool(Tool):
         return published
 
 
-def _validated_request(args: object, *, max_wait_ms: int) -> dict[str, Any]:
+def _validated_request(
+    args: object,
+    *,
+    max_wait_ms: int,
+    max_scroll_repeats: int = DEFAULT_BROWSER_SESSION_MAX_SCROLL_REPEATS,
+    max_upload_files: int = DEFAULT_BROWSER_SESSION_MAX_UPLOAD_FILES,
+) -> dict[str, Any]:
     if type(args) is not dict:
         raise TypeError("Browser arguments must be an object.")
     raw_args = dict(cast("dict[str, Any]", args))
@@ -4212,6 +4676,12 @@ def _validated_request(args: object, *, max_wait_ms: int) -> dict[str, Any]:
         "select": revision_page | {"ref", "value"},
         "press": revision_page | {"ref", "key"},
         "wait": revision_page | {"wait_ms"},
+        "back": revision_page,
+        "forward": revision_page,
+        "reload": revision_page,
+        "scroll": revision_page | {"direction", "amount", "repeat_count"},
+        "hover": revision_page | {"ref"},
+        "upload": revision_page | {"ref", "artifact_ids"},
         "screenshot": revision_page | {"full_page"},
         "download": revision_page | {"ref"},
         "list_pages": {"operation", "session_id", "operation_id"},
@@ -4230,6 +4700,12 @@ def _validated_request(args: object, *, max_wait_ms: int) -> dict[str, Any]:
         "select": revision_page | {"ref", "value"},
         "press": revision_page | {"ref", "key"},
         "wait": revision_page | {"wait_ms"},
+        "back": revision_page,
+        "forward": revision_page,
+        "reload": revision_page,
+        "scroll": revision_page | {"direction", "amount", "repeat_count"},
+        "hover": revision_page | {"ref"},
+        "upload": revision_page | {"ref", "artifact_ids"},
         "screenshot": revision_page,
         "download": revision_page | {"ref"},
         "list_pages": {"operation", "session_id", "operation_id"},
@@ -4294,6 +4770,36 @@ def _validated_request(args: object, *, max_wait_ms: int) -> dict[str, Any]:
         if type(raw_args["full_page"]) is not bool:
             raise ValueError("full_page must be a boolean.")
         copied["full_page"] = raw_args["full_page"]
+    if "direction" in raw_args:
+        direction = raw_args["direction"]
+        if type(direction) is not str or direction not in {"up", "down", "left", "right"}:
+            raise ValueError("direction is not a supported semantic scroll direction.")
+        copied["direction"] = direction
+    if "amount" in raw_args:
+        amount = raw_args["amount"]
+        if type(amount) is not str or amount not in {"line", "page"}:
+            raise ValueError("amount is not a supported semantic scroll amount.")
+        copied["amount"] = amount
+    if "repeat_count" in raw_args:
+        repeat_count = raw_args["repeat_count"]
+        if type(repeat_count) is not int or repeat_count < 1 or repeat_count > max_scroll_repeats:
+            raise ValueError("repeat_count is outside the configured bound.")
+        copied["repeat_count"] = repeat_count
+    if "artifact_ids" in raw_args:
+        artifact_ids = raw_args["artifact_ids"]
+        if (
+            type(artifact_ids) is not list
+            or not artifact_ids
+            or len(artifact_ids) > max_upload_files
+        ):
+            raise ValueError("artifact_ids is outside the configured bound.")
+        copied_ids = tuple(
+            _bounded_identifier(item, "artifact_id", maximum=_MAX_BROWSER_ID_LENGTH)
+            for item in artifact_ids
+        )
+        if len(set(copied_ids)) != len(copied_ids):
+            raise ValueError("artifact_ids must not contain duplicates.")
+        copied["artifact_ids"] = list(copied_ids)
     return copied
 
 
@@ -4718,6 +5224,7 @@ def _apply_backend_page_set(
     for summary in page_set.pages:
         retained = previous.get(summary.page_id)
         refs = frozenset()
+        file_input_refs: Mapping[str, bool] = {}
         valid = False
         if (
             retained is not None
@@ -4727,9 +5234,15 @@ def _apply_backend_page_set(
             and summary.lifecycle == "active"
         ):
             refs = retained.refs
+            file_input_refs = retained.file_input_refs
             valid = True
         if observation is not None and observation.page_id == summary.page_id:
             refs = frozenset(item.ref for item in observation.refs)
+            file_input_refs = {
+                item.ref: cast("bool", item.allows_multiple_files)
+                for item in observation.refs
+                if item.element_type == "file_input"
+            }
             valid = True
         visual_authority = retained.visual if retained is not None and valid else None
         if observation is not None and observation.page_id == summary.page_id:
@@ -4743,6 +5256,7 @@ def _apply_backend_page_set(
             creation_epoch=summary.creation_epoch,
             control_epoch=summary.control_epoch,
             refs=refs,
+            file_input_refs=file_input_refs,
             lifecycle=summary.lifecycle,
             summary=summary,
             valid=valid,
@@ -4833,6 +5347,12 @@ def _preflight_request(
             and request["screenshot_sha256"] != page.visual.screenshot_sha256
         ):
             return _error_result("visual_evidence_expired", dispatch="not_started")
+    if operation == "upload":
+        allows_multiple = page.file_input_refs.get(request["ref"])
+        if allows_multiple is None or (
+            len(cast("list[str]", request["artifact_ids"])) > 1 and not allows_multiple
+        ):
+            return _error_result("incompatible_upload_target", dispatch="not_started")
     return None
 
 
@@ -4946,6 +5466,18 @@ def _failure_is_current_cancellation(
     )
 
 
+def _task_received_cancellation(
+    current_task: asyncio.Task[Any] | None,
+    *,
+    cancellations_before: int,
+    cancellation_pending_before: bool,
+) -> bool:
+    return bool(
+        current_task is not None
+        and (cancellation_pending_before or current_task.cancelling() > cancellations_before)
+    )
+
+
 def _failure_contains_process_control(failure: BaseException) -> bool:
     return _failure_tree_contains(failure, (GeneratorExit, KeyboardInterrupt, SystemExit))
 
@@ -4970,6 +5502,21 @@ def _raise_with_profile_settlement_failure(
             [primary, settlement_failure],
         ) from None
     raise primary from settlement_failure
+
+
+def _secret_snapshot_is_current(
+    ctx: ToolContext,
+    snapshot: InvocationRedactorSnapshot,
+) -> bool:
+    """Require the exact secret scope captured before external upload disclosure."""
+
+    try:
+        current = active_secret_redactor_snapshot(ctx)
+    except BaseException:
+        return False
+    return current.revision == snapshot.revision and current.redactor.has_same_registry(
+        snapshot.redactor
+    )
 
 
 def _browser_session_response_envelope_limit(
@@ -5024,6 +5571,8 @@ def _browser_terminal_result_envelope_limit(
 def _validate_recovered_browser_tool_result(
     value: object,
     *,
+    operation: str,
+    upload_artifact_count: int | None,
     max_snapshot_bytes: int,
     max_refs: int,
     max_page_records: int,
@@ -5146,6 +5695,23 @@ def _validate_recovered_browser_tool_result(
         artifacts = raw_structured.get("artifacts")
         if type(artifacts) is not list or len(artifacts) > 1:
             return None
+        raw_operation_evidence = raw_structured.get("operation_evidence")
+        operation_evidence: BrowserOperationEvidence | None = None
+        if raw_operation_evidence is not None:
+            try:
+                operation_evidence = BrowserOperationEvidence.model_validate(raw_operation_evidence)
+            except (TypeError, ValueError):
+                return None
+        if operation in {"scroll", "upload"}:
+            if operation_evidence is None or operation_evidence.operation != operation:
+                return None
+            if (
+                operation == "upload"
+                and operation_evidence.selected_file_count != upload_artifact_count
+            ):
+                return None
+        elif operation_evidence is not None:
+            return None
     elif error is None and closed is not True:
         if page_set is None:
             return None
@@ -5189,6 +5755,11 @@ def _validate_durable_browser_operation_record(
     max_page_records: int,
     max_page_creations_per_operation: int,
     page_set_limits: _BrowserPageSetLimits,
+    max_upload_files: int,
+    max_upload_file_bytes: int,
+    max_upload_total_bytes: int,
+    max_upload_filename_bytes: int,
+    allowed_upload_content_types: tuple[str, ...],
 ) -> tuple[dict[str, Any], ToolResult | None] | None:
     if type(record) is not dict:
         return None
@@ -5197,6 +5768,16 @@ def _validate_durable_browser_operation_record(
     except (TypeError, ValueError):
         return None
     if not _durable_browser_operation_identity_matches(copied, identity):
+        return None
+    if not _upload_artifact_evidence_matches(
+        copied.get("upload_artifacts"),
+        expected_sha256=identity.upload_artifacts_sha256,
+        max_files=max_upload_files,
+        max_file_bytes=max_upload_file_bytes,
+        max_total_bytes=max_upload_total_bytes,
+        max_filename_bytes=max_upload_filename_bytes,
+        allowed_content_types=allowed_upload_content_types,
+    ):
         return None
     if not all(
         _is_sha256_hexdigest(value)
@@ -5227,6 +5808,12 @@ def _validate_durable_browser_operation_record(
         return copied, None
     result = _validate_recovered_browser_tool_result(
         raw_result,
+        operation=identity.operation,
+        upload_artifact_count=(
+            len(cast("list[object]", copied["upload_artifacts"]))
+            if identity.operation == "upload"
+            else None
+        ),
         max_snapshot_bytes=max_snapshot_bytes,
         max_refs=max_refs,
         max_page_records=max_page_records,
@@ -5272,6 +5859,7 @@ def _browser_portable_result_evidence(structured: Mapping[str, Any]) -> dict[str
             "allocation_disposition",
             "execution",
             "visual_action",
+            "operation_evidence",
         )
         if key in structured
     }
@@ -5368,6 +5956,134 @@ def _request_fingerprint(request: Mapping[str, Any]) -> str:
         "utf-8"
     )
     return hashlib.sha256(b"cayu-browser-operation-v1\0" + encoded).hexdigest()
+
+
+def _upload_artifacts_sha256(request: Mapping[str, Any]) -> str | None:
+    evidence = request.get("upload_artifacts")
+    if evidence is None:
+        return None
+    return hashlib.sha256(
+        canonical_durable_json_bytes(evidence, "browser_upload_artifacts")
+    ).hexdigest()
+
+
+def _copy_upload_artifact_read_result(
+    value: object,
+    *,
+    expected_artifact_id: str,
+    max_content_bytes: int,
+) -> ArtifactReadResult:
+    """Reconstruct extension-owned upload evidence without serializing it first."""
+
+    if type(value) is not ArtifactReadResult or type(value.metadata) is not ArtifactMetadata:
+        raise TypeError("Artifact store returned invalid upload evidence.")
+    source_metadata = value.metadata
+    metadata = ArtifactMetadata.model_validate(
+        {
+            "id": source_metadata.id,
+            "filename": source_metadata.filename,
+            "content_type": source_metadata.content_type,
+            "size_bytes": source_metadata.size_bytes,
+            "scope": source_metadata.scope,
+            "session_id": source_metadata.session_id,
+            "agent_name": source_metadata.agent_name,
+            "environment_name": source_metadata.environment_name,
+            "created_at": source_metadata.created_at,
+            "metadata": source_metadata.metadata,
+        }
+    )
+    copied = ArtifactReadResult(
+        metadata=metadata,
+        content=value.content,
+        total_bytes=value.total_bytes,
+        truncated=value.truncated,
+        source_bytes_read=value.source_bytes_read,
+        redaction_truncated=value.redaction_truncated,
+    )
+    if copied.metadata.id != expected_artifact_id:
+        raise ValueError("Artifact store returned evidence for another artifact.")
+    if len(copied.content) > max_content_bytes:
+        raise ValueError("Artifact store exceeded the upload read limit.")
+    return copied
+
+
+def _copy_browser_operation_evidence(
+    value: object,
+) -> BrowserOperationEvidence | None:
+    """Reconstruct backend-owned evidence without serializing rejected values."""
+
+    if value is None:
+        return None
+    if type(value) is not BrowserOperationEvidence:
+        raise TypeError("Browser backend returned invalid operation evidence.")
+    return BrowserOperationEvidence(
+        operation=value.operation,
+        moved=value.moved,
+        edge=value.edge,
+        selected_file_count=value.selected_file_count,
+        selection_state=value.selection_state,
+    )
+
+
+def _upload_artifact_evidence_matches(
+    value: object,
+    *,
+    expected_sha256: str | None,
+    max_files: int,
+    max_file_bytes: int,
+    max_total_bytes: int,
+    max_filename_bytes: int,
+    allowed_content_types: tuple[str, ...],
+) -> bool:
+    if expected_sha256 is None:
+        return value is None
+    if type(value) is not list or not 1 <= len(value) <= max_files:
+        return False
+    artifact_ids: set[str] = set()
+    total_bytes = 0
+    for raw_item in value:
+        if type(raw_item) is not dict or set(raw_item) != {
+            "artifact_id",
+            "content_sha256",
+            "filename",
+            "content_type",
+            "size_bytes",
+        }:
+            return False
+        item = cast("dict[str, Any]", raw_item)
+        try:
+            artifact_id = _bounded_identifier(
+                item["artifact_id"], "artifact_id", maximum=_MAX_BROWSER_ID_LENGTH
+            )
+        except (TypeError, ValueError):
+            return False
+        filename = item["filename"]
+        content_type = item["content_type"]
+        size_bytes = item["size_bytes"]
+        if (
+            artifact_id in artifact_ids
+            or not _is_sha256_hexdigest(item["content_sha256"])
+            or type(filename) is not str
+            or not filename
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or len(filename.encode("utf-8")) > max_filename_bytes
+            or type(content_type) is not str
+            or content_type not in allowed_content_types
+            or type(size_bytes) is not int
+            or size_bytes < 0
+            or size_bytes > max_file_bytes
+        ):
+            return False
+        artifact_ids.add(artifact_id)
+        total_bytes += size_bytes
+        if total_bytes > max_total_bytes:
+            return False
+    return (
+        hashlib.sha256(canonical_durable_json_bytes(value, "browser_upload_artifacts")).hexdigest()
+        == expected_sha256
+    )
 
 
 def _durable_browser_operation_key(operation_id: str) -> str:
@@ -5491,6 +6207,8 @@ def _browser_operation_locator_record(
     authority: Any,
     operation_storage_key: str,
     fingerprint: str,
+    operation: str,
+    upload_artifacts_sha256: str | None,
 ) -> dict[str, Any]:
     return copy_durable_json_object(
         {
@@ -5507,7 +6225,9 @@ def _browser_operation_locator_record(
             "tool_call_id": authority.tool_call_id,
             "idempotency_key": authority.idempotency_key,
             "effective_arguments_sha256": authority.effective_arguments_sha256,
+            "operation": operation,
             "fingerprint": fingerprint,
+            "upload_artifacts_sha256": upload_artifacts_sha256,
             "operation_storage_key": operation_storage_key,
         },
         "browser_operation_locator_record",
@@ -5693,6 +6413,7 @@ def _browser_operation_record(
         "record_type": _DURABLE_BROWSER_OPERATION_RECORD_TYPE,
         "schema_version": 1,
         "state": state,
+        "operation": request["operation"],
         "operation_id_sha256": _browser_operation_id_sha256(operation_id),
         "fingerprint": fingerprint,
         "parent_session_id": ctx.session_id,
@@ -5706,9 +6427,12 @@ def _browser_operation_record(
         "tool_call_id": authority.tool_call_id,
         "idempotency_key": authority.idempotency_key,
         "effective_arguments_sha256": authority.effective_arguments_sha256,
+        "upload_artifacts_sha256": _upload_artifacts_sha256(request),
         "browser_session_id": request.get("session_id"),
         "page_id": request.get("page_id"),
     }
+    if "upload_artifacts" in request:
+        record["upload_artifacts"] = request["upload_artifacts"]
     if result is not None:
         record["result"] = result.model_dump(mode="json")
     return copy_durable_json_object(record, "browser_operation_record")
@@ -5774,6 +6498,14 @@ def _browser_session_record(
                 "control_epoch": summary.control_epoch,
                 "revision": summary.revision,
                 "refs": refs,
+                "file_input_refs": (
+                    []
+                    if page is None
+                    else [
+                        {"ref": ref, "allows_multiple_files": multiple}
+                        for ref, multiple in sorted(page.file_input_refs.items())
+                    ]
+                ),
                 "refs_valid": refs_valid,
                 "visual": None
                 if page is None or page.visual is None
@@ -5894,11 +6626,13 @@ def _validate_durable_browser_session_record(
             "control_epoch",
             "revision",
             "refs",
+            "file_input_refs",
             "refs_valid",
             "visual",
         }:
             return None, "restoration_required"
         refs = raw_authority.get("refs")
+        file_input_refs = raw_authority.get("file_input_refs")
         refs_valid = raw_authority.get("refs_valid")
         if (
             raw_authority.get("page_id") != summary.page_id
@@ -5911,6 +6645,18 @@ def _validate_durable_browser_session_record(
             or any(type(item) is not str for item in refs)
             or any(len(item) > _MAX_REF_LENGTH or _SAFE_ID.fullmatch(item) is None for item in refs)
             or refs != sorted(set(refs))
+            or type(file_input_refs) is not list
+            or len(file_input_refs) > max_refs
+            or any(
+                type(item) is not dict
+                or set(item) != {"ref", "allows_multiple_files"}
+                or type(item.get("ref")) is not str
+                or item.get("ref") not in refs
+                or type(item.get("allows_multiple_files")) is not bool
+                for item in file_input_refs
+            )
+            or [item["ref"] for item in file_input_refs]
+            != sorted({item["ref"] for item in file_input_refs})
             or type(refs_valid) is not bool
             or (refs_valid and (summary.lifecycle != "active" or summary.revision is None))
         ):
@@ -5929,6 +6675,10 @@ def _validate_durable_browser_session_record(
             creation_epoch=summary.creation_epoch,
             control_epoch=summary.control_epoch,
             refs=frozenset(cast("list[str]", refs)),
+            file_input_refs={
+                item["ref"]: item["allows_multiple_files"]
+                for item in cast("list[dict[str, Any]]", file_input_refs)
+            },
             lifecycle=summary.lifecycle,
             summary=summary,
             valid=bool(refs_valid) and state == "live",
@@ -5959,13 +6709,16 @@ def _durable_browser_operation_identity(
     *,
     ctx: ToolContext,
     authority: Any,
+    operation: str,
     operation_id: str,
     fingerprint: str,
+    upload_artifacts_sha256: str | None,
 ) -> _DurableBrowserOperationIdentity:
     allocation_fingerprint = authority.environment_allocation_fingerprint
     if type(allocation_fingerprint) is not str:
         raise RuntimeError("Durable browser operations require live allocation authority.")
     return _DurableBrowserOperationIdentity(
+        operation=operation,
         operation_id_sha256=_browser_operation_id_sha256(operation_id),
         fingerprint=fingerprint,
         parent_session_id=ctx.session_id,
@@ -5979,6 +6732,7 @@ def _durable_browser_operation_identity(
         tool_call_id=authority.tool_call_id,
         idempotency_key=authority.idempotency_key,
         effective_arguments_sha256=authority.effective_arguments_sha256,
+        upload_artifacts_sha256=upload_artifacts_sha256,
     )
 
 
@@ -5987,13 +6741,20 @@ def _durable_browser_replay_result(
     *,
     ctx: ToolContext,
     authority: Any,
+    operation: str,
     operation_id: str,
     fingerprint: str,
+    upload_artifacts_sha256: str | None,
     max_snapshot_bytes: int,
     max_refs: int,
     max_page_records: int,
     max_page_creations_per_operation: int,
     page_set_limits: _BrowserPageSetLimits,
+    max_upload_files: int,
+    max_upload_file_bytes: int,
+    max_upload_total_bytes: int,
+    max_upload_filename_bytes: int,
+    allowed_upload_content_types: tuple[str, ...],
 ) -> ToolResult:
     allocation_fingerprint = authority.environment_allocation_fingerprint
     if type(allocation_fingerprint) is not str:
@@ -6001,6 +6762,8 @@ def _durable_browser_replay_result(
     identity = _durable_browser_operation_identity(
         ctx=ctx,
         authority=authority,
+        operation=operation,
+        upload_artifacts_sha256=upload_artifacts_sha256,
         operation_id=operation_id,
         fingerprint=fingerprint,
     )
@@ -6012,6 +6775,11 @@ def _durable_browser_replay_result(
         max_page_records=max_page_records,
         max_page_creations_per_operation=max_page_creations_per_operation,
         page_set_limits=page_set_limits,
+        max_upload_files=max_upload_files,
+        max_upload_file_bytes=max_upload_file_bytes,
+        max_upload_total_bytes=max_upload_total_bytes,
+        max_upload_filename_bytes=max_upload_filename_bytes,
+        allowed_upload_content_types=allowed_upload_content_types,
     )
     if validated is None:
         if type(record) is not dict:
@@ -6171,6 +6939,12 @@ def _parse_runner_response(
                     content=content,
                 )
             )
+        raw_operation_evidence = raw.get("operation_evidence")
+        operation_evidence = (
+            None
+            if raw_operation_evidence is None
+            else BrowserOperationEvidence.model_validate(raw_operation_evidence)
+        )
     except (KeyError, TypeError, ValueError, RecursionError):
         return BrowserBackendResponse(failure=BrowserBackendFailure("browser_crash"))
     try:
@@ -6179,6 +6953,7 @@ def _parse_runner_response(
             page_set=page_set,
             page_delta=page_delta,
             artifacts=tuple(artifacts),
+            operation_evidence=operation_evidence,
             allocation_disposition=cast(
                 'Literal["live", "retired", "uncertain"]',
                 allocation_disposition,
@@ -6375,6 +7150,38 @@ def _bounded_configuration(
     if type(value) is not int or value < minimum or value > maximum:
         raise ValueError(f"{field_name} must be between {minimum} and {maximum}.")
     return value
+
+
+def _upload_content_types(value: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(value, str | bytes):
+        raise TypeError("allowed_upload_content_types must be a sequence of media types.")
+    copied: list[str] = []
+    for item in value:
+        if type(item) is not str:
+            raise TypeError("allowed_upload_content_types must contain strings.")
+        normalized = require_durable_clean_nonblank(item, "allowed_upload_content_types").lower()
+        if (
+            len(normalized.encode("ascii", "ignore")) != len(normalized)
+            or len(normalized.encode("utf-8")) > 255
+            or _UPLOAD_CONTENT_TYPE_RE.fullmatch(normalized) is None
+        ):
+            raise ValueError("allowed_upload_content_types contains an invalid media type.")
+        copied.append(normalized)
+    if not copied or len(copied) > 64 or len(set(copied)) != len(copied):
+        raise ValueError("allowed_upload_content_types must contain 1 to 64 unique media types.")
+    return tuple(sorted(copied))
+
+
+def _upload_taint_labels(value: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(value, str | bytes):
+        raise TypeError("allowed_upload_taint_labels must be a sequence of labels.")
+    copied = list(value)
+    if not copied:
+        return ()
+    labels = taint_labels_from_metadata({TAINT_LABELS_METADATA_KEY: copied})
+    if len(labels) > 64:
+        raise ValueError("allowed_upload_taint_labels must not exceed 64 labels.")
+    return tuple(sorted(labels))
 
 
 __all__ = [

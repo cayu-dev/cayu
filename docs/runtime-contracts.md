@@ -8755,7 +8755,7 @@ and benchmark evidence must preserve the blocked source separately from any
 configured replacement.
 
 The opt-in interactive sandboxed profile exposes one ordinary
-`browser_session` tool backed by `cayu.browser-session.v4` worker version 8 in
+`browser_session` tool backed by `cayu.browser-session.v4` worker version 9 in
 the same pinned Playwright/Chromium worker image. Cayu owns browser session and
 random opaque page identities; Chromium targets, contexts, handles, CDP
 sessions, and raw opener objects never cross the guest boundary.
@@ -8831,6 +8831,19 @@ it.
 Only the exact active-page `download` operation admits a download event.
 Automatic and popup-initiated downloads are cancelled and quarantine their
 originating page through one of the same bounded page-cleanup owners.
+
+The same closed tool supports true Chromium back/forward traversal, GET/HEAD-only
+reload, bounded semantic scroll, strict current-ref hover, and session-owned
+artifact upload. Every admitted successful operation advances the page revision,
+including no-op movement; a post-dispatch failure invalidates the prior revision
+and requires a fresh observation before another action. Upload admission binds exact artifact IDs and
+content fingerprints, validates scope, media type, taint, individual and
+aggregate limits, and secret-free content before dispatch, then transfers bounded
+in-memory file payloads with the admitted names and MIME types to Chromium.
+Selection does not depend on guest temporary files that could disappear before
+a later read or submission; allocation teardown owns eventual browser cleanup. Durable and public
+evidence excludes raw bytes and guest paths, and file selection is not evidence
+of remote acceptance.
 
 When an environment factory has published reconnect metadata, the runtime
 derives a content-free allocation fingerprint and binds it with the parent

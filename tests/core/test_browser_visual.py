@@ -71,6 +71,10 @@ def test_visual_action_cancellation_owns_guard_cleanup(cleanup_fails: bool) -> N
             key=None,
             wait_ms=None,
             full_page=False,
+            direction=None,
+            amount=None,
+            repeat_count=None,
+            upload_files=(),
             multi_page=False,
             limits=guest._InteractiveLimits(
                 **{item.name: 100 for item in fields(guest._InteractiveLimits)}

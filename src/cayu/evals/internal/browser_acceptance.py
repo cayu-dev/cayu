@@ -19,13 +19,14 @@ from itertools import pairwise
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import SecretStr
 
 from cayu import (
     AgentSpec,
     ApprovedEgressDestination,
+    ArtifactScope,
     BrowserEgressPolicy,
     BrowserVisualPolicy,
     CayuApp,
@@ -61,7 +62,10 @@ from cayu.evals.browser_acceptance import (
     BrowserAcceptanceSemanticOracle,
     _browser_dispatches_from_trial,
 )
-from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
+from cayu.evals.browser_acceptance_fixture import (
+    BROWSER_ACCEPTANCE_FIXTURE_UPLOAD_BYTES,
+    BrowserAcceptanceFixtureV1,
+)
 from cayu.evals.browser_acceptance_manifests import (
     DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION,
     deterministic_browser_acceptance_manifest,
@@ -107,19 +111,20 @@ _MODEL = "browser-acceptance-deterministic-v1"
 _POLICY = "browser-acceptance"
 _PLANNER_REVISION = _content_revision(
     {
-        "version": 2,
+        "version": 3,
         "case_prompt": "browser acceptance case: <case-id>",
         "selection": "accessible-name exact first match",
         "detached_element_settlement_ms": 3_000,
         "browser_crash_wait_ms": 2_000,
         "visual_selection": "retained visual target; bounded fixture-gated mutations",
+        "upload_fixture": "session-scoped content-bound artifact reference",
         "terminal_output": "browser_acceptance:success",
     },
     "browser acceptance deterministic planner",
 )
 _SCENARIO_EXECUTOR_REVISION = _content_revision(
     {
-        "version": 2,
+        "version": 3,
         "entrance": "CayuApp.run",
         "recovery": "CayuApp.recover_incomplete_session",
         "process_store": "sqlite",
@@ -242,6 +247,14 @@ def _scenario_stage(scenario: BrowserAcceptanceFaultScenario) -> tuple[str, str]
         BrowserAcceptanceFaultScenario.BROWSER_BACKGROUND_PAGE_CRASH: (
             "browser",
             "background_page_crash",
+        ),
+        BrowserAcceptanceFaultScenario.BROWSER_UPLOAD_DISCONNECTION: (
+            "browser",
+            "upload_disconnection",
+        ),
+        BrowserAcceptanceFaultScenario.BROWSER_UPLOAD_ACKNOWLEDGEMENT_LOSS: (
+            "browser",
+            "upload_acknowledgement_loss",
         ),
     }
     if scenario in browser_stages:
@@ -385,9 +398,10 @@ class _AcceptanceEventJournalSink(EventSink):
 class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
     """Closed transcript-driven provider for the checked-in browser corpus."""
 
-    def __init__(self, cases: dict[str, Any]) -> None:
+    def __init__(self, cases: dict[str, Any], artifact_store: LocalArtifactStore) -> None:
         super().__init__((), name="browser-acceptance-scripted")
         self._cases = dict(cases)
+        self._artifact_store = artifact_store
         self._acceptance_temporary_directory: TemporaryDirectory[str] | None = None
         self.execution_revision = _PLANNER_REVISION
         self.visual_fixture: BrowserAcceptanceFixtureV1 | None = None
@@ -430,14 +444,39 @@ class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
         if operation_index == 1 and case_id in {
             "action-detached-control",
             "action-replaced-element",
+            "action-hover-detached",
         }:
             await asyncio.sleep(3)
+        upload_artifact_id: str | None = None
+        if operation == "upload":
+            parent_session_id = _parent_session_id(request)
+            upload_artifact_id = _upload_artifact_id(case_id, parent_session_id)
+            if case_id != "artifact-upload-missing":
+                await self._artifact_store.put_bytes(
+                    (
+                        b"x" * 1_025
+                        if case_id == "artifact-upload-too-large"
+                        else BROWSER_ACCEPTANCE_FIXTURE_UPLOAD_BYTES
+                    ),
+                    artifact_id=upload_artifact_id,
+                    filename="acceptance-upload.txt",
+                    content_type="text/plain",
+                    scope=ArtifactScope.SESSION,
+                    session_id=(
+                        "unrelated-fixture-session"
+                        if case_id == "artifact-upload-wrong-session"
+                        else parent_session_id
+                    ),
+                    agent_name=_AGENT,
+                    environment_name="browser",
+                )
         arguments = _operation_arguments(
             case_id=case_id,
             operation=operation,
             operation_index=operation_index,
             fixture_route=case.fixture_route,
             results=results,
+            upload_artifact_id=upload_artifact_id,
         )
         yield ModelStreamEvent.tool_call(
             id=f"{case_id}-{operation_index + 1}",
@@ -471,7 +510,11 @@ async def _signal_browser_daemon(ctx: Any, session_id: str, signal_number: int) 
 
 
 async def _control_browser_page_fault(
-    ctx: Any, session_id: str, *, page_id: str | None = None
+    ctx: Any,
+    session_id: str,
+    *,
+    page_id: str | None = None,
+    upload_fault: Literal["disconnection", "acknowledgement_loss"] | None = None,
 ) -> None:
     raw_runner = getattr(ctx.runner, "_InvocationRunnerHandle__runner", None)
     if not isinstance(raw_runner, Runner):
@@ -481,6 +524,10 @@ async def _control_browser_page_fault(
         if page_id is None
         else None
     )
+    if upload_fault is not None:
+        if source is None or upload_fault not in {"disconnection", "acknowledgement_loss"}:
+            raise ValueError("Invalid acceptance upload fault entrance.")
+        source = source.replace("UPLOAD_FAULT = None", f"UPLOAD_FAULT = {upload_fault!r}")
     result = await raw_runner.exec_system(
         ExecCommand.process(
             "/usr/local/bin/python",
@@ -513,6 +560,13 @@ def _install_browser_crash_fault(bridge: WebBridge, control: _FaultControl) -> N
         BrowserAcceptanceFaultScenario.BROWSER_ACTIVE_PAGE_CRASH,
         BrowserAcceptanceFaultScenario.BROWSER_BACKGROUND_PAGE_CRASH,
     }
+    upload_fault: Literal["disconnection", "acknowledgement_loss"] | None = (
+        "disconnection"
+        if control.scenario is BrowserAcceptanceFaultScenario.BROWSER_UPLOAD_DISCONNECTION
+        else "acknowledgement_loss"
+        if control.scenario is BrowserAcceptanceFaultScenario.BROWSER_UPLOAD_ACKNOWLEDGEMENT_LOSS
+        else None
+    )
 
     async def execute_with_browser_fault(
         ctx: Any, request: dict[str, Any]
@@ -521,10 +575,23 @@ def _install_browser_crash_fault(bridge: WebBridge, control: _FaultControl) -> N
         operation_number += 1
         if page_fault and operation_number == 1:
             await _control_browser_page_fault(ctx, request["session_id"])
+        if upload_fault is not None and operation_number == 1:
+            await _control_browser_page_fault(ctx, request["session_id"], upload_fault=upload_fault)
         if operation_number != control.target_operation_number:
             previous_response = await original_execute(ctx, request)
             return previous_response
         scenario = control.scenario
+        if upload_fault is not None:
+            response = await original_execute(ctx, request)
+            expected = "browser_crash" if upload_fault == "disconnection" else "outcome_ambiguous"
+            if (
+                request["operation"] != "upload"
+                or response.failure is None
+                or response.failure.code != expected
+            ):
+                raise RuntimeError("The acceptance upload selection fault was not observed.")
+            control.trigger("browser", f"upload_{upload_fault}", operation_number)
+            return response
         session_id = request["session_id"]
         if page_fault:
             before = None if previous_response is None else previous_response.page_set
@@ -606,8 +673,49 @@ def _case_id(request: ModelRequest) -> str:
             continue
         for part in message.content:
             if type(part) is TextPart and part.text.startswith(prefix):
-                return part.text.removeprefix(prefix)
+                return part.text.removeprefix(prefix).splitlines()[0]
     raise RuntimeError("Browser acceptance request has no canonical case identity.")
+
+
+def bind_trial_session(
+    suite_id: str, case_id: str, trial_number: int, request: RunRequest
+) -> RunRequest:
+    """Bind fixture artifact scope after the eval runner isolates the trial session."""
+
+    del suite_id, trial_number
+    if type(request.session_id) is not str or not request.session_id:
+        raise ValueError("Browser acceptance trial has no isolated session identity.")
+    messages = []
+    for message in request.messages:
+        content = []
+        for part in message.content:
+            if (
+                message.role == "user"
+                and type(part) is TextPart
+                and part.text.startswith(f"browser acceptance case: {case_id}\n")
+            ):
+                part = TextPart(
+                    text=f"browser acceptance case: {case_id}\n"
+                    f"browser acceptance parent session: {request.session_id}"
+                )
+            content.append(part)
+        messages.append(message.model_copy(update={"content": content}))
+    return request.model_copy(update={"messages": messages})
+
+
+def _parent_session_id(request: ModelRequest) -> str:
+    prefix = "browser acceptance parent session: "
+    for message in request.messages:
+        if message.role != "user":
+            continue
+        for part in message.content:
+            if type(part) is TextPart:
+                for line in part.text.splitlines():
+                    if line.startswith(prefix):
+                        session_id = line.removeprefix(prefix)
+                        if session_id and session_id != "None":
+                            return session_id
+    raise RuntimeError("Browser acceptance request has no parent-session identity.")
 
 
 def _browser_results(request: ModelRequest) -> tuple[dict[str, Any], ...]:
@@ -724,6 +832,28 @@ def _ref(state: Mapping[str, Any], names: tuple[str, ...]) -> str:
     raise RuntimeError("Browser acceptance observation lacks the required element reference.")
 
 
+def _upload_artifact_id(case_id: str, session_id: str) -> str:
+    identity = f"{case_id}\0{session_id}".encode()
+    return f"art_{hashlib.sha256(identity).hexdigest()[:32]}"
+
+
+def _stale_reference_state(
+    case_id: str,
+    operation_index: int,
+    results: tuple[dict[str, Any], ...],
+) -> dict[str, Any] | None:
+    if not case_id.startswith("revision-stale-ref-after-"):
+        return None
+    action = case_id.removeprefix("revision-stale-ref-after-")
+    stale_result_index, final_operation_index = {
+        "back": (1, 3),
+        "forward": (2, 4),
+    }.get(action, (0, 2))
+    if operation_index != final_operation_index or len(results) <= stale_result_index:
+        return None
+    return results[stale_result_index]
+
+
 def _operation_arguments(
     *,
     case_id: str,
@@ -731,6 +861,7 @@ def _operation_arguments(
     operation_index: int,
     fixture_route: str | None,
     results: tuple[dict[str, Any], ...],
+    upload_artifact_id: str | None = None,
 ) -> dict[str, Any]:
     operation_id = f"{case_id}:{operation_index + 1}:{operation}"
     if case_id in {
@@ -747,9 +878,8 @@ def _operation_arguments(
     state = (
         results[1]
         if case_id == "visual-stale-screenshot" and operation_index == 3 and len(results) > 1
-        else results[0]
-        if case_id.startswith("revision-stale-ref-after-") and operation_index == 2 and results
-        else _latest_browser_state(results)
+        else _stale_reference_state(case_id, operation_index, results)
+        or _latest_browser_state(results)
     )
     arguments: dict[str, Any] = {
         "operation": operation,
@@ -773,6 +903,12 @@ def _operation_arguments(
         "download",
         "click_visual_target",
         "click_visual_point",
+        "back",
+        "forward",
+        "reload",
+        "scroll",
+        "hover",
+        "upload",
     }:
         control_epoch = state.get("control_epoch")
         if type(control_epoch) is not int:
@@ -797,50 +933,89 @@ def _operation_arguments(
         arguments["wait_ms"] = 2_000 if case_id == "crash-during-execution" else 250
     elif operation == "screenshot":
         arguments["full_page"] = True
-    elif operation in {"click", "fill", "select", "press", "download"}:
+    elif operation == "scroll":
+        arguments.update(
+            direction="down",
+            amount="page",
+            # Valid public schema, but beyond this campaign's application limit.
+            repeat_count=5 if case_id == "navigation-scroll-over-limit" else 2,
+        )
+    elif operation in {"click", "fill", "select", "press", "download", "hover", "upload"}:
+        history_case = case_id in {
+            "navigation-history-back",
+            "navigation-history-forward",
+            "revision-stale-ref-after-back",
+            "revision-stale-ref-after-forward",
+        }
         names = (
-            (("Download report",) if operation == "download" else ("Save",))
-            if case_id.startswith("revision-stale-ref-after-") and operation_index == 2
-            else {
-                ("action-delayed-element", "click"): ("Continue",),
-                ("visual-semantic-preference", "click"): ("Activate",),
-                ("action-disabled-control", "click"): ("Unavailable",),
-                ("action-duplicate-labels", "click"): ("Continue",),
-                ("action-form-controls", "fill"): ("Name",),
-                ("action-form-controls", "select"): ("Region",),
-                ("action-form-controls", "press"): ("Name",),
-                ("action-form-controls", "click"): ("Save",),
-                ("action-form-validation", "click"): ("Save",),
-                ("action-hidden-control", "click"): ("Hidden action",),
-                ("action-detached-control", "click"): ("Detach me",),
-                ("action-occluded-control", "click"): ("Covered action",),
-                ("action-replaced-element", "click"): ("Old", "New"),
-                ("action-readonly-control", "fill"): ("Account",),
-                ("navigation-scroll-dependent-control", "click"): ("Bottom action",),
-                ("page-about-blank-popup-transition", "click"): ("Open blank popup",),
-                ("page-active-page-crash", "click"): ("Open popup",),
-                ("page-background-page-crash", "click"): ("Open popup",),
-                ("page-complete-cleanup", "click"): ("Open popup",),
-                ("page-cross-origin-popup", "click"): ("Open cross-origin popup",),
-                ("page-cross-page-stale-ref", "click"): ("Open popup",),
-                ("page-popup-burst", "click"): ("Open popup burst",),
-                ("page-popup-exact-replay", "click"): ("Open popup",),
-                ("page-popup-opener-navigation", "click"): ("Open navigating popup",),
-                ("page-popup-process-loss-ambiguity", "click"): ("Open popup",),
-                ("page-popup-redirect-pivot", "click"): ("Open redirecting popup",),
-                ("page-multiple-popup-tab-switch-close", "click"): ("Open popup",),
-                ("iframe-cross-origin", "fill"): ("Frame value",),
-                ("iframe-cross-origin", "click"): ("Apply",),
-                ("iframe-same-origin", "fill"): ("Frame value",),
-                ("iframe-same-origin", "click"): ("Apply",),
-                ("artifact-bounded-download", "download"): ("Download report",),
-                ("limit-oversized-download", "download"): ("Download oversized file",),
-                ("revision-stale-ref-after-click", "click"): ("Save",),
-                ("revision-stale-ref-after-download", "download"): ("Download report",),
-                ("revision-stale-ref-after-fill", "fill"): ("Name",),
-                ("revision-stale-ref-after-press", "press"): ("Name",),
-                ("revision-stale-ref-after-select", "select"): ("Region",),
-            }.get((case_id, operation))
+            {
+                "revision-stale-ref-after-back": ("Forward destination",),
+                "revision-stale-ref-after-download": ("Download report",),
+                "revision-stale-ref-after-forward": ("Back destination",),
+                "revision-stale-ref-after-hover": ("Hover target",),
+                "revision-stale-ref-after-reload": ("Reload anchor",),
+                "revision-stale-ref-after-upload": ("Save",),
+            }.get(case_id, ("Save",))
+            if _stale_reference_state(case_id, operation_index, results) is not None
+            else (
+                ("Next destination",)
+                if history_case and operation_index == 1
+                else {
+                    ("visual-semantic-preference", "click"): ("Activate",),
+                    ("action-delayed-element", "click"): ("Continue",),
+                    ("action-disabled-control", "click"): ("Unavailable",),
+                    ("action-duplicate-labels", "click"): ("Continue",),
+                    ("action-form-controls", "fill"): ("Name",),
+                    ("action-form-controls", "select"): ("Region",),
+                    ("action-form-controls", "press"): ("Name",),
+                    ("action-form-controls", "click"): ("Save",),
+                    ("action-form-validation", "click"): ("Save",),
+                    ("action-hidden-control", "click"): ("Hidden action",),
+                    ("action-detached-control", "click"): ("Detach me",),
+                    ("action-occluded-control", "click"): ("Covered action",),
+                    ("action-replaced-element", "click"): ("Old", "New"),
+                    ("action-readonly-control", "fill"): ("Account",),
+                    ("navigation-scroll-dependent-control", "click"): ("Bottom action",),
+                    ("navigation-history-back", "click"): ("Back destination",),
+                    ("navigation-history-forward", "click"): ("Forward destination",),
+                    ("navigation-reload", "click"): ("Reload confirmed",),
+                    ("action-strict-hover", "hover"): ("Hover target",),
+                    ("action-hover-detached", "hover"): ("Detach me",),
+                    ("action-hover-occluded", "hover"): ("Covered action",),
+                    ("artifact-upload", "upload"): ("Upload file",),
+                    ("artifact-upload-missing", "upload"): ("Upload file",),
+                    ("artifact-upload-wrong-session", "upload"): ("Upload file",),
+                    ("artifact-upload-too-large", "upload"): ("Upload file",),
+                    ("artifact-upload-incompatible-target", "upload"): ("Save",),
+                    ("artifact-upload-disconnection", "upload"): ("Upload file",),
+                    ("artifact-upload-acknowledgement-loss", "upload"): ("Upload file",),
+                    ("page-about-blank-popup-transition", "click"): ("Open blank popup",),
+                    ("page-active-page-crash", "click"): ("Open popup",),
+                    ("page-background-page-crash", "click"): ("Open popup",),
+                    ("page-complete-cleanup", "click"): ("Open popup",),
+                    ("page-cross-origin-popup", "click"): ("Open cross-origin popup",),
+                    ("page-cross-page-stale-ref", "click"): ("Open popup",),
+                    ("page-popup-burst", "click"): ("Open popup burst",),
+                    ("page-popup-exact-replay", "click"): ("Open popup",),
+                    ("page-popup-opener-navigation", "click"): ("Open navigating popup",),
+                    ("page-popup-process-loss-ambiguity", "click"): ("Open popup",),
+                    ("page-popup-redirect-pivot", "click"): ("Open redirecting popup",),
+                    ("page-multiple-popup-tab-switch-close", "click"): ("Open popup",),
+                    ("iframe-cross-origin", "fill"): ("Frame value",),
+                    ("iframe-cross-origin", "click"): ("Apply",),
+                    ("iframe-same-origin", "fill"): ("Frame value",),
+                    ("iframe-same-origin", "click"): ("Apply",),
+                    ("artifact-bounded-download", "download"): ("Download report",),
+                    ("limit-oversized-download", "download"): ("Download oversized file",),
+                    ("revision-stale-ref-after-click", "click"): ("Save",),
+                    ("revision-stale-ref-after-download", "download"): ("Download report",),
+                    ("revision-stale-ref-after-fill", "fill"): ("Name",),
+                    ("revision-stale-ref-after-press", "press"): ("Name",),
+                    ("revision-stale-ref-after-select", "select"): ("Region",),
+                    ("revision-stale-ref-after-hover", "hover"): ("Hover target",),
+                    ("revision-stale-ref-after-upload", "upload"): ("Upload file",),
+                }.get((case_id, operation))
+            )
         )
         if names is None:
             raise RuntimeError("Browser acceptance planner lacks an operation target.")
@@ -854,6 +1029,10 @@ def _operation_arguments(
             arguments["value"] = "South"
         elif operation == "press":
             arguments["key"] = "Tab"
+        elif operation == "upload":
+            if upload_artifact_id is None:
+                raise RuntimeError("Browser acceptance upload artifact is unavailable.")
+            arguments["artifact_ids"] = [upload_artifact_id]
     return arguments
 
 
@@ -862,7 +1041,13 @@ def _case_request(case: Any, *, session_id: str | None = None) -> RunRequest:
     return RunRequest(
         session_id=session_id,
         agent_name=_AGENT,
-        messages=[Message.text("user", f"browser acceptance case: {case.case_id}")],
+        messages=[
+            Message.text(
+                "user",
+                f"browser acceptance case: {case.case_id}\n"
+                f"browser acceptance parent session: {session_id}",
+            )
+        ],
         max_steps=len(case.operations) + 1,
         limits=RunLimits(
             max_tool_calls=len(case.operations),
@@ -881,7 +1066,8 @@ def _build_runtime(
     control: _FaultControl | None,
 ) -> tuple[CayuApp, WebBridge, BrowserAcceptanceDeterministicProvider]:
     root.mkdir(parents=True, exist_ok=True)
-    provider = BrowserAcceptanceDeterministicProvider(cases)
+    artifact_store = _FaultArtifactStore(root / "artifacts", control=control)
+    provider = BrowserAcceptanceDeterministicProvider(cases, artifact_store)
     store = _FaultSQLiteSessionStore(root / "sessions.sqlite", control=control)
     artifact_store = _FaultArtifactStore(root / "artifacts", control=control)
     app = CayuApp(
@@ -930,6 +1116,9 @@ def _build_runtime(
                 DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
             ),
             "max_operations": 8,
+            "max_scroll_repeats": 4,
+            "max_upload_file_bytes": 1_024,
+            "max_upload_total_bytes": 2_048,
             "max_snapshot_bytes": 64 * 1024,
             "max_sessions": 1,
             "multi_page": True,
@@ -1212,6 +1401,11 @@ async def _recovered_browser_tool_calls(
             operation_index=operation_index,
             fixture_route=case.fixture_route,
             results=tuple(prior_results),
+            upload_artifact_id=(
+                _upload_artifact_id(case.case_id, started_event.session_id)
+                if case.operations[operation_index] == "upload"
+                else None
+            ),
         )
         if (
             call is not None

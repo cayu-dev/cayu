@@ -21,6 +21,8 @@ from cayu import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
     BROWSER_FETCH_PROTOCOL_VERSION,
     BROWSER_FETCH_WORKER_VERSION,
+    BROWSER_SESSION_PROTOCOL_VERSION,
+    BROWSER_SESSION_WORKER_VERSION,
     DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
     BrowserWebFetchAdapter,
     ExecCommand,
@@ -1505,6 +1507,8 @@ def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup() -> N
             ca_started_at = loop.time()
             await asyncio.sleep(0.3)
 
+        owner_uid = os.geteuid()
+        admission_uid = iter((1000,))
         with (
             patch.dict(
                 sys.modules,
@@ -1513,7 +1517,7 @@ def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup() -> N
                     "playwright.async_api": async_api,
                 },
             ),
-            patch.object(os, "geteuid", return_value=1000),
+            patch.object(os, "geteuid", side_effect=lambda: next(admission_uid, owner_uid)),
             patch.object(guest.importlib.metadata, "version", return_value="1.62.0"),
             patch.object(
                 guest,
@@ -1839,26 +1843,40 @@ def test_guest_temporary_profile_helper_enforces_its_own_deadline() -> None:
             shutil.rmtree(home)
 
 
+@pytest.mark.parametrize("failure_phase", ["validation", "pipe", "spawn"])
 def test_guest_profile_owner_spawn_failure_fails_without_sync_deletion(
     tmp_path: Path,
+    failure_phase: str,
 ) -> None:
     profile_home = tmp_path / "cayu-browser-unowned"
     profile_home.mkdir()
+    real_pipe = guest.os.pipe
 
     async def exercise() -> None:
         with (
+            patch.object(
+                guest,
+                "_TEMPORARY_PROFILE_ROOT",
+                tmp_path if failure_phase != "validation" else tmp_path / "missing",
+            ),
             patch.object(guest.tempfile, "mkdtemp", return_value=str(profile_home)),
+            patch.object(
+                guest.os,
+                "pipe",
+                side_effect=OSError("pipe failed") if failure_phase == "pipe" else real_pipe,
+            ),
             patch.object(
                 guest.subprocess,
                 "Popen",
                 side_effect=OSError("spawn failed"),
-            ),
+            ) as spawn,
             patch.object(guest.shutil, "rmtree") as sync_delete,
             pytest.raises(guest._GuestFailure) as captured,
         ):
             await guest._start_temporary_profile_owner(timeout_seconds=0.1)
 
         assert captured.value.code == "cleanup_failed"
+        assert spawn.call_count == (1 if failure_phase == "spawn" else 0)
         sync_delete.assert_not_called()
 
     asyncio.run(exercise())
@@ -1893,6 +1911,7 @@ def test_guest_profile_owner_start_timeout_kills_and_reaps_blocked_child(
 
     async def exercise() -> None:
         with (
+            patch.object(guest, "_TEMPORARY_PROFILE_ROOT", tmp_path),
             patch.object(guest.tempfile, "mkdtemp", return_value=str(profile_home)),
             patch.object(
                 guest,
@@ -2100,9 +2119,12 @@ def test_guest_blocking_profile_cleanup_returns_bounded_failure(tmp_path: Path) 
         del state, operation_timeout_ms, cleanup_timeout_seconds, cleanup_deadline
         return {}
 
+    owner_uid = os.geteuid()
+    admission_uid = iter((1000,))
     started_at = time.monotonic()
     with (
-        patch.object(os, "geteuid", return_value=1000),
+        patch.object(os, "geteuid", side_effect=lambda: next(admission_uid, owner_uid)),
+        patch.object(guest, "_TEMPORARY_PROFILE_ROOT", tmp_path),
         patch.object(guest.importlib.metadata, "version", return_value="1.62.0"),
         patch.object(
             guest,
@@ -2323,6 +2345,8 @@ def test_versioned_browser_image_matches_host_and_guest_contract() -> None:
     assert "COPY --chown=pwuser:pwuser" not in dockerfile
     assert f'dev.cayu.browser-fetch.protocol="{BROWSER_FETCH_PROTOCOL_VERSION}"' in dockerfile
     assert f'dev.cayu.browser-fetch.worker="{BROWSER_FETCH_WORKER_VERSION}"' in dockerfile
+    assert f'dev.cayu.browser-session.protocol="{BROWSER_SESSION_PROTOCOL_VERSION}"' in dockerfile
+    assert f'dev.cayu.browser-session.worker="{BROWSER_SESSION_WORKER_VERSION}"' in dockerfile
     assert "@sha256:" in dockerfile
     assert "USER pwuser" in dockerfile
     assert seccomp_profile["defaultAction"] == "SCMP_ACT_ERRNO"

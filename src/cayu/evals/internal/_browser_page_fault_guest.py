@@ -13,6 +13,8 @@ import os
 import runpy
 import sys
 
+UPLOAD_FAULT = None
+
 
 async def main(session_id: str) -> None:
     worker = runpy.run_path("/opt/cayu-browser/worker.py", run_name="cayu_acceptance_worker")
@@ -20,6 +22,32 @@ async def main(session_id: str) -> None:
     original_start = daemon_type.start
     fault_server: asyncio.AbstractServer | None = None
     socket_path = worker["_interactive_socket_path"](session_id).with_suffix(".page-fault.sock")
+    if UPLOAD_FAULT is not None:
+        if UPLOAD_FAULT not in {"disconnection", "acknowledgement_loss"}:
+            raise ValueError("Unknown acceptance upload fault.")
+        original_upload = daemon_type._upload_files
+
+        async def upload_with_fault(daemon, state, request, locator, internal_ref):
+            class SelectionBoundary:
+                async def evaluate(self, expression):
+                    return await locator.evaluate(expression)
+
+                async def set_input_files(self, files):
+                    # Deliver through the real browser selection and page effect,
+                    # then lose acknowledgement before the worker publishes success.
+                    async with state.page.expect_response(
+                        lambda response: response.url.endswith("/effect/upload-selected"),
+                        timeout=5000,
+                    ) as selected:
+                        await locator.set_input_files(files)
+                    await selected.value
+                    if UPLOAD_FAULT == "disconnection":
+                        await daemon.browser.close()
+                    raise RuntimeError("Acceptance upload acknowledgement was lost.")
+
+            return await original_upload(daemon, state, request, SelectionBoundary(), internal_ref)
+
+        daemon_type._upload_files = upload_with_fault
 
     async def start(daemon):
         nonlocal fault_server
