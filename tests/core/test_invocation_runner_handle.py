@@ -55,6 +55,7 @@ from cayu.tools._resources import (
 )
 from cayu.tools._runner import (
     InvocationRunnerHandle,
+    invocation_runner_handle,
     is_current_runner_cancellation_group,
     sanitize_runner_failure_group,
 )
@@ -836,6 +837,138 @@ def test_runner_execution_observer_quarantines_unpublished_arguments() -> None:
         "arguments_state": "unavailable",
     }
     assert observations[1][1]["command"] == observations[0][1]["command"]
+
+
+def test_runtime_denies_private_browser_profile_dispatch_to_other_tools() -> None:
+    private_material = "private-browser-profile-material"
+
+    class PrivateOutputRunner(_ImmediateRunner):
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            return ExecResult(stdout=private_material)
+
+    class PrivateDispatchTool(Tool):
+        spec = ToolSpec(
+            name="private_dispatch",
+            description="Exercise one runtime-private runner dispatch.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            with pytest.raises(
+                AttributeError,
+                match="_exec_private_browser_profile",
+            ):
+                attribute = "_exec_private_browser_profile"
+                getattr(ctx.runner, attribute)
+            internal_exec = ctx.runner._InvocationRunnerHandle__exec
+            with pytest.raises(
+                RuntimeError,
+                match="Private browser-profile runner I/O is unavailable",
+            ):
+                await internal_exec(
+                    ExecCommand.process("echo", private_material),
+                    stdin=private_material,
+                    publish_execution_arguments=False,
+                    private_output=True,
+                )
+            return ToolResult(content="private dispatch denied")
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call-private-dispatch",
+                    name="private_dispatch",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="runner"),
+            runner=PrivateOutputRunner(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[PrivateDispatchTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "run privately")],
+            ),
+        )
+    )
+    runner_events = [
+        event
+        for event in events
+        if event.type in {EventType.RUNNER_EXEC_STARTED, EventType.RUNNER_EXEC_COMPLETED}
+    ]
+
+    assert runner_events == []
+    assert private_material not in repr(events)
+
+
+def test_private_browser_profile_dispatch_quarantines_argument_evidence() -> None:
+    private_material = "private-browser-profile-material"
+    observations: list[tuple[str, dict[str, Any]]] = []
+
+    class PrivateOutputRunner(_ImmediateRunner):
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            return ExecResult(stdout=private_material)
+
+    async def observe(
+        phase: str,
+        payload: dict[str, Any],
+        command_evidence_revision: int,
+    ) -> None:
+        assert command_evidence_revision == 0
+        observations.append((phase, payload))
+
+    async def scenario() -> None:
+        handle = invocation_runner_handle(
+            PrivateOutputRunner(),
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(),
+            ),
+            execution_observer=observe,
+            publish_execution_arguments=True,
+            allow_private_browser_profile_io=True,
+        )
+        assert handle is not None
+        private_exec = handle._exec_private_browser_profile
+        result = await private_exec(
+            ExecCommand.process("echo", private_material),
+            stdin=private_material,
+        )
+        assert result.stdout == private_material
+
+    asyncio.run(scenario())
+
+    assert [phase for phase, _payload in observations] == ["started", "completed"]
+    assert all(
+        payload["command"] == {"kind": "process", "arguments_state": "unavailable"}
+        for _phase, payload in observations
+    )
+    assert private_material not in repr(observations)
 
 
 def test_runtime_runner_events_honor_tool_argument_quarantine() -> None:

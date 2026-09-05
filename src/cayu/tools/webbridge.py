@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from cayu._validation import require_durable_clean_nonblank
+from cayu.browser_profiles import BrowserProfileBinding
 from cayu.core.agents import AgentSpec
 from cayu.core.execution_identity import (
     ExecutionProfileBehaviorIdentity,
@@ -331,6 +332,7 @@ class WebBridge:
         screenshot_options: dict[str, Any] | None = None,
         interactive: bool = False,
         interactive_options: dict[str, Any] | None = None,
+        browser_profile: BrowserProfileBinding | None = None,
     ) -> WebBridge:
         """Build browser tools for a static or factory-backed environment."""
 
@@ -356,6 +358,8 @@ class WebBridge:
             )
         if not interactive and interactive_options is not None:
             raise ValueError("interactive_options require interactive=True.")
+        if not interactive and browser_profile is not None:
+            raise ValueError("browser_profile requires interactive=True.")
         if isinstance(environment, Environment):
             runner = environment.runner
             if runner is None:
@@ -406,17 +410,24 @@ class WebBridge:
             raise ValueError("sandboxed WebBridge artifact store must have a stable id.")
         expected_candidate = candidate.candidate
         if interactive:
+            interactive_configuration = _profile_options(
+                interactive_options,
+                _INTERACTIVE_OPTION_NAMES,
+                "interactive browser",
+            )
+            if browser_profile is not None:
+                configured_sessions = interactive_configuration.get("max_sessions")
+                if configured_sessions not in {None, 1}:
+                    raise ValueError("browser_profile requires interactive max_sessions=1.")
+                interactive_configuration["max_sessions"] = 1
             tools = (
                 BrowserSessionTool(
                     expected_runner_candidate=expected_candidate,
                     expected_environment_authority=owned_environment_authority,
                     expected_workload_authority=PINNED_BROWSER_SESSION_WORKLOAD,
                     expected_artifact_store_id=artifact_store_id,
-                    **_profile_options(
-                        interactive_options,
-                        _INTERACTIVE_OPTION_NAMES,
-                        "interactive browser",
-                    ),
+                    browser_profile=browser_profile,
+                    **interactive_configuration,
                 ),
             )
             browser_protocol = BROWSER_SESSION_PROTOCOL_VERSION

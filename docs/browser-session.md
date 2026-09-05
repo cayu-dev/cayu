@@ -264,15 +264,201 @@ These terms are not interchangeable. A **live-allocation reconnect** continues
 the same admitted browser process and its exact surviving page set, cookies,
 storage, and navigation state. Losing that allocation loses the entire page set;
 Cayu never rebuilds tabs from stored URLs or history. **Browser-profile
-restoration** would create a fresh page set under separately declared persisted
-profile authority and must never reuse old page IDs, refs, tabs, URLs, or
-operation receipts; Cayu does not currently offer that mode.
-A **page reload** is a new navigation and may change external state. An
-**operation replay** repeats an old request and is forbidden after ambiguity. A
-**full execution-environment snapshot** would preserve process/VM state; this
-contract makes no such claim. JavaScript heap objects, open sockets, in-flight
-downloads, and arbitrary process state are not reconstructible if the live
-allocation itself is lost.
+restoration** creates a fresh allocation and page set and imports only an
+application-declared cookie and origin-local-storage snapshot. A **page reload**
+is a new navigation inside one allocation and may change
+external state. An **operation replay** repeats an old request and is forbidden
+after ambiguity. A **full execution-environment snapshot** would preserve
+process/VM state; this contract makes no such claim. Profile restoration never
+reconstructs prior pages, URLs, revisions, refs, operation results, JavaScript
+heap objects, sockets, in-flight downloads, or arbitrary process state.
+
+## Application-owned browser profiles
+
+Browser-profile restoration is an explicit composition option for the pinned
+interactive worker. The application creates a dedicated profile store and key
+authority, defines ownership and sharing scope, fixes the maximum destination
+policy, and passes the resulting immutable binding to `WebBridge`. None of
+those values appears in the `browser_session` tool schema, so the model cannot
+select or switch profiles, stores, keys, tenants, generations, merge behavior,
+or checkpoint policy.
+
+```python
+from cayu import (
+    AESGCMBrowserProfileKeyAuthority,
+    BrowserProfileBinding,
+    BrowserProfileCheckpointPolicy,
+    BrowserProfileDestinationPolicy,
+    BrowserProfileScope,
+    DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE,
+    SQLiteBrowserProfileStore,
+    WebBridge,
+)
+from cayu.tools.browser_session import (
+    BROWSER_SESSION_PROTOCOL_VERSION,
+    BROWSER_SESSION_WORKER_VERSION,
+)
+
+profile_store = SQLiteBrowserProfileStore(
+    ".cayu/browser-profiles.sqlite",
+    store_id="production-browser-profiles",
+)
+profile_key = AESGCMBrowserProfileKeyAuthority(
+    authority_id="browser-profile-key-2026-01",
+    key=key_loaded_from_application_secret_storage,
+)
+profile = BrowserProfileBinding.build(
+    scope=BrowserProfileScope.build(
+        application_id="support-console",
+        tenant_id="tenant-42",
+        sharing_scope="support-agent-release-7",
+    ),
+    destination_policy=BrowserProfileDestinationPolicy.build(
+        ("https://accounts.example.com",)
+    ),
+    browser_protocol=BROWSER_SESSION_PROTOCOL_VERSION,
+    browser_worker_version=BROWSER_SESSION_WORKER_VERSION,
+    store=profile_store,
+    key_authority=profile_key,
+    profile_id=browser_profile_id_from_control_config,
+    created_at=browser_profile_created_at_from_control_config,
+    checkpoint_policy=BrowserProfileCheckpointPolicy.ON_CLOSE,
+)
+await profile.initialize()
+
+browser = WebBridge.sandboxed_browser(
+    environment=browser_environment_factory,
+    browser_image=DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE,
+    interactive=True,
+    browser_profile=profile,
+)
+```
+
+The store is separate from `SessionStore`, `ArtifactStore`, `Workspace`, and
+environment-variable storage. `InMemoryBrowserProfileStore` is process-local;
+`SQLiteBrowserProfileStore` is the durable local implementation and should be
+closed during application shutdown. The AES-GCM key value remains with the
+application-owned key authority. Only a bounded encrypted envelope and
+content-free authority, lease, receipt, count, timestamp, and status metadata
+reach the profile store. Profile plaintext is private runner transport to the
+pinned worker; it is not a tool argument, transcript item, ordinary event,
+artifact, workspace file, diagnostic, or support-bundle field.
+
+Custom stores implement only the protected create, load, list, and atomic
+mutation primitives on `BrowserProfileStore`. The mutation primitive must run
+the supplied callback exactly once under one store write boundary, using the
+store-owned UTC observation passed to that callback, and must commit the
+returned record together with its returned result. It must not override the
+public lifecycle methods. Custom key authorities keep key material private and
+implement the same AES-256-GCM operation selected by the binding; their async
+calls are treated as opaque external work and remain owned until they return or
+the configured import/export timeout proves the local wait has ended. The
+binding defensively validates store and key-authority identities and every
+returned authority-bearing model, but those checks do not turn a contract-
+violating extension into a supported implementation.
+
+For durable use, persist the immutable `BrowserProfileAuthority` in authenticated
+application configuration, or reconstruct it with the same explicit `profile_id`,
+`created_at`, scope, policy, protocol, worker, store, and key-authority identities.
+Calling `BrowserProfileBinding.build()` with generated identity defaults after a
+restart creates a different profile; it does not discover or adopt an existing
+one by store contents alone. Reinitializing the exact same immutable authority is
+idempotent and returns the store's current generation rather than recreating or
+rolling it back.
+
+For a profile-bound interactive tool, the pinned worker rechecks current cookie
+and local-storage values before every textual observation and omits content that
+would reflect them. Cayu rejects screenshot and download operations before
+dispatch because binary output cannot be redacted soundly. Use a separate,
+credential-free browser tool when an application needs those capture operations.
+Page summaries omit titles and URLs for profile-bound sessions, including listing,
+background-page, and error responses. Only a protected observation exposes page
+text and its checked URL; omitted refs do not consume published ref authority.
+The worker retains prior credential strings only within the configured plaintext
+byte ceiling and one complete profile's category-count ceiling. If rotating site
+state exhausts that anti-reflection history, later textual observations fail
+closed with `resource_exhausted`; `close` remains available.
+
+Schema v1 persists only bounded Secure cookies with exact host domains and
+bounded `localStorage` entries for explicitly admitted HTTPS origins. It names
+all omitted categories and rejects unknown fields or categories. It does not
+persist session storage, profile directories, passwords, TOTP seeds,
+extensions, cache, service-worker bodies, history, downloads, screenshots,
+traces, open pages, refs, heap state, sockets, renderer state, or in-flight
+requests. Origin, cookie, storage-entry, name, value, aggregate plaintext,
+aggregate ciphertext, import-time, and export-time limits are independent.
+
+The authority fingerprint binds application/tenant ownership, declared sharing,
+the maximum origin policy, protocol/worker/state versions, key-authority and
+store identities, creation, and optional expiry. The current policy may be a
+strict subset of the recorded policy, but never a superset. Restoration rejects
+the complete generation if any cookie or local-storage origin falls outside the
+current policy; it does not silently discard security-significant state and
+report success. `expected_ref` may pin an exact generation and encrypted-content
+fingerprint when the application needs an exact restore.
+
+Before import, the profile store acquires one bounded renewable writer lease for
+the exact generation, execution profile, materialized allocation, and new
+browser-session identity. Every writer admission, renewal, and profile-publication
+mutation loads the record, samples the store clock, validates the lease, and
+commits while holding one store write boundary. Direct failed settlement requires
+that exact lease to remain live; exact release and revocation can still close or
+fence authority without pretending an expired lease is live. A later writer
+admission records an unsettled expired operation as `outcome_unknown` before
+reusing the generation. Restart reconstruction atomically renews the exact live
+writer before replaying or importing state into its allocation. A second writable
+allocation is rejected. The worker creates its browser context from the validated
+storage state before it creates a page or executes an untrusted document. The
+subsequent explicit `navigate` creates fresh page, revision, and ref identities. A
+restore receipt proves only that this state was imported; it does not prove the
+website still considers the session authenticated. An expired site cookie can
+therefore restore correctly while the first navigation honestly observes a
+signed-out page.
+
+The current profile-origin policy also travels through the private pinned-worker
+protocol and governs every HTTPS document and subresource request plus every
+secure WebSocket connection. Plain HTTP and WebSocket destinations remain
+denied. This remains necessary when the selected virtual-egress environment has
+a broader application allow-list: authenticated page state never widens that
+environment into profile authority.
+
+Checkpointing is runtime policy: `DISABLED`, `AFTER_TERMINAL_OPERATION`, or
+`ON_CLOSE`. The model has no checkpoint operation. Cayu reserves the store's
+configured ciphertext capacity before asking the browser to export plaintext,
+validates the complete exported state, encrypts with a fresh AES-256-GCM nonce,
+and authenticates profile, scope, destination, schema, generation, store/key,
+and length metadata as AAD. It stages one complete envelope and receipt, then
+publishes by compare-and-swap against the generation held by that writer. The
+old generation remains authoritative until publication commits. Exact readback
+adopts a committed replacement after acknowledgement loss without recapturing
+state. Each receipt binds the latest settled browser revision and source
+operation identity; an ambiguous earlier effect remains marked in its lineage.
+With `ON_CLOSE`, a definite checkpoint failure prevents the close dispatch and
+retains the live writer; a new close operation identity may retry checkpointing
+before the allocation is retired.
+
+Durable restore/checkpoint settlement resists caller cancellation long enough to
+reach or reconcile its exact terminal record. If a Cayu process disappears after
+reserving a restore but before its receipt commits, exact durable allocation and
+operation authority may replay the same private import against the still-live
+pinned worker; the worker's operation ledger returns the original result rather
+than importing twice. If that allocation cannot be reconstructed, the finite
+writer lease prevents immediate concurrent reuse. A later authorized restore
+fences the expired writer and records any unsettled import or staged checkpoint
+as `outcome_unknown`; an unpublished staged envelope never replaces the prior
+generation. Successful historical checkpoints retain explicit publication
+evidence even after a newer generation becomes current. Revocation and profile
+expiry reject new restores, renewals, and checkpoints once observed, but do not
+claim to erase credentials already loaded in a live remote allocation. The
+application must separately close or quarantine that allocation.
+
+`inspect_profile()` and scope-filtered `list_profiles()` return only opaque
+identity and fingerprints, compatibility identity, generation, category counts,
+byte totals, timestamps, active-writer state, receipt IDs, status, and fixed safe
+error codes. They never return names, values, ciphertext, nonces, or key
+material. Keep the `BrowserProfileAccess` capability and its owner/sharing scope
+inside authenticated application or operator control code; browser tools do not
+expose listing or inspection to model sessions.
 
 Access-block classification and explicit fallback routing belong to a separate
 browser-access contract; this recovery boundary does not infer or select a

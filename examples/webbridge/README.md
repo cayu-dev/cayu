@@ -116,3 +116,12 @@ bridge.register_agent(
     AgentSpec(name="browser-researcher", model="your-model"),
 )
 ```
+
+An interactive bridge may additionally receive an application-owned
+`browser_profile=BrowserProfileBinding(...)`. Initialize that binding before
+registration. The binding fixes its owner/sharing scope, destination policy,
+dedicated encrypted store, key-authority identity, lease, limits, and checkpoint
+policy; none is model-selectable. See
+[`docs/browser-session.md`](../../docs/browser-session.md#application-owned-browser-profiles)
+for the complete setup and for the distinction between profile restoration and
+live-allocation reconnect.

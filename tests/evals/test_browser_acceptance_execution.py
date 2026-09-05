@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import signal
 import time
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
@@ -22,9 +23,14 @@ import pytest
 import scripts.run_browser_acceptance as command
 
 from cayu import (
+    AESGCMBrowserProfileKeyAuthority,
     AgentSpec,
     ApprovedEgressDestination,
     BrowserEgressPolicy,
+    BrowserProfileBinding,
+    BrowserProfileCheckpointPolicy,
+    BrowserProfileDestinationPolicy,
+    BrowserProfileScope,
     BudgetLimit,
     BudgetReservation,
     CayuApp,
@@ -36,6 +42,7 @@ from cayu import (
     RunLimits,
     RunRequest,
     ScriptedModelProvider,
+    SQLiteBrowserProfileStore,
     VirtualEgressEnvironmentFactory,
     WebBridge,
 )
@@ -92,7 +99,7 @@ from cayu.runtime._event_projection import public_event_id, public_event_sequenc
 
 
 class _ProtocolBrowserRunner(Runner):
-    def __init__(self, upstream_origin: str) -> None:
+    def __init__(self, upstream_origin: str, evidence_path: str | None = None) -> None:
         self._upstream_origin = upstream_origin
         self._revision = 0
         self._pages: dict[str, dict[str, Any]] = {}
@@ -100,6 +107,11 @@ class _ProtocolBrowserRunner(Runner):
         self._total_operations = 0
         self._total_observations = 0
         self._total_page_creations = 0
+        self._evidence_path = evidence_path
+        self._current_url = "https://docs.browser.test/basic"
+        self._profile_state: dict[str, Any] = {"cookies": [], "origins": []}
+        self._profile_active = False
+        self.operations: list[str] = []
 
     def _page_set(self) -> dict[str, Any]:
         return {
@@ -145,7 +157,8 @@ class _ProtocolBrowserRunner(Runner):
         self._total_observations += 1
         page["observation_count"] += 1
         page["ref_count"] += 22
-        page["revision"] = f"br_acceptance_revision_{self._revision}"
+        session_component = hashlib.sha256(page["session_id"].encode("utf-8")).hexdigest()[:16]
+        page["revision"] = f"br_acceptance_{session_component}_{self._revision}"
         page["last_observation_revision"] = page["revision"]
         names = (
             "Account",
@@ -209,6 +222,61 @@ class _ProtocolBrowserRunner(Runner):
         assert command.argv == list(PINNED_BROWSER_SESSION_WORKLOAD.command)
         request = json.loads(kwargs["stdin"])
         operation = request["operation"]
+        self.operations.append(operation)
+        if operation == "profile_restore":
+            profile = request["browser_profile"]
+            self._profile_state = copy.deepcopy(profile["restore_state"])
+            self._profile_active = True
+            self._record_evidence(
+                operation,
+                cookie_count=len(self._profile_state["cookies"]),
+                origin_count=len(self._profile_state["origins"]),
+                session_id=request["session_id"],
+            )
+            return ExecResult(
+                stdout=json.dumps(
+                    {
+                        "protocol_version": "cayu.browser-session.v3",
+                        "worker_version": "7",
+                        "playwright_version": "1.62.0",
+                        "kind": "profile_restore",
+                        "allocation_disposition": "live",
+                        "profile_restored": True,
+                    }
+                )
+            )
+        if operation == "profile_checkpoint":
+            self._record_evidence(
+                operation,
+                cookie_count=len(self._profile_state["cookies"]),
+                origin_count=len(self._profile_state["origins"]),
+                session_id=request["session_id"],
+            )
+            return ExecResult(
+                stdout=json.dumps(
+                    {
+                        "protocol_version": "cayu.browser-session.v3",
+                        "worker_version": "7",
+                        "playwright_version": "1.62.0",
+                        "kind": "profile_checkpoint",
+                        "allocation_disposition": "live",
+                        "profile_state": copy.deepcopy(self._profile_state),
+                    }
+                )
+            )
+        if operation == "close":
+            self._record_evidence(operation)
+            return ExecResult(
+                stdout=json.dumps(
+                    {
+                        "protocol_version": "cayu.browser-session.v3",
+                        "worker_version": "7",
+                        "playwright_version": "1.62.0",
+                        "kind": "closed",
+                        "allocation_disposition": "retired",
+                    }
+                )
+            )
         delta: dict[str, Any] = {
             "created_page_ids": [],
             "admitted_page_ids": [],
@@ -218,17 +286,68 @@ class _ProtocolBrowserRunner(Runner):
         }
         failure: str | None = None
         observation: dict[str, Any] | None = None
+        title = "Acceptance fixture"
         if operation == "navigate":
+            self._current_url = request["url"]
             upstream = urlsplit(self._upstream_origin)
             target = urlsplit(request["url"])
             assert upstream.hostname is not None
             assert upstream.port is not None
             connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=2)
             try:
-                connection.request("GET", target.path or "/")
+                cookies = "; ".join(
+                    f"{item['name']}={item['value']}"
+                    for item in self._profile_state["cookies"]
+                    if item["domain"] == target.hostname
+                    and (item["expires"] == -1 or item["expires"] > time.time())
+                )
+                connection.request(
+                    "GET",
+                    target.path or "/",
+                    headers=({"Cookie": cookies} if cookies else {}),
+                )
                 response = connection.getresponse()
-                response.read()
+                body = response.read().decode("utf-8")
                 assert response.status < 500
+                title_start = body.find("<title>")
+                title_end = body.find("</title>", title_start + 7)
+                if title_start >= 0 and title_end > title_start:
+                    title = body[title_start + 7 : title_end]
+                if target.path == "/auth/login":
+                    self._profile_state = {
+                        "cookies": [
+                            {
+                                "name": "cayu_fixture_session",
+                                "value": "active",
+                                "domain": "docs.browser.test",
+                                "path": "/",
+                                "expires": -1,
+                                "httpOnly": True,
+                                "secure": True,
+                                "sameSite": "Lax",
+                            }
+                        ],
+                        "origins": [
+                            {
+                                "origin": "https://docs.browser.test",
+                                "localStorage": [
+                                    {"name": "cayu_fixture_session", "value": "active"}
+                                ],
+                            }
+                        ],
+                    }
+                elif target.path == "/auth/login-expired":
+                    self._profile_state = {
+                        "cookies": [],
+                        "origins": [
+                            {
+                                "origin": "https://docs.browser.test",
+                                "localStorage": [
+                                    {"name": "cayu_fixture_session", "value": "expired"}
+                                ],
+                            }
+                        ],
+                    }
             finally:
                 connection.close()
             page = {
@@ -241,7 +360,7 @@ class _ProtocolBrowserRunner(Runner):
                 "creating_operation_id_sha256": None,
                 "revision": None,
                 "url": request["url"],
-                "title": "Acceptance fixture",
+                "title": title,
                 "last_observation_revision": None,
                 "last_operation_id_sha256": hashlib.sha256(
                     request["operation_id"].encode("utf-8")
@@ -281,7 +400,10 @@ class _ProtocolBrowserRunner(Runner):
                     current = self._pages[self._active_page_id]
                     current["lifecycle"] = "background"
                     current["control_epoch"] += 1
-                    current["revision"] = f"br_acceptance_revision_{self._revision + 1}"
+                    session_component = hashlib.sha256(
+                        current["session_id"].encode("utf-8")
+                    ).hexdigest()[:16]
+                    current["revision"] = f"br_acceptance_{session_component}_{self._revision + 1}"
                 page["lifecycle"] = "active"
                 page["control_epoch"] += 1
                 self._active_page_id = page["page_id"]
@@ -357,6 +479,27 @@ class _ProtocolBrowserRunner(Runner):
                         delta["created_page_ids"] = [popup_id]
                         delta["admitted_page_ids"] = [popup_id]
                 observation = self._observe(page)
+        evidence_page = self._pages.get(request.get("page_id"))
+        self._record_evidence(
+            operation,
+            page_id=request.get("page_id"),
+            revision=(
+                observation["revision"]
+                if observation is not None
+                else (evidence_page or {}).get("revision")
+            ),
+            session_id=request["session_id"],
+            title=(
+                observation["title"]
+                if observation is not None
+                else (evidence_page or {}).get("title")
+            ),
+            url=(
+                observation["url"]
+                if observation is not None
+                else (evidence_page or {}).get("url", self._current_url)
+            ),
+        )
         artifacts = []
         if operation == "screenshot":
             artifacts.append(
@@ -378,12 +521,20 @@ class _ProtocolBrowserRunner(Runner):
             "page_set": page_set,
             "page_delta": delta,
             "artifacts": artifacts,
+            "profile_output_protected": self._profile_active,
         }
         if failure is not None:
             payload["error"] = failure
         elif observation is not None:
             payload["observation"] = observation
         return ExecResult(stdout=json.dumps(payload))
+
+    def _record_evidence(self, operation: str, **fields: object) -> None:
+        if self._evidence_path is None:
+            return
+        document = {"operation": operation, **fields}
+        with Path(self._evidence_path).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(document, sort_keys=True) + "\n")
 
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
         return ExecutionAdmissionCandidate(
@@ -416,8 +567,9 @@ class _ProtocolEgressAdapter(SandboxEgressAdapter):
     process_external_allocation = False
     egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
 
-    def __init__(self, upstream_origin: str) -> None:
+    def __init__(self, upstream_origin: str, evidence_path: str | None = None) -> None:
         self._upstream_origin = upstream_origin
+        self._evidence_path = evidence_path
 
     async def prepare(self, *, session_id, grants, broker):  # type: ignore[no-untyped-def]
         del session_id, grants, broker
@@ -430,7 +582,7 @@ class _ProtocolEgressAdapter(SandboxEgressAdapter):
 
     async def create_runner(self, request):  # type: ignore[no-untyped-def]
         del request
-        return _ProtocolBrowserRunner(self._upstream_origin)
+        return _ProtocolBrowserRunner(self._upstream_origin, self._evidence_path)
 
     async def egress_environment_fingerprint(self, runner: Runner) -> str:
         if not isinstance(runner, _ProtocolBrowserRunner):
@@ -492,6 +644,176 @@ def _run_protocol_process_scenario(
         scenario_value,
         session_id,
     )
+
+
+def _run_browser_profile_acceptance_process(
+    upstream_origin: str,
+    upstream_routes: dict[str, str],
+    store_path: str,
+    evidence_path: str,
+    profile_id: str,
+    navigation_path: str,
+    clock_value: str,
+    use_profile: bool,
+) -> None:
+    async def scenario() -> None:
+        observed_at = datetime.fromisoformat(clock_value)
+        profile_store = SQLiteBrowserProfileStore(
+            store_path,
+            store_id="browser-acceptance-profiles",
+            clock=lambda: observed_at,
+        )
+        profile_binding: BrowserProfileBinding | None = None
+        if use_profile:
+            profile_binding = BrowserProfileBinding.build(
+                scope=BrowserProfileScope.build(
+                    application_id="browser-acceptance",
+                    tenant_id="credential-free-fixture",
+                    sharing_scope="browser-profile-v1",
+                ),
+                destination_policy=BrowserProfileDestinationPolicy.build(
+                    ("https://docs.browser.test",)
+                ),
+                browser_protocol="cayu.browser-session.v3",
+                browser_worker_version="7",
+                store=profile_store,
+                key_authority=AESGCMBrowserProfileKeyAuthority(
+                    authority_id="browser-acceptance-key-v1",
+                    key=b"browser-profile-fixture-key-0001",
+                ),
+                profile_id=profile_id,
+                created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                checkpoint_policy=(BrowserProfileCheckpointPolicy.AFTER_TERMINAL_OPERATION),
+                lease_seconds=60,
+            )
+            await profile_binding.initialize()
+        adapter = _ProtocolEgressAdapter(upstream_origin, evidence_path)
+        factory = VirtualEgressEnvironmentFactory(
+            policies={
+                "browser-profile-acceptance": BrowserEgressPolicy(
+                    name="browser-profile-acceptance",
+                    allowed_hosts=("docs.browser.test",),
+                    allowed_path_prefixes=("/",),
+                )
+            },
+            approved_destinations=(
+                ApprovedEgressDestination(
+                    destination="docs.browser.test",
+                    policy_name="browser-profile-acceptance",
+                ),
+            ),
+            adapter=adapter,
+            upstream=HttpxUpstream(routes=upstream_routes),
+            image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+            artifact_store=LocalArtifactStore(
+                Path(store_path).with_suffix(".artifacts"),
+                store_id="browser-profile-acceptance-artifacts",
+            ),
+        )
+        bridge = WebBridge.sandboxed_browser(
+            environment=factory,
+            browser_image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+            interactive=True,
+            interactive_options={
+                "idle_timeout_seconds": 1,
+                "max_wait_ms": 0,
+                "max_operations": 4,
+            },
+            browser_profile=profile_binding,
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="browser-profile-call",
+                        name="browser_session",
+                        arguments={
+                            "operation": "navigate",
+                            "url": f"https://docs.browser.test{navigation_path}",
+                            "operation_id": "browser-profile-navigation",
+                        },
+                    ),
+                    ModelStreamEvent.completed(
+                        {
+                            "finish_reason": "tool_calls",
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
+                        }
+                    ),
+                ],
+                [
+                    ModelStreamEvent.text_delta("complete"),
+                    ModelStreamEvent.completed(
+                        {
+                            "finish_reason": "stop",
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
+                        }
+                    ),
+                ],
+            ]
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="browser"),
+            factory,
+            default=True,
+        )
+        bridge.register_agent(
+            app,
+            AgentSpec(name="browser-agent", model="browser-profile-fixture-v1"),
+        )
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="browser-agent",
+                    session_id=(
+                        f"browser-profile-{profile_id}-{navigation_path.rsplit('/', 1)[-1]}"
+                    ),
+                    messages=[Message.text("user", "Navigate once.")],
+                    max_steps=2,
+                    limits=RunLimits(max_tool_calls=1, max_elapsed_seconds=15),
+                )
+            )
+        ]
+        if not events or events[-1].type.value != "session.completed":
+            raise AssertionError("browser profile acceptance session did not complete")
+        terminal_tool = next(
+            (
+                event
+                for event in events
+                if event.type.value in {"tool.call.completed", "tool.call.failed"}
+            ),
+            None,
+        )
+        if terminal_tool is None:
+            raise AssertionError("browser profile acceptance tool did not settle")
+        result = terminal_tool.payload.get("result")
+        if (
+            type(result) is not dict
+            or result.get("is_error") is not False
+            or type(result.get("structured")) is not dict
+            or result["structured"].get("access_state") != "available"
+        ):
+            error_code = (
+                result.get("structured", {}).get("error")
+                if type(result) is dict and type(result.get("structured")) is dict
+                else "invalid_result"
+            )
+            raise AssertionError(
+                f"browser profile acceptance result was not published: {error_code}"
+            )
+        await profile_store.close()
+
+    asyncio.run(scenario())
 
 
 def _block_process_scenario_until_killed(
@@ -761,6 +1083,120 @@ def test_browser_acceptance_uses_portable_result_evidence_after_externalization(
     assert navigation.completion_state.value == "complete"
     assert navigation.diagnostic.truncated_categories == ()
     assert navigation.diagnostic.operations[0].snapshot_bytes == 5_000
+
+
+def test_browser_profile_restores_authenticated_fixture_state_in_a_fresh_process(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    def run_phase(
+        fixture: BrowserAcceptanceFixtureV1,
+        *,
+        profile_id: str,
+        navigation_path: str,
+        phase: str,
+        seconds_after_start: int,
+        use_profile: bool = True,
+    ) -> list[dict[str, Any]]:
+        evidence_path = tmp_path / f"{profile_id}-{phase}.jsonl"
+        process = context.Process(
+            target=_run_browser_profile_acceptance_process,
+            args=(
+                fixture.upstream_origin,
+                fixture.upstream_routes,
+                str(tmp_path / f"{profile_id}.sqlite"),
+                str(evidence_path),
+                profile_id,
+                navigation_path,
+                (observed_at + timedelta(seconds=seconds_after_start)).isoformat(),
+                use_profile,
+            ),
+        )
+        process.start()
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        exit_code = process.exitcode
+        process.close()
+        assert exit_code == 0
+        return [json.loads(line) for line in evidence_path.read_text().splitlines()]
+
+    with BrowserAcceptanceFixtureV1() as fixture:
+        login = run_phase(
+            fixture,
+            profile_id="bprof_acceptance_active",
+            navigation_path="/auth/login",
+            phase="login",
+            seconds_after_start=0,
+        )
+        restored = run_phase(
+            fixture,
+            profile_id="bprof_acceptance_active",
+            navigation_path="/auth/account",
+            phase="restored",
+            # The first worker disappears without a positive remote-close
+            # acknowledgement.  A fresh worker must wait for the finite
+            # writer lease rather than overlap the possibly live allocation.
+            seconds_after_start=61,
+        )
+        credentialless = run_phase(
+            fixture,
+            profile_id="bprof_acceptance_no_profile",
+            navigation_path="/auth/account",
+            phase="credentialless",
+            seconds_after_start=31,
+            use_profile=False,
+        )
+        expired_login = run_phase(
+            fixture,
+            profile_id="bprof_acceptance_expired",
+            navigation_path="/auth/login-expired",
+            phase="expired-login",
+            seconds_after_start=0,
+        )
+        expired_restore = run_phase(
+            fixture,
+            profile_id="bprof_acceptance_expired",
+            navigation_path="/auth/account",
+            phase="expired-restore",
+            seconds_after_start=61,
+        )
+
+    assert [item["operation"] for item in login] == [
+        "profile_restore",
+        "navigate",
+        "profile_checkpoint",
+    ]
+    assert login[0]["cookie_count"] == 0
+    assert login[2]["cookie_count"] == 1
+    assert [item["operation"] for item in restored] == [
+        "profile_restore",
+        "navigate",
+        "profile_checkpoint",
+    ]
+    assert restored[0]["cookie_count"] == 1
+    assert restored[1]["title"] == "Authenticated fixture account"
+    assert restored[0]["session_id"] == restored[1]["session_id"]
+    assert login[0]["session_id"] != restored[0]["session_id"]
+    assert login[1]["page_id"] != restored[1]["page_id"]
+    assert login[1]["revision"] != restored[1]["revision"]
+
+    assert [item["operation"] for item in credentialless] == ["navigate"]
+    assert credentialless[0]["title"] == "Signed out fixture account"
+    assert expired_login[2]["cookie_count"] == 0
+    assert expired_restore[0]["cookie_count"] == 0
+    assert expired_restore[1]["title"] == "Signed out fixture account"
+
+    raw_profile_files = tuple(tmp_path.glob("bprof_acceptance_*.sqlite*"))
+    assert raw_profile_files
+    assert all(
+        b"cayu_fixture_session" not in path.read_bytes()
+        for path in raw_profile_files
+        if path.is_file()
+    )
 
 
 def test_cayu_owned_deterministic_target_binds_every_executable_manifest_case() -> None:

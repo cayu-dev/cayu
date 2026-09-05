@@ -104,6 +104,20 @@ RunnerExecutionObserver = Callable[
 ]
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _PrivateRunnerExecResult:
+    """Minimal raw result visible only to a trusted in-process consumer."""
+
+    stdout: str
+    exit_code: int
+    timed_out: bool
+    cancelled: bool
+    stdout_truncated: bool
+
+    def __repr__(self) -> str:
+        return "_PrivateRunnerExecResult(<private>)"
+
+
 class InvocationRunnerHandle:
     """Expose command dispatch without leaking the raw lifecycle-owning runner."""
 
@@ -321,7 +335,46 @@ class InvocationRunnerHandle:
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
+        """Dispatch while publishing the registered tool's command policy."""
+
+        operation = self.__exec(
+            command,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+            publish_execution_arguments=self.__publish_execution_arguments,
+            private_output=False,
+        )
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes, self
+        try:
+            return cast("ExecResult", await operation)
+        finally:
+            del operation
+
+    async def __exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+        publish_execution_arguments: bool,
+        private_output: bool,
+    ) -> ExecResult | _PrivateRunnerExecResult:
         """Dispatch with the invocation registry current at the call boundary."""
+
+        if private_output and type(self) is not _BrowserProfileInvocationRunnerHandle:
+            raise RuntimeError("Private browser-profile runner I/O is unavailable.")
+        if private_output and self.__durable_operation_identity is not None:
+            raise RuntimeError(
+                "Private browser-profile I/O cannot consume a durable command operation."
+            )
 
         # Validate and own the complete portable request before consulting the
         # invocation secret registry or reaching a cancellation checkpoint.
@@ -404,6 +457,7 @@ class InvocationRunnerHandle:
             )
         initial = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
         initial_revision = initial.revision
+        result_output_limit = owned_output_limit
         result: ExecResult | None = None
         failure: Exception | None = None
         grouped_failure: BaseExceptionGroup | None = None
@@ -473,7 +527,8 @@ class InvocationRunnerHandle:
             kwargs: dict[str, Any] = kwargs,
             capture_settlement: bool = self.__mutation_owner is not None,
             execution_observer: RunnerExecutionObserver | None = self.__execution_observer,
-            publish_execution_arguments: bool = self.__publish_execution_arguments,
+            publish_execution_arguments: bool = publish_execution_arguments,
+            private_output: bool = private_output,
             command_evidence_revision: int = initial_revision,
         ) -> Awaitable[_RunnerDispatchOutcome]:
             return _capture_runner_dispatch_outcome(
@@ -483,6 +538,7 @@ class InvocationRunnerHandle:
                 capture_settlement=capture_settlement,
                 execution_observer=execution_observer,
                 publish_execution_arguments=publish_execution_arguments,
+                private_output=private_output,
                 command_evidence_revision=command_evidence_revision,
             )
 
@@ -729,16 +785,31 @@ class InvocationRunnerHandle:
         if result is None:
             raise RuntimeError("Runner command returned without a result.")
 
+        if private_output:
+            private_result = _private_runner_exec_result(
+                result,
+                output_limit_bytes=result_output_limit,
+            )
+            result = None
+            if private_result is None:
+                safe_failure = _safe_runner_execution_error(
+                    self.__runner,
+                    RuntimeError("Runner private result is invalid."),
+                )
+                del self
+                raise safe_failure from None
+            return private_result
+
         current = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
         projected = redact_completed_exec_result(
             result,
             redactor=current.redactor,
-            output_limit_bytes=owned_output_limit,
+            output_limit_bytes=result_output_limit,
             omit_pretruncated=current.revision != initial_revision,
         )
         if self.__ambiguous_capture_observer is not None and _has_ambiguous_capture(
             projected,
-            output_limit_bytes=owned_output_limit,
+            output_limit_bytes=result_output_limit,
         ):
             self.__ambiguous_capture_observer(current.revision)
         published = projected.model_copy(
@@ -779,6 +850,42 @@ class InvocationRunnerHandle:
                 return None
             return str(workspace_root)
         return None
+
+
+class _BrowserProfileInvocationRunnerHandle(InvocationRunnerHandle):
+    """Exact runtime-only handle for the built-in profile-aware browser tool."""
+
+    __slots__ = ()
+
+    async def _exec_private_browser_profile(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> _PrivateRunnerExecResult:
+        """Dispatch private profile I/O without publishing credential material."""
+
+        operation = self._InvocationRunnerHandle__exec(  # ty: ignore[unresolved-attribute]
+            command,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+            publish_execution_arguments=False,
+            private_output=True,
+        )
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes, self
+        try:
+            return cast("_PrivateRunnerExecResult", await operation)
+        finally:
+            del operation
 
 
 def _durable_runner_resource_identity(runner: Runner) -> str | None:
@@ -936,6 +1043,7 @@ async def _capture_runner_dispatch_outcome(
     capture_settlement: bool,
     execution_observer: RunnerExecutionObserver | None,
     publish_execution_arguments: bool,
+    private_output: bool,
     command_evidence_revision: int,
 ) -> _RunnerDispatchOutcome:
     """Freeze settlement evidence before an extension can mutate its outcome."""
@@ -968,7 +1076,13 @@ async def _capture_runner_dispatch_outcome(
     result: object | None = None
     error: BaseException | None = None
     try:
-        result = await runner.exec_redacted(command, **kwargs)
+        if private_output:
+            private_kwargs = dict(kwargs)
+            private_kwargs.pop("redactor", None)
+            result = await runner.exec(command, **private_kwargs)
+            private_kwargs.clear()
+        else:
+            result = await runner.exec_redacted(command, **kwargs)
     except BaseException as exc:
         error = exc
 
@@ -1026,6 +1140,49 @@ async def _capture_runner_dispatch_outcome(
             settlement_error=settlement_error,
         )
     return outcome
+
+
+def _private_runner_exec_result(
+    result: object,
+    *,
+    output_limit_bytes: int | None,
+) -> _PrivateRunnerExecResult | None:
+    """Own one bounded raw stdout value without retaining extension containers."""
+
+    if type(result) is not ExecResult or type(output_limit_bytes) is not int:
+        return None
+    if output_limit_bytes <= 0:
+        return None
+    if (
+        type(result.stdout) is not str
+        or type(result.exit_code) is not int
+        or type(result.timed_out) is not bool
+        or type(result.cancelled) is not bool
+        or type(result.stdout_truncated) is not bool
+        or (
+            result.stdout_bytes is not None
+            and (type(result.stdout_bytes) is not int or result.stdout_bytes < 0)
+        )
+    ):
+        return None
+    stdout = result.stdout
+    incomplete = result.stdout_truncated or (
+        result.stdout_bytes is not None and result.stdout_bytes > output_limit_bytes
+    )
+    if not incomplete:
+        try:
+            incomplete = len(stdout) > output_limit_bytes or (
+                len(stdout.encode("utf-8")) > output_limit_bytes
+            )
+        except UnicodeEncodeError:
+            incomplete = True
+    return _PrivateRunnerExecResult(
+        stdout="" if incomplete else stdout,
+        exit_code=result.exit_code,
+        timed_out=result.timed_out,
+        cancelled=result.cancelled,
+        stdout_truncated=incomplete,
+    )
 
 
 def _runner_command_evidence(
@@ -1571,6 +1728,7 @@ def invocation_runner_handle(
     mutation_owner: InvocationWorkspaceMutationOwner | None = None,
     execution_observer: RunnerExecutionObserver | None = None,
     publish_execution_arguments: bool = True,
+    allow_private_browser_profile_io: bool = False,
 ) -> InvocationRunnerHandle | None:
     """Build the narrow runtime runner capability for one tool invocation."""
 
@@ -1578,7 +1736,12 @@ def invocation_runner_handle(
         return None
     if not isinstance(runner, Runner):
         raise TypeError("Registered environment runner must implement Runner.")
-    return InvocationRunnerHandle(
+    handle_type = (
+        _BrowserProfileInvocationRunnerHandle
+        if allow_private_browser_profile_io
+        else InvocationRunnerHandle
+    )
+    return handle_type(
         runner,
         redactor_snapshot_provider=redactor_snapshot_provider,
         ambiguous_capture_observer=ambiguous_capture_observer,

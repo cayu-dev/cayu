@@ -25,13 +25,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Literal, Never
+from typing import Any, Literal, Never, cast
 from urllib.parse import urljoin, urlsplit
 
 PROTOCOL_VERSION = "cayu.browser-fetch.v4"
@@ -74,7 +75,16 @@ _INTERACTIVE_IDLE_SECONDS = 15 * 60
 _INTERACTIVE_CONNECT_SECONDS = 5.0
 _INTERACTIVE_STARTUP_SETTLEMENT_SECONDS = 5.0
 _INTERACTIVE_IDLE_POLL_SECONDS = 0.25
-_INTERACTIVE_MAX_REQUEST_BYTES = 128 * 1024
+_INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES = 1024 * 1024
+_INTERACTIVE_MAX_PROFILE_ORIGINS = 32
+_INTERACTIVE_MAX_PROFILE_COOKIES = 256
+_INTERACTIVE_MAX_PROFILE_STORAGE_ENTRIES = 512
+_INTERACTIVE_MAX_PROFILE_PRIVATE_VALUES = 2 * (
+    _INTERACTIVE_MAX_PROFILE_COOKIES + _INTERACTIVE_MAX_PROFILE_STORAGE_ENTRIES
+)
+_INTERACTIVE_MAX_PROFILE_NAME_BYTES = 1024
+_INTERACTIVE_MAX_PROFILE_VALUE_BYTES = 64 * 1024
+_INTERACTIVE_MAX_REQUEST_BYTES = 7 * _INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES
 _INTERACTIVE_MAX_SNAPSHOT_BYTES = 256 * 1024
 _INTERACTIVE_MAX_DOM_NODES = 100_000
 _INTERACTIVE_MAX_REFS = 1_024
@@ -113,6 +123,7 @@ _INTERACTIVE_ACCESSIBILITY_SERIALIZATION_MULTIPLIER = 8
 _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES = 64 * 1024 * 1024
 _INTERACTIVE_ACCESSIBILITY_NODE_ENVELOPE_BYTES = 512
 _INTERACTIVE_RETIREMENT_BUCKET_HEX_LENGTH = 3
+_INTERACTIVE_PROFILE_OUTPUT_OMITTED = "Browser content omitted because it contained profile state."
 _INTERACTIVE_POPUP_GUARD = r"""(configuration => {
     const admissionToken = configuration.token;
     const isSafeInteger = Number.isSafeInteger;
@@ -276,6 +287,7 @@ _INTERACTIVE_MAX_MESSAGE_BYTES = (
     + 6 * (_MAX_URL_LENGTH + _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES)
     + _INTERACTIVE_MAX_TOTAL_PAGE_CREATIONS
     * (6 * (_MAX_URL_LENGTH + _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES + 256) + 4_096)
+    + 7 * _INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES
     + _INTERACTIVE_RESPONSE_FIXED_BYTES
 )
 _INTERACTIVE_REF_PATTERN = re.compile(
@@ -430,6 +442,25 @@ def _guest_https_origin(url: str) -> str:
     return f"https://{hostname}/"
 
 
+def _guest_websocket_https_origin(url: Any) -> str:
+    if type(url) is not str or not 0 < len(url) <= _MAX_URL_LENGTH:
+        raise _GuestFailure("browser_crash")
+    split = urlsplit(url)
+    try:
+        port = split.port
+    except ValueError as exc:
+        raise _GuestFailure("browser_crash") from exc
+    if (
+        split.scheme.lower() != "wss"
+        or split.hostname is None
+        or split.username is not None
+        or split.password is not None
+        or port not in {None, 443}
+    ):
+        raise _GuestFailure("browser_crash")
+    return _guest_https_origin(f"https://{split.hostname}/")
+
+
 def _guest_retry_after_seconds(value: str | None) -> tuple[int | None, bool]:
     if value is None:
         return None, False
@@ -544,11 +575,11 @@ class _FrameProjection:
     node_count: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class _TemporaryProfileOwner:
     home: Path
     process: subprocess.Popen[bytes]
-    control_fd: int
+    control_fd: int | None
 
     @property
     def pid(self) -> int:
@@ -610,6 +641,8 @@ class _InteractiveRequest:
         "switch_page",
         "close_page",
         "close",
+        "profile_restore",
+        "profile_checkpoint",
     ]
     session_id: str
     page_id: str | None
@@ -625,6 +658,11 @@ class _InteractiveRequest:
     limits: _InteractiveLimits
     multi_page: bool
     popup_policy: _InteractivePopupPolicy
+    profile_restore_state: dict[str, Any] | None = field(default=None, repr=False)
+    profile_allowed_origins: tuple[str, ...] | None = None
+    profile_plaintext_limit: int | None = None
+    profile_capture_limit: int | None = None
+    profile_timeout_seconds: float | None = None
     reconcile_only: bool = False
 
 
@@ -922,6 +960,8 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             "switch_page",
             "close_page",
             "close",
+            "profile_restore",
+            "profile_checkpoint",
         }
     ):
         raise _GuestFailure("incompatible_browser")
@@ -950,11 +990,15 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "switch_page": page,
         "close_page": page,
         "close": base | {"operation_id"},
+        "profile_restore": base | {"operation_id"},
+        "profile_checkpoint": base | {"operation_id"},
     }
     allowed = set(expected[operation])
     allowed.add("reconcile_only")
     if operation == "screenshot":
         allowed.add("full_page")
+    if "browser_profile" in raw:
+        allowed.add("browser_profile")
     if set(raw) - allowed or expected[operation] - set(raw):
         raise _GuestFailure("incompatible_browser")
     raw_limits = raw.get("limits")
@@ -1218,6 +1262,69 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
     reconcile_only = raw.get("reconcile_only", False)
     if type(reconcile_only) is not bool:
         raise _GuestFailure("incompatible_browser")
+    profile_restore_state: dict[str, Any] | None = None
+    profile_allowed_origins: tuple[str, ...] | None = None
+    profile_plaintext_limit: int | None = None
+    profile_capture_limit: int | None = None
+    profile_timeout_seconds: float | None = None
+    raw_profile = raw.get("browser_profile")
+    if raw_profile is not None:
+        if type(raw_profile) is not dict or set(raw_profile) != {
+            "allowed_origins",
+            "schema_version",
+            "capture",
+            "max_plaintext_bytes",
+            "restore_state",
+            "timeout_seconds",
+        }:
+            raise _GuestFailure("incompatible_browser")
+        capture = raw_profile.get("capture")
+        restore_state = raw_profile.get("restore_state")
+        if raw_profile.get("schema_version") != 1 or type(capture) is not bool:
+            raise _GuestFailure("incompatible_browser")
+        profile_limit = _bounded_int(
+            raw_profile.get("max_plaintext_bytes"),
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES,
+        )
+        profile_plaintext_limit = profile_limit
+        raw_allowed_origins = raw_profile.get("allowed_origins")
+        if type(raw_allowed_origins) is not list or not raw_allowed_origins:
+            raise _GuestFailure("incompatible_browser")
+        try:
+            profile_allowed_origins = tuple(
+                _guest_https_origin(value).removesuffix("/") for value in raw_allowed_origins
+            )
+        except (TypeError, ValueError, _GuestFailure):
+            raise _GuestFailure("incompatible_browser") from None
+        if (
+            len(profile_allowed_origins) > _INTERACTIVE_MAX_PROFILE_ORIGINS
+            or profile_allowed_origins != tuple(sorted(set(profile_allowed_origins)))
+            or tuple(raw_allowed_origins) != profile_allowed_origins
+        ):
+            raise _GuestFailure("incompatible_browser")
+        profile_timeout_seconds = _bounded_float(
+            raw_profile.get("timeout_seconds"),
+            minimum=0.001,
+            maximum=_MAX_TIMEOUT_SECONDS,
+        )
+        if operation == "profile_restore":
+            if capture or type(restore_state) is not dict:
+                raise _GuestFailure("incompatible_browser")
+            profile_restore_state = _validate_interactive_profile_state(
+                restore_state,
+                maximum_bytes=profile_limit,
+                allowed_origins=profile_allowed_origins,
+                require_canonical_order=True,
+            )
+        elif operation == "profile_checkpoint":
+            if not capture or restore_state is not None:
+                raise _GuestFailure("incompatible_browser")
+            profile_capture_limit = profile_limit
+        else:
+            raise _GuestFailure("incompatible_browser")
+    elif operation in {"profile_restore", "profile_checkpoint"}:
+        raise _GuestFailure("incompatible_browser")
     return _InteractiveRequest(
         operation=operation,
         session_id=session_id,
@@ -1239,8 +1346,232 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             allowed_opener_origins=tuple(allowed_opener_origins),
             allowed_destination_origins=tuple(allowed_destination_origins),
         ),
+        profile_restore_state=profile_restore_state,
+        profile_allowed_origins=profile_allowed_origins,
+        profile_plaintext_limit=profile_plaintext_limit,
+        profile_capture_limit=profile_capture_limit,
+        profile_timeout_seconds=profile_timeout_seconds,
         reconcile_only=reconcile_only,
     )
+
+
+def _validate_interactive_profile_state(
+    value: object,
+    *,
+    maximum_bytes: int,
+    allowed_origins: tuple[str, ...],
+    require_canonical_order: bool = False,
+) -> dict[str, Any]:
+    """Own only Playwright's portable cookie/local-storage state shape."""
+
+    if type(value) is not dict or set(value) != {"cookies", "origins"}:
+        raise _GuestFailure("incompatible_browser")
+    owned_value = cast("dict[str, object]", value)
+    cookies = owned_value.get("cookies")
+    origins = owned_value.get("origins")
+    if type(cookies) is not list or type(origins) is not list:
+        raise _GuestFailure("incompatible_browser")
+    if (
+        len(cookies) > _INTERACTIVE_MAX_PROFILE_COOKIES
+        or len(origins) > _INTERACTIVE_MAX_PROFILE_ORIGINS
+    ):
+        raise _GuestFailure("incompatible_browser")
+    admitted_hosts = {urlsplit(origin).hostname for origin in allowed_origins}
+    cookie_keys: list[tuple[str, str, str]] = []
+    for cookie in cookies:
+        if type(cookie) is not dict or set(cookie) != {
+            "name",
+            "value",
+            "domain",
+            "path",
+            "expires",
+            "httpOnly",
+            "secure",
+            "sameSite",
+        }:
+            raise _GuestFailure("incompatible_browser")
+        owned_cookie = cast("dict[str, Any]", cookie)
+        name = _interactive_profile_text(
+            owned_cookie.get("name"),
+            maximum_bytes=_INTERACTIVE_MAX_PROFILE_NAME_BYTES,
+        )
+        cookie_value = _interactive_profile_text(
+            owned_cookie.get("value"),
+            maximum_bytes=_INTERACTIVE_MAX_PROFILE_VALUE_BYTES,
+        )
+        domain = owned_cookie.get("domain")
+        path = owned_cookie.get("path")
+        expires = owned_cookie.get("expires")
+        try:
+            normalized_expiry = (
+                None
+                if isinstance(expires, bool) or not isinstance(expires, (int, float))
+                else float(expires)
+            )
+        except OverflowError:
+            normalized_expiry = None
+        if (
+            not name
+            or any(character in name for character in "=;\r\n\t ")
+            or any(character in cookie_value for character in ";\r\n")
+            or type(domain) is not str
+            or not domain
+            or domain.startswith(".")
+            or type(path) is not str
+            or not path.startswith("/")
+            or "\\" in path
+            or "\r" in path
+            or "\n" in path
+            or normalized_expiry is None
+            or not math.isfinite(normalized_expiry)
+            or (normalized_expiry != -1.0 and normalized_expiry < 0)
+            or type(owned_cookie.get("httpOnly")) is not bool
+            or owned_cookie.get("secure") is not True
+            or owned_cookie.get("sameSite") not in {"Strict", "Lax", "None"}
+        ):
+            raise _GuestFailure("incompatible_browser")
+        _interactive_profile_text(
+            domain,
+            maximum_bytes=253,
+        )
+        _interactive_profile_text(
+            path,
+            maximum_bytes=2_048,
+        )
+        try:
+            normalized_domain = (
+                _guest_https_origin(f"https://{domain}").removeprefix("https://").removesuffix("/")
+            )
+        except _GuestFailure:
+            raise _GuestFailure("incompatible_browser") from None
+        if domain != normalized_domain or domain not in admitted_hosts:
+            raise _GuestFailure("incompatible_browser")
+        cookie_keys.append((domain, path, name))
+    if len(cookie_keys) != len(set(cookie_keys)) or (
+        require_canonical_order and cookie_keys != sorted(cookie_keys)
+    ):
+        raise _GuestFailure("incompatible_browser")
+    storage_count = 0
+    observed_origins: list[str] = []
+    for origin in origins:
+        if type(origin) is not dict or set(origin) != {"origin", "localStorage"}:
+            raise _GuestFailure("incompatible_browser")
+        owned_origin = cast("dict[str, Any]", origin)
+        entries = owned_origin.get("localStorage")
+        if type(entries) is not list:
+            raise _GuestFailure("incompatible_browser")
+        storage_count += len(entries)
+        if storage_count > _INTERACTIVE_MAX_PROFILE_STORAGE_ENTRIES:
+            raise _GuestFailure("incompatible_browser")
+        if any(type(entry) is not dict or set(entry) != {"name", "value"} for entry in entries):
+            raise _GuestFailure("incompatible_browser")
+        raw_origin = owned_origin.get("origin")
+        if type(raw_origin) is not str:
+            raise _GuestFailure("incompatible_browser")
+        try:
+            normalized_origin = _guest_https_origin(raw_origin).removesuffix("/")
+        except _GuestFailure:
+            raise _GuestFailure("incompatible_browser") from None
+        if raw_origin != normalized_origin or raw_origin not in allowed_origins:
+            raise _GuestFailure("incompatible_browser")
+        observed_origins.append(raw_origin)
+        entry_names: list[str] = []
+        for entry in entries:
+            owned_entry = cast("dict[str, Any]", entry)
+            entry_names.append(
+                _interactive_profile_text(
+                    owned_entry.get("name"),
+                    maximum_bytes=_INTERACTIVE_MAX_PROFILE_NAME_BYTES,
+                )
+            )
+            _interactive_profile_text(
+                owned_entry.get("value"),
+                maximum_bytes=_INTERACTIVE_MAX_PROFILE_VALUE_BYTES,
+            )
+        if len(entry_names) != len(set(entry_names)) or (
+            require_canonical_order and entry_names != sorted(entry_names)
+        ):
+            raise _GuestFailure("incompatible_browser")
+    if len(observed_origins) != len(set(observed_origins)) or (
+        require_canonical_order and observed_origins != sorted(observed_origins)
+    ):
+        raise _GuestFailure("incompatible_browser")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise _GuestFailure("incompatible_browser") from exc
+    if len(encoded) > maximum_bytes:
+        raise _GuestFailure("incompatible_browser")
+    return json.loads(encoded)
+
+
+def _interactive_profile_text(value: Any, *, maximum_bytes: int) -> str:
+    if type(value) is not str or "\x00" in value:
+        raise _GuestFailure("incompatible_browser")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _GuestFailure("incompatible_browser") from exc
+    if len(encoded) > maximum_bytes:
+        raise _GuestFailure("incompatible_browser")
+    return value
+
+
+def _interactive_profile_private_values(state: dict[str, Any]) -> tuple[str, ...]:
+    """Extract non-empty cookie/storage names and values from bounded private state."""
+
+    values: set[str] = set()
+    cookies = state.get("cookies")
+    origins = state.get("origins")
+    if type(cookies) is not list or type(origins) is not list:
+        raise _GuestFailure("incompatible_browser")
+    for cookie in cookies:
+        if (
+            type(cookie) is not dict
+            or type(cookie.get("name")) is not str
+            or type(cookie.get("value")) is not str
+        ):
+            raise _GuestFailure("incompatible_browser")
+        values.update(item for item in (cookie["name"], cookie["value"]) if item)
+    for origin in origins:
+        if type(origin) is not dict or type(origin.get("localStorage")) is not list:
+            raise _GuestFailure("incompatible_browser")
+        for entry in origin["localStorage"]:
+            if (
+                type(entry) is not dict
+                or type(entry.get("name")) is not str
+                or type(entry.get("value")) is not str
+            ):
+                raise _GuestFailure("incompatible_browser")
+            values.update(item for item in (entry["name"], entry["value"]) if item)
+    return tuple(sorted(values, key=lambda item: (-len(item), item)))
+
+
+def _bounded_interactive_profile_private_values(
+    prior_values: tuple[str, ...],
+    current_values: tuple[str, ...],
+    *,
+    maximum_bytes: int,
+) -> tuple[str, ...]:
+    """Own one finite anti-reflection history or fail before publishing content."""
+
+    protected_values = tuple(
+        sorted(
+            set(prior_values) | set(current_values),
+            key=lambda item: (-len(item), item),
+        )
+    )
+    if (
+        len(protected_values) > _INTERACTIVE_MAX_PROFILE_PRIVATE_VALUES
+        or sum(len(item.encode("utf-8")) for item in protected_values) > maximum_bytes
+    ):
+        raise _GuestFailure("resource_exhausted")
+    return protected_values
 
 
 def _interactive_identifier(value: Any) -> str:
@@ -1399,33 +1730,81 @@ def _temporary_profile_cleanup_main(raw_home: str, raw_timeout_seconds: str) -> 
         raise TimeoutError
 
     previous_handler = signal.signal(signal.SIGALRM, cleanup_timed_out)
-    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
     try:
-        shutil.rmtree(home)
-    except FileNotFoundError:
-        return 0
-    except (OSError, TimeoutError):
-        return 1
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return 1
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            try:
+                shutil.rmtree(home)
+                return 0
+            except FileNotFoundError:
+                return 0
+            except TimeoutError:
+                return 1
+            except OSError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return 1
+                time.sleep(min(0.01, remaining))
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
-    return 0
+
+
+def _validate_temporary_profile_home(home: Path) -> None:
+    try:
+        root = _TEMPORARY_PROFILE_ROOT.resolve(strict=True)
+        parent = home.parent.resolve(strict=True)
+        metadata = home.lstat()
+    except OSError as exc:
+        raise _GuestFailure("cleanup_failed") from exc
+    if (
+        not home.is_absolute()
+        or parent != root
+        or not home.name.startswith(_TEMPORARY_PROFILE_PREFIX)
+        or len(home.name) <= len(_TEMPORARY_PROFILE_PREFIX)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise _GuestFailure("cleanup_failed")
 
 
 async def _start_temporary_profile_owner(
     *,
     timeout_seconds: float,
     startup_timeout_seconds: float | None = None,
+    existing_home: Path | None = None,
 ) -> _TemporaryProfileOwner:
-    try:
-        home = Path(
-            tempfile.mkdtemp(
-                prefix=_TEMPORARY_PROFILE_PREFIX,
-                dir=str(_TEMPORARY_PROFILE_ROOT),
+    created_home = existing_home is None
+    if existing_home is None:
+        try:
+            home = Path(
+                tempfile.mkdtemp(
+                    prefix=_TEMPORARY_PROFILE_PREFIX,
+                    dir=str(_TEMPORARY_PROFILE_ROOT),
+                )
             )
-        )
-    except OSError as exc:
-        raise _GuestFailure("cleanup_failed") from exc
+        except OSError as exc:
+            raise _GuestFailure("cleanup_failed") from exc
+    else:
+        home = existing_home
+    try:
+        _validate_temporary_profile_home(home)
+    except BaseException:
+        if created_home:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(home)
+        raise
+    cleanup_timeout_seconds = max(
+        0.001,
+        min(
+            _MAX_PROFILE_CLEANUP_RESERVE_SECONDS,
+            timeout_seconds * 0.75,
+        ),
+    )
     descriptors: list[int] = []
     try:
         control_read, control_write = os.pipe()
@@ -1436,9 +1815,15 @@ async def _start_temporary_profile_owner(
         for descriptor in descriptors:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+        if created_home:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(home)
         raise _GuestFailure("cleanup_failed") from exc
     try:
-        command = _temporary_profile_cleanup_command(home, timeout_seconds=timeout_seconds)
+        command = _temporary_profile_cleanup_command(
+            home,
+            timeout_seconds=cleanup_timeout_seconds,
+        )
         process = subprocess.Popen(
             command,
             stdin=control_read,
@@ -1456,6 +1841,9 @@ async def _start_temporary_profile_owner(
         for descriptor in (control_read, control_write, ready_read, ready_write):
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+        if created_home:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(home)
         # No synchronous fallback is safe here: filesystem deletion is exactly
         # the operation that must not be allowed to block the worker deadline.
         raise _GuestFailure("cleanup_failed") from exc
@@ -1535,20 +1923,21 @@ async def _cleanup_temporary_profile_owner(
     """Release and reap the independent profile owner within a finite budget."""
 
     errors: list[BaseException] = []
-    try:
-        os.close(owner.control_fd)
-    except OSError as exc:
-        errors.append(exc)
+    if owner.control_fd is not None:
+        control_fd = owner.control_fd
+        owner.control_fd = None
+        try:
+            os.close(control_fd)
+        except OSError as exc:
+            errors.append(exc)
     timeout_seconds = max(0.0, timeout_seconds)
     deadline = asyncio.get_running_loop().time() + timeout_seconds
-    kill_reserve = min(0.1, timeout_seconds * 0.25)
-    graceful_seconds = max(0.0, timeout_seconds - kill_reserve)
     timed_out = False
     returncode: int | None = None
     try:
         returncode = await _wait_temporary_profile_owner(
             owner.process,
-            timeout_seconds=graceful_seconds,
+            timeout_seconds=timeout_seconds,
         )
         timed_out = returncode is None
         if timed_out:
@@ -1558,7 +1947,10 @@ async def _cleanup_temporary_profile_owner(
                 pass
             except OSError as exc:
                 errors.append(exc)
-            remaining_seconds = max(0.0, deadline - asyncio.get_running_loop().time())
+            remaining_seconds = max(
+                0.0,
+                deadline - asyncio.get_running_loop().time(),
+            )
             returncode = await _wait_temporary_profile_owner(
                 owner.process,
                 timeout_seconds=remaining_seconds,
@@ -1571,6 +1963,10 @@ async def _cleanup_temporary_profile_owner(
             errors.insert(0, TimeoutError("Temporary browser profile cleanup timed out."))
         elif returncode != 0:
             errors.append(RuntimeError("Temporary browser profile cleanup failed."))
+        elif owner.home.exists():
+            errors.append(
+                RuntimeError("Temporary browser profile cleanup did not remove its home.")
+            )
     except asyncio.CancelledError:
         with contextlib.suppress(OSError):
             owner.process.kill()
@@ -3312,7 +3708,10 @@ def _interactive_socket_path(session_id: str) -> Path:
 
 def _interactive_retired_path(session_id: str) -> Path:
     token = _interactive_retirement_token(session_id)
-    return _INTERACTIVE_ROOT / (f"{token[:_INTERACTIVE_RETIREMENT_BUCKET_HEX_LENGTH]}.retired")
+    # The full digest is the durable retirement identity. Short shared buckets
+    # allow an unrelated session to overwrite positive quiescence evidence and
+    # later resurrect the retired allocation after acknowledgement loss.
+    return _INTERACTIVE_ROOT / f"{token}.retired"
 
 
 def _interactive_retirement_token(session_id: str) -> str:
@@ -3343,7 +3742,7 @@ def _interactive_retirement_is_recorded(session_id: str) -> bool:
 
 
 def _record_interactive_retirement(session_id: str) -> bool:
-    """Publish one exact marker in a fixed-size, collision-safe slot table."""
+    """Publish one exact marker without aliasing another session identity."""
 
     retired_path = _interactive_retired_path(session_id)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
@@ -3382,10 +3781,14 @@ def _interactive_response_has_uncertain_closure(response: Mapping[str, Any]) -> 
     )
 
 
+def _interactive_response_claims_retirement(response: Mapping[str, Any]) -> bool:
+    return response.get("allocation_disposition") == "retired"
+
+
 async def _run_interactive_request(raw: Any) -> dict[str, Any]:
     request = _interactive_request_from_json(raw)
     pre_dispatch_disposition: Literal["live", "retired"] = (
-        "retired" if request.operation == "navigate" else "live"
+        "retired" if request.operation in {"navigate", "profile_restore"} else "live"
     )
     if not hasattr(os, "geteuid") or os.geteuid() == 0:
         raise _GuestFailure(
@@ -3426,13 +3829,21 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
     response = await _interactive_send(socket_path, raw)
     if response is not None:
         if (
+            _interactive_response_claims_retirement(response)
+            and not _interactive_retirement_is_recorded(request.session_id)
+            and not await _await_interactive_retirement(request.session_id)
+        ):
+            # Positive retirement may release host-side profile authority. Do
+            # not publish it until the daemon's process-loss marker is visible.
+            return _interactive_error_payload(_GuestFailure("cleanup_failed"))
+        if (
             request.operation != "navigate"
             and _interactive_response_has_uncertain_closure(response)
             and await _await_interactive_retirement(request.session_id)
         ):
             return {**response, "allocation_disposition": "retired"}
         return response
-    if request.operation != "navigate" or request.reconcile_only:
+    if request.operation not in {"navigate", "profile_restore"} or request.reconcile_only:
         retired = await _await_interactive_retirement(request.session_id)
         disposition: Literal["retired", "uncertain"] = "retired" if retired else "uncertain"
         return _interactive_error_payload(
@@ -3440,6 +3851,11 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
                 "allocation_lost" if retired else "session_closed",
                 allocation_disposition=disposition,
             )
+        )
+    if _interactive_retirement_is_recorded(request.session_id):
+        raise _GuestFailure(
+            "browser_unavailable",
+            allocation_disposition="retired",
         )
     await _start_interactive_daemon(request.session_id, socket_path)
     # A daemon can fail near the end of its connection window and then spend
@@ -3455,6 +3871,12 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
     while asyncio.get_running_loop().time() < deadline:
         response = await _interactive_send(socket_path, raw)
         if response is not None:
+            if (
+                _interactive_response_claims_retirement(response)
+                and not _interactive_retirement_is_recorded(request.session_id)
+                and not await _await_interactive_retirement(request.session_id)
+            ):
+                return _interactive_error_payload(_GuestFailure("cleanup_failed"))
             return response
         if _interactive_retirement_is_recorded(request.session_id):
             raise _GuestFailure(
@@ -3545,6 +3967,7 @@ class _InteractiveDaemon:
         self.operations: dict[str, _InteractiveOperationRecord] = {}
         self.page_cleanup_operations: dict[str, _InteractiveOperationRecord] = {}
         self.session_cleanup_operations: dict[str, _InteractiveOperationRecord] = {}
+        self.profile_operations: dict[str, _InteractiveOperationRecord] = {}
         self.operation_ledger_bytes = 0
         self.total_page_creations = 0
         self.total_operations = 0
@@ -3573,6 +3996,10 @@ class _InteractiveDaemon:
         self.last_activity = 0.0
         self.home: Path | None = None
         self.profile_owner: _TemporaryProfileOwner | None = None
+        self.profile_output_values: tuple[str, ...] | None = None
+        self.profile_allowed_origins: tuple[str, ...] | None = None
+        self.profile_plaintext_limit: int | None = None
+        self.profile_timeout_seconds: float | None = None
 
     async def start(self) -> None:
         try:
@@ -3581,10 +4008,9 @@ class _InteractiveDaemon:
             raise _GuestFailure("browser_unavailable") from exc
         proxy, ca_path = _proxy_and_ca()
         try:
-            self.profile_owner = await _start_temporary_profile_owner(
-                timeout_seconds=_MAX_PROFILE_CLEANUP_RESERVE_SECONDS,
-            )
-            self.home = self.profile_owner.home
+            await self._start_profile_home()
+            if self.home is None:  # pragma: no cover - profile-owner invariant
+                raise _GuestFailure("cleanup_failed")
             _sanitize_environment(self.home, proxy=proxy, ca_path=ca_path)
             await _install_browser_ca(self.home, ca_path)
             self.playwright = await async_playwright().start()
@@ -3611,6 +4037,33 @@ class _InteractiveDaemon:
                 ],
             )
             self.browser_version = str(self.browser.version)
+            # A context is intentionally not created here.  The first navigate
+            # request may carry application-owned profile state, which must be
+            # imported before any page or untrusted document exists.
+        except _GuestFailure:
+            await self.close()
+            raise
+        except Exception as exc:
+            await self.close()
+            raise _GuestFailure("browser_unavailable") from exc
+
+    async def _start_profile_home(self) -> None:
+        """Allocate a profile home owned by an independent process-loss guardian."""
+
+        if self.profile_owner is not None or self.home is not None:
+            raise _GuestFailure("incompatible_browser")
+        owner = await _start_temporary_profile_owner(
+            timeout_seconds=_MAX_PROFILE_CLEANUP_RESERVE_SECONDS,
+        )
+        self.profile_owner = owner
+        self.home = owner.home
+
+    async def _ensure_context(self, storage_state: dict[str, Any] | None) -> None:
+        if self.context is not None:
+            if storage_state is not None:
+                raise _GuestFailure("incompatible_browser")
+            return
+        try:
             self.context = await self.browser.new_context(
                 accept_downloads=True,
                 ignore_https_errors=False,
@@ -3618,13 +4071,13 @@ class _InteractiveDaemon:
                 service_workers="block",
                 viewport={"width": 1280, "height": 720},
                 device_scale_factor=1,
+                **({"storage_state": storage_state} if storage_state is not None else {}),
             )
         except _GuestFailure:
             await self.close()
             raise
         except Exception as exc:
-            await self.close()
-            raise _GuestFailure("browser_unavailable") from exc
+            raise _GuestFailure("incompatible_browser") from exc
 
     async def execute(self, request: _InteractiveRequest) -> dict[str, Any]:
         if request.session_id != self.session_id:
@@ -3636,6 +4089,8 @@ class _InteractiveDaemon:
                 existing = self.page_cleanup_operations.get(request.operation_id)
             if existing is None:
                 existing = self.session_cleanup_operations.get(request.operation_id)
+            if existing is None:
+                existing = self.profile_operations.get(request.operation_id)
             if existing is not None:
                 if existing.fingerprint != fingerprint:
                     return _interactive_error_payload(_GuestFailure("operation_conflict"))
@@ -3652,6 +4107,8 @@ class _InteractiveDaemon:
                 if request.operation == "close"
                 else self.page_cleanup_operations
                 if request.operation == "close_page"
+                else self.profile_operations
+                if request.operation in {"profile_restore", "profile_checkpoint"}
                 else self.operations
             )
             if request.operation == "close":
@@ -3660,15 +4117,29 @@ class _InteractiveDaemon:
             elif request.operation == "close_page":
                 if len(operation_records) >= request.limits.max_page_cleanup_operations:
                     return _interactive_error_payload(_GuestFailure("resource_exhausted"))
+            elif request.operation in {"profile_restore", "profile_checkpoint"}:
+                # A profile-bound allocation needs one private restore receipt
+                # in addition to one checkpoint for every admitted public
+                # operation.  The public max_operations bound must therefore
+                # not consume the restore slot at its exact upper boundary.
+                if len(operation_records) >= request.limits.max_operations + 1:
+                    return _interactive_error_payload(_GuestFailure("resource_exhausted"))
             elif len(operation_records) >= request.limits.max_operations:
                 return _interactive_error_payload(_GuestFailure("resource_exhausted"))
             try:
                 response = await self._execute_locked(request)
             except _GuestFailure as exc:
-                response = _interactive_error_payload(exc)
+                response = (
+                    await self._retire_failed_allocation(exc, request)
+                    if request.operation == "profile_restore"
+                    else _interactive_error_payload(exc)
+                )
             except Exception as exc:
-                response = _interactive_error_payload(
-                    _interactive_playwright_error(request.operation, exc)
+                failure = _interactive_playwright_error(request.operation, exc)
+                response = (
+                    await self._retire_failed_allocation(failure, request)
+                    if request.operation == "profile_restore"
+                    else _interactive_error_payload(failure)
                 )
             finally:
                 self.last_activity = asyncio.get_running_loop().time()
@@ -3679,8 +4150,13 @@ class _InteractiveDaemon:
                 sort_keys=True,
             ).encode("utf-8")
             retained = response
+            response_bound = (
+                _INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES * 7
+                if request.operation in {"profile_restore", "profile_checkpoint"}
+                else _INTERACTIVE_MAX_SNAPSHOT_BYTES * 2
+            )
             if (
-                len(encoded) > _INTERACTIVE_MAX_SNAPSHOT_BYTES * 2
+                len(encoded) > response_bound
                 or self.operation_ledger_bytes + len(encoded) > _INTERACTIVE_OPERATION_LEDGER_BYTES
             ):
                 retained = _interactive_error_payload(_GuestFailure("outcome_ambiguous"))
@@ -3699,6 +4175,12 @@ class _InteractiveDaemon:
             return response
 
     async def _ensure_configuration(self, request: _InteractiveRequest) -> None:
+        if self.context is None:
+            if request.operation == "profile_restore":
+                return
+            if request.operation != "navigate":
+                raise _GuestFailure("browser_crash")
+            await self._ensure_context(None)
         material = {
             "limits": asdict(request.limits),
             "multi_page": request.multi_page,
@@ -3722,6 +4204,8 @@ class _InteractiveDaemon:
         try:
             await self.context.add_init_script(_interactive_popup_guard(self.popup_guard_token))
             await self.context.route("**/*", self._route_interactive_request)
+            if self.profile_allowed_origins is not None:
+                await self.context.route_web_socket("**/*", self._route_profile_web_socket)
         except asyncio.CancelledError:
             self._mark_popup_guard_uncertain()
             raise
@@ -3737,6 +4221,78 @@ class _InteractiveDaemon:
         """Execute while the caller owns the daemon lifecycle lock."""
 
         self.idle_timeout_seconds = request.limits.idle_timeout_seconds
+        if request.operation == "profile_restore":
+            if (
+                request.profile_restore_state is None
+                or request.profile_timeout_seconds is None
+                or request.profile_allowed_origins is None
+                or request.profile_plaintext_limit is None
+                or self.context is not None
+                or self.pages
+            ):
+                raise _GuestFailure("incompatible_browser")
+            try:
+                async with asyncio.timeout(request.profile_timeout_seconds):
+                    await self._ensure_context(request.profile_restore_state)
+                self.profile_output_values = _bounded_interactive_profile_private_values(
+                    (),
+                    _interactive_profile_private_values(request.profile_restore_state),
+                    maximum_bytes=request.profile_plaintext_limit,
+                )
+                self.profile_allowed_origins = request.profile_allowed_origins
+                self.profile_plaintext_limit = request.profile_plaintext_limit
+                self.profile_timeout_seconds = request.profile_timeout_seconds
+                await self._ensure_configuration(request)
+            except _GuestFailure:
+                raise
+            except TimeoutError as exc:
+                raise _GuestFailure("timeout") from exc
+            except Exception as exc:
+                raise _GuestFailure("incompatible_browser") from exc
+            return {
+                "protocol_version": INTERACTIVE_PROTOCOL_VERSION,
+                "worker_version": INTERACTIVE_WORKER_VERSION,
+                "playwright_version": PLAYWRIGHT_VERSION,
+                "kind": "profile_restore",
+                "allocation_disposition": "live",
+                "profile_restored": True,
+            }
+        if request.operation == "profile_checkpoint":
+            if (
+                self.context is None
+                or request.profile_capture_limit is None
+                or request.profile_timeout_seconds is None
+                or self.profile_allowed_origins is None
+                or request.profile_allowed_origins != self.profile_allowed_origins
+            ):
+                raise _GuestFailure("session_closed")
+            try:
+                async with asyncio.timeout(request.profile_timeout_seconds):
+                    profile_state = await self.context.storage_state(indexed_db=False)
+                owned_state = _validate_interactive_profile_state(
+                    profile_state,
+                    maximum_bytes=request.profile_capture_limit,
+                    allowed_origins=self.profile_allowed_origins,
+                )
+            except _GuestFailure:
+                raise
+            except TimeoutError as exc:
+                raise _GuestFailure("timeout") from exc
+            except Exception as exc:
+                raise _GuestFailure("browser_crash") from exc
+            return {
+                "protocol_version": INTERACTIVE_PROTOCOL_VERSION,
+                "worker_version": INTERACTIVE_WORKER_VERSION,
+                "playwright_version": PLAYWRIGHT_VERSION,
+                "kind": "profile_checkpoint",
+                "allocation_disposition": "live",
+                "profile_state": owned_state,
+            }
+        if self.profile_output_values is not None and request.operation in {
+            "screenshot",
+            "download",
+        }:
+            raise _GuestFailure("policy_denied")
         delta = _InteractivePageDelta()
         delta.closed_page_ids.update(self.pending_closed_page_ids)
         delta.crashed_page_ids.update(self.pending_crashed_page_ids)
@@ -3911,6 +4467,12 @@ class _InteractiveDaemon:
             if type(url) is str and len(url.encode("utf-8", errors="replace")) > _MAX_URL_LENGTH:
                 url = _interactive_origin(url)
             title = state.title
+            if self.profile_output_values is not None:
+                # Summaries also cover unobserved/background pages and error
+                # paths, where current storage cannot be safely refreshed.
+                # Only the protected observation publishes page text/URLs.
+                url = None
+                title = None
             if title is not None and len(title.encode("utf-8", errors="replace")) > (
                 _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES
             ):
@@ -4124,6 +4686,7 @@ class _InteractiveDaemon:
             observation,
             page_set=self._page_set_payload(),
             page_delta=self._page_delta_payload(delta),
+            profile_output_protected=self.profile_output_values is not None,
         )
 
     async def _observe_page(
@@ -4137,17 +4700,25 @@ class _InteractiveDaemon:
         ):
             raise _GuestFailure("resource_exhausted")
         navigation_epoch = state.navigation_epoch
+        previous_observation_revision = state.last_observation_revision
         observation = await _interactive_observation(
             state,
             limits,
             browser_version=self.browser_version,
         )
-        if (
-            state.access_evidence is None and state.navigation_epoch != navigation_epoch
-        ) or state.revision != observation.get("revision"):
+        try:
+            observation, _protected = await self._protect_profile_observation(observation)
+            if (
+                state.access_evidence is None and state.navigation_epoch != navigation_epoch
+            ) or state.revision != observation.get("revision"):
+                raise _GuestFailure("browser_crash")
+        except BaseException:
             state.revision = None
             state.refs.clear()
-            raise _GuestFailure("browser_crash")
+            state.last_observation_revision = previous_observation_revision
+            raise
+        if not observation["refs"]:
+            state.refs.clear()
         ref_count = len(state.refs)
         if (
             state.ref_count + ref_count > limits.max_refs_per_page
@@ -4998,6 +5569,17 @@ class _InteractiveDaemon:
             state.denied_code = "redirect_denied" if is_redirect else "destination_denied"
             await route.abort("blockedbyclient")
             return
+        if self.profile_allowed_origins is not None:
+            request_scheme = urlsplit(browser_request.url).scheme.lower()
+            if request_scheme == "https":
+                try:
+                    request_origin = _guest_https_origin(browser_request.url).removesuffix("/")
+                except _GuestFailure:
+                    request_origin = None
+                if request_origin not in self.profile_allowed_origins:
+                    state.denied_code = "destination_denied"
+                    await route.abort("blockedbyclient")
+                    return
         if (
             state.opener_page_id is not None
             and is_main_navigation
@@ -5033,6 +5615,36 @@ class _InteractiveDaemon:
             await route.abort("blockedbyclient")
             return
         await route.continue_()
+
+    def _route_profile_web_socket(self, web_socket_route: Any) -> None:
+        allowed_origins = self.profile_allowed_origins
+        limits = self.configuration_limits
+        state = self.pages.get(self.active_page_id or "")
+        self.total_requests += 1
+        if state is not None:
+            state.request_count += 1
+        if (
+            allowed_origins is None
+            or limits is None
+            or self.total_requests > limits.max_total_requests
+            or (state is not None and state.request_count > limits.max_requests)
+        ):
+            if state is not None:
+                state.limit_exceeded = True
+                state.limit_error_code = "resource_exhausted"
+                self._schedule_response_limit_abort(state)
+            web_socket_route.close(code=1008, reason="Request limit exceeded.")
+            return
+        try:
+            request_origin = _guest_websocket_https_origin(web_socket_route.url).removesuffix("/")
+        except _GuestFailure:
+            request_origin = None
+        if request_origin is None or request_origin not in allowed_origins:
+            if state is not None:
+                state.denied_code = "destination_denied"
+            web_socket_route.close(code=1008, reason="Policy denied.")
+            return
+        web_socket_route.connect_to_server()
 
     def _handle_page_download(self, state: _InteractivePage, download: Any) -> None:
         request = self.active_request
@@ -5406,7 +6018,74 @@ class _InteractiveDaemon:
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
-        return _interactive_success_payload(observation, artifact=artifact)
+        return _interactive_success_payload(
+            observation,
+            artifact=artifact,
+            profile_output_protected=self.profile_output_values is not None,
+        )
+
+    async def _protect_profile_observation(
+        self,
+        observation: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Omit current or historical profile values before guest publication."""
+
+        prior_values = self.profile_output_values
+        if prior_values is None:
+            return observation, False
+        if (
+            self.context is None
+            or self.profile_plaintext_limit is None
+            or self.profile_timeout_seconds is None
+            or self.profile_allowed_origins is None
+        ):
+            raise _GuestFailure("policy_denied")
+        try:
+            async with asyncio.timeout(self.profile_timeout_seconds):
+                current_state = await self.context.storage_state(indexed_db=False)
+            current_state = _validate_interactive_profile_state(
+                current_state,
+                maximum_bytes=self.profile_plaintext_limit,
+                allowed_origins=self.profile_allowed_origins,
+            )
+            current_values = _interactive_profile_private_values(current_state)
+        except _GuestFailure:
+            raise
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            raise _GuestFailure("policy_denied") from exc
+        protected_values = _bounded_interactive_profile_private_values(
+            prior_values,
+            current_values,
+            maximum_bytes=self.profile_plaintext_limit,
+        )
+        self.profile_output_values = protected_values
+        protected = json.loads(json.dumps(observation, ensure_ascii=False))
+        url = protected.get("url")
+        if type(url) is not str:
+            raise _GuestFailure("policy_denied")
+        if any(secret in url for secret in protected_values):
+            raise _GuestFailure("policy_denied")
+        visible_values = [protected.get("title"), protected.get("snapshot")]
+        refs = protected.get("refs")
+        if type(refs) is not list:
+            raise _GuestFailure("policy_denied")
+        visible_values.extend(
+            value
+            for item in refs
+            if type(item) is dict
+            for value in (item.get("role"), item.get("name"))
+        )
+        if any(
+            type(value) is str and secret in value
+            for secret in protected_values
+            for value in visible_values
+        ):
+            protected["title"] = None
+            protected["snapshot"] = _INTERACTIVE_PROFILE_OUTPUT_OMITTED
+            protected["refs"] = []
+        return protected, True
 
     async def _download_and_observe(
         self,
@@ -5456,7 +6135,11 @@ class _InteractiveDaemon:
         }
         state.artifact_count += 1
         self.total_artifacts += 1
-        return _interactive_success_payload(observation, artifact=artifact)
+        return _interactive_success_payload(
+            observation,
+            artifact=artifact,
+            profile_output_protected=False,
+        )
 
     async def close(self, *, timeout_seconds: float = 5.0) -> bool:
         deadline = asyncio.get_running_loop().time() + max(0.001, timeout_seconds)
@@ -5570,6 +6253,19 @@ class _InteractiveDaemon:
                 elif task.done():
                     self.session_cleanup_tasks.pop(attribute, None)
 
+            if self.profile_owner is None and self.home is not None:
+                try:
+                    remaining = max(0.001, deadline - asyncio.get_running_loop().time())
+                    self.profile_owner = await _start_temporary_profile_owner(
+                        timeout_seconds=min(
+                            remaining,
+                            _MAX_PROFILE_CLEANUP_RESERVE_SECONDS,
+                        ),
+                        startup_timeout_seconds=remaining,
+                        existing_home=self.home,
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
             profile_owner = self.profile_owner
             if profile_owner is not None:
                 remaining = max(0.0, deadline - asyncio.get_running_loop().time())
@@ -5578,8 +6274,9 @@ class _InteractiveDaemon:
                     timeout_seconds=remaining,
                 )
                 errors.extend(profile_errors)
-                if not profile_errors:
+                if profile_owner.process.poll() is not None:
                     self.profile_owner = None
+                if not profile_owner.home.exists():
                     self.home = None
             return tuple(errors)
 
@@ -6145,6 +6842,7 @@ def _interactive_success_payload(
     artifact: dict[str, Any] | None = None,
     page_set: dict[str, Any] | None = None,
     page_delta: dict[str, Any] | None = None,
+    profile_output_protected: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "protocol_version": INTERACTIVE_PROTOCOL_VERSION,
@@ -6153,6 +6851,7 @@ def _interactive_success_payload(
         "kind": "success",
         "allocation_disposition": "live",
         "artifacts": [] if artifact is None else [artifact],
+        "profile_output_protected": profile_output_protected,
     }
     if observation is not None:
         payload["observation"] = observation
@@ -6376,9 +7075,8 @@ async def _interactive_daemon_main(session_id: str) -> int:
             await server.wait_closed()
         cleanup_ok = await daemon.close()
         if cleanup_ok:
-            # The fixed-size marker table can evict an older colliding marker,
-            # which only makes that older allocation uncertain. Exact token
-            # validation prevents a collision from fabricating retirement.
+            # One full-digest marker preserves positive quiescence evidence for
+            # this exact allocation identity across daemon process loss.
             _record_interactive_retirement(session_id)
         with contextlib.suppress(OSError):
             socket_path.unlink()

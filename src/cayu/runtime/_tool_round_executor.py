@@ -4231,6 +4231,12 @@ class ToolRoundExecutor:
             workspace_receipt_artifact_store,
             workspace_receipt_artifact_unavailable_detail,
         ) = _workspace_receipt_artifact_store(registered_environment)
+        from cayu.tools.browser_session import BrowserSessionTool
+
+        allow_private_browser_profile_io = (
+            type(registered_tool.tool) is BrowserSessionTool
+            and registered_tool.tool.browser_profile is not None
+        )
         tool_context = ToolContext(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
@@ -4260,6 +4266,7 @@ class ToolRoundExecutor:
                 mutation_owner=workspace_mutation_owner,
                 execution_observer=observe_runner_execution,
                 publish_execution_arguments=registered_tool.publish_arguments,
+                allow_private_browser_profile_io=allow_private_browser_profile_io,
             ),
             invocation_secret_redactor=redactor_provider,
             invocation_secret_snapshot_provider=invocation_secret_scope.snapshot,

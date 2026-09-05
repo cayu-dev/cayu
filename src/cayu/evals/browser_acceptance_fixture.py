@@ -14,6 +14,9 @@ from cayu.evals.corpus import _content_revision
 
 _FIXTURE_PAGE_ROUTES = (
     "/actionability",
+    "/auth/account",
+    "/auth/login",
+    "/auth/login-expired",
     "/basic",
     "/challenge",
     "/cross-origin-frame",
@@ -52,6 +55,12 @@ def _fixture_pages() -> dict[str, str]:
     return {
         "/basic": """<!doctype html><title>Browser acceptance</title>
             <main><h1>Browser acceptance fixture</h1><p>ready</p></main>""",
+        "/auth/login": """<!doctype html><title>Fixture login complete</title>
+            <main><h1>Signed in</h1><p>credential-free test session</p></main>
+            <script>localStorage.setItem('cayu_fixture_session','active')</script>""",
+        "/auth/login-expired": """<!doctype html><title>Fixture login expired</title>
+            <main><h1>Expired test session</h1></main>
+            <script>localStorage.setItem('cayu_fixture_session','expired')</script>""",
         "/forms": """<!doctype html><title>Form controls</title><main>
             <form id="profile"><label>Name <input aria-label="Name" required></label>
             <label>Region <select aria-label="Region"><option>North</option>
@@ -166,6 +175,17 @@ BROWSER_ACCEPTANCE_FIXTURE_REVISION = _content_revision(
         },
         "response_headers": {
             "/challenge": {"X-Cayu-Access-Block": "bot_challenge"},
+            "/auth/login": {
+                "Set-Cookie": (
+                    "cayu_fixture_session=active; Path=/; Secure; HttpOnly; SameSite=Lax"
+                ),
+            },
+            "/auth/login-expired": {
+                "Set-Cookie": (
+                    "cayu_fixture_session=expired; Path=/; Secure; HttpOnly; "
+                    "SameSite=Lax; Max-Age=0"
+                ),
+            },
         },
         "artifacts": {
             "/download/report.txt": {
@@ -237,11 +257,46 @@ class _FixtureHandler(http.server.BaseHTTPRequestHandler):
                 headers={"Content-Disposition": 'attachment; filename="oversized.bin"'},
             )
             return
+        if path == "/auth/account":
+            authenticated = "cayu_fixture_session=active" in self.headers.get(
+                "Cookie",
+                "",
+            )
+            body = (
+                "<!doctype html><title>Authenticated fixture account</title>"
+                "<main><h1>Authenticated</h1></main>"
+                if authenticated
+                else "<!doctype html><title>Signed out fixture account</title>"
+                "<main><h1>Signed out</h1></main>"
+            )
+            self._send(
+                200 if authenticated else 401,
+                "text/html; charset=utf-8",
+                body.encode("utf-8"),
+            )
+            return
         body = _fixture_pages().get(path)
         if body is None:
             self._send(404, "text/plain; charset=utf-8", b"not found")
             return
-        headers = {"X-Cayu-Access-Block": "bot_challenge"} if path == "/challenge" else None
+        headers = (
+            {"X-Cayu-Access-Block": "bot_challenge"}
+            if path == "/challenge"
+            else {
+                "Set-Cookie": (
+                    "cayu_fixture_session=active; Path=/; Secure; HttpOnly; SameSite=Lax"
+                )
+            }
+            if path == "/auth/login"
+            else {
+                "Set-Cookie": (
+                    "cayu_fixture_session=expired; Path=/; Secure; HttpOnly; "
+                    "SameSite=Lax; Max-Age=0"
+                )
+            }
+            if path == "/auth/login-expired"
+            else None
+        )
         self._send(
             200,
             "text/html; charset=utf-8",

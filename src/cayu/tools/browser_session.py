@@ -11,6 +11,7 @@ import re
 import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
@@ -27,6 +28,20 @@ from cayu.artifacts import (
     ArtifactMetadata,
     ArtifactScope,
     copy_artifact_read_result,
+)
+from cayu.browser_profiles import (
+    BROWSER_PROFILE_MAX_PLAINTEXT_BYTES,
+    BrowserProfileBinding,
+    BrowserProfileCheckpointPolicy,
+    BrowserProfileDestinationPolicy,
+    BrowserProfileLimits,
+    BrowserProfileRestoreMaterial,
+    BrowserProfileStateV1,
+    BrowserProfileStoreConflict,
+    BrowserProfileTerminalOutcome,
+    BrowserProfileUnavailable,
+    browser_profile_state_from_playwright,
+    browser_profile_state_to_playwright,
 )
 from cayu.core.tools import (
     DurableToolRecoveryAuthority,
@@ -195,6 +210,7 @@ _BACKEND_FAILURE_CODES = frozenset(
         "policy_denied",
         "redirect_denied",
         "resource_exhausted",
+        "restoration_required",
         "session_closed",
         "timeout",
     }
@@ -222,6 +238,7 @@ _ERROR_MESSAGES = {
     "oversized_response": "The browser exceeded its configured network evidence limits.",
     "oversized_snapshot": "The browser observation exceeded its configured evidence limits.",
     "policy_denied": "The browser operation was denied by policy.",
+    "profile_checkpoint_failed": "The browser profile could not be checkpointed safely.",
     "redirect_denied": "The browser navigation exceeded its redirect policy.",
     "resource_exhausted": "The browser allocation reached its configured resource limit.",
     "restoration_required": (
@@ -255,6 +272,9 @@ _ERROR_GUIDANCE = {
     ),
     "outcome_ambiguous": (
         "Do not replay this action; observe only if the same live allocation remains admitted."
+    ),
+    "profile_checkpoint_failed": (
+        "The live allocation remains owned; use a new close operation id to retry checkpointing."
     ),
     "restoration_required": (
         "Start a new browser session explicitly; live browser state cannot be reconstructed."
@@ -664,6 +684,7 @@ class BrowserBackendResponse:
     failure: BrowserBackendFailure | None = None
     closed: bool = False
     allocation_disposition: Literal["live", "retired", "uncertain"] | None = None
+    profile_output_protected: bool = False
 
     def __post_init__(self) -> None:
         terminal_count = (
@@ -688,6 +709,10 @@ class BrowserBackendResponse:
             raise ValueError("Browser page deltas require a page registry.")
         if type(self.closed) is not bool:
             raise TypeError("closed must be a boolean.")
+        if type(self.profile_output_protected) is not bool:
+            raise TypeError("profile_output_protected must be a boolean.")
+        if self.profile_output_protected and self.observation is None:
+            raise ValueError("Profile output protection requires a browser observation.")
         disposition = self.allocation_disposition
         if disposition is None:
             disposition = (
@@ -742,6 +767,14 @@ class BrowserSessionBackend(ABC):
         """Execute one already-admitted, bounded browser operation."""
 
 
+class _BrowserProfileImportRejected(BrowserProfileUnavailable):
+    """Pinned guest proved that profile import did not leave a live allocation."""
+
+
+class _BrowserProfileChildCancellation(BrowserProfileUnavailable):
+    """Private profile dispatch stopped without cancelling its owning task."""
+
+
 @dataclass
 class _PageAuthority:
     revision: str
@@ -767,6 +800,15 @@ class _LiveSession:
     page_set: BrowserPageSetState | None = None
     allocation_authority: _LiveAllocationAuthority | None = None
     closed: bool = False
+    profile_material: BrowserProfileRestoreMaterial | None = field(
+        default=None,
+        repr=False,
+    )
+    last_settled_revision: str | None = None
+    last_operation_receipt_id: str | None = None
+    last_operation_fingerprint: str | None = None
+    ambiguous_lineage: bool = False
+    pending_profile_checkpoint_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1038,53 +1080,264 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
             max_page_creations_per_operation=self.max_page_creations_per_operation,
         )
 
+    async def restore_profile(
+        self,
+        ctx: ToolContext,
+        *,
+        browser_session_id: str,
+        operation_id: str,
+        state: BrowserProfileStateV1,
+        limits: BrowserProfileLimits,
+        current_policy: BrowserProfileDestinationPolicy,
+    ) -> None:
+        """Import private profile state before a model-visible page exists."""
+
+        request = {
+            "operation": "profile_restore",
+            "session_id": browser_session_id,
+            "operation_id": operation_id,
+        }
+        prepared = self._prepare_dispatch(
+            ctx,
+            request,
+            restore_state=state,
+            capture_profile=False,
+            profile_plaintext_limit=limits.max_plaintext_bytes,
+            profile_timeout_seconds=limits.import_timeout_seconds,
+            profile_current_policy=current_policy,
+        )
+        # The state and limits are credential-bearing authority.  The owned
+        # serialized request below is their only path into the runner.
+        state = BrowserProfileStateV1()
+        limits = BrowserProfileLimits()
+        if isinstance(prepared, BrowserBackendResponse):
+            raise BrowserProfileUnavailable("Browser profile import is unavailable.")
+        runner, payload, output_limit, timeout_seconds = prepared
+        private_exec = getattr(runner, "_exec_private_browser_profile", None)
+        if not callable(private_exec):
+            payload = ""
+            raise BrowserProfileUnavailable("Browser profile import is unavailable.")
+        prepared = None
+        current_task = asyncio.current_task()
+        cancellation_requests_before = 0 if current_task is None else current_task.cancelling()
+        cancellation_pending_before = bool(
+            current_task is not None and getattr(current_task, "_must_cancel", False)
+        )
+        dispatch = asyncio.create_task(
+            private_exec(
+                _browser_worker_command(DEFAULT_BROWSER_FETCH_WORKER_COMMAND),
+                timeout_s=max(1, int(timeout_seconds + 0.999)),
+                stdin=payload,
+                output_limit_bytes=output_limit,
+            ),
+            name="cayu-browser-profile-private-restore",
+        )
+        payload = ""
+        try:
+            execution = await dispatch
+        except asyncio.CancelledError as cancellation:
+            if _failure_is_current_cancellation(
+                cancellation,
+                current_task=current_task,
+                cancellation_requests_before=cancellation_requests_before,
+                cancellation_pending_before=cancellation_pending_before,
+            ):
+                raise
+            cancellation.__traceback__ = None
+            raise _BrowserProfileChildCancellation(
+                "Browser profile import was cancelled unexpectedly."
+            ) from None
+        except (RunnerExecutionError, TimeoutError):
+            raise BrowserProfileUnavailable("Browser profile import failed.") from None
+        finally:
+            del dispatch
+        if (
+            execution.timed_out
+            or execution.cancelled
+            or execution.stdout_truncated
+            or execution.exit_code != 0
+        ):
+            execution = None
+            raise BrowserProfileUnavailable("Browser profile import was not settled.")
+        try:
+            if len(execution.stdout.encode("utf-8")) > output_limit:
+                execution = None
+                raise BrowserProfileUnavailable(
+                    "Browser profile import response exceeded its bound."
+                )
+        except UnicodeEncodeError:
+            execution = None
+            raise BrowserProfileUnavailable("Browser profile import response is invalid.") from None
+        stdout = execution.stdout
+        execution = None
+        try:
+            _parse_profile_restore_response(stdout)
+        finally:
+            stdout = ""
+
+    async def capture_profile(
+        self,
+        ctx: ToolContext,
+        *,
+        browser_session_id: str,
+        operation_id: str,
+        limits: BrowserProfileLimits,
+        current_policy: BrowserProfileDestinationPolicy,
+    ) -> BrowserProfileStateV1:
+        request = {
+            "operation": "profile_checkpoint",
+            "session_id": browser_session_id,
+            "operation_id": operation_id,
+        }
+        prepared = self._prepare_dispatch(
+            ctx,
+            request,
+            capture_profile=True,
+            profile_plaintext_limit=limits.max_plaintext_bytes,
+            profile_timeout_seconds=limits.export_timeout_seconds,
+            profile_current_policy=current_policy,
+        )
+        if isinstance(prepared, BrowserBackendResponse):
+            raise BrowserProfileUnavailable("Browser profile export is unavailable.")
+        runner, payload, output_limit, timeout_seconds = prepared
+        private_exec = getattr(runner, "_exec_private_browser_profile", None)
+        if not callable(private_exec):
+            payload = ""
+            raise BrowserProfileUnavailable("Browser profile export is unavailable.")
+        prepared = None
+        current_task = asyncio.current_task()
+        cancellation_requests_before = 0 if current_task is None else current_task.cancelling()
+        cancellation_pending_before = bool(
+            current_task is not None and getattr(current_task, "_must_cancel", False)
+        )
+        dispatch = asyncio.create_task(
+            private_exec(
+                _browser_worker_command(DEFAULT_BROWSER_FETCH_WORKER_COMMAND),
+                timeout_s=max(1, int(timeout_seconds + 0.999)),
+                stdin=payload,
+                output_limit_bytes=output_limit,
+            ),
+            name="cayu-browser-profile-private-checkpoint",
+        )
+        payload = ""
+        try:
+            execution = await dispatch
+        except asyncio.CancelledError as cancellation:
+            if _failure_is_current_cancellation(
+                cancellation,
+                current_task=current_task,
+                cancellation_requests_before=cancellation_requests_before,
+                cancellation_pending_before=cancellation_pending_before,
+            ):
+                raise
+            cancellation.__traceback__ = None
+            raise _BrowserProfileChildCancellation(
+                "Browser profile export was cancelled unexpectedly."
+            ) from None
+        except (RunnerExecutionError, TimeoutError):
+            raise BrowserProfileUnavailable("Browser profile export failed.") from None
+        finally:
+            del dispatch
+        if (
+            execution.timed_out
+            or execution.cancelled
+            or execution.stdout_truncated
+            or execution.exit_code != 0
+        ):
+            execution = None
+            raise BrowserProfileUnavailable("Browser profile export was not settled.")
+        stdout = execution.stdout
+        execution = None
+        try:
+            state = _parse_profile_checkpoint_response(
+                stdout,
+                limits=limits,
+                current_policy=current_policy,
+            )
+        except BaseException:
+            stdout = ""
+            raise
+        stdout = ""
+        return state
+
     def _prepare_dispatch(
         self,
         ctx: ToolContext,
         request: dict[str, Any],
+        *,
+        restore_state: BrowserProfileStateV1 | None = None,
+        capture_profile: bool = False,
+        profile_plaintext_limit: int = BROWSER_PROFILE_MAX_PLAINTEXT_BYTES,
+        profile_timeout_seconds: float = 10.0,
+        profile_current_policy: BrowserProfileDestinationPolicy | None = None,
     ) -> tuple[Any, str, int, float] | BrowserBackendResponse:
         """Own one request and revalidate exact runner authority without dispatch."""
 
-        payload = json.dumps(
-            {
-                "protocol_version": BROWSER_SESSION_PROTOCOL_VERSION,
-                "worker_version": BROWSER_SESSION_WORKER_VERSION,
-                "expected_playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
-                **request,
-                "limits": {
-                    "max_snapshot_bytes": self.max_snapshot_bytes,
-                    "max_dom_nodes": self.max_dom_nodes,
-                    "max_refs": self.max_refs,
-                    "max_artifact_bytes": self.max_artifact_bytes,
-                    "max_page_width": self.max_page_width,
-                    "max_page_height": self.max_page_height,
-                    "max_page_pixels": self.max_page_pixels,
-                    "max_wait_ms": self.max_wait_ms,
-                    "idle_timeout_seconds": self.idle_timeout_seconds,
-                    "max_redirects": self.max_redirects,
-                    "max_requests": self.max_requests,
-                    "max_response_bytes": self.max_response_bytes,
-                    "max_operations": self.max_operations,
-                    "max_pages": self.max_pages,
-                    "max_provisional_pages": self.max_provisional_pages,
-                    "max_page_creations_per_operation": (self.max_page_creations_per_operation),
-                    "max_total_page_creations": self.max_total_page_creations,
-                    "max_background_lifetime_seconds": (self.max_background_lifetime_seconds),
-                    "max_operations_per_page": self.max_operations_per_page,
-                    "max_observations_per_page": self.max_observations_per_page,
-                    "max_total_observations": self.max_total_observations,
-                    "max_refs_per_page": self.max_refs_per_page,
-                    "max_total_refs": self.max_total_refs,
-                    "max_total_requests": self.max_total_requests,
-                    "max_artifacts_per_page": self.max_artifacts_per_page,
-                    "max_total_artifacts": self.max_total_artifacts,
-                    "max_page_cleanup_operations": self.max_page_cleanup_operations,
-                },
-                "page_policy": {
-                    "multi_page": self.multi_page,
-                    "popup": self.popup_policy.model_dump(mode="json"),
-                },
+        private_profile: dict[str, object] | None = None
+        if restore_state is not None or capture_profile:
+            if restore_state is not None and request.get("operation") != "profile_restore":
+                return _pre_dispatch_backend_failure(request, "incompatible_browser")
+            if (
+                type(profile_plaintext_limit) is not int
+                or not 1 <= profile_plaintext_limit <= BROWSER_PROFILE_MAX_PLAINTEXT_BYTES
+                or type(profile_current_policy) is not BrowserProfileDestinationPolicy
+            ):
+                return _pre_dispatch_backend_failure(request, "incompatible_browser")
+            private_profile = {
+                "schema_version": 1,
+                "allowed_origins": list(profile_current_policy.origins),
+                "capture": capture_profile,
+                "max_plaintext_bytes": profile_plaintext_limit,
+                "timeout_seconds": profile_timeout_seconds,
+                "restore_state": (
+                    None
+                    if restore_state is None
+                    else browser_profile_state_to_playwright(restore_state)
+                ),
+            }
+        payload_document: dict[str, object] = {
+            "protocol_version": BROWSER_SESSION_PROTOCOL_VERSION,
+            "worker_version": BROWSER_SESSION_WORKER_VERSION,
+            "expected_playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
+            **request,
+            "limits": {
+                "max_snapshot_bytes": self.max_snapshot_bytes,
+                "max_dom_nodes": self.max_dom_nodes,
+                "max_refs": self.max_refs,
+                "max_artifact_bytes": self.max_artifact_bytes,
+                "max_page_width": self.max_page_width,
+                "max_page_height": self.max_page_height,
+                "max_page_pixels": self.max_page_pixels,
+                "max_wait_ms": self.max_wait_ms,
+                "idle_timeout_seconds": self.idle_timeout_seconds,
+                "max_redirects": self.max_redirects,
+                "max_requests": self.max_requests,
+                "max_response_bytes": self.max_response_bytes,
+                "max_operations": self.max_operations,
+                "max_pages": self.max_pages,
+                "max_provisional_pages": self.max_provisional_pages,
+                "max_page_creations_per_operation": self.max_page_creations_per_operation,
+                "max_total_page_creations": self.max_total_page_creations,
+                "max_background_lifetime_seconds": self.max_background_lifetime_seconds,
+                "max_operations_per_page": self.max_operations_per_page,
+                "max_observations_per_page": self.max_observations_per_page,
+                "max_total_observations": self.max_total_observations,
+                "max_refs_per_page": self.max_refs_per_page,
+                "max_total_refs": self.max_total_refs,
+                "max_total_requests": self.max_total_requests,
+                "max_artifacts_per_page": self.max_artifacts_per_page,
+                "max_total_artifacts": self.max_total_artifacts,
+                "max_page_cleanup_operations": self.max_page_cleanup_operations,
             },
+            "page_policy": {
+                "multi_page": self.multi_page,
+                "popup": self.popup_policy.model_dump(mode="json"),
+            },
+        }
+        if private_profile is not None:
+            payload_document["browser_profile"] = private_profile
+        payload = json.dumps(
+            payload_document,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -1093,7 +1346,11 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         # five-second startup-cleanup settlement reserve before an operation's
         # configured wait. Keep the runner alive for both boundaries plus the
         # existing operation/transport reserve.
-        timeout_seconds = max(1.0, self.max_wait_ms / 1000 + 15.0)
+        timeout_seconds = max(
+            1.0,
+            self.max_wait_ms / 1000 + 15.0,
+            profile_timeout_seconds + 15.0 if private_profile is not None else 0.0,
+        )
         runner = ctx.runner
         if runner is None or not isinstance(runner, _AdmissionAwareRunnerHandle):
             return _pre_dispatch_backend_failure(request, "browser_unavailable")
@@ -1133,6 +1390,8 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
             max_refs=self.max_refs,
             max_page_records=self.max_total_page_creations,
         )
+        if capture_profile:
+            output_limit += 6 * profile_plaintext_limit + 4_096
         return runner, payload, output_limit, timeout_seconds
 
 
@@ -1347,6 +1606,7 @@ class BrowserSessionTool(Tool):
         expected_environment_authority: ExecutionEnvironmentAuthority | None = None,
         expected_workload_authority: RunnerWorkloadAuthority = PINNED_BROWSER_SESSION_WORKLOAD,
         expected_artifact_store_id: str | None = None,
+        browser_profile: BrowserProfileBinding | None = None,
         spec: ToolSpec | None = None,
         _backend: BrowserSessionBackend | None = None,
     ) -> None:
@@ -1588,6 +1848,32 @@ class BrowserSessionTool(Tool):
                 "expected_artifact_store_id",
             )
         )
+        if browser_profile is not None and type(browser_profile) is not BrowserProfileBinding:
+            raise TypeError("browser_profile must be a BrowserProfileBinding or None.")
+        if browser_profile is not None:
+            if _backend is not None:
+                raise ValueError("Browser profiles require Cayu's pinned runner browser backend.")
+            if browser_profile.authority.browser_protocol != BROWSER_SESSION_PROTOCOL_VERSION:
+                raise ValueError("Browser profile requires the pinned browser protocol.")
+            if browser_profile.authority.browser_worker_version != BROWSER_SESSION_WORKER_VERSION:
+                raise ValueError("Browser profile requires the pinned browser worker.")
+            minimum_lease = (
+                max(
+                    self.idle_timeout_seconds + self.max_wait_ms / 1_000,
+                    2 * browser_profile.limits.import_timeout_seconds,
+                    2 * browser_profile.limits.export_timeout_seconds,
+                )
+                + 20
+            )
+            if browser_profile.lease_seconds <= minimum_lease:
+                raise ValueError(
+                    "Browser-profile lease must outlive browser idle and operation bounds."
+                )
+            if self.max_sessions != 1:
+                raise ValueError(
+                    "Browser-profile schema v1 requires max_sessions=1 per tool instance."
+                )
+        self._browser_profile = browser_profile
         self.expected_runner_candidate = _expected_runner_candidate(expected_runner_candidate)
         self.expected_environment_authority = _expected_environment_authority(
             expected_environment_authority
@@ -1651,6 +1937,12 @@ class BrowserSessionTool(Tool):
             max_artifacts_per_page=self.max_artifacts_per_page,
             max_page_cleanup_operations=self.max_page_cleanup_operations,
         )
+
+    @property
+    def browser_profile(self) -> BrowserProfileBinding | None:
+        """Return the application-selected immutable profile binding."""
+
+        return self._browser_profile
 
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return exact material only for Cayu's shipped interactive backend."""
@@ -1777,6 +2069,8 @@ class BrowserSessionTool(Tool):
             }
         if self.expected_artifact_store_id is not None:
             material["expected_artifact_store_id"] = self.expected_artifact_store_id
+        if self.browser_profile is not None:
+            material["browser_profile"] = self.browser_profile.execution_profile_material()
         return material
 
     @classmethod
@@ -1804,6 +2098,14 @@ class BrowserSessionTool(Tool):
             durable_authority = _durable_browser_authority(ctx, args)
         except (TypeError, ValueError, RuntimeError):
             return _error_result("authority_expired", dispatch="not_started")
+        if self.browser_profile is not None and request["operation"] in {
+            "screenshot",
+            "download",
+        }:
+            # Binary captures cannot be redacted reliably. A profile-bound
+            # allocation may contain imported or newly issued credentials even
+            # when the invocation registry is otherwise empty.
+            return _error_result("policy_denied", dispatch="not_started")
         if request["operation"] in {"screenshot", "download"}:
             try:
                 operation_artifact_store = _screenshot_artifact_store(ctx)
@@ -2228,6 +2530,63 @@ class BrowserSessionTool(Tool):
                 )
             return result
 
+        profile_material: BrowserProfileRestoreMaterial | None = None
+        profile_binding = self.browser_profile
+        live_session = parent_state.sessions.get(dispatched_request["session_id"])
+        profile_authority_lost = False
+        if profile_binding is not None:
+            if (
+                durable_authority is None
+                or type(durable_authority.environment_allocation_fingerprint) is not str
+                or type(durable_authority.execution_profile_fingerprint) is not str
+                or type(operation_id) is not str
+            ):
+                return _error_result("authority_expired", dispatch="not_started")
+            if request["operation"] == "navigate":
+                requested_url = dispatched_request.get("url")
+                if type(requested_url) is not str:
+                    return _error_result("invalid_arguments", dispatch="not_started")
+                if not profile_binding.current_policy.admits_url(requested_url):
+                    return _error_result("destination_denied", dispatch="not_started")
+            else:
+                if live_session is None or live_session.profile_material is None:
+                    return _error_result("restoration_required", dispatch="not_started")
+                profile_material = live_session.profile_material
+                try:
+                    await self._reconcile_pending_profile_checkpoint(live_session)
+                    await profile_binding.renew_writer(profile_material)
+                except (BrowserProfileStoreConflict, BrowserProfileUnavailable):
+                    if request["operation"] != "close":
+                        return _error_result("authority_expired", dispatch="not_started")
+                    profile_authority_lost = True
+
+            if (
+                request["operation"] == "close"
+                and profile_binding.checkpoint_policy is BrowserProfileCheckpointPolicy.ON_CLOSE
+                and live_session is not None
+                and live_session.last_settled_revision is not None
+                and not profile_authority_lost
+            ):
+                try:
+                    checkpointed = await self._checkpoint_browser_profile(
+                        ctx,
+                        live_session,
+                        trigger_operation_id=operation_id,
+                    )
+                except BaseException as failure:
+                    if isinstance(
+                        failure, asyncio.CancelledError
+                    ) or _failure_contains_process_control(failure):
+                        raise
+                    checkpointed = False
+                if not checkpointed:
+                    return _error_result(
+                        "profile_checkpoint_failed",
+                        dispatch="not_started",
+                        request=dispatched_request,
+                        allocation_disposition="live",
+                    )
+
         durable_intent: dict[str, Any] | None = None
         durable_dispatched: dict[str, Any] | None = None
         durable_parent_dispatched: dict[str, Any] | None = None
@@ -2385,6 +2744,7 @@ class BrowserSessionTool(Tool):
             parent_state.sessions[dispatched_request["session_id"]] = _LiveSession(
                 allocation_authority=current_allocation_authority
             )
+        owned_live_session = parent_state.sessions.get(dispatched_request["session_id"])
         current_task = asyncio.current_task()
         cancellation_requests_before_dispatch = (
             0 if current_task is None else current_task.cancelling()
@@ -2393,8 +2753,106 @@ class BrowserSessionTool(Tool):
             current_task is not None and getattr(current_task, "_must_cancel", False)
         )
         try:
-            response = await self._backend.execute(ctx, dispatched_request)
+            profile_restore_rejected = False
+            if profile_binding is not None and request["operation"] == "navigate":
+                if type(self._backend) is not _RunnerBrowserSessionBackend:
+                    raise BrowserProfileUnavailable("Browser profile import is unavailable.")
+                if durable_authority is None or type(operation_id) is not str:
+                    raise BrowserProfileUnavailable("Browser profile authority is unavailable.")
+                try:
+                    profile_material = await profile_binding.prepare_restore(
+                        operation_id=_browser_profile_operation_id(
+                            "restore",
+                            browser_session_id=dispatched_request["session_id"],
+                            operation_id=operation_id,
+                        ),
+                        execution_profile_fingerprint=(
+                            durable_authority.execution_profile_fingerprint
+                        ),
+                        allocation_fingerprint=(
+                            durable_authority.environment_allocation_fingerprint
+                        ),
+                        browser_session_id=dispatched_request["session_id"],
+                    )
+                except (BrowserProfileStoreConflict, BrowserProfileUnavailable):
+                    profile_restore_rejected = True
+                if not profile_restore_rejected:
+                    if owned_live_session is None or profile_material is None:
+                        raise BrowserProfileUnavailable(
+                            "Browser profile allocation is unavailable."
+                        )
+                    owned_live_session.profile_material = profile_material
+                    try:
+                        await self._backend.restore_profile(
+                            ctx,
+                            browser_session_id=dispatched_request["session_id"],
+                            operation_id=profile_material.preparation.request.operation_id,
+                            state=profile_material.state,
+                            limits=profile_binding.limits,
+                            current_policy=profile_binding.current_policy,
+                        )
+                    except _BrowserProfileImportRejected:
+                        await profile_binding.complete_restore(
+                            profile_material,
+                            outcome=BrowserProfileTerminalOutcome.FAILED,
+                            error_code="restore_rejected",
+                        )
+                        profile_restore_rejected = True
+                    except BaseException as failure:
+                        try:
+                            await profile_binding.complete_restore(
+                                profile_material,
+                                outcome=BrowserProfileTerminalOutcome.OUTCOME_UNKNOWN,
+                                error_code="restore_outcome_unknown",
+                            )
+                        except BaseException as settlement_failure:
+                            _raise_with_profile_settlement_failure(
+                                failure,
+                                settlement_failure,
+                                note="Browser-profile restore settlement also failed.",
+                                group_message=(
+                                    "Browser-profile restore and settlement received termination."
+                                ),
+                            )
+                        raise
+                    if not profile_restore_rejected:
+                        await profile_binding.renew_writer(profile_material)
+                        await profile_binding.complete_restore(
+                            profile_material,
+                            outcome=BrowserProfileTerminalOutcome.SUCCEEDED,
+                        )
+            if profile_restore_rejected:
+                response = BrowserBackendResponse(
+                    failure=BrowserBackendFailure("restoration_required"),
+                    allocation_disposition="retired",
+                )
+            else:
+                response = await self._backend.execute(ctx, dispatched_request)
+            if profile_binding is not None and not _browser_profile_response_is_protected(
+                response,
+                profile_material.state if profile_material is not None else BrowserProfileStateV1(),
+            ):
+                response = BrowserBackendResponse(
+                    failure=BrowserBackendFailure("policy_denied"),
+                    allocation_disposition=response.allocation_disposition,
+                )
             _apply_allocation_disposition(parent_state, dispatched_request, response)
+            if (
+                response.failure is not None
+                and response.failure.code == "outcome_ambiguous"
+                and owned_live_session is not None
+            ):
+                owned_live_session.ambiguous_lineage = True
+            if (
+                profile_binding is not None
+                and response.allocation_disposition == "retired"
+                and owned_live_session is not None
+            ):
+                try:
+                    await self._release_browser_profile_writer(owned_live_session)
+                except (BrowserProfileStoreConflict, BrowserProfileUnavailable):
+                    if not profile_authority_lost:
+                        raise
 
             if secret_snapshot is not None:
                 try:
@@ -2434,8 +2892,35 @@ class BrowserSessionTool(Tool):
                     dispatched_request,
                     response,
                 )
+            if owned_live_session is not None:
+                error_code = None
+                if isinstance(result.structured, Mapping):
+                    error_code = result.structured.get("error")
+                if error_code == "outcome_ambiguous":
+                    owned_live_session.ambiguous_lineage = True
+                if (
+                    request["operation"] != "close"
+                    and response.allocation_disposition == "live"
+                    and error_code != "outcome_ambiguous"
+                    and type(operation_id) is str
+                ):
+                    if not result.is_error:
+                        revision = (
+                            result.structured.get("revision")
+                            if isinstance(result.structured, Mapping)
+                            else None
+                        )
+                        if type(revision) is str:
+                            owned_live_session.last_settled_revision = revision
+                    if owned_live_session.last_settled_revision is not None:
+                        owned_live_session.last_operation_receipt_id = (
+                            _browser_operation_receipt_id(operation_id, fingerprint)
+                        )
+                        owned_live_session.last_operation_fingerprint = fingerprint
         except BaseException as failure:
             _invalidate_session_refs(parent_state, dispatched_request)
+            if owned_live_session is not None:
+                owned_live_session.ambiguous_lineage = True
             result = _error_result(
                 "outcome_ambiguous",
                 dispatch="acknowledgement_lost",
@@ -2456,6 +2941,7 @@ class BrowserSessionTool(Tool):
                     request=dispatched_request,
                     fingerprint=fingerprint,
                     result=result,
+                    allocation_disposition="uncertain",
                     parent_state=parent_state,
                     expected_parent=durable_parent_dispatched,
                     durable_parent_state=durable_parent_state,
@@ -2493,12 +2979,35 @@ class BrowserSessionTool(Tool):
                 expected_parent=durable_parent_dispatched,
                 durable_parent_state=durable_parent_state,
             )
+            # Publication reconstructs the public session from sealed evidence.
+            # Any subsequent checkpoint must retain its retry owner on that
+            # authoritative live session, not the superseded local instance.
+            owned_live_session = parent_state.sessions.get(dispatched_request["session_id"])
         if operation_id is not None:
             operation_records[operation_id] = _OperationRecord(
                 fingerprint,
                 result,
                 current_invocation_identity,
             )
+        if (
+            profile_binding is not None
+            and owned_live_session is not None
+            and request["operation"] != "close"
+            and response.allocation_disposition == "live"
+            and not (
+                isinstance(result.structured, Mapping)
+                and result.structured.get("error") == "outcome_ambiguous"
+            )
+            and profile_binding.checkpoint_policy
+            is BrowserProfileCheckpointPolicy.AFTER_TERMINAL_OPERATION
+        ):
+            try:
+                await self._checkpoint_browser_profile(ctx, owned_live_session)
+            except BaseException as failure:
+                if isinstance(failure, asyncio.CancelledError) or _failure_contains_process_control(
+                    failure
+                ):
+                    raise
         return result
 
     async def _reconcile_dispatched_operation(
@@ -2523,6 +3032,34 @@ class BrowserSessionTool(Tool):
                 return fallback
             if secret_snapshot.redactor.has_values:
                 return fallback
+        profile_binding = self.browser_profile
+        profile_session: _LiveSession | None = None
+        if profile_binding is not None:
+            browser_session_id = request.get("session_id")
+            allocation_authority = _live_browser_allocation_authority(ctx, durable_authority)
+            if type(browser_session_id) is not str or allocation_authority is None:
+                return fallback
+            existing_session = parent_state.sessions.get(browser_session_id)
+            profile_session = existing_session or _LiveSession(
+                allocation_authority=allocation_authority
+            )
+            if (
+                _live_browser_allocation_failure(
+                    profile_session.allocation_authority,
+                    allocation_authority,
+                )
+                is not None
+            ):
+                return fallback
+            if not await self._resume_browser_profile_writer(
+                ctx,
+                profile_session,
+                browser_session_id=browser_session_id,
+                durable_authority=durable_authority,
+            ):
+                return fallback
+            if existing_session is None:
+                parent_state.sessions[browser_session_id] = profile_session
         try:
             response = await self._backend.reconcile(ctx, request)
         except BaseException as failure:
@@ -2540,7 +3077,29 @@ class BrowserSessionTool(Tool):
             }
         ):
             return fallback
+        profile_material = None if profile_session is None else profile_session.profile_material
+        if profile_binding is not None and not _browser_profile_response_is_protected(
+            response,
+            profile_material.state if profile_material is not None else BrowserProfileStateV1(),
+        ):
+            response = BrowserBackendResponse(
+                failure=BrowserBackendFailure("policy_denied"),
+                allocation_disposition=response.allocation_disposition,
+            )
         _apply_allocation_disposition(parent_state, request, response)
+        if (
+            profile_binding is not None
+            and response.allocation_disposition == "retired"
+            and profile_session is not None
+        ):
+            try:
+                await self._release_browser_profile_writer(profile_session)
+            except BaseException as failure:
+                if isinstance(failure, asyncio.CancelledError) or _failure_contains_process_control(
+                    failure
+                ):
+                    raise
+                return fallback
         if secret_snapshot is not None:
             try:
                 current_secret_snapshot = active_secret_redactor_snapshot(ctx)
@@ -2561,6 +3120,34 @@ class BrowserSessionTool(Tool):
                 result = await self._project_response(ctx, parent_state, request, response)
         else:
             result = await self._project_response(ctx, parent_state, request, response)
+        operation_id = request.get("operation_id")
+        live_session = parent_state.sessions.get(request["session_id"])
+        if profile_binding is not None and live_session is not None:
+            error_code = None
+            if isinstance(result.structured, Mapping):
+                error_code = result.structured.get("error")
+            if error_code == "outcome_ambiguous":
+                live_session.ambiguous_lineage = True
+            if (
+                request["operation"] != "close"
+                and response.allocation_disposition == "live"
+                and error_code != "outcome_ambiguous"
+                and type(operation_id) is str
+            ):
+                if not result.is_error:
+                    revision = (
+                        result.structured.get("revision")
+                        if isinstance(result.structured, Mapping)
+                        else None
+                    )
+                    if type(revision) is str:
+                        live_session.last_settled_revision = revision
+                if live_session.last_settled_revision is not None:
+                    live_session.last_operation_receipt_id = _browser_operation_receipt_id(
+                        operation_id,
+                        fingerprint,
+                    )
+                    live_session.last_operation_fingerprint = fingerprint
         raw_parent = await durable_authority.load_durable_operation(_DURABLE_BROWSER_PARENT_KEY)
         try:
             durable_parent_state, failure = _validate_durable_browser_parent_record(
@@ -2587,7 +3174,6 @@ class BrowserSessionTool(Tool):
             expected_parent=raw_parent,
             durable_parent_state=durable_parent_state,
         )
-        operation_id = request.get("operation_id")
         if type(operation_id) is str:
             operation_records[operation_id] = _OperationRecord(
                 fingerprint,
@@ -2599,7 +3185,240 @@ class BrowserSessionTool(Tool):
                     fingerprint=fingerprint,
                 ),
             )
+        settled_session = parent_state.sessions.get(request["session_id"])
+        if (
+            profile_binding is not None
+            and settled_session is not None
+            and request["operation"] != "close"
+            and response.allocation_disposition == "live"
+            and not (
+                isinstance(result.structured, Mapping)
+                and result.structured.get("error") == "outcome_ambiguous"
+            )
+            and profile_binding.checkpoint_policy
+            is BrowserProfileCheckpointPolicy.AFTER_TERMINAL_OPERATION
+        ):
+            try:
+                await self._checkpoint_browser_profile(ctx, settled_session)
+            except BaseException as failure:
+                if isinstance(failure, asyncio.CancelledError) or _failure_contains_process_control(
+                    failure
+                ):
+                    raise
         return result
+
+    async def _checkpoint_browser_profile(
+        self,
+        ctx: ToolContext,
+        session: _LiveSession,
+        *,
+        trigger_operation_id: str | None = None,
+    ) -> bool:
+        """Checkpoint one positively settled revision without exposing profile state."""
+
+        binding = self.browser_profile
+        material = session.profile_material
+        if (
+            binding is None
+            or material is None
+            or session.last_settled_revision is None
+            or session.last_operation_receipt_id is None
+            or session.last_operation_fingerprint is None
+        ):
+            return False
+        await self._reconcile_pending_profile_checkpoint(session)
+        checkpoint_identity = session.last_operation_receipt_id
+        if trigger_operation_id is not None:
+            checkpoint_identity = f"{checkpoint_identity}\0{trigger_operation_id}"
+        checkpoint_operation_id = _browser_profile_operation_id(
+            "checkpoint",
+            browser_session_id=material.preparation.request.browser_session_id,
+            operation_id=checkpoint_identity,
+        )
+        session.pending_profile_checkpoint_id = checkpoint_operation_id
+        existing = await binding.reconcile_checkpoint(checkpoint_operation_id, material=material)
+        session.pending_profile_checkpoint_id = None
+        if existing is not None:
+            return existing.outcome is BrowserProfileTerminalOutcome.SUCCEEDED
+        await binding.renew_writer(material)
+        plan = await binding.reserve_checkpoint(
+            material=material,
+            operation_id=checkpoint_operation_id,
+            source_revision=session.last_settled_revision,
+            source_operation_receipt_id=session.last_operation_receipt_id,
+            source_operation_fingerprint=session.last_operation_fingerprint,
+            ambiguous_lineage=session.ambiguous_lineage,
+        )
+        backend = self._backend
+        if type(backend) is not _RunnerBrowserSessionBackend:
+            raise BrowserProfileUnavailable("Browser profile export is unavailable.")
+        try:
+            state = await backend.capture_profile(
+                ctx,
+                browser_session_id=material.preparation.request.browser_session_id,
+                operation_id=checkpoint_operation_id,
+                limits=binding.limits,
+                current_policy=binding.current_policy,
+            )
+            session.pending_profile_checkpoint_id = checkpoint_operation_id
+            await binding.publish_checkpoint(plan, state)
+            session.pending_profile_checkpoint_id = None
+        except BaseException as failure:
+            try:
+                reconciled = await binding.reconcile_checkpoint(
+                    checkpoint_operation_id, material=material
+                )
+            except BaseException as reconciliation_failure:
+                _raise_with_profile_settlement_failure(
+                    failure,
+                    reconciliation_failure,
+                    note="Browser-profile checkpoint reconciliation also failed.",
+                    group_message=(
+                        "Browser-profile checkpoint and reconciliation received termination."
+                    ),
+                )
+            if (
+                reconciled is not None
+                and reconciled.outcome is BrowserProfileTerminalOutcome.SUCCEEDED
+            ):
+                session.pending_profile_checkpoint_id = None
+                if isinstance(failure, asyncio.CancelledError) or _failure_contains_process_control(
+                    failure
+                ):
+                    raise failure
+                return True
+            outcome = (
+                BrowserProfileTerminalOutcome.OUTCOME_UNKNOWN
+                if isinstance(
+                    failure,
+                    (asyncio.CancelledError, _BrowserProfileChildCancellation),
+                )
+                or _failure_contains_process_control(failure)
+                else BrowserProfileTerminalOutcome.FAILED
+            )
+            error_code = (
+                "checkpoint_outcome_unknown"
+                if outcome is BrowserProfileTerminalOutcome.OUTCOME_UNKNOWN
+                else "checkpoint_failed"
+            )
+            try:
+                await binding.fail_checkpoint(
+                    plan,
+                    outcome=outcome,
+                    error_code=error_code,
+                )
+                session.pending_profile_checkpoint_id = None
+            except BaseException as settlement_failure:
+                _raise_with_profile_settlement_failure(
+                    failure,
+                    settlement_failure,
+                    note="Browser-profile checkpoint failure settlement also failed.",
+                    group_message=(
+                        "Browser-profile checkpoint and failure settlement received termination."
+                    ),
+                )
+            if outcome is BrowserProfileTerminalOutcome.OUTCOME_UNKNOWN:
+                raise
+            return False
+        return True
+
+    async def _reconcile_pending_profile_checkpoint(self, session: _LiveSession) -> None:
+        """Retry only the owned checkpoint's publication/adoption, never recapture."""
+
+        operation_id = session.pending_profile_checkpoint_id
+        binding = self.browser_profile
+        material = session.profile_material
+        if operation_id is None:
+            return
+        if binding is None or material is None:
+            raise BrowserProfileUnavailable("Browser profile checkpoint authority is unavailable.")
+        await binding.reconcile_checkpoint(operation_id, material=material)
+        session.pending_profile_checkpoint_id = None
+
+    async def _release_browser_profile_writer(self, session: _LiveSession | None) -> None:
+        binding = self.browser_profile
+        if binding is None or session is None or session.profile_material is None:
+            return
+        await binding.release_writer(session.profile_material)
+
+    async def _resume_browser_profile_writer(
+        self,
+        ctx: ToolContext,
+        session: _LiveSession,
+        *,
+        browser_session_id: str,
+        durable_authority: Any,
+    ) -> bool:
+        """Reconstruct one exact writer and settle any interrupted private restore."""
+
+        binding = self.browser_profile
+        if binding is None:
+            return True
+        if session.profile_material is not None:
+            try:
+                await self._reconcile_pending_profile_checkpoint(session)
+            except (BrowserProfileStoreConflict, BrowserProfileUnavailable):
+                return False
+            return True
+        try:
+            material = await binding.resume_writer(
+                execution_profile_fingerprint=(durable_authority.execution_profile_fingerprint),
+                allocation_fingerprint=(durable_authority.environment_allocation_fingerprint),
+                browser_session_id=browser_session_id,
+            )
+        except (BrowserProfileStoreConflict, BrowserProfileUnavailable):
+            return False
+        session.profile_material = material
+        if material.preparation.existing_receipt is not None:
+            return True
+        if type(self._backend) is not _RunnerBrowserSessionBackend:
+            await binding.complete_restore(
+                material,
+                outcome=BrowserProfileTerminalOutcome.FAILED,
+                error_code="profile_incompatible",
+            )
+            return False
+        try:
+            await self._backend.restore_profile(
+                ctx,
+                browser_session_id=browser_session_id,
+                operation_id=material.preparation.request.operation_id,
+                state=material.state,
+                limits=binding.limits,
+                current_policy=binding.current_policy,
+            )
+        except _BrowserProfileImportRejected:
+            await binding.complete_restore(
+                material,
+                outcome=BrowserProfileTerminalOutcome.FAILED,
+                error_code="restore_rejected",
+            )
+            return False
+        except BaseException as failure:
+            try:
+                await binding.complete_restore(
+                    material,
+                    outcome=BrowserProfileTerminalOutcome.OUTCOME_UNKNOWN,
+                    error_code="restore_outcome_unknown",
+                )
+            except BaseException as settlement_failure:
+                _raise_with_profile_settlement_failure(
+                    failure,
+                    settlement_failure,
+                    note="Browser-profile restore recovery settlement also failed.",
+                    group_message=("Browser-profile recovery and settlement received termination."),
+                )
+            if isinstance(failure, asyncio.CancelledError) or _failure_contains_process_control(
+                failure
+            ):
+                raise
+            return False
+        await binding.renew_writer(material)
+        await binding.complete_restore(
+            material,
+            outcome=BrowserProfileTerminalOutcome.SUCCEEDED,
+        )
+        return True
 
     async def _restore_durable_session(
         self,
@@ -2631,6 +3450,26 @@ class BrowserSessionTool(Tool):
             return _error_result(failure, dispatch="not_started")
         if restored is None:  # pragma: no cover - paired result invariant
             return _error_result("restoration_required", dispatch="not_started")
+        if self.browser_profile is not None:
+            if not await self._resume_browser_profile_writer(
+                ctx,
+                restored,
+                browser_session_id=browser_session_id,
+                durable_authority=durable_authority,
+            ):
+                return _error_result("restoration_required", dispatch="not_started")
+            if (
+                self.browser_profile.checkpoint_policy
+                is BrowserProfileCheckpointPolicy.AFTER_TERMINAL_OPERATION
+            ):
+                try:
+                    await self._checkpoint_browser_profile(ctx, restored)
+                except BaseException as checkpoint_failure:
+                    if isinstance(
+                        checkpoint_failure,
+                        asyncio.CancelledError,
+                    ) or _failure_contains_process_control(checkpoint_failure):
+                        raise
         parent_state.sessions[browser_session_id] = restored
         return None
 
@@ -2741,6 +3580,14 @@ class BrowserSessionTool(Tool):
                 },
             )
             if sealed_live is not None:
+                if live is not None:
+                    # Durable publication rebuilds the public page/session
+                    # authority from sealed JSON.  The active profile writer
+                    # is an in-process capability and must remain attached to
+                    # that exact authenticated allocation; it is never
+                    # serialized into the durable session record.
+                    sealed_live.profile_material = live.profile_material
+                    sealed_live.pending_profile_checkpoint_id = live.pending_profile_checkpoint_id
                 parent_state.sessions[session_id] = sealed_live
         except Exception:
             return _error_result(
@@ -3732,6 +4579,28 @@ def _failure_contains_process_control(failure: BaseException) -> bool:
     return _failure_tree_contains(failure, (GeneratorExit, KeyboardInterrupt, SystemExit))
 
 
+def _raise_with_profile_settlement_failure(
+    primary: BaseException,
+    settlement_failure: BaseException,
+    *,
+    note: str,
+    group_message: str,
+) -> None:
+    """Keep newly delivered termination visible without replacing the primary."""
+
+    primary.add_note(note)
+    if _failure_tree_contains(
+        settlement_failure,
+        (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit),
+    ):
+        settlement_failure.__context__ = None
+        raise BaseExceptionGroup(
+            group_message,
+            [primary, settlement_failure],
+        ) from None
+    raise primary from settlement_failure
+
+
 def _browser_session_response_envelope_limit(
     *,
     max_artifact_bytes: int,
@@ -4114,6 +4983,77 @@ def _browser_operation_id_sha256(operation_id: str) -> str:
     return hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
 
 
+def _browser_profile_operation_id(
+    kind: str,
+    *,
+    browser_session_id: str,
+    operation_id: str,
+) -> str:
+    digest = hashlib.sha256(
+        b"cayu.browser-profile-operation.v1\0"
+        + kind.encode("ascii")
+        + b"\0"
+        + browser_session_id.encode("utf-8")
+        + b"\0"
+        + operation_id.encode("utf-8")
+    ).hexdigest()
+    return f"bpo_{digest}"
+
+
+def _browser_profile_response_is_protected(
+    response: BrowserBackendResponse,
+    state: BrowserProfileStateV1,
+) -> bool:
+    # Page summaries include background pages and error paths. The profile
+    # worker omits their text/URLs, even when no observation is returned.
+    if response.page_set is not None and any(
+        page.title is not None or page.url is not None for page in response.page_set.pages
+    ):
+        return False
+    return response.observation is None or (
+        response.profile_output_protected
+        and not _browser_profile_observation_contains_private_value(response.observation, state)
+    )
+
+
+def _browser_profile_observation_contains_private_value(
+    observation: BrowserBackendObservation,
+    state: BrowserProfileStateV1,
+) -> bool:
+    """Defensively reject restored values echoed by a purportedly guarded worker."""
+
+    private_values = {
+        candidate for item in state.cookies for candidate in (item.name, item.value) if candidate
+    }
+    private_values.update(
+        candidate
+        for origin in state.origins
+        for entry in origin.local_storage
+        for candidate in (entry.name, entry.value)
+        if candidate
+    )
+    if not private_values:
+        return False
+    model_visible = [
+        observation.url,
+        observation.title or "",
+        observation.snapshot,
+        *(item.role for item in observation.refs),
+        *(item.name for item in observation.refs),
+    ]
+    return any(secret in value for secret in private_values for value in model_visible)
+
+
+def _browser_operation_receipt_id(operation_id: str, fingerprint: str) -> str:
+    digest = hashlib.sha256(
+        b"cayu.browser-operation-receipt.v1\0"
+        + operation_id.encode("utf-8")
+        + b"\0"
+        + fingerprint.encode("ascii")
+    ).hexdigest()
+    return f"bor_{digest}"
+
+
 def _is_sha256_hexdigest(value: object) -> bool:
     return (
         type(value) is str
@@ -4454,6 +5394,14 @@ def _browser_session_record(
             "browser_session_id": browser_session_id,
             "page_set": page_set.model_dump(mode="json"),
             "page_authorities": page_authorities,
+            "profile_ambiguous_lineage": (False if live is None else live.ambiguous_lineage),
+            "profile_last_settled_revision": (None if live is None else live.last_settled_revision),
+            "profile_last_operation_receipt_id": (
+                None if live is None else live.last_operation_receipt_id
+            ),
+            "profile_last_operation_fingerprint": (
+                None if live is None else live.last_operation_fingerprint
+            ),
         },
         "browser_session_record",
     )
@@ -4486,6 +5434,40 @@ def _validate_durable_browser_session_record(
     state = copied.get("state")
     if state == "closed":
         return None, "session_closed"
+    profile_ambiguous_lineage = copied.get("profile_ambiguous_lineage", False)
+    profile_last_settled_revision = copied.get("profile_last_settled_revision")
+    profile_last_operation_receipt_id = copied.get("profile_last_operation_receipt_id")
+    profile_last_operation_fingerprint = copied.get("profile_last_operation_fingerprint")
+    if (
+        type(profile_ambiguous_lineage) is not bool
+        or (
+            profile_last_settled_revision is not None
+            and (
+                type(profile_last_settled_revision) is not str
+                or len(profile_last_settled_revision) > _MAX_BROWSER_ID_LENGTH
+                or _SAFE_ID.fullmatch(profile_last_settled_revision) is None
+            )
+        )
+        or (
+            profile_last_operation_receipt_id is not None
+            and (
+                type(profile_last_operation_receipt_id) is not str
+                or len(profile_last_operation_receipt_id) != 68
+                or not profile_last_operation_receipt_id.startswith("bor_")
+                or not _is_sha256_hexdigest(profile_last_operation_receipt_id[4:])
+            )
+        )
+        or (
+            profile_last_operation_fingerprint is not None
+            and not _is_sha256_hexdigest(profile_last_operation_fingerprint)
+        )
+        or ((profile_last_settled_revision is None) != (profile_last_operation_receipt_id is None))
+        or (
+            (profile_last_operation_receipt_id is None)
+            != (profile_last_operation_fingerprint is None)
+        )
+    ):
+        return None, "restoration_required"
     raw_page_set = copied.get("page_set")
     raw_authorities = copied.get("page_authorities")
     if state not in {"live", "uncertain"} or type(raw_authorities) is not list:
@@ -4556,6 +5538,10 @@ def _validate_durable_browser_session_record(
                 environment_name=cast("str | None", copied["environment_name"]),
                 allocation_fingerprint=cast("str", copied["allocation_fingerprint"]),
             ),
+            ambiguous_lineage=profile_ambiguous_lineage,
+            last_settled_revision=profile_last_settled_revision,
+            last_operation_receipt_id=profile_last_operation_receipt_id,
+            last_operation_fingerprint=profile_last_operation_fingerprint,
         ),
         None,
     )
@@ -4739,6 +5725,9 @@ def _parse_runner_response(
     ):
         return BrowserBackendResponse(failure=BrowserBackendFailure("browser_crash"))
     try:
+        profile_output_protected = raw.get("profile_output_protected", False)
+        if type(profile_output_protected) is not bool:
+            raise ValueError("Browser profile output protection evidence is invalid.")
         observation = (
             None
             if raw_observation is None
@@ -4786,9 +5775,152 @@ def _parse_runner_response(
                 'Literal["live", "retired", "uncertain"]',
                 allocation_disposition,
             ),
+            profile_output_protected=profile_output_protected,
         )
     except (ValueError, RecursionError):
         return BrowserBackendResponse(failure=BrowserBackendFailure("browser_crash"))
+
+
+def _parse_profile_checkpoint_response(
+    stdout: str,
+    *,
+    limits: BrowserProfileLimits,
+    current_policy: BrowserProfileDestinationPolicy,
+) -> BrowserProfileStateV1:
+    """Own one private guest export without reflecting credential-bearing input."""
+
+    raw: object = None
+    safe_failure: BrowserProfileUnavailable | None = None
+    try:
+        if len(stdout.encode("utf-8")) > 7 * limits.max_plaintext_bytes + 4_096:
+            raise ValueError("profile export is too large")
+        raw = json.loads(stdout)
+        if type(raw) is not dict or set(raw) != {
+            "protocol_version",
+            "worker_version",
+            "playwright_version",
+            "kind",
+            "allocation_disposition",
+            "profile_state",
+        }:
+            raise ValueError("profile export shape is invalid")
+        if (
+            raw.get("protocol_version") != BROWSER_SESSION_PROTOCOL_VERSION
+            or raw.get("worker_version") != BROWSER_SESSION_WORKER_VERSION
+            or raw.get("playwright_version") != BROWSER_FETCH_PLAYWRIGHT_VERSION
+            or raw.get("kind") != "profile_checkpoint"
+            or raw.get("allocation_disposition") != "live"
+        ):
+            raise ValueError("profile export identity is invalid")
+        return browser_profile_state_from_playwright(
+            raw.get("profile_state"),
+            limits=limits,
+            current_policy=current_policy,
+        )
+    except (TypeError, ValueError, UnicodeError, RecursionError) as failure:
+        _clear_private_profile_parse_failure(failure)
+        raw = None
+        stdout = ""
+        safe_failure = BrowserProfileUnavailable("Browser profile export is malformed.")
+    if safe_failure is not None:
+        safe_failure.__cause__ = None
+        safe_failure.__context__ = None
+        raise safe_failure from None
+    raise AssertionError("Browser profile export parsing lost its terminal result.")
+
+
+def _clear_private_profile_parse_failure(error: BaseException) -> None:
+    """Drop completed guest-parser frames that may retain profile plaintext."""
+
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        traceback = current.__traceback__
+        while traceback is not None:
+            next_traceback = traceback.tb_next
+            with suppress(RuntimeError):
+                traceback.tb_frame.clear()
+            traceback = next_traceback
+        current.__traceback__ = None
+        current.__cause__ = None
+        current.__context__ = None
+
+
+def _parse_profile_restore_response(stdout: str) -> None:
+    """Validate only positive private import evidence from the pinned guest."""
+
+    raw: object = None
+    safe_failure: BrowserProfileUnavailable | None = None
+    try:
+        if len(stdout.encode("utf-8")) > 4_096:
+            raise ValueError("profile import response is too large")
+        raw = json.loads(stdout)
+        if type(raw) is not dict:
+            raise ValueError("profile import response shape is invalid")
+        if raw.get("kind") == "error":
+            if (
+                set(raw)
+                == {
+                    "protocol_version",
+                    "worker_version",
+                    "playwright_version",
+                    "kind",
+                    "allocation_disposition",
+                    "error",
+                }
+                and raw.get("protocol_version") == BROWSER_SESSION_PROTOCOL_VERSION
+                and raw.get("worker_version") == BROWSER_SESSION_WORKER_VERSION
+                and raw.get("playwright_version") == BROWSER_FETCH_PLAYWRIGHT_VERSION
+                and raw.get("allocation_disposition") == "retired"
+                and raw.get("error") in _BACKEND_FAILURE_CODES
+            ):
+                raise _BrowserProfileImportRejected(
+                    "Browser profile import was rejected before a live allocation remained."
+                )
+            raise ValueError("profile import failure evidence is invalid")
+        if set(raw) != {
+            "protocol_version",
+            "worker_version",
+            "playwright_version",
+            "kind",
+            "allocation_disposition",
+            "profile_restored",
+        }:
+            raise ValueError("profile import response shape is invalid")
+        if (
+            raw.get("protocol_version") != BROWSER_SESSION_PROTOCOL_VERSION
+            or raw.get("worker_version") != BROWSER_SESSION_WORKER_VERSION
+            or raw.get("playwright_version") != BROWSER_FETCH_PLAYWRIGHT_VERSION
+            or raw.get("kind") != "profile_restore"
+            or raw.get("allocation_disposition") != "live"
+            or raw.get("profile_restored") is not True
+        ):
+            raise ValueError("profile import response identity is invalid")
+        return
+    except _BrowserProfileImportRejected:
+        raw = None
+        stdout = ""
+        raise
+    except (TypeError, ValueError, UnicodeError, RecursionError) as failure:
+        _clear_private_profile_parse_failure(failure)
+        raw = None
+        stdout = ""
+        safe_failure = BrowserProfileUnavailable("Browser profile import is malformed.")
+    if safe_failure is not None:
+        safe_failure.__cause__ = None
+        safe_failure.__context__ = None
+        raise safe_failure from None
+    raise AssertionError("Browser profile import parsing lost its terminal result.")
 
 
 def _bounded_identifier(value: object, field_name: str, *, maximum: int) -> str:

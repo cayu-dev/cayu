@@ -8865,6 +8865,57 @@ full process/VM snapshot when the live allocation is gone. See
 `docs/browser-session.md` for the precise reconnect, restoration, reload, and
 replay terminology.
 
+Applications may separately bind one opaque browser-profile authority to the
+pinned interactive tool. This mode uses a dedicated `BrowserProfileStore` and
+application-owned key authority; it is not SessionStore, ArtifactStore,
+Workspace, environment, or model authority. Schema v1 persists only bounded
+Secure exact-host cookies and bounded `localStorage` for explicitly admitted
+HTTPS origins. Unknown fields/categories and any state outside the current
+origin policy fail closed. The recorded policy may be narrowed but never
+widened. Encrypted envelopes use fresh AES-256-GCM nonces and AAD binding the
+profile/scope, recorded destination policy, protocol/worker/state schema,
+generation, key/store identities, and content lengths.
+
+One durable finite writer lease binds the restored generation, exact execution
+profile, allocation fingerprint, and fresh browser-session identity. The store
+loads ownership, samples its clock, validates the lease, and commits each writer
+admission, renewal, and profile-publication mutation within one write lock or
+transaction. Direct failed settlement requires the exact live lease; release and
+revocation can close or fence exact authority without treating an expired lease
+as live, and later writer admission records an unsettled expired operation as
+`outcome_unknown`. Restart reconstruction atomically renews the exact live writer
+before guest replay or import. Import occurs before a browser context creates a
+page or executes an untrusted body.
+Checkpoint policy is application/runtime-owned and may run after a settled
+terminal browser operation or before close; the model cannot request it. The
+store records capacity before export, stages a complete validated encrypted
+generation, and publishes by compare-and-swap against the restored generation.
+The prior generation remains authoritative until commit; exact readback adopts
+a committed replacement after acknowledgement loss. Receipts bind the source
+revision and operation lineage, including unresolved ambiguity. Expiry or
+revocation prevents new profile authority but does not imply deletion from an
+already-loaded allocation.
+
+Before each textual observation, the pinned profile-aware worker re-reads the
+current cookie/local-storage subset and omits page-derived text or refs that
+would expose a current or previously observed profile value. A profile-bound
+tool rejects screenshots and downloads before dispatch because binary captures
+have no sound redaction boundary. The cumulative anti-reflection history remains
+within the configured plaintext byte ceiling and one complete profile's
+category-count ceiling; exhausting either bound makes later textual observations
+fail closed while preserving the explicit close path.
+
+Profile restoration creates a new allocation, browser session, page, revision,
+and ref namespace. It never restores the old URL, page, refs, pending operation,
+or result, and it does not prove that a site login remains valid. The first
+model-visible state requires an explicit new navigation/observation. This is
+distinct from reconnecting the exact live allocation, reloading a page,
+replaying an operation, or snapshotting a process/VM. Full process/environment
+snapshotting remains unsupported. Safe inspection contains opaque identity,
+fingerprints, counts, sizes, timestamps, writer status, and fixed receipt/error
+codes only. See `docs/browser-session.md` for setup and the complete lifecycle
+contract.
+
 Tool policy authorizes a model call, and URL validation bounds the requested
 destination, but neither is a process or network-isolation boundary. Only the
 selected adapter's execution location and the admitted environment establish
