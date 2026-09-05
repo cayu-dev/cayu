@@ -1385,12 +1385,12 @@ class _MissingProfileAfterRecoveryClaimStore(InMemorySessionStore):
         self.corrupted_after_claim_renewal = False
         self.generic_run_fence_release_calls = 0
 
-    async def transform_checkpoint(
+    async def transform_checkpoint_with_store_time(
         self,
         session_id: str,
         checkpoint_transform,
     ) -> None:
-        await super().transform_checkpoint(session_id, checkpoint_transform)
+        await super().transform_checkpoint_with_store_time(session_id, checkpoint_transform)
         checkpoint = await InMemorySessionStore.load_checkpoint(self, session_id)
         claim = (
             None
@@ -2529,6 +2529,20 @@ def test_incomplete_recovery_cleanup_rejects_missing_profile_after_claim() -> No
             interaction_id=f"interaction-{uuid4().hex}",
             profile=_profile(),
         )
+        start_event = command.interaction_started_event
+        command = command.model_copy(
+            update={
+                "interaction_started_event": start_event.model_copy(
+                    update={
+                        "payload": {
+                            "status": "active",
+                            "start_event_id": start_event.id,
+                            "started_at": start_event.timestamp.isoformat(),
+                        },
+                    }
+                ),
+            }
+        )
         created = await store.apply_invocation_lifecycle_command(command)
         assert type(created) is InvocationMutationResult
         await store.update_status(session_id, SessionStatus.COMPLETED)
@@ -3286,3 +3300,42 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
             ),
             validated_profile=active.profile,
         )
+
+    from cayu.runtime._environment_lifecycle import (
+        _ActiveEnvironmentSetup,
+        _advance_cleanup_environment,
+        _retain_cleanup_invocation_context,
+    )
+
+    owner = _ActiveEnvironmentSetup(
+        registered_environment,
+        invocation_context=environment_context,
+    )
+    bound_environment = replace(registered_environment)
+    _advance_cleanup_environment(owner, bound_environment)
+    retained = owner.invocation_context
+    assert retained is not None
+
+    # A separately authenticated context with the old environment does not own
+    # this cleanup, even if all of its other authority values agree.
+    other_context = _authenticated_invocation_context(
+        active_profile=environment_context.active_profile,
+        binding=environment_context.binding,
+        validated_profile=environment_context.profile,
+        registered_agent=registered_agent,
+        registered_provider=registered_provider,
+        registered_environment=registered_environment,
+        runtime_hooks=app._runtime_hooks,
+        loop_policies=app._loop_policies,
+        request_loop_policies=(),
+        budget_policy=app.budget_policy,
+        tool_capability_ceiling=environment_context.tool_capability_ceiling,
+    )
+    with pytest.raises(RuntimeError, match="does not own the retained environment"):
+        _retain_cleanup_invocation_context(owner, other_context)
+    assert owner.invocation_context is retained
+
+    _retain_cleanup_invocation_context(owner, environment_context)
+    assert owner.invocation_context is not None
+    assert owner.invocation_context.registered_environment is bound_environment
+    assert owner.invocation_context.binding is environment_context.binding

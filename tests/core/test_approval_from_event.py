@@ -152,3 +152,40 @@ def test_from_event_rejects_missing_approval_payload() -> None:
     event = Event(type=EventType.TOOL_CALL_APPROVAL_REQUESTED, payload={}, session_id="s")
     with pytest.raises(ValueError, match="approval"):
         PendingToolApproval.from_event(event)
+
+
+@pytest.mark.parametrize("publish_arguments", [False, True])
+def test_pending_approval_payload_is_stable_at_terminal_publication(
+    publish_arguments: bool,
+) -> None:
+    from cayu.runtime._approval_support import bounded_pending_approval_event_payload
+    from cayu.runtime._event_projection import prepare_new_runtime_event
+    from cayu.vaults import SecretRedactor
+
+    pending = _pending().model_copy(
+        update={
+            "publish_arguments": publish_arguments,
+            "secret_resolution_scope": "static",
+            "arguments": {"private": "root argument"},
+            "tool_calls": [
+                PendingToolCallApproval(
+                    tool_call_id="call_1",
+                    tool_name="send_email",
+                    arguments={"private": "nested argument"},
+                )
+            ],
+        }
+    )
+    payload = bounded_pending_approval_event_payload(pending, redactor=SecretRedactor())
+    event = Event(
+        type=EventType.SESSION_INTERRUPTED,
+        session_id="sess_1",
+        agent_name="assistant",
+        payload=payload,
+    )
+    prepared = prepare_new_runtime_event(event, redactor=SecretRedactor())
+    assert prepared.payload["approval"] == payload["approval"]
+    assert "arguments" not in payload["approval"]
+    assert "arguments" not in payload["approval"]["tool_calls"][0]
+    assert pending.arguments == {"private": "root argument"}
+    assert pending.tool_calls[0].arguments == {"private": "nested argument"}

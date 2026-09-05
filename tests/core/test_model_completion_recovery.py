@@ -18,6 +18,7 @@ from cayu.core.messages import ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
+    DEFAULT_MAX_STEPS,
     BudgetLimit,
     BudgetReservation,
     CayuApp,
@@ -40,6 +41,7 @@ from cayu.runtime import (
     RecoveryPlanRequest,
     RecoveryPlanSelection,
     ResumeRequest,
+    RetryPolicy,
     RunLimits,
     RunRequest,
     Session,
@@ -237,7 +239,7 @@ def _test_execution_profile(
         process_identity=profile_app._execution_profile_process_identity,
         registered_provider=profile_app._providers[provider_name],
         finalization=execution_profile_admission.model_finalization_material(
-            max_steps=16,
+            max_steps=DEFAULT_MAX_STEPS,
             limits=RunLimits() if limits is None else limits,
             retry_policy=profile_app._effective_retry_policy(None),
         ),
@@ -480,6 +482,7 @@ async def _stage_completed_model_boundary(
         "source_transcript_cursor": source_cursor,
         "request_fingerprint": "0" * 64,
         "recovery_context": ModelCompletionRecoveryContext(
+            max_steps=DEFAULT_MAX_STEPS,
             execution_profile_fingerprint=execution_profile.fingerprint,
             tool_exposure=(_test_tool_exposure_authority(tool_name) if with_tool_call else None),
         ).model_dump(mode="json"),
@@ -549,6 +552,10 @@ async def _stage_completed_model_boundary(
             policy_outcomes=None,
             structured_output=None,
             tool_round_identity=tool_round_identity,
+            max_steps=DEFAULT_MAX_STEPS,
+            limits=RunLimits() if limits is None else limits,
+            budget_limits=(),
+            retry_policy=RetryPolicy(),
             source_model_step_id=logical_step_id,
             source_transcript_cursor=source_cursor,
             model_step=1,
@@ -749,6 +756,7 @@ async def _stage_in_flight_model_boundary(
                 "source_transcript_cursor": 1,
                 "request_fingerprint": "1" * 64,
                 "recovery_context": ModelCompletionRecoveryContext(
+                    max_steps=DEFAULT_MAX_STEPS,
                     interaction_id=interaction_id,
                     execution_profile_fingerprint=execution_profile.fingerprint,
                     budget_reservations=budget_reservations,

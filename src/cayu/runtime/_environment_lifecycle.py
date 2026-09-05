@@ -428,6 +428,7 @@ class _ActiveEnvironmentSetup:
     disposal_recovery_factory: EnvironmentFactory | None = field(default=None, repr=False)
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = field(default=None, repr=False)
+    cleanup_predecessor_context: InvocationContext | None = field(default=None, repr=False)
     cleanup_started: bool = False
     cleanup_finished: bool = False
     prebind_release_tombstone: bool = False
@@ -468,6 +469,17 @@ def _retain_cleanup_invocation_context(
     if type(invocation_context) is not InvocationContext:
         raise TypeError("invocation_context must be an InvocationContext.")
     current = owner.invocation_context
+    if (
+        invocation_context is owner.cleanup_predecessor_context
+        and invocation_context.registered_environment is not owner.registered_environment
+    ):
+        # Setup may advance to a bound or released environment before raising.
+        # Its unwinding caller still holds this exact frozen predecessor. Carry
+        # only that known context forward, then revalidate all invocation authority.
+        invocation_context = invocation_context.with_registered_environment(
+            owner.registered_environment,
+            validated_profile=invocation_context.profile,
+        )
     if current is invocation_context:
         return
     if current is not None:
@@ -527,6 +539,8 @@ def _advance_cleanup_environment(
 ) -> None:
     context = owner.invocation_context
     if context is not None:
+        if owner.cleanup_predecessor_context is None:
+            owner.cleanup_predecessor_context = context
         context = context.with_registered_environment(
             registered_environment,
             validated_profile=context.profile,

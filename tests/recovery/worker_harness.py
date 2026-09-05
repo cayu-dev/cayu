@@ -1302,13 +1302,39 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(session_id=session_id)
             )
-            async for _ in app.resume(
-                ResumeRequest(
-                    session_id=session_id,
-                    messages=[Message.text("user", "Continue the attached task.")],
-                )
-            ):
-                pass
+
+            async def reject_fresh_claim(_app, _task, _worker_id):
+                raise AssertionError("An attached task must not re-enter the fresh queue")
+
+            async def resume_attached(recovery_app, task, worker_id):
+                if task.id != task_id or task.session_id != session_id:
+                    raise AssertionError("Continuation claimed a different attached task")
+                async for _ in recovery_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        task_worker_id=worker_id,
+                        task_handoff_id=task.interrupted_handoff_id,
+                        messages=[Message.text("user", "Continue the attached task.")],
+                    )
+                ):
+                    pass
+
+            handled = await asyncio.wait_for(
+                run_task_worker(
+                    app,
+                    task_store,
+                    reject_fresh_claim,
+                    worker_id="worker-b",
+                    query=TaskQuery(type=task_type),
+                    reclaim=False,
+                    recovered_interrupted_task_handler=resume_attached,
+                    max_tasks=1,
+                    poll_interval_s=0.01,
+                ),
+                timeout=_WORKER_TIMEOUT_S,
+            )
+            if handled != 1:
+                raise AssertionError("The elected continuation did not complete exactly one task")
         elif action == "plan_attached_manual":
             if worker_b_claim is not None:
                 raise AssertionError("an attached task was incorrectly returned to the free queue")

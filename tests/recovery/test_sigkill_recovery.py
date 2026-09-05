@@ -20,6 +20,7 @@ from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
@@ -35,13 +36,20 @@ pytestmark = [
 ]
 
 
-def _assert_only_model_step_publication(checkpoint: dict) -> None:
-    assert set(checkpoint) == {
+def _assert_only_model_step_publication(
+    checkpoint: dict,
+    *,
+    settled_terminal_decision: bool = False,
+) -> None:
+    expected_keys = {
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
+    if settled_terminal_decision:
+        expected_keys.add(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY)
+    assert set(checkpoint) == expected_keys
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert active_invocation_execution_profile_from_checkpoint(checkpoint) is not None
     publication = model_step_publication_from_checkpoint(checkpoint)
@@ -328,7 +336,23 @@ def test_sigkill_after_durable_approval_request_preserves_resolution(
         recovered = asyncio.run(harness.load_session_state(session_id))
         assert recovered.session is not None
         assert recovered.session.status == SessionStatus.COMPLETED
-        _assert_only_model_step_publication(recovered.checkpoint)
+        _assert_only_model_step_publication(
+            recovered.checkpoint,
+            settled_terminal_decision=True,
+        )
+        from cayu.runtime._invocation_terminal_decision import (
+            settled_invocation_terminal_decision_from_checkpoint,
+        )
+
+        settled = settled_invocation_terminal_decision_from_checkpoint(recovered.checkpoint)
+        assert settled is not None
+        terminal = next(
+            event for event in recovered.events if event.id == settled.terminal_event_id
+        )
+        assert terminal.type is EventType.SESSION_INTERRUPTED
+        assert all(
+            terminal.payload.get(key) == value for key, value in settled.terminal_payload.items()
+        )
         assert len(harness.read_marker()) == (1 if decision == "approve" else 0)
 
         event_types = [event.type for event in recovered.events]

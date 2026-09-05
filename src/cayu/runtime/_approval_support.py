@@ -347,9 +347,11 @@ def bounded_pending_approval_event_payload(
     payload.pop("secret_resolution_scope", None)
     payload.pop("run_limit_accounting", None)
     publish_policy_output = approval.secret_resolution_scope == "static" and publish_arguments
-    if not publish_arguments:
-        payload.pop("arguments", None)
-        payload[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "quarantined"
+    # Pause events precede execution, so arguments remain private even when
+    # static scope permits publishing bounded policy output. Keep this payload
+    # canonical before recording a paired terminal decision.
+    payload.pop("arguments", None)
+    payload[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "quarantined"
     if not publish_policy_output:
         payload.pop("reason", None)
         payload.pop("metadata", None)
@@ -372,9 +374,8 @@ def bounded_pending_approval_event_payload(
         raw_call.pop("targeted_tool_grant_id", None)
         raw_call.pop("targeted_tool_invocation", None)
         raw_call.pop("targeted_tool_rejection", None)
-        if not publish_arguments:
-            raw_call.pop("arguments", None)
-            raw_call[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "quarantined"
+        raw_call.pop("arguments", None)
+        raw_call[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "quarantined"
         if not publish_policy_output:
             raw_call.pop("reason", None)
             raw_call.pop("metadata", None)
