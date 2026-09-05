@@ -200,6 +200,57 @@ Custom memory-intervention runtime runners must accept the new restricted
 reference-key argument and keep it ephemeral; it cannot mint the durable parent
 request fingerprint.
 
+### Private memory-ablation campaigns now have a bounded local runner
+
+Applications can run production-shaped private corpora through the same frozen
+memory-intervention executor and paired report schema as the credential-free
+reference campaign. A new SDK preflight pins the corpus bytes, experiment gates
+and ranking, target/snapshot/profiles, evaluator, provider configuration,
+pricing and budgets, evidence policies, deterministic schedule, durable state,
+and one new private artifact destination before provider work. The runner keeps
+abnormal and missing matrix rows, supports exact restart recovery, records a
+bounded content-free methodology, omits candidate output text, and atomically
+publishes an exact no-replace artifact tree after persisting both payload files,
+their directory entries, and the completion marker. Live mode is
+explicit and requires application-owned authorization, credentials, budgets,
+pricing, and evidence collection; no private or live campaign runs in CI, and
+the feature neither publishes results nor mutates production knowledge.
+Portable-report failure retains only terminal projections that are both
+redaction-safe and valid for their exact terminal status. Completed bindings
+may be represented by their durable fingerprint when the body is omitted;
+unsafe abnormal bindings remain recoverable only from the private execution
+store. The content-free fallback is rechecked before provider dispatch and
+again before use so a changed redaction scope cannot publish a result that the
+current application considers secret.
+When report or methodology sanitization fails after an earlier campaign
+failure, the methodology retains the original stop code and ordinal and records
+the later report failure as a separate typed limitation.
+
+This is a breaking prerelease change for custom
+`MemoryInterventionRuntimeApplicationFactory` implementations. A factory must
+now declare a stable `provider_configuration_fingerprint`, classify its provider
+authority with `provider_execution_mode`, and implement the
+abstract `runtime_session_store` and `runtime_budget_ledger` properties. Those
+properties must return the exact store objects installed in every `CayuApp`
+created by the factory; update custom factories before constructing
+`CayuMemoryInterventionRuntimeRunner`. There is no compatibility fallback to
+infer these authorities from a created application. External-private preflight
+requires the factory-owned provider execution mode to match the campaign mode,
+so a live provider cannot enter through hermetic cost and evidence policy.
+External-private campaigns additionally require every bound local SQLite store
+to be file-backed:
+`SQLiteAgentSnapshotStore(":memory:")` and
+`SQLiteMemoryInterventionExecutionStore(":memory:")` are process-local and do
+not provide durable path evidence. File-backed state authority includes stable
+file identity, so same-path database replacement invalidates a prepared
+campaign before provider dispatch. Private filesystem values now own explicit,
+independent `close()`/context-manager leases; applications keep the prepared
+lease alive through artifact publication and retain exclusive namespace
+mutation ownership of the approved root. Native artifact publication supports
+Linux, macOS, and Windows and fails closed elsewhere; Windows final trees retain
+their protected private DACL, and exact completed-tree retries are
+idempotent.
+
 ### A credential-free campaign exercises causal memory end to end
 
 The checked causal-memory reference corpus now runs repeated `as_declared`,

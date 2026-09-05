@@ -2233,8 +2233,9 @@ def test_guarded_tree_publication_rolls_back_when_finalizer_fails(
         _name: str,
         *,
         expected: publication._Identity,
+        preserve_windows_destination_dacl: bool,
     ) -> None:
-        del expected
+        del expected, preserve_windows_destination_dacl
         raise OSError("simulated finalizer failure")
 
     monkeypatch.setattr(publication, "_finalize_published_tree", fail_finalizer)
@@ -2255,6 +2256,39 @@ def test_guarded_tree_publication_rolls_back_when_finalizer_fails(
         assert list(destination.iterdir()) == []
     assert not _journal_path(destination).exists()
     assert _owned_paths(tmp_path) == []
+
+
+def test_guarded_tree_publication_binds_private_windows_dacl_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "published"
+    finalized_policies: list[bool] = []
+
+    def record_finalizer(
+        _parent: publication._Parent,
+        _name: str,
+        *,
+        expected: publication._Identity,
+        preserve_windows_destination_dacl: bool,
+    ) -> None:
+        del expected
+        finalized_policies.append(preserve_windows_destination_dacl)
+
+    monkeypatch.setattr(publication, "_finalize_published_tree", record_finalizer)
+
+    publish_guarded_tree(
+        destination,
+        consumer="test",
+        request_digest=_REQUEST_DIGEST,
+        policy=DestinationPolicy.ABSENT_OR_EMPTY,
+        populate=_populate,
+        preserve_windows_destination_dacl=True,
+    )
+
+    receipt = json.loads(_receipt_path(destination).read_text(encoding="ascii").splitlines()[-1])
+    assert finalized_policies == [True]
+    assert receipt["preserve_windows_destination_dacl"] is True
 
 
 def test_guarded_tree_publication_preserves_conflict_after_backup(
@@ -2825,8 +2859,9 @@ def test_guarded_tree_publication_recovers_after_process_death_at_every_phase(
         name: str,
         *,
         expected: publication._Identity,
+        preserve_windows_destination_dacl: bool,
     ) -> None:
-        del expected
+        del expected, preserve_windows_destination_dacl
         finalized.append(parent.path / name)
 
     monkeypatch.setattr(publication, "_finalize_published_tree", record_finalization)
@@ -3327,6 +3362,7 @@ def test_guarded_tree_pending_journal_preserves_caller_authored_authority(
         token=token,
         destination_name="foreign" if conflict == "destination" else destination.name,
         policy=DestinationPolicy.ABSENT_OR_EMPTY,
+        preserve_windows_destination_dacl=False,
         parent_identity=parent_identity,
         original_identity=None,
         original_sha256=None,
@@ -4647,6 +4683,7 @@ def test_guarded_tree_recovery_classifies_invalid_unicode_journal_metadata(
         token=token,
         destination_name=destination.name,
         policy=DestinationPolicy.ABSENT_OR_EMPTY,
+        preserve_windows_destination_dacl=False,
         parent_identity=publication._capture_parent(tmp_path),
         original_identity=None,
         original_sha256=None,

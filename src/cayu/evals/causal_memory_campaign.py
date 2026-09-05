@@ -114,6 +114,7 @@ from cayu.memory_intervention_execution import (
     MemoryInterventionExecutor,
     MemoryInterventionIsolationAuthority,
     MemoryInterventionOverlayProvider,
+    MemoryInterventionProviderExecutionMode,
     MemoryInterventionRequestFingerprintKey,
     MemoryInterventionRuntimeApplicationFactory,
     MemoryInterventionRuntimeResult,
@@ -147,6 +148,7 @@ from cayu.retrieval import (
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.runtime.app import CayuApp
+from cayu.runtime.budgets import BudgetLedger
 from cayu.runtime.context import CheckpointCompactionContextPolicy, TranscriptDigestCompactor
 from cayu.runtime.manifest import AppManifest
 from cayu.runtime.memory_context import (
@@ -156,6 +158,7 @@ from cayu.runtime.memory_context import (
 from cayu.runtime.request_footprints import RequestFootprintConfig
 from cayu.runtime.sessions import RunRequest, SessionStore
 from cayu.runtime.usage import session_usage_summary_payload
+from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
@@ -180,7 +183,7 @@ _CAMPAIGN_TIME = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
 _CAMPAIGN_NAMESPACE = "campaign"
 _PRIVATE_NAMESPACE = "private-campaign"
 _MODEL = "causal-memory-fixture-model"
-_APPLICATION_RELEASE = "cayu-causal-memory-reference-v1"
+_APPLICATION_RELEASE = "cayu-causal-memory-reference-v2"
 _EVALUATOR_FINGERPRINT = hashlib.sha256(b"cayu-causal-memory-evaluator-v1").hexdigest()
 _ISOLATION_REVISION = "sha256:" + hashlib.sha256(b"cayu-causal-memory-isolation-v1").hexdigest()
 _SOURCE_REVISION_FINGERPRINT = hashlib.sha256(
@@ -284,12 +287,31 @@ def _context_policy(policy: AutomaticRecallPolicy) -> AutomaticRecallContextPoli
 class _CampaignApplicationFactory(MemoryInterventionRuntimeApplicationFactory):
     factory_id = "cayu.reference-campaign-runtime.v1"
     execution_profile_fingerprint = _digest("cayu.reference-campaign-runtime.v1")
+    provider_configuration_fingerprint = _digest(
+        "cayu.reference-campaign-provider-configuration.v1"
+    )
+    provider_execution_mode = MemoryInterventionProviderExecutionMode.HERMETIC
 
-    def __init__(self, *, sessions: SessionStore, provider: ScriptedModelProvider) -> None:
+    def __init__(
+        self,
+        *,
+        sessions: SessionStore,
+        budgets: BudgetLedger,
+        provider: ScriptedModelProvider,
+    ) -> None:
         self.sessions = sessions
+        self.budgets = budgets
         self.provider = provider
         self.profile_by_policy: dict[str, str] = {}
         self.app_by_session: dict[str, CayuApp] = {}
+
+    @property
+    def runtime_session_store(self) -> SessionStore:
+        return self.sessions
+
+    @property
+    def runtime_budget_ledger(self) -> BudgetLedger:
+        return self.budgets
 
     def expected_execution_profile_fingerprint(self, spec: MemoryInterventionSpec) -> str:
         try:
@@ -306,6 +328,7 @@ class _CampaignApplicationFactory(MemoryInterventionRuntimeApplicationFactory):
     ) -> CayuApp:
         app = CayuApp(
             session_store=self.sessions,
+            budget_ledger=self.budgets,
             request_footprint=RequestFootprintConfig(
                 fingerprint_key_id="causal-memory-reference",
                 fingerprint_key=SecretStr("causal-memory-reference-key-material"),
@@ -1222,17 +1245,29 @@ async def run_causal_memory_reference_campaign(
     state_path = Path(state_directory)
     state_path.mkdir(parents=True, exist_ok=True)
     provider = _scripted_provider(recover_only=recover_only)
+    budget_path = state_path / "budgets.sqlite"
+    if recover_only and not budget_path.is_file():
+        raise MemoryInterventionExecutionConflict(
+            "Recovery requires the complete previously persisted campaign budget ledger."
+        )
     sessions = SQLiteSessionStore(state_path / "sessions.sqlite")
+    budgets: SQLiteBudgetLedger | None = None
     try:
+        budgets = SQLiteBudgetLedger(budget_path)
         return await _run_causal_memory_reference_campaign(
             corpus,
             state_path,
             recover_only=recover_only,
             provider=provider,
             sessions=sessions,
+            budgets=budgets,
         )
     finally:
-        await sessions.close()
+        try:
+            if budgets is not None:
+                await budgets.close()
+        finally:
+            await sessions.close()
 
 
 async def _run_causal_memory_reference_campaign(
@@ -1242,8 +1277,13 @@ async def _run_causal_memory_reference_campaign(
     recover_only: bool,
     provider: _CampaignScriptedProvider,
     sessions: SQLiteSessionStore,
+    budgets: SQLiteBudgetLedger,
 ) -> MemoryExperimentReport:
-    factory = _CampaignApplicationFactory(sessions=sessions, provider=provider)
+    factory = _CampaignApplicationFactory(
+        sessions=sessions,
+        budgets=budgets,
+        provider=provider,
+    )
     starting_policy = _recall_policy()
     off_policy = _recall_policy(AutomaticRecallMode.OFF)
     target = _target(factory, policy=starting_policy)

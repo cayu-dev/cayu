@@ -16,7 +16,7 @@ import hmac
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -114,6 +114,7 @@ from cayu.runtime._memory_attribution import (
     project_memory_attribution,
 )
 from cayu.runtime._memory_evidence import memory_evidence_key
+from cayu.runtime.budgets import BudgetLedger
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileIdentity,
@@ -127,6 +128,7 @@ from cayu.runtime.sessions import (
     RuntimeSessionCreateClaimReferenceKey,
     Session,
     SessionStatus,
+    SessionStore,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
@@ -167,6 +169,13 @@ _MODEL_CONFIG = ConfigDict(
 )
 
 
+class MemoryInterventionProviderExecutionMode(StrEnum):
+    """Whether an intervention runtime may dispatch external provider work."""
+
+    HERMETIC = "hermetic"
+    LIVE = "live"
+
+
 async def _acquire_execution_gate(execution_id: str) -> Future[None]:
     """Serialize one process-local identity across executors and event loops."""
 
@@ -186,6 +195,23 @@ def _release_execution_gate(execution_id: str, owned: Future[None]) -> None:
             raise AssertionError("Memory-intervention execution gate ownership changed.")
         del _EXECUTION_GATES[execution_id]
     owned.set_result(None)
+
+
+def _retain_secondary_failure(
+    primary: BaseException,
+    secondary: BaseException,
+    *,
+    group_message: str,
+) -> None:
+    """Attach a boundary failure without discarding an existing explicit cause."""
+
+    existing = exception_cause(primary)
+    if existing is secondary:
+        return
+    cause = (
+        secondary if existing is None else BaseExceptionGroup(group_message, (existing, secondary))
+    )
+    set_exception_cause(primary, cause)
 
 
 def _clean(value: str, field_name: str, *, max_chars: int = _MAX_ID_CHARS) -> str:
@@ -964,6 +990,11 @@ class _MemoryInterventionRuntimeTimeoutObserved(Exception):
 
 
 class MemoryInterventionExecutionStore(ABC):
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return local files that own this store's durable state."""
+
+        return ()
+
     @abstractmethod
     async def begin(
         self,
@@ -1263,6 +1294,15 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
         self._schema_lock = threading.Lock()
         self._schema_ready = False
         self._ownership_clock = utc_clock(ownership_clock)
+        if self.path != Path(":memory:"):
+            self._ensure_schema()
+
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return the primary SQLite file for state-boundary validation."""
+
+        if self.path == Path(":memory:"):
+            return ()
+        return (self.path.resolve(),)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -1553,6 +1593,30 @@ class MemoryInterventionRuntimeRunner(ABC):
     """
 
     execution_profile_fingerprint: str
+    provider_configuration_fingerprint: str | None = None
+    provider_execution_mode: MemoryInterventionProviderExecutionMode | None = None
+
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return local files used by this runner's canonical runtime."""
+
+        return ()
+
+    def durable_budget_ledger_paths(self) -> tuple[Path, ...]:
+        """Return local files used by this runner's reservation ledger."""
+
+        return ()
+
+    def current_provider_configuration_fingerprint(self) -> str | None:
+        """Return the live provider configuration identity, when available."""
+
+        return self.provider_configuration_fingerprint
+
+    def current_provider_execution_mode(
+        self,
+    ) -> MemoryInterventionProviderExecutionMode | None:
+        """Return whether the current provider authority is hermetic or live."""
+
+        return self.provider_execution_mode
 
     def required_execution_profile_fingerprint(
         self,
@@ -1561,6 +1625,27 @@ class MemoryInterventionRuntimeRunner(ABC):
         if type(spec) is not MemoryInterventionSpec:
             raise TypeError("spec must be an exact MemoryInterventionSpec.")
         return spec.execution_profile_fingerprint
+
+    async def accounting_sessions_belong_to_trial(
+        self,
+        execution: MemoryInterventionExecutionRecord,
+        session_ids: Sequence[str],
+    ) -> bool:
+        """Return whether every accounting session is attributable to this trial.
+
+        Generic runners can prove only the root session. Runtime integrations
+        that support child sessions must override this boundary with durable
+        lineage validation.
+        """
+
+        if type(execution) is not MemoryInterventionExecutionRecord:
+            raise TypeError("execution must be a MemoryInterventionExecutionRecord.")
+        if not isinstance(session_ids, Sequence) or isinstance(session_ids, str | bytes):
+            raise TypeError("session_ids must be an ordered string sequence.")
+        copied = tuple(
+            _clean(value, "accounting session_id", max_chars=512) for value in session_ids
+        )
+        return all(session_id == execution.session_id for session_id in copied)
 
     @abstractmethod
     async def run(
@@ -1607,6 +1692,26 @@ class MemoryInterventionRuntimeApplicationFactory(ABC):
 
     factory_id: str
     execution_profile_fingerprint: str
+
+    @property
+    @abstractmethod
+    def provider_configuration_fingerprint(self) -> str:
+        """Return the exact provider configuration installed by this factory."""
+
+    @property
+    @abstractmethod
+    def provider_execution_mode(self) -> MemoryInterventionProviderExecutionMode:
+        """Return whether created applications may dispatch external provider work."""
+
+    @property
+    @abstractmethod
+    def runtime_session_store(self) -> SessionStore:
+        """Return the exact store installed in every application this factory creates."""
+
+    @property
+    @abstractmethod
+    def runtime_budget_ledger(self) -> BudgetLedger:
+        """Return the exact reservation ledger installed in every created application."""
 
     def expected_execution_profile_fingerprint(
         self,
@@ -1722,6 +1827,25 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             factory.execution_profile_fingerprint,
             "factory.execution_profile_fingerprint",
         )
+        self._provider_configuration_fingerprint = _sha256(
+            factory.provider_configuration_fingerprint,
+            "factory.provider_configuration_fingerprint",
+        )
+        provider_execution_mode = factory.provider_execution_mode
+        if type(provider_execution_mode) is not MemoryInterventionProviderExecutionMode:
+            raise TypeError(
+                "factory.provider_execution_mode must be an exact "
+                "MemoryInterventionProviderExecutionMode."
+            )
+        self._provider_execution_mode = provider_execution_mode
+        runtime_session_store = factory.runtime_session_store
+        if not isinstance(runtime_session_store, SessionStore):
+            raise TypeError("factory.runtime_session_store must be a SessionStore.")
+        self._runtime_session_store = runtime_session_store
+        runtime_budget_ledger = factory.runtime_budget_ledger
+        if not isinstance(runtime_budget_ledger, BudgetLedger):
+            raise TypeError("factory.runtime_budget_ledger must be a BudgetLedger.")
+        self._runtime_budget_ledger = runtime_budget_ledger
         requested_bounds = MemoryAttributionBounds.model_validate(
             (attribution_bounds or MemoryAttributionBounds()).model_dump(mode="python")
         )
@@ -1746,10 +1870,54 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 "version": 2,
                 "factory_id": self._factory_id,
                 "factory_fingerprint": self._factory_fingerprint,
+                "provider_configuration_fingerprint": (self._provider_configuration_fingerprint),
+                "provider_execution_mode": self._provider_execution_mode.value,
                 "attribution_bounds": self._attribution_bounds.model_dump(mode="json"),
             },
             "memory intervention runtime runner",
         )
+        self.provider_configuration_fingerprint = self._provider_configuration_fingerprint
+        self.provider_execution_mode = self._provider_execution_mode
+
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return the exact canonical runtime store's local state files."""
+
+        return tuple(self._runtime_session_store.durable_state_paths())
+
+    def durable_budget_ledger_paths(self) -> tuple[Path, ...]:
+        """Return local files used by the canonical runtime's reservation ledger."""
+
+        return tuple(self._runtime_budget_ledger.durable_state_paths())
+
+    def current_provider_configuration_fingerprint(self) -> str:
+        """Verify and return the factory's live provider configuration identity."""
+
+        current = _sha256(
+            self.factory.provider_configuration_fingerprint,
+            "factory.provider_configuration_fingerprint",
+        )
+        if (
+            current != self._provider_configuration_fingerprint
+            or self.factory.runtime_session_store is not self._runtime_session_store
+            or self.factory.runtime_budget_ledger is not self._runtime_budget_ledger
+        ):
+            raise MemoryInterventionExecutionConflict(
+                "Memory intervention runtime factory identity changed."
+            )
+        return current
+
+    def current_provider_execution_mode(self) -> MemoryInterventionProviderExecutionMode:
+        """Verify and return the factory's provider dispatch classification."""
+
+        current = self.factory.provider_execution_mode
+        if (
+            type(current) is not MemoryInterventionProviderExecutionMode
+            or current is not self._provider_execution_mode
+        ):
+            raise MemoryInterventionExecutionConflict(
+                "Memory intervention runtime factory identity changed."
+            )
+        return current
 
     def required_execution_profile_fingerprint(
         self,
@@ -1759,6 +1927,28 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             self.factory.expected_execution_profile_fingerprint(spec),
             "factory expected execution profile",
         )
+
+    async def accounting_sessions_belong_to_trial(
+        self,
+        execution: MemoryInterventionExecutionRecord,
+        session_ids: Sequence[str],
+    ) -> bool:
+        if type(execution) is not MemoryInterventionExecutionRecord:
+            raise TypeError("execution must be a MemoryInterventionExecutionRecord.")
+        if not isinstance(session_ids, Sequence) or isinstance(session_ids, str | bytes):
+            raise TypeError("session_ids must be an ordered string sequence.")
+        copied = tuple(
+            _clean(value, "accounting session_id", max_chars=512) for value in session_ids
+        )
+        for session_id in dict.fromkeys(copied):
+            session = await self._runtime_session_store.load(session_id)
+            if (
+                session is None
+                or session.invocation.root_session_id != execution.session_id
+                or session.causal_budget_id != execution.causal_budget_id
+            ):
+                return False
+        return True
 
     async def run(
         self,
@@ -1787,16 +1977,19 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             view=view,
             reference_key=reference_key,
         )
-        return await self._execute(
-            app=app,
-            request=request,
-            runtime_request=runtime_request,
-            expected_profile=expected_profile,
-            expected_registered_environment=registered_environment,
-            expected_context_policy=policy,
-            session_create_claim=session_create_claim,
-            execution=execution,
-            reference_key=reference_key,
+        return await self._with_application_cleanup(
+            app,
+            lambda: self._execute(
+                app=app,
+                request=request,
+                runtime_request=runtime_request,
+                expected_profile=expected_profile,
+                expected_registered_environment=registered_environment,
+                expected_context_policy=policy,
+                session_create_claim=session_create_claim,
+                execution=execution,
+                reference_key=reference_key,
+            ),
         )
 
     async def recover(
@@ -1826,53 +2019,39 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             view=view,
             reference_key=reference_key,
         )
-        session = await app.session_store.load(execution.session_id)
-        if session is None:
-            if execution.runtime_timeout_observed:
-                return _runtime_timeout_before_session_result(
-                    execution,
-                    effective_attribution_bounds=self._attribution_bounds,
-                    source_alias=_memory_intervention_source_alias(
-                        app,
-                        execution.session_id,
-                    ),
-                )
-            return await self._execute(
-                app=app,
-                request=request,
-                runtime_request=runtime_request,
-                expected_profile=expected_profile,
-                expected_registered_environment=registered_environment,
-                expected_context_policy=policy,
-                session_create_claim=session_create_claim,
-                execution=execution,
-                reference_key=reference_key,
-            )
-        session = await _authenticate_intervention_session(
-            app,
-            session,
-            session_create_claim,
-            reference=execution.runtime_session_create_claim,
-            request=runtime_request,
-            operation_id=execution.execution_id,
-            reference_key=reference_key,
-        )
-        if session.status not in {
-            SessionStatus.COMPLETED,
-            SessionStatus.FAILED,
-            SessionStatus.INTERRUPTED,
-        }:
-            await app._recover_incomplete_session_private(
-                IncompleteSessionRecoveryRequest(
-                    session_id=execution.session_id,
-                    reason="memory_intervention_runtime_recovery",
-                    metadata={
-                        "execution_id": execution.execution_id,
-                        "operation_id": operation.operation_id,
-                    },
-                )
-            )
+
+        async def recover_application() -> MemoryInterventionRuntimeResult:
             session = await app.session_store.load(execution.session_id)
+            if session is None:
+                if execution.runtime_timeout_observed:
+                    return _runtime_timeout_before_session_result(
+                        execution,
+                        effective_attribution_bounds=self._attribution_bounds,
+                        source_alias=_memory_intervention_source_alias(
+                            app,
+                            execution.session_id,
+                        ),
+                    )
+                if execution.runtime_cancellation_observed:
+                    return _runtime_cancellation_before_session_result(
+                        execution,
+                        effective_attribution_bounds=self._attribution_bounds,
+                        source_alias=_memory_intervention_source_alias(
+                            app,
+                            execution.session_id,
+                        ),
+                    )
+                return await self._execute(
+                    app=app,
+                    request=request,
+                    runtime_request=runtime_request,
+                    expected_profile=expected_profile,
+                    expected_registered_environment=registered_environment,
+                    expected_context_policy=policy,
+                    session_create_claim=session_create_claim,
+                    execution=execution,
+                    reference_key=reference_key,
+                )
             session = await _authenticate_intervention_session(
                 app,
                 session,
@@ -1882,13 +2061,120 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 operation_id=execution.execution_id,
                 reference_key=reference_key,
             )
-        return await self._collect_result(
-            app=app,
-            expected_session=session,
-            observed_events=(),
-            timeout_expired=execution.runtime_timeout_observed,
-            cancellation_observed=execution.runtime_cancellation_observed,
+            if session.status not in {
+                SessionStatus.COMPLETED,
+                SessionStatus.FAILED,
+                SessionStatus.INTERRUPTED,
+            }:
+                await app._recover_incomplete_session_private(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=execution.session_id,
+                        reason="memory_intervention_runtime_recovery",
+                        metadata={
+                            "execution_id": execution.execution_id,
+                            "operation_id": operation.operation_id,
+                        },
+                    )
+                )
+                session = await app.session_store.load(execution.session_id)
+                session = await _authenticate_intervention_session(
+                    app,
+                    session,
+                    session_create_claim,
+                    reference=execution.runtime_session_create_claim,
+                    request=runtime_request,
+                    operation_id=execution.execution_id,
+                    reference_key=reference_key,
+                )
+            return await self._collect_result(
+                app=app,
+                expected_session=session,
+                observed_events=(),
+                timeout_expired=execution.runtime_timeout_observed,
+                cancellation_observed=execution.runtime_cancellation_observed,
+            )
+
+        return await self._with_application_cleanup(app, recover_application)
+
+    async def _with_application_cleanup(
+        self,
+        app,
+        operation: Callable[[], Awaitable[MemoryInterventionRuntimeResult]],
+    ) -> MemoryInterventionRuntimeResult:
+        """Run one disposable app and preserve failures while draining cancellation work."""
+
+        operation_result: MemoryInterventionRuntimeResult | None = None
+        operation_error: BaseException | None = None
+        try:
+            operation_result = await operation()
+        except BaseException as error:
+            operation_error = error
+
+        initial_cancellation = (
+            operation_error if isinstance(operation_error, asyncio.CancelledError) else None
         )
+        drain_task = asyncio.create_task(
+            capture_awaitable_outcome(
+                lambda: app.drain_provider_operation_cancellations(timeout_s=10.0)
+            ),
+            name="cayu-memory-intervention-provider-cancellation-drain",
+        )
+        drain_wait = await await_shielded_task_outcome(
+            drain_task,
+            cancellation=initial_cancellation,
+        )
+        drain_error: BaseException | None = drain_wait.error
+        if drain_error is None:
+            captured = drain_wait.result
+            if captured is None:
+                drain_error = RuntimeError(
+                    "Provider-operation cancellation drain returned no outcome."
+                )
+            elif captured.error is not None:
+                drain_error = captured.error
+            elif captured.result is not True:
+                drain_error = MemoryInterventionExecutionConflict(
+                    "Provider-operation cancellation owners exceeded the runtime cleanup bound."
+                )
+
+        cancellation = drain_wait.cancellation
+        if cancellation is not None:
+            if operation_error is not None and operation_error is not cancellation:
+                _retain_secondary_failure(
+                    cancellation,
+                    operation_error,
+                    group_message="Memory intervention retained multiple runtime failures.",
+                )
+            if drain_error is not None:
+                _retain_secondary_failure(
+                    cancellation,
+                    drain_error,
+                    group_message=(
+                        "Memory intervention cancellation retained runtime and cleanup failures."
+                    ),
+                )
+            restore_task_cancellation_requests(
+                drain_wait.cancellation_requests_consumed,
+                cancellation=cancellation,
+            )
+            raise cancellation
+        if operation_error is not None:
+            if drain_error is not None:
+                _retain_secondary_failure(
+                    operation_error,
+                    drain_error,
+                    group_message=(
+                        "Memory intervention runtime retained operation and cleanup failures."
+                    ),
+                )
+            raise operation_error
+        if drain_error is not None:
+            raise drain_error
+        if operation_result is None:  # pragma: no cover - exact result contract
+            raise MemoryInterventionExecutionConflict(
+                "Memory intervention runtime returned no result."
+            )
+        return operation_result
 
     async def _prepare_application(
         self,
@@ -1902,7 +2188,6 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         reference_key: RuntimeSessionCreateClaimReferenceKey,
     ):
         from cayu.runtime.app import CayuApp
-        from cayu.runtime.memory_context import AutomaticRecallContextPolicy
 
         if type(reference_key) is not RuntimeSessionCreateClaimReferenceKey:
             raise TypeError("reference_key must be a RuntimeSessionCreateClaimReferenceKey.")
@@ -1917,6 +2202,14 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 "factory.execution_profile_fingerprint",
             )
             != self._factory_fingerprint
+            or _sha256(
+                self.factory.provider_configuration_fingerprint,
+                "factory.provider_configuration_fingerprint",
+            )
+            != self._provider_configuration_fingerprint
+            or self.factory.provider_execution_mode is not self._provider_execution_mode
+            or self.factory.runtime_session_store is not self._runtime_session_store
+            or self.factory.runtime_budget_ledger is not self._runtime_budget_ledger
         ):
             raise MemoryInterventionExecutionConflict(
                 "Memory intervention runtime factory identity changed."
@@ -1956,6 +2249,47 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 "Memory intervention runtime factory returned an invalid application."
             )
         app = value
+        try:
+            return await self._validate_application(
+                app=app,
+                request=request,
+                execution=execution,
+                starting_execution_profile=starting_execution_profile,
+                view=view,
+                runtime_request=runtime_request,
+                session_create_claim=session_create_claim,
+            )
+        except BaseException as validation_error:
+
+            async def raise_validation_error(
+                error: BaseException = validation_error,
+            ) -> MemoryInterventionRuntimeResult:
+                raise error
+
+            await self._with_application_cleanup(app, raise_validation_error)
+            raise AssertionError("Application validation failure was not re-raised.") from None
+
+    async def _validate_application(
+        self,
+        *,
+        app,
+        request: MemoryInterventionTrialRequest,
+        execution: MemoryInterventionExecutionRecord,
+        starting_execution_profile: AgentSnapshotExecutionProfileRef,
+        view: MemoryInterventionRuntimeView,
+        runtime_request: RunRequest,
+        session_create_claim,
+    ):
+        from cayu.runtime.memory_context import AutomaticRecallContextPolicy
+
+        if app.session_store is not self._runtime_session_store:
+            raise MemoryInterventionExecutionConflict(
+                "Memory intervention runtime factory changed its bound session store."
+            )
+        if app.budget_ledger is not self._runtime_budget_ledger:
+            raise MemoryInterventionExecutionConflict(
+                "Memory intervention runtime factory changed its bound budget ledger."
+            )
         registered_environment = app._get_registered_environment(
             request.run_request.environment_name
         )
@@ -2442,6 +2776,39 @@ def _runtime_timeout_before_session_result(
     )
 
 
+def _runtime_cancellation_before_session_result(
+    execution: MemoryInterventionExecutionRecord,
+    *,
+    effective_attribution_bounds: MemoryAttributionBounds,
+    source_alias: EvalMemorySourceAliasV1 | None,
+) -> MemoryInterventionRuntimeResult:
+    return MemoryInterventionRuntimeResult(
+        session_id=execution.session_id,
+        terminal_disposition=AgentSnapshotTerminalDisposition.CANCELLED,
+        runtime_evidence_fingerprint=_content_sha256(
+            {
+                "kind": "memory_intervention_runtime_cancelled_before_session",
+                "version": 1,
+                "execution_id": execution.execution_id,
+                "session_id": execution.session_id,
+                "runtime_session_create_claim_id": (
+                    None
+                    if execution.runtime_session_create_claim is None
+                    else execution.runtime_session_create_claim.claim_id
+                ),
+            },
+            "memory intervention pre-session cancellation evidence",
+        ),
+        terminal_evidence_available=False,
+        terminal_evidence_limitation=EvalMemoryEvidenceLimitation.MISSING,
+        expected_receipt_count=None,
+        expected_exposure_count=None,
+        effective_attribution_bounds=effective_attribution_bounds,
+        source_alias=source_alias,
+        attribution=_unavailable_terminal_memory_attribution(),
+    )
+
+
 def _terminal_evidence_limitation(
     error: NotImplementedError | TerminalSessionEvidenceError,
 ) -> EvalMemoryEvidenceLimitation:
@@ -2575,6 +2942,70 @@ def _runtime_result_from_record(
     return result
 
 
+class MemoryInterventionExecutorAuthority(BaseModel):
+    """Detached identity of the components that may execute one intervention."""
+
+    model_config = _MODEL_CONFIG
+
+    schema_version: Literal[1] = 1
+    overlay_provider_id: StrictStr = Field(max_length=_MAX_ID_CHARS)
+    overlay_provider_fingerprint: StrictStr
+    runtime_runner_fingerprint: StrictStr
+    evaluator_fingerprint: StrictStr
+    provider_configuration_fingerprint: StrictStr | None = None
+    provider_execution_mode: MemoryInterventionProviderExecutionMode | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be a JSON integer.")
+        return value
+
+    @field_validator("overlay_provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str, info) -> str:
+        return _clean(value, info.field_name)
+
+    @field_validator(
+        "overlay_provider_fingerprint",
+        "runtime_runner_fingerprint",
+        "evaluator_fingerprint",
+        "provider_configuration_fingerprint",
+    )
+    @classmethod
+    def validate_fingerprints(cls, value: str | None, info) -> str | None:
+        return None if value is None else _sha256(value, info.field_name)
+
+    @property
+    def fingerprint(self) -> str:
+        return _content_sha256(
+            self.model_dump(mode="json"),
+            "memory intervention executor authority",
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class MemoryInterventionExecutorStatePaths:
+    """Local durable state files used by one intervention executor."""
+
+    snapshot_store: tuple[Path, ...]
+    execution_store: tuple[Path, ...]
+    runtime_session_store: tuple[Path, ...]
+    runtime_budget_ledger: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _MemoryInterventionExecutorComponents:
+    """One immutable set of application-owned execution capabilities."""
+
+    snapshots: AgentSnapshotCoordinator
+    executions: MemoryInterventionExecutionStore
+    overlay_provider: MemoryInterventionOverlayProvider
+    runtime_runner: MemoryInterventionRuntimeRunner
+    evaluator: MemoryInterventionEvaluator
+
+
 class MemoryInterventionExecutor:
     """Execute one fixed intervention through durable, exact phase boundaries.
 
@@ -2631,11 +3062,13 @@ class MemoryInterventionExecutor:
             raise ValueError("The current memory-intervention request key is unavailable.")
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable.")
-        self.snapshots = snapshots
-        self.executions = executions
-        self.overlay_provider = overlay_provider
-        self.runtime_runner = runtime_runner
-        self.evaluator = evaluator
+        self._components = _MemoryInterventionExecutorComponents(
+            snapshots=snapshots,
+            executions=executions,
+            overlay_provider=overlay_provider,
+            runtime_runner=runtime_runner,
+            evaluator=evaluator,
+        )
         self._provider_id = provider_id
         self._provider_fingerprint = provider_fingerprint
         self._runner_fingerprint = runner_fingerprint
@@ -2646,6 +3079,63 @@ class MemoryInterventionExecutor:
         self._runtime_clock = lambda: datetime.now(UTC)
         self._runtime_dispatch_owner_id = f"memory-intervention-worker:{uuid4().hex}"
 
+    @property
+    def snapshots(self) -> AgentSnapshotCoordinator:
+        """Return the immutable snapshot capability bound at construction."""
+
+        return self._components.snapshots
+
+    @property
+    def executions(self) -> MemoryInterventionExecutionStore:
+        """Return the immutable execution journal bound at construction."""
+
+        return self._components.executions
+
+    @property
+    def overlay_provider(self) -> MemoryInterventionOverlayProvider:
+        """Return the immutable overlay capability bound at construction."""
+
+        return self._components.overlay_provider
+
+    @property
+    def runtime_runner(self) -> MemoryInterventionRuntimeRunner:
+        """Return the immutable runtime capability bound at construction."""
+
+        return self._components.runtime_runner
+
+    @property
+    def evaluator(self) -> MemoryInterventionEvaluator:
+        """Return the immutable evaluator capability bound at construction."""
+
+        return self._components.evaluator
+
+    @property
+    def execution_authority(self) -> MemoryInterventionExecutorAuthority:
+        """Return the current detached identity of every execution component."""
+
+        self._validate_live_owners()
+        provider_configuration = self.runtime_runner.current_provider_configuration_fingerprint()
+        provider_execution_mode = self.runtime_runner.current_provider_execution_mode()
+        return MemoryInterventionExecutorAuthority(
+            overlay_provider_id=self._provider_id,
+            overlay_provider_fingerprint=self._provider_fingerprint,
+            runtime_runner_fingerprint=self._runner_fingerprint,
+            evaluator_fingerprint=self._evaluator_fingerprint,
+            provider_configuration_fingerprint=provider_configuration,
+            provider_execution_mode=provider_execution_mode,
+        )
+
+    def durable_state_paths(self) -> MemoryInterventionExecutorStatePaths:
+        """Return local state files from the exact stores used by this executor."""
+
+        self._validate_live_owners()
+        return MemoryInterventionExecutorStatePaths(
+            snapshot_store=tuple(self.snapshots.store.durable_state_paths()),
+            execution_store=tuple(self.executions.durable_state_paths()),
+            runtime_session_store=tuple(self.runtime_runner.durable_state_paths()),
+            runtime_budget_ledger=tuple(self.runtime_runner.durable_budget_ledger_paths()),
+        )
+
     def _now(self, *, at_least: datetime | None = None) -> datetime:
         value = _utc(self._clock(), "clock result")
         if at_least is not None and value < at_least:
@@ -2655,14 +3145,20 @@ class MemoryInterventionExecutor:
     async def execute_trial(
         self,
         request: MemoryInterventionTrialRequest,
+        *,
+        admission_check: Callable[[], None] | None = None,
     ) -> MemoryInterventionTrialOutcome:
         """Execute or exactly recover one deterministic candidate trial."""
 
         request = _copy_trial_request(request)
+        if admission_check is not None and not callable(admission_check):
+            raise TypeError("admission_check must be callable.")
         self._validate_live_owners()
         execution_id = request.execution_id
         gate = await _acquire_execution_gate(execution_id)
         try:
+            if admission_check is not None:
+                admission_check()
             return await self._execute_trial(request)
         finally:
             _release_execution_gate(execution_id, gate)
@@ -2977,6 +3473,8 @@ class MemoryInterventionExecutor:
             raise MemoryInterventionExecutionConflict(
                 "Runtime execution is missing its durable deadline."
             )
+        if record.runtime_cancellation_observed:
+            return False
         return record.runtime_timeout_observed or self._runtime_clock() >= deadline
 
     async def _claim_runtime_dispatch(
@@ -2992,12 +3490,23 @@ class MemoryInterventionExecutor:
         """Claim through store time, waiting without interpreting a worker clock."""
 
         current = record
-        claim_id = "memory-intervention-runtime-claim:" + _content_sha256(
-            {
-                "execution_id": record.execution_id,
-                "owner_id": self._runtime_dispatch_owner_id,
-            },
-            "memory intervention runtime claim",
+        previous_ownership = current.runtime_dispatch_ownership
+        claim_id = (
+            previous_ownership.claim_id
+            if previous_ownership is not None
+            and previous_ownership.state is DurableOperationOwnershipState.ACTIVE
+            and previous_ownership.owner_id == self._runtime_dispatch_owner_id
+            else "memory-intervention-runtime-claim:"
+            + _content_sha256(
+                {
+                    "execution_id": record.execution_id,
+                    "owner_id": self._runtime_dispatch_owner_id,
+                    "previous_generation": (
+                        0 if previous_ownership is None else previous_ownership.generation
+                    ),
+                },
+                "memory intervention runtime claim",
+            )
         )
         request = DurableOperationOwnershipTransition(
             operation_id=record.execution_id,
@@ -3163,10 +3672,7 @@ class MemoryInterventionExecutor:
             ) from None
         publication_task = asyncio.create_task(
             capture_awaitable_outcome(
-                lambda: self._publish_runtime_control_authority(
-                    record,
-                    control="cancellation",
-                )
+                lambda: self._publish_and_release_runtime_cancellation(record)
             ),
             name="cayu-memory-intervention-cancellation-authority",
         )
@@ -3224,6 +3730,85 @@ class MemoryInterventionExecutor:
             cancellation=cancellation,
         )
         raise runtime_failure
+
+    async def _publish_and_release_runtime_cancellation(
+        self,
+        record: MemoryInterventionExecutionRecord,
+    ) -> tuple[MemoryInterventionExecutionRecord, bool]:
+        published, won = await self._publish_runtime_control_authority(
+            record,
+            control="cancellation",
+        )
+        ownership = published.runtime_dispatch_ownership
+        if ownership is None or ownership.state is not DurableOperationOwnershipState.ACTIVE:
+            raise MemoryInterventionExecutionConflict(
+                "Runtime cancellation authority lost its active dispatch ownership."
+            )
+        request = DurableOperationOwnershipTransition(
+            operation_id=ownership.operation_id,
+            claim_id=ownership.claim_id,
+            owner_id=ownership.owner_id,
+            generation=ownership.generation,
+            action=DurableOperationOwnershipAction.RELEASE,
+        )
+        transition_error: Exception | None = None
+        result: MemoryInterventionRuntimeOwnershipResult | None = None
+        try:
+            raw_result = await self.executions.transition_runtime_dispatch_ownership(
+                published.execution_id,
+                request,
+            )
+            if type(raw_result) is not MemoryInterventionRuntimeOwnershipResult:
+                raise MemoryInterventionExecutionConflict(
+                    "Execution store returned invalid cancellation release evidence."
+                )
+            result = MemoryInterventionRuntimeOwnershipResult.model_validate(
+                raw_result.model_dump(mode="python")
+            )
+        except Exception as error:
+            transition_error = error
+
+        released_execution = None if result is None else result.execution
+        released = None if result is None else result.ownership.ownership
+        if result is None or result.ownership.disposition is (
+            DurableOperationOwnershipDisposition.INDETERMINATE
+        ):
+            released_execution = _validated_store_record(
+                await self.executions.load(published.execution_id),
+                operation="cancellation ownership release readback",
+            )
+            released = (
+                None
+                if released_execution is None
+                else released_execution.runtime_dispatch_ownership
+            )
+        release_matches = (
+            released_execution is not None
+            and released_execution.immutable_identity() == published.immutable_identity()
+            and released_execution.runtime_cancellation_observed
+            and (
+                result is None
+                or result.ownership.disposition
+                in {
+                    DurableOperationOwnershipDisposition.RELEASED,
+                    DurableOperationOwnershipDisposition.INDETERMINATE,
+                }
+            )
+            and released is not None
+            and released.state is DurableOperationOwnershipState.RELEASED
+            and released.operation_id == ownership.operation_id
+            and released.claim_id == ownership.claim_id
+            and released.owner_id == ownership.owner_id
+            and released.generation == ownership.generation
+        )
+        if not release_matches:
+            if transition_error is not None:
+                raise transition_error
+            raise MemoryInterventionExecutionConflict(
+                "Runtime cancellation ownership was not durably released."
+            )
+        assert released_execution is not None
+        return released_execution, won
 
     async def _record_runtime_timeout(
         self,
@@ -3856,8 +4441,11 @@ __all__ = [
     "MemoryInterventionExecutionStatus",
     "MemoryInterventionExecutionStore",
     "MemoryInterventionExecutor",
+    "MemoryInterventionExecutorAuthority",
+    "MemoryInterventionExecutorStatePaths",
     "MemoryInterventionIsolationAuthority",
     "MemoryInterventionOverlayProvider",
+    "MemoryInterventionProviderExecutionMode",
     "MemoryInterventionRequestFingerprintKey",
     "MemoryInterventionRuntimeApplicationFactory",
     "MemoryInterventionRuntimeResult",

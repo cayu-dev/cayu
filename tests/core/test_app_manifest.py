@@ -36,7 +36,7 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
-from cayu._validation import copy_durable_json_object
+from cayu._validation import copy_durable_json_object, revalidate_model_input
 from cayu.evals import EvaluationTargetIdentity
 
 
@@ -200,6 +200,16 @@ def test_manifest_fingerprint_survives_durable_json_round_trip() -> None:
     restored = EvaluationTargetIdentity.model_validate(stored)
 
     assert restored == target
+
+
+def test_manifest_survives_defensive_model_revalidation() -> None:
+    manifest = CayuApp(enable_logging=False).describe()
+
+    restored = revalidate_model_input(manifest, AppManifest)
+
+    assert restored == manifest
+    assert restored is not manifest
+    assert restored.runtime.configuration.values is not manifest.runtime.configuration.values
 
 
 def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:

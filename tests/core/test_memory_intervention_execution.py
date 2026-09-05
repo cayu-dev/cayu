@@ -96,6 +96,7 @@ from cayu.memory_intervention_execution import (
     MemoryInterventionExecutor,
     MemoryInterventionIsolationAuthority,
     MemoryInterventionOverlayProvider,
+    MemoryInterventionProviderExecutionMode,
     MemoryInterventionRequestFingerprintKey,
     MemoryInterventionRuntimeApplicationFactory,
     MemoryInterventionRuntimeOwnershipResult,
@@ -130,9 +131,11 @@ from cayu.runtime._durable_operation_ownership import (
     DurableOperationOwnershipAction,
     DurableOperationOwnershipDisposition,
     DurableOperationOwnershipResult,
+    DurableOperationOwnershipState,
     DurableOperationOwnershipTransition,
 )
 from cayu.runtime.app import CayuApp
+from cayu.runtime.budgets import BudgetLedger, InMemoryBudgetLedger
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.invocation import (
     InvocationOrigin,
@@ -148,6 +151,7 @@ from cayu.runtime.sessions import (
     InterruptSessionRequest,
     RunRequest,
     RuntimeSessionCreateClaimReference,
+    SessionIdentity,
     SessionStatus,
     SessionStore,
     TerminalSessionEvidence,
@@ -175,6 +179,23 @@ def _async_test(function):
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def test_runtime_cleanup_retains_an_existing_operation_cause() -> None:
+    primary = RuntimeError("operation failed")
+    existing = ValueError("earlier boundary failed")
+    cleanup = OSError("cleanup failed")
+    primary.__cause__ = existing
+
+    memory_intervention_execution_module._retain_secondary_failure(
+        primary,
+        cleanup,
+        group_message="retained failures",
+    )
+
+    cause = primary.__cause__
+    assert isinstance(cause, BaseExceptionGroup)
+    assert cause.exceptions == (existing, cleanup)
 
 
 def _ref(value: str, *, scope: str | None = None) -> AgentSnapshotLogicalRef:
@@ -955,6 +976,8 @@ def _canonical_runtime_context_policy(
 class _CanonicalRuntimeApplicationFactory(MemoryInterventionRuntimeApplicationFactory):
     factory_id = "test.canonical-memory-intervention-runtime.v1"
     execution_profile_fingerprint = _digest("canonical-runtime-factory:v1")
+    provider_configuration_fingerprint = _digest("canonical-runtime-provider:v1")
+    provider_execution_mode = MemoryInterventionProviderExecutionMode.HERMETIC
 
     def __init__(
         self,
@@ -963,10 +986,19 @@ class _CanonicalRuntimeApplicationFactory(MemoryInterventionRuntimeApplicationFa
         provider: ScriptedModelProvider,
     ) -> None:
         self.sessions = sessions
+        self.budgets = InMemoryBudgetLedger()
         self.provider = provider
         self.profile_by_policy: dict[str, str] = {}
         self.model_by_policy: dict[str, str] = {}
         self.created_apps: list[CayuApp] = []
+
+    @property
+    def runtime_session_store(self) -> SessionStore:
+        return self.sessions
+
+    @property
+    def runtime_budget_ledger(self) -> BudgetLedger:
+        return self.budgets
 
     def expected_execution_profile_fingerprint(
         self,
@@ -986,6 +1018,7 @@ class _CanonicalRuntimeApplicationFactory(MemoryInterventionRuntimeApplicationFa
     ) -> CayuApp:
         app = CayuApp(
             session_store=self.sessions,
+            budget_ledger=self.budgets,
             request_footprint=RequestFootprintConfig(
                 fingerprint_key_id="memory-intervention-test",
                 fingerprint_key="memory-intervention-test-secret-material",
@@ -1035,6 +1068,37 @@ class _CanonicalRuntimeApplicationFactory(MemoryInterventionRuntimeApplicationFa
         )
 
 
+class _BlockOnceRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactory):
+    """Pause the first disposable application before it can create a session."""
+
+    def __init__(self, *, sessions: SessionStore, provider: ScriptedModelProvider) -> None:
+        super().__init__(sessions=sessions, provider=provider)
+        self.preparation_started = asyncio.Event()
+        self.allow_preparation = asyncio.Event()
+        self._block_next_preparation = True
+
+    async def create(
+        self,
+        *,
+        request: MemoryInterventionTrialRequest,
+        execution: MemoryInterventionExecutionRecord,
+        trial: AgentSnapshotTrialBinding,
+        operation: MemoryInterventionOperation,
+        view: MemoryInterventionRuntimeView,
+    ) -> object:
+        if self._block_next_preparation:
+            self._block_next_preparation = False
+            self.preparation_started.set()
+            await self.allow_preparation.wait()
+        return await super().create(
+            request=request,
+            execution=execution,
+            trial=trial,
+            operation=operation,
+            view=view,
+        )
+
+
 class _ProfileRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactory):
     """Change one registered semantic after dry preflight but before admission."""
 
@@ -1072,6 +1136,17 @@ class _ProfileRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactor
 
         engine._prepare_initial_run = prepare_with_registration_race  # type: ignore[method-assign]
         return app
+
+
+def test_runtime_application_factory_requires_exact_runtime_authorities() -> None:
+    required = {
+        "provider_configuration_fingerprint",
+        "provider_execution_mode",
+        "runtime_session_store",
+        "runtime_budget_ledger",
+    }
+
+    assert required <= MemoryInterventionRuntimeApplicationFactory.__abstractmethods__
 
 
 class _StoreRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactory):
@@ -1519,6 +1594,47 @@ async def _canonical_execution_harness(
 
 
 @_async_test
+async def test_concrete_runner_attributes_accounting_to_the_trial_session_tree(
+    tmp_path,
+) -> None:
+    provider = ScriptedModelProvider(
+        (
+            ModelStreamEvent.text_delta("Friday"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        )
+    )
+    executor, _, request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix="accounting-session-tree",
+    )
+    outcome = await executor.execute_trial(request)
+    runner = executor.runtime_runner
+    assert type(runner) is CayuMemoryInterventionRuntimeRunner
+    factory = runner.factory
+    assert type(factory) is _CanonicalRuntimeApplicationFactory
+    child = await factory.sessions.create(
+        RunRequest(
+            agent_name="agent",
+            session_id="accounting-child",
+            parent_session_id=outcome.execution.session_id,
+            causal_budget_id=outcome.execution.causal_budget_id,
+            messages=[Message.text("user", "child work")],
+        ),
+        identity=SessionIdentity(provider_name="fake", model="fake-model"),
+    )
+
+    assert await runner.accounting_sessions_belong_to_trial(
+        outcome.execution,
+        (outcome.execution.session_id, child.id),
+    )
+    assert not await runner.accounting_sessions_belong_to_trial(
+        outcome.execution,
+        ("unknown-session",),
+    )
+
+
+@_async_test
 async def test_concrete_runner_rejects_wrong_reference_key_before_factory_creation(
     tmp_path,
 ) -> None:
@@ -1871,6 +1987,46 @@ async def _executor(
     return executor, overlay, runner, evaluator
 
 
+def _executor_with_execution_store(
+    executor: MemoryInterventionExecutor,
+    executions: MemoryInterventionExecutionStore,
+) -> MemoryInterventionExecutor:
+    """Build a fault-injection executor without mutating production authority."""
+
+    replacement = MemoryInterventionExecutor(
+        snapshots=executor.snapshots,
+        executions=executions,
+        overlay_provider=executor.overlay_provider,
+        runtime_runner=executor.runtime_runner,
+        evaluator=executor.evaluator,
+        request_keys=executor._request_keys,
+        current_request_key_id=executor._current_request_key_id,
+        clock=executor._clock,
+    )
+    replacement._runtime_clock = executor._runtime_clock
+    replacement._runtime_dispatch_owner_id = executor._runtime_dispatch_owner_id
+    return replacement
+
+
+@_async_test
+async def test_executor_component_authority_cannot_be_rebound(tmp_path) -> None:
+    provider = ScriptedModelProvider((ModelStreamEvent.completed({"finish_reason": "stop"}),))
+    executor, executions, _, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix="immutable-components",
+    )
+
+    replacements = {
+        "executions": executions,
+        "runtime_runner": executor.runtime_runner,
+        "snapshots": executor.snapshots,
+    }
+    for attribute, replacement in replacements.items():
+        with pytest.raises(AttributeError):
+            setattr(executor, attribute, replacement)
+
+
 class _CommitThenFailExecutionStore(MemoryInterventionExecutionStore):
     def __init__(
         self,
@@ -1987,6 +2143,54 @@ class _OwnershipTransitionFaultStore(MemoryInterventionExecutionStore):
             raise ConnectionError("test ownership acknowledgement was lost")
         if self.failure != "indeterminate":
             raise AssertionError(f"Unknown ownership failure mode: {self.failure}")
+        current = await self.delegate.load(execution_id)
+        assert current is not None
+        return MemoryInterventionRuntimeOwnershipResult(
+            execution=current,
+            ownership=DurableOperationOwnershipResult(
+                disposition=DurableOperationOwnershipDisposition.INDETERMINATE,
+                observed_at=current.updated_at,
+            ),
+        )
+
+
+class _CancellationReleaseFaultStore(MemoryInterventionExecutionStore):
+    def __init__(
+        self,
+        delegate: MemoryInterventionExecutionStore,
+        *,
+        failure: Literal["commit-before-error", "indeterminate-after-commit"],
+    ) -> None:
+        self.delegate = delegate
+        self.failure = failure
+        self.failed = False
+
+    async def begin(
+        self,
+        record: MemoryInterventionExecutionRecord,
+    ) -> MemoryInterventionExecutionRecord:
+        return await self.delegate.begin(record)
+
+    async def load(self, execution_id: str) -> MemoryInterventionExecutionRecord | None:
+        return await self.delegate.load(execution_id)
+
+    async def compare_and_set(
+        self,
+        expected: MemoryInterventionExecutionRecord,
+        desired: MemoryInterventionExecutionRecord,
+    ) -> MemoryInterventionExecutionRecord:
+        return await self.delegate.compare_and_set(expected, desired)
+
+    async def transition_runtime_dispatch_ownership(self, execution_id, request):
+        if self.failed or request.action is not DurableOperationOwnershipAction.RELEASE:
+            return await self.delegate.transition_runtime_dispatch_ownership(
+                execution_id,
+                request,
+            )
+        self.failed = True
+        await self.delegate.transition_runtime_dispatch_ownership(execution_id, request)
+        if self.failure == "commit-before-error":
+            raise ConnectionError("test cancellation release acknowledgement was lost")
         current = await self.delegate.load(execution_id)
         assert current is not None
         return MemoryInterventionRuntimeOwnershipResult(
@@ -2703,6 +2907,12 @@ async def test_sqlite_store_rejects_indexed_revision_document_disagreement(tmp_p
         await store.load(prepared.execution_id)
 
 
+def test_sqlite_memory_execution_store_does_not_claim_filesystem_durability() -> None:
+    store = SQLiteMemoryInterventionExecutionStore(":memory:")
+
+    assert store.durable_state_paths() == ()
+
+
 @_async_test
 async def test_executor_finalizes_exact_lineage_and_replays_without_redispatch() -> None:
     snapshot = _snapshot()
@@ -2970,6 +3180,13 @@ async def test_concrete_runner_records_a_real_runtime_deadline_as_timed_out(tmp_
     assert provider.started.is_set()
     assert provider.cancelled.is_set()
     assert len(provider.requests) == 1
+    runner = executor.runtime_runner
+    assert type(runner) is CayuMemoryInterventionRuntimeRunner
+    factory = runner.factory
+    assert type(factory) is _CanonicalRuntimeApplicationFactory
+    cleanup = factory.created_apps[-1].provider_operation_cancellation_status()
+    assert cleanup.admissions_sealed is True
+    assert cleanup.active_owners == 0
     assert outcome.execution.phase is MemoryInterventionExecutionPhase.FINALIZED
     assert outcome.execution.status is MemoryInterventionExecutionStatus.TIMED_OUT
     assert outcome.execution.runtime_timeout_observed is True
@@ -2992,9 +3209,12 @@ async def test_timeout_result_survives_lost_journal_acknowledgement_without_redi
         suffix="timeout-ack-lost",
         timeout_seconds=1,
     )
-    executor.executions = _CommitThenFailExecutionStore(
-        executions,
-        fail_phase=MemoryInterventionExecutionPhase.RUNTIME_TERMINAL,
+    executor = _executor_with_execution_store(
+        executor,
+        _CommitThenFailExecutionStore(
+            executions,
+            fail_phase=MemoryInterventionExecutionPhase.RUNTIME_TERMINAL,
+        ),
     )
 
     with pytest.raises(ConnectionError, match="acknowledgement lost"):
@@ -3154,9 +3374,12 @@ async def test_expired_durable_deadline_prevents_first_runtime_dispatch(tmp_path
         suffix="expired-before-dispatch",
         timeout_seconds=1,
     )
-    executor.executions = _CommitThenFailExecutionStore(
-        executions,
-        fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+    executor = _executor_with_execution_store(
+        executor,
+        _CommitThenFailExecutionStore(
+            executions,
+            fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        ),
     )
 
     with pytest.raises(ConnectionError, match="acknowledgement lost"):
@@ -3166,7 +3389,7 @@ async def test_expired_durable_deadline_prevents_first_runtime_dispatch(tmp_path
     assert bound is not None
     deadline = bound.runtime_deadline_at
     assert deadline is not None
-    executor.executions = executions
+    executor = _executor_with_execution_store(executor, executions)
     executor._runtime_clock = lambda: deadline + timedelta(seconds=1)
 
     outcome = await executor.execute_trial(request)
@@ -3189,9 +3412,12 @@ async def test_recorded_timeout_with_missing_session_never_redispatches(tmp_path
         provider=provider,
         suffix="recorded-timeout-no-session",
     )
-    executor.executions = _CommitThenFailExecutionStore(
-        executions,
-        fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+    executor = _executor_with_execution_store(
+        executor,
+        _CommitThenFailExecutionStore(
+            executions,
+            fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        ),
     )
 
     with pytest.raises(ConnectionError, match="acknowledgement lost"):
@@ -3199,7 +3425,7 @@ async def test_recorded_timeout_with_missing_session_never_redispatches(tmp_path
 
     bound = await executions.load(request.execution_id)
     assert bound is not None
-    executor.executions = executions
+    executor = _executor_with_execution_store(executor, executions)
     bound, _, ownership = await executor._claim_runtime_dispatch(
         bound,
         fresh_if_acquired=False,
@@ -3227,9 +3453,12 @@ async def test_fresh_runtime_reconstructs_the_overlay_before_first_dispatch(tmp_
         provider=first_provider,
         suffix="fresh-recovery",
     )
-    first.executions = _CommitThenFailExecutionStore(
-        executions,
-        fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+    first = _executor_with_execution_store(
+        first,
+        _CommitThenFailExecutionStore(
+            executions,
+            fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        ),
     )
 
     with pytest.raises(ConnectionError, match="acknowledgement lost"):
@@ -3296,9 +3525,12 @@ async def test_recovery_rejects_foreign_terminal_session_with_predicted_id(tmp_p
         provider=intervention_provider,
         suffix="foreign-session-collision",
     )
-    executor.executions = _CommitThenFailExecutionStore(
-        executions,
-        fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+    executor = _executor_with_execution_store(
+        executor,
+        _CommitThenFailExecutionStore(
+            executions,
+            fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        ),
     )
 
     with pytest.raises(ConnectionError, match="acknowledgement lost"):
@@ -3335,7 +3567,7 @@ async def test_recovery_rejects_foreign_terminal_session_with_predicted_id(tmp_p
             )
         )
     ]
-    executor.executions = executions
+    executor = _executor_with_execution_store(executor, executions)
 
     with pytest.raises(
         MemoryInterventionExecutionConflict,
@@ -3360,9 +3592,12 @@ async def test_recovery_rejects_foreign_running_session_with_predicted_id(tmp_pa
         provider=intervention_provider,
         suffix="foreign-running-session-collision",
     )
-    executor.executions = _CommitThenFailExecutionStore(
-        executions,
-        fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+    executor = _executor_with_execution_store(
+        executor,
+        _CommitThenFailExecutionStore(
+            executions,
+            fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        ),
     )
     with pytest.raises(ConnectionError, match="acknowledgement lost"):
         await executor.execute_trial(request)
@@ -3398,7 +3633,7 @@ async def test_recovery_rejects_foreign_running_session_with_predicted_id(tmp_pa
 
     foreign_task = asyncio.create_task(run_foreign_session())
     await foreign_provider.started.wait()
-    executor.executions = executions
+    executor = _executor_with_execution_store(executor, executions)
     try:
         with pytest.raises(
             MemoryInterventionExecutionConflict,
@@ -3429,9 +3664,12 @@ async def test_spawned_process_recovers_exact_sqlite_trial_without_duplicate_dis
         provider=first_provider,
         suffix=suffix,
     )
-    first.executions = _CommitThenFailExecutionStore(
-        executions,
-        fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+    first = _executor_with_execution_store(
+        first,
+        _CommitThenFailExecutionStore(
+            executions,
+            fail_phase=MemoryInterventionExecutionPhase.SESSION_BOUND,
+        ),
     )
 
     with pytest.raises(ConnectionError, match="acknowledgement lost"):
@@ -3503,11 +3741,23 @@ async def test_concrete_runner_preserves_real_cancellation_and_recovers_without_
     assert task.cancelled()
     assert provider.cancelled.is_set()
     assert len(provider.requests) == 1
+    runner = executor.runtime_runner
+    assert type(runner) is CayuMemoryInterventionRuntimeRunner
+    factory = runner.factory
+    assert type(factory) is _CanonicalRuntimeApplicationFactory
+    cleanup = factory.created_apps[-1].provider_operation_cancellation_status()
+    assert cleanup.admissions_sealed is True
+    assert cleanup.active_owners == 0
     interrupted = await executions.load(request.execution_id)
     assert interrupted is not None
     assert interrupted.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
     assert interrupted.status is MemoryInterventionExecutionStatus.ACTIVE
     assert interrupted.runtime_cancellation_observed is True
+    assert interrupted.runtime_dispatch_ownership is not None
+    assert interrupted.runtime_dispatch_ownership.state is DurableOperationOwnershipState.RELEASED
+    deadline = interrupted.runtime_deadline_at
+    assert deadline is not None
+    executor._runtime_clock = lambda: deadline + timedelta(seconds=1)
 
     recovered = await executor.execute_trial(request)
 
@@ -3532,6 +3782,61 @@ async def test_concrete_runner_preserves_real_cancellation_and_recovers_without_
 
 
 @_async_test
+async def test_cancellation_during_application_preparation_recovers_without_dispatch(
+    tmp_path,
+) -> None:
+    provider = _BlockingRuntimeProvider()
+    executor, executions, request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix="cancelled-before-session",
+        factory_type=_BlockOnceRuntimeApplicationFactory,
+    )
+    runner = executor.runtime_runner
+    assert type(runner) is CayuMemoryInterventionRuntimeRunner
+    factory = runner.factory
+    assert type(factory) is _BlockOnceRuntimeApplicationFactory
+    task = asyncio.create_task(executor.execute_trial(request))
+    await factory.preparation_started.wait()
+
+    task.cancel("stop intervention preparation")
+    with pytest.raises(asyncio.CancelledError, match="stop intervention preparation"):
+        await task
+
+    assert task.cancelling() == 1
+    assert task.cancelled()
+    assert provider.requests == []
+    assert await factory.sessions.load(request.session_id) is None
+    interrupted = await executions.load(request.execution_id)
+    assert interrupted is not None
+    assert interrupted.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+    assert interrupted.status is MemoryInterventionExecutionStatus.ACTIVE
+    assert interrupted.runtime_cancellation_observed is True
+    assert interrupted.runtime_dispatch_ownership is not None
+    assert interrupted.runtime_dispatch_ownership.state is (DurableOperationOwnershipState.RELEASED)
+
+    recovered = await executor.execute_trial(request)
+
+    assert provider.requests == []
+    assert await factory.sessions.load(request.session_id) is None
+    assert recovered.execution.phase is MemoryInterventionExecutionPhase.FINALIZED
+    assert recovered.execution.status is MemoryInterventionExecutionStatus.CANCELLED
+    assert recovered.execution.failure_code == "runtime_cancelled"
+    assert recovered.snapshot_result is not None
+    assert recovered.snapshot_result.terminal_disposition is (
+        AgentSnapshotTerminalDisposition.CANCELLED
+    )
+    assert recovered.eval_result is not None
+    assert recovered.eval_result.memory_attribution.completeness is (
+        EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    )
+    assert recovered.binding is not None
+    assert recovered.binding.terminal_evidence_available is False
+    assert recovered.binding.attribution.status is MemoryAttributionStatus.UNAVAILABLE
+    assert recovered.binding.proves_no_memory_exposure is False
+
+
+@_async_test
 async def test_runtime_cancellation_authority_survives_repeated_caller_cancellation(
     tmp_path,
 ) -> None:
@@ -3542,7 +3847,7 @@ async def test_runtime_cancellation_authority_survives_repeated_caller_cancellat
         suffix="repeated-cancellation",
     )
     pausing_store = _PausingCancellationAuthorityStore(executions)
-    executor.executions = pausing_store
+    executor = _executor_with_execution_store(executor, pausing_store)
     task = asyncio.create_task(executor.execute_trial(request))
     await provider.started.wait()
 
@@ -3555,10 +3860,56 @@ async def test_runtime_cancellation_authority_survives_repeated_caller_cancellat
 
     assert task.cancelling() == 2
     assert task.cancelled()
+    runner = executor.runtime_runner
+    assert type(runner) is CayuMemoryInterventionRuntimeRunner
+    factory = runner.factory
+    assert type(factory) is _CanonicalRuntimeApplicationFactory
+    cleanup = factory.created_apps[-1].provider_operation_cancellation_status()
+    assert cleanup.admissions_sealed is True
+    assert cleanup.active_owners == 0
     record = await executions.load(request.execution_id)
     assert record is not None
     assert record.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
     assert record.runtime_cancellation_observed is True
+    assert record.runtime_dispatch_ownership is not None
+    assert record.runtime_dispatch_ownership.state is DurableOperationOwnershipState.RELEASED
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("commit-before-error", "indeterminate-after-commit"),
+)
+@_async_test
+async def test_runtime_cancellation_release_recovers_ambiguous_acknowledgement(
+    tmp_path,
+    failure: Literal["commit-before-error", "indeterminate-after-commit"],
+) -> None:
+    provider = _BlockingRuntimeProvider()
+    executor, executions, request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix=f"cancellation-release-{failure}",
+    )
+    fault_store = _CancellationReleaseFaultStore(executions, failure=failure)
+    executor = _executor_with_execution_store(executor, fault_store)
+    task = asyncio.create_task(executor.execute_trial(request))
+    await provider.started.wait()
+
+    task.cancel("stop intervention trial")
+    with pytest.raises(asyncio.CancelledError, match="stop intervention trial"):
+        await task
+
+    assert fault_store.failed
+    interrupted = await executions.load(request.execution_id)
+    assert interrupted is not None
+    assert interrupted.runtime_cancellation_observed is True
+    assert interrupted.runtime_dispatch_ownership is not None
+    assert interrupted.runtime_dispatch_ownership.state is DurableOperationOwnershipState.RELEASED
+
+    recovered = await executor.execute_trial(request)
+
+    assert len(provider.requests) == 1
+    assert recovered.execution.status is MemoryInterventionExecutionStatus.CANCELLED
 
 
 @_async_test
@@ -3594,6 +3945,9 @@ async def test_concrete_runner_does_not_misclassify_operator_interruption_as_can
 
     assert interrupt_events
     assert provider.cancelled.is_set()
+    cleanup = app.provider_operation_cancellation_status()
+    assert cleanup.admissions_sealed is True
+    assert cleanup.active_owners == 0
     assert outcome.execution.status is MemoryInterventionExecutionStatus.OUTCOME_UNKNOWN
     assert outcome.execution.failure_code == "runtime_outcome_unknown"
     assert outcome.execution.runtime_cancellation_observed is False
@@ -3681,6 +4035,9 @@ async def test_actual_session_admission_rejects_profile_race_after_dry_preflight
     assert type(runner) is CayuMemoryInterventionRuntimeRunner
     session = await runner.factory.sessions.load(request.session_id)
     assert session is None
+    cleanup = runner.factory.created_apps[-1].provider_operation_cancellation_status()
+    assert cleanup.admissions_sealed is True
+    assert cleanup.active_owners == 0
 
 
 @_async_test
@@ -3707,6 +4064,11 @@ async def test_actual_session_admission_rejects_store_swap_after_dry_preflight(
     record = await executions.load(request.execution_id)
     assert record is not None
     assert record.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+    runner = executor.runtime_runner
+    assert type(runner) is CayuMemoryInterventionRuntimeRunner
+    cleanup = runner.factory.created_apps[-1].provider_operation_cancellation_status()
+    assert cleanup.admissions_sealed is True
+    assert cleanup.active_owners == 0
 
 
 @pytest.mark.parametrize(

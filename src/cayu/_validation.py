@@ -89,21 +89,31 @@ def _model_instance_python_input(value: BaseModel) -> dict[str, Any]:
         exclude=set(nested_fields),
     )
     for field_name, field_value in nested_fields.items():
-        document[field_name] = (
-            dict(field_value)
-            if isinstance(field_value, Mapping)
-            else _nested_model_python_input(field_value)
-        )
+        document[field_name] = _nested_model_python_input(field_value)
     return document
 
 
 def _nested_model_python_input(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return _model_instance_python_input(value)
+    if isinstance(value, Mapping):
+        return {key: _nested_mapping_python_input(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_nested_model_python_input(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_nested_model_python_input(item) for item in value)
+    return value
+
+
+def _nested_mapping_python_input(value: Any) -> Any:
+    """Thaw recursively immutable containers nested inside mapping fields."""
+
+    if isinstance(value, BaseModel):
+        return _model_instance_python_input(value)
+    if isinstance(value, Mapping):
+        return {key: _nested_mapping_python_input(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_nested_mapping_python_input(item) for item in value]
     return value
 
 

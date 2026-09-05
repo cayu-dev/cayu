@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from itertools import islice, pairwise
+from pathlib import Path
 from types import FunctionType, MethodType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast, overload
 from uuid import uuid4
@@ -9557,6 +9558,16 @@ class SessionStore(ABC):
     supports_recall_evidence: ClassVar[bool] = False
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
+
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return local files that own this store's durable state.
+
+        In-memory and remote stores return no paths. Filesystem-confined
+        features must fail closed when the store cannot provide this evidence;
+        custom local stores can opt in by overriding this method.
+        """
+
+        return ()
 
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:

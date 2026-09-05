@@ -99,6 +99,13 @@ class SQLiteBudgetLedger(BudgetLedger):
     def reservation_ttl_seconds(self) -> int | None:
         return self._reservation_ttl_seconds
 
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return the primary SQLite database file."""
+
+        if self.path == Path(":memory:"):
+            return ()
+        return (self.path.resolve(),)
+
     async def claim_reservation_identity(
         self,
         *,

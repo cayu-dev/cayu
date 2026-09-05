@@ -1804,6 +1804,13 @@ class SQLiteSessionStore(SessionStore):
             self._read_connection = self._connect_read_only(effective_db_path)
             self._read_lock = asyncio.Lock()
 
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return the primary SQLite file for state-boundary validation."""
+
+        if str(self.path) == ":memory:":
+            return ()
+        return (self.path.resolve(),)
+
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
         """Return the immutable codec bound to this store's durable alias registry."""

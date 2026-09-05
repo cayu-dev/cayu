@@ -761,6 +761,7 @@ class ToolContext(BaseModel):
     _policy_denials: list[_PolicyDenialSignal] = PrivateAttr(default_factory=list)
     _runtime_workspace_authority: Any = PrivateAttr(default=None)
     _runtime_artifact_store_authority: Any = PrivateAttr(default=None)
+    _runtime_causal_budget_limits: tuple[Any, ...] = PrivateAttr(default=())
 
     def _bind_runtime_resource_authorities(
         self,
@@ -776,6 +777,20 @@ class ToolContext(BaseModel):
             raise RuntimeError("Runtime artifact-store authority is already bound.")
         self._runtime_workspace_authority = workspace
         self._runtime_artifact_store_authority = artifact_store
+
+    def _bind_runtime_causal_budget_limits(self, limits: tuple[Any, ...]) -> None:
+        """Bind request-owned causal limits for Cayu's child-session tools."""
+
+        if type(limits) is not tuple:
+            raise TypeError("Runtime causal budget limits must be a tuple.")
+        if self._runtime_causal_budget_limits:
+            raise RuntimeError("Runtime causal budget limits are already bound.")
+        self._runtime_causal_budget_limits = limits
+
+    def _causal_budget_limits_for_builtin(self) -> tuple[Any, ...]:
+        """Return parent limits that Cayu-owned child sessions must inherit."""
+
+        return self._runtime_causal_budget_limits
 
     def _authoritative_workspace_for_builtin(self) -> Any:
         return self._runtime_workspace_authority

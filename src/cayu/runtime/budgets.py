@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, DecimalException, Inexact, localcontext
 from hashlib import sha256
 from itertools import chain
+from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, NamedTuple, cast
 from uuid import uuid4
@@ -1869,6 +1870,11 @@ class BudgetLedger(ABC):
     a store-owned injectable clock.
     """
 
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return local files that hold this ledger's durable state."""
+
+        return ()
+
     async def claim_reservation_identity(
         self,
         *,
@@ -2925,6 +2931,14 @@ def _copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
     )
 
 
+def _copy_budget_limit_definition(limit: BudgetLimit) -> BudgetLimit:
+    """Copy configured semantics while removing a Runtime-assigned identity."""
+
+    if type(limit) not in {BudgetLimit, _EffectiveBudgetLimit}:
+        raise TypeError("Budget limits must be BudgetLimit instances.")
+    return BudgetLimit(**_copy_budget_limit_fields(limit))
+
+
 def _copy_effective_budget_limit(limit: _EffectiveBudgetLimit) -> _EffectiveBudgetLimit:
     if type(limit) is not _EffectiveBudgetLimit:
         raise TypeError("Effective budget limits must be runtime-owned limit instances.")
@@ -2971,7 +2985,7 @@ def _effective_budget_limits(
             prepared.append((_copy_effective_budget_limit(limit), None))
             continue
         copied_limit = (
-            BudgetLimit(**_copy_budget_limit_fields(limit))
+            _copy_budget_limit_definition(limit)
             if type(limit) is _EffectiveBudgetLimit
             else _copy_budget_limit(limit)
         )

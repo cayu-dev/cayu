@@ -6,6 +6,7 @@ import threading
 import warnings
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, tzinfo
+from decimal import Decimal
 from typing import Any, cast
 
 import pytest
@@ -20,6 +21,8 @@ from cayu.runtime import (
     AfterToolCallDecision,
     BeforeToolCallDecision,
     BeforeToolCallHookContext,
+    BudgetLimit,
+    BudgetReservation,
     CayuApp,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -36,6 +39,7 @@ from cayu.runtime import (
     ToolPolicyResult,
 )
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.storage import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
@@ -96,6 +100,30 @@ class _ScriptedProvider(ModelProvider):
             return
         yield ModelStreamEvent.text_delta("done")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _UsageScriptedProvider(_ScriptedProvider):
+    """Scripted provider that supplies exact accounting for budget tests."""
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            for call_id, name, arguments in self._tool_calls:
+                yield ModelStreamEvent.tool_call(id=call_id, name=name, arguments=arguments)
+            yield ModelStreamEvent.completed(
+                {
+                    "finish_reason": "tool_calls",
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                }
+            )
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed(
+            {
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+        )
 
 
 class _Recorder:
@@ -241,7 +269,11 @@ class _CapturePolicy(ToolPolicy):
 
 
 class _FakeSubagentRuntime:
+    def __init__(self) -> None:
+        self.requests: list[RunRequest] = []
+
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
+        self.requests.append(request)
         if False:
             yield Event(type=EventType.SESSION_STARTED, session_id=request.session_id)
 
@@ -312,6 +344,62 @@ def test_builtin_mutating_tools_are_not_parallel_safe() -> None:
         ToolEffect.EXTERNAL
     )
     assert SubagentResultTool(InMemorySessionStore()).spec.effect is ToolEffect.NONE
+
+
+def test_subagent_inherits_matching_request_causal_budget_limits() -> None:
+    runtime = _FakeSubagentRuntime()
+    subagent = SubagentTool(runtime, agents={"helper": "helper"})
+    app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+    app.register_provider(
+        _UsageScriptedProvider(
+            [
+                (
+                    "call-subagent",
+                    "subagent",
+                    {"agent": "helper", "task": "check the bounded change"},
+                )
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[subagent],
+    )
+    causal_limit = BudgetLimit(
+        scope="causal",
+        key="private-trial-budget",
+        max_estimated_cost=Decimal("1"),
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("10"),
+                ),
+            )
+        ),
+        reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=1),
+    )
+
+    asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="causal-budget-parent",
+                causal_budget_id="private-trial-budget",
+                messages=[Message.text("user", "delegate the check")],
+                budget_limits=(causal_limit,),
+            ),
+        )
+    )
+
+    assert len(runtime.requests) == 1
+    child = runtime.requests[0]
+    assert child.causal_budget_id == "private-trial-budget"
+    assert child.budget_limits == (causal_limit,)
 
 
 def test_remember_knowledge_ambiguous_failure_event_is_bounded_and_content_free() -> None:

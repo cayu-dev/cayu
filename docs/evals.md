@@ -1611,6 +1611,186 @@ measured output changed under an exact declared memory intervention. It does not
 claim that the model attended to a record, used it in hidden reasoning, or that
 the result generalizes beyond the frozen corpus and candidate.
 
+### External-private memory-ablation campaigns
+
+Applications can run the same intervention executor and memory-report schema on
+a production-shaped corpus that must remain private. The
+`external_private_memory_ablation` SDK is deliberately application-owned: Cayu
+does not discover private files, provider credentials, targets, snapshots,
+budgets, or destinations, and it never starts such a campaign automatically.
+
+The application performs four explicit steps:
+
+1. Load one standard Evals corpus with
+   `load_external_private_memory_ablation_corpus(...)`. Both the file and the
+   retained executor state must be below one approved private root.
+2. Declare a fixed `MemoryExperimentReportRequest`, exact
+   `ExternalPrivateMemoryAblationTrial` matrix, schedule policy, and
+   `ExternalPrivateMemoryAblationAuthorization`. The authorization pins the
+   corpus, suite, experiment gates and ranking, target/release/manifest,
+   AgentSnapshot, execution profiles, evaluator, provider/model configuration,
+   pricing, evidence/redaction/retention policy, case/repetition/trial ceilings,
+   timeout/model/token/cost bounds, the per-trial report-evidence ceiling, the
+   supplemental-evidence ceiling when a collector is authorized, cache policy,
+   state storage, and report destination.
+3. Pass the application's exact `MemoryInterventionExecutor` to
+   `prepare_external_private_memory_ablation(...)` before giving it any work,
+   then pass that same executor and the prepared value to
+   `run_external_private_memory_ablation(...)`.
+4. Optionally commit the returned report and content-free methodology to a new
+   private directory with
+   `write_external_private_memory_ablation_artifacts(...)`. Cayu durably stages
+   the report and methodology before `COMPLETE`, verifies the exact tree, then
+   makes it visible through an atomic no-replace publication. Consumers
+   therefore cannot observe published completion without both matching payload
+   files.
+
+Preflight reloads and hashes the bounded corpus, revalidates the approved paths,
+compiles every case through the selected target, and requires the complete
+case/repetition/variant matrix exactly once. Fixed, deterministic-randomized,
+and counterbalanced schedules retain their exact realized order and stable
+execution identities. A changed gate, snapshot, profile, source manifest,
+provider/model, evaluator, budget, schedule, executor, or destination fails
+before the first provider dispatch. Each trial request is bound at preflight;
+changing its prepared input before execution is rejected. The runner executes
+detached copies so later caller mutations cannot alter trials awaiting admission.
+Executor preflight binds the overlay, runtime runner, evaluator, declared
+provider configuration, factory-owned
+provider execution mode, exact execution profiles, and the snapshot,
+execution-journal, and runtime-session files that
+the executor actually uses, including each file's stable filesystem identity.
+SQLite `:memory:` stores are process-local and do not qualify as durable state
+files. That binding is checked again around every trial, so swapping an owner,
+factory configuration, store, file path, or same-path state-file object cannot
+silently continue an authorized campaign. Sequential execution is intentional:
+the current contract authorizes concurrency one so trial order, failure
+position, and recovery remain unambiguous. Preflight also reserves the
+complete report's worst-case bounded execution, intervention, published metric,
+judge-explanation, and authorized supplemental evidence before provider work.
+The per-trial report-evidence ceiling must be between the independently bounded
+1 MiB execution record plus its small JSON envelope and 4 MiB. The lower bound
+guarantees that byte capacity alone cannot exclude a complete terminal
+execution, so an impossible ceiling is refused before dispatch. If evaluator or
+completed-intervention binding evidence exceeds the selected ceiling or fails
+the portable redaction boundary, the campaign stops and retains that terminal
+trial as unmatched rather than rewriting completed work as missing. Its exact
+binding fingerprint and execution-lineage revision remain in the report; only
+the unsafe or unrepresentable binding body and optional evaluator evidence are
+omitted, and the methodology records `report_evidence_omitted`. The report
+schema cannot make that omission claim for an abnormal terminal binding. If
+such a binding is unsafe, the portable row is missing while the complete
+terminal evidence remains in the private execution store.
+
+The complete missing-row report and methodology are redaction-checked again
+immediately before the first provider dispatch. Report-level redaction failure
+then removes optional evidence and retains only terminal projections that pass
+the current boundary; if none can be retained, the runner returns that
+content-free incomplete result. A static publication-boundary change is
+rejected before provider work whenever observable at admission. If it races
+with provider execution and also makes the content-free result unsafe, the
+runner returns no unsafe value and leaves the completed evidence recoverable in
+the private execution store. Invalid or oversized portable evidence is
+distinguished from runtime failure by the typed `report_evidence_failed` run
+code. If execution has already stopped for another reason, that original run
+failure and ordinal remain authoritative while a `report_evidence_failed`
+limitation records the later report fallback; neither failure replaces the
+other.
+Collectors that exceed their authorized byte ceiling fail closed as invalid
+evidence instead of allowing an oversized final artifact.
+
+Private filesystem authority is object-bound, not only path-bound. Corpus and
+state paths are traversed from pinned roots without following substituted
+ancestors, and their stable identities are revalidated at each use boundary.
+Artifact publication uses descriptor-relative POSIX writes and guarded Windows
+publication. Windows retains and verifies the protected private destination
+DACL; private bytes are not written until the exact authorized parent has been
+pinned or namespace-fenced. Exact retries authenticate and reuse only the
+already-complete expected tree, while conflicting preexisting content fails
+closed.
+
+Corpus, destination, and prepared campaign values retain process-local
+filesystem authority. Treat each returned value as a closeable resource: keep
+the prepared campaign open through artifact publication, then call `close()` or
+use its context-manager protocol. Validation creates independent authority
+leases, so closing an input after successful preparation does not invalidate
+the prepared campaign. Reusing a closed value fails before private access.
+
+The application must retain exclusive namespace-mutation ownership of the
+approved private root for the campaign lifetime. Cayu pins identities and
+rechecks them inside executor admission, but it does not sandbox or constrain a
+non-cooperating process running as the same filesystem principal. Native local
+artifact publication is supported on Linux, macOS, and Windows; other POSIX
+platforms fail closed before publication.
+
+The methodology binds content fingerprints of the exact executor authority,
+its relative state-file set, the canonical private root, state directory,
+artifact directory, and their application-owned IDs without retaining those
+paths. Artifact writing rejects a different path even when a caller reuses the
+same IDs, so a reviewed result cannot be redirected to another root after
+execution.
+
+Preflight also rejects legacy free-form model-judge rubrics and assertion kinds
+whose published detail embeds case-owned JSON, paths, or artifact names. Use the
+structured judge/private-reference privacy contract—which suppresses generated
+judge explanations—or content-free assertion projections instead. The
+private-safe set is an explicit allowlist, so a future assertion projection is
+rejected until its portable shape is reviewed. A private corpus is not
+permission to place its case data inside a portable report.
+
+Structured judges are currently limited to hermetic external-private campaigns.
+Live campaigns reject them during preflight because judge calls use separate
+provider work that does not yet participate in the campaign's reservation-backed
+total-cost authority. This prevents a reviewed campaign ceiling from describing
+only candidate spend while silently admitting additional judge spend.
+
+Live mode additionally requires an explicit live-execution authorization ID,
+a session-cumulative total-token ceiling for every trial, an all-time causal
+cost limit keyed to that trial's durable causal-budget identity, a conservative
+per-model-step cost reservation, a total campaign cost ceiling, an exact
+pricing identity, and an application-owned evidence collector. Run-scoped
+token limits and run/session-scoped or rolling cost limits do not qualify: they
+can reset across recovery or omit related session usage. The collector can
+project canonical accounting, memory-preparation overhead, cache read/write
+counts, and provider retry counts; it never returns raw provider bodies or
+prompts. Each accounting attempt must name the trial's root runtime session or
+a durably recorded child session with the same root session and causal budget;
+foreign-session evidence fails closed. Live trial agents that expose child-
+session tools are rejected until total-token authority can cover the complete
+causal session tree, rather than only the root session. Credentials stay in the
+application's provider adapter and are neither
+accepted nor persisted by this API. Hermetic tests and CI need no credential. A
+hermetic campaign may omit cost authority, but any declared total cost cap in
+either mode requires matching pricing and per-trial fail-closed budgets and is
+enforced across the complete matrix.
+The application runtime factory independently classifies its provider authority
+as `hermetic` or `live`; preflight requires that classification to match the
+campaign authorization. A caller cannot label an API-backed runtime hermetic to
+bypass the live authorization, evidence, token, or cost gates.
+
+Every terminal intervention outcome stays in the ordinary
+`MemoryExperimentReport`; unstarted coordinates remain explicit missing rows.
+The methodology records the provider/model/configuration, attempt time, realized
+order, terminal states, cache/retry availability, report revision, and bounded
+limitations. Candidate output text is replaced by a fixed omission marker for
+an external-private campaign, and the application workload-secret redactor
+checks both portable documents before they can be returned. Raw cases, prompts,
+recalled contents, unrestricted runtime events, credentials, and provider
+bodies are not written. Artifact files use private permissions, an existing
+destination is never overwritten, and neither execution nor artifact writing
+publishes to an EvalStore or changes canonical production knowledge.
+
+Use durable, application-owned snapshot, session, intervention-execution, and
+overlay state under the authorized state directory when restart recovery is
+required. External-private preflight requires the snapshot store, execution
+journal, runtime session store, and reservation ledger to name their primary
+durable database files; the built-in SQLite stores provide that evidence, while
+in-memory, remote, or custom stores without explicit path evidence fail closed.
+Every disposable `CayuApp` is sealed and boundedly drains
+Runtime-owned provider cancellation work before the trial entrance returns.
+Re-running the same exact trial identities lets
+`MemoryInterventionExecutor` recover terminal work without a duplicate provider
+dispatch; changing the contract requires a new authorization and destination.
+
 ## Capturing terminal session evidence
 
 The built-in in-memory, SQLite, and PostgreSQL session stores expose

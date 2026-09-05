@@ -103,6 +103,27 @@ This campaign establishes only that measured outputs changed under the declared
 interventions for this fixed corpus and scripted candidate. It does not establish
 model attention, hidden reasoning, universal causality, or production quality.
 
+## External-private causal-memory campaigns
+
+Production-shaped memory-ablation corpora and their reports stay outside this
+repository. Applications use the public
+`cayu.evals.external_private_memory_ablation` SDK with the same standard Evals
+corpus, `MemoryInterventionTrialRequest`, `MemoryInterventionExecutor`, and
+`MemoryExperimentReport` contracts exercised by the checked reference campaign.
+The SDK adds an exact application-owned authorization, bounded private-root file
+loading, deterministic randomized or counterbalanced scheduling, pre-provider
+matrix and budget validation, content-free methodology, and exclusive private
+artifact publication.
+
+Private and live execution is never part of this benchmark command or CI. A
+live campaign requires separate application authority, credentials held by the
+provider adapter, fail-closed token and priced-cost limits, and an authorized
+evidence collector. Cayu records missing and abnormal rows and limitations; it
+does not retry toward a favorable sample, expose candidate output text,
+publish the result automatically, or mutate production knowledge. See
+[`docs/evals.md`](../../docs/evals.md#external-private-memory-ablation-campaigns)
+for the complete preflight and recovery contract.
+
 ## Memory evidence overhead
 
 `memory-evidence-performance-v1.json` is the hermetic 50-pair baseline for the durable

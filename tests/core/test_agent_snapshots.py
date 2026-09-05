@@ -1150,6 +1150,12 @@ def test_default_materialization_identity_preserves_base_record_shape() -> None:
     )
 
 
+def test_sqlite_memory_snapshot_store_does_not_claim_filesystem_durability() -> None:
+    store = SQLiteAgentSnapshotStore(":memory:")
+
+    assert store.durable_state_paths() == ()
+
+
 @_async_test
 async def test_fresh_process_recovery_and_result_lineage_are_idempotent(tmp_path) -> None:
     now = [datetime(2026, 8, 23, tzinfo=UTC)]

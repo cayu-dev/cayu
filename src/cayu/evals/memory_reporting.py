@@ -79,14 +79,14 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.usage import AggregateCount
 
 MEMORY_EXPERIMENT_REPORT_SCHEMA_VERSION = 1
-MEMORY_EXPERIMENT_REPORT_MAX_BYTES = 32 << 20
+MEMORY_EXPERIMENT_REPORT_MAX_BYTES = 64 << 20
 MEMORY_EXPERIMENT_REPORT_MAX_CASES = 1_000
 MEMORY_EXPERIMENT_REPORT_MAX_VARIANTS = 128
 MEMORY_EXPERIMENT_REPORT_MAX_REPETITIONS = 1_000
 MEMORY_EXPERIMENT_REPORT_MAX_ROWS = 100_000
 MEMORY_EXPERIMENT_REPORT_MAX_METRICS = 32
 MEMORY_EXPERIMENT_REPORT_MAX_PAIRS = 256
-MEMORY_EXPERIMENT_REPORT_MAX_HTML_BYTES = 32 << 20
+MEMORY_EXPERIMENT_REPORT_MAX_HTML_BYTES = 64 << 20
 
 _MODEL_CONFIG = ConfigDict(
     extra="forbid",
@@ -579,6 +579,7 @@ class MemoryExperimentTrialEvidence(_ReportModel):
     variant_id: StrictStr = Field(max_length=128)
     execution: MemoryInterventionExecutionRecord
     intervention_binding: MemoryInterventionTrialBinding | None = None
+    intervention_binding_omitted: StrictBool = False
     published_result_revision: StrictStr | None = Field(default=None, max_length=71)
     accounting_side: PairedCostQualitySide | None = None
     memory_overhead: MemoryPreparationOverheadEvidence | None = None
@@ -617,6 +618,25 @@ class MemoryExperimentTrialEvidence(_ReportModel):
     @classmethod
     def copy_memory_overhead(cls, value: object) -> object:
         return revalidate_model_input(value, MemoryPreparationOverheadEvidence)
+
+    @model_validator(mode="after")
+    def validate_binding_omission(self) -> Self:
+        if not self.intervention_binding_omitted:
+            return self
+        if self.intervention_binding is not None:
+            raise ValueError("Omitted intervention binding evidence cannot retain its body.")
+        if (
+            self.execution.status is not MemoryInterventionExecutionStatus.COMPLETED
+            or self.execution.final_binding_fingerprint is None
+        ):
+            raise ValueError(
+                "Only a completed execution may retain an omitted intervention binding."
+            )
+        if self.published_result_revision is not None:
+            raise ValueError(
+                "Omitted intervention binding evidence cannot support a published trial."
+            )
+        return self
 
 
 class MemoryExperimentReportRequest(_ReportModel):
@@ -835,13 +855,11 @@ def _require_execution_variant_authority(
 def _require_terminal_execution_binding(
     execution: MemoryInterventionExecutionRecord,
     binding: MemoryInterventionTrialBinding | None,
+    *,
+    binding_omitted: bool = False,
 ) -> str | None:
     if execution.status is MemoryInterventionExecutionStatus.ACTIVE:
         raise ValueError("Memory experiment reports require terminal trial executions.")
-    if (binding is None) != (execution.final_binding_fingerprint is None):
-        raise ValueError("Trial binding evidence is incomplete.")
-    if binding is None:
-        return None
     execution_lineage = {
         "spec_fingerprint": execution.spec_fingerprint,
         "materialization_fingerprint": execution.materialization_fingerprint,
@@ -856,6 +874,21 @@ def _require_terminal_execution_binding(
         "eval_result_revision": execution.eval_result_revision,
         "terminal_disposition": execution.status.value,
     }
+    if binding_omitted:
+        if (
+            binding is not None
+            or execution.status is not MemoryInterventionExecutionStatus.COMPLETED
+            or execution.final_binding_fingerprint is None
+        ):
+            raise ValueError("Omitted trial binding evidence has an invalid terminal shape.")
+        return _content_revision(
+            execution_lineage,
+            "memory intervention execution binding lineage",
+        )
+    if (binding is None) != (execution.final_binding_fingerprint is None):
+        raise ValueError("Trial binding evidence is incomplete.")
+    if binding is None:
+        return None
     binding_lineage = _intervention_binding_lineage(binding)
     if binding_lineage != execution_lineage:
         raise ValueError("Trial binding conflicts with its complete execution lineage.")
@@ -903,6 +936,7 @@ class MemoryTrialReportRow(_ReportModel):
     final_binding_fingerprint: StrictStr | None = None
     execution_binding_lineage_revision: StrictStr | None = None
     intervention_binding: MemoryInterventionTrialBinding | None = None
+    intervention_binding_omitted: StrictBool = False
     published_result_revision: StrictStr | None = None
     published_run_id: StrictStr | None = None
     source_trial_revision: StrictStr | None = None
@@ -986,6 +1020,7 @@ class MemoryTrialReportRow(_ReportModel):
                     self.final_binding_fingerprint,
                     self.execution_binding_lineage_revision,
                     self.intervention_binding,
+                    self.intervention_binding_omitted or None,
                     self.published_result_revision,
                     self.published_run_id,
                     self.source_trial_revision,
@@ -1015,7 +1050,16 @@ class MemoryTrialReportRow(_ReportModel):
             raise ValueError("An observed trial row requires exact execution identity.")
         if self.execution_status is MemoryInterventionExecutionStatus.ACTIVE:
             raise ValueError("Memory experiment reports require terminal trial executions.")
-        if (self.intervention_binding is None) != (self.final_binding_fingerprint is None):
+        if self.intervention_binding_omitted:
+            if (
+                self.intervention_binding is not None
+                or self.final_binding_fingerprint is None
+                or self.execution_binding_lineage_revision is None
+                or self.execution_status is not MemoryInterventionExecutionStatus.COMPLETED
+                or self.published_result_revision is not None
+            ):
+                raise ValueError("Omitted intervention binding evidence has an invalid row shape.")
+        elif (self.intervention_binding is None) != (self.final_binding_fingerprint is None):
             raise ValueError(
                 "An observed trial row requires complete intervention binding evidence."
             )
@@ -1024,7 +1068,9 @@ class MemoryTrialReportRow(_ReportModel):
             and self.intervention_binding.fingerprint != self.final_binding_fingerprint
         ):
             raise ValueError("Intervention binding evidence conflicts with its fingerprint.")
-        if (self.intervention_binding is None) != (self.execution_binding_lineage_revision is None):
+        if (self.final_binding_fingerprint is None) != (
+            self.execution_binding_lineage_revision is None
+        ):
             raise ValueError("Trial row execution-binding lineage evidence is incomplete.")
         if self.intervention_binding is not None and (
             self.execution_binding_lineage_revision
@@ -1639,7 +1685,11 @@ def _validate_trial_evidence(
         variant=variant,
     )
     binding = evidence.intervention_binding
-    _require_terminal_execution_binding(execution, binding)
+    _require_terminal_execution_binding(
+        execution,
+        binding,
+        binding_omitted=evidence.intervention_binding_omitted,
+    )
     published = _published_trial_for_evidence(evidence, published_results)
     if published is not None:
         if execution.eval_result_revision is None:
@@ -1928,9 +1978,13 @@ def _build_row(
             else _require_terminal_execution_binding(
                 evidence.execution,
                 evidence.intervention_binding,
+                binding_omitted=evidence.intervention_binding_omitted,
             )
         ),
         intervention_binding=(None if evidence is None else evidence.intervention_binding),
+        intervention_binding_omitted=(
+            False if evidence is None else evidence.intervention_binding_omitted
+        ),
         published_result_revision=(
             None if evidence is None else evidence.published_result_revision
         ),

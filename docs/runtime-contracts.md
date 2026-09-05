@@ -13110,7 +13110,23 @@ preflight cannot create or dispatch a session under another profile. The exact
 registered environment and context-policy objects are likewise pinned through
 actual admission, and an `Environment` knowledge-store binding is read-only
 after registration, so a store swap cannot redirect an admitted trial into
-production knowledge. The runner drains the ordinary runtime stream, loads
+production knowledge. The factory also declares its exact runtime
+`SessionStore`, `BudgetLedger`, provider-configuration fingerprint, and typed
+hermetic-or-live provider execution mode. The runner binds those authorities,
+verifies that every created application installs
+those same store objects, and exposes the live binding to higher-level
+private-campaign preflight. The built-in SQLite snapshot,
+intervention-execution, session, and budget-ledger stores expose their primary
+durable database paths for that boundary. The factory contract is intentionally
+abstract and has no inference fallback: custom factories must declare a stable
+`provider_configuration_fingerprint` and `provider_execution_mode`, implement
+`runtime_session_store` and `runtime_budget_ledger`, and install those exact
+returned objects in every created application. This is a breaking prerelease
+migration for custom factory implementations. SQLite `:memory:` snapshot and
+intervention-execution stores return no paths because their contents cannot
+survive process restart. Stores
+with no local-file evidence remain valid for ordinary intervention execution but cannot satisfy a
+filesystem-confined private campaign. The runner drains the ordinary runtime stream, loads
 exact terminal or fresh interrupted evidence, derives the terminal
 receipt/exposure census, and only then projects ordinary memory attribution and
 usage evidence. If exact terminal evidence is unavailable, the result retains
@@ -13129,6 +13145,13 @@ its independent 1 MiB record bound and, if a custom runner still returns a
 larger valid attribution, persists a truthful `truncated` projection with the
 observed and omitted-at-least counts instead of stranding the session-bound
 record after provider completion.
+
+Each application created by the canonical factory is a disposable runtime
+owner. Whether execution succeeds, fails, times out, or is cancelled, the
+runner seals and boundedly drains that application's Runtime-owned provider
+cancellation lifecycle before returning. Caller cancellation remains the
+authoritative outcome and its cancellation-request count is preserved; a
+cleanup failure cannot replace an earlier execution failure.
 
 After the application-owned effect, `MemoryInterventionReceipt.create(...)`
 emits deterministic evidence for `verified_no_change`, `applied`,

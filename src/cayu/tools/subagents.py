@@ -44,6 +44,7 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_receipt_matches_intent,
     require_durable_subagent_receipt_matches_seed,
 )
+from cayu.runtime.budgets import copy_request_budget_limits
 from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.invocation import (
@@ -442,6 +443,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             environment_name=ctx.environment_name,
             messages=[Message.text("user", task)],
             metadata=child_metadata,
+            budget_limits=copy_request_budget_limits(ctx._causal_budget_limits_for_builtin()),
         )
         run_default_overrides: dict[str, object] = {}
         if "max_steps" in spec.model_fields_set:

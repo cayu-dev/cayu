@@ -29,7 +29,7 @@ from cayu._exception_groups import (
 )
 from cayu._filesystem_lock import cooperative_path_lock
 
-_JOURNAL_SCHEMA_VERSION = 3
+_JOURNAL_SCHEMA_VERSION = 4
 _JOURNAL_LIMIT_BYTES = 64 * 1024
 _PUBLICATION_METADATA_CENSUS_LIMIT = 1024
 _PARENT_DIRECTORY_CENSUS_LIMIT = 16_384
@@ -1159,6 +1159,7 @@ class _Record:
     token: str
     destination_name: str
     policy: DestinationPolicy
+    preserve_windows_destination_dacl: bool
     parent_identity: _Identity
     original_identity: _Identity | None
     original_sha256: str | None
@@ -1188,6 +1189,7 @@ class _Record:
             "token": self.token,
             "destination_name": self.destination_name,
             "policy": self.policy.value,
+            "preserve_windows_destination_dacl": self.preserve_windows_destination_dacl,
             "parent_identity": self.parent_identity.as_json(),
             "original_identity": (
                 None if self.original_identity is None else self.original_identity.as_json()
@@ -1289,6 +1291,7 @@ def publish_guarded_tree(
     populate: Callable[[GuardedTreeStage], None],
     predecessor_request_digest: str | None = None,
     settle_active_operation: bool = False,
+    preserve_windows_destination_dacl: bool = False,
 ) -> GuardedTreePublicationResult:
     """Populate one tree, optionally settling recoverable active work first."""
 
@@ -1301,6 +1304,7 @@ def publish_guarded_tree(
         predecessor_request_digest=predecessor_request_digest,
         bind_current_replacement=False,
         settle_active_operation=settle_active_operation,
+        preserve_windows_destination_dacl=preserve_windows_destination_dacl,
     )
 
 
@@ -1322,6 +1326,7 @@ def replace_guarded_tree(
         predecessor_request_digest=None,
         bind_current_replacement=True,
         settle_active_operation=False,
+        preserve_windows_destination_dacl=False,
     )
 
 
@@ -1335,6 +1340,7 @@ def _publish_guarded_tree(
     predecessor_request_digest: str | None,
     bind_current_replacement: bool,
     settle_active_operation: bool,
+    preserve_windows_destination_dacl: bool,
 ) -> GuardedTreePublicationResult:
     """Run one guarded publication through the shared destination owner."""
 
@@ -1347,6 +1353,7 @@ def _publish_guarded_tree(
         populate=populate,
         predecessor_request_digest=predecessor_request_digest,
         settle_active_operation=settle_active_operation,
+        preserve_windows_destination_dacl=preserve_windows_destination_dacl,
     )
     parent_path = destination.parent
     expected_parent = _capture_parent(parent_path)
@@ -1377,6 +1384,7 @@ def _publish_guarded_tree(
                 populate=populate,
                 predecessor_request_digest=predecessor_request_digest,
                 settle_active_operation=settle_active_operation,
+                preserve_windows_destination_dacl=preserve_windows_destination_dacl,
                 parent=parent,
                 metadata_stem=metadata_stem,
             )
@@ -1448,6 +1456,7 @@ def _publish_guarded_tree_owned(
     populate: Callable[[GuardedTreeStage], None],
     predecessor_request_digest: str | None,
     settle_active_operation: bool,
+    preserve_windows_destination_dacl: bool,
     parent: _Parent,
     metadata_stem: str,
 ) -> GuardedTreePublicationResult:
@@ -1465,6 +1474,8 @@ def _publish_guarded_tree_owned(
             and journal.record.request_digest == request_digest
             and journal.record.predecessor_request_digest == predecessor_request_digest
             and journal.record.policy is policy
+            and journal.record.preserve_windows_destination_dacl
+            is preserve_windows_destination_dacl
         )
         _require_parent_namespace_mutable(parent)
         retired = _retire_stale_settled_publication_if_safe(journal, parent=parent)
@@ -1489,6 +1500,8 @@ def _publish_guarded_tree_owned(
             and receipt.record.request_digest == request_digest
             and receipt.record.predecessor_request_digest == predecessor_request_digest
             and receipt.record.policy is policy
+            and receipt.record.preserve_windows_destination_dacl
+            is preserve_windows_destination_dacl
         )
         retired = _retire_stale_settled_publication_if_safe(receipt, parent=parent)
         receipt_outcome = "rolled_back" if retired else _recover(receipt, parent=parent)
@@ -1547,6 +1560,7 @@ def _publish_guarded_tree_owned(
         token=token,
         destination_name=destination.name,
         policy=policy,
+        preserve_windows_destination_dacl=preserve_windows_destination_dacl,
         parent_identity=parent.identity,
         original_identity=original_identity,
         original_sha256=original_sha256,
@@ -1768,8 +1782,10 @@ def _execute_publication(
         parent,
         journal.record.destination_name,
         expected=journal.record.stage_identity,
+        preserve_windows_destination_dacl=(journal.record.preserve_windows_destination_dacl),
     )
     _require_published_stage(journal.record, parent=parent)
+    _require_windows_destination_dacl(journal.record, parent=parent)
     _append_journal(
         journal,
         replace(journal.record, phase=_Phase.PUBLISHED),
@@ -1873,8 +1889,10 @@ def _recover(
                 parent,
                 record.destination_name,
                 expected=record.stage_identity,
+                preserve_windows_destination_dacl=(record.preserve_windows_destination_dacl),
             )
             _require_published_stage(record, parent=parent)
+            _require_windows_destination_dacl(record, parent=parent)
             _append_journal(
                 journal,
                 replace(journal.record, phase=_Phase.PUBLISHED),
@@ -2377,7 +2395,16 @@ def _reconcile_missing_journal(record: _Record, *, parent: _Parent) -> str:
         }:
             _require_published_identity(record, parent=parent)
         else:
+            if record.stage_identity is None:
+                raise _conflict(record, "published staging authority is incomplete")
+            _finalize_published_tree(
+                parent,
+                record.destination_name,
+                expected=record.stage_identity,
+                preserve_windows_destination_dacl=(record.preserve_windows_destination_dacl),
+            )
             _require_published_stage(record, parent=parent)
+            _require_windows_destination_dacl(record, parent=parent)
         return "published"
     if (
         backup is None
@@ -2405,6 +2432,7 @@ def _validate_publication_input(
     populate: Callable[[GuardedTreeStage], None],
     predecessor_request_digest: str | None,
     settle_active_operation: bool,
+    preserve_windows_destination_dacl: bool,
 ) -> None:
     _validate_destination_name(destination)
     if not isinstance(policy, DestinationPolicy):
@@ -2421,6 +2449,11 @@ def _validate_publication_input(
         raise GuardedTreePublicationError(
             "invalid_recovery_policy",
             "publication active-operation settlement policy is invalid",
+        )
+    if type(preserve_windows_destination_dacl) is not bool:
+        raise GuardedTreePublicationError(
+            "invalid_permission_policy",
+            "publication Windows destination permission policy is invalid",
         )
     try:
         consumer_size = len(consumer.encode("utf-8"))
@@ -4140,6 +4173,7 @@ def _reuse_or_retire_exact_receipt(receipt: _Journal, *, parent: _Parent) -> boo
 
     record = receipt.record
     if _published_stage_matches(record, parent=parent):
+        _require_windows_destination_dacl(record, parent=parent)
         return True
     if record.policy is not DestinationPolicy.ABSENT_OR_EMPTY:
         raise _conflict(record, "published tree changed after settlement")
@@ -4185,6 +4219,7 @@ def _retire_stale_settled_publication_if_safe(
             record,
             parent=parent,
         ):
+            _require_windows_destination_dacl(record, parent=parent)
             return False
         if not _directory_is_empty(
             parent,
@@ -4221,6 +4256,17 @@ def _require_published_identity(record: _Record, *, parent: _Parent) -> None:
         label="published destination",
         path=record.destination_name,
     )
+    _require_windows_destination_dacl(record, parent=parent)
+
+
+def _require_windows_destination_dacl(record: _Record, *, parent: _Parent) -> None:
+    if os.name != "nt":
+        return
+    path = parent.path / record.destination_name
+    if record.preserve_windows_destination_dacl:
+        _assert_windows_directory_dacl_is_protected(path)
+    else:
+        _assert_windows_directory_dacl_is_inherited(path)
 
 
 def _create_journal(path: Path, *, record: _Record, parent: _Parent) -> _Journal:
@@ -4629,6 +4675,7 @@ def _parse_journal_entry(
         "token",
         "destination_name",
         "policy",
+        "preserve_windows_destination_dacl",
         "parent_identity",
         "original_identity",
         "original_sha256",
@@ -4690,6 +4737,11 @@ def _parse_journal_entry(
     }
     if any(not isinstance(item, str) for item in strings.values()):
         raise _invalid_journal("publication journal contains a non-string identity field")
+    preserve_windows_destination_dacl = value["preserve_windows_destination_dacl"]
+    if type(preserve_windows_destination_dacl) is not bool:
+        raise _invalid_journal(
+            "publication journal contains an invalid Windows destination permission policy"
+        )
     predecessor_raw = value["predecessor_request_digest"]
     if predecessor_raw is not None and not isinstance(predecessor_raw, str):
         raise _invalid_journal("publication journal contains an invalid predecessor digest")
@@ -4728,6 +4780,7 @@ def _parse_journal_entry(
         token=strings["token"],
         destination_name=strings["destination_name"],
         policy=policy,
+        preserve_windows_destination_dacl=preserve_windows_destination_dacl,
         parent_identity=parent_identity,
         original_identity=original_identity,
         original_sha256=original_sha256,
@@ -4756,6 +4809,7 @@ def _require_record_successor(previous: _Record, record: _Record) -> None:
         record.token,
         record.destination_name,
         record.policy,
+        record.preserve_windows_destination_dacl,
         record.parent_identity,
         record.original_identity,
         record.original_sha256,
@@ -4770,6 +4824,7 @@ def _require_record_successor(previous: _Record, record: _Record) -> None:
         previous.token,
         previous.destination_name,
         previous.policy,
+        previous.preserve_windows_destination_dacl,
         previous.parent_identity,
         previous.original_identity,
         previous.original_sha256,
@@ -4809,6 +4864,7 @@ def _validate_record(record: _Record) -> None:
             character not in "abcdefghijklmnopqrstuvwxyz0123456789_.-"
             for character in record.consumer
         )
+        or type(record.preserve_windows_destination_dacl) is not bool
         or not _is_sha256(record.request_digest)
         or (
             record.predecessor_request_digest is not None
@@ -6323,6 +6379,7 @@ def _finalize_published_tree(
     name: str,
     *,
     expected: _Identity,
+    preserve_windows_destination_dacl: bool,
 ) -> None:
     parent.assert_unchanged()
     _require_identity(parent, name, expected, label="published destination")
@@ -6331,7 +6388,10 @@ def _finalize_published_tree(
     path = parent.path / name
     with _windows_directory_namespace_fence(path):
         _require_identity(parent, name, expected, label="published destination")
-        _restore_windows_directory_inheritance(path)
+        if preserve_windows_destination_dacl:
+            _assert_windows_directory_dacl_is_protected(path)
+        else:
+            _restore_windows_directory_inheritance(path)
         _require_identity(parent, name, expected, label="published destination")
 
 

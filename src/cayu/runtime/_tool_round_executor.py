@@ -129,7 +129,11 @@ from cayu.runtime.approvals import (
     ToolPolicyEvidence,
     copy_pending_tool_approval,
 )
-from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.budgets import (
+    BudgetLimit,
+    _copy_budget_limit_definition,
+    copy_request_budget_limits,
+)
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_FINGERPRINT_FIELD,
     ExecutionProfileIdentity,
@@ -3305,6 +3309,7 @@ class ToolRoundExecutor:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_call: runtime_records.ToolCallRequest,
         request_metadata: dict[str, Any],
+        budget_limits: tuple[BudgetLimit, ...],
         task_id: str | None,
         model_step: int | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
@@ -4288,6 +4293,15 @@ class ToolRoundExecutor:
             knowledge_access_scope=_knowledge_access_scope(registered_environment),
             mcp_servers=_mcp_servers(registered_environment),
             metadata=ctx_metadata,
+        )
+        tool_context._bind_runtime_causal_budget_limits(
+            tuple(
+                _copy_budget_limit_definition(limit)
+                for limit in budget_limits
+                if limit.scope == "causal" and limit.key == session.causal_budget_id
+            )
+            if registered_tool.child_session_recovery is not None
+            else ()
         )
         tool_context._bind_runtime_resource_authorities(
             workspace=raw_workspace,
@@ -8051,6 +8065,7 @@ class ToolRoundRun:
                 registered_environment=self._registered_environment,
                 tool_call=tool_call,
                 request_metadata=self._request_metadata,
+                budget_limits=self._budget_limits,
                 task_id=self._task_id,
                 model_step=model_step,
                 execution_profile=self._execution_profile,
@@ -8115,6 +8130,7 @@ class ToolRoundRun:
                         registered_environment=self._registered_environment,
                         tool_call=tool_call,
                         request_metadata=self._request_metadata,
+                        budget_limits=self._budget_limits,
                         task_id=self._task_id,
                         model_step=model_step,
                         execution_profile=self._execution_profile,

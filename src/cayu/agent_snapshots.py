@@ -2758,6 +2758,11 @@ class AgentSnapshotComponentProvider(ABC):
 
 
 class AgentSnapshotStore(ABC):
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return local files that own this store's durable state."""
+
+        return ()
+
     @abstractmethod
     async def put_snapshot(
         self,
@@ -4143,6 +4148,13 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         self.path = Path(path)
         self._write_lock = threading.RLock()
         self._initialize()
+
+    def durable_state_paths(self) -> tuple[Path, ...]:
+        """Return the primary SQLite file for state-boundary validation."""
+
+        if self.path == Path(":memory:"):
+            return ()
+        return (self.path.resolve(),)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
