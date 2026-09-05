@@ -483,6 +483,21 @@ guarantee. Docker reconnect verifies the exact retained container and its
 immutable mounts; deterministic attachment replay retains one durable reference
 for that same physical container instead of allocating a duplicate.
 
+Attachment ownership follows the allocation lifetime, rather than the session.
+Recoverable creation uses Runtime's durable allocation ID; direct `create()`
+reserves an incarnation in the shared input store before admitting attachments.
+Retries and reconstructed workers retain that identity. After confirmed disposal,
+a new allocation for the same session receives distinct attachment ownership and
+can reuse the retained bytes. Released attachment tombstones remain terminal even
+after collection. Admission cancellation leaves references with the durable
+allocation so another worker's replay cannot release them.
+
+For interrupted Docker binding finalization, Runtime checkpoints exact disposal
+authority before removing the container. Successful disposal retires the live
+reconnect receipt. Recovery finishes any pending exact disposal before requesting
+a new allocation; it never substitutes a new container for an exact reconnect.
+Use the same managed immutable-input store across cooperating Docker factories.
+
 A `SyncBinding` target plan factory is an identity-resolution boundary, not an
 allocation owner: `target_workspace_plan_factory` returns a
 `SyncTargetWorkspacePlan` containing an already lifecycle-owned, quiescent

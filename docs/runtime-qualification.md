@@ -28,6 +28,24 @@ five-minute wall-clock bound (ten minutes for stress), followed by a bounded cle
 PostgreSQL are required. POSIX process groups and real SIGKILL are required for
 fresh-process recovery; unsupported hosts produce prerequisite failure, not a pass.
 
+The default `docker-allocation` scenario uses simulated Docker calls to qualify
+immutable attachment lifetimes without a daemon. For the real Docker continuation
+and fresh-process controls, explicitly enable the local Docker lane with an existing
+coding image (no image build or pull is performed):
+
+```sh
+CAYU_DOCKER_CODING_IMAGE=<existing-coding-image> \
+python scripts/run_runtime_qualification.py \
+  --python /tmp/cayu-qualification-env/bin/python --docker \
+  --scenario docker-allocation-live --repeat 1 \
+  --report runtime-qualification-docker.json
+```
+
+This lane requires Docker availability rather than accepting skipped fixtures.
+It verifies the three recreation controls, model-step interrupted handoff and
+continuation without a duplicate effect, concurrent fresh-process reconstruction,
+exact container disposal, and immutable reference counts.
+
 The explicit stress profile adds 100 concurrent durable sessions/task workers,
 100 concurrent environment operations, a single 100-call model-authored round,
 and 200 empty workers:

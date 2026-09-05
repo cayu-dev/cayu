@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Self
+from uuid import uuid4
 
 from pydantic import (
     BaseModel,
@@ -348,6 +349,62 @@ class ImmutableInputStore:
         self._registry = managed_root / "registry.json"
         self._thread_lock = threading.RLock()
 
+    def reserve_allocation_sync(
+        self,
+        scope_id: str,
+        projection_fingerprints: tuple[str, ...],
+    ) -> str:
+        """Reserve a durable incarnation until all its attachments are released.
+
+        Missing admissions and closing attachments retain the same incarnation.
+        Callers must use the returned identity as their attachment owner ID.
+        """
+
+        scope_id = require_durable_clean_nonblank(scope_id, "scope_id")
+        fingerprints = tuple(
+            sorted(
+                _require_sha256(value, "projection_fingerprint")
+                for value in projection_fingerprints
+            )
+        )
+        if not fingerprints or len(set(fingerprints)) != len(fingerprints):
+            raise ValueError("Allocation projections must be nonempty and unique.")
+        with self._exclusive_registry() as registry:
+            allocations = registry.setdefault("allocations", {})
+            retained = allocations.get(scope_id)
+            generation = 0
+            if retained is not None:
+                if retained["projection_fingerprints"] != list(fingerprints):
+                    raise RuntimeError("Immutable allocation scope changed projections.")
+                generation = retained["generation"]
+                attachments = [
+                    value
+                    for value in registry["attachments"].values()
+                    if value["owner_id"] == retained["allocation_id"]
+                ]
+                if {value["projection_fingerprint"] for value in attachments} != set(
+                    fingerprints
+                ) or any(value["state"] != "released" for value in attachments):
+                    return str(retained["allocation_id"])
+                generation += 1
+            namespace = registry.setdefault("allocation_namespace", uuid4().hex)
+            allocation_id = (
+                "ealloc_"
+                + hashlib.sha256(
+                    canonical_durable_json_bytes(
+                        {"namespace": namespace, "scope_id": scope_id, "generation": generation},
+                        "immutable_allocation",
+                    )
+                ).hexdigest()
+            )
+            allocations[scope_id] = {
+                "generation": generation,
+                "allocation_id": allocation_id,
+                "projection_fingerprints": list(fingerprints),
+            }
+            self._write_registry(registry)
+            return allocation_id
+
     async def attach(
         self,
         source: LocalImmutableInput,
@@ -390,6 +447,8 @@ class ImmutableInputStore:
         owner_id = require_durable_clean_nonblank(owner_id, "owner_id")
         projection = source.projection
         with self._exclusive_registry() as registry:
+            if owner_id in registry.get("released_allocations", {}):
+                raise ImmutableInputAttachmentStateError(attachment_id, "released")
             existing_attachment = registry["attachments"].get(attachment_id)
             if existing_attachment is not None:
                 if (
@@ -435,6 +494,21 @@ class ImmutableInputStore:
             return self._attachment(
                 attachment_id, owner_id, projection, materialization, reused=reused
             )
+
+    def release_allocation_sync(self, owner_id: str) -> None:
+        """Terminalize an exact allocation, including admissions not yet written.
+
+        The caller must first confirm disposal of the owned external resource.
+        """
+
+        owner_id = require_durable_clean_nonblank(owner_id, "owner_id")
+        with self._exclusive_registry() as registry:
+            registry.setdefault("released_allocations", {})[owner_id] = True
+            for attachment in registry["attachments"].values():
+                if attachment["owner_id"] == owner_id:
+                    attachment["state"] = "released"
+                    attachment.pop("container_id", None)
+            self._write_registry(registry)
 
     async def release(self, attachment_id: str) -> None:
         task = asyncio.create_task(asyncio.to_thread(self.release_sync, attachment_id))
@@ -660,11 +734,7 @@ class ImmutableInputStore:
             self._write_registry(registry)
             _remove_tree(materialization_path)
             del registry["materializations"][projection_fingerprint]
-            registry["attachments"] = {
-                key: item
-                for key, item in registry["attachments"].items()
-                if item["projection_fingerprint"] != projection_fingerprint
-            }
+            # Released identities remain terminal even after their bytes are collected.
             self._write_registry(registry)
             return True
 

@@ -217,6 +217,8 @@ from cayu.workspaces.revisions import (
 )
 
 FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES = 4096
+_PENDING_ALLOCATION_DISPOSAL_KEY = "environment_factory_pending_disposals"
+_RETIRED_ALLOCATION_DISPOSAL_KEY = "environment_factory_retired_disposals"
 _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE = "_cayu_environment_factory_release"
 _MAX_LAZY_ENVIRONMENT_CLEANUP_SETTLEMENTS = 16
 _LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS = 0.01
@@ -1588,6 +1590,48 @@ class EnvironmentLifecycle:
                 environment_name=environment_name,
             )
             checkpoint = await self._session_store.load_checkpoint(session.id)
+            pending_disposal = (
+                (checkpoint or {}).get(_PENDING_ALLOCATION_DISPOSAL_KEY, {}).get(environment_name)
+            )
+            if pending_disposal is not None:
+                pending_reconnect, pending_owner = _factory_reconnect_state_from_checkpoint(
+                    checkpoint,
+                    environment_name=environment_name,
+                )
+                if (
+                    pending_owner != session.id
+                    or pending_reconnect != pending_disposal["reconnect_metadata"]
+                ):
+                    raise RuntimeError(
+                        "Pending disposal lost its exact session allocation authority."
+                    )
+                disposal_request = EnvironmentFactoryRequest(
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata=pending_disposal["reconnect_metadata"],
+                    execution_requirements=registered_agent.execution_requirements,
+                )
+                await _await_with_environment_lifecycle_reporter(
+                    progress_reporter,
+                    lambda: environment_operation_boundary.await_environment_operation(
+                        lambda: factory.recover_finalization_disposal(
+                            disposal_request,
+                            pending_disposal["state"],
+                        ),
+                        operation_name="Interrupted environment disposal recovery",
+                        redactor=self._secret_redactor,
+                    ),
+                )
+                await self._retire_disposed_allocation(
+                    session.id,
+                    environment_name,
+                    pending_disposal,
+                    session_instance_id=session.instance_id,
+                    run_epoch=session.run_epoch,
+                )
+                checkpoint = await self._session_store.load_checkpoint(session.id)
             reconnect_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
                 checkpoint,
                 environment_name=environment_name,
@@ -2049,6 +2093,67 @@ class EnvironmentLifecycle:
             self.checkpoint_transform_preserving_runtime_state(checkpoint),
         )
 
+    async def _retire_disposed_allocation(
+        self,
+        session_id: str,
+        environment_name: str,
+        expected: dict[str, Any],
+        *,
+        session_instance_id: str,
+        run_epoch: int,
+    ) -> None:
+        """Remove exact live reconnect authority only after confirmed disposal."""
+
+        def retire(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
+            if session.instance_id != session_instance_id or session.run_epoch != run_epoch:
+                raise SessionRunFenced("Allocation disposal lost its session generation.")
+            copied = copy_json_value(current or {}, "checkpoint")
+            retired = copied.get(_RETIRED_ALLOCATION_DISPOSAL_KEY, {})
+            if retired.get(environment_name) == expected:
+                # Read back an exact retirement whose commit acknowledgement was lost.
+                return copied
+            pending = copied.get(_PENDING_ALLOCATION_DISPOSAL_KEY, {})
+            if pending.get(environment_name) != expected:
+                raise RuntimeError("Allocation disposal lost its exact durable marker.")
+            reconnect, owner = _factory_reconnect_state_from_checkpoint(
+                copied,
+                environment_name=environment_name,
+            )
+            if owner != session_id or reconnect != expected["reconnect_metadata"]:
+                raise RuntimeError("Allocation disposal lost its exact reconnect authority.")
+            if (
+                self._allocation_coordinator.record_from_checkpoint(
+                    copied,
+                    environment_name=environment_name,
+                )
+                is not None
+            ):
+                raise RuntimeError("Allocation disposal conflicts with a pending allocation.")
+            receipt = self._allocation_coordinator.receipt_from_checkpoint(
+                copied,
+                environment_name=environment_name,
+            )
+            if receipt is not None and (
+                receipt.intent.session_id != session_id
+                or receipt.intent.environment_name != environment_name
+                or receipt.reconnect_metadata != reconnect
+            ):
+                raise RuntimeError("Allocation disposal conflicts with its receipt.")
+            copied.setdefault(_RETIRED_ALLOCATION_DISPOSAL_KEY, {})[environment_name] = expected
+            for key in (
+                _PENDING_ALLOCATION_DISPOSAL_KEY,
+                ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+            ):
+                values = copied.get(key, {})
+                values.pop(environment_name, None)
+                if not values:
+                    copied.pop(key, None)
+            return copied
+
+        await self._session_store.transform_checkpoint(session_id, retire)
+
     async def _finalize_binding_with_disposal_checkpoint(
         self,
         registered_environment: runtime_records.RegisteredEnvironment,
@@ -2062,13 +2167,70 @@ class EnvironmentLifecycle:
         if type(session_id) is not str:
             raise RuntimeError("Binding finalization lost its session identity.")
 
+        pending_disposal: dict[str, Any] | None = None
+        disposal_context: InvocationContext | None = None
+
         async def checkpoint_disposal(state: dict[str, Any]) -> None:
+            nonlocal pending_disposal, disposal_context
             checkpoint = await self._session_store.load_checkpoint(session_id)
             expected = pending_completion_finalization_from_checkpoint(checkpoint)
             if expected is None:
                 if outcome == "completed":
                     raise RuntimeError("Completion disposal lost its durable marker.")
-                # Direct non-completion teardown has no completion obligation.
+                # Non-completion teardown must retire live reconnect authority.
+                # Retain an exact recovery marker before the destructive step.
+                owner = self._active_environment_setups.get(session_id)
+                context = None if owner is None else owner.invocation_context
+                factory = None if owner is None else owner.disposal_recovery_factory
+                if context is None or factory is None:
+                    raise RuntimeError("Allocation disposal lost its invocation owner.")
+                if (
+                    type(factory).recover_finalization_disposal
+                    is EnvironmentFactory.recover_finalization_disposal
+                ):
+                    raise RuntimeError("Allocation disposal requires a factory recovery hook.")
+                environment_name = registered_environment.spec.name
+                reconnect, allocation_owner = _factory_reconnect_state_from_checkpoint(
+                    checkpoint,
+                    environment_name=environment_name,
+                )
+                retired = (
+                    (checkpoint or {})
+                    .get(_RETIRED_ALLOCATION_DISPOSAL_KEY, {})
+                    .get(environment_name)
+                )
+                if retired is not None and retired.get("state") == state:
+                    # A retry after retirement must not revive old live authority.
+                    return
+                if allocation_owner != session_id:
+                    raise RuntimeError("Allocation disposal lost its allocation owner.")
+                pending = {
+                    "reconnect_metadata": reconnect,
+                    "state": copy_durable_json_object(state, "allocation disposal state"),
+                }
+
+                def retain(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
+                    if (
+                        session.instance_id != context.binding.session_instance_id
+                        or session.run_epoch != context.binding.run_epoch
+                    ):
+                        raise SessionRunFenced("Allocation disposal lost its session generation.")
+                    current_reconnect, current_owner = _factory_reconnect_state_from_checkpoint(
+                        current,
+                        environment_name=environment_name,
+                    )
+                    if current_reconnect != reconnect or current_owner != session_id:
+                        raise RuntimeError("Allocation disposal reconnect authority changed.")
+                    copied = copy_json_value(current or {}, "checkpoint")
+                    values = copied.setdefault(_PENDING_ALLOCATION_DISPOSAL_KEY, {})
+                    if environment_name in values and values[environment_name] != pending:
+                        raise RuntimeError("Allocation disposal marker changed.")
+                    values[environment_name] = pending
+                    return copied
+
+                await self._session_store.transform_checkpoint(session_id, retain)
+                pending_disposal = pending
+                disposal_context = context
                 return
             if expected["environment_name"] != registered_environment.spec.name:
                 raise RuntimeError("Disposal checkpoint names another environment.")
@@ -2107,13 +2269,23 @@ class EnvironmentLifecycle:
 
         token = finalization_disposal_checkpoint.set(checkpoint_disposal)
         try:
-            return await _finalize_binding_after_mutation_quiescence(
+            snapshot = await _finalize_binding_after_mutation_quiescence(
                 registered_environment,
                 binding,
                 bound_workspace,
                 outcome=outcome,
                 metadata=metadata,
             )
+            if pending_disposal is not None:
+                assert disposal_context is not None
+                await self._retire_disposed_allocation(
+                    session_id,
+                    registered_environment.spec.name,
+                    pending_disposal,
+                    session_instance_id=disposal_context.binding.session_instance_id,
+                    run_epoch=disposal_context.binding.run_epoch,
+                )
+            return snapshot
         finally:
             finalization_disposal_checkpoint.reset(token)
 
@@ -2382,6 +2554,8 @@ class EnvironmentLifecycle:
 
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
         runtime_keys = (
+            _PENDING_ALLOCATION_DISPOSAL_KEY,
+            _RETIRED_ALLOCATION_DISPOSAL_KEY,
             ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,

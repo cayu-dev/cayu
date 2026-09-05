@@ -408,3 +408,94 @@ def test_store_rejects_source_overlap_and_never_collects_a_registry_path(
 
     assert caught.value.reason_code == "registry_path_conflict"
     assert victim.is_dir()
+
+
+def test_allocation_reservation_retains_missing_and_closing_admissions(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "data").write_text("shared")
+    source = _source(source_root)
+    store = ImmutableInputStore(tmp_path / "store")
+    fingerprints = (source.projection.fingerprint,)
+    owner = store.reserve_allocation_sync("scope", fingerprints)
+    assert ImmutableInputStore(store.root).reserve_allocation_sync("scope", fingerprints) == owner
+    attachment = store.attach_sync(source, attachment_id=owner, owner_id=owner)
+    store.mark_container_closing_sync((attachment,), container_id="a" * 64)
+    assert store.reserve_allocation_sync("scope", fingerprints) == owner
+    store.release_sync(owner)
+    assert store.collect(source.projection.fingerprint)
+    with pytest.raises(ImmutableInputAttachmentStateError, match="released"):
+        store.attach_sync(source, attachment_id=owner, owner_id=owner)
+    successor = store.reserve_allocation_sync("scope", fingerprints)
+    assert successor != owner
+    store.attach_sync(source, attachment_id=successor, owner_id=successor)
+    store.release_sync(owner)
+    assert store.inspect()[0].reference_count == 1
+    store.release_sync(successor)
+    assert store.inspect()[0].reference_count == 0
+    assert store.collect(source.projection.fingerprint)
+
+
+@pytest.mark.process
+def test_fresh_processes_converge_on_reserved_allocation(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "data").write_text("shared")
+    source = _source(source_root)
+    store = ImmutableInputStore(tmp_path / "store")
+    script = """
+import sys
+from cayu import ImmutableInputStore, inspect_local_immutable_input
+store = ImmutableInputStore(sys.argv[1])
+source = inspect_local_immutable_input(
+    sys.argv[2], target_path='/opt/cayu/inputs/runtime',
+    policy_fingerprint='sha256:' + 'a' * 64,
+    runtime_compatibility_fingerprint='sha256:' + 'b' * 64,
+    authorization_scope_fingerprint='sha256:' + 'c' * 64,
+    max_files=100, max_file_bytes=1024 * 1024, max_total_bytes=4 * 1024 * 1024,
+)
+owner = store.reserve_allocation_sync('scope', (source.projection.fingerprint,))
+store.attach_sync(source, attachment_id=owner, owner_id=owner)
+print(owner)
+"""
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(store.root), str(source_root)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(4)
+    ]
+    owners = []
+    try:
+        for child in children:
+            stdout, stderr = child.communicate(timeout=30)
+            assert child.returncode == 0, stderr
+            owners.append(stdout.strip())
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
+    assert len(set(owners)) == 1
+    assert store.inspect()[0].reference_count == 1
+    store.release_sync(owners[0])
+    assert store.inspect()[0].reference_count == 0
+    assert store.collect(source.projection.fingerprint)
+
+
+def test_reaped_allocation_rejects_late_admission(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "data").write_text("shared")
+    source = _source(source_root)
+    store = ImmutableInputStore(tmp_path / "store")
+    store.release_allocation_sync("reaped-before-admission")
+    with pytest.raises(ImmutableInputAttachmentStateError, match="released"):
+        ImmutableInputStore(store.root).attach_sync(
+            source,
+            attachment_id="late",
+            owner_id="reaped-before-admission",
+        )
+    assert store.inspect() == ()

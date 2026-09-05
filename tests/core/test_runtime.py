@@ -22709,6 +22709,8 @@ def test_fork_does_not_inherit_source_result_event_publication_reservation() -> 
         "session_run_operation",
         "queued_dispatch_terminal_receipts",
         "prompt_anatomy_transition_intents",
+        "environment_factory_pending_disposals",
+        "environment_factory_retired_disposals",
         COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,

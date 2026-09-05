@@ -137,6 +137,16 @@ SCENARIOS = (
         ),
     ),
     Scenario(
+        "docker-allocation",
+        "Allocation retries converge and released immutable owners remain terminal",
+        "immutable admission, container acknowledgement and allocation reaping",
+        (
+            "tests/environments/test_docker_coding.py",
+            "tests/test_immutable_inputs.py",
+            "tests/test_filesystem_lock.py",
+        ),
+    ),
+    Scenario(
         "environment-contention",
         "Conflicting environment allocations retain one authoritative owner",
         "environment allocation claim",
@@ -163,5 +173,18 @@ POSTGRES_SCENARIOS = (
         "native PostgreSQL commit and claim release",
         core("postgres_session_store", "postgres_session_operation_fault_conformance")
         + core("postgres_task_store", "postgres_interrupted_task_handoff_faults_reconcile_exactly"),
+    ),
+)
+
+
+DOCKER_SCENARIOS = (
+    Scenario(
+        "docker-allocation-live",
+        "Interrupted tasks continue once in a successor allocation after exact predecessor disposal",
+        "model-step handoff, Docker disposal, fresh-process reconstruction and immutable references",
+        (
+            "tests/environments/test_docker_coding_live.py::test_real_docker_reallocate_after_confirmed_disposal",
+            "tests/environments/test_docker_allocation_lifetime_live.py",
+        ),
     ),
 )

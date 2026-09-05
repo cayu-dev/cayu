@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import tempfile
@@ -18,6 +19,7 @@ def cooperative_path_lock(
     *,
     lock_directory_name: str,
     shared: bool = False,
+    blocking: bool = True,
     retain_on_exit: Callable[[], bool] | None = None,
 ) -> Iterator[None]:
     """Serialize cooperative processes addressing one root-relative path."""
@@ -44,11 +46,21 @@ def cooperative_path_lock(
                 if os.fstat(descriptor).st_size == 0:
                     os.write(descriptor, b"\0")
                 os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+                except OSError as error:
+                    if not blocking and error.errno in {errno.EACCES, errno.EAGAIN}:
+                        raise BlockingIOError(
+                            error.errno, "Filesystem lock is already owned."
+                        ) from None
+                    raise
             else:
                 import fcntl
 
-                fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+                operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+                if not blocking:
+                    operation |= fcntl.LOCK_NB
+                fcntl.flock(descriptor, operation)
             acquired = True
             yield
         except BaseException as error:

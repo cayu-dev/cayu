@@ -34,9 +34,9 @@ def test_report_excludes_payloads_exceptions_paths_and_untrusted_properties():
 
 
 def test_registry_names_are_unique_and_every_scenario_has_a_boundary():
-    from tests.qualification.registry import POSTGRES_SCENARIOS, SCENARIOS
+    from tests.qualification.registry import DOCKER_SCENARIOS, POSTGRES_SCENARIOS, SCENARIOS
 
-    scenarios = SCENARIOS + POSTGRES_SCENARIOS
+    scenarios = SCENARIOS + POSTGRES_SCENARIOS + DOCKER_SCENARIOS
     assert len({s.name for s in scenarios}) == len(scenarios)
     assert all(s.invariant and s.boundary and s.selectors for s in scenarios)
 

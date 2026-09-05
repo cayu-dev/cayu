@@ -1185,7 +1185,10 @@ def test_fork_replaces_only_its_copied_parent_allocation_receipt() -> None:
     asyncio.run(run())
 
 
-def test_detached_fork_replaces_inherited_allocation_from_immutable_lineage() -> None:
+@pytest.mark.parametrize("retained_disposal", [False, True])
+def test_detached_fork_replaces_inherited_allocation_from_immutable_lineage(
+    retained_disposal: bool,
+) -> None:
     async def run() -> None:
         store = InMemorySessionStore()
         allocation_provider = _FakeRemoteProvider()
@@ -1213,6 +1216,30 @@ def test_detached_fork_replaces_inherited_allocation_from_immutable_lineage() ->
             )
         ]
         assert EventType.SESSION_COMPLETED in {event.type for event in source_events}
+        source_checkpoint = await store.load_checkpoint(source_id)
+        assert source_checkpoint is not None
+        disposal_keys = (
+            "environment_factory_pending_disposals",
+            "environment_factory_retired_disposals",
+        )
+        if retained_disposal:
+            # Model retained teardown authority at a process-loss boundary. Both
+            # pending cleanup and its previous retirement belong only to the source.
+            source_checkpoint[disposal_keys[0]] = {
+                _ENVIRONMENT_NAME: {
+                    "reconnect_metadata": source_checkpoint[
+                        ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY
+                    ][_ENVIRONMENT_NAME],
+                    "state": {"kind": "fake_remote_disposal", "allocation": "current"},
+                }
+            }
+            source_checkpoint[disposal_keys[1]] = {
+                _ENVIRONMENT_NAME: {
+                    "reconnect_metadata": {"allocation_id": "previous"},
+                    "state": {"kind": "fake_remote_disposal", "allocation": "previous"},
+                }
+            }
+            await store.checkpoint(source_id, source_checkpoint)
         source_snapshot = await app.snapshot_fork_source(source_id)
         fork_events = [
             event
@@ -1226,6 +1253,10 @@ def test_detached_fork_replaces_inherited_allocation_from_immutable_lineage() ->
         ]
         assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
 
+        child_checkpoint = await store.load_checkpoint(child_id)
+        assert child_checkpoint is not None
+        assert all(key not in child_checkpoint for key in disposal_keys)
+        assert await store.load_checkpoint(source_id) == source_checkpoint
         await store.delete_session(source_id)
         detached_child = await store.load(child_id)
         assert detached_child is not None
@@ -1247,6 +1278,7 @@ def test_detached_fork_replaces_inherited_allocation_from_immutable_lineage() ->
         assert factory.requests[1].operation is EnvironmentFactoryOperation.CREATE
         assert factory.requests[1].parent_session_id == source_id
         assert len(allocation_provider.create_calls) == 2
+        assert allocation_provider.reap_calls == []
         assert len(model_provider.requests) == 2
         child_checkpoint = await store.load_checkpoint(child_id)
         assert child_checkpoint is not None

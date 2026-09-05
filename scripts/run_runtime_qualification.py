@@ -26,7 +26,11 @@ from tests.qualification.process_cleanup import (  # noqa: E402
     process_group_exists,
     registered_process_groups,
 )
-from tests.qualification.registry import POSTGRES_SCENARIOS, SCENARIOS  # noqa: E402
+from tests.qualification.registry import (  # noqa: E402
+    DOCKER_SCENARIOS,
+    POSTGRES_SCENARIOS,
+    SCENARIOS,
+)
 
 PROBE = """
 import importlib.metadata, json
@@ -139,12 +143,17 @@ def main():
         action="store_true",
         help="Require disposable PostgreSQL via CAYU_TEST_POSTGRES_DSN",
     )
+    parser.add_argument(
+        "--docker",
+        action="store_true",
+        help="Require local Docker and an existing CAYU_DOCKER_CODING_IMAGE",
+    )
     parser.add_argument("--repeat", type=int, default=2, choices=range(1, 6))
     parser.add_argument("--report", type=Path, default=Path("runtime-qualification.json"))
     parser.add_argument(
         "--scenario",
         action="append",
-        choices=[s.name for s in SCENARIOS + POSTGRES_SCENARIOS],
+        choices=[s.name for s in SCENARIOS + POSTGRES_SCENARIOS + DOCKER_SCENARIOS],
         help="Focused diagnosis; does not qualify the full profile",
     )
     args = parser.parse_args()
@@ -152,6 +161,10 @@ def main():
         name in {s.name for s in POSTGRES_SCENARIOS} for name in args.scenario or ()
     ):
         parser.error("PostgreSQL scenarios require --postgres")
+    if not args.docker and any(
+        name in {s.name for s in DOCKER_SCENARIOS} for name in args.scenario or ()
+    ):
+        parser.error("Docker scenarios require --docker")
     report = {
         "schema_version": 1,
         "suite": "cayu-runtime-qualification-v1",
@@ -168,6 +181,8 @@ def main():
             "disposable PostgreSQL DSN" if args.postgres else "SQLite writable temporary directory",
         ],
     }
+    if args.docker:
+        report["prerequisites"].append("local Docker and an existing CAYU_DOCKER_CODING_IMAGE")
     if args.profile == "stress":
         report["prerequisites"] += [
             "100 concurrent sessions and environment bindings; 200 idle workers",
@@ -177,6 +192,8 @@ def main():
         if os.name != "posix":
             return 2
         if args.postgres and not os.environ.get("CAYU_TEST_POSTGRES_DSN"):
+            return 2
+        if args.docker and not os.environ.get("CAYU_DOCKER_CODING_IMAGE"):
             return 2
         if args.profile == "stress":
             import resource
@@ -217,6 +234,8 @@ def main():
             env["PYTHONPATH"] = str(stage)
             env["CAYU_QUALIFICATION_PACKAGE"] = identity["package"]
             env["CAYU_QUALIFICATION_PROFILE"] = args.profile
+            if args.docker:
+                env["CAYU_REQUIRE_DOCKER_CODING"] = "1"
             if args.postgres:
                 env["CAYU_REQUIRE_POSTGRES"] = "1"
                 env["CAYU_QUALIFICATION_POSTGRES"] = "1"
@@ -224,7 +243,8 @@ def main():
                 env.pop("CAYU_TEST_POSTGRES_DSN", None)
                 env.pop("CAYU_REQUIRE_POSTGRES", None)
             manifest = json.dumps(
-                [s.__dict__ for s in SCENARIOS + POSTGRES_SCENARIOS], sort_keys=True
+                [s.__dict__ for s in SCENARIOS + POSTGRES_SCENARIOS + DOCKER_SCENARIOS],
+                sort_keys=True,
             ).encode()
             report["registry_sha256"] = hashlib.sha256(manifest).hexdigest()
             fixture_hash = hashlib.sha256()
@@ -236,7 +256,11 @@ def main():
             report["fixtures_sha256"] = fixture_hash.hexdigest()
             report["status"] = "running"
             write_report(args.report, report)
-            scenarios = SCENARIOS + (POSTGRES_SCENARIOS if args.postgres else ())
+            scenarios = (
+                SCENARIOS
+                + (POSTGRES_SCENARIOS if args.postgres else ())
+                + (DOCKER_SCENARIOS if args.docker else ())
+            )
             for repetition in range(args.repeat):
                 for scenario in scenarios:
                     if args.scenario and scenario.name not in args.scenario:

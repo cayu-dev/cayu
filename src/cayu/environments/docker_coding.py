@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
@@ -17,6 +19,8 @@ from cayu._coding_product_authority import (
     is_final_git_result_envelope,
     source_copy_authority_from_metadata,
 )
+from cayu._filesystem_lock import cooperative_path_lock
+from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -200,11 +204,14 @@ def _validate_immutable_inputs(
 def _immutable_input_attachment_id(
     request: EnvironmentFactoryRequest,
     source: LocalImmutableInput,
+    *,
+    allocation_id: str | None = None,
 ) -> str:
     return _immutable_input_attachment_id_from_owner(
         session_id=request.session_id,
         environment_name=request.environment_name,
         source=source,
+        allocation_id=allocation_id or request.reconnect_metadata.get("allocation_id"),
     )
 
 
@@ -213,6 +220,7 @@ def _immutable_input_attachment_id_from_owner(
     session_id: str,
     environment_name: str,
     source: LocalImmutableInput,
+    allocation_id: str | None = None,
 ) -> str:
     material = {
         "schema_version": 1,
@@ -220,6 +228,9 @@ def _immutable_input_attachment_id_from_owner(
         "environment_name": environment_name,
         "projection_fingerprint": source.projection.fingerprint,
     }
+    if allocation_id is not None:
+        material["allocation_id"] = allocation_id
+        material["schema_version"] = 2
     return (
         "docker:"
         + sha256(
@@ -820,7 +831,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
-            behavior_version="12",
+            behavior_version="13",
             implementation_version=self._configuration_fingerprint,
         )
 
@@ -881,10 +892,50 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             return None
         return EnvironmentAllocationScope(
             provider="docker",
-            adapter_generation="cayu.docker_coding.v11",
+            adapter_generation="cayu.docker_coding.v12",
         )
 
+    @asynccontextmanager
+    async def _allocation_lock(self, request: EnvironmentFactoryRequest) -> AsyncIterator[None]:
+        # The immutable store is shared across reconstructed factories/processes.
+        # Serialize admission, Docker's name-based create, publication and disposal.
+        root = (
+            self.immutable_input_store.root
+            if self.immutable_input_store is not None
+            else self.source_workspace.root
+        )
+        while True:
+            lock = cooperative_path_lock(
+                root,
+                _docker_coding_container_name(
+                    request,
+                    configuration_fingerprint=self._configuration_fingerprint,
+                ),
+                lock_directory_name="cayu-docker-allocation-locks",
+                blocking=False,
+            )
+            try:
+                lock.__enter__()
+                break
+            except BlockingIOError:
+                # Contended locks must not occupy executor threads needed by the
+                # active owner's immutable materialization and checkpoint writes.
+                await asyncio.sleep(0.01)
+        try:
+            yield
+        finally:
+            lock.__exit__(None, None, None)
+
     async def create_recoverable(
+        self,
+        request: EnvironmentFactoryRequest,
+        allocation: EnvironmentAllocationContext,
+    ) -> EnvironmentFactoryResult:
+        self._validate_request(request)
+        async with self._allocation_lock(request):
+            return await self._create_recoverable(request, allocation)
+
+    async def _create_recoverable(
         self,
         request: EnvironmentFactoryRequest,
         allocation: EnvironmentAllocationContext,
@@ -894,6 +945,14 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             raise TypeError("Recoverable Docker coding requires an allocation context.")
         if request.operation is not EnvironmentFactoryOperation.CREATE:
             raise ValueError("Recoverable Docker coding only accepts create operations.")
+        intent = allocation.intent
+        if (
+            intent.session_id != request.session_id
+            or intent.environment_name != request.environment_name
+            or intent.provider != "docker"
+            or intent.adapter_generation != "cayu.docker_coding.v12"
+        ):
+            raise ValueError("Docker allocation authority conflicts with its request or adapter.")
         expected_name = _docker_coding_container_name(
             request,
             configuration_fingerprint=self._configuration_fingerprint,
@@ -915,9 +974,20 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         return await self._create(request, allocation=allocation)
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
-        return await self._create(request, allocation=None)
+        self._validate_request(request)
+        async with self._allocation_lock(request):
+            return await self._create(request, allocation=None)
 
     async def recover_finalization_disposal(
+        self,
+        request: EnvironmentFactoryRequest,
+        state: dict[str, Any],
+    ) -> None:
+        self._validate_request(request)
+        async with self._allocation_lock(request):
+            await self._recover_finalization_disposal(request, state)
+
+    async def _recover_finalization_disposal(
         self,
         request: EnvironmentFactoryRequest,
         state: dict[str, Any],
@@ -982,12 +1052,31 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         if _read_seccomp_sha256(self.seccomp_profile) != self._seccomp_sha256:
             raise RuntimeError("Docker coding seccomp profile changed after factory admission.")
 
+        allocation_id = (
+            allocation.intent.allocation_id
+            if allocation is not None
+            else request.reconnect_metadata.get("allocation_id")
+        )
+        if (
+            allocation_id is None
+            and self.immutable_inputs
+            and request.operation is EnvironmentFactoryOperation.CREATE
+        ):
+            assert self.immutable_input_store is not None
+            allocation_id = await asyncio.to_thread(
+                self.immutable_input_store.reserve_allocation_sync,
+                _docker_coding_container_name(
+                    request,
+                    configuration_fingerprint=self._configuration_fingerprint,
+                ),
+                tuple(source.projection.fingerprint for source in self.immutable_inputs),
+            )
         attachments: tuple[ImmutableInputAttachment, ...] = ()
         runner: DockerRunner | None = None
         try:
             if request.operation is EnvironmentFactoryOperation.RECONNECT:
                 await self._reconcile_interrupted_immutable_cleanup(request)
-            attachments = await self._attach_immutable_inputs(request)
+            attachments = await self._attach_immutable_inputs(request, allocation_id=allocation_id)
             immutable_mounts = tuple(attachment.docker_mount() for attachment in attachments)
             if request.operation is EnvironmentFactoryOperation.CREATE:
                 if allocation is not None:
@@ -1020,6 +1109,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                         _docker_coding_container_name(
                             request,
                             configuration_fingerprint=self._configuration_fingerprint,
+                            allocation_id=allocation_id,
                         ),
                         immutable_mounts=immutable_mounts,
                     )
@@ -1136,6 +1226,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 configuration_fingerprint=self._configuration_fingerprint,
                 image_fingerprint=self.image_identity.fingerprint,
                 toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+                allocation_id=allocation_id,
             )
             if allocation is not None:
                 if allocation.state is EnvironmentAllocationState.DISPATCHED:
@@ -1147,13 +1238,14 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
 
             async def release(action: EnvironmentFactoryReleaseAction) -> None:
                 if action is EnvironmentFactoryReleaseAction.DISCARD:
-                    await runner.close()
-                    await self._release_immutable_inputs(attachments)
-                    if (
-                        allocation is not None
-                        and allocation.state is EnvironmentAllocationState.REAPING
-                    ):
-                        await allocation.mark_reaped()
+                    async with self._allocation_lock(request):
+                        await runner.close()
+                        await self._release_immutable_inputs(attachments)
+                        if (
+                            allocation is not None
+                            and allocation.state is EnvironmentAllocationState.REAPING
+                        ):
+                            await allocation.mark_reaped()
 
             return EnvironmentFactoryResult(
                 environment=environment,
@@ -1162,7 +1254,13 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 release=release,
             )
         except BaseException as original:
-            if request.operation is EnvironmentFactoryOperation.RECONNECT or allocation is not None:
+            if (
+                request.operation is EnvironmentFactoryOperation.RECONNECT
+                or allocation is not None
+                or allocation_id is not None
+            ):
+                # Admission belongs to the durable allocation, including an ambiguous
+                # Docker outcome. A retry must adopt it or exact reaping must release it.
                 raise
             cleanup_error: BaseException | None = None
             if runner is not None:
@@ -1300,19 +1398,25 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             await runner.close()
         store = self.immutable_input_store
         if store is not None:
-            for source in self.immutable_inputs:
-                await store.release(
-                    _immutable_input_attachment_id_from_owner(
-                        session_id=allocation.intent.session_id,
-                        environment_name=allocation.intent.environment_name,
-                        source=source,
+            outcome = await await_shielded_task_outcome(
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        store.release_allocation_sync,
+                        allocation.intent.allocation_id,
                     )
                 )
+            )
+            if outcome.error is not None:
+                raise outcome.error
+            if outcome.cancellation is not None:
+                raise outcome.cancellation
         await allocation.mark_reaped()
 
     async def _attach_immutable_inputs(
         self,
         request: EnvironmentFactoryRequest,
+        *,
+        allocation_id: str | None = None,
     ) -> tuple[ImmutableInputAttachment, ...]:
         if not self.immutable_inputs:
             return ()
@@ -1320,24 +1424,31 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         if store is None:  # pragma: no cover - constructor invariant
             raise AssertionError("Docker immutable input store was not retained.")
         attached: list[ImmutableInputAttachment] = []
-        try:
-            for source in self.immutable_inputs:
-                attached.append(
-                    await store.attach(
+        for source in self.immutable_inputs:
+            # Cancellation must not release a convergent attachment another worker
+            # may already be using. Durable allocation reaping owns rollback.
+            outcome = await await_shielded_task_outcome(
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        store.attach_sync,
                         source,
-                        attachment_id=_immutable_input_attachment_id(request, source),
-                        owner_id=request.session_id,
+                        attachment_id=_immutable_input_attachment_id(
+                            request,
+                            source,
+                            allocation_id=allocation_id,
+                        ),
+                        owner_id=allocation_id
+                        or request.reconnect_metadata.get("allocation_id")
+                        or request.session_id,
                     )
                 )
-        except BaseException as original:
-            try:
-                await self._release_immutable_inputs(tuple(attached))
-            except BaseException as cleanup_error:
-                raise BaseExceptionGroup(
-                    "Docker immutable input attachment and rollback both failed.",
-                    [original, cleanup_error],
-                ) from None
-            raise
+            )
+            if outcome.error is not None:
+                raise outcome.error
+            if outcome.cancellation is not None:
+                raise outcome.cancellation
+            assert isinstance(outcome.result, ImmutableInputAttachment)
+            attached.append(outcome.result)
         return tuple(attached)
 
     async def _release_immutable_inputs(
@@ -1370,6 +1481,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             configuration_fingerprint=self._configuration_fingerprint,
             image_fingerprint=self.image_identity.fingerprint,
             toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            allocation_id=request.reconnect_metadata.get("allocation_id"),
         )
         if request.reconnect_metadata != expected:
             raise ValueError("Docker coding reconnect metadata does not match this factory.")
@@ -2060,6 +2172,7 @@ def _docker_coding_reconnect_metadata(
     configuration_fingerprint: str,
     image_fingerprint: str,
     toolchain_profile_fingerprint: str,
+    allocation_id: str | None = None,
 ) -> dict[str, Any]:
     identity = {
         "version": 1,
@@ -2069,6 +2182,9 @@ def _docker_coding_reconnect_metadata(
         "image_fingerprint": image_fingerprint,
         "toolchain_profile_fingerprint": toolchain_profile_fingerprint,
     }
+    if allocation_id is not None:
+        identity["allocation_id"] = require_durable_clean_nonblank(allocation_id, "allocation_id")
+        identity["version"] = 2
     return {
         **identity,
         "allocation_fingerprint": sha256(

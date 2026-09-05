@@ -473,3 +473,106 @@ def test_real_docker_ignored_scratch_obeys_copy_back_policy(
         assert "No such container" in inspection.stderr or "No such object" in inspection.stderr
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("shared_input,new_session", [(False, False), (True, True), (True, False)])
+def test_real_docker_reallocate_after_confirmed_disposal(
+    tmp_path: Path,
+    shared_input: bool,
+    new_session: bool,
+    record_property,
+) -> None:
+    """Issue #1412: a new incarnation must not reuse a released attachment."""
+    docker_path, image, image_id = _configuration_or_skip()
+    source = tmp_path / "input"
+    source.mkdir()
+    (source / "evidence.txt").write_text("immutable evidence\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    identity = DockerImageIdentity(reference=image, content_digest=image_id)
+    projection = inspect_local_immutable_input(
+        source,
+        target_path="/evidence",
+        policy_fingerprint="sha256:" + "1" * 64,
+        runtime_compatibility_fingerprint=identity.fingerprint,
+        authorization_scope_fingerprint="sha256:" + "3" * 64,
+    )
+    store = ImmutableInputStore(tmp_path / "inputs")
+
+    def factory() -> DockerCodingEnvironmentFactory:
+        return DockerCodingEnvironmentFactory(
+            source_workspace=LocalWorkspace(workspace),
+            toolchain_profile=docker_toolchain_profile(
+                image_identity=identity,
+                platform_architecture=subprocess.check_output(
+                    [docker_path, "image", "inspect", "--format", "{{.Architecture}}", image],
+                    text=True,
+                ).strip(),
+            ),
+            immutable_inputs=(projection,) if shared_input else (),
+            immutable_input_store=store if shared_input else None,
+            immutable_input_runtime_compatibility_fingerprint=(
+                identity.fingerprint if shared_input else None
+            ),
+        )
+
+    def assert_absent(container_id: str) -> None:
+        assert (
+            subprocess.check_output(
+                [
+                    docker_path,
+                    "ps",
+                    "-a",
+                    "--no-trunc",
+                    "--filter",
+                    f"id={container_id}",
+                    "--format",
+                    "{{.ID}}",
+                ],
+                text=True,
+                timeout=15,
+            ).strip()
+            == ""
+        )
+
+    async def run() -> None:
+        request = EnvironmentFactoryRequest(
+            session_id=f"recreation-{tmp_path.name}",
+            agent_name="worker",
+            environment_name="coding",
+        )
+        first = await factory().create(request)
+        assert first.release is not None
+        await first.release(EnvironmentFactoryReleaseAction.DISCARD)
+        assert_absent(first.metadata["container_id"])
+        if shared_input:
+            assert store.inspect()[0].reference_count == 0
+        next_request = (
+            replace(request, session_id=request.session_id + "-other") if new_session else request
+        )
+        second = await factory().create(next_request)
+        assert second.release is not None
+        try:
+            assert second.metadata["container_id"] != first.metadata["container_id"]
+            if shared_input:
+                assert (
+                    second.metadata["immutable_inputs"][0]["attachment_id"]
+                    != first.metadata["immutable_inputs"][0]["attachment_id"]
+                )
+                assert second.metadata["immutable_inputs"][0]["reused"] is True
+                assert store.inspect()[0].reference_count == 1
+                # Repeating stale cleanup cannot touch the successor's reference.
+                await first.release(EnvironmentFactoryReleaseAction.DISCARD)
+                assert store.inspect()[0].reference_count == 1
+                with pytest.raises(RuntimeError, match="referenced"):
+                    store.collect(projection.projection.fingerprint)
+        finally:
+            await second.release(EnvironmentFactoryReleaseAction.DISCARD)
+        assert_absent(second.metadata["container_id"])
+        if shared_input:
+            assert store.inspect()[0].reference_count == 0
+            assert store.collect(projection.projection.fingerprint)
+
+    asyncio.run(run())
+    record_property("remaining_owned_containers", 0)
+    record_property("immutable_input_references", 0)

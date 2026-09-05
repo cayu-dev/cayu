@@ -39,6 +39,10 @@ _SOURCE_OWNED_CHECKPOINT_KEYS = frozenset(
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
         AUTOMATIC_RECALL_CHECKPOINT_KEY,
         _EGRESS_AUTHORITY_TRANSITION_CHECKPOINT_KEY,
+        # Disposal and retirement authorize teardown of the source allocation.
+        # A fork must create its own allocation without inheriting that authority.
+        "environment_factory_pending_disposals",
+        "environment_factory_retired_disposals",
     }
 )
 

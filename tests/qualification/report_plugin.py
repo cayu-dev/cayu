@@ -30,6 +30,8 @@ COUNTERS = frozenset(
         "active_claims",
         "active_fences",
         "retained_cleanups",
+        "remaining_owned_containers",
+        "immutable_input_references",
         "control_latency_ms",
         "empty_polls",
         "unfinished_tasks",

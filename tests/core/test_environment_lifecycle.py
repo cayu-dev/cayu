@@ -3668,3 +3668,70 @@ def test_lazy_environment_cleanup_retries_fatal_only_finalization(
     assert len(binding.abandon_calls) == 1
     assert binding.abandon_calls[0] is binding.finalize_calls[0]["bound"]
     assert repr(retained_context) == "InvocationContext(<authenticated>)"
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_disposal_retirement_preserves_successor_authority(stale: bool) -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant", session_id="dispose", messages=[Message.text("user", "go")]
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        expected = {"reconnect_metadata": {"container_id": "old"}, "state": {"exact": "old"}}
+        retained = (
+            {"reconnect_metadata": {"container_id": "new"}, "state": {"exact": "new"}}
+            if stale
+            else expected
+        )
+        checkpoint = {
+            environment_lifecycle_module._PENDING_ALLOCATION_DISPOSAL_KEY: {"coding": retained},
+            ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY: {
+                "coding": retained["reconnect_metadata"],
+                "other": {"id": "keep"},
+            },
+            ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY: {
+                "coding": session.id,
+                "other": session.id,
+            },
+            "unrelated": True,
+        }
+        await store.checkpoint(session.id, checkpoint)
+        lifecycle = _lifecycle(store)
+        await lifecycle.checkpoint_preserving_runtime_state(session.id, {"unrelated": True})
+        if stale:
+            with pytest.raises(RuntimeError, match="exact durable marker"):
+                await lifecycle._retire_disposed_allocation(
+                    session.id,
+                    "coding",
+                    expected,
+                    session_instance_id=session.instance_id,
+                    run_epoch=session.run_epoch,
+                )
+            assert await store.load_checkpoint(session.id) == checkpoint
+        else:
+            await lifecycle._retire_disposed_allocation(
+                session.id,
+                "coding",
+                expected,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
+            )
+            # Lost commit acknowledgement can be retried without restoring live authority.
+            await lifecycle._retire_disposed_allocation(
+                session.id,
+                "coding",
+                expected,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
+            )
+            assert await store.load_checkpoint(session.id) == {
+                environment_lifecycle_module._RETIRED_ALLOCATION_DISPOSAL_KEY: {"coding": expected},
+                ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY: {"other": {"id": "keep"}},
+                ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY: {"other": session.id},
+                "unrelated": True,
+            }
+
+    asyncio.run(run())

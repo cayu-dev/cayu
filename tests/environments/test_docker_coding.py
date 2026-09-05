@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -1382,7 +1383,7 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
     intent = EnvironmentAllocationIntent(
         allocation_id="ealloc_" + ("d" * 32),
         provider="docker",
-        adapter_generation="cayu.docker_coding.v11",
+        adapter_generation="cayu.docker_coding.v12",
         session_id=request.session_id,
         environment_name=request.environment_name,
         requested_operation=EnvironmentFactoryOperation.CREATE,
@@ -2663,3 +2664,189 @@ def test_disposal_recovery_validates_exact_identity_before_docker_access(
     asyncio.run(run())
     assert probes == [_CONTAINER_ID]
     assert closes == ([_CONTAINER_ID] if presence == "present" else [])
+
+
+@pytest.mark.parametrize("fault", ["none", "admission", "container", "acknowledgement"])
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("worker_count", [2, 40])
+def test_docker_immutable_allocation_retry_and_concurrent_reconstruction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fault: str,
+    cancel: bool,
+    worker_count: int,
+) -> None:
+    restrictions = DockerWorkloadRestrictions()
+    calls: list[list[str]] = []
+    container_exists = False
+    mount_source = None
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "input"
+    source.mkdir()
+    (source / "data").write_text("shared bytes")
+    projection = inspect_local_immutable_input(
+        source,
+        target_path="/evidence",
+        policy_fingerprint="sha256:" + "a" * 64,
+        runtime_compatibility_fingerprint=_image_identity().fingerprint,
+        authorization_scope_fingerprint="sha256:" + "c" * 64,
+    )
+    store = ImmutableInputStore(tmp_path / "managed")
+
+    async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
+        nonlocal container_exists, mount_source
+        del kwargs
+        calls.append(command.argv)
+        if any(".cayu-toolchain-write-probe" in arg for arg in command.argv):
+            return ExecResult(stdout="linux/amd64\n")
+        docker_args = command.argv[1:]
+        if docker_args[:2] == ["container", "ls"]:
+            return ExecResult(stdout=(_CONTAINER_ID + "\n") if container_exists else "")
+        if docker_args[0] == "run":
+            container_exists = True
+            mount_argument = docker_args[docker_args.index("--mount") + 1]
+            mount_source = mount_argument.split("source=", 1)[1].split(",", 1)[0]
+            return ExecResult(stdout=_CONTAINER_ID)
+        if docker_args[0] == "inspect":
+            return ExecResult(
+                stdout=json.dumps(
+                    _inspection(restrictions, immutable_mount=(mount_source, "/evidence"))
+                )
+            )
+        if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
+            return ExecResult(stdout=restrictions.user)
+        if docker_args[:2] == ["rm", "-f"]:
+            container_exists = False
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(workspace),
+        immutable_inputs=(projection,),
+        immutable_input_store=store,
+        immutable_input_runtime_compatibility_fingerprint=_image_identity().fingerprint,
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=_image_identity(), restrictions=restrictions
+        ),
+        docker_path="/usr/bin/docker",
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="recoverable-create",
+        agent_name="agent",
+        environment_name="coding",
+    )
+    intent = EnvironmentAllocationIntent(
+        allocation_id="ealloc_" + ("d" * 32),
+        provider="docker",
+        adapter_generation="cayu.docker_coding.v12",
+        session_id=request.session_id,
+        environment_name=request.environment_name,
+        requested_operation=EnvironmentFactoryOperation.CREATE,
+    )
+
+    armed = fault != "none"
+    failure = asyncio.CancelledError if cancel else RuntimeError
+
+    def fail_once(stage):
+        nonlocal armed
+        if armed and fault == stage:
+            armed = False
+            raise failure("injected allocation interruption")
+
+    original_attach = factory._attach_immutable_inputs
+    original_runner = factory._create_or_recover_runner
+
+    async def attach(*args, **kwargs):
+        value = await original_attach(*args, **kwargs)
+        fail_once("admission")
+        return value
+
+    async def runner(*args, **kwargs):
+        value = await original_runner(*args, **kwargs)
+        fail_once("container")
+        return value
+
+    class Context(_TestAllocationContext):
+        async def acknowledge(self, metadata):
+            await super().acknowledge(metadata)
+            fail_once("acknowledgement")
+
+    monkeypatch.setattr(factory, "_attach_immutable_inputs", attach)
+    monkeypatch.setattr(factory, "_create_or_recover_runner", runner)
+
+    async def run() -> None:
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+        first_context = Context(intent)
+        if fault != "none":
+            with pytest.raises(failure, match="injected"):
+                await factory.create_recoverable(request, first_context)
+            assert store.inspect()[0].reference_count == 1
+            assert container_exists == (fault != "admission")
+        # Concurrent reconstructions use the same durable intent. An admission or
+        # publication interruption must not terminalize their shared attachment.
+        contexts = [
+            _TestAllocationContext(
+                first_context.intent,
+                state=(
+                    EnvironmentAllocationState.PREPARED
+                    if fault in ("none", "admission")
+                    else EnvironmentAllocationState.DISPATCHED
+                ),
+            )
+            for _ in range(worker_count)
+        ]
+        if fault == "none":
+            await contexts[0].prepare(
+                {
+                    "container_name": "cayu-coding-" + intent.allocation_id,
+                    "configuration_fingerprint": factory._configuration_fingerprint,
+                }
+            )
+            contexts = [
+                _TestAllocationContext(
+                    contexts[0].intent, state=EnvironmentAllocationState.PREPARED
+                )
+                for _ in range(worker_count)
+            ]
+        recovered = await asyncio.gather(
+            *(factory.create_recoverable(request, context) for context in contexts)
+        )
+        assert recovered[0].reconnect_metadata == recovered[1].reconnect_metadata
+        assert (
+            recovered[0].metadata["immutable_inputs"][0]["attachment_id"]
+            == recovered[1].metadata["immutable_inputs"][0]["attachment_id"]
+        )
+        assert store.inspect()[0].reference_count == 1
+        await recovered[0].release(EnvironmentFactoryReleaseAction.DISCARD)
+        assert not container_exists
+        assert store.inspect()[0].reference_count == 0
+        with pytest.raises(RuntimeError, match="released"):
+            await factory.create_recoverable(request, contexts[1])
+        assert store.collect(projection.projection.fingerprint)
+
+    asyncio.run(run())
+    assert sum(call[1] == "run" for call in calls) == 1
+
+
+@pytest.mark.parametrize("conflict", ["session", "environment", "adapter"])
+def test_docker_recoverable_allocation_rejects_foreign_authority(
+    tmp_path: Path, conflict: str
+) -> None:
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="owner", agent_name="agent", environment_name="coding"
+    )
+    intent = EnvironmentAllocationIntent(
+        allocation_id="ealloc_" + "d" * 32,
+        provider="docker",
+        adapter_generation="old" if conflict == "adapter" else "cayu.docker_coding.v12",
+        session_id="foreign" if conflict == "session" else request.session_id,
+        environment_name="foreign" if conflict == "environment" else request.environment_name,
+        requested_operation=EnvironmentFactoryOperation.CREATE,
+    )
+    with pytest.raises(ValueError, match="allocation authority conflicts"):
+        asyncio.run(factory.create_recoverable(request, _TestAllocationContext(intent)))
