@@ -125,11 +125,6 @@ def test_real_docker_coding_round_trip_is_bounded_and_excludes_host_git(
                 )
             )
             assert inspection.exit_code == 0
-            snapshot = await environment.binding.finalize(
-                bound,
-                outcome="completed",
-            )
-            assert snapshot is not None
             network_probe = await environment.runner.exec(
                 ExecCommand.process(
                     "python3",
@@ -141,14 +136,24 @@ def test_real_docker_coding_round_trip_is_bounded_and_excludes_host_git(
                 )
             )
             assert network_probe.exit_code == 0
-            timed_out = await environment.runner.exec(
+            snapshot = await environment.binding.finalize(bound, outcome="completed")
+            assert snapshot is not None
+            assert environment.runner._closed is True
+        finally:
+            await environment.runner.close()
+
+        timeout_result = await factory.create(request)
+        timeout_runner = timeout_result.environment.runner
+        assert timeout_runner is not None
+        try:
+            timed_out = await timeout_runner.exec(
                 ExecCommand.process("python3", "-c", "import time; time.sleep(60)"),
                 timeout_s=1,
             )
             assert timed_out.timed_out is True
-            assert environment.runner._closed is True
+            assert timeout_runner._closed is True
         finally:
-            await environment.runner.close()
+            await timeout_runner.close()
 
         cancellation_result = await factory.create(request)
         cancellation_runner = cancellation_result.environment.runner

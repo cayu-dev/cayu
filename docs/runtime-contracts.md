@@ -9438,6 +9438,33 @@ supervisory process-control exceptions propagate after the dispatched mutation
 is fenced and are never reclassified as source conflicts. Guest Git metadata
 and the other protected directories are never copied back.
 
+Terminal Docker coding finalization also closes the exact owned container,
+including when `sync_back="never"` or no immutable inputs are attached. Binding
+ownership retires only after runner close and any attachment releases succeed.
+A close failure retains the completed copy-back snapshot for disposal retry;
+retrying close does not republish source files. This disposal is completion-critical
+even for non-publishing runs: Runtime retains its durable finalization checkpoint
+and fenced cleanup owner on failure, and an environment cleanup drain remains
+incomplete until that owner settles. Recovery reconnects the exact recorded
+container while publication remains pending; publication failures retain guest
+output rather than destroying it. Once publication succeeds, Runtime atomically
+adds a bounded `disposal_state` to the existing completion-finalization checkpoint
+before dispatching container removal. Checkpoint failure or cancellation prevents
+removal and retains the in-process publication snapshot for retry.
+
+Recovery of that disposal phase calls
+`EnvironmentFactory.recover_finalization_disposal(request, state)` under the
+existing session recovery owner, without creating or reconnecting a guest. The
+Docker factory validates the recorded full container ID, configuration, and exact
+session/environment attachment IDs; it removes a still-present container or
+accepts positively verified absence, then idempotently releases the recorded
+inputs. Daemon lookup failures do not count as absence. Runtime clears the pending
+marker only after disposal and terminal repair succeed, so process loss after
+removal is replay-safe and never repeats source publication. Factory wrappers
+around Docker coding must forward `recover_finalization_disposal` as well as
+creation; Runtime refuses container removal when that recovery hook is missing.
+Disposal recovery does not perform a new guest revision observation.
+
 ### Maintained coding-product settlement
 
 `CodingProductRunner` is the product layer above an ordinary Cayu app and the

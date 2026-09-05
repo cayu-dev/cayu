@@ -74,12 +74,14 @@ from cayu.environments import (
     evaluate_execution_admission,
     load_workspace_instructions,
 )
+from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
 from cayu.environments.bindings import (
     SyncBinding,
     _EnvironmentLifecycleBindAttempt,
     _runtime_owned_workspace_observer_name,
 )
 from cayu.environments.factory import (
+    EnvironmentFactory,
     attach_environment_factory_cleanup_settlement_task,
     combine_environment_factory_cleanup_settlement_tasks,
     environment_factory_cleanup_retry_available,
@@ -381,6 +383,9 @@ def pending_completion_finalization_from_checkpoint(
         if type(value) is not str:
             raise ValueError(f"Pending completion finalization {field_name} must be a string.")
         require_clean_nonblank(value, field_name)
+    disposal_state = marker.get("disposal_state")
+    if disposal_state is not None and type(disposal_state) is not dict:
+        raise ValueError("Completion disposal state must be an object.")
     task_id = marker.get("task_id")
     if task_id is not None:
         if type(task_id) is not str:
@@ -401,6 +406,16 @@ def pending_completion_finalization_from_checkpoint(
     return marker
 
 
+def _same_completion_marker(left: dict[str, Any] | None, right: dict[str, Any]) -> bool:
+    if left is None:
+        return False
+    if "disposal_state" in right and left.get("disposal_state") != right["disposal_state"]:
+        return False
+    return {key: value for key, value in left.items() if key != "disposal_state"} == {
+        key: value for key, value in right.items() if key != "disposal_state"
+    }
+
+
 @dataclass(frozen=True)
 class _EnvironmentCleanupSettlementOutcome:
     error: BaseException | None = None
@@ -410,6 +425,7 @@ class _EnvironmentCleanupSettlementOutcome:
 @dataclass
 class _ActiveEnvironmentSetup:
     registered_environment: runtime_records.RegisteredEnvironment
+    disposal_recovery_factory: EnvironmentFactory | None = field(default=None, repr=False)
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = field(default=None, repr=False)
     cleanup_started: bool = False
@@ -1835,6 +1851,7 @@ class EnvironmentLifecycle:
                 session.id,
                 _ActiveEnvironmentSetup(
                     registered_environment=resolved_environment,
+                    disposal_recovery_factory=factory,
                     execution_profile=execution_profile,
                     invocation_context=(
                         None
@@ -2013,6 +2030,136 @@ class EnvironmentLifecycle:
             self.checkpoint_transform_preserving_runtime_state(checkpoint),
         )
 
+    async def _finalize_binding_with_disposal_checkpoint(
+        self,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        binding: WorkspaceBinding,
+        bound_workspace: BoundWorkspace,
+        *,
+        outcome: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> WorkspaceSnapshot | None:
+        session_id = None if metadata is None else metadata.get("session_id")
+        if type(session_id) is not str:
+            raise RuntimeError("Binding finalization lost its session identity.")
+
+        async def checkpoint_disposal(state: dict[str, Any]) -> None:
+            checkpoint = await self._session_store.load_checkpoint(session_id)
+            expected = pending_completion_finalization_from_checkpoint(checkpoint)
+            if expected is None:
+                if outcome == "completed":
+                    raise RuntimeError("Completion disposal lost its durable marker.")
+                # Direct non-completion teardown has no completion obligation.
+                return
+            if expected["environment_name"] != registered_environment.spec.name:
+                raise RuntimeError("Disposal checkpoint names another environment.")
+            owner = self._active_environment_setups.get(session_id)
+            factory = None if owner is None else owner.disposal_recovery_factory
+            if factory is None or (
+                type(factory).recover_finalization_disposal
+                is EnvironmentFactory.recover_finalization_disposal
+            ):
+                raise RuntimeError("Completion disposal requires a factory disposal-recovery hook.")
+            state = copy_durable_json_object(state, "completion disposal state")
+            context = None if owner is None else owner.invocation_context
+            if context is None:
+                raise RuntimeError("Completion disposal lost its invocation owner.")
+
+            def advance(_session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
+                if (
+                    _session.instance_id != context.binding.session_instance_id
+                    or _session.run_epoch != context.binding.run_epoch
+                ):
+                    raise SessionRunFenced("Completion disposal lost its session generation.")
+                marker = pending_completion_finalization_from_checkpoint(current)
+                if not _same_completion_marker(marker, expected):
+                    raise RuntimeError("Disposal checkpoint lost its finalization authority.")
+                assert marker is not None
+                existing = marker.get("disposal_state")
+                if existing is not None and existing != state:
+                    raise RuntimeError("Completion disposal authority changed.")
+                marker["disposal_state"] = state
+                updated = copy_json_value(current, "checkpoint")
+                updated[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = marker
+                pending_completion_finalization_from_checkpoint(updated)
+                return updated
+
+            await self._session_store.transform_checkpoint(session_id, advance)
+
+        token = finalization_disposal_checkpoint.set(checkpoint_disposal)
+        try:
+            return await _finalize_binding_after_mutation_quiescence(
+                registered_environment,
+                binding,
+                bound_workspace,
+                outcome=outcome,
+                metadata=metadata,
+            )
+        finally:
+            finalization_disposal_checkpoint.reset(token)
+
+    async def recover_completion_disposal(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity,
+        marker: dict[str, Any],
+    ) -> bool:
+        state = marker.get("disposal_state")
+        if state is None:
+            return False
+        self._require_no_retained_cleanup_for_session(session.id)
+        factory = registered_environment.factory
+        if factory is None:
+            raise RuntimeError("Completion disposal recovery requires its factory.")
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if pending_completion_finalization_from_checkpoint(checkpoint) != marker:
+            raise RuntimeError("Completion disposal recovery lost its exact marker.")
+        reconnect_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
+            checkpoint,
+            environment_name=registered_environment.spec.name,
+        )
+        if allocation_owner != session.id:
+            raise RuntimeError("Completion disposal recovery lost its allocation owner.")
+        record = self._allocation_coordinator.record_from_checkpoint(
+            checkpoint,
+            environment_name=registered_environment.spec.name,
+        )
+        receipt = self._allocation_coordinator.receipt_from_checkpoint(
+            checkpoint,
+            environment_name=registered_environment.spec.name,
+        )
+        if record is not None or (
+            receipt is not None
+            and (
+                receipt.intent.session_id != session.id
+                or receipt.intent.environment_name != registered_environment.spec.name
+                or receipt.reconnect_metadata != reconnect_metadata
+            )
+        ):
+            raise RuntimeError("Completion disposal conflicts with its allocation receipt.")
+        request = EnvironmentFactoryRequest(
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=registered_environment.spec.name,
+            execution_profile_fingerprint=execution_profile.fingerprint,
+            operation=EnvironmentFactoryOperation.RECONNECT,
+            parent_session_id=environment_allocation_parent_session_id(session),
+            causal_budget_id=session.causal_budget_id,
+            labels=session.labels,
+            metadata=session_user_metadata(session.metadata),
+            reconnect_metadata=reconnect_metadata,
+            execution_requirements=registered_agent.execution_requirements,
+        )
+        await environment_operation_boundary.await_environment_operation(
+            lambda: factory.recover_finalization_disposal(request, state),
+            operation_name="Environment completion disposal recovery",
+            redactor=self._secret_redactor,
+        )
+        return True
+
     async def checkpoint_completion_finalization(
         self,
         *,
@@ -2058,6 +2205,10 @@ class EnvironmentLifecycle:
                 ):
                     if existing.get(field_name) != marker.get(field_name):
                         raise RuntimeError("Completion finalization recovery authority changed.")
+            if existing is not None and "disposal_state" in existing:
+                marker["disposal_state"] = copy_json_value(
+                    existing["disposal_state"], "completion disposal state"
+                )
             copied[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = copy_json_value(
                 marker,
                 "pending completion finalization",
@@ -2159,7 +2310,7 @@ class EnvironmentLifecycle:
             current = pending_completion_finalization_from_checkpoint(checkpoint)
             if current is None:
                 return checkpoint
-            if current != expected:
+            if not _same_completion_marker(current, expected):
                 raise RuntimeError("Completion finalization marker changed before cleanup.")
             copied = copy_json_value(checkpoint, "checkpoint")
             copied.pop(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
@@ -2191,7 +2342,7 @@ class EnvironmentLifecycle:
             ):
                 raise SessionRunFenced("Completion finalization lost its exact session authority.")
             current = pending_completion_finalization_from_checkpoint(checkpoint)
-            if current != expected:
+            if not _same_completion_marker(current, expected):
                 raise RuntimeError("Completion finalization marker changed before commit.")
             copied = copy_json_value(checkpoint, "checkpoint")
             copied.pop(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
@@ -3480,7 +3631,7 @@ class EnvironmentLifecycle:
                 asyncio.CancelledError | None,
                 int,
             ]:
-                final_snapshot_value = await _finalize_binding_after_mutation_quiescence(
+                final_snapshot_value = await self._finalize_binding_with_disposal_checkpoint(
                     registered_environment,
                     binding,
                     bound_workspace,
@@ -4069,7 +4220,7 @@ class EnvironmentLifecycle:
             async def retry_binding_finalize() -> BaseException | None:
                 try:
                     await environment_operation_boundary.await_environment_operation(
-                        lambda: _finalize_binding_after_mutation_quiescence(
+                        lambda: self._finalize_binding_with_disposal_checkpoint(
                             registered_environment,
                             binding,
                             bound_workspace,
@@ -4273,7 +4424,7 @@ class EnvironmentLifecycle:
         cleanup_error: BaseException | None = None
         try:
             await environment_operation_boundary.await_environment_operation(
-                lambda: _finalize_binding_after_mutation_quiescence(
+                lambda: self._finalize_binding_with_disposal_checkpoint(
                     registered_environment,
                     binding,
                     bound_workspace,

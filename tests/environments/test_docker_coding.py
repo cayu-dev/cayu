@@ -237,6 +237,10 @@ class _LocalDockerRunner(DockerRunner):
         kwargs["cwd"] = None
         return await self.local.exec_stream(command, **kwargs)
 
+    async def close(self) -> None:
+        await self.local.close()
+        self._closed = True
+
 
 def test_docker_runner_workspace_partial_read_drops_complete_file_identity(
     tmp_path: Path,
@@ -1968,6 +1972,10 @@ def test_docker_coding_binding_uses_ephemeral_git_and_never_copies_protected_pat
             kwargs["cwd"] = None
             return await self.local.exec_stream(command, **kwargs)
 
+        async def close(self) -> None:
+            await self.local.close()
+            self._closed = True
+
     runner = LocalDockerRunner(target_root)
     source = LocalWorkspace(
         source_root,
@@ -2346,6 +2354,10 @@ def test_docker_coding_binding_scopes_ignored_path_guard_to_publication(
             kwargs["cwd"] = None
             return await self.local.exec_stream(command, **kwargs)
 
+        async def close(self) -> None:
+            await self.local.close()
+            self._closed = True
+
     runner = LocalDockerRunner(target_root)
     source = LocalWorkspace(
         source_root,
@@ -2483,3 +2495,171 @@ def test_nonpublishing_coding_binding_still_captures_bounded_git_evidence(
     assert "workspace_delta_unrepresented" in evidence["diff"]["structured"]["truncation_reasons"]
     assert (source_root / "code.py").read_bytes() == b"value = 1\n"
     assert not (source_root / "scratch").exists()
+
+
+@pytest.mark.parametrize("sync_back", ["never", "always"])
+@pytest.mark.parametrize("fault", ["error", "cancel"])
+def test_docker_coding_close_failure_retains_exact_generation_for_retry(
+    tmp_path: Path,
+    monkeypatch,
+    sync_back,
+    fault,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    foreign_root = tmp_path / "foreign"
+    for root in (source_root, target_root, foreign_root):
+        root.mkdir()
+    (source_root / "code.py").write_bytes(b"value = 1\n")
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+    binding.sync_back = sync_back
+    foreign_runner = _LocalDockerRunner(foreign_root)
+    close_calls = 0
+    original_close = runner.close
+
+    async def close():
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            if fault == "cancel":
+                raise asyncio.CancelledError("fixture close cancellation")
+            raise OSError("fixture close failure")
+        await original_close()
+
+    monkeypatch.setattr(runner, "close", close)
+
+    async def run():
+        bound = await binding.bind(source, runner, session_id="close-retry")
+        assert binding._completion_requires_successful_finalization(bound) is True
+        assert bound.workspace is not None
+        await bound.workspace.write_bytes("code.py", b"value = 2\n")
+        with pytest.raises(asyncio.CancelledError if fault == "cancel" else OSError):
+            await binding.finalize(bound, outcome="completed")
+        assert binding.abandon(bound) is False
+        assert binding._completion_finalization_recovery_state(bound) is not None
+        with pytest.raises(ValueError, match="exact DockerRunner"):
+            await binding.finalize(replace(bound, runner=foreign_runner), outcome="completed")
+        with pytest.raises(ValueError, match="source workspace"):
+            await binding.finalize(
+                replace(bound, source_workspace=LocalWorkspace(foreign_root)),
+                outcome="completed",
+            )
+        assert close_calls == 1
+        assert foreign_runner._closed is False
+        # Publication already finished; retrying disposal must not copy again.
+        (source_root / "code.py").write_bytes(b"external edit\n")
+        await binding.finalize(bound, outcome="completed")
+        assert runner._closed is True
+        assert binding.abandon(bound) is True
+        assert binding._states == {}
+        with pytest.raises(RuntimeError, match="lost its admitted authority"):
+            await binding.finalize(bound, outcome="completed")
+        assert close_calls == 2
+
+    asyncio.run(run())
+    assert (source_root / "code.py").read_bytes() == b"external edit\n"
+
+
+@pytest.mark.parametrize("fault", ["error", "cancel"])
+def test_disposal_checkpoint_failure_retains_container_and_published_snapshot(tmp_path, fault):
+    from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
+
+    source_root, target_root = tmp_path / "source", tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "code.py").write_bytes(b"before")
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+    binding.sync_back = "always"
+    checkpoint_calls = []
+
+    async def checkpoint(state):
+        assert (source_root / "code.py").read_bytes() == b"candidate"
+        assert runner._closed is False
+        checkpoint_calls.append(state)
+        if fault == "cancel":
+            raise asyncio.CancelledError("checkpoint cancelled")
+        raise OSError("checkpoint unavailable")
+
+    async def run():
+        bound = await binding.bind(source, runner, session_id="disposal-checkpoint")
+        assert bound.workspace is not None
+        await bound.workspace.write_bytes("code.py", b"candidate")
+        token = finalization_disposal_checkpoint.set(checkpoint)
+        try:
+            with pytest.raises(asyncio.CancelledError if fault == "cancel" else OSError):
+                await binding.finalize(bound, outcome="completed")
+        finally:
+            finalization_disposal_checkpoint.reset(token)
+        assert runner._closed is False
+        assert binding.abandon(bound) is False
+        (source_root / "code.py").write_bytes(b"later edit")
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        assert runner._closed is True
+        assert (source_root / "code.py").read_bytes() == b"later edit"
+        assert not binding._states
+
+    asyncio.run(run())
+    assert len(checkpoint_calls) == 1
+
+
+@pytest.mark.parametrize("presence", ["present", "absent", "unavailable"])
+def test_disposal_recovery_validates_exact_identity_before_docker_access(
+    tmp_path,
+    monkeypatch,
+    presence,
+):
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
+    )
+    metadata = docker_coding_module._docker_coding_reconnect_metadata(
+        container_id=_CONTAINER_ID,
+        configuration_fingerprint=factory._configuration_fingerprint,
+        image_fingerprint=factory.image_identity.fingerprint,
+        toolchain_profile_fingerprint=factory.toolchain_profile.fingerprint,
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="disposal",
+        agent_name="probe",
+        environment_name="coding",
+        operation=EnvironmentFactoryOperation.RECONNECT,
+        reconnect_metadata=metadata,
+    )
+    state = {
+        "version": 1,
+        "kind": "docker_coding_disposal",
+        "container_id": _CONTAINER_ID,
+        "attachment_ids": [],
+    }
+    probes, closes = [], []
+
+    async def exists(container_id, **kwargs):
+        probes.append(container_id)
+        if presence == "unavailable":
+            raise OSError("daemon unavailable")
+        return presence == "present"
+
+    async def close(self):
+        closes.append(self.container_id)
+
+    monkeypatch.setattr(DockerRunner, "container_exists", exists)
+    monkeypatch.setattr(DockerRunner, "close", close)
+
+    async def run():
+        for forged in (
+            {**state, "container_id": "f" * 64},
+            {**state, "attachment_ids": ["foreign"]},
+        ):
+            with pytest.raises(ValueError, match="exact allocation"):
+                await factory.recover_finalization_disposal(request, forged)
+        assert probes == closes == []
+        if presence == "unavailable":
+            with pytest.raises(OSError, match="daemon unavailable"):
+                await factory.recover_finalization_disposal(request, state)
+        else:
+            await factory.recover_finalization_disposal(request, state)
+
+    asyncio.run(run())
+    assert probes == [_CONTAINER_ID]
+    assert closes == ([_CONTAINER_ID] if presence == "present" else [])

@@ -745,6 +745,23 @@ class EnvironmentFactory(ABC):
             "crash-safe creation and recovery."
         )
 
+    async def recover_finalization_disposal(
+        self,
+        request: EnvironmentFactoryRequest,
+        state: dict[str, Any],
+    ) -> None:
+        """Idempotently dispose an allocation whose publication durably finished.
+
+        This cleanup-only hook must validate the exact reconnect identity and
+        disposal state, tolerate an already absent allocation, and never create
+        a replacement or access/publish guest output. Factory wrappers must
+        forward this hook when forwarding a factory that supports disposal.
+        """
+        del request, state
+        raise EnvironmentAllocationUnsupportedError(
+            "Environment factory cannot recover completed-publication disposal."
+        )
+
     @abstractmethod
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         """Return a concrete environment for the requested session."""

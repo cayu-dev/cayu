@@ -19531,89 +19531,99 @@ class RecoveryCoordinator:
         resolved_context = invocation_context
         authoritative_error: BaseException | None = None
         try:
-            factory_started = await self._environment_lifecycle.emit_factory_started(
+            disposal_recovered = await self._environment_lifecycle.recover_completion_disposal(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=resolved_environment,
                 execution_profile=execution_profile,
-                invocation_context=resolved_context,
+                marker=marker,
             )
-            if factory_started is not None:
-                events.append(factory_started)
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=resolved_environment,
-                started_event=factory_started,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-                execution_profile=execution_profile,
-                invocation_context=resolved_context,
-            )
-            events.extend(factory_resolution.events)
-            resolved_environment = factory_resolution.registered_environment
-            if resolved_environment is None:
-                raise RuntimeError("Completion finalization recovery resolved no environment.")
-            resolved_context = resolved_context.with_registered_environment(
-                resolved_environment,
-                validated_profile=execution_profile,
-            )
-            if factory_resolution.error is not None:
-                raise factory_resolution.error
-            binding_started = await self._environment_lifecycle.emit_binding_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=resolved_environment,
-                execution_profile=execution_profile,
-                invocation_context=resolved_context,
-            )
-            if binding_started is not None:
-                events.append(binding_started)
-            binding_result = await self._environment_lifecycle.bind(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=resolved_environment,
-                started_event=binding_started,
-                execution_profile=execution_profile,
-                invocation_context=resolved_context,
-                completion_finalization_recovery_state=marker["binding_state"],
-            )
-            events.extend(binding_result.events)
-            resolved_environment = binding_result.registered_environment
-            if resolved_environment is None:
-                raise RuntimeError("Completion finalization recovery lost its bound environment.")
-            resolved_context = resolved_context.with_registered_environment(
-                resolved_environment,
-                validated_profile=execution_profile,
-            )
-            if binding_result.error is not None:
-                raise binding_result.error
-            finalized = await self._environment_lifecycle.finalize_terminal_event(
-                event=Event(
-                    type=EventType.SESSION_COMPLETED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=resolved_environment.spec.name,
-                    payload={"completion_finalization_recovery": True},
-                ),
-                session=session,
-                registered_environment=resolved_environment,
-                execution_profile=execution_profile,
-                invocation_context=resolved_context,
-            )
-            events.extend(finalized.events)
-            finalize_error = finalized.event.payload.get("binding_finalize_error")
-            if type(finalize_error) is dict:
-                return IncompleteSessionRecoveryResult(
-                    session_id=session.id,
-                    previous_status=previous_status,
-                    status=session.status,
-                    actions=(IncompleteSessionRecoveryAction.FAILED,),
-                    events=tuple(events),
-                    message=(
-                        "Workspace completion finalization remains pending; the failed "
-                        "session was not re-executed."
-                    ),
+            if not disposal_recovered:
+                factory_started = await self._environment_lifecycle.emit_factory_started(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=resolved_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=resolved_context,
                 )
+                if factory_started is not None:
+                    events.append(factory_started)
+                factory_resolution = await self._environment_lifecycle.resolve_factory(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=resolved_environment,
+                    started_event=factory_started,
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    execution_profile=execution_profile,
+                    invocation_context=resolved_context,
+                )
+                events.extend(factory_resolution.events)
+                resolved_environment = factory_resolution.registered_environment
+                if resolved_environment is None:
+                    raise RuntimeError("Completion finalization recovery resolved no environment.")
+                resolved_context = resolved_context.with_registered_environment(
+                    resolved_environment,
+                    validated_profile=execution_profile,
+                )
+                if factory_resolution.error is not None:
+                    raise factory_resolution.error
+                binding_started = await self._environment_lifecycle.emit_binding_started(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=resolved_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=resolved_context,
+                )
+                if binding_started is not None:
+                    events.append(binding_started)
+                binding_result = await self._environment_lifecycle.bind(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=resolved_environment,
+                    started_event=binding_started,
+                    execution_profile=execution_profile,
+                    invocation_context=resolved_context,
+                    completion_finalization_recovery_state=marker["binding_state"],
+                )
+                events.extend(binding_result.events)
+                resolved_environment = binding_result.registered_environment
+                if resolved_environment is None:
+                    raise RuntimeError(
+                        "Completion finalization recovery lost its bound environment."
+                    )
+                resolved_context = resolved_context.with_registered_environment(
+                    resolved_environment,
+                    validated_profile=execution_profile,
+                )
+                if binding_result.error is not None:
+                    raise binding_result.error
+                finalized = await self._environment_lifecycle.finalize_terminal_event(
+                    event=Event(
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=resolved_environment.spec.name,
+                        payload={"completion_finalization_recovery": True},
+                    ),
+                    session=session,
+                    registered_environment=resolved_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=resolved_context,
+                )
+                events.extend(finalized.events)
+                finalize_error = finalized.event.payload.get("binding_finalize_error")
+                if type(finalize_error) is dict:
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=session.status,
+                        actions=(IncompleteSessionRecoveryAction.FAILED,),
+                        events=tuple(events),
+                        message=(
+                            "Workspace completion finalization remains pending; the failed "
+                            "session was not re-executed."
+                        ),
+                    )
             task_failed_event = await self._settle_recovered_completion_task(
                 session=session,
                 marker=marker,

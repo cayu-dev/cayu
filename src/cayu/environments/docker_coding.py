@@ -26,6 +26,7 @@ from cayu._validation import (
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import ToolContext
 from cayu.credentials import CredentialMode
+from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
@@ -115,7 +116,7 @@ class _DockerCodingBindAuthority:
 
 
 @dataclass(slots=True)
-class _ImmutableInputFinalizeState:
+class _DockerCodingFinalizeState:
     snapshot: WorkspaceSnapshot | None
     runner_closed: bool = False
 
@@ -307,7 +308,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         self._immutable_input_attachments = attachments
         self._coding_authority_lock = threading.Lock()
         self._coding_authorities: dict[str, _DockerCodingBindAuthority] = {}
-        self._immutable_finalize_states: dict[str, _ImmutableInputFinalizeState] = {}
+        self._coding_finalize_states: dict[str, _DockerCodingFinalizeState] = {}
         super().__init__(
             target_workspace=target_workspace,
             path=path,
@@ -630,11 +631,15 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         if state_key is None:
             raise RuntimeError("Docker coding finalization lost its sync generation.")
         with self._coding_authority_lock:
-            cleanup_state = self._immutable_finalize_states.get(state_key)
+            cleanup_state = self._coding_finalize_states.get(state_key)
+        runner = bound.runner
+        if not isinstance(runner, DockerRunner) or not self._docker_target.is_bound_to_runner(
+            runner
+        ):
+            raise ValueError("Docker coding cleanup requires its exact DockerRunner.")
         if cleanup_state is None:
-            if self._immutable_input_attachments:
-                self._defer_finalize_release(bound)
             authority = self._bind_authority(bound)
+            self._defer_finalize_release(bound)
             final_git_evidence = (
                 None
                 if authority.source is None
@@ -653,54 +658,73 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                     metadata={**snapshot.metadata, "final_git_evidence": final_git_evidence},
                 )
             )
-            if not self._immutable_input_attachments:
-                self._discard_bind_authority(bound)
-                return final_snapshot
-            cleanup_state = _ImmutableInputFinalizeState(snapshot=final_snapshot)
+            cleanup_state = _DockerCodingFinalizeState(snapshot=final_snapshot)
             with self._coding_authority_lock:
-                existing = self._immutable_finalize_states.setdefault(
+                existing = self._coding_finalize_states.setdefault(
                     state_key,
                     cleanup_state,
                 )
             if existing is not cleanup_state:  # pragma: no cover - finalize is generation-owned
-                raise RuntimeError("Docker immutable input finalization raced its owner.")
+                raise RuntimeError("Docker coding finalization raced its owner.")
 
-        runner = bound.runner
-        if not isinstance(runner, DockerRunner):  # pragma: no cover - bind invariant
-            raise AssertionError("Docker immutable input cleanup lost its exact runner.")
+        # A retry must prove the same source/target generation before disposing
+        # its runner; a state-key match alone is not cleanup authority.
+        if not super()._requires_mutation_quiescence(bound):
+            raise RuntimeError("Docker coding cleanup lost its sync ownership.")
+        await checkpoint_finalization_disposal(
+            {
+                "version": 1,
+                "kind": "docker_coding_disposal",
+                "container_id": runner.container_id,
+                "attachment_ids": [
+                    attachment.attachment_id for attachment in self._immutable_input_attachments
+                ],
+            }
+        )
         store = self._immutable_input_store
-        if store is None:  # pragma: no cover - constructor invariant
-            raise AssertionError("Docker immutable input cleanup lost its store.")
         if not cleanup_state.runner_closed:
             container_id = runner.container_id
             if container_id is None:  # pragma: no cover - strict runner invariant
-                raise AssertionError("Docker immutable input cleanup lost its container id.")
-            await store.mark_container_closing(
-                self._immutable_input_attachments,
-                container_id=container_id,
-            )
+                raise AssertionError("Docker coding cleanup lost its container id.")
+            if self._immutable_input_attachments:
+                if store is None:  # pragma: no cover - constructor invariant
+                    raise AssertionError("Docker immutable input cleanup lost its store.")
+                await store.mark_container_closing(
+                    self._immutable_input_attachments,
+                    container_id=container_id,
+                )
             await runner.close()
             with self._coding_authority_lock:
-                retained_state = self._immutable_finalize_states.get(state_key)
+                retained_state = self._coding_finalize_states.get(state_key)
                 if retained_state is not cleanup_state:
-                    raise RuntimeError("Docker immutable input cleanup lost its retry state.")
+                    raise RuntimeError("Docker coding cleanup lost its retry state.")
                 cleanup_state.runner_closed = True
-        await _release_immutable_input_attachments(
-            store,
-            self._immutable_input_attachments,
-        )
+        if self._immutable_input_attachments:
+            if store is None:  # pragma: no cover - constructor invariant
+                raise AssertionError("Docker immutable input cleanup lost its store.")
+            await _release_immutable_input_attachments(
+                store,
+                self._immutable_input_attachments,
+            )
         if not super().abandon(bound):  # pragma: no cover - SyncBinding contract
-            raise RuntimeError("Docker immutable input cleanup retained sync ownership.")
+            raise RuntimeError("Docker coding cleanup retained sync ownership.")
         with self._coding_authority_lock:
-            self._immutable_finalize_states.pop(state_key, None)
+            self._coding_finalize_states.pop(state_key, None)
         self._discard_bind_authority(bound)
         return cleanup_state.snapshot
+
+    def _completion_requires_successful_finalization(self, bound: BoundWorkspace) -> bool:
+        # The fixed target's container is owned by this binding even when there
+        # is no source publication. Use the runtime's durable finalization path
+        # so a failed close retains a fenced, recoverable cleanup obligation.
+        super()._completion_requires_successful_finalization(bound)
+        return True
 
     def abandon(self, bound: BoundWorkspace) -> bool:
         state_key = bound.state_key
         if state_key is not None:
             with self._coding_authority_lock:
-                if state_key in self._immutable_finalize_states:
+                if state_key in self._coding_finalize_states:
                     return False
         abandoned = super().abandon(bound)
         if abandoned:
@@ -892,6 +916,40 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         return await self._create(request, allocation=None)
+
+    async def recover_finalization_disposal(
+        self,
+        request: EnvironmentFactoryRequest,
+        state: dict[str, Any],
+    ) -> None:
+        self._validate_request(request)
+        if request.operation is not EnvironmentFactoryOperation.RECONNECT:
+            raise ValueError("Docker disposal recovery requires reconnect authority.")
+        container_id = cast("str", request.reconnect_metadata["container_id"])
+        attachment_ids = [
+            _immutable_input_attachment_id(request, source) for source in self.immutable_inputs
+        ]
+        expected = {
+            "version": 1,
+            "kind": "docker_coding_disposal",
+            "container_id": container_id,
+            "attachment_ids": attachment_ids,
+        }
+        if copy_durable_json_object(state, "Docker disposal state") != expected:
+            raise ValueError("Docker disposal state conflicts with its exact allocation.")
+        # Full immutable container IDs cannot name a replacement. Do not perform
+        # guest admission or reattach inputs after publication has completed.
+        if await DockerRunner.container_exists(container_id, docker_path=self.docker_path):
+            await DockerRunner(
+                container_id,
+                close_action="remove",
+                docker_path=self.docker_path,
+                _container_id=container_id,
+            ).close()
+        store = self.immutable_input_store
+        if store is not None:
+            for attachment_id in attachment_ids:
+                await store.release(attachment_id)
 
     async def _create(
         self,
