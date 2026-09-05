@@ -488,6 +488,90 @@ def unresolved_gateway_rejection_event(
     )
 
 
+class DynamicToolReferenceRejection(BaseModel):
+    """Content-safe corrective result; never contains a reference or tool descriptor."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    status: Literal["rejected"] = "rejected"
+    reason: TargetedToolUseRejectionReason
+    next_action: Literal["search_tools", "correct_arguments", "do_not_retry"]
+    message: str = Field(max_length=512)
+
+
+_DISCOVERY_REJECTION_MESSAGES = {
+    TargetedToolUseRejectionReason.MALFORMED: "The call_tool request or reference is malformed.",
+    TargetedToolUseRejectionReason.UNKNOWN: (
+        "The reference is not available in the current session. References do not transfer "
+        "across sessions or forks."
+    ),
+    TargetedToolUseRejectionReason.NOT_YET_VALID: "The reference is not yet valid.",
+    TargetedToolUseRejectionReason.EXPIRED: "The reference has expired.",
+    TargetedToolUseRejectionReason.REVOKED: "The reference grant was revoked.",
+    TargetedToolUseRejectionReason.EXHAUSTED: "The reference has no remaining calls.",
+    TargetedToolUseRejectionReason.CROSS_SESSION: "The reference belongs to another session.",
+    TargetedToolUseRejectionReason.CROSS_INTERACTION: (
+        "The reference belongs to a different interaction."
+    ),
+    TargetedToolUseRejectionReason.CROSS_GENERATION: (
+        "The reference belongs to a previous authority generation; session/fork boundaries "
+        "reset reference authority."
+    ),
+    TargetedToolUseRejectionReason.PRINCIPAL_MISMATCH: "The caller is outside the grant authority.",
+    TargetedToolUseRejectionReason.TENANT_MISMATCH: "The tenant is outside the grant authority.",
+    TargetedToolUseRejectionReason.AGENT_MISMATCH: "The agent is outside the grant authority.",
+    TargetedToolUseRejectionReason.TASK_MISMATCH: "The task is outside the grant authority.",
+    TargetedToolUseRejectionReason.ENVIRONMENT_MISMATCH: (
+        "The environment is outside the grant authority."
+    ),
+    TargetedToolUseRejectionReason.OUT_OF_CEILING: "The target is outside the permitted tool set.",
+    TargetedToolUseRejectionReason.CATALOGUE_DRIFT: "The tool catalogue has changed.",
+    TargetedToolUseRejectionReason.DESCRIPTOR_DRIFT: "The target tool definition has changed.",
+    TargetedToolUseRejectionReason.INVALID_ARGUMENTS: (
+        "The arguments do not satisfy the granted tool schema."
+    ),
+    TargetedToolUseRejectionReason.ALTERED_REPLAY: (
+        "The invocation conflicts with an already recorded use."
+    ),
+}
+_DISCOVERY_POLICY_REFUSALS = frozenset(
+    {
+        TargetedToolUseRejectionReason.PRINCIPAL_MISMATCH,
+        TargetedToolUseRejectionReason.TENANT_MISMATCH,
+        TargetedToolUseRejectionReason.AGENT_MISMATCH,
+        TargetedToolUseRejectionReason.TASK_MISMATCH,
+        TargetedToolUseRejectionReason.ENVIRONMENT_MISMATCH,
+        TargetedToolUseRejectionReason.OUT_OF_CEILING,
+        TargetedToolUseRejectionReason.ALTERED_REPLAY,
+    }
+)
+
+
+def dynamic_tool_reference_rejection(
+    reason: TargetedToolUseRejectionReason,
+) -> DynamicToolReferenceRejection:
+    """Project established authority evidence without looking up another session's tools."""
+
+    if reason in _DISCOVERY_POLICY_REFUSALS:
+        next_action = "do_not_retry"
+        correction = "Do not retry this invocation or attempt to bypass its authority boundary."
+    elif reason is TargetedToolUseRejectionReason.INVALID_ARGUMENTS:
+        next_action = "correct_arguments"
+        correction = "Correct the arguments using the tool definition returned by search_tools."
+    else:
+        next_action = "search_tools"
+        correction = (
+            "Call search_tools with a description of the task, then use an exact reference "
+            "from its current results. Do not guess or reuse the rejected reference."
+        )
+    return DynamicToolReferenceRejection(
+        reason=reason,
+        next_action=next_action,
+        message=f"{reason.value}: {_DISCOVERY_REJECTION_MESSAGES[reason]} {correction}",
+    )
+
+
 def gateway_rejection_content(reason: TargetedToolUseRejectionReason) -> str:
     return CALL_TOOL_REJECTION_CONTENT.get(
         reason,

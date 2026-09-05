@@ -575,6 +575,11 @@ def resolve_execution_profile_identity(
             "call_tool_core": {
                 **call_tool_gateway_execution_profile_material(),
                 "callable": (tool_discovery_projection is ToolDiscoveryProjectionKind.SEARCH_TOOLS),
+                **(
+                    {"reference_rejection_behavior_version": 1}
+                    if tool_discovery_projection is ToolDiscoveryProjectionKind.SEARCH_TOOLS
+                    else {}
+                ),
             },
         }
     )

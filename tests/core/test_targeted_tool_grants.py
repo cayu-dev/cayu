@@ -1476,10 +1476,10 @@ async def _assert_openai_native_routes_canonical_identity(
     app = CayuApp(
         session_store=targeted_store,
         config=CayuConfig(
-            run=RunDefaults(
-                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0)
+            run=(
+                RunDefaults(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
                 if retry_first
-                else None
+                else RunDefaults()
             )
         ),
         enable_logging=False,

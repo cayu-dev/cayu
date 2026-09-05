@@ -2269,6 +2269,30 @@ changes. OpenAI Responses, Anthropic, Chat Completions, Bedrock, and Vertex
 preserve the same `search_tools`, `call_tool` prefix before any small direct
 exposure.
 
+When portable `search_tools` is available, a rejected `call_tool` reference returns
+a bounded typed corrective result (`schema_version=1`, `status="rejected"`,
+`reason`, `next_action`, and `message`). The message includes the stable reason
+code even for providers that render only text. Malformed, unknown, expired,
+revoked, exhausted, or stale references direct the model to `search_tools` and
+then to an exact reference from the current results. Invalid arguments use
+`next_action="correct_arguments"`. Authority refusals such as a target outside
+the capability ceiling, a principal/tenant mismatch, or an altered replay use
+`next_action="do_not_retry"`; rediscovery never overrides policy or resurrects a
+revoked grant. A new discovery result is independently subject to the ordinary
+capability, policy, approval, and execution controls.
+
+The response preserves established `cross_session`, `cross_interaction`, and
+`cross_generation` evidence when available. An unresolved opaque discovery
+reference remains `unknown`, including a copied parent reference after a fork:
+Runtime does not search other sessions or guess why an unrecognized reference
+was supplied. The corrective text explains that references do not transfer
+across session/fork boundaries. No reference, private descriptor, alternative
+reference list, caller identity, or grant details are added to the rejection.
+The same content-safe result is retained in the terminal event and transcript
+for reconstruction and compaction. Direct tool execution and applications or
+provider-native projections without portable discovery retain their existing
+results. The discovery execution-profile version covers this response contract.
+
 OpenAI client Tool Search projects the same canonical `search_tools` definition
 as `{"type":"tool_search","execution":"client",...}`. Cayu executes the
 returned `tool_search_call` locally through the ordinary discovery tool path,

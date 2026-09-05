@@ -195,9 +195,11 @@ from cayu.runtime.tool_catalogue import (
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_REFERENCE_PREFIX,
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryProjectionKind,
     _bind_runtime_tool_discovery_authority,
     current_tool_discovery_view,
     discovered_tool_rejection_event,
+    resolve_tool_discovery_projection,
     resolved_discovered_tool_invocation,
     tool_discovery_generation_id,
     tool_discovery_record_matches_descriptor,
@@ -213,6 +215,7 @@ from cayu.runtime.tool_exposure import (
 )
 from cayu.runtime.tool_gateway import (
     CallToolEnvelope,
+    dynamic_tool_reference_rejection,
     rejected_targeted_tool_invocation,
     resolved_targeted_tool_invocation,
     targeted_tool_rejection_content,
@@ -1798,7 +1801,9 @@ class ToolRoundExecutor:
                 except KeyError:
                     descriptor = None
                 rejection_reason = None
-                if (
+                if discovered_record.tool_name not in ceiling_names:
+                    rejection_reason = TargetedToolUseRejectionReason.OUT_OF_CEILING
+                elif (
                     descriptor is None
                     or discovered_record.catalogue_revision
                     != registered_agent.tool_catalogue.revision
@@ -1810,7 +1815,6 @@ class ToolRoundExecutor:
                         registered_agent,
                         discovered_record.tool_name,
                     )
-                    or discovered_record.tool_name not in ceiling_names
                 ):
                     rejection_reason = TargetedToolUseRejectionReason.CATALOGUE_DRIFT
                 elif not validate_effective_tool_arguments(
@@ -3368,6 +3372,22 @@ class ToolRoundExecutor:
                 },
                 is_error=True,
             )
+            if (
+                rejection.dispatch_kind == "gateway"
+                and invocation_context is not None
+                and resolve_tool_discovery_projection(
+                    registered_agent.tool_discovery_mode,
+                    provider=invocation_context.registered_provider.provider,
+                    model=invocation_context.binding.model,
+                )
+                is ToolDiscoveryProjectionKind.SEARCH_TOOLS
+            ):
+                corrective = dynamic_tool_reference_rejection(rejection.reason)
+                result = ToolResult(
+                    content=corrective.message,
+                    structured=corrective.model_dump(mode="json"),
+                    is_error=True,
+                )
             idempotency_key = tool_execution.tool_idempotency_key(
                 session_id=session.id,
                 tool_call_id=tool_call.id,
