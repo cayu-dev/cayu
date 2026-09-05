@@ -258,7 +258,7 @@ class WebSearchSource(BaseModel):
 
 
 class WebSearchAction(BaseModel):
-    """Bounded provider-neutral terminal web-search action evidence."""
+    """Bounded terminal evidence; optional provider details may be absent."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
@@ -306,10 +306,6 @@ class WebSearchAction(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> WebSearchAction:
-        if self.type == "search" and self.query is None and not self.queries:
-            raise ValueError("Search actions require query or queries.")
-        if self.type == "open_page" and self.url is None:
-            raise ValueError("Open-page actions require url.")
         if self.type == "find_in_page" and (self.url is None or self.pattern is None):
             raise ValueError("Find-in-page actions require url and pattern.")
         return self

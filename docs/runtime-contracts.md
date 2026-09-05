@@ -8097,6 +8097,14 @@ identity even when OpenAI reuses another response field. Only a completed
 or transport-ambiguous calls remain terminal evidence and cannot become a
 pending Cayu tool round.
 
+Terminal action evidence follows the provider's optional fields: an `open_page`
+URL may be omitted or null, and a `search` may omit both query fields or report
+an empty `queries` list. Missing details remain absent evidence through
+normalization, transcript storage, and replay; they do not change a completed
+call into an unknown outcome. Supplied URLs and text retain their bounded/safe
+validation, and `find_in_page` still requires both URL and pattern. See the
+[OpenAI Responses schema](https://developers.openai.com/api/reference/typescript/resources/responses/methods/create).
+
 Hosted search delegates network, filtering, retry, quota, and billing execution
 to OpenAI. Cayu local approvals, tool policy, runners, DNS, and egress do not
 intercept it. Returned queries, sources, and URL citations are bounded and

@@ -3580,7 +3580,7 @@ def _normalized_web_search_action(action: object, *, path: str) -> dict[str, Any
         normalized["url"] = _normalized_external_web_url(raw_url, path=f"{path}.url")
     raw_queries = action.get("queries")
     if raw_queries is not None:
-        if not isinstance(raw_queries, list) or not raw_queries or len(raw_queries) > 100:
+        if not isinstance(raw_queries, list) or len(raw_queries) > 100:
             raise OpenAIProtocolError(
                 f"OpenAI {path}.queries must be a bounded list.",
                 reason_code="web_search_action_queries_must_be_a_bounded_list",
