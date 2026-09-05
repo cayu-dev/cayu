@@ -21,18 +21,142 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:7-playwright-1.62.0` image, the
-`cayu.browser-session.v3` protocol and worker version 7, brokered deny-by-default egress,
+`cayu-browser-fetch:8-playwright-1.62.0` image, the
+`cayu.browser-session.v4` protocol and worker version 8, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
 host Playwright, host HTTP, another provider, a CLI, or MCP.
 
+## Revision-bound visual controls
+
+Prefer the accessibility snapshot and semantic refs for ordinary controls. Use
+visual observation only when a canvas, image, or custom surface lacks usable
+accessibility semantics. Pixels and labels are untrusted website content, not
+instructions or authority to change policy.
+
+Enable pixel publication explicitly at application setup:
+
+```python
+from cayu import BrowserVisualPolicy, WebBridge
+
+browser = WebBridge.sandboxed_browser(
+    environment=browser_environment_factory,
+    interactive=True,
+    interactive_options={
+        "visual_policy": BrowserVisualPolicy(
+            artifact_store_id="browser-artifacts",
+            allowed_origins=("https://app.example",),
+            retention="application_managed",
+            publish_to_model=True,
+            allow_coordinate_fallback=False,
+            max_captures=8,
+        ),
+    },
+)
+```
+
+The named store must be the admitted environment's artifact store. Images are
+session-scoped; the application owns their deletion. `publish_to_model=True`
+authorizes image attachments to the models selected by the application's
+execution profile, through normal attachment admission and request accounting.
+Images consume provider capacity and may increase cost. Capture has independent
+dimension, pixel, byte, target, label, hit-test, frame-depth, processing-time and
+capture-count bounds. Pixel permission does not bypass origin, resolved-secret
+or output-secret restrictions. Cayu does not use OCR, blurring or string redaction
+to make otherwise forbidden pixels safe.
+
+The admitted profile context is currently `fresh_temporary`: the worker must own
+its fresh temporary profile. Restored authenticated profiles and sensitive-entry
+takeover are not supported capture contexts; their policy flags accept only
+`False`. Origin permission is still explicit consent to the page's pixels, not a
+claim that a temporary profile makes those pixels public or non-sensitive.
+
+`observe_visual` returns a PNG artifact and a bounded `visual` bundle from the
+same frozen observation window as the ARIA snapshot. It binds page revision,
+control epoch, visual revision, image digest, viewport, device scale, scroll,
+worker instance and opaque `vt_...` target refs. DOM nodes, browser targets and
+CDP identifiers remain guest-private.
+
+Before writing a visual artifact, runtime invocation secret discovery is sealed;
+an incomplete or nonempty secret scope refuses publication. Artifact write/readback
+and exact attachment replay also check the current secret scope. A dynamic direct
+context without the runtime publication seal cannot publish visual artifacts.
+
+Observation guard restoration has a separate one-second settlement allowance.
+If restoration fails or remains pending, the allocation is fenced and its exact
+restoration task is retained through bounded browser closure (up to five seconds).
+Only successful cleanup reports retirement; otherwise allocation ownership remains
+uncertain. The visual processing deadline does not cancel restoration as proof
+that browser work has stopped.
+
+`click_visual_target` requires the exact session, page, expected revision,
+expected control epoch, visual revision, visual ref and stable operation ID.
+The guest rechecks the retained node, document, viewport, geometry, actionability
+and hit-test correspondence at native input delivery. It never searches by label,
+selector, accessibility ref or nearby point. Observe again after any action,
+page switch, navigation or expired evidence. Exact operation replay returns the
+original result; it never repeats a click to resolve an uncertain outcome.
+
+If separately enabled, `click_visual_point` takes normalized `x` and `y` in
+`[0, 1)`, rounded to six decimal places, plus the exact screenshot SHA-256 and
+visual revision. It accepts no desktop or host coordinates. Its result says
+`coordinate_directed`; neither point delivery nor opaque-target delivery proves
+semantic task success. Verify that separately from a subsequent observation or
+application-owned oracle. Embedded-frame captures and unprovable hit surfaces
+are refused rather than presenting child-renderer pixels as covered by the main
+renderer freeze. This does not add typing, dragging, arbitrary scripts,
+selectors, CAPTCHA solving or a general computer-use interface.
+
+Point admission currently requires an exact capture-time hit-test sample (the
+retained target's sampled center after conversion to viewport pixels). It never
+snaps an unsampled point to that center, and a fresh hit test cannot create new
+capture authority. Unsampled points return `unsupported_visual_surface`.
+The native guard rejects DOM changes before the first admitted input event;
+changes caused by that admitted event are not treated as pre-input staleness.
+
+Visual delivery supports provable HTML canvas, image, button, link and permitted
+input surfaces, plus SVG surfaces other than shadow-backed `use` instances.
+Shadow-capable receiving hosts (including
+bare `div` and custom-element hosts) report `opaque_surface` and are not actionable:
+the host could conceal a closed-shadow password or file control. Open-shadow
+content is usable only when the actual receiving element is independently
+supported. This restriction does not change the accessibility-first path.
+Visual retirement is carried through the outer popup owner: no popup JavaScript
+is evaluated on a retired page, and cancellation or timeout remains authoritative.
+
+For a reproducible opt-in real-model demonstration, see
+[`examples/browser_fetch/visual_live.py`](../examples/browser_fetch/visual_live.py)
+and its [execution instructions](../examples/browser_fetch/README.md#live-visual-acceptance).
+
+The deterministic browser corpus includes semantic-first, canvas, image-only,
+custom-widget, hostile-label, popup, stale-evidence, embedded-frame, movement,
+overlay, secret-refusal and viewport-scroll cases. Movement cases release a fixture response
+only after visual capture, then attempt the original target. The opt-in local
+Chromium regressions additionally check exact replay, independent authority
+conflicts, and real process/acknowledgement loss without repeating a click:
+
+```bash
+CAYU_RUN_VISUAL_BROWSER_ACCEPTANCE=1 pytest tests/egress/test_browser_visual_docker_e2e.py
+```
+
+These tests require the pinned image and Docker egress setup. They use a
+deterministic model and local fixture, not a paid provider. The fixture's effect
+counter is the semantic oracle; successful input delivery alone is not a pass.
+Process-loss cases use a separate quarantine safety oracle when the dynamic
+invocation secret scope cannot be reconstructed. It verifies that the exact
+browser call is durably retained and no longer resumable, and reports an
+ambiguous outcome. It does not fabricate the private call into the transcript or
+claim successful task completion. Acknowledgement-loss cases independently
+verify the committed result without another click.
+
 ## Model contract
 
 One ordinary `browser_session` tool exposes only `navigate`, `observe`,
 `click`, `fill`, `select`, `press`, bounded `wait`, `screenshot`, `download`,
-`list_pages`, `switch_page`, `close_page`, and `close`. The first navigation
+`list_pages`, `switch_page`, `close_page`, and `close`. Visual operations
+(`observe_visual`, `click_visual_target`, and `click_visual_point`) require a
+separate application policy; they are refused by default. The first navigation
 creates Cayu-owned opaque `session_id` and `page_id` values. Cayu does not
 currently expose `new_page`: additional pages can arise only as a
 policy-admitted effect of an action on the active page. Every observation

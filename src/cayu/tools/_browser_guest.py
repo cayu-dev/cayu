@@ -13,6 +13,7 @@ import base64
 import contextlib
 import hashlib
 import importlib.metadata
+import importlib.util
 import ipaddress
 import json
 import math
@@ -32,14 +33,37 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Literal, Never, cast
+from typing import TYPE_CHECKING, Any, Literal, Never, cast
 from urllib.parse import urljoin, urlsplit
+
+if TYPE_CHECKING or __package__:
+    from ._browser_visual_guest import (
+        VISUAL_FAILURE_CODES,
+        VisualGuestFailure,
+        VisualPageOwner,
+        visual_policy_from_json,
+    )
+else:
+    # Isolated Python deliberately excludes the script directory from sys.path.
+    # Load only the shipped sibling, without admitting cwd or PYTHONPATH imports.
+    _visual_spec = importlib.util.spec_from_file_location(
+        "_browser_visual_guest", Path(__file__).resolve().with_name("_browser_visual_guest.py")
+    )
+    if _visual_spec is None or _visual_spec.loader is None:
+        raise ImportError("The browser visual guest module is unavailable.")
+    _visual_module = importlib.util.module_from_spec(_visual_spec)
+    sys.modules[_visual_spec.name] = _visual_module
+    _visual_spec.loader.exec_module(_visual_module)
+    VISUAL_FAILURE_CODES = _visual_module.VISUAL_FAILURE_CODES
+    VisualGuestFailure = _visual_module.VisualGuestFailure
+    VisualPageOwner = _visual_module.VisualPageOwner
+    visual_policy_from_json = _visual_module.visual_policy_from_json
 
 PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
-INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v3"
-INTERACTIVE_WORKER_VERSION = "7"
+INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
+INTERACTIVE_WORKER_VERSION = "8"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -113,9 +137,20 @@ _INTERACTIVE_MAX_TOTAL_ARTIFACTS = 16_384
 _INTERACTIVE_MAX_PAGE_CLEANUP_OPERATIONS = 16_384
 _INTERACTIVE_MAX_POPUP_POLICY_ORIGINS = 64
 _INTERACTIVE_POPUP_EFFECT_OPERATIONS = frozenset(
-    {"navigate", "click", "fill", "select", "press", "wait", "download"}
+    {
+        "navigate",
+        "click",
+        "fill",
+        "select",
+        "press",
+        "wait",
+        "download",
+        "click_visual_target",
+        "click_visual_point",
+    }
 )
 _INTERACTIVE_OPERATION_LEDGER_BYTES = 16 * 1024 * 1024
+_OBSERVATION_GUARD_SETTLEMENT_SECONDS = 1.0
 _INTERACTIVE_MAX_ELEMENT_TEXT_BYTES = 2 * 1024
 _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES = 4 * 1024
 _INTERACTIVE_ACCESSIBILITY_SOURCE_MULTIPLIER = 8
@@ -635,6 +670,9 @@ class _InteractiveRequest:
     operation: Literal[
         "navigate",
         "observe",
+        "observe_visual",
+        "click_visual_target",
+        "click_visual_point",
         "click",
         "fill",
         "select",
@@ -668,6 +706,12 @@ class _InteractiveRequest:
     profile_plaintext_limit: int | None = None
     profile_capture_limit: int | None = None
     profile_timeout_seconds: float | None = None
+    visual_policy: dict[str, Any] | None = None
+    visual_revision: str | None = None
+    visual_ref: str | None = None
+    screenshot_sha256: str | None = None
+    x: float | None = None
+    y: float | None = None
     reconcile_only: bool = False
 
 
@@ -720,6 +764,10 @@ class _InteractivePage:
     # ``None`` exists only for internally constructed/test states that predate
     # an observation; production observations always install a complete map.
     ref_targets: dict[str, Any] | None = None
+    visual_owner: VisualPageOwner | None = None
+    observation_cleanup_task: asyncio.Task[tuple[BaseException, ...]] | None = None
+    observation_cleanup_disposition: Literal["retired", "uncertain"] | None = None
+    visual_action_cleanup_disposition: Literal["retired", "uncertain"] | None = None
     request_count: int = 0
     redirect_count: int = 0
     response_bytes: int = 0
@@ -983,6 +1031,9 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         not in {
             "navigate",
             "observe",
+            "observe_visual",
+            "click_visual_target",
+            "click_visual_point",
             "click",
             "fill",
             "select",
@@ -1007,12 +1058,16 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "page_policy",
         "session_id",
         "worker_version",
+        "visual_policy",
     }
     page = base | {"page_id", "operation_id"}
     revision = page | {"expected_revision", "expected_control_epoch"}
     expected: dict[str, set[str]] = {
         "navigate": base | {"page_id", "operation_id", "url"},
         "observe": page,
+        "observe_visual": page,
+        "click_visual_target": revision | {"visual_revision", "visual_ref"},
+        "click_visual_point": revision | {"visual_revision", "screenshot_sha256", "x", "y"},
         "click": revision | {"ref"},
         "fill": revision | {"ref", "value"},
         "select": revision | {"ref", "value"},
@@ -1224,7 +1279,17 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         popup_mode not in {"deny", "same_origin", "destination_policy"}
         or type(allowed_operations) is not list
         or any(
-            type(value) is not str or value not in {"click", "fill", "select", "press", "wait"}
+            type(value) is not str
+            or value
+            not in {
+                "click",
+                "fill",
+                "select",
+                "press",
+                "wait",
+                "click_visual_target",
+                "click_visual_point",
+            }
             for value in allowed_operations
         )
         or allowed_operations != sorted(set(allowed_operations))
@@ -1359,6 +1424,23 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             raise _GuestFailure("incompatible_browser")
     elif operation in {"profile_restore", "profile_checkpoint"}:
         raise _GuestFailure("incompatible_browser")
+    try:
+        visual_policy = visual_policy_from_json(raw.get("visual_policy"))
+    except (VisualGuestFailure, ValueError) as exc:
+        raise _GuestFailure("visual_publication_denied") from exc
+    visual_revision = (
+        _interactive_identifier(raw["visual_revision"]) if "visual_revision" in raw else None
+    )
+    visual_ref = _interactive_identifier(raw["visual_ref"]) if "visual_ref" in raw else None
+    screenshot_sha256 = raw.get("screenshot_sha256")
+    if screenshot_sha256 is not None and (
+        type(screenshot_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", screenshot_sha256) is None
+    ):
+        raise _GuestFailure("incompatible_browser")
+    for axis in ("x", "y"):
+        if axis in raw and (type(raw[axis]) not in {int, float} or not 0 <= raw[axis] < 1):
+            raise _GuestFailure("visual_point_outside_viewport")
     return _InteractiveRequest(
         operation=operation,
         session_id=session_id,
@@ -1386,6 +1468,12 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         profile_capture_limit=profile_capture_limit,
         profile_timeout_seconds=profile_timeout_seconds,
         reconcile_only=reconcile_only,
+        visual_policy=visual_policy,
+        visual_revision=visual_revision,
+        visual_ref=visual_ref,
+        screenshot_sha256=screenshot_sha256,
+        x=raw.get("x"),
+        y=raw.get("y"),
     )
 
 
@@ -4019,6 +4107,9 @@ class _InteractiveDaemon:
         self.active_delta: _InteractivePageDelta | None = None
         self.popup_cleanup_task: asyncio.Task[bool] | None = None
         self.popup_candidate_observed = asyncio.Event()
+        self.visual_worker_instance = "vw_" + secrets.token_hex(16)
+        self.total_visual_captures = 0
+        self.configuration_visual_policy: dict[str, Any] | None = None
         self.popup_effect_opener_page_id: str | None = None
         self.popup_effect_opener_origin: str | None = None
         self.popup_cleanup_pages: list[Any] = []
@@ -4217,6 +4308,7 @@ class _InteractiveDaemon:
             await self._ensure_context(None)
         material = {
             "limits": asdict(request.limits),
+            "visual_policy": request.visual_policy,
             "multi_page": request.multi_page,
             "popup_policy": asdict(request.popup_policy),
         }
@@ -4250,6 +4342,7 @@ class _InteractiveDaemon:
         self.configuration_limits = request.limits
         self.configuration_multi_page = request.multi_page
         self.configuration_popup_policy = request.popup_policy
+        self.configuration_visual_policy = request.visual_policy
 
     async def _execute_locked(self, request: _InteractiveRequest) -> dict[str, Any]:
         """Execute while the caller owns the daemon lifecycle lock."""
@@ -4325,6 +4418,9 @@ class _InteractiveDaemon:
         if self.profile_output_values is not None and request.operation in {
             "screenshot",
             "download",
+            "observe_visual",
+            "click_visual_target",
+            "click_visual_point",
         }:
             raise _GuestFailure("policy_denied")
         delta = _InteractivePageDelta()
@@ -4337,6 +4433,11 @@ class _InteractiveDaemon:
         state: _InteractivePage | None = None
         created_page = False
         try:
+            if (
+                request.operation in {"observe_visual", "click_visual_target", "click_visual_point"}
+                and request.visual_policy is None
+            ):
+                raise _GuestFailure("visual_mode_disabled")
             await self._expire_background_pages(request.limits, delta=delta)
             if request.operation == "close":
                 self.closing = True
@@ -4397,7 +4498,7 @@ class _InteractiveDaemon:
                 raise _GuestFailure("session_closed")
             if request.operation != "navigate" and self.active_page_id != state.page_id:
                 raise _GuestFailure("missing_element")
-            if request.operation not in {"navigate", "observe"}:
+            if request.operation not in {"navigate", "observe", "observe_visual"}:
                 if (
                     state.revision is None
                     or request.expected_revision != state.revision
@@ -4416,9 +4517,9 @@ class _InteractiveDaemon:
             state.last_operation_id_sha256 = hashlib.sha256(
                 request.operation_id.encode("utf-8")
             ).hexdigest()
-            if request.operation not in {"navigate", "observe"}:
+            if request.operation not in {"navigate", "observe", "observe_visual"}:
                 state.control_epoch += 1
-            if request.operation in {"screenshot", "download"} and (
+            if request.operation in {"screenshot", "download", "observe_visual"} and (
                 state.artifact_count >= request.limits.max_artifacts_per_page
                 or self.total_artifacts >= request.limits.max_total_artifacts
             ):
@@ -4428,6 +4529,13 @@ class _InteractiveDaemon:
             try:
                 response = await self._execute_page(state, request)
             except BaseException as primary_failure:
+                if (
+                    state.observation_cleanup_disposition is not None
+                    or state.visual_action_cleanup_disposition is not None
+                ):
+                    # Visual cleanup already joined the whole browser owner.
+                    # Do not restart popup settlement or spend a second close budget.
+                    raise
                 try:
                     await self._settle_operation_popups(
                         request,
@@ -4436,7 +4544,9 @@ class _InteractiveDaemon:
                     )
                 except BaseException as settlement_failure:
                     if not isinstance(primary_failure, Exception):
-                        raise primary_failure from settlement_failure
+                        raise primary_failure from _browser_cleanup_evidence(
+                            primary_failure.__cause__, (settlement_failure,)
+                        )
                     raise settlement_failure from primary_failure
                 raise
             await self._settle_operation_popups(request, delta)
@@ -4449,7 +4559,18 @@ class _InteractiveDaemon:
                     page_delta=self._page_delta_payload(delta),
                 )
             return self._with_page_evidence(response, delta)
+        except VisualGuestFailure as exc:
+            return _interactive_error_payload(
+                _GuestFailure(exc.code, allocation_disposition="live"),
+                page_set=self._page_set_payload() if self.pages else None,
+                page_delta=self._page_delta_payload(delta),
+            )
         except _GuestFailure as exc:
+            if state is not None and (
+                state.observation_cleanup_disposition is not None
+                or state.visual_action_cleanup_disposition is not None
+            ):
+                return _interactive_error_payload(exc)
             if state is not None and (created_page or state.limit_exceeded):
                 return await self._retire_failed_allocation(exc, request)
             return _interactive_error_payload(
@@ -4460,6 +4581,13 @@ class _InteractiveDaemon:
         except Exception as exc:
             if state is None:
                 return _interactive_error_payload(_GuestFailure("browser_crash"))
+            if state.observation_cleanup_disposition is not None:
+                return _interactive_error_payload(
+                    _GuestFailure(
+                        "timeout" if isinstance(exc, TimeoutError) else "cleanup_failed",
+                        allocation_disposition=state.observation_cleanup_disposition,
+                    )
+                )
             if state.denied_code is not None:
                 failure = _GuestFailure(state.denied_code)
             elif state.limit_exceeded:
@@ -4731,6 +4859,9 @@ class _InteractiveDaemon:
         self,
         state: _InteractivePage,
         limits: _InteractiveLimits,
+        *,
+        visual_policy: dict[str, Any] | None = None,
+        visual_artifacts: list[bytes] | None = None,
     ) -> dict[str, Any]:
         if (
             state.observation_count >= limits.max_observations_per_page
@@ -4739,11 +4870,51 @@ class _InteractiveDaemon:
             raise _GuestFailure("resource_exhausted")
         navigation_epoch = state.navigation_epoch
         previous_observation_revision = state.last_observation_revision
-        observation = await _interactive_observation(
-            state,
-            limits,
-            browser_version=self.browser_version,
-        )
+        try:
+            observation = await _interactive_observation(
+                state,
+                limits,
+                browser_version=self.browser_version,
+                visual_policy=visual_policy,
+                visual_artifacts=visual_artifacts,
+            )
+        except BaseException as primary:
+            if state.observation_cleanup_disposition is None:
+                raise
+            self.closing = True
+            self.close_requested.set()
+
+            async def retire_observation() -> tuple[BaseException, ...]:
+                try:
+                    if await self.close(timeout_seconds=5.0):
+                        state.observation_cleanup_disposition = "retired"
+                        return ()
+                except BaseException as error:
+                    return (error,)
+                return (RuntimeError("Browser observation cleanup remains uncertain."),)
+
+            outcome = await _await_browser_cleanup_resisting_cancellation(
+                asyncio.create_task(retire_observation())
+            )
+            signal = outcome.cancellation
+            if signal is None and not isinstance(primary, Exception):
+                signal = primary
+            cause = _browser_cleanup_evidence(
+                primary.__cause__
+                if signal is primary or isinstance(primary, asyncio.CancelledError)
+                else primary,
+                outcome.errors,
+            )
+            if signal is not None:
+                # Keep earlier restoration evidence when the primary is itself
+                # cancellation (the generic evidence helper excludes that signal).
+                if signal is primary and not outcome.errors:
+                    raise primary
+                raise signal from cause
+            raise _GuestFailure(
+                "timeout" if isinstance(primary, TimeoutError) else "cleanup_failed",
+                allocation_disposition=state.observation_cleanup_disposition,
+            ) from cause
         try:
             observation, _protected = await self._protect_profile_observation(observation)
             if (
@@ -5837,6 +6008,9 @@ class _InteractiveDaemon:
         page.set_default_navigation_timeout(max(1_000, limits.max_wait_ms))
 
         state.cdp = await self.context.new_cdp_session(page)
+        if self.configuration_visual_policy is not None:
+            state.visual_owner = VisualPageOwner(state.cdp, self.visual_worker_instance)
+            await state.visual_owner.install()
         await state.cdp.send("Network.enable")
         frame_tree = await state.cdp.send("Page.getFrameTree")
         main_frame_id = frame_tree["frameTree"]["frame"]["id"]
@@ -6074,7 +6248,8 @@ class _InteractiveDaemon:
         if failure is not None:
             raise failure
         action_target = None
-        if request.operation not in {"navigate", "observe"}:
+        visual_action = request.operation in {"click_visual_target", "click_visual_point"}
+        if request.operation not in {"navigate", "observe", "observe_visual"}:
             if (
                 state.revision is None
                 or request.expected_revision != state.revision
@@ -6110,12 +6285,15 @@ class _InteractiveDaemon:
             else:
                 state.revision = None
                 state.clear_refs()
+        if state.visual_owner is not None and not visual_action:
+            state.visual_owner.invalidate()
         guard_effect = request.multi_page and request.operation in (
             _INTERACTIVE_POPUP_EFFECT_OPERATIONS
         )
         popup_refusal: str | None = None
         if guard_effect:
             popup_refusal = await self._begin_popup_effect(state, request)
+        primary_failure: BaseException | None = None
         try:
             if request.operation == "navigate":
                 try:
@@ -6137,6 +6315,8 @@ class _InteractiveDaemon:
                 # the click await settles. Give that already-dispatched signal
                 # one bounded event-loop turn before accepting the operation.
                 await asyncio.sleep(0)
+            elif visual_action:
+                await self._execute_visual_action(state, request)
             elif request.operation == "fill":
                 if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
@@ -6155,16 +6335,29 @@ class _InteractiveDaemon:
                 if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
                 return await self._download_and_observe(state, request, action_target)
-            elif request.operation not in {"observe", "screenshot"}:
+            elif request.operation not in {"observe", "screenshot", "observe_visual"}:
                 raise _GuestFailure("incompatible_browser")
+        except BaseException as exc:
+            primary_failure = exc
+            raise
         finally:
-            # A positively classified response denial intentionally aborts the
-            # page. The enclosing operation owner retires the allocation next;
-            # querying page JavaScript here would only replace that authority
-            # with Playwright's generic target-closed error.
-            if guard_effect and _interactive_page_failure(state) is None:
-                admitted_urls = await self._end_popup_effect(state, popup_refusal)
-                await self._wait_for_popup_candidates(request, admitted_urls)
+            if (
+                guard_effect
+                and _interactive_page_failure(state) is None
+                and state.visual_action_cleanup_disposition is None
+            ):
+                try:
+                    admitted_urls = await self._end_popup_effect(state, popup_refusal)
+                    await self._wait_for_popup_candidates(request, admitted_urls)
+                except BaseException as cleanup_failure:
+                    # Cancellation can arrive during a successful visual disarm,
+                    # without retiring the page. Its authority does not depend
+                    # on the retirement marker or on popup cleanup succeeding.
+                    if primary_failure is not None and not isinstance(primary_failure, Exception):
+                        raise primary_failure from _browser_cleanup_evidence(
+                            primary_failure.__cause__, (cleanup_failure,)
+                        )
+                    raise
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
@@ -6179,7 +6372,37 @@ class _InteractiveDaemon:
             }
             state.artifact_count += 1
             self.total_artifacts += 1
-        observation = await self._observe_page(state, request.limits)
+        if request.operation == "observe_visual":
+            policy = request.visual_policy
+            if policy is None:
+                raise VisualGuestFailure("visual_mode_disabled")
+            if (
+                type(self.profile_owner) is not _TemporaryProfileOwner
+                or self.closing
+                or self.close_requested.is_set()
+            ):
+                raise VisualGuestFailure("visual_publication_denied")
+            if self.total_visual_captures >= policy["max_captures"]:
+                raise _GuestFailure("resource_exhausted")
+            self.total_visual_captures += 1
+            captures: list[bytes] = []
+            async with asyncio.timeout(policy["max_processing_ms"] / 1000):
+                observation = await self._observe_page(
+                    state,
+                    request.limits,
+                    visual_policy=policy,
+                    visual_artifacts=captures,
+                )
+            artifact = {
+                "kind": "screenshot",
+                "filename": "browser-visual.png",
+                "content_type": "image/png",
+                "content_base64": base64.b64encode(captures[0]).decode("ascii"),
+            }
+            state.artifact_count += 1
+            self.total_artifacts += 1
+        else:
+            observation = await self._observe_page(state, request.limits)
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
@@ -6306,6 +6529,109 @@ class _InteractiveDaemon:
             profile_output_protected=False,
         )
 
+    async def _execute_visual_action(
+        self, state: _InteractivePage, request: _InteractiveRequest
+    ) -> None:
+        owner = state.visual_owner
+        policy = request.visual_policy
+        if owner is None or policy is None:
+            raise VisualGuestFailure("visual_evidence_expired")
+        primary: BaseException | None = None
+        owner.action_task = asyncio.create_task(owner.click(policy, asdict(request)))
+        try:
+            done, _ = await asyncio.wait(
+                {owner.action_task}, timeout=policy["max_processing_ms"] / 1000
+            )
+            if not done:
+                raise TimeoutError("Browser visual action exceeded its bound.")
+            owner.action_task.result()
+        except BaseException as exc:
+            primary = exc
+        finally:
+            owner.invalidate()
+
+        if primary is not None and not isinstance(primary, VisualGuestFailure):
+            self.closing = True
+            self.close_requested.set()
+            state.visual_action_cleanup_disposition = "uncertain"
+            retired = False
+
+            async def retire_uncertain_input() -> tuple[BaseException, ...]:
+                nonlocal retired
+                try:
+                    retired = await self.close()
+                    if retired:
+                        state.visual_action_cleanup_disposition = "retired"
+                except BaseException as exc:
+                    return (exc,)
+                return () if retired else (RuntimeError("Browser input settlement is uncertain."),)
+
+            outcome = await _await_browser_cleanup_resisting_cancellation(
+                asyncio.create_task(retire_uncertain_input())
+            )
+            cause = _browser_cleanup_evidence(primary, outcome.errors)
+            signal: BaseException | None = outcome.cancellation
+            if signal is None and not isinstance(primary, Exception):
+                signal = primary
+            if signal is not None:
+                raise signal from cause
+            raise _GuestFailure(
+                "timeout" if isinstance(primary, TimeoutError) else "outcome_ambiguous",
+                allocation_disposition="retired" if retired else "uncertain",
+            ) from cause
+        owner.action_task = None
+
+        async def settle_guard() -> tuple[BaseException, ...]:
+            owner.disarm_task = asyncio.create_task(owner.disarm(policy))
+            done, _ = await asyncio.wait({owner.disarm_task}, timeout=1.0)
+            if not done:
+                return (TimeoutError("Browser visual guard cleanup exceeded its bound."),)
+            try:
+                owner.disarm_task.result()
+            except BaseException as exc:
+                return (exc,)
+            owner.disarm_task = None
+            return ()
+
+        outcome = await _await_browser_cleanup_resisting_cancellation(
+            asyncio.create_task(settle_guard())
+        )
+        if outcome.errors:
+            self.closing = True
+            self.close_requested.set()
+            state.visual_action_cleanup_disposition = "uncertain"
+
+            # An armed native-input guard is not a reusable page. The retained
+            # CDP owner is joined by close; only positive browser settlement can
+            # release this allocation.
+            async def retire_guard() -> tuple[BaseException, ...]:
+                try:
+                    if await self.close():
+                        state.visual_action_cleanup_disposition = "retired"
+                        return ()
+                except BaseException as exc:
+                    return (exc,)
+                return (RuntimeError("Browser input settlement is uncertain."),)
+
+            settlement = await _await_browser_cleanup_resisting_cancellation(
+                asyncio.create_task(retire_guard())
+            )
+            failure = _GuestFailure(
+                "cleanup_failed",
+                allocation_disposition=state.visual_action_cleanup_disposition,
+            )
+            cause = _browser_cleanup_evidence(primary, outcome.errors + settlement.errors)
+            signal = settlement.cancellation or outcome.cancellation
+            if signal is None and primary is not None and not isinstance(primary, Exception):
+                signal = primary
+            if signal is not None:
+                raise signal from cause
+            raise failure from cause
+        if outcome.cancellation is not None:
+            raise outcome.cancellation from _browser_cleanup_evidence(primary, ())
+        if primary is not None:
+            raise primary
+
     async def close(self, *, timeout_seconds: float = 5.0) -> bool:
         deadline = asyncio.get_running_loop().time() + max(0.001, timeout_seconds)
 
@@ -6417,6 +6743,38 @@ class _InteractiveDaemon:
                     self.session_cleanup_tasks.pop(attribute, None)
                 elif task.done():
                     self.session_cleanup_tasks.pop(attribute, None)
+
+            # Close the browser first: a CDP acknowledgement can be permanently
+            # stalled while its input is still queued. Waiting for it must not
+            # spend the time reserved for stopping that browser.
+            for state in tuple(self.pages.values()):
+                restoration = state.observation_cleanup_task
+                if restoration is not None:
+                    _, failures = await settle_owned_task(restoration, label="observation-guard")
+                    if restoration.done():
+                        state.observation_cleanup_task = None
+                        if self.browser is not None:
+                            errors.extend(failures)
+                            if not failures:
+                                errors.extend(restoration.result())
+                    else:
+                        errors.extend(failures)
+                visual_owner = state.visual_owner
+                if visual_owner is None:
+                    continue
+                for task_name in ("action_task", "disarm_task"):
+                    task = getattr(visual_owner, task_name)
+                    if task is None:
+                        continue
+                    _, failures = await settle_owned_task(task, label="visual-" + task_name)
+                    if task.done():
+                        # Browser closure makes failed input acknowledgements
+                        # expected. An uncompleted owner must remain retained.
+                        setattr(visual_owner, task_name, None)
+                        if self.browser is not None:
+                            errors.extend(failures)
+                    else:
+                        errors.extend(failures)
 
             if self.profile_owner is None and self.home is not None:
                 try:
@@ -6771,6 +7129,8 @@ async def _interactive_observation(
     limits: _InteractiveLimits,
     *,
     browser_version: str,
+    visual_policy: dict[str, Any] | None = None,
+    visual_artifacts: list[bytes] | None = None,
 ) -> dict[str, Any]:
     page = state.page
     blocked = state.access_evidence is not None
@@ -6779,6 +7139,9 @@ async def _interactive_observation(
     primary_failure: BaseException | None = None
     scripts_disabled = False
     animations_frozen = False
+    visual_candidate = None
+    visual_evidence = None
+    revision = f"br_{secrets.token_hex(16)}"
     try:
         scripts_disabled = True
         await state.cdp.send("Emulation.setScriptExecutionDisabled", {"value": True})
@@ -6797,6 +7160,13 @@ async def _interactive_observation(
             truncation: list[str] = []
         else:
             await _admit_interactive_snapshot_materialization(state, limits)
+            if visual_policy is not None:
+                if state.visual_owner is None:
+                    raise VisualGuestFailure("visual_mode_disabled")
+                visual_candidate = await state.visual_owner.collect(
+                    visual_policy,
+                    max_dom_nodes=limits.max_dom_nodes,
+                )
             raw_snapshot = await page.locator("body").aria_snapshot(
                 mode="ai",
                 depth=_ACCESSIBILITY_SNAPSHOT_DEPTH,
@@ -6848,6 +7218,37 @@ async def _interactive_observation(
             if len(title_bytes) > _MAX_TITLE_BYTES:
                 title = title_bytes[:_MAX_TITLE_BYTES].decode("utf-8", errors="ignore")
                 truncation.append("title")
+        if visual_policy is not None:
+            if (
+                blocked
+                or visual_candidate is None
+                or state.visual_owner is None
+                or visual_artifacts is None
+            ):
+                raise VisualGuestFailure("visual_publication_denied")
+            screenshot = await page.screenshot(type="png", full_page=False)
+            if type(screenshot) is not bytes or len(screenshot) > min(
+                limits.max_artifact_bytes, visual_policy["max_bytes"]
+            ):
+                raise _GuestFailure("oversized_artifact")
+            width, height = _png_header_dimensions(screenshot)
+            view = visual_candidate["viewport"]
+            if (
+                width != round(view[0] * view[2])
+                or height != round(view[1] * view[2])
+                or width * height > visual_policy["max_pixels"]
+            ):
+                raise VisualGuestFailure("unstable_visual_observation")
+            visual_evidence = await state.visual_owner.seal(
+                visual_policy,
+                visual_candidate,
+                screenshot,
+                session_id=state.session_id,
+                page_id=state.page_id,
+                revision=revision,
+                control_epoch=state.control_epoch,
+            )
+            visual_artifacts.append(screenshot)
     except _GuestFailure as exc:
         primary_failure = exc
         if exc.code in {"oversized_response", "oversized_snapshot"}:
@@ -6859,6 +7260,8 @@ async def _interactive_observation(
         primary_failure = exc
         raise
     finally:
+        if state.observation_cleanup_task is not None:
+            raise RuntimeError("Browser observation already owns guard restoration.")
         cleanup_task = asyncio.create_task(
             _restore_interactive_observation_guards(
                 state.cdp,
@@ -6866,7 +7269,49 @@ async def _interactive_observation(
                 scripts_disabled=scripts_disabled,
             )
         )
-        cleanup_outcome = await _await_browser_cleanup_resisting_cancellation(cleanup_task)
+        state.observation_cleanup_task = cleanup_task
+
+        async def settle_restoration() -> tuple[BaseException, ...]:
+            done, _ = await asyncio.wait(
+                {cleanup_task}, timeout=_OBSERVATION_GUARD_SETTLEMENT_SECONDS
+            )
+            if not done:
+                return (TimeoutError("Browser observation guard restoration exceeded its bound."),)
+            try:
+                return cleanup_task.result()
+            except asyncio.CancelledError as error:
+                failure = RuntimeError("Browser observation guard restoration was cancelled.")
+                failure.__cause__ = error
+                return (failure,)
+            except BaseException as error:
+                return (error,)
+
+        cleanup_outcome = await _await_browser_cleanup_resisting_cancellation(
+            asyncio.create_task(settle_restoration())
+        )
+        if cleanup_outcome.errors:
+            state.observation_cleanup_disposition = "uncertain"
+            state.revision = None
+            state.clear_refs()
+            if state.visual_owner is not None:
+                state.visual_owner.invalidate()
+            if visual_artifacts is not None:
+                visual_artifacts.clear()
+        else:
+            state.observation_cleanup_task = None
+        process_control = next(
+            (
+                error
+                for error in cleanup_outcome.errors
+                if isinstance(error, (SystemExit, KeyboardInterrupt, GeneratorExit))
+            ),
+            None,
+        )
+        if cleanup_outcome.cancellation is None and process_control is not None:
+            raise process_control from _browser_cleanup_evidence(
+                primary_failure,
+                tuple(error for error in cleanup_outcome.errors if error is not process_control),
+            )
         if cleanup_outcome.cancellation is not None:
             cause = _browser_cleanup_evidence(primary_failure, cleanup_outcome.errors)
             if cause is None:
@@ -6879,19 +7324,18 @@ async def _interactive_observation(
                     cleanup_outcome.errors,
                 )
         elif cleanup_outcome.errors:
-            state.limit_exceeded = True
-            state.limit_error_code = "resource_exhausted"
             if primary_failure is None:
                 raise _GuestFailure("browser_crash") from _browser_cleanup_evidence(
                     None,
                     cleanup_outcome.errors,
                 )
-            primary_failure.add_note("Browser observation guard cleanup also failed.")
-    state.revision = f"br_{secrets.token_hex(16)}"
+            raise primary_failure from _browser_cleanup_evidence(None, cleanup_outcome.errors)
+    state.revision = revision
     state.last_observation_revision = state.revision
     state.refs = refs
     state.ref_targets = ref_targets
     return {
+        **({"visual": visual_evidence} if visual_evidence is not None else {}),
         "session_id": state.session_id,
         "page_id": state.page_id,
         "revision": state.revision,
@@ -6945,7 +7389,7 @@ async def _restore_interactive_observation_guards(
             failure = RuntimeError("Browser animation guard cleanup cancelled unexpectedly.")
             failure.__cause__ = exc
             errors.append(failure)
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(exc)
     if scripts_disabled:
         try:
@@ -6957,7 +7401,7 @@ async def _restore_interactive_observation_guards(
             failure = RuntimeError("Browser script guard cleanup cancelled unexpectedly.")
             failure.__cause__ = exc
             errors.append(failure)
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(exc)
     return tuple(errors)
 
@@ -7070,7 +7514,7 @@ def _interactive_error_payload(
     page_delta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stable = error.code
-    if stable not in {
+    if stable not in VISUAL_FAILURE_CODES | {
         "access_blocked",
         "actionability_failed",
         "allocation_lost",

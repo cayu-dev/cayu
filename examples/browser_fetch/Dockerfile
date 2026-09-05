@@ -13,11 +13,11 @@ RUN python -m pip install --no-cache-dir "playwright==1.62.0" \
 FROM ${PYTHON_IMAGE}
 
 LABEL org.opencontainers.image.title="Cayu browser inspection worker" \
-      org.opencontainers.image.version="7-playwright-1.62.0" \
+      org.opencontainers.image.version="8-playwright-1.62.0" \
       dev.cayu.browser-fetch.protocol="cayu.browser-fetch.v4" \
       dev.cayu.browser-fetch.worker="4" \
-      dev.cayu.browser-session.protocol="cayu.browser-session.v3" \
-      dev.cayu.browser-session.worker="7" \
+      dev.cayu.browser-session.protocol="cayu.browser-session.v4" \
+      dev.cayu.browser-session.worker="8" \
       dev.cayu.browser-fetch.playwright="1.62.0"
 
 USER root
@@ -44,6 +44,7 @@ RUN shell_path="$(find /ms-playwright/chromium_headless_shell-* -type f \( -name
     && test -u "${sandbox_target}"
 
 COPY --chown=root:root src/cayu/tools/_browser_guest.py /opt/cayu-browser/worker.py
+COPY --chown=root:root src/cayu/tools/_browser_visual_guest.py /opt/cayu-browser/_browser_visual_guest.py
 
 RUN chmod 0555 /opt/cayu-browser/worker.py \
     && python -m py_compile /opt/cayu-browser/worker.py \

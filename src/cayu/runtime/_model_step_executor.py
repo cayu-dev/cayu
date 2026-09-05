@@ -14574,6 +14574,28 @@ async def _resolved_file_attachments(
                 raise _FileAttachmentUnavailable(
                     "File attachment size changed before provider request."
                 )
+            visual_policy = artifact.metadata.get("visual_publication")
+            expected_digest = attachment.metadata.get("browser_visual_screenshot_sha256")
+            if visual_policy is not None or expected_digest is not None:
+                from cayu.tools.browser_visual import BrowserVisualPolicy
+
+                try:
+                    policy = BrowserVisualPolicy.model_validate(visual_policy)
+                except (TypeError, ValueError):
+                    raise _FileAttachmentUnavailable(
+                        "Visual screenshot publication authority is unavailable."
+                    ) from None
+                if (
+                    not policy.publish_to_model
+                    or artifact_store.id != policy.artifact_store_id
+                    or artifact.size_bytes > policy.max_bytes
+                    or type(expected_digest) is not str
+                    or expected_digest != artifact.metadata.get("content_sha256")
+                    or sha256(result.content).hexdigest() != expected_digest
+                ):
+                    raise _FileAttachmentUnavailable(
+                        "Visual screenshot publication authority changed."
+                    )
         except (FileNotFoundError, InvalidArtifactIdError, _FileAttachmentUnavailable):
             is_exclusively_prompt = (
                 attachment.artifact_id in prompt_file_artifact_ids

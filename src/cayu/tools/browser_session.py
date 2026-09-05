@@ -29,6 +29,7 @@ from cayu.artifacts import (
     ArtifactScope,
     copy_artifact_read_result,
 )
+from cayu.artifacts.attachments import file_attachment
 from cayu.browser_profiles import (
     BROWSER_PROFILE_MAX_PLAINTEXT_BYTES,
     BrowserProfileBinding,
@@ -59,7 +60,7 @@ from cayu.runners import (
     RunnerUnavailableError,
     RunnerWorkloadAuthority,
 )
-from cayu.tools._redaction import active_secret_redactor_snapshot
+from cayu.tools._redaction import InvocationRedactorSnapshot, active_secret_redactor_snapshot
 from cayu.tools.browser import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
     DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
@@ -77,12 +78,22 @@ from cayu.tools.browser import (
     _workload_authority_material,
     _WorkloadAwareRunnerHandle,
 )
+from cayu.tools.browser_visual import (
+    VISUAL_ACTIONS,
+    VISUAL_FAILURE_CODES,
+    VISUAL_OPERATIONS,
+    BrowserVisualAuthority,
+    BrowserVisualObservation,
+    BrowserVisualPolicy,
+    canonical_visual_point,
+)
 from cayu.tools.web import MAX_WEB_FETCH_URL_LENGTH, _canonicalize_url
 from cayu.tools.web_access import (
     WebAccessEvidence,
     WebAccessEvidenceSource,
     web_destination_fingerprint,
 )
+from cayu.vaults import SecretRedactor
 
 BROWSER_SESSION_PROTOCOL_VERSION = PINNED_BROWSER_SESSION_WORKLOAD.protocol_version
 BROWSER_SESSION_WORKER_VERSION = PINNED_BROWSER_SESSION_WORKLOAD.worker_version
@@ -186,7 +197,7 @@ _PAGE_TERMINAL_REASONS = frozenset(
         "session_closed",
     }
 )
-_BACKEND_FAILURE_CODES = frozenset(
+_BACKEND_FAILURE_CODES = VISUAL_FAILURE_CODES | frozenset(
     {
         "access_blocked",
         "actionability_failed",
@@ -218,6 +229,18 @@ _BACKEND_FAILURE_CODES = frozenset(
 )
 _ERROR_MESSAGES = {
     "access_blocked": "The destination returned a classified access barrier.",
+    "visual_mode_disabled": "Visual browser interaction is not enabled by the application.",
+    "visual_publication_denied": "The application has not authorized these browser pixels.",
+    "unstable_visual_observation": "The visual observation changed during capture; no evidence was published.",
+    "visual_evidence_expired": "The exact visual observation is no longer actionable.",
+    "unknown_visual_target": "The visual target does not belong to this observation.",
+    "visual_viewport_mismatch": "The browser viewport or scroll position changed.",
+    "visual_page_mismatch": "The visual evidence belongs to a different page.",
+    "visual_cross_frame_refused": "The visual action cannot authenticate this frame surface.",
+    "visual_hit_test_mismatch": "The visual target moved or is covered by another surface.",
+    "visual_target_not_actionable": "The retained visual target is not actionable.",
+    "visual_point_outside_viewport": "The visual point is outside the captured viewport.",
+    "unsupported_visual_surface": "This visual browser surface is not supported.",
     "actionability_failed": "The browser element was not actionable.",
     "artifact_write_failed": "The browser artifact could not be stored safely.",
     "browser_crash": "The interactive browser stopped unexpectedly.",
@@ -296,7 +319,12 @@ class BrowserPopupPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True, strict=True)
 
     mode: Literal["deny", "same_origin", "destination_policy"] = "deny"
-    allowed_operations: tuple[Literal["click", "fill", "select", "press", "wait"], ...] = ()
+    allowed_operations: tuple[
+        Literal[
+            "click", "fill", "select", "press", "wait", "click_visual_target", "click_visual_point"
+        ],
+        ...,
+    ] = ()
     allowed_opener_origins: tuple[str, ...] = Field(
         default=(), max_length=_MAX_POPUP_POLICY_ORIGINS
     )
@@ -543,8 +571,8 @@ class BrowserBackendIdentity(BaseModel):
     backend_version: str = Field(min_length=1, max_length=64)
     browser: str = Field(min_length=1, max_length=64)
     browser_version: str = Field(min_length=1, max_length=128)
-    worker_protocol: Literal["cayu.browser-session.v3"]
-    worker_version: Literal["7"]
+    worker_protocol: Literal["cayu.browser-session.v4"]
+    worker_version: Literal["8"]
 
     @field_validator("backend", "backend_version", "browser", "browser_version")
     @classmethod
@@ -594,6 +622,7 @@ class BrowserBackendObservation(BaseModel):
         Literal["snapshot", "refs", "title", "url", "requests", "responses"], ...
     ] = Field(max_length=6)
     backend_identity: BrowserBackendIdentity
+    visual: BrowserVisualObservation | None = None
 
     @field_validator("session_id", "page_id", "revision")
     @classmethod
@@ -619,6 +648,14 @@ class BrowserBackendObservation(BaseModel):
 
     @model_validator(mode="after")
     def validate_access_state(self) -> BrowserBackendObservation:
+        if self.visual is not None and (
+            self.visual.session_id != self.session_id
+            or self.visual.page_id != self.page_id
+            or self.visual.page_revision != self.revision
+            or self.visual.control_epoch != self.control_epoch
+            or self.access_state != "available"
+        ):
+            raise ValueError("Visual evidence must match its exact available observation.")
         if (self.access_state == "blocked") != (self.access is not None):
             raise ValueError("Blocked browser observations require typed access evidence.")
         if self.access is not None:
@@ -786,6 +823,7 @@ class _PageAuthority:
     lifecycle: str = "active"
     summary: BrowserPageSummary | None = None
     valid: bool = True
+    visual: BrowserVisualAuthority | None = None
 
 
 @dataclass(frozen=True)
@@ -940,6 +978,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         max_artifacts_per_page: int,
         max_total_artifacts: int,
         max_page_cleanup_operations: int,
+        visual_policy: BrowserVisualPolicy | None = None,
     ) -> None:
         self.expected_runner_candidate = _expected_runner_candidate(expected_runner_candidate)
         self.expected_environment_authority = _expected_environment_authority(
@@ -978,6 +1017,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         self.max_artifacts_per_page = max_artifacts_per_page
         self.max_total_artifacts = max_total_artifacts
         self.max_page_cleanup_operations = max_page_cleanup_operations
+        self.visual_policy = visual_policy
 
     async def preflight(
         self,
@@ -1338,6 +1378,9 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         }
         if private_profile is not None:
             payload_document["browser_profile"] = private_profile
+        payload_document["visual_policy"] = (
+            None if self.visual_policy is None else self.visual_policy.model_dump(mode="json")
+        )
         payload = json.dumps(
             payload_document,
             ensure_ascii=False,
@@ -1397,6 +1440,10 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         return runner, payload, output_limit, timeout_seconds
 
 
+class _VisualPublicationDenied(Exception):
+    """Private control signal; never includes pixel or secret material."""
+
+
 class BrowserSessionTool(Tool):
     """One closed stateful browser interface backed by an admitted runner."""
 
@@ -1418,6 +1465,9 @@ class BrowserSessionTool(Tool):
                     "enum": [
                         "navigate",
                         "observe",
+                        "observe_visual",
+                        "click_visual_target",
+                        "click_visual_point",
                         "click",
                         "fill",
                         "select",
@@ -1456,6 +1506,11 @@ class BrowserSessionTool(Tool):
                     "description": ("For page actions, copy the latest returned control_epoch."),
                 },
                 "ref": {"type": "string", "maxLength": _MAX_REF_LENGTH},
+                "visual_ref": {"type": "string", "pattern": "^vt_[0-9a-f]{32}$"},
+                "visual_revision": {"type": "string", "pattern": "^vr_[0-9a-f]{32}$"},
+                "screenshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "x": {"type": "number", "minimum": 0, "exclusiveMaximum": 1},
+                "y": {"type": "number", "minimum": 0, "exclusiveMaximum": 1},
                 "operation_id": {
                     "type": "string",
                     "maxLength": _MAX_OPERATION_ID_LENGTH,
@@ -1479,6 +1534,29 @@ class BrowserSessionTool(Tool):
             "allOf": [
                 {
                     "if": {
+                        "properties": {
+                            "operation": {"enum": ["click_visual_target", "click_visual_point"]}
+                        },
+                        "required": ["operation"],
+                    },
+                    "then": {"required": ["visual_revision"]},
+                },
+                {
+                    "if": {
+                        "properties": {"operation": {"const": "click_visual_target"}},
+                        "required": ["operation"],
+                    },
+                    "then": {"required": ["visual_ref"]},
+                },
+                {
+                    "if": {
+                        "properties": {"operation": {"const": "click_visual_point"}},
+                        "required": ["operation"],
+                    },
+                    "then": {"required": ["screenshot_sha256", "x", "y"]},
+                },
+                {
+                    "if": {
                         "properties": {"operation": {"const": "navigate"}},
                         "required": ["operation"],
                     },
@@ -1486,7 +1564,7 @@ class BrowserSessionTool(Tool):
                 },
                 {
                     "if": {
-                        "properties": {"operation": {"const": "observe"}},
+                        "properties": {"operation": {"enum": ["observe", "observe_visual"]}},
                         "required": ["operation"],
                     },
                     "then": {"required": ["session_id", "page_id"]},
@@ -1497,6 +1575,8 @@ class BrowserSessionTool(Tool):
                             "operation": {
                                 "enum": [
                                     "click",
+                                    "click_visual_target",
+                                    "click_visual_point",
                                     "fill",
                                     "select",
                                     "press",
@@ -1609,9 +1689,19 @@ class BrowserSessionTool(Tool):
         expected_workload_authority: RunnerWorkloadAuthority = PINNED_BROWSER_SESSION_WORKLOAD,
         expected_artifact_store_id: str | None = None,
         browser_profile: BrowserProfileBinding | None = None,
+        visual_policy: BrowserVisualPolicy | dict[str, Any] | None = None,
         spec: ToolSpec | None = None,
         _backend: BrowserSessionBackend | None = None,
     ) -> None:
+        self.visual_policy = (
+            None
+            if visual_policy is None
+            else BrowserVisualPolicy.model_validate(
+                visual_policy.model_dump(mode="python", warnings=False)
+                if isinstance(visual_policy, BrowserVisualPolicy)
+                else visual_policy
+            )
+        )
         self.max_snapshot_bytes = _bounded_configuration(
             max_snapshot_bytes,
             "max_snapshot_bytes",
@@ -1917,6 +2007,7 @@ class BrowserSessionTool(Tool):
             max_artifacts_per_page=self.max_artifacts_per_page,
             max_total_artifacts=self.max_total_artifacts,
             max_page_cleanup_operations=self.max_page_cleanup_operations,
+            visual_policy=self.visual_policy,
         )
         self._states: dict[str, _ParentBrowserState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -2022,6 +2113,8 @@ class BrowserSessionTool(Tool):
         )
         if backend_configuration != tool_configuration:
             return None
+        if backend.visual_policy != self.visual_policy:
+            return None
         if (
             self.expected_environment_authority is not None
             and self.expected_environment_authority.profile_identity is None
@@ -2073,6 +2166,9 @@ class BrowserSessionTool(Tool):
             material["expected_artifact_store_id"] = self.expected_artifact_store_id
         if self.browser_profile is not None:
             material["browser_profile"] = self.browser_profile.execution_profile_material()
+        material["visual_policy"] = (
+            None if self.visual_policy is None else self.visual_policy.model_dump(mode="json")
+        )
         return material
 
     @classmethod
@@ -2096,6 +2192,24 @@ class BrowserSessionTool(Tool):
             request = _validated_request(args, max_wait_ms=self.max_wait_ms)
         except (TypeError, ValueError):
             return _error_result("invalid_arguments", dispatch="not_started")
+        if request["operation"] in VISUAL_OPERATIONS:
+            try:
+                policy = self._visual_policy_snapshot()
+            except (TypeError, ValueError):
+                return _error_result("visual_publication_denied", dispatch="not_started")
+            if policy is None:
+                return _error_result("visual_mode_disabled", dispatch="not_started")
+            if (
+                request["operation"] == "click_visual_point"
+                and not policy.allow_coordinate_fallback
+            ):
+                return _error_result("visual_mode_disabled", dispatch="not_started")
+            try:
+                visual_store = _screenshot_artifact_store(ctx)
+            except TypeError:
+                visual_store = None
+            if visual_store is None or visual_store.id != policy.artifact_store_id:
+                return _error_result("visual_publication_denied", dispatch="not_started")
         try:
             durable_authority = _durable_browser_authority(ctx, args)
         except (TypeError, ValueError, RuntimeError):
@@ -2103,12 +2217,13 @@ class BrowserSessionTool(Tool):
         if self.browser_profile is not None and request["operation"] in {
             "screenshot",
             "download",
+            *VISUAL_OPERATIONS,
         }:
             # Binary captures cannot be redacted reliably. A profile-bound
             # allocation may contain imported or newly issued credentials even
             # when the invocation registry is otherwise empty.
             return _error_result("policy_denied", dispatch="not_started")
-        if request["operation"] in {"screenshot", "download"}:
+        if request["operation"] in {"screenshot", "download", "observe_visual"}:
             try:
                 operation_artifact_store = _screenshot_artifact_store(ctx)
             except TypeError:
@@ -2150,6 +2265,91 @@ class BrowserSessionTool(Tool):
                 )
         finally:
             parent_state.active_calls -= 1
+
+    def _visual_policy_snapshot(self) -> BrowserVisualPolicy | None:
+        if self.visual_policy is None:
+            return None
+        if type(self.visual_policy) is not BrowserVisualPolicy:
+            raise ValueError("Visual publication policy is invalid.")
+        snapshot = BrowserVisualPolicy.model_validate(
+            self.visual_policy.model_dump(mode="python", warnings=False)
+        )
+        if (
+            isinstance(self._backend, _RunnerBrowserSessionBackend)
+            and self._backend.visual_policy != snapshot
+        ):
+            raise ValueError("Visual publication policy changed before dispatch.")
+        return snapshot
+
+    def _visual_secret_snapshot_current(
+        self, ctx: ToolContext, expected: InvocationRedactorSnapshot
+    ) -> bool:
+        try:
+            current = active_secret_redactor_snapshot(ctx)
+            if isinstance(self._backend, _RunnerBrowserSessionBackend):
+                runner = ctx.runner
+                if not isinstance(runner, _OutputSecretAwareRunnerHandle):
+                    return False
+                if runner.output_secret_values_present() is not False:
+                    return False
+            return (
+                not current.redactor.has_values
+                and current.revision == expected.revision
+                and current.redactor.has_same_registry(expected.redactor)
+            )
+        except Exception:
+            return False
+
+    def _seal_visual_publication(
+        self, ctx: ToolContext, expected: InvocationRedactorSnapshot
+    ) -> bool:
+        if not self._visual_secret_snapshot_current(ctx, expected):
+            return False
+        if ctx.invocation_secret_snapshot_provider is None:
+            return True
+        authority = _runtime_tool_invocation_authority(ctx)
+        if authority is None:
+            return False
+        try:
+            publication = authority.secret_publication_sealer()
+            redactor = getattr(publication, "redactor", None)
+            return (
+                getattr(publication, "unsafe_output", True) is False
+                and getattr(publication, "secret_scope_incomplete", True) is False
+                and isinstance(redactor, SecretRedactor)
+                and not redactor.has_values
+                and redactor.has_same_registry(expected.redactor)
+                and self._visual_secret_snapshot_current(ctx, expected)
+            )
+        except Exception:
+            return False
+
+    def _visual_replay_result(
+        self, ctx: ToolContext, request: Mapping[str, Any], result: ToolResult
+    ) -> ToolResult:
+        if request["operation"] != "observe_visual" or not result.artifacts:
+            return result
+        try:
+            policy = self._visual_policy_snapshot()
+            snapshot = active_secret_redactor_snapshot(ctx)
+            allowed = (
+                policy is not None
+                and self._seal_visual_publication(ctx, snapshot)
+                and (
+                    policy.publish_to_model
+                    or not any(
+                        artifact.get("type") == "cayu.file_attachment.v1"
+                        for artifact in result.artifacts
+                    )
+                )
+            )
+        except Exception:
+            allowed = False
+        return (
+            result
+            if allowed
+            else _error_result("policy_denied", dispatch="completed", request=request)
+        )
 
     async def reconcile_durable_tool_call(
         self,
@@ -2361,7 +2561,7 @@ class BrowserSessionTool(Tool):
                 if authority_failure is not None:
                     return _error_result(authority_failure, dispatch="not_started")
                 if retained.fingerprint == fingerprint:
-                    return retained.result
+                    return self._visual_replay_result(ctx, request, retained.result)
                 return _error_result("operation_conflict", dispatch="not_started")
         operation_records = (
             parent_state.session_cleanup_operations
@@ -2426,7 +2626,7 @@ class BrowserSessionTool(Tool):
                     page_set_limits=self._page_set_limits(),
                 )
                 if validated_existing is None or validated_existing[0].get("state") != "dispatched":
-                    return replay
+                    return self._visual_replay_result(ctx, request, replay)
                 recorded_request = validated_existing[0]
                 recorded_session_id = recorded_request.get("browser_session_id")
                 recorded_page_id = recorded_request.get("page_id")
@@ -2508,8 +2708,12 @@ class BrowserSessionTool(Tool):
         )
         if preflight is not None:
             return preflight
+        try:
+            visual_policy_snapshot = self._visual_policy_snapshot()
+        except (TypeError, ValueError):
+            return _error_result("visual_publication_denied", dispatch="not_started")
         secret_snapshot = None
-        if request["operation"] in {"screenshot", "download"}:
+        if request["operation"] in {"screenshot", "download", "observe_visual"}:
             try:
                 secret_snapshot = active_secret_redactor_snapshot(ctx)
             except Exception:
@@ -2886,6 +3090,8 @@ class BrowserSessionTool(Tool):
                             parent_state,
                             dispatched_request,
                             response,
+                            visual_policy_snapshot=visual_policy_snapshot,
+                            secret_snapshot=secret_snapshot,
                         )
             else:
                 result = await self._project_response(
@@ -2893,6 +3099,8 @@ class BrowserSessionTool(Tool):
                     parent_state,
                     dispatched_request,
                     response,
+                    visual_policy_snapshot=visual_policy_snapshot,
+                    secret_snapshot=secret_snapshot,
                 )
             if owned_live_session is not None:
                 error_code = None
@@ -3026,8 +3234,12 @@ class BrowserSessionTool(Tool):
     ) -> ToolResult:
         """Publish only a guest-authenticated receipt for an ambiguous dispatch."""
 
+        try:
+            visual_policy_snapshot = self._visual_policy_snapshot()
+        except (TypeError, ValueError):
+            return fallback
         secret_snapshot = None
-        if request["operation"] in {"screenshot", "download"}:
+        if request["operation"] in {"screenshot", "download", "observe_visual"}:
             try:
                 secret_snapshot = active_secret_redactor_snapshot(ctx)
             except Exception:
@@ -3119,9 +3331,23 @@ class BrowserSessionTool(Tool):
                     allocation_disposition=response.allocation_disposition,
                 )
             else:
-                result = await self._project_response(ctx, parent_state, request, response)
+                result = await self._project_response(
+                    ctx,
+                    parent_state,
+                    request,
+                    response,
+                    visual_policy_snapshot=visual_policy_snapshot,
+                    secret_snapshot=secret_snapshot,
+                )
         else:
-            result = await self._project_response(ctx, parent_state, request, response)
+            result = await self._project_response(
+                ctx,
+                parent_state,
+                request,
+                response,
+                visual_policy_snapshot=visual_policy_snapshot,
+                secret_snapshot=secret_snapshot,
+            )
         operation_id = request.get("operation_id")
         live_session = parent_state.sessions.get(request["session_id"])
         if profile_binding is not None and live_session is not None:
@@ -3605,7 +3831,20 @@ class BrowserSessionTool(Tool):
         parent_state: _ParentBrowserState,
         request: Mapping[str, Any],
         response: BrowserBackendResponse,
+        *,
+        visual_policy_snapshot: BrowserVisualPolicy | None = None,
+        secret_snapshot: InvocationRedactorSnapshot | None = None,
     ) -> ToolResult:
+        if request["operation"] in VISUAL_OPERATIONS:
+            try:
+                current_policy = self._visual_policy_snapshot()
+            except (TypeError, ValueError):
+                current_policy = None
+            if visual_policy_snapshot is None or current_policy != visual_policy_snapshot:
+                _invalidate_session_refs(parent_state, request)
+                return _error_result(
+                    "visual_publication_denied", dispatch="completed", request=request
+                )
         page_set = _validated_backend_page_set(
             response,
             request=request,
@@ -3717,6 +3956,31 @@ class BrowserSessionTool(Tool):
                 request=request,
                 allocation_disposition=response.allocation_disposition,
             )
+        if observation.visual is not None:
+            policy = self.visual_policy
+            visual = observation.visual
+            if (
+                request["operation"] != "observe_visual"
+                or policy is None
+                or len(response.artifacts) != 1
+                or response.artifacts[0].kind != "screenshot"
+                or response.artifacts[0].content_type != "image/png"
+                or len(response.artifacts[0].content) > policy.max_bytes
+                or hashlib.sha256(response.artifacts[0].content).hexdigest()
+                != visual.screenshot_sha256
+                or len(visual.targets) > policy.max_targets
+                or visual.viewport_width > policy.max_width
+                or visual.viewport_height > policy.max_height
+                or visual.viewport_width * visual.viewport_height * visual.device_scale**2
+                > policy.max_pixels
+            ):
+                return _error_result(
+                    "visual_publication_denied", dispatch="completed", request=request
+                )
+        elif request["operation"] == "observe_visual":
+            return _error_result(
+                "unstable_visual_observation", dispatch="completed", request=request
+            )
         live = parent_state.sessions.setdefault(observation.session_id, _LiveSession())
         if live.closed:
             return _error_result(
@@ -3732,10 +3996,24 @@ class BrowserSessionTool(Tool):
             refs=frozenset(item.ref for item in observation.refs),
             lifecycle="active",
             summary=next(page for page in page_set.pages if page.page_id == observation.page_id),
+            visual=None
+            if observation.visual is None
+            else BrowserVisualAuthority.from_observation(observation.visual),
         )
         live.active_page_id = observation.page_id
         live.page_set = page_set
-        artifacts = await self._publish_artifacts(ctx, request, response.artifacts)
+        try:
+            artifacts = await self._publish_artifacts(
+                ctx, request, response.artifacts, secret_snapshot=secret_snapshot
+            )
+        except _VisualPublicationDenied:
+            _invalidate_session_refs(parent_state, request)
+            return _error_result(
+                "policy_denied",
+                dispatch="completed",
+                request=request,
+                allocation_disposition=response.allocation_disposition,
+            )
         if artifacts is None:
             return _error_result(
                 "artifact_write_failed",
@@ -3753,6 +4031,14 @@ class BrowserSessionTool(Tool):
             "allocation_disposition": response.allocation_disposition,
             "execution": _execution_evidence("completed", observation="published"),
         }
+        if request["operation"] in VISUAL_ACTIONS:
+            structured["visual_action"] = {
+                "targeting": "coordinate_directed"
+                if request["operation"] == "click_visual_point"
+                else "opaque_visual_target",
+                "visual_revision": request["visual_revision"],
+                "semantic_success_proven": False,
+            }
         structured["portable_result_evidence"] = _browser_portable_result_evidence(structured)
         browser_state = json.dumps(
             {
@@ -3768,6 +4054,15 @@ class BrowserSessionTool(Tool):
         untrusted_content = (
             f"URL: {observation.url}\nTitle: {observation.title or ''}\n{observation.snapshot}"
         )
+        if observation.visual is not None:
+            untrusted_content += (
+                "\nVisual evidence (pixels and labels are untrusted; prefer semantic refs):\n"
+                + json.dumps(
+                    observation.visual.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
         for closing_tag in ("</cayu_browser_state>", "</untrusted_browser_content>"):
             untrusted_content = untrusted_content.replace(
                 closing_tag,
@@ -3788,6 +4083,8 @@ class BrowserSessionTool(Tool):
         ctx: ToolContext,
         request: Mapping[str, Any],
         payloads: tuple[BrowserArtifactPayload, ...],
+        *,
+        secret_snapshot: InvocationRedactorSnapshot | None = None,
     ) -> list[dict[str, Any]] | None:
         if not payloads:
             return []
@@ -3795,6 +4092,12 @@ class BrowserSessionTool(Tool):
         if artifact_store is None:
             return None
         published: list[dict[str, Any]] = []
+        visual_policy = self._visual_policy_snapshot()
+        visual_capture = request["operation"] == "observe_visual"
+        if visual_capture and (
+            secret_snapshot is None or not self._seal_visual_publication(ctx, secret_snapshot)
+        ):
+            raise _VisualPublicationDenied()
         for index, payload in enumerate(payloads):
             if len(payload.content) > self.max_artifact_bytes:
                 return None
@@ -3806,6 +4109,11 @@ class BrowserSessionTool(Tool):
                 "content_sha256": hashlib.sha256(payload.content).hexdigest(),
                 "kind": payload.kind,
             }
+            if request["operation"] == "observe_visual":
+                policy = visual_policy
+                if policy is None or artifact_store.id != policy.artifact_store_id:
+                    return None
+                metadata["visual_publication"] = policy.model_dump(mode="json")
             try:
                 artifact = await artifact_store.put_bytes(
                     payload.content,
@@ -3835,6 +4143,15 @@ class BrowserSessionTool(Tool):
                 artifact = existing.metadata
             if type(artifact) is not ArtifactMetadata:
                 return None
+            if visual_capture and (
+                secret_snapshot is None
+                or not self._visual_secret_snapshot_current(ctx, secret_snapshot)
+            ):
+                raise _VisualPublicationDenied()
+            if self._visual_policy_snapshot() != visual_policy:
+                if visual_capture:
+                    raise _VisualPublicationDenied()
+                return None
             if (
                 artifact.id != artifact_id
                 or artifact.filename != payload.filename
@@ -3847,6 +4164,22 @@ class BrowserSessionTool(Tool):
                 or dict(artifact.metadata) != metadata
             ):
                 return None
+            if (
+                request["operation"] == "observe_visual"
+                and visual_policy is not None
+                and visual_policy.publish_to_model
+            ):
+                published.append(
+                    file_attachment(
+                        artifact_id=artifact.id,
+                        kind="image",
+                        filename=artifact.filename,
+                        content_type=artifact.content_type,
+                        size_bytes=artifact.size_bytes,
+                        metadata={"browser_visual_screenshot_sha256": metadata["content_sha256"]},
+                    )
+                )
+                continue
             published.append(
                 {
                     "artifact_id": artifact.id,
@@ -3871,6 +4204,9 @@ def _validated_request(args: object, *, max_wait_ms: int) -> dict[str, Any]:
     allowed: dict[str, set[str]] = {
         "navigate": {"operation", "url", "operation_id"},
         "observe": common_page,
+        "observe_visual": common_page,
+        "click_visual_target": revision_page | {"visual_revision", "visual_ref"},
+        "click_visual_point": revision_page | {"visual_revision", "screenshot_sha256", "x", "y"},
         "click": revision_page | {"ref"},
         "fill": revision_page | {"ref", "value"},
         "select": revision_page | {"ref", "value"},
@@ -3886,6 +4222,9 @@ def _validated_request(args: object, *, max_wait_ms: int) -> dict[str, Any]:
     required: dict[str, set[str]] = {
         "navigate": {"operation", "url", "operation_id"},
         "observe": common_page,
+        "observe_visual": common_page,
+        "click_visual_target": revision_page | {"visual_revision", "visual_ref"},
+        "click_visual_point": revision_page | {"visual_revision", "screenshot_sha256", "x", "y"},
         "click": revision_page | {"ref"},
         "fill": revision_page | {"ref", "value"},
         "select": revision_page | {"ref", "value"},
@@ -3905,9 +4244,21 @@ def _validated_request(args: object, *, max_wait_ms: int) -> dict[str, Any]:
     ):
         raise ValueError("Browser operation fields are invalid.")
     copied: dict[str, Any] = {"operation": operation}
-    for name in ("session_id", "page_id", "expected_revision"):
+    for name in ("session_id", "page_id", "expected_revision", "visual_revision", "visual_ref"):
         if name in raw_args:
             copied[name] = _bounded_identifier(raw_args[name], name, maximum=_MAX_BROWSER_ID_LENGTH)
+    if "screenshot_sha256" in raw_args:
+        digest = raw_args["screenshot_sha256"]
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(c not in "0123456789abcdef" for c in digest)
+        ):
+            raise ValueError("Visual screenshot fingerprint is invalid.")
+        copied["screenshot_sha256"] = digest
+    for name in ("x", "y"):
+        if name in raw_args:
+            copied[name] = canonical_visual_point(raw_args[name])
     if "expected_control_epoch" in raw_args:
         expected_control_epoch = raw_args["expected_control_epoch"]
         if (
@@ -4226,7 +4577,7 @@ def _browser_page_set_transition_is_valid(
                 return False
             operation = request.get("operation")
             target_control_epoch = current_pages[observation.page_id].control_epoch
-            if operation == "observe":
+            if operation in {"observe", "observe_visual"}:
                 control_epoch_valid = target_control_epoch >= target_prior.control_epoch
             elif operation == "switch_page":
                 control_epoch_valid = target_control_epoch > target_prior.control_epoch
@@ -4380,6 +4731,13 @@ def _apply_backend_page_set(
         if observation is not None and observation.page_id == summary.page_id:
             refs = frozenset(item.ref for item in observation.refs)
             valid = True
+        visual_authority = retained.visual if retained is not None and valid else None
+        if observation is not None and observation.page_id == summary.page_id:
+            visual_authority = (
+                None
+                if observation.visual is None
+                else BrowserVisualAuthority.from_observation(observation.visual)
+            )
         pages[summary.page_id] = _PageAuthority(
             revision=summary.revision or "",
             creation_epoch=summary.creation_epoch,
@@ -4388,6 +4746,7 @@ def _apply_backend_page_set(
             lifecycle=summary.lifecycle,
             summary=summary,
             valid=valid,
+            visual=visual_authority,
         )
     live.pages = pages
     live.active_page_id = page_set.active_page_id
@@ -4454,7 +4813,7 @@ def _preflight_request(
         return None
     if session.active_page_id != request["page_id"]:
         return _error_result("unknown_page", dispatch="not_started")
-    if operation == "observe":
+    if operation in {"observe", "observe_visual"}:
         return None
     if (
         not page.valid
@@ -4464,6 +4823,16 @@ def _preflight_request(
         return _error_result("stale_observation", dispatch="not_started")
     if "ref" in request and request["ref"] not in page.refs:
         return _error_result("unknown_element", dispatch="not_started")
+    if operation in VISUAL_ACTIONS:
+        if page.visual is None or page.visual.visual_revision != request["visual_revision"]:
+            return _error_result("visual_evidence_expired", dispatch="not_started")
+        if operation == "click_visual_target" and request["visual_ref"] not in page.visual.refs:
+            return _error_result("unknown_visual_target", dispatch="not_started")
+        if (
+            operation == "click_visual_point"
+            and request["screenshot_sha256"] != page.visual.screenshot_sha256
+        ):
+            return _error_result("visual_evidence_expired", dispatch="not_started")
     return None
 
 
@@ -4902,6 +5271,7 @@ def _browser_portable_result_evidence(structured: Mapping[str, Any]) -> dict[str
             "artifacts",
             "allocation_disposition",
             "execution",
+            "visual_action",
         )
         if key in structured
     }
@@ -4911,6 +5281,29 @@ def _browser_portable_result_evidence(structured: Mapping[str, Any]) -> dict[str
     refs = structured.get("refs")
     if isinstance(refs, list | tuple):
         portable["ref_count"] = len(refs)
+    visual = structured.get("visual")
+    if isinstance(visual, Mapping):
+        portable["visual"] = {
+            key: visual[key]
+            for key in (
+                "page_revision",
+                "control_epoch",
+                "worker_instance",
+                "visual_revision",
+                "screenshot_sha256",
+                "viewport_width",
+                "viewport_height",
+                "device_scale",
+                "scroll_x",
+                "scroll_y",
+                "truncation_reasons",
+                "unsupported_reasons",
+            )
+            if key in visual
+        }
+        targets = visual.get("targets")
+        if isinstance(targets, list | tuple):
+            portable["visual"]["target_count"] = len(targets)
     raw_page_set = structured.get("page_set")
     if isinstance(raw_page_set, Mapping):
         pages = raw_page_set.get("pages")
@@ -5382,6 +5775,9 @@ def _browser_session_record(
                 "revision": summary.revision,
                 "refs": refs,
                 "refs_valid": refs_valid,
+                "visual": None
+                if page is None or page.visual is None
+                else page.visual.model_dump(mode="json"),
             }
         )
     return copy_durable_json_object(
@@ -5499,6 +5895,7 @@ def _validate_durable_browser_session_record(
             "revision",
             "refs",
             "refs_valid",
+            "visual",
         }:
             return None, "restoration_required"
         refs = raw_authority.get("refs")
@@ -5519,6 +5916,14 @@ def _validate_durable_browser_session_record(
         ):
             return None, "restoration_required"
         retained_ref_count += len(refs)
+        try:
+            visual = (
+                None
+                if raw_authority["visual"] is None
+                else BrowserVisualAuthority.model_validate(raw_authority["visual"])
+            )
+        except (TypeError, ValueError):
+            return None, "restoration_required"
         pages[summary.page_id] = _PageAuthority(
             revision=summary.revision or "",
             creation_epoch=summary.creation_epoch,
@@ -5527,6 +5932,7 @@ def _validate_durable_browser_session_record(
             lifecycle=summary.lifecycle,
             summary=summary,
             valid=bool(refs_valid) and state == "live",
+            visual=visual,
         )
     if retained_ref_count > limits.max_total_refs:
         return None, "restoration_required"

@@ -22,6 +22,7 @@ from cayu.tools.browser_session import (
     BrowserPopupPolicy,
     BrowserSessionTool,
 )
+from cayu.tools.browser_visual import BrowserVisualPolicy
 from cayu.tools.child_sessions import ChildSessionResultTool
 from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import (
@@ -175,6 +176,7 @@ __all__ = [
     "BrowserPageSummary",
     "BrowserPopupPolicy",
     "BrowserSessionTool",
+    "BrowserVisualPolicy",
     "BrowserWebFetchAdapter",
     "ChildSessionResultTool",
     "CommandPolicy",

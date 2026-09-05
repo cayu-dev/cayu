@@ -11,6 +11,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import secrets
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,10 +21,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, ClassVar
 
+from pydantic import SecretStr
+
 from cayu import (
     AgentSpec,
     ApprovedEgressDestination,
     BrowserEgressPolicy,
+    BrowserVisualPolicy,
     CayuApp,
     EnvironmentSpec,
     EvalCase,
@@ -54,6 +58,7 @@ from cayu.evals.browser_acceptance import (
     BrowserAcceptanceFaultScenario,
     BrowserAcceptancePlanV1,
     BrowserAcceptanceScenarioExecutionV1,
+    BrowserAcceptanceSemanticOracle,
     _browser_dispatches_from_trial,
 )
 from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
@@ -73,9 +78,11 @@ from cayu.evals.trajectory import _trajectory_from_terminal_evidence, trajectory
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand, Runner
 from cayu.runtime._event_projection import public_event_sequence
+from cayu.runtime._tool_round_recovery import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
 from cayu.runtime.egress import VIRTUAL_EGRESS_EVENT_TYPES, VirtualEgressEnvironmentFactory
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.sessions import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
@@ -93,6 +100,7 @@ from cayu.tools.browser_session import (
     BrowserSessionTool,
     _durable_browser_operation_locator_key,
 )
+from cayu.vaults import SecretRedactor
 
 _AGENT = "browser-acceptance"
 _MODEL = "browser-acceptance-deterministic-v1"
@@ -104,6 +112,7 @@ _PLANNER_REVISION = _content_revision(
         "selection": "accessible-name exact first match",
         "detached_element_settlement_ms": 3_000,
         "browser_crash_wait_ms": 2_000,
+        "visual_selection": "retained visual target; bounded fixture-gated mutations",
         "terminal_output": "browser_acceptance:success",
     },
     "browser acceptance deterministic planner",
@@ -209,6 +218,8 @@ _ENVIRONMENT_EXECUTION_PROFILE_IDENTITY = ExecutionProfileBehaviorIdentity(
 
 
 def _scenario_stage(scenario: BrowserAcceptanceFaultScenario) -> tuple[str, str]:
+    if scenario is BrowserAcceptanceFaultScenario.SECRET_BEFORE_CAPTURE:
+        return "secret", "before_capture"
     browser_stages = {
         BrowserAcceptanceFaultScenario.BROWSER_BEFORE_DISPATCH: (
             "browser",
@@ -283,7 +294,18 @@ class _FaultSQLiteSessionStore(SQLiteSessionStore):
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
 
     def __init__(self, path: Path, *, control: _FaultControl | None) -> None:
-        super().__init__(path)
+        codec = None
+        if (
+            control is not None
+            and control.scenario is BrowserAcceptanceFaultScenario.SECRET_BEFORE_CAPTURE
+        ):
+            codec = PublicAuthorityAliasCodec(
+                PublicAuthorityAliasKeyring(
+                    active_key_id="browser-acceptance",
+                    keys={"browser-acceptance": SecretStr(secrets.token_urlsafe(32))},
+                )
+            )
+        super().__init__(path, public_authority_alias_codec=codec)
         self._acceptance_control = control
         self._acceptance_state_counts: dict[str, int] = {}
 
@@ -368,6 +390,7 @@ class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
         self._cases = dict(cases)
         self._acceptance_temporary_directory: TemporaryDirectory[str] | None = None
         self.execution_revision = _PLANNER_REVISION
+        self.visual_fixture: BrowserAcceptanceFixtureV1 | None = None
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
@@ -383,6 +406,22 @@ class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
             raise RuntimeError("Browser acceptance request does not name a canonical case.")
         results = _browser_results(request)
         operation_index = len(results)
+        change = {
+            "visual-virtualized-movement": "moved",
+            "visual-sticky-overlay": "overlay",
+            "visual-viewport-scroll-change": "scroll",
+        }.get(case_id)
+        if change is not None:
+            fixture = self.visual_fixture
+            if fixture is None:
+                raise RuntimeError("Visual mutation scenario has no owned fixture.")
+            if operation_index == 0:
+                fixture.prepare_visual_change(change)
+            elif operation_index == 2:
+                fixture.release_visual_change(change)
+                async with asyncio.timeout(5):
+                    while not fixture.visual_change_applied(change):
+                        await asyncio.sleep(0.01)
         if operation_index >= len(case.operations):
             yield ModelStreamEvent.text_delta("browser_acceptance:success")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
@@ -706,7 +745,9 @@ def _operation_arguments(
         url = route if route.startswith("https://") else f"https://docs.browser.test{route}"
         return {"operation": operation, "url": url, "operation_id": operation_id}
     state = (
-        results[0]
+        results[1]
+        if case_id == "visual-stale-screenshot" and operation_index == 3 and len(results) > 1
+        else results[0]
         if case_id.startswith("revision-stale-ref-after-") and operation_index == 2 and results
         else _latest_browser_state(results)
     )
@@ -720,14 +761,39 @@ def _operation_arguments(
         if operation in {"switch_page", "close_page"} and case_id.startswith("page-"):
             page_id = _popup_page_id(results)
         arguments["page_id"] = page_id
-        if operation not in {"observe", "switch_page", "close_page"}:
+        if operation not in {"switch_page", "close_page", "observe", "observe_visual"}:
             arguments["expected_revision"] = state["revision"]
-    if operation in {"click", "fill", "select", "press", "wait", "screenshot", "download"}:
+    if operation in {
+        "click",
+        "fill",
+        "select",
+        "press",
+        "wait",
+        "screenshot",
+        "download",
+        "click_visual_target",
+        "click_visual_point",
+    }:
         control_epoch = state.get("control_epoch")
         if type(control_epoch) is not int:
             raise RuntimeError("Browser acceptance observation lacks its control epoch.")
         arguments["expected_control_epoch"] = control_epoch
-    if operation == "wait":
+    if operation in {"click_visual_target", "click_visual_point"}:
+        visual = state.get("visual")
+        if not isinstance(visual, dict) or not visual.get("targets"):
+            raise RuntimeError("Browser acceptance observation lacks its visual target.")
+        arguments["visual_revision"] = visual["visual_revision"]
+        target = visual["targets"][0]
+        if operation == "click_visual_target":
+            arguments["visual_ref"] = target["ref"]
+        else:
+            geometry = target["geometry"]
+            arguments.update(
+                screenshot_sha256=visual["screenshot_sha256"],
+                x=geometry["x"] + geometry["width"] / 2,
+                y=geometry["y"] + geometry["height"] / 2,
+            )
+    elif operation == "wait":
         arguments["wait_ms"] = 2_000 if case_id == "crash-during-execution" else 250
     elif operation == "screenshot":
         arguments["full_page"] = True
@@ -737,6 +803,7 @@ def _operation_arguments(
             if case_id.startswith("revision-stale-ref-after-") and operation_index == 2
             else {
                 ("action-delayed-element", "click"): ("Continue",),
+                ("visual-semantic-preference", "click"): ("Activate",),
                 ("action-disabled-control", "click"): ("Unavailable",),
                 ("action-duplicate-labels", "click"): ("Continue",),
                 ("action-form-controls", "fill"): ("Name",),
@@ -816,10 +883,17 @@ def _build_runtime(
     root.mkdir(parents=True, exist_ok=True)
     provider = BrowserAcceptanceDeterministicProvider(cases)
     store = _FaultSQLiteSessionStore(root / "sessions.sqlite", control=control)
+    artifact_store = _FaultArtifactStore(root / "artifacts", control=control)
     app = CayuApp(
         session_store=store,
         event_sinks=[_AcceptanceEventJournalSink(root / _OBSERVED_EVENTS_FILENAME)],
         enable_logging=False,
+        secret_redactor=(
+            SecretRedactor(["browser-acceptance-private-pixel-canary"])
+            if control is not None
+            and control.scenario is BrowserAcceptanceFaultScenario.SECRET_BEFORE_CAPTURE
+            else None
+        ),
     )
     factory = VirtualEgressEnvironmentFactory(
         policies={
@@ -836,7 +910,7 @@ def _build_runtime(
         adapter=DockerEgressAdapter(seccomp_profile=str(seccomp_profile)),
         upstream=HttpxUpstream(routes=upstream_routes),
         image=PINNED_BROWSER_SESSION_WORKLOAD.image,
-        artifact_store=_FaultArtifactStore(root / "artifacts", control=control),
+        artifact_store=artifact_store,
         event_emitter=app.scoped_event_emitter(event_types=VIRTUAL_EGRESS_EVENT_TYPES),
         execution_profile_identity=_ENVIRONMENT_EXECUTION_PROFILE_IDENTITY,
     )
@@ -845,6 +919,13 @@ def _build_runtime(
         browser_image=PINNED_BROWSER_SESSION_WORKLOAD.image,
         interactive=True,
         interactive_options={
+            "visual_policy": BrowserVisualPolicy(
+                artifact_store_id=artifact_store.id,
+                allowed_origins=tuple(f"https://{host}" for host in hosts),
+                retention="application_managed",
+                publish_to_model=True,
+                allow_coordinate_fallback=True,
+            ),
             "max_artifact_bytes": (
                 DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
             ),
@@ -854,7 +935,7 @@ def _build_runtime(
             "multi_page": True,
             "popup_policy": {
                 "mode": "destination_policy",
-                "allowed_operations": ["click"],
+                "allowed_operations": ["click", "click_visual_point", "click_visual_target"],
                 "allowed_opener_origins": ["https://docs.browser.test/"],
                 "allowed_destination_origins": [
                     "https://docs.browser.test/",
@@ -880,6 +961,11 @@ def _build_runtime(
     )
     if control is not None and control.scenario.value.startswith("browser_"):
         _install_browser_crash_fault(bridge, control)
+    if (
+        control is not None
+        and control.scenario is BrowserAcceptanceFaultScenario.SECRET_BEFORE_CAPTURE
+    ):
+        control.trigger("secret", "before_capture", control.target_operation_number)
     app.register_provider(provider, default=True)
     app.register_environment_factory(
         EnvironmentSpec(
@@ -1517,6 +1603,39 @@ class _DeterministicScenarioExecutor:
                 recovery = await _recover_scenario(app, session_id)
                 interrupted = recovery.status is SessionStatus.INTERRUPTED
         await _drain_acceptance_event_observations(app)
+        quarantined_tool_calls = 0
+        if (
+            process_loss
+            and interrupted
+            and case.semantic_oracle is BrowserAcceptanceSemanticOracle.QUARANTINED_RECOVERY
+        ):
+            checkpoint = await app.session_store.load_checkpoint(session_id)
+            archive = (
+                None if checkpoint is None else checkpoint.get("abandoned_unreplayable_tool_round")
+            )
+            if archive is not None:
+                if (
+                    type(archive) is not dict
+                    or checkpoint is None
+                    or PENDING_TOOL_ROUND_CHECKPOINT_KEY in checkpoint
+                ):
+                    raise RuntimeError("Browser recovery quarantine conflicts with resumable work.")
+                pending = PendingToolRound.model_validate(archive.get("tool_round"))
+                publication = pending.assistant_publication
+                if (
+                    archive.get("reason") != "opaque_provider_state"
+                    or publication is None
+                    or publication.state != "blocked"
+                    or len(pending.tool_calls) != 1
+                    or pending.tool_calls[0].tool_name != "browser_session"
+                    or pending.tool_calls[0].arguments.get("operation") != case.operations[-1]
+                    or pending.tool_calls[0].tool_call_id
+                    != f"{case.case_id}-{len(case.operations)}"
+                ):
+                    raise RuntimeError(
+                        "Browser recovery quarantine lacks exact final-call evidence."
+                    )
+                quarantined_tool_calls = 1
         observed_events = await _load_observed_events(
             app,
             trial_root / _OBSERVED_EVENTS_FILENAME,
@@ -1575,6 +1694,7 @@ class _DeterministicScenarioExecutor:
                 process_loss_observed=process_loss,
                 recovered_in_fresh_app=process_loss,
                 browser_dispatches=_browser_dispatches_from_trial(trial),
+                quarantined_tool_calls=quarantined_tool_calls,
             ),
         )
 
@@ -1604,6 +1724,7 @@ async def build(fixture: BrowserAcceptanceFixtureV1) -> BrowserAcceptancePlanV1:
         control=None,
     )
     provider._acceptance_temporary_directory = temporary_directory
+    provider.visual_fixture = fixture
     suite = EvalSuite(
         id=manifest.suite_id,
         cases=[

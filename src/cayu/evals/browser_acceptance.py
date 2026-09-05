@@ -66,6 +66,7 @@ from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.runtime.costs import PriceBook
 from cayu.runtime.usage import SessionUsageSummary
 from cayu.tools.browser_session import BrowserSessionTool
+from cayu.tools.browser_visual import VISUAL_FAILURE_CODES
 from cayu.tools.webbridge import WebBridge, WebBridgeProfileKind
 
 BROWSER_ACCEPTANCE_SCHEMA_VERSION = 1
@@ -85,7 +86,7 @@ BROWSER_ACCEPTANCE_MAX_ERROR_CATEGORIES = 64
 BROWSER_ACCEPTANCE_MAX_TRUNCATION_CATEGORIES = 32
 BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION = 4 * 1024 * 1024
 
-_REFUSAL_ERRORS = frozenset(
+_REFUSAL_ERRORS = VISUAL_FAILURE_CODES | frozenset(
     {
         "access_blocked",
         "actionability_failed",
@@ -293,6 +294,7 @@ class BrowserAllocationDisposition(StrEnum):
 
 
 class BrowserAcceptanceSemanticOracle(StrEnum):
+    QUARANTINED_RECOVERY = "quarantined_recovery"
     OBSERVATION = "observation"
     FIXTURE_EFFECT = "fixture_effect"
     ARTIFACT = "artifact"
@@ -302,6 +304,7 @@ class BrowserAcceptanceSemanticOracle(StrEnum):
 
 
 class BrowserAcceptanceFaultScenario(StrEnum):
+    SECRET_BEFORE_CAPTURE = "secret_before_capture"
     CANCEL_AFTER_INTENT = "cancel_after_intent"
     CANCEL_AFTER_DISPATCHED = "cancel_after_dispatched"
     CANCEL_BEFORE_TERMINAL = "cancel_before_terminal"
@@ -403,6 +406,21 @@ class BrowserAcceptanceCaseV1(BaseModel):
 
     @model_validator(mode="after")
     def validate_case(self) -> Self:
+        if self.semantic_oracle is BrowserAcceptanceSemanticOracle.QUARANTINED_RECOVERY and (
+            self.category is not BrowserAcceptanceCaseCategory.RECOVERY
+            or self.expected_state is not BrowserAcceptanceState.AMBIGUOUS
+            or self.fault_scenario is None
+            or not self.fault_scenario.value.startswith("process_")
+            or type(self.oracle_parameters.get("quarantined_tool_calls")) is not int
+            or self.oracle_parameters["quarantined_tool_calls"] != 1
+            or type(self.oracle_parameters.get("expected_browser_dispatches")) is not int
+            or self.oracle_parameters["expected_browser_dispatches"] != len(self.operations)
+            or self.fixture_route is None
+            or not self.fixture_route.startswith("/")
+            or self.oracle_parameters.get("expected_effects") != {"visual-activated": 1}
+            or type(self.oracle_parameters["expected_effects"].get("visual-activated")) is not int
+        ):
+            raise ValueError("Quarantined recovery requires an exact process-loss safety oracle.")
         if self.expected_state is BrowserAcceptanceState.UNSUPPORTED and (
             self.semantic_oracle is not BrowserAcceptanceSemanticOracle.PUBLIC_SCHEMA_UNSUPPORTED
             or self.semantic_success_required
@@ -793,6 +811,9 @@ class BrowserAcceptanceFaultEvidenceV1(BaseModel):
     process_loss_observed: StrictBool = False
     recovered_in_fresh_app: StrictBool = False
     browser_dispatches: StrictInt = Field(ge=0, le=BROWSER_ACCEPTANCE_MAX_OPERATIONS_PER_CASE)
+    quarantined_tool_calls: StrictInt = Field(
+        default=0, ge=0, le=BROWSER_ACCEPTANCE_MAX_OPERATIONS_PER_CASE
+    )
 
     @model_validator(mode="after")
     def validate_signal(self) -> Self:
@@ -804,6 +825,8 @@ class BrowserAcceptanceFaultEvidenceV1(BaseModel):
             raise ValueError("Fault evidence process-loss signal conflicts with its scenario.")
         if self.recovered_in_fresh_app and not is_process_loss:
             raise ValueError("Only process-loss scenarios may claim fresh-app recovery.")
+        if self.quarantined_tool_calls and not (is_process_loss and self.recovered_in_fresh_app):
+            raise ValueError("Quarantined recovery evidence requires fresh-app process recovery.")
         return self
 
 
@@ -3403,6 +3426,13 @@ def _observed_state(
 ) -> BrowserAcceptanceState:
     if trial.status in {EvalStatus.ERROR, EvalStatus.UNAVAILABLE}:
         return BrowserAcceptanceState.UNAVAILABLE
+    if case.semantic_oracle is BrowserAcceptanceSemanticOracle.QUARANTINED_RECOVERY:
+        return (
+            BrowserAcceptanceState.AMBIGUOUS
+            if _semantic_state(case, diagnostic, public_operations=public_operations)
+            is BrowserAcceptanceSemanticState.PASSED
+            else BrowserAcceptanceState.UNAVAILABLE
+        )
     if case.semantic_oracle is BrowserAcceptanceSemanticOracle.PUBLIC_SCHEMA_UNSUPPORTED:
         return _public_schema_state(case, public_operations)
     errors = tuple(
@@ -3430,6 +3460,27 @@ def _semantic_state(
         return BrowserAcceptanceSemanticState.NOT_APPLICABLE
     if diagnostic.state is not BrowserAcceptanceDiagnosticState.CAPTURED:
         return BrowserAcceptanceSemanticState.UNAVAILABLE
+    if case.semantic_oracle is BrowserAcceptanceSemanticOracle.QUARANTINED_RECOVERY:
+        # Quarantine is an independent safety outcome. Its private invocation
+        # request must not be synthesized into ordinary public tool evidence.
+        fault = diagnostic.fault
+        parameters = case.oracle_parameters
+        return (
+            BrowserAcceptanceSemanticState.PASSED
+            if fault is not None
+            and fault.scenario is case.fault_scenario
+            and fault.boundary_observed
+            and fault.process_loss_observed
+            and fault.recovered_in_fresh_app
+            and fault.quarantined_tool_calls == parameters.get("quarantined_tool_calls") == 1
+            and fault.browser_dispatches == diagnostic.browser_dispatches
+            and diagnostic.browser_dispatches == parameters.get("expected_browser_dispatches")
+            and diagnostic.fixture_route_observed is True
+            and diagnostic.fixture_route_request_count is not None
+            and diagnostic.fixture_route_request_count > 0
+            and diagnostic.fixture_effects == parameters.get("expected_effects")
+            else BrowserAcceptanceSemanticState.FAILED
+        )
     for operation in diagnostic.operations:
         if operation.state is BrowserAcceptanceOperationState.OPERATION_NOT_DISPATCHED:
             if operation.error_category is None:

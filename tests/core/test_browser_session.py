@@ -88,8 +88,8 @@ _IDENTITY = BrowserBackendIdentity(
     backend_version="1.62.0",
     browser="chromium",
     browser_version="test-chromium",
-    worker_protocol="cayu.browser-session.v3",
-    worker_version="7",
+    worker_protocol="cayu.browser-session.v4",
+    worker_version="8",
 )
 
 
@@ -797,8 +797,8 @@ class _WireRunner:
         return ExecResult(
             stdout=json.dumps(
                 {
-                    "protocol_version": "cayu.browser-session.v3",
-                    "worker_version": "7",
+                    "protocol_version": "cayu.browser-session.v4",
+                    "worker_version": "8",
                     "playwright_version": "1.62.0",
                     "kind": "success",
                     "allocation_disposition": "live",
@@ -821,8 +821,8 @@ class _WireRunner:
                             "backend_version": "1.62.0",
                             "browser": "chromium",
                             "browser_version": "test-chromium",
-                            "worker_protocol": "cayu.browser-session.v3",
-                            "worker_version": "7",
+                            "worker_protocol": "cayu.browser-session.v4",
+                            "worker_version": "8",
                         },
                     },
                     "page_set": {
@@ -902,8 +902,8 @@ class _ProfileWireRunner(_WireRunner):
                 return ExecResult(
                     stdout=json.dumps(
                         {
-                            "protocol_version": "cayu.browser-session.v3",
-                            "worker_version": "7",
+                            "protocol_version": "cayu.browser-session.v4",
+                            "worker_version": "8",
                             "playwright_version": "1.62.0",
                             "kind": "error",
                             "allocation_disposition": "retired",
@@ -914,8 +914,8 @@ class _ProfileWireRunner(_WireRunner):
             return ExecResult(
                 stdout=json.dumps(
                     {
-                        "protocol_version": "cayu.browser-session.v3",
-                        "worker_version": "7",
+                        "protocol_version": "cayu.browser-session.v4",
+                        "worker_version": "8",
                         "playwright_version": "1.62.0",
                         "kind": "profile_restore",
                         "allocation_disposition": "live",
@@ -927,8 +927,8 @@ class _ProfileWireRunner(_WireRunner):
             return ExecResult(
                 stdout=json.dumps(
                     {
-                        "protocol_version": "cayu.browser-session.v3",
-                        "worker_version": "7",
+                        "protocol_version": "cayu.browser-session.v4",
+                        "worker_version": "8",
                         "playwright_version": "1.62.0",
                         "kind": "profile_checkpoint",
                         "allocation_disposition": "live",
@@ -940,8 +940,8 @@ class _ProfileWireRunner(_WireRunner):
             return ExecResult(
                 stdout=json.dumps(
                     {
-                        "protocol_version": "cayu.browser-session.v3",
-                        "worker_version": "7",
+                        "protocol_version": "cayu.browser-session.v4",
+                        "worker_version": "8",
                         "playwright_version": "1.62.0",
                         "kind": "closed",
                         "allocation_disposition": "retired",
@@ -1128,8 +1128,8 @@ def _browser_profile_binding(
             sharing_scope="agent-release-one",
         ),
         destination_policy=BrowserProfileDestinationPolicy.build(("https://example.test",)),
-        browser_protocol="cayu.browser-session.v3",
-        browser_worker_version="7",
+        browser_protocol="cayu.browser-session.v4",
+        browser_worker_version="8",
         store=store,
         key_authority=AESGCMBrowserProfileKeyAuthority(
             authority_id="browser-profile-test-key",
@@ -1179,6 +1179,7 @@ def _durable_context(
     fail_before_state: str | None = None,
     fail_after_state: str | None = None,
     secret_redactor: SecretRedactor | None = None,
+    secret_tracker: Any | None = None,
 ) -> ToolContext:
     ctx = _context(tmp_path).model_copy(
         update={
@@ -1186,6 +1187,10 @@ def _durable_context(
             "runner": runner,
         }
     )
+    if secret_tracker is not None:
+        ctx = ctx.model_copy(
+            update={"invocation_secret_snapshot_provider": secret_tracker.snapshot}
+        )
 
     async def load(key: str) -> dict[str, Any] | None:
         record = records.get(key)
@@ -1235,7 +1240,9 @@ def _durable_context(
         load_durable_operation=load,
         compare_and_set_durable_operation=compare_and_set,
         seal_durable_output=seal_durable_output,
-        secret_publication_sealer=lambda: None,
+        secret_publication_sealer=(
+            secret_tracker.seal_for_publication if secret_tracker is not None else lambda: None
+        ),
     )
     return ctx
 
@@ -1442,8 +1449,9 @@ async def _configure_interactive_daemon_for_test(
 
 def _interactive_raw_request(operation: str) -> dict[str, Any]:
     raw: dict[str, Any] = {
-        "protocol_version": "cayu.browser-session.v3",
-        "worker_version": "7",
+        "visual_policy": None,
+        "protocol_version": "cayu.browser-session.v4",
+        "worker_version": "8",
         "expected_playwright_version": "1.62.0",
         "operation": operation,
         "session_id": "bs_test",
@@ -2100,6 +2108,29 @@ def test_browser_session_schema_is_closed_and_has_no_browser_escape_hatches() ->
     assert schema["allOf"] == [
         {
             "if": {
+                "properties": {
+                    "operation": {"enum": ["click_visual_target", "click_visual_point"]}
+                },
+                "required": ["operation"],
+            },
+            "then": {"required": ["visual_revision"]},
+        },
+        {
+            "if": {
+                "properties": {"operation": {"const": "click_visual_target"}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["visual_ref"]},
+        },
+        {
+            "if": {
+                "properties": {"operation": {"const": "click_visual_point"}},
+                "required": ["operation"],
+            },
+            "then": {"required": ["screenshot_sha256", "x", "y"]},
+        },
+        {
+            "if": {
                 "properties": {"operation": {"const": "navigate"}},
                 "required": ["operation"],
             },
@@ -2107,7 +2138,7 @@ def test_browser_session_schema_is_closed_and_has_no_browser_escape_hatches() ->
         },
         {
             "if": {
-                "properties": {"operation": {"const": "observe"}},
+                "properties": {"operation": {"enum": ["observe", "observe_visual"]}},
                 "required": ["operation"],
             },
             "then": {"required": ["session_id", "page_id"]},
@@ -2118,6 +2149,8 @@ def test_browser_session_schema_is_closed_and_has_no_browser_escape_hatches() ->
                     "operation": {
                         "enum": [
                             "click",
+                            "click_visual_target",
+                            "click_visual_point",
                             "fill",
                             "select",
                             "press",
@@ -3018,6 +3051,8 @@ def test_browser_profile_restore_replays_after_process_loss_before_receipt(
 
 
 def test_browser_profile_rejects_binary_capture_before_runner_dispatch(tmp_path: Path) -> None:
+    from cayu.tools.browser_visual import BrowserVisualPolicy
+
     async def scenario() -> None:
         store = InMemoryBrowserProfileStore(store_id="browser-session-profile-store")
         binding = _browser_profile_binding(store)
@@ -3026,6 +3061,12 @@ def test_browser_profile_rejects_binary_capture_before_runner_dispatch(tmp_path:
         tool = BrowserSessionTool(
             expected_runner_candidate="wire-browser",
             browser_profile=binding,
+            visual_policy=BrowserVisualPolicy(
+                artifact_store_id="browser-artifacts",
+                allowed_origins=("https://example.test",),
+                retention="application_managed",
+                publish_to_model=True,
+            ),
             max_sessions=1,
             max_wait_ms=1_000,
             idle_timeout_seconds=60,
@@ -3034,6 +3075,7 @@ def test_browser_profile_rejects_binary_capture_before_runner_dispatch(tmp_path:
         for operation, fields in (
             ("screenshot", {"full_page": False}),
             ("download", {"ref": "ref_download"}),
+            ("observe_visual", {}),
         ):
             args = {
                 "operation": operation,
@@ -3044,6 +3086,9 @@ def test_browser_profile_rejects_binary_capture_before_runner_dispatch(tmp_path:
                 "operation_id": f"profile-{operation}-denied",
                 **fields,
             }
+            if operation == "observe_visual":
+                args.pop("expected_revision")
+                args.pop("expected_control_epoch")
             result = await tool.run(
                 _durable_context(
                     tmp_path,
@@ -3190,8 +3235,11 @@ def test_profile_guest_response_protects_page_evidence(
                 ],
             }
 
-    async def observation(state, limits, *, browser_version):
+    async def observation(
+        state, limits, *, browser_version, visual_policy=None, visual_artifacts=None
+    ):
         del limits, browser_version
+        assert visual_policy is None and visual_artifacts is None
         if operation == "error":
             raise _browser_guest._GuestFailure("fetch_failed")
         state.revision = "br_observed"
@@ -3219,8 +3267,8 @@ def test_profile_guest_response_protects_page_evidence(
                 "backend_version": "1.62.0",
                 "browser": "chromium",
                 "browser_version": "test-chromium",
-                "worker_protocol": "cayu.browser-session.v3",
-                "worker_version": "7",
+                "worker_protocol": "cayu.browser-session.v4",
+                "worker_version": "8",
             },
         }
 
@@ -4018,9 +4066,13 @@ def test_browser_session_rejects_mismatched_backend_identity(tmp_path: Path) -> 
     assert result.structured["error"] == "incompatible_browser"
 
 
+@pytest.mark.parametrize("operation", ["screenshot", "observe_visual"])
 def test_browser_session_refuses_binary_artifacts_from_secret_bearing_runner(
     tmp_path: Path,
+    operation: str,
 ) -> None:
+    from cayu import BrowserVisualPolicy
+
     class _SecretBearingRunner(_WireRunner):
         calls = 0
 
@@ -4034,7 +4086,15 @@ def test_browser_session_refuses_binary_artifacts_from_secret_bearing_runner(
     async def scenario() -> None:
         runner = _SecretBearingRunner()
         ctx = _context(tmp_path).model_copy(update={"runner": runner})
-        tool = BrowserSessionTool(expected_runner_candidate="wire-browser")
+        tool = BrowserSessionTool(
+            expected_runner_candidate="wire-browser",
+            visual_policy=BrowserVisualPolicy(
+                artifact_store_id=ctx.artifact_store.id,
+                allowed_origins=("https://example.test",),
+                retention="application_managed",
+                publish_to_model=True,
+            ),
+        )
         opened = await tool.run(
             ctx,
             {
@@ -4046,11 +4106,17 @@ def test_browser_session_refuses_binary_artifacts_from_secret_bearing_runner(
         result = await tool.run(
             ctx,
             {
-                "operation": "screenshot",
+                "operation": operation,
                 "session_id": opened.structured["session_id"],
                 "page_id": opened.structured["page_id"],
-                "expected_revision": opened.structured["revision"],
-                "expected_control_epoch": opened.structured["control_epoch"],
+                **(
+                    {
+                        "expected_revision": opened.structured["revision"],
+                        "expected_control_epoch": opened.structured["control_epoch"],
+                    }
+                    if operation == "screenshot"
+                    else {}
+                ),
                 "operation_id": "screenshot-secret-runner",
             },
         )
@@ -5340,9 +5406,13 @@ def test_browser_session_escapes_the_complete_untrusted_browser_block(tmp_path: 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("operation", ["screenshot", "observe_visual"])
 def test_browser_session_refuses_artifacts_when_secret_authority_appears_during_dispatch(
     tmp_path: Path,
+    operation: str,
 ) -> None:
+    from cayu import BrowserVisualPolicy
+
     class _Tracker:
         revision = 0
         redactor = SecretRedactor()
@@ -5361,7 +5431,7 @@ def test_browser_session_refuses_artifacts_when_secret_authority_appears_during_
             request: dict[str, Any],
         ) -> BrowserBackendResponse:
             response = await super().execute(ctx, request)
-            if request["operation"] in {"screenshot", "download"}:
+            if request["operation"] in {"screenshot", "download", "observe_visual"}:
                 tracker.resolve_secret()
             return response
 
@@ -5372,6 +5442,12 @@ def test_browser_session_refuses_artifacts_when_secret_authority_appears_during_
         tool = _tool(backend)
         ctx = _context(tmp_path).model_copy(
             update={"invocation_secret_snapshot_provider": tracker.snapshot}
+        )
+        tool.visual_policy = BrowserVisualPolicy(
+            artifact_store_id=ctx.artifact_store.id,
+            allowed_origins=("https://example.test",),
+            retention="application_managed",
+            publish_to_model=True,
         )
         opened = await tool.run(
             ctx,
@@ -5385,11 +5461,17 @@ def test_browser_session_refuses_artifacts_when_secret_authority_appears_during_
         result = await tool.run(
             ctx,
             {
-                "operation": "screenshot",
+                "operation": operation,
                 "session_id": opened.structured["session_id"],
                 "page_id": opened.structured["page_id"],
-                "expected_revision": opened.structured["revision"],
-                "expected_control_epoch": opened.structured["control_epoch"],
+                **(
+                    {
+                        "expected_revision": opened.structured["revision"],
+                        "expected_control_epoch": opened.structured["control_epoch"],
+                    }
+                    if operation == "screenshot"
+                    else {}
+                ),
                 "operation_id": "screenshot-secret",
             },
         )
@@ -5788,8 +5870,8 @@ def test_interactive_guest_operation_ledger_deduplicates_without_replay() -> Non
         async def _execute_locked(self, request):
             self.calls += 1
             return {
-                "protocol_version": "cayu.browser-session.v3",
-                "worker_version": "7",
+                "protocol_version": "cayu.browser-session.v4",
+                "worker_version": "8",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"call": self.calls, "operation": request.operation},
@@ -5914,8 +5996,8 @@ def test_interactive_guest_admits_switches_closes_and_tracks_popup_lineage() -> 
                     "backend_version": "1.62.0",
                     "browser": "chromium",
                     "browser_version": "test-chromium",
-                    "worker_protocol": "cayu.browser-session.v3",
-                    "worker_version": "7",
+                    "worker_protocol": "cayu.browser-session.v4",
+                    "worker_version": "8",
                 },
             }
 
@@ -6781,8 +6863,8 @@ def test_interactive_guest_operation_ledger_reserves_cleanup_capacity() -> None:
     class _LedgerDaemon(_browser_guest._InteractiveDaemon):
         async def _execute_locked(self, request):
             return {
-                "protocol_version": "cayu.browser-session.v3",
-                "worker_version": "7",
+                "protocol_version": "cayu.browser-session.v4",
+                "worker_version": "8",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"operation": request.operation},
@@ -7632,8 +7714,10 @@ def test_interactive_guest_ref_limits_independently_retire_allocation(
         limits: Any,
         *,
         browser_version: str,
+        visual_policy: Any = None,
+        visual_artifacts: Any = None,
     ) -> dict[str, Any]:
-        del limits, browser_version
+        del limits, browser_version, visual_policy, visual_artifacts
         state.revision = "br_rejected_second_observation"
         state.last_observation_revision = state.revision
         state.refs = {"opaque_ref": "aria-ref=private"}
@@ -7657,8 +7741,8 @@ def test_interactive_guest_ref_limits_independently_retire_allocation(
                 "backend_version": "1.62.0",
                 "browser": "chromium",
                 "browser_version": "test-chromium",
-                "worker_protocol": "cayu.browser-session.v3",
-                "worker_version": "7",
+                "worker_protocol": "cayu.browser-session.v4",
+                "worker_version": "8",
             },
         }
 
@@ -7947,8 +8031,8 @@ def test_interactive_guest_popup_guard_bounds_one_effect_before_target_admission
                     "backend_version": "1.62.0",
                     "browser": "chromium",
                     "browser_version": "test-chromium",
-                    "worker_protocol": "cayu.browser-session.v3",
-                    "worker_version": "7",
+                    "worker_protocol": "cayu.browser-session.v4",
+                    "worker_version": "8",
                 },
             }
 

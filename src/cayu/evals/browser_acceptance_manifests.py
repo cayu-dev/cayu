@@ -722,9 +722,137 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                         "wait",
                     )
                 ),
-                _unsupported("visual-canvas-control", "visual_click"),
-                _unsupported("visual-inaccessible-control", "visual_click"),
-                _unsupported("visual-positioned-control", "visual_click"),
+                *(
+                    _case(
+                        case_id,
+                        category=BrowserAcceptanceCaseCategory.SUCCESS,
+                        operations=("navigate", "observe_visual", "click_visual_target"),
+                        route=route,
+                        oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                        parameters={
+                            "required_operations": [
+                                "navigate",
+                                "observe_visual",
+                                "click_visual_target",
+                            ],
+                            "expected_effects": {"visual-activated": 1},
+                        },
+                    )
+                    for case_id, route in (
+                        ("visual-canvas-control", "/visual-canvas"),
+                        ("visual-inaccessible-control", "/visual-image"),
+                        ("visual-positioned-control", "/visual-positioned-canvas"),
+                        ("visual-hostile-pixels-labels", "/visual-hostile"),
+                        ("visual-popup-outcome", "/visual-popup"),
+                    )
+                ),
+                _case(
+                    "visual-semantic-preference",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "click"),
+                    route="/visual-semantic",
+                    oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                    parameters={
+                        "required_operations": ["navigate", "click"],
+                        "expected_effects": {"visual-activated": 1},
+                    },
+                ),
+                _case(
+                    "visual-opaque-host-refusal",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.REFUSED,
+                    operations=("navigate", "observe_visual", "click_visual_target"),
+                    route="/visual-positioned",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={"error": "unsupported_visual_surface"},
+                ),
+                _case(
+                    "visual-stale-screenshot",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.REFUSED,
+                    operations=("navigate", "observe_visual", "wait", "click_visual_target"),
+                    route="/visual-canvas",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={"error": "stale_observation"},
+                ),
+                _case(
+                    "visual-secret-refusal",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.REFUSED,
+                    operations=("navigate", "observe_visual"),
+                    route="/visual-canvas",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={"error": "policy_denied", "expected_browser_dispatches": 1},
+                    fault_scenario=BrowserAcceptanceFaultScenario.SECRET_BEFORE_CAPTURE,
+                ),
+                *(
+                    _case(
+                        case_id,
+                        category=BrowserAcceptanceCaseCategory.RECOVERY,
+                        operations=("navigate", "observe_visual", "click_visual_target"),
+                        route="/visual-popup",
+                        oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                        parameters={
+                            "required_operations": [
+                                "navigate",
+                                "observe_visual",
+                                "click_visual_target",
+                            ],
+                            "expected_effects": {"visual-activated": 1},
+                            "expected_browser_dispatches": 3,
+                        },
+                        fault_scenario=fault,
+                    )
+                    for case_id, fault in (
+                        (
+                            "visual-terminal-acknowledgement-loss",
+                            BrowserAcceptanceFaultScenario.ACKNOWLEDGEMENT_LOSS,
+                        ),
+                    )
+                ),
+                _case(
+                    "visual-process-terminal-replay",
+                    category=BrowserAcceptanceCaseCategory.RECOVERY,
+                    state=BrowserAcceptanceState.AMBIGUOUS,
+                    operations=("navigate", "observe_visual", "click_visual_target"),
+                    route="/visual-popup",
+                    oracle=BrowserAcceptanceSemanticOracle.QUARANTINED_RECOVERY,
+                    parameters={
+                        "quarantined_tool_calls": 1,
+                        "expected_browser_dispatches": 3,
+                        "expected_effects": {"visual-activated": 1},
+                    },
+                    fault_scenario=BrowserAcceptanceFaultScenario.PROCESS_AFTER_TERMINAL,
+                ),
+                *(
+                    _case(
+                        case_id,
+                        category=BrowserAcceptanceCaseCategory.REFUSAL,
+                        state=BrowserAcceptanceState.REFUSED,
+                        operations=("navigate", "observe_visual", "click_visual_target"),
+                        route=route,
+                        oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                        parameters={"error": error},
+                    )
+                    for case_id, route, error in (
+                        ("visual-virtualized-movement", "/visual-moved", "visual_evidence_expired"),
+                        ("visual-sticky-overlay", "/visual-overlay", "visual_evidence_expired"),
+                        (
+                            "visual-viewport-scroll-change",
+                            "/visual-scroll",
+                            "visual_viewport_mismatch",
+                        ),
+                    )
+                ),
+                _case(
+                    "visual-cross-origin-frame",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.REFUSED,
+                    operations=("navigate", "observe_visual"),
+                    route="/cross-origin-frame",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={"error": "unsupported_visual_surface"},
+                ),
             ),
             key=lambda item: item.case_id,
         )

@@ -1,10 +1,41 @@
 # Sandboxed browser inspection image
 
+## Live visual acceptance
+
+`visual_live.py` runs a real Gemini agent against real Docker/Chromium and a
+local fictional headphone comparison. The model follows an accessible link,
+then reads canvas-only product details from `observe_visual`, selects one opaque
+visual target, and verifies the result. Only the admitted fixture destination
+is routed; there are no accounts, purchases, or third-party shopping requests.
+
+With the pinned browser image installed, run from the repository root:
+
+```bash
+# Supply GEMINI_API_KEY through the environment; do not commit it or trace the shell.
+PYTHONPATH=src python examples/browser_fetch/visual_live.py \
+  --model gemini-2.5-flash --output /tmp/cayu-visual-live
+```
+
+This is opt-in and incurs provider charges. It has one session, at most twelve
+tool calls, three visual captures, forty thousand reported tokens and a
+five-minute runtime budget; it does not retry provider failures automatically.
+Rate limits may fail the run. Outputs contain screenshots, model content and
+runtime evidence; treat the selected directory as private and delete it when
+no longer needed. The API key is not written to the report.
+
+`report.json` separates actual outbound image delivery and visual tool use from
+the fixture oracle (exactly one `commute` selection), session completion and
+cleanup settlement. A final model assertion alone cannot pass acceptance.
+The reference local run on 2026-09-05 used Gemini 2.5 Flash: one visual capture,
+one correct visual selection, a completed session and settled cleanup. That is
+positive-flow evidence, not coverage of every visual guard or cancellation path;
+the opt-in tests under `tests/egress/test_browser_visual*` cover those separately.
+
 This image is the versioned guest half of `BrowserWebFetchAdapter`,
 `ScreenshotPageTool`, and the opt-in `BrowserSessionTool`. It contains
 Playwright 1.62.0, its matching Chromium build, NSS tooling for the per-session
 Cayu CA, the closed `cayu.browser-fetch.v4` one-shot protocol, and the closed
-`cayu.browser-session.v3` stateful protocol. The image runs as the
+`cayu.browser-session.v4` stateful protocol. The image runs as the
 non-root `pwuser`; the root-owned, read-only worker refuses root execution and
 launches Chromium with its browser sandbox enabled. Other commands running as
 the guest user cannot replace the versioned worker between invocations.
@@ -20,7 +51,7 @@ Build from the repository root:
 ```bash
 docker build \
   --file examples/browser_fetch/Dockerfile \
-  --tag cayu-browser-fetch:7-playwright-1.62.0 \
+  --tag cayu-browser-fetch:8-playwright-1.62.0 \
   .
 ```
 
@@ -68,7 +99,7 @@ Pass `policies={"product-docs": browser_policy}`,
 `approved_destinations=approved_destinations`, `credentials=[]`, an adapter
 constructed with
 `DockerEgressAdapter(seccomp_profile="/absolute/path/to/examples/browser_fetch/seccomp_profile.json")`,
-and `image="cayu-browser-fetch:7-playwright-1.62.0"` to
+and `image="cayu-browser-fetch:8-playwright-1.62.0"` to
 `VirtualEgressEnvironmentFactory`. Plain Docker proves the enforced networking
 path for trusted development and CI; it is not Cayu's untrusted-code isolation
 boundary. Applications that require a stronger boundary use the same adapter

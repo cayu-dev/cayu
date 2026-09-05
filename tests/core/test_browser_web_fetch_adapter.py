@@ -1775,6 +1775,38 @@ def test_guest_temporary_profile_helper_rejects_paths_outside_its_root(
     assert evidence.read_text(encoding="utf-8") == "retain"
 
 
+def test_guest_standalone_loads_only_its_shipped_visual_sibling(tmp_path: Path) -> None:
+    shipped = tmp_path / "shipped"
+    shipped.mkdir()
+    source = Path(guest.__file__).resolve()
+    worker = shipped / "worker.py"
+    shutil.copyfile(source, worker)
+    shutil.copyfile(
+        source.with_name("_browser_visual_guest.py"), shipped / "_browser_visual_guest.py"
+    )
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "_browser_visual_guest.py").write_text(
+        'raise RuntimeError("untrusted module imported")\n', encoding="utf-8"
+    )
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    evidence = protected / "evidence.txt"
+    evidence.write_text("retain", encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, "-I", str(worker), guest._PROFILE_CLEANUP_ARGUMENT, str(protected), "1.0"],
+        input=b"",
+        cwd=unrelated,
+        env={**os.environ, "PYTHONPATH": str(unrelated)},
+        capture_output=True,
+        check=False,
+        timeout=3,
+    )
+    assert completed.returncode == 2
+    assert completed.stdout == completed.stderr == b""
+    assert evidence.read_text(encoding="utf-8") == "retain"
+
+
 def test_guest_temporary_profile_helper_enforces_its_own_deadline() -> None:
     home = Path(
         guest.tempfile.mkdtemp(

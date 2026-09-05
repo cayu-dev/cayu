@@ -85,6 +85,7 @@ _SCREENSHOT_OPTION_NAMES = frozenset(
 )
 _INTERACTIVE_OPTION_NAMES = frozenset(
     {
+        "visual_policy",
         "max_snapshot_bytes",
         "max_dom_nodes",
         "max_refs",

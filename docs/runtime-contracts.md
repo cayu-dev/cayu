@@ -8755,7 +8755,7 @@ and benchmark evidence must preserve the blocked source separately from any
 configured replacement.
 
 The opt-in interactive sandboxed profile exposes one ordinary
-`browser_session` tool backed by `cayu.browser-session.v3` worker version 7 in
+`browser_session` tool backed by `cayu.browser-session.v4` worker version 8 in
 the same pinned Playwright/Chromium worker image. Cayu owns browser session and
 random opaque page identities; Chromium targets, contexts, handles, CDP
 sessions, and raw opener objects never cross the guest boundary.

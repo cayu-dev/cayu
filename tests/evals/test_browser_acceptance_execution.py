@@ -214,8 +214,8 @@ class _ProtocolBrowserRunner(Runner):
                 "backend_version": "1.62.0",
                 "browser": "chromium",
                 "browser_version": "acceptance-fixture",
-                "worker_protocol": "cayu.browser-session.v3",
-                "worker_version": "7",
+                "worker_protocol": "cayu.browser-session.v4",
+                "worker_version": "8",
             },
         }
 
@@ -237,8 +237,8 @@ class _ProtocolBrowserRunner(Runner):
             return ExecResult(
                 stdout=json.dumps(
                     {
-                        "protocol_version": "cayu.browser-session.v3",
-                        "worker_version": "7",
+                        "protocol_version": "cayu.browser-session.v4",
+                        "worker_version": "8",
                         "playwright_version": "1.62.0",
                         "kind": "profile_restore",
                         "allocation_disposition": "live",
@@ -256,8 +256,8 @@ class _ProtocolBrowserRunner(Runner):
             return ExecResult(
                 stdout=json.dumps(
                     {
-                        "protocol_version": "cayu.browser-session.v3",
-                        "worker_version": "7",
+                        "protocol_version": "cayu.browser-session.v4",
+                        "worker_version": "8",
                         "playwright_version": "1.62.0",
                         "kind": "profile_checkpoint",
                         "allocation_disposition": "live",
@@ -270,8 +270,8 @@ class _ProtocolBrowserRunner(Runner):
             return ExecResult(
                 stdout=json.dumps(
                     {
-                        "protocol_version": "cayu.browser-session.v3",
-                        "worker_version": "7",
+                        "protocol_version": "cayu.browser-session.v4",
+                        "worker_version": "8",
                         "playwright_version": "1.62.0",
                         "kind": "closed",
                         "allocation_disposition": "retired",
@@ -385,8 +385,8 @@ class _ProtocolBrowserRunner(Runner):
             return ExecResult(
                 stdout=json.dumps(
                     {
-                        "protocol_version": "cayu.browser-session.v3",
-                        "worker_version": "7",
+                        "protocol_version": "cayu.browser-session.v4",
+                        "worker_version": "8",
                         "playwright_version": "1.62.0",
                         "kind": "success",
                         "allocation_disposition": "retired",
@@ -514,8 +514,8 @@ class _ProtocolBrowserRunner(Runner):
             self._pages[request["page_id"]]["artifact_count"] += 1
         page_set = self._page_set()
         payload: dict[str, Any] = {
-            "protocol_version": "cayu.browser-session.v3",
-            "worker_version": "7",
+            "protocol_version": "cayu.browser-session.v4",
+            "worker_version": "8",
             "playwright_version": "1.62.0",
             "kind": "error" if failure is not None else "success",
             "allocation_disposition": "live",
@@ -675,8 +675,8 @@ def _run_browser_profile_acceptance_process(
                 destination_policy=BrowserProfileDestinationPolicy.build(
                     ("https://docs.browser.test",)
                 ),
-                browser_protocol="cayu.browser-session.v3",
-                browser_worker_version="7",
+                browser_protocol="cayu.browser-session.v4",
+                browser_worker_version="8",
                 store=profile_store,
                 key_authority=AESGCMBrowserProfileKeyAuthority(
                     authority_id="browser-acceptance-key-v1",
