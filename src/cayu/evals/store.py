@@ -456,6 +456,71 @@ class EvalRunFailureCode(StrEnum):
     WORKER_INTERRUPTED = "worker_interrupted"
 
 
+class EvalRunFailureReason(StrEnum):
+    """Closed causal vocabulary; values never come from exception messages."""
+
+    CORPUS_LOAD_FAILED = "corpus_load_failed"
+    CORPUS_MISSING = "corpus_missing"
+    TARGET_REGISTRATION_MISSING = "target_registration_missing"
+    TARGET_PREFLIGHT_FAILED = "target_preflight_failed"
+    EXECUTION_PROFILE_MISSING = "execution_profile_missing"
+    EXECUTION_PROFILE_CHANGED = "execution_profile_changed"
+    TARGET_IDENTITY_FAILED = "target_identity_failed"
+    TARGET_IDENTITY_CHANGED = "target_identity_changed"
+    CORPUS_COMPILATION_FAILED = "corpus_compilation_failed"
+    EXECUTION_FAILED = "execution_failed"
+    EXECUTION_PROFILE_REJECTED = "execution_profile_rejected"
+    PROVIDER_PROTOCOL_FAILED = "provider_protocol_failed"
+    EXECUTION_CANCELLED = "execution_cancelled"
+    RESULT_PUBLICATION_FAILED = "result_publication_failed"
+
+
+class EvalRunFailureDiagnostic(_EvalStoreModel):
+    """Safe causal evidence bound to the containing run and fenced terminal claim."""
+
+    reason: EvalRunFailureReason
+    provider_protocol_reason: StrictStr | None = Field(default=None, max_length=128)
+
+    @field_validator("provider_protocol_reason")
+    @classmethod
+    def validate_protocol_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        from cayu.providers._openai_protocol import protocol_diagnostic_fields
+
+        if protocol_diagnostic_fields(value)["provider_protocol_reason"] != value:
+            raise ValueError("Unknown provider protocol diagnostic reason.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_protocol_failure(self) -> EvalRunFailureDiagnostic:
+        if self.provider_protocol_reason is not None and (
+            self.reason is not EvalRunFailureReason.PROVIDER_PROTOCOL_FAILED
+        ):
+            raise ValueError("Provider protocol evidence requires a protocol failure.")
+        return self
+
+    @property
+    def phase(self) -> str:
+        if self.reason in {
+            EvalRunFailureReason.CORPUS_LOAD_FAILED,
+            EvalRunFailureReason.CORPUS_MISSING,
+        }:
+            return "corpus_load"
+        if self.reason is EvalRunFailureReason.CORPUS_COMPILATION_FAILED:
+            return "corpus_compilation"
+        if self.reason is EvalRunFailureReason.RESULT_PUBLICATION_FAILED:
+            return "result_publication"
+        if self.reason in {
+            EvalRunFailureReason.EXECUTION_FAILED,
+            EvalRunFailureReason.EXECUTION_PROFILE_REJECTED,
+            EvalRunFailureReason.PROVIDER_PROTOCOL_FAILED,
+            EvalRunFailureReason.EXECUTION_CANCELLED,
+        }:
+            return "execution"
+        return "target_preflight"
+
+
 class EvalCatalogQuery(_EvalStoreModel):
     target_key: StrictStr | None = None
     cursor: StrictStr | None = None
@@ -2025,6 +2090,7 @@ class EvalRunRecord(_EvalStoreModel):
     ownership: EvalRunOwnership | None = None
     result: EvalRunResultSummary | None = None
     failure_code: EvalRunFailureCode | None = None
+    failure_diagnostic: EvalRunFailureDiagnostic | None = None
     scenario_progress: EvalScenarioRunProgress | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -2088,6 +2154,8 @@ class EvalRunRecord(_EvalStoreModel):
                 raise ValueError("Failed eval runs require a safe failure code.")
         elif self.failure_code is not None:
             raise ValueError("Only failed eval runs may carry a failure code.")
+        if self.failure_diagnostic is not None and self.status is not EvalRunStatus.FAILED:
+            raise ValueError("Only failed eval runs may carry causal diagnostics.")
         scenario = self.spec.invocation.scenario
         if scenario is None:
             if self.scenario_progress is not None:
@@ -3327,6 +3395,8 @@ class EvalStore(ABC):
         self,
         claim: EvalRunClaim,
         code: EvalRunFailureCode,
+        *,
+        diagnostic: EvalRunFailureDiagnostic | None = None,
     ) -> EvalRunRecord:
         """Terminalize owned work with a closed, credential-free diagnostic."""
 
@@ -3427,6 +3497,7 @@ class _MemoryRunState:
     lease_expires_at: datetime | None = None
     result: CorpusExecutionResult | None = None
     failure_code: EvalRunFailureCode | None = None
+    failure_diagnostic: EvalRunFailureDiagnostic | None = None
     scenario_progress: EvalScenarioRunProgress | None = None
     trial_checkpoints: dict[tuple[str, int], EvalRunTrialCheckpoint] = field(default_factory=dict)
     trial_checkpoint_bytes: int = 0
@@ -4330,14 +4401,22 @@ class InMemoryEvalStore(EvalStore):
         self,
         claim: EvalRunClaim,
         code: EvalRunFailureCode,
+        *,
+        diagnostic: EvalRunFailureDiagnostic | None = None,
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
         if not isinstance(code, EvalRunFailureCode):
             raise TypeError("code must be an EvalRunFailureCode.")
+        if diagnostic is not None:
+            diagnostic = _exact_model(diagnostic, EvalRunFailureDiagnostic, "diagnostic")
         async with self._lock:
             state = self._require_run(claim.run_id)
             if state.status is EvalRunStatus.FAILED:
-                if self._historical_claim_matches(state, claim) and state.failure_code is code:
+                if (
+                    self._historical_claim_matches(state, claim)
+                    and state.failure_code is code
+                    and state.failure_diagnostic == diagnostic
+                ):
                     return self._record(state)
                 raise EvalRunStateConflict("Eval run already failed with another outcome.")
             state = self._require_live_claim(claim)
@@ -4346,6 +4425,7 @@ class InMemoryEvalStore(EvalStore):
             now = self._now()
             state.status = EvalRunStatus.FAILED
             state.failure_code = code
+            state.failure_diagnostic = diagnostic
             state.trial_checkpoints.clear()
             state.trial_checkpoint_bytes = 0
             state.updated_at = now
@@ -4657,6 +4737,7 @@ class InMemoryEvalStore(EvalStore):
             ownership=ownership,
             result=None if state.result is None else result_summary(state.result),
             failure_code=state.failure_code,
+            failure_diagnostic=state.failure_diagnostic,
             scenario_progress=(
                 None
                 if state.scenario_progress is None

@@ -428,6 +428,8 @@ REVISIONS: tuple[Revision, ...] = (
     # canonical priority projection. Every session/event writer must maintain
     # that projection, so pre-79 workers cannot safely share the database.
     Revision(revision=79, kind=RevisionKind.BREAKING, compatible_from=79),
+    # Optional closed eval failure diagnostics; historical failures remain valid.
+    Revision(revision=80, kind=RevisionKind.ADDITIVE, compatible_from=79),
 )
 
 #: The revision an empty database is initialized to.

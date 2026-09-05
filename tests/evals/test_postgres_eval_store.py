@@ -294,7 +294,7 @@ def test_postgres_eval_store_requires_and_migrates_revision_seventy_four(
 
         validating = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(SchemaTooOld, match="requires >= 74"):
+            with pytest.raises(SchemaTooOld, match="requires >= 80"):
                 await validating.list_corpora()
         finally:
             await validating.close()

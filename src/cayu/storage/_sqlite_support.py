@@ -4073,6 +4073,7 @@ _MIGRATION_STEPS: dict[int, str] = {
             )
         );
     """,
+    80: "ALTER TABLE cayu_eval_runs ADD COLUMN failure_diagnostic_json TEXT;",
     79: """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
             child_session_id TEXT COLLATE BINARY PRIMARY KEY

@@ -68,6 +68,7 @@ from cayu.evals.store import (
     EvalRunClaim,
     EvalRunClaimLost,
     EvalRunFailureCode,
+    EvalRunFailureDiagnostic,
     EvalRunLease,
     EvalRunObservation,
     EvalRunOwnership,
@@ -147,7 +148,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 74
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 80
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,8 @@ _RUN_COLUMNS = """
     trial_checkpoint_count,
     trial_checkpoint_bytes,
     authored_suite_launch_revision,
-    authored_suite_launch_lane
+    authored_suite_launch_lane,
+    failure_diagnostic_json
 """
 
 _RUN_OBSERVATION_COLUMNS = """
@@ -367,6 +369,11 @@ def _run_record_from_row(row: sqlite3.Row) -> EvalRunRecord:
         cancel_requested_at=_parse_optional_datetime(row["cancel_requested_at"]),
         ownership=ownership,
         result=result,
+        failure_diagnostic=(
+            None
+            if row["failure_diagnostic_json"] is None
+            else EvalRunFailureDiagnostic.model_validate_json(row["failure_diagnostic_json"])
+        ),
         failure_code=(
             None if row["failure_code"] is None else EvalRunFailureCode(row["failure_code"])
         ),
@@ -2346,15 +2353,20 @@ class SQLiteEvalStore(EvalStore):
         self,
         claim: EvalRunClaim,
         code: EvalRunFailureCode,
+        *,
+        diagnostic: EvalRunFailureDiagnostic | None = None,
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
         if not isinstance(code, EvalRunFailureCode):
             raise TypeError("code must be an EvalRunFailureCode.")
+        if diagnostic is not None:
+            diagnostic = _exact_model(diagnostic, EvalRunFailureDiagnostic, "diagnostic")
         return await self._terminalize_without_result(
             claim,
             required_status=EvalRunStatus.RUNNING,
             terminal_status=EvalRunStatus.FAILED,
             failure_code=code,
+            diagnostic=diagnostic,
         )
 
     async def finish_cancel(self, claim: EvalRunClaim) -> EvalRunRecord:
@@ -2744,6 +2756,7 @@ class SQLiteEvalStore(EvalStore):
         required_status: EvalRunStatus,
         terminal_status: EvalRunStatus,
         failure_code: EvalRunFailureCode | None,
+        diagnostic: EvalRunFailureDiagnostic | None = None,
     ) -> EvalRunRecord:
 
         def operation(connection: sqlite3.Connection) -> EvalRunRecord:
@@ -2758,7 +2771,11 @@ class SQLiteEvalStore(EvalStore):
                         if row["failure_code"] is None
                         else EvalRunFailureCode(row["failure_code"])
                     )
-                    if self._claim_matches(row, claim) and stored_code is failure_code:
+                    if (
+                        self._claim_matches(row, claim)
+                        and stored_code is failure_code
+                        and _run_record_from_row(row).failure_diagnostic == diagnostic
+                    ):
                         connection.commit()
                         return _run_record_from_row(row)
                     raise EvalRunStateConflict("Eval run already has another terminal outcome.")
@@ -2775,7 +2792,7 @@ class SQLiteEvalStore(EvalStore):
                     UPDATE cayu_eval_runs
                     SET status = ?, updated_at = ?, finished_at = ?,
                         cancel_requested_at = ?, lease_expires_at = NULL, failure_code = ?,
-                        trial_checkpoint_count = 0, trial_checkpoint_bytes = 0
+                        trial_checkpoint_count = 0, trial_checkpoint_bytes = 0, failure_diagnostic_json = ?
                     WHERE run_id = ?
                     """,
                     (
@@ -2784,6 +2801,7 @@ class SQLiteEvalStore(EvalStore):
                         _format_datetime(now),
                         cancel_requested_at,
                         None if failure_code is None else str(failure_code),
+                        None if diagnostic is None else diagnostic.model_dump_json(),
                         claim.run_id,
                     ),
                 )

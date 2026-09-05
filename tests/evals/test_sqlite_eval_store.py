@@ -868,7 +868,7 @@ def test_sqlite_eval_store_requires_current_schema(
         schema_migrations.REVISIONS = revisions
         connection.close()
 
-    with pytest.raises(SchemaTooOld, match="requires >= 74"):
+    with pytest.raises(SchemaTooOld, match="requires >= 80"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
 
@@ -962,7 +962,7 @@ def test_sqlite_eval_store_requires_and_migrates_revision_seventy_four(
         finally:
             connection.close()
 
-        with pytest.raises(SchemaTooOld, match="requires >= 74"):
+        with pytest.raises(SchemaTooOld, match="requires >= 80"):
             SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
         migrated = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)

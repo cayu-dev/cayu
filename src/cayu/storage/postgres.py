@@ -2999,6 +2999,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    80: ("ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS failure_diagnostic_json TEXT",),
     79: (
         """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (

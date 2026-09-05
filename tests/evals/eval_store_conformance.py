@@ -56,6 +56,8 @@ from cayu.evals.store import (
     EvalRunClaimLost,
     EvalRunCostBudget,
     EvalRunFailureCode,
+    EvalRunFailureDiagnostic,
+    EvalRunFailureReason,
     EvalRunInvocation,
     EvalRunQuery,
     EvalRunRequest,
@@ -1181,9 +1183,33 @@ async def assert_eval_store_conformance(
     assert await store.load_trial_checkpoints(failure_claim) == (checkpoint,)
     with pytest.raises(EvalRunClaimLost):
         await store.load_trial_checkpoints(stale_failure_claim)
-    failed = await store.fail_run(failure_claim, EvalRunFailureCode.EXECUTION_FAILED)
+    diagnostic = EvalRunFailureDiagnostic(reason=EvalRunFailureReason.EXECUTION_FAILED)
+    with pytest.raises(EvalRunClaimLost):
+        await store.fail_run(
+            stale_failure_claim, EvalRunFailureCode.EXECUTION_FAILED, diagnostic=diagnostic
+        )
+    failed = await store.fail_run(
+        failure_claim, EvalRunFailureCode.EXECUTION_FAILED, diagnostic=diagnostic
+    )
     assert failed.status is EvalRunStatus.FAILED
-    assert await store.fail_run(failure_claim, EvalRunFailureCode.EXECUTION_FAILED) == failed
+    assert failed.failure_diagnostic == diagnostic
+    assert (
+        await store.fail_run(
+            failure_claim, EvalRunFailureCode.EXECUTION_FAILED, diagnostic=diagnostic
+        )
+        == failed
+    )
+    with pytest.raises(EvalRunStateConflict):
+        await store.fail_run(
+            failure_claim,
+            EvalRunFailureCode.EXECUTION_FAILED,
+            diagnostic=EvalRunFailureDiagnostic(
+                reason=EvalRunFailureReason.RESULT_PUBLICATION_FAILED
+            ),
+        )
+    with pytest.raises(EvalRunStateConflict):
+        await store.fail_run(failure_claim, EvalRunFailureCode.EXECUTION_FAILED)
+    assert await store.load_run(failure_claim.run_id) == failed
 
     terminal = await store.list_runs(EvalRunQuery(limit=3))
     assert {item.status for item in terminal.items} == {

@@ -2942,3 +2942,127 @@ def test_shutdown_grace_bounds_a_stalled_durable_release(tmp_path, monkeypatch) 
             await store.close()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("boundary", "reason"),
+    [
+        ("load", "corpus_load_failed"),
+        ("missing", "corpus_missing"),
+        ("preflight", "target_preflight_failed"),
+        ("compile", "corpus_compilation_failed"),
+        ("execute", "execution_failed"),
+        ("protocol", "provider_protocol_failed"),
+    ],
+)
+def test_worker_persists_safe_causal_failure_across_restart(
+    tmp_path, monkeypatch, caplog, boundary, reason
+):
+    from cayu.providers.openai import OpenAIProtocolError
+
+    provider = _provider(trials=1)
+    target = _target(provider)
+    corpus = _corpus(trials=1)
+    database = tmp_path / "causal.db"
+    store = SQLiteEvalStore(database)
+    secret = "credential-secret-/private/provider-response"
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    async def async_fail(*args, **kwargs):
+        fail()
+
+    async def missing(*args, **kwargs):
+        return None
+
+    async def protocol_fail(*args, **kwargs):
+        raise OpenAIProtocolError(secret, reason_code="web_search_action_type_is_unsupported")
+
+    async def exercise():
+        request = EvalRunRequest(
+            run_id="eval-causal-failure",
+            idempotency_key="sha256:" + "9" * 64,
+            corpus_revision=corpus.revision,
+            target_key=target.key,
+            suite_id=corpus.suites[0].id,
+            suite_revision=corpus.suites[0].revision,
+            max_concurrency=1,
+            invocation=await _bound_eval_invocation(target),
+        )
+        await store.save_corpus(corpus, redact_json=target.app.redact_json)
+        await store.admit_run(request, redact_json=target.app.redact_json)
+        config = _evals_config(target, store)
+        if boundary in {"load", "missing"}:
+            monkeypatch.setattr(
+                store, "load_corpus", missing if boundary == "missing" else async_fail
+            )
+        elif boundary == "preflight":
+            monkeypatch.setattr(evals_worker_module, "target_for_eval_invocation", fail)
+        elif boundary == "compile":
+            monkeypatch.setattr(evals_worker_module, "compile_corpus_suite", fail)
+        else:
+            monkeypatch.setattr(
+                evals_worker_module,
+                "_run_compiled_corpus_suite",
+                protocol_fail if boundary == "protocol" else async_fail,
+            )
+        coordinator = evals_worker_module.EvalRunCoordinator(config)
+        coordinator.start()
+        try:
+            async with asyncio.timeout(10):
+                while True:
+                    record = await store.load_run(request.run_id)
+                    if record.status is EvalRunStatus.FAILED:
+                        break
+                    await asyncio.sleep(0.01)
+            assert record.failure_diagnostic.reason == reason
+            assert secret not in record.model_dump_json()
+            if boundary == "protocol":
+                assert (
+                    record.failure_diagnostic.provider_protocol_reason
+                    == "web_search_action_type_is_unsupported"
+                )
+        finally:
+            await coordinator.stop()
+            await store.close()
+        # New store owner must see the same exact fenced failure evidence.
+        reopened = SQLiteEvalStore(database)
+        try:
+            assert await reopened.load_run(request.run_id) == record
+        finally:
+            await reopened.close()
+
+    asyncio.run(exercise())
+    import subprocess
+    import sys
+
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio, sys
+from cayu import SQLiteEvalStore
+async def read():
+    store = SQLiteEvalStore(sys.argv[1])
+    try:
+        record = await store.load_run('eval-causal-failure')
+        print(record.failure_diagnostic.model_dump_json())
+    finally:
+        await store.close()
+asyncio.run(read())
+""",
+            str(database),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(child.stdout)["reason"] == reason
+    assert secret not in child.stdout + child.stderr
+    assert secret not in caplog.text
+    causal_logs = [r for r in caplog.records if hasattr(r, "eval_failure_diagnostic")]
+    assert causal_logs
+    assert causal_logs[-1].eval_failure_diagnostic["reason"] == reason

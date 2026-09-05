@@ -13213,3 +13213,31 @@ reconciliation and are never replayed solely because the child was reaped.
 Normal durable receipt and recovery rules own duplicate delivery. Abrupt Cayu
 parent death, distributed execution, and hostile-code isolation are outside
 this adapter's authority.
+
+### Durable eval failure diagnostics
+
+A failed durable eval run retains its existing `failure_code` classification and
+may also expose `failure_diagnostic`. The closed `EvalRunFailureReason` vocabulary
+identifies corpus load/missing data, target preflight and profile/identity drift,
+corpus compilation, execution, or result publication. `diagnostic.phase` derives
+from that reason; it does not accept caller-supplied text. Known OpenAI protocol
+exceptions reuse the provider's allowlisted reason code. Unknown exception types
+retain the phase's fallback reason without copying exception content.
+
+The containing run record supplies the run/target identity and attempt count.
+`load_run`, run listing and the server run response expose the same evidence after
+worker restart. Structured `Durable eval failed` logs contain the persisted reason,
+phase and exact claim epoch only after fenced failure publication succeeds.
+Diagnostics are not candidate scores, retry instructions, or effect dispositions.
+Provider failures already captured in trial results retain their existing native
+Runtime evidence; worker-level diagnostics describe failures escaping execution.
+
+`EvalStore.fail_run(..., diagnostic=...)` publishes the optional closed diagnostic
+in the same transaction as terminal failure. Exact acknowledgement retries must
+match both classification and diagnostic; conflicting or stale owners cannot
+replace either. Custom eval stores must support this keyword and equivalent
+fencing before running the durable worker; there is no diagnostic-dropping fallback.
+Schema revision 80 adds nullable `failure_diagnostic_json`; historical failures
+remain readable with no diagnostic. New eval stores require revision 80 and normal
+storage migration before using an existing database. No diagnostic contains raw
+exception text, tracebacks, corpus values, prompts, provider responses or credentials.

@@ -37,6 +37,8 @@ from cayu.evals.store import (
     EvalRunClaim,
     EvalRunClaimLost,
     EvalRunFailureCode,
+    EvalRunFailureDiagnostic,
+    EvalRunFailureReason,
     EvalRunLease,
     EvalRunStateConflict,
     EvalRunStatus,
@@ -60,6 +62,33 @@ from cayu.server.evals_registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _EvalFailure:
+    code: EvalRunFailureCode
+    diagnostic: EvalRunFailureDiagnostic
+
+
+def _failure(code: EvalRunFailureCode, reason: EvalRunFailureReason) -> _EvalFailure:
+    return _EvalFailure(code, EvalRunFailureDiagnostic(reason=reason))
+
+
+def _execution_diagnostic(error: BaseException) -> EvalRunFailureDiagnostic:
+    from cayu.providers._openai_protocol import protocol_diagnostic_fields
+    from cayu.providers.openai import OpenAIProtocolError
+
+    if _is_execution_profile_failure(error):
+        return EvalRunFailureDiagnostic(reason=EvalRunFailureReason.EXECUTION_PROFILE_REJECTED)
+    for candidate in iter_exception_tree(error):
+        if type(candidate) is OpenAIProtocolError:
+            return EvalRunFailureDiagnostic(
+                reason=EvalRunFailureReason.PROVIDER_PROTOCOL_FAILED,
+                provider_protocol_reason=protocol_diagnostic_fields(candidate.reason_code)[
+                    "provider_protocol_reason"
+                ],
+            )
+    return EvalRunFailureDiagnostic(reason=EvalRunFailureReason.EXECUTION_FAILED)
 
 
 def _is_execution_profile_failure(error: BaseException) -> bool:
@@ -266,6 +295,9 @@ class EvalRunCoordinator:
             await self._finalize_failure(
                 lease.claim,
                 EvalRunFailureCode.TARGET_UNAVAILABLE,
+                diagnostic=EvalRunFailureDiagnostic(
+                    reason=EvalRunFailureReason.TARGET_REGISTRATION_MISSING
+                ),
             )
             return
         await self._run_owned_lease(lease, registration)
@@ -298,9 +330,11 @@ class EvalRunCoordinator:
                 return
 
             preflight_result = preflight.result()
-            if isinstance(preflight_result, EvalRunFailureCode):
+            if isinstance(preflight_result, _EvalFailure):
                 failure = asyncio.create_task(
-                    self._finalize_failure(lease.claim, preflight_result),
+                    self._finalize_failure(
+                        lease.claim, preflight_result.code, diagnostic=preflight_result.diagnostic
+                    ),
                     name=f"cayu-eval-preflight-failure-{lease.run.id}",
                 )
                 await self._await_owned_action(lease.claim, failure, monitor)
@@ -328,15 +362,19 @@ class EvalRunCoordinator:
         self,
         lease: EvalRunLease,
         registration: EvalTargetRegistration,
-    ) -> _PreparedEvalRun | EvalRunFailureCode:
+    ) -> _PreparedEvalRun | _EvalFailure:
         try:
             corpus = await self._config.store.load_corpus(lease.run.spec.corpus_revision)
         except asyncio.CancelledError:
             raise
         except Exception:
-            return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            return _failure(
+                EvalRunFailureCode.CORPUS_UNAVAILABLE, EvalRunFailureReason.CORPUS_LOAD_FAILED
+            )
         if corpus is None:
-            return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            return _failure(
+                EvalRunFailureCode.CORPUS_UNAVAILABLE, EvalRunFailureReason.CORPUS_MISSING
+            )
 
         try:
             target = target_for_eval_invocation(
@@ -346,7 +384,10 @@ class EvalRunCoordinator:
             expected_profile = lease.run.spec.invocation.execution_profile
             expected_snapshot = lease.run.spec.invocation.execution_profile_snapshot
             if expected_profile is None:
-                return EvalRunFailureCode.TARGET_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.TARGET_UNAVAILABLE,
+                    EvalRunFailureReason.EXECUTION_PROFILE_MISSING,
+                )
             prepared_profile = await self._config.registry.prepare_execution_profile(
                 target.key,
                 effective_target=target,
@@ -354,11 +395,16 @@ class EvalRunCoordinator:
             if prepared_profile.binding != expected_profile or (
                 expected_snapshot is not None and prepared_profile.snapshot != expected_snapshot
             ):
-                return EvalRunFailureCode.TARGET_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.TARGET_UNAVAILABLE,
+                    EvalRunFailureReason.EXECUTION_PROFILE_CHANGED,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
-            return EvalRunFailureCode.TARGET_UNAVAILABLE
+            return _failure(
+                EvalRunFailureCode.TARGET_UNAVAILABLE, EvalRunFailureReason.TARGET_PREFLIGHT_FAILED
+            )
 
         scenario_invocation = lease.run.spec.invocation.scenario
         if scenario_invocation is not None:
@@ -369,9 +415,13 @@ class EvalRunCoordinator:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.CORPUS_UNAVAILABLE, EvalRunFailureReason.CORPUS_LOAD_FAILED
+                )
             if scenario is None:
-                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.CORPUS_UNAVAILABLE, EvalRunFailureReason.CORPUS_MISSING
+                )
             authored_suite: EvalSuiteDocument | None = None
             if scenario_invocation.authored_suite_revision is not None:
                 try:
@@ -381,9 +431,14 @@ class EvalRunCoordinator:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                    return _failure(
+                        EvalRunFailureCode.CORPUS_UNAVAILABLE,
+                        EvalRunFailureReason.CORPUS_LOAD_FAILED,
+                    )
                 if authored_suite is None:
-                    return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                    return _failure(
+                        EvalRunFailureCode.CORPUS_UNAVAILABLE, EvalRunFailureReason.CORPUS_MISSING
+                    )
             try:
                 settings = scenario_launch_settings_from_invocation(
                     scenario_invocation,
@@ -402,14 +457,20 @@ class EvalRunCoordinator:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                return EvalRunFailureCode.TARGET_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.TARGET_UNAVAILABLE,
+                    EvalRunFailureReason.TARGET_PREFLIGHT_FAILED,
+                )
             binding = preflight.binding
             if (
                 not preflight.ready
                 or binding is None
                 or binding.revision != scenario_invocation.binding_revision
             ):
-                return EvalRunFailureCode.TARGET_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.TARGET_UNAVAILABLE,
+                    EvalRunFailureReason.TARGET_PREFLIGHT_FAILED,
+                )
             prepared = await asyncio.to_thread(
                 self._compile_loaded_scenario,
                 corpus,
@@ -439,16 +500,20 @@ class EvalRunCoordinator:
         registration: EvalTargetRegistration,
         target: CorpusTarget,
         execution_profile: ExecutionProfileIdentity,
-    ) -> _PreparedEvalRun | EvalRunFailureCode:
+    ) -> _PreparedEvalRun | _EvalFailure:
         try:
             identity = evaluation_target_identity(
                 target,
                 project_root=registration.manifest_project_root,
             )
         except Exception:
-            return EvalRunFailureCode.TARGET_UNAVAILABLE
+            return _failure(
+                EvalRunFailureCode.TARGET_UNAVAILABLE, EvalRunFailureReason.TARGET_IDENTITY_FAILED
+            )
         if identity.app_manifest_fingerprint != registration.catalog_entry.app_manifest_fingerprint:
-            return EvalRunFailureCode.TARGET_UNAVAILABLE
+            return _failure(
+                EvalRunFailureCode.TARGET_UNAVAILABLE, EvalRunFailureReason.TARGET_IDENTITY_CHANGED
+            )
         try:
             compiled = compile_corpus_suite(
                 corpus,
@@ -474,7 +539,10 @@ class EvalRunCoordinator:
             ):
                 raise ValueError("Persisted authored run lost its accepted work exposure.")
         except Exception:
-            return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            return _failure(
+                EvalRunFailureCode.CORPUS_UNAVAILABLE,
+                EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
+            )
         return _PreparedEvalRun(
             target=target,
             compiled=compiled,
@@ -491,11 +559,14 @@ class EvalRunCoordinator:
         registration: EvalTargetRegistration,
         target: CorpusTarget,
         execution_profile: ExecutionProfileIdentity,
-    ) -> _PreparedEvalRun | EvalRunFailureCode:
+    ) -> _PreparedEvalRun | _EvalFailure:
         try:
             scenario_invocation = lease.run.spec.invocation.scenario
             if scenario_invocation is None:
-                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.CORPUS_UNAVAILABLE,
+                    EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
+                )
             if authored_suite is None:
                 expected_corpus = corpus_for_eval_scenario(
                     scenario,
@@ -517,7 +588,10 @@ class EvalRunCoordinator:
                     or authored_case is None
                     or authored_case.revision != scenario_invocation.authored_case_revision
                 ):
-                    return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                    return _failure(
+                        EvalRunFailureCode.CORPUS_UNAVAILABLE,
+                        EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
+                    )
                 expected_corpus = corpus_for_authored_scenario_case(
                     authored_suite,
                     corpus.cases[0].id,
@@ -527,13 +601,19 @@ class EvalRunCoordinator:
                     project_root=registration.manifest_project_root,
                 )
             if expected_corpus != corpus:
-                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.CORPUS_UNAVAILABLE,
+                    EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
+                )
             compiled = compile_corpus_suite(corpus, target, lease.run.spec.suite_id)
             if (
                 compiled.run_contract.corpus_revision != lease.run.spec.corpus_revision
                 or compiled.run_contract.suite_revision != lease.run.spec.suite_revision
             ):
-                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.CORPUS_UNAVAILABLE,
+                    EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
+                )
             exposure = lease.run.spec.invocation.authored_suite_exposure
             snapshot = lease.run.spec.invocation.execution_profile_snapshot
             if authored_suite is not None and (
@@ -545,9 +625,15 @@ class EvalRunCoordinator:
                 > compiled.run_contract.trial_policy.max_concurrency
                 or not _accepted_candidate_pricing_matches_target(lease, target)
             ):
-                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                return _failure(
+                    EvalRunFailureCode.CORPUS_UNAVAILABLE,
+                    EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
+                )
         except Exception:
-            return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            return _failure(
+                EvalRunFailureCode.CORPUS_UNAVAILABLE,
+                EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
+            )
         return _PreparedEvalRun(
             target=target,
             compiled=compiled,
@@ -688,6 +774,9 @@ class EvalRunCoordinator:
             await self._finalize_failure(
                 claim,
                 EvalRunFailureCode.WORKER_INTERRUPTED,
+                diagnostic=EvalRunFailureDiagnostic(
+                    reason=EvalRunFailureReason.EXECUTION_CANCELLED
+                ),
                 refresh=False,
             )
             return
@@ -700,6 +789,7 @@ class EvalRunCoordinator:
                     if _is_execution_profile_failure(failure)
                     else EvalRunFailureCode.EXECUTION_FAILED
                 ),
+                diagnostic=_execution_diagnostic(failure),
                 refresh=False,
             )
             return
@@ -734,6 +824,9 @@ class EvalRunCoordinator:
             await self._finalize_failure(
                 claim,
                 EvalRunFailureCode.EXECUTION_FAILED,
+                diagnostic=EvalRunFailureDiagnostic(
+                    reason=EvalRunFailureReason.RESULT_PUBLICATION_FAILED
+                ),
             )
 
     async def _await_owned_action(
@@ -837,6 +930,7 @@ class EvalRunCoordinator:
         claim: EvalRunClaim,
         code: EvalRunFailureCode,
         *,
+        diagnostic: EvalRunFailureDiagnostic | None = None,
         refresh: bool = True,
     ) -> None:
         if refresh:
@@ -847,7 +941,22 @@ class EvalRunCoordinator:
                 await self._finish_cancel(claim)
                 return
         try:
-            await self._config.store.fail_run(claim, code)
+            record = await self._config.store.fail_run(claim, code, diagnostic=diagnostic)
+            # Log only the fenced record after durable publication succeeds. The
+            # same closed evidence is returned by load_run after worker restart.
+            if record.failure_diagnostic is not None:
+                logger.warning(
+                    "Durable eval failed.",
+                    extra={
+                        "eval_run_id": record.id,
+                        "eval_claim_epoch": claim.epoch,
+                        "eval_failure_code": str(record.failure_code),
+                        "eval_failure_phase": record.failure_diagnostic.phase,
+                        "eval_failure_diagnostic": record.failure_diagnostic.model_dump(
+                            mode="json"
+                        ),
+                    },
+                )
         except EvalRunClaimLost:
             return
         except EvalRunStateConflict:

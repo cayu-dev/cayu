@@ -63,6 +63,7 @@ from cayu.evals.store import (
     EvalRunClaim,
     EvalRunClaimLost,
     EvalRunFailureCode,
+    EvalRunFailureDiagnostic,
     EvalRunLease,
     EvalRunObservation,
     EvalRunOwnership,
@@ -139,7 +140,7 @@ from cayu.evals.suite_authoring import (
 )
 from cayu.storage.postgres import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 74
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 80
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,8 @@ _RUN_COLUMNS = """
     trial_checkpoint_count,
     trial_checkpoint_bytes,
     authored_suite_launch_revision,
-    authored_suite_launch_lane
+    authored_suite_launch_lane,
+    failure_diagnostic_json
 """
 
 _RUN_OBSERVATION_COLUMNS = """
@@ -324,6 +326,9 @@ def _run_record_from_row(row: Any) -> EvalRunRecord:
         cancel_requested_at=row[13],
         ownership=ownership,
         result=result,
+        failure_diagnostic=(
+            None if row[27] is None else EvalRunFailureDiagnostic.model_validate_json(row[27])
+        ),
         failure_code=None if row[21] is None else EvalRunFailureCode(row[21]),
         scenario_progress=(
             None if row[22] is None else EvalScenarioRunProgress.model_validate_json(row[22])
@@ -1948,15 +1953,20 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         self,
         claim: EvalRunClaim,
         code: EvalRunFailureCode,
+        *,
+        diagnostic: EvalRunFailureDiagnostic | None = None,
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
         if not isinstance(code, EvalRunFailureCode):
             raise TypeError("code must be an EvalRunFailureCode.")
+        if diagnostic is not None:
+            diagnostic = _exact_model(diagnostic, EvalRunFailureDiagnostic, "diagnostic")
         return await self._terminalize_without_result(
             claim,
             required_status=EvalRunStatus.RUNNING,
             terminal_status=EvalRunStatus.FAILED,
             failure_code=code,
+            diagnostic=diagnostic,
         )
 
     async def finish_cancel(self, claim: EvalRunClaim) -> EvalRunRecord:
@@ -2364,6 +2374,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         required_status: EvalRunStatus,
         terminal_status: EvalRunStatus,
         failure_code: EvalRunFailureCode | None,
+        diagnostic: EvalRunFailureDiagnostic | None = None,
     ) -> EvalRunRecord:
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -2373,7 +2384,11 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     status = EvalRunStatus(row[8])
                     if status is terminal_status:
                         stored_code = None if row[21] is None else EvalRunFailureCode(row[21])
-                        if self._claim_matches(row, claim) and stored_code is failure_code:
+                        if (
+                            self._claim_matches(row, claim)
+                            and stored_code is failure_code
+                            and _run_record_from_row(row).failure_diagnostic == diagnostic
+                        ):
                             await conn.commit()
                             return _run_record_from_row(row)
                         raise EvalRunStateConflict("Eval run already has another terminal outcome.")
@@ -2392,7 +2407,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         SET status = %s, updated_at = %s, finished_at = %s,
                             cancel_requested_at = %s, lease_expires_at = NULL,
                             failure_code = %s, trial_checkpoint_count = 0,
-                            trial_checkpoint_bytes = 0
+                            trial_checkpoint_bytes = 0, failure_diagnostic_json = %s
                         WHERE run_id = %s
                         """,
                         (
@@ -2401,6 +2416,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             now,
                             cancel_requested_at,
                             None if failure_code is None else str(failure_code),
+                            None if diagnostic is None else diagnostic.model_dump_json(),
                             claim.run_id,
                         ),
                     )
