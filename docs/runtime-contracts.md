@@ -9205,6 +9205,13 @@ read-only-root, no-new-privileges, and an empty capability add-back set. A
 weakened restriction value reports both capabilities as unsupported so matching
 admission requirements fail closed.
 
+Runtime owns a disposable home and XDG/uv cache contract inside the container's
+bounded `/tmp` allocation. These paths are private to the allocation, excluded from
+workspace publication/checkpoints, and verified on strict creation and reconnect.
+The toolchain evidence records the effective paths; fresh reconstruction discards
+their state. See [writable home and tool caches](docker-coding-toolchains.md#writable-home-and-tool-caches)
+for configuration, lifecycle behavior, and tool-specific overrides.
+
 An explicit `DockerCodingToolchainProfile` binds that Docker allocation to a
 versioned profile ID, immutable image identity, Linux architecture, numeric
 runtime user, `/workspace` copy contract, read-only support paths, exact command

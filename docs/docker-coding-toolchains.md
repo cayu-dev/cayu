@@ -112,3 +112,41 @@ detached-session descendant cannot outlive a successful receipt, timeouts quiesc
 the runner, ordinary workspace mutations copy back, and exact profile/image/dependency
 identities remain in receipts. The test removes its ephemeral containers and image
 tags on settlement.
+
+
+## Writable home and tool caches
+
+Runtime-created Docker coding containers receive a private, disposable home at
+`/tmp/cayu-home`. Runtime supplies `HOME`, `XDG_CACHE_HOME` (`$HOME/.cache`),
+`XDG_CONFIG_HOME` (`$HOME/.config`), `XDG_DATA_HOME` (`$HOME/.local/share`),
+`XDG_STATE_HOME` (`$HOME/.local/state`), and `UV_CACHE_DIR` (`$HOME/.cache/uv`).
+These are literal absolute paths in the container environment; no shell expansion
+is required. Runtime creates the directories as the configured non-root uid/gid
+with a restrictive umask before admitting the container.
+
+The home shares the existing bounded `/tmp` tmpfs allocation (64 MiB by default),
+including its memory, execution, and lifecycle restrictions. It is separate from
+`/workspace`, so caches and home state are not copied back or included in workspace
+checkpoints. No host home, credentials, or cache is mounted or copied. Concurrent
+candidate containers have separate allocations. Reconnecting to the same running
+container retains its home; reconstructing a container starts with an empty home.
+Tools must tolerate cache loss. A stopped/restarted container whose tmpfs state was
+lost is not admitted as a valid reconnect.
+
+`DockerWorkloadRestrictions.home_directory` can select another normalized path
+below `/tmp`. Restrictions require a bounded `/tmp` mount without nested mounts.
+The restrictions and toolchain fingerprints include this configuration, and
+`toolchain_home_environment` records the non-secret effective paths in profile
+evidence. Strict creation and reconnect verify the configured environment and the
+writable, non-symlink directory paths before returning live evidence. Older
+containers without this contract must be reconstructed.
+
+Applications may add tool-specific defaults through command authorities'
+`fixed_environment`, for example a `PIP_CACHE_DIR` value of
+`/tmp/cayu-home/.cache/pip`, or a `UV_CACHE_DIR` override beneath the home.
+Create tool-specific subdirectories when the tool requires them. Use absolute
+paths matching the configured home; fixed values are not shell-expanded. The
+command authority and its overrides remain part of the toolchain identity.
+`HOME` and the base XDG variables are reserved and cannot be replaced through
+`fixed_environment`. Increase the explicitly configured `/tmp` size if the
+workload needs larger caches; this does not make them durable.

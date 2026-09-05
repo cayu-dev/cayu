@@ -191,3 +191,32 @@ def test_local_dependency_verification_refuses_symlink_components(tmp_path: Path
         verify_local_docker_coding_toolchain_dependencies(profile, source)
 
     assert caught.value.code == "dependency_inputs_unavailable"
+
+
+@pytest.mark.parametrize(
+    "name", ["HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"]
+)
+def test_command_authority_cannot_replace_runtime_home(name: str) -> None:
+    with pytest.raises(ValidationError, match="Runtime-owned"):
+        DockerCodingCommandAuthority(
+            max_arguments=0,
+            selector="cache-check",
+            revision="1",
+            description="Cache check",
+            exposure="named_check",
+            executable="/usr/bin/python3",
+            fixed_environment=({"name": name, "value": "/workspace"},),
+        )
+
+
+def test_command_authority_can_add_tool_specific_cache_override() -> None:
+    authority = DockerCodingCommandAuthority(
+        max_arguments=0,
+        selector="cache-check",
+        revision="1",
+        description="Cache check",
+        exposure="named_check",
+        executable="/usr/bin/python3",
+        fixed_environment=({"name": "PIP_CACHE_DIR", "value": "/tmp/cayu-home/.cache/pip"},),
+    )
+    assert authority.environment == {"PIP_CACHE_DIR": "/tmp/cayu-home/.cache/pip"}

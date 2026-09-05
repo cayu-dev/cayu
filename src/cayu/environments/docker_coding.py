@@ -788,7 +788,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
-            behavior_version="11",
+            behavior_version="12",
             implementation_version=self._configuration_fingerprint,
         )
 

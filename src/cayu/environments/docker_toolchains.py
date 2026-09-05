@@ -350,6 +350,14 @@ class DockerCodingCommandAuthority(BaseModel):
         value: tuple[DockerCodingFixedEnvironmentVariable, ...],
     ) -> tuple[DockerCodingFixedEnvironmentVariable, ...]:
         names = [item.name for item in value]
+        if {
+            "HOME",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+        }.intersection(names):
+            raise ValueError("fixed_environment cannot replace Runtime-owned home/XDG directories.")
         if names != sorted(names) or len(names) != len(set(names)):
             raise ValueError("fixed_environment must be unique and sorted by name.")
         return value
@@ -734,6 +742,7 @@ class DockerCodingToolchainProfile(BaseModel):
             "toolchain_image_content_digest": self.image_identity.content_digest,
             "toolchain_platform": f"{self.platform_os}/{self.platform_architecture}",
             "toolchain_runtime_user": self.runtime_user,
+            "toolchain_home_environment": self.restrictions.home_environment,
             "toolchain_working_directory": self.working_directory,
             "toolchain_runtime_restrictions_identity": _fingerprint(
                 restrictions,

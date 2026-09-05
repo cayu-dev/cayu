@@ -162,7 +162,11 @@ def _inspection(
     return {
         "Id": _CONTAINER_ID,
         "Image": _IMAGE_ID,
-        "Config": {"Image": _IMAGE_REFERENCE, "User": restrictions.user},
+        "Config": {
+            "Image": _IMAGE_REFERENCE,
+            "User": restrictions.user,
+            "Env": [f"{name}={value}" for name, value in restrictions.home_environment.items()],
+        },
         "HostConfig": {
             "NetworkMode": network_mode,
             "Privileged": False,
@@ -2371,3 +2375,51 @@ def test_docker_coding_binding_refuses_publishable_git_ignored_paths(
     asyncio.run(run())
 
     assert not (source_root / "ignored.txt").exists()
+
+
+@pytest.mark.parametrize("change", ["missing", "wrong", "duplicate", "unwritable"])
+def test_strict_reconnect_rejects_home_contract_drift(monkeypatch, change):
+    restrictions = DockerWorkloadRestrictions()
+    inspection = _inspection(restrictions)
+    if change == "missing":
+        inspection["Config"].pop("Env")
+    elif change == "wrong":
+        inspection["Config"]["Env"][0] = "HOME=/"
+    elif change == "duplicate":
+        inspection["Config"]["Env"].append("HOME=/")
+
+    async def fake_run_subprocess(command, **kwargs):
+        if command.argv[1] == "inspect":
+            return ExecResult(stdout=json.dumps(inspection))
+        if "id -u" in command.argv[-1]:
+            return ExecResult(stdout=restrictions.user)
+        if "cayu-home-probe" in command.argv:
+            return ExecResult(exit_code=1)
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    with pytest.raises(DockerRuntimeConfigurationError, match="home"):
+        asyncio.run(
+            DockerRunner.reconnect_strict(
+                "home-drift",
+                container_id=_CONTAINER_ID,
+                image_identity=_image_identity(),
+                workload_restrictions=restrictions,
+                docker_path="/usr/bin/docker",
+            )
+        )
+
+
+def test_home_contract_is_bounded_and_part_of_profile_evidence():
+    default = DockerWorkloadRestrictions()
+    changed = DockerWorkloadRestrictions(home_directory="/tmp/another-home")
+    assert changed.fingerprint != default.fingerprint
+    profile = docker_toolchain_profile(image_identity=_image_identity())
+    other_profile = docker_toolchain_profile(image_identity=_image_identity(), restrictions=changed)
+    assert profile.fingerprint != other_profile.fingerprint
+    assert profile.evidence()["toolchain_home_environment"] == default.home_environment
+    for path in ("/", "/workspace/home", "/tmp/../workspace", "/tmp/home/.."):
+        with pytest.raises(ValueError, match="home_directory"):
+            DockerWorkloadRestrictions(home_directory=path)
+    with pytest.raises(ValueError, match="bounded /tmp"):
+        DockerWorkloadRestrictions(tmpfs=default.tmpfs[1:])

@@ -4,6 +4,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from tests.docker_toolchain import docker_toolchain_profile
 from cayu import (
     DockerCodingEnvironmentFactory,
     DockerImageIdentity,
+    EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
@@ -272,3 +274,109 @@ def test_100_real_docker_environments_share_one_immutable_input(
     assert diagnostic.reference_count == 0
     assert diagnostic.cleanup_state == "eligible"
     assert store.collect(immutable_input.projection.fingerprint) is True
+
+
+def test_real_coding_home_initializes_uv_is_private_and_reconstructs(tmp_path: Path) -> None:
+    docker_path, image, image_id = _configuration_or_skip()
+    profile = docker_toolchain_profile(
+        image_identity=DockerImageIdentity(reference=image, content_digest=image_id),
+        platform_architecture=subprocess.check_output(
+            [docker_path, "image", "inspect", "--format", "{{.Architecture}}", image], text=True
+        ).strip(),
+    )
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path, workspace_id="home-source"),
+        toolchain_profile=profile,
+        docker_path=docker_path,
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="home-contract",
+        agent_name="agent",
+        environment_name="coding",
+    )
+    probe = """
+import errno, os, pathlib, subprocess, sys
+home = pathlib.Path.home()
+assert os.getuid() == 1000 and os.getgid() == 1000
+assert home == pathlib.Path('/tmp/cayu-home')
+assert home.stat().st_mode & 0o777 == 0o700
+assert not (home / '.ssh').exists()
+assert not (home / 'private-marker').exists()
+for key in ('HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'UV_CACHE_DIR'):
+    path = pathlib.Path(os.environ[key])
+    assert path.resolve().is_relative_to(home)
+    (path / 'python-probe').write_text('private tool state')
+try:
+    pathlib.Path('/cayu-root-write-probe').write_text('forbidden')
+except OSError as exc:
+    assert exc.errno in (errno.EROFS, errno.EACCES)
+else:
+    raise AssertionError('root filesystem is writable')
+subprocess.run(['uv', 'venv', '--offline', '--no-python-downloads', '--python', sys.executable,
+                str(home / 'venv')], check=True)
+assert (pathlib.Path(os.environ['UV_CACHE_DIR']) / 'CACHEDIR.TAG').is_file()
+(home / 'private-marker').write_text('candidate-only')
+"""
+
+    async def run() -> None:
+        first = await factory.create(request)
+        runner = first.environment.runner
+        assert runner is not None
+        second = None
+        try:
+            result = await runner.exec(ExecCommand.process("python3", "-c", probe))
+            assert result.exit_code == 0, result.stderr
+            second = await factory.create(replace(request, session_id="home-other-candidate"))
+            assert second.environment.runner is not None
+            result = await second.environment.runner.exec(
+                ExecCommand.process("python3", "-c", probe)
+            )
+            assert result.exit_code == 0, result.stderr
+            recovered = await factory.create(
+                replace(
+                    request,
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata=first.reconnect_metadata,
+                )
+            )
+            assert recovered.environment.runner is not None
+            result = await recovered.environment.runner.exec(
+                ExecCommand.process(
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; assert (Path.home() / 'private-marker').read_text() == 'candidate-only'",
+                )
+            )
+            assert result.exit_code == 0, result.stderr
+            environment = first.environment
+            assert environment.binding is not None
+            bound = await environment.binding.bind(
+                environment.workspace,
+                runner,
+                session_id=request.session_id,
+                agent_name=request.agent_name,
+                environment_name=request.environment_name,
+            )
+            result = await runner.exec(
+                ExecCommand.process("sh", "-c", "echo published > result.txt")
+            )
+            assert result.exit_code == 0
+            await environment.binding.finalize(bound, outcome="completed")
+            assert (tmp_path / "result.txt").read_text().strip() == "published"
+            assert not (tmp_path / "private-marker").exists()
+            assert not (tmp_path / ".cache").exists()
+        finally:
+            await runner.close()
+            if second is not None and second.environment.runner is not None:
+                await second.environment.runner.close()
+        fresh = await factory.create(request)
+        assert fresh.environment.runner is not None
+        try:
+            result = await fresh.environment.runner.exec(
+                ExecCommand.process("python3", "-c", probe)
+            )
+            assert result.exit_code == 0, result.stderr
+        finally:
+            await fresh.environment.runner.close()
+
+    asyncio.run(run())

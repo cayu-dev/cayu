@@ -376,6 +376,13 @@ def _verify_strict_container_inspection(
     if config.get("User") != restrictions.user:
         raise DockerRuntimeConfigurationError("nonroot_user_drift")
 
+    configured_env = _require_sequence(config.get("Env"), "home_environment_missing")
+    for name, value in restrictions.home_environment.items():
+        if [
+            item for item in configured_env if isinstance(item, str) and item.startswith(name + "=")
+        ] != [f"{name}={value}"]:
+            raise DockerRuntimeConfigurationError("home_environment_drift")
+
     host = _require_mapping(inspection.get("HostConfig"), "host_config_missing")
     if host.get("NetworkMode") != network_mode:
         raise DockerRuntimeConfigurationError("network_mode_drift")
@@ -587,6 +594,23 @@ async def _probe_strict_container(
     )
     if identity.exit_code != 0 or identity.timed_out or identity.stdout != restrictions.user:
         raise DockerRuntimeConfigurationError("nonroot_runtime_identity_drift")
+    home_probe = await _run_docker(
+        docker_path,
+        [
+            "exec",
+            container_id,
+            "sh",
+            "-c",
+            'for path do test -d "$path" && test ! -L "$path" && test -w "$path" && '
+            '(cd -P "$path" && test "$PWD" = "$path") || exit 1; done',
+            "cayu-home-probe",
+            *restrictions.home_environment.values(),
+        ],
+        docker_cli_env_allowlist=docker_cli_env_allowlist,
+        timeout_s=30,
+    )
+    if home_probe.exit_code != 0 or home_probe.timed_out:
+        raise DockerRuntimeConfigurationError("writable_home_unavailable")
     availability: list[tuple[str, bool]] = []
     for executable in required_executables:
         result = await _run_docker(
@@ -1403,6 +1427,19 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                         _docker_lifecycle_redactor(env_overlay, docker_cli_allowlist),
                     )
                     raise RuntimeError(f"docker workspace mkdir failed: {detail}")
+            if owned_restrictions is not None:
+                # Fresh private tmpfs; never initialize tool state as root or copy host state.
+                paths = " ".join(
+                    shlex.quote(path) for path in owned_restrictions.home_environment.values()
+                )
+                initialized = await _run_docker(
+                    docker,
+                    ["exec", container_reference, "sh", "-c", f"umask 077; mkdir -p {paths}"],
+                    docker_cli_env_allowlist=docker_cli_allowlist,
+                    timeout_s=30,
+                )
+                if initialized.exit_code != 0 or initialized.timed_out:
+                    raise DockerRuntimeConfigurationError("writable_home_initialization_failed")
             # Setup runs on the (already-attached) network with the egress
             # overlay applied, so any setup traffic is brokered like the app's —
             # it is subject to the same egress policy, so bake tools that need

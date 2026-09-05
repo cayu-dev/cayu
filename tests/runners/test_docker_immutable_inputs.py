@@ -51,7 +51,11 @@ def _inspection(
     return {
         "Id": container_id,
         "Image": _IMAGE_ID,
-        "Config": {"Image": _IMAGE_REFERENCE, "User": restrictions.user},
+        "Config": {
+            "Image": _IMAGE_REFERENCE,
+            "User": restrictions.user,
+            "Env": [f"{name}={value}" for name, value in restrictions.home_environment.items()],
+        },
         "HostConfig": {
             "NetworkMode": "none",
             "Privileged": False,

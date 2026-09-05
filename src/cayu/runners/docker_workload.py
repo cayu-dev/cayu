@@ -108,6 +108,8 @@ class DockerWorkloadRestrictions(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
+    home_directory: str = Field(default="/tmp/cayu-home", max_length=4000)
+
     uid: StrictInt = Field(default=1000, ge=1, le=2**31 - 1)
     gid: StrictInt = Field(default=1000, ge=1, le=2**31 - 1)
     read_only_root: StrictBool = True
@@ -179,7 +181,32 @@ class DockerWorkloadRestrictions(BaseModel):
     def validate_resource_relationships(self) -> Self:
         if self.memory_swap_bytes < self.memory_bytes:
             raise ValueError("Docker memory_swap_bytes must be at least memory_bytes.")
+        if not any(mount.target == "/tmp" for mount in self.tmpfs):
+            raise ValueError("Docker writable home requires a bounded /tmp tmpfs allocation.")
+        if any(mount.target.startswith("/tmp/") for mount in self.tmpfs):
+            raise ValueError("Docker writable home forbids nested /tmp mounts.")
         return self
+
+    @field_validator("home_directory")
+    @classmethod
+    def validate_home_directory(cls, value: str) -> str:
+        value = require_durable_clean_nonblank(value, "home_directory")
+        if not value.startswith("/tmp/") or posixpath.normpath(value) != value:
+            raise ValueError("Docker home_directory must be a normalized directory below /tmp.")
+        return value
+
+    @property
+    def home_environment(self) -> dict[str, str]:
+        """Non-secret, versioned by the restrictions identity, disposable tool state."""
+
+        return {
+            "HOME": self.home_directory,
+            "XDG_CACHE_HOME": f"{self.home_directory}/.cache",
+            "XDG_CONFIG_HOME": f"{self.home_directory}/.config",
+            "XDG_DATA_HOME": f"{self.home_directory}/.local/share",
+            "XDG_STATE_HOME": f"{self.home_directory}/.local/state",
+            "UV_CACHE_DIR": f"{self.home_directory}/.cache/uv",
+        }
 
     @property
     def user(self) -> str:
@@ -197,6 +224,8 @@ class DockerWorkloadRestrictions(BaseModel):
         """Project the typed value into deterministic ``docker run`` arguments."""
 
         args = ["--user", self.user]
+        for name, value in self.home_environment.items():
+            args += ["--env", f"{name}={value}"]
         if self.read_only_root:
             args.append("--read-only")
         if self.no_new_privileges:
