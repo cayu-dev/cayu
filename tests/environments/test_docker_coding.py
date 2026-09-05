@@ -2309,8 +2309,12 @@ def test_docker_coding_binding_failed_abandon_preserves_finalization_authority(
     assert source_file.read_text(encoding="utf-8") == "value = 2\n"
 
 
-def test_docker_coding_binding_refuses_publishable_git_ignored_paths(
+@pytest.mark.parametrize("sync_back", ["never", "on_success", "always"])
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled", None])
+def test_docker_coding_binding_scopes_ignored_path_guard_to_publication(
     tmp_path: Path,
+    sync_back,
+    outcome,
 ) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
@@ -2366,10 +2370,16 @@ def test_docker_coding_binding_refuses_publishable_git_ignored_paths(
     )
 
     async def run() -> None:
+        binding.sync_back = sync_back
         bound = await binding.bind(source, runner, session_id="ignored-publication")
         (target_root / "ignored.txt").write_text("hidden mutation\n", encoding="utf-8")
-        with pytest.raises(RuntimeError, match="Git would omit a source path"):
-            await binding.finalize(bound, outcome="completed")
+        if sync_back == "always" or (sync_back == "on_success" and outcome == "completed"):
+            with pytest.raises(RuntimeError, match="Git would omit a source path"):
+                await binding.finalize(bound, outcome=outcome)
+        else:
+            assert await binding.finalize(bound, outcome=outcome) is None
+            with pytest.raises(RuntimeError, match="lost its admitted authority"):
+                await binding.finalize(bound, outcome=outcome)
         assert binding.abandon(bound) is True
 
     asyncio.run(run())
@@ -2423,3 +2433,53 @@ def test_home_contract_is_bounded_and_part_of_profile_evidence():
             DockerWorkloadRestrictions(home_directory=path)
     with pytest.raises(ValueError, match="bounded /tmp"):
         DockerWorkloadRestrictions(tmpfs=default.tmpfs[1:])
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+def test_nonpublishing_coding_binding_still_captures_bounded_git_evidence(
+    tmp_path: Path,
+    monkeypatch,
+    outcome,
+) -> None:
+    from cayu.environments import docker_coding
+    from cayu.tools.git import MAX_GIT_CHANGES_RESULT_BYTES
+
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / ".gitignore").write_bytes(b"scratch/\n")
+    (source_root / "code.py").write_bytes(b"value = 1\n")
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+    binding.sync_back = "never"
+    captured = []
+    capture = docker_coding._capture_final_git_evidence
+
+    async def record_capture(bound, authority):
+        evidence = await capture(bound, authority)
+        captured.append(evidence)
+        return evidence
+
+    monkeypatch.setattr(docker_coding, "_capture_final_git_evidence", record_capture)
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="nonpublishing-evidence")
+        assert bound.workspace is not None
+        await bound.workspace.write_bytes("code.py", b"value = 2\n")
+        await bound.workspace.write_bytes("scratch/note.txt", b"fixture")
+        assert await binding.finalize(bound, outcome=outcome) is None
+        with pytest.raises(RuntimeError, match="lost its admitted authority"):
+            await binding.finalize(bound, outcome=outcome)
+        assert binding.abandon(bound) is True
+
+    asyncio.run(run())
+    assert len(captured) == 1
+    evidence = captured[0]
+    assert evidence["source_workspace_id"] == source.id
+    for mode in ("status", "summary", "diff"):
+        assert len(json.dumps(evidence[mode]).encode()) < 2 * MAX_GIT_CHANGES_RESULT_BYTES
+    assert "+value = 2" in evidence["diff"]["content"]
+    assert evidence["diff"]["structured"]["truncated"] is True
+    assert "workspace_delta_unrepresented" in evidence["diff"]["structured"]["truncation_reasons"]
+    assert (source_root / "code.py").read_bytes() == b"value = 1\n"
+    assert not (source_root / "scratch").exists()

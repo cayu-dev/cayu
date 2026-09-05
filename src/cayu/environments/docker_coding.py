@@ -35,7 +35,12 @@ from cayu.environments.admission import (
     evaluate_execution_admission,
 )
 from cayu.environments.base import Environment, EnvironmentSpec
-from cayu.environments.bindings import BoundWorkspace, SyncBinding, WorkspaceSnapshot
+from cayu.environments.bindings import (
+    BoundWorkspace,
+    SyncBinding,
+    WorkspaceSnapshot,
+    _should_sync_back,
+)
 from cayu.environments.docker_toolchains import (
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
@@ -635,7 +640,10 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                 if authority.source is None
                 else await _capture_final_git_evidence(bound, authority)
             )
-            await _require_no_publishable_ignored_paths(bound)
+            # Ignored scratch is valid when this outcome does not publish source.
+            # Keep the decision identical to SyncBinding copy-back.
+            if _should_sync_back(self.sync_back, outcome):
+                await _require_no_publishable_ignored_paths(bound)
             snapshot = await super().finalize(bound, outcome=outcome, metadata=metadata)
             final_snapshot = (
                 snapshot

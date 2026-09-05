@@ -12,6 +12,7 @@ from tests.docker_toolchain import docker_toolchain_profile
 
 from cayu import (
     DockerCodingEnvironmentFactory,
+    DockerCodingWorkspaceBinding,
     DockerImageIdentity,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
@@ -378,5 +379,92 @@ assert (pathlib.Path(os.environ['UV_CACHE_DIR']) / 'CACHEDIR.TAG').is_file()
             assert result.exit_code == 0, result.stderr
         finally:
             await fresh.environment.runner.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("sync_back", "outcome", "scratch", "publishes"),
+    [
+        ("never", "completed", False, False),
+        ("never", "completed", True, False),
+        ("never", "failed", True, False),
+        ("never", "cancelled", True, False),
+        ("on_success", "failed", True, False),
+        ("on_success", "completed", True, True),
+        ("always", "completed", True, True),
+    ],
+)
+def test_real_docker_ignored_scratch_obeys_copy_back_policy(
+    tmp_path: Path,
+    sync_back,
+    outcome,
+    scratch,
+    publishes,
+) -> None:
+    docker_path, image, image_id = _configuration_or_skip()
+    (tmp_path / ".gitignore").write_bytes(b"scratch/\n")
+    (tmp_path / "candidate.py").write_bytes(b"value = 1\n")
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    architecture = subprocess.check_output(
+        [docker_path, "image", "inspect", "--format", "{{.Architecture}}", image],
+        text=True,
+    ).strip()
+    assert architecture in ("amd64", "arm64")
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path),
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=DockerImageIdentity(reference=image, content_digest=image_id),
+            platform_architecture="arm64" if architecture == "arm64" else "amd64",
+        ),
+        docker_path=docker_path,
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="ignored-scratch-policy",
+        agent_name="agent",
+        environment_name="coding",
+    )
+
+    async def run() -> None:
+        result = await factory.create(request)
+        assert result.release is not None
+        container_id = result.metadata["container_id"]
+        try:
+            environment = result.environment
+            binding = environment.binding
+            assert isinstance(binding, DockerCodingWorkspaceBinding)
+            binding.sync_back = sync_back
+            bound = await binding.bind(
+                environment.workspace,
+                environment.runner,
+                session_id=request.session_id,
+                agent_name=request.agent_name,
+                environment_name=request.environment_name,
+            )
+            assert bound.workspace is not None
+            await bound.workspace.write_bytes("candidate.py", b"value = 2\n")
+            if scratch:
+                await bound.workspace.write_bytes("scratch/note.txt", b"fixture")
+            if publishes:
+                for _ in range(2):
+                    with pytest.raises(RuntimeError, match="Git would omit a source path"):
+                        await binding.finalize(bound, outcome=outcome)
+            else:
+                assert await binding.finalize(bound, outcome=outcome) is None
+                # A retired generation cannot silently acquire publication authority.
+                with pytest.raises(RuntimeError, match="lost its admitted authority"):
+                    await binding.finalize(bound, outcome=outcome)
+            assert binding.abandon(bound) is True
+            assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+        finally:
+            await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+            await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+        inspection = subprocess.run(
+            [docker_path, "container", "inspect", container_id],
+            capture_output=True,
+            text=True,
+        )
+        assert inspection.returncode != 0
+        assert "No such container" in inspection.stderr or "No such object" in inspection.stderr
 
     asyncio.run(run())
