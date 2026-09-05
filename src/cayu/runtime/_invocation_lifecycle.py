@@ -42,6 +42,7 @@ from cayu.core.events import (
 )
 from cayu.core.messages import Message, detach_message
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
@@ -1320,10 +1321,21 @@ class SettleInvocationCommand(_InvocationCommandModel):
     expected_run_epoch: StrictInt = Field(ge=1)
     expected_active_profile: ActiveInvocationExecutionProfile
     expected_authority_state: Literal["active", "released"] = "active"
+    recovery_claim_id: str | None = None
+    terminalization_only: StrictBool = False
+    terminalization_plan_ownership: DurableOperationOwnership | None = None
     transition: InteractionTransitionSpec
 
     @model_validator(mode="after")
     def validate_settlement_authority(self) -> SettleInvocationCommand:
+        if self.terminalization_only and (
+            self.recovery_claim_id is None
+            or self.transition.model_completion_stage_settlement is None
+            or self.transition.terminal_event is None
+        ):
+            raise ValueError(
+                "Model terminalization requires a claim and paired stage/session settlement."
+            )
         active = self.expected_active_profile
         if active.session_id != self.session_id:
             raise ValueError("Settlement authority belongs to another session.")

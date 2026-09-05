@@ -2495,6 +2495,17 @@ class ModelCompletionManualRecoveryRequest(BaseModel):
     stage_id: str = Field(max_length=256)
     expected_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     terminal_status: SessionStatus
+    terminalization_only: StrictBool = False
+    expected_session_instance_id: str | None = None
+    inactive_for_seconds: StrictInt = Field(default=30, ge=0)
+
+    @model_validator(mode="after")
+    def validate_terminalization_identity(self) -> ModelCompletionManualRecoveryRequest:
+        if self.terminalization_only and not self.expected_session_instance_id:
+            raise ValueError(
+                "Terminalization-only recovery requires the exact session incarnation."
+            )
+        return self
 
     @field_validator("session_id", "stage_id")
     @classmethod
@@ -2523,6 +2534,9 @@ def copy_model_completion_manual_recovery_request(
         stage_id=request.stage_id,
         expected_run_epoch=request.expected_run_epoch,
         terminal_status=request.terminal_status,
+        terminalization_only=request.terminalization_only,
+        expected_session_instance_id=request.expected_session_instance_id,
+        inactive_for_seconds=request.inactive_for_seconds,
     )
 
 
@@ -9532,6 +9546,7 @@ class SessionStore(ABC):
     # delivering a command they cannot interpret atomically.
     invocation_lifecycle_command_version: ClassVar[int | None] = None
     terminal_interaction_publication_version: ClassVar[int | None] = None
+    durable_model_terminalization_version: ClassVar[int | None] = None
     queued_interaction_profile_handoff_version: ClassVar[int | None] = None
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
@@ -10290,6 +10305,8 @@ class SessionStore(ABC):
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
         expected_recovery_claim_id: str | None = None,
+        terminalization_only: bool = False,
+        terminalization_plan_ownership: Any = None,
     ) -> InteractionTransitionResult:
         """Atomically publish one interaction state and its session transition.
 
@@ -12138,6 +12155,7 @@ class InMemorySessionStore(SessionStore):
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
     terminal_interaction_publication_version: ClassVar[int | None] = 1
+    durable_model_terminalization_version: ClassVar[int | None] = 1
     queued_interaction_profile_handoff_version: ClassVar[int | None] = 1
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
@@ -14972,6 +14990,8 @@ class InMemorySessionStore(SessionStore):
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
         expected_recovery_claim_id: str | None = None,
+        terminalization_only: bool = False,
+        terminalization_plan_ownership: Any = None,
     ) -> InteractionTransitionResult:
         expected_recovery_claim_id = _validate_interaction_transition_recovery_claim_id(
             expected_recovery_claim_id
@@ -15059,6 +15079,26 @@ class InMemorySessionStore(SessionStore):
             if existing_terminal is not None:
                 raise RuntimeError("Terminal session event exists without its interaction receipt.")
             current_checkpoint = self._checkpoints.get(session_id)
+            if terminalization_only:
+                from cayu.runtime._durable_model_terminalization import (
+                    require_terminalization_checkpoint,
+                    require_terminalization_plan_owner,
+                )
+
+                require_terminalization_checkpoint(session, current_checkpoint)
+
+                require_terminalization_plan_owner(
+                    current_checkpoint, terminalization_plan_ownership, self._ownership_clock()
+                )
+                if (
+                    self._child_session_keys_by_parent.get(session_id)
+                    or self._deferred_interaction_inputs.get(session_id)
+                    or any(
+                        (session_id, mode) in self._pending_session_messages
+                        for mode in SessionMessageDeliveryMode
+                    )
+                ):
+                    raise SessionRunFenced("Model terminalization has dependent work.")
             settled_checkpoint = _checkpoint_after_exact_invocation_terminal_decision(
                 current_checkpoint,
                 session=session,
@@ -15255,6 +15295,11 @@ class InMemorySessionStore(SessionStore):
         if transition.terminal_event is not None:
             kwargs["terminal_event"] = transition.terminal_event
             kwargs["terminal_decision"] = transition.terminal_decision
+        if copied.recovery_claim_id is not None:
+            kwargs["expected_recovery_claim_id"] = copied.recovery_claim_id
+        if copied.terminalization_only:
+            kwargs["terminalization_only"] = True
+            kwargs["terminalization_plan_ownership"] = copied.terminalization_plan_ownership
         return await self.publish_interaction_transition(copied.session_id, **kwargs)
 
     async def load_interaction_transition_receipt(

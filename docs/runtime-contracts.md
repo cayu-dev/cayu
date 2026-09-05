@@ -13214,6 +13214,56 @@ Normal durable receipt and recovery rules own duplicate delivery. Abrupt Cayu
 parent death, distributed execution, and hostile-code isolation are outside
 this adapter's authority.
 
+### Terminalizing a dispatched model after executable-profile drift
+
+`ModelCompletionManualRecoveryRequest(terminalization_only=True, ...)` permits an
+explicit failed/interrupted disposition from authenticated durable model authority.
+It requires `expected_session_instance_id`, the exact stage ID and run epoch, and
+an inactivity bound (`inactive_for_seconds`, default 30). The operator declares the
+provider effect outcome unknown; Runtime does not call the old provider or tools,
+resume execution, or infer that the effect never happened.
+
+This path supports standalone SDK/HTTP assistant stages with complete dispatch,
+profile and reservation evidence. It rejects registered environments, parent/task
+linkage, dependent children, queued/deferred input, pending tool/workspace work,
+and unfamiliar checkpoint roots. Compaction and provider-background stages remain
+on ordinary recovery because they can carry additional accounting/publication or
+provider ownership. These blockers are intentional; terminalization cannot discard
+dependent work to make an invocation look finished.
+
+Runtime acquires the existing incomplete-recovery claim and advances the run epoch
+before accounting work, elects a content-bound model disposition, then conservatively
+reconciles the exact budget reservations. The store transaction rechecks the live
+claim, session incarnation/profile, exact stage, terminal decision and dependent-work
+absence, and writes stage settlement, interaction terminal evidence and the matching
+session terminal event together. Plan-triggered operations also recheck the exact
+live plan owner/generation inside publication. Exact retries reuse the committed
+decision and receipts; changed dispositions, successor invocations and stale owners
+cannot overwrite them. Partial accounting settlement retains the stage for retry.
+The disposition identity binds the session incarnation, stage and terminal status;
+the attempt's expected epoch and inactivity bound are admission checks, not part of
+that identity. After a failed plan execution, replaying that execution returns its
+immutable failed receipt. A fresh plan can resume the same elected disposition
+under a new live owner and epoch, without changing its decision or terminal events.
+
+The operation has a 30-second work deadline and uses the existing recovery heartbeat
+and bounded cleanup supervision. Cancellation or cleanup that cannot prove quiescence
+retains fenced work rather than releasing authority for a replacement execution.
+No application or Runtime hooks run in this terminalization-only path.
+
+Registered-application recovery plans expose eligible profile-drift cases as
+`registration.status=terminalization_only` with the existing `model_mark_failed` and
+`model_mark_interrupted` decisions. The SDK and CLI execution surface use the same
+path and skip executable continuation repair afterward. Successful terminalization
+never grants later continuation authority: resuming or starting work still crosses
+ordinary profile admission.
+
+Custom session stores must explicitly support `durable_model_terminalization_version=1`
+and the guarded `SettleInvocationCommand`/paired publication contract, including
+recovery-plan ownership and transaction-time claim expiry. Stores that do not support
+it decline before claiming work. This feature does not repair historical gateway
+alias loss in retained N9 checkpoints; that compatibility decision remains separate.
+
 ### Durable eval failure diagnostics
 
 A failed durable eval run retains its existing `failure_code` classification and

@@ -1709,6 +1709,7 @@ class SQLiteSessionStore(SessionStore):
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
     terminal_interaction_publication_version: ClassVar[int | None] = 1
+    durable_model_terminalization_version: ClassVar[int | None] = 1
     queued_interaction_profile_handoff_version: ClassVar[int | None] = 1
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
@@ -5839,6 +5840,8 @@ class SQLiteSessionStore(SessionStore):
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
         expected_recovery_claim_id: str | None = None,
+        terminalization_only: bool = False,
+        terminalization_plan_ownership: Any = None,
     ) -> InteractionTransitionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -5949,6 +5952,36 @@ class SQLiteSessionStore(SessionStore):
                         "Terminal session event exists without its interaction receipt."
                     )
                 current_checkpoint = _load_checkpoint_state(connection, session_id)
+                if terminalization_only:
+                    from cayu.runtime._durable_model_terminalization import (
+                        require_terminalization_checkpoint,
+                        require_terminalization_plan_owner,
+                    )
+
+                    require_terminalization_checkpoint(loaded, current_checkpoint)
+
+                    require_terminalization_plan_owner(
+                        current_checkpoint, terminalization_plan_ownership, self._ownership_clock()
+                    )
+                    if any(
+                        connection.execute(
+                            f"SELECT 1 FROM {table} WHERE {column} = ? "
+                            + (
+                                "AND status = 'queued' "
+                                if table == "cayu_session_message_queue"
+                                else ""
+                            )
+                            + "LIMIT 1",
+                            (session_id,),
+                        ).fetchone()
+                        is not None
+                        for table, column in (
+                            ("cayu_sessions", "parent_session_id"),
+                            ("cayu_deferred_interaction_inputs", "session_id"),
+                            ("cayu_session_message_queue", "session_id"),
+                        )
+                    ):
+                        raise SessionRunFenced("Model terminalization has dependent work.")
                 settled_checkpoint = _checkpoint_after_exact_invocation_terminal_decision(
                     current_checkpoint,
                     session=loaded,
@@ -6291,6 +6324,11 @@ class SQLiteSessionStore(SessionStore):
         if transition.terminal_event is not None:
             kwargs["terminal_event"] = transition.terminal_event
             kwargs["terminal_decision"] = transition.terminal_decision
+        if copied.recovery_claim_id is not None:
+            kwargs["expected_recovery_claim_id"] = copied.recovery_claim_id
+        if copied.terminalization_only:
+            kwargs["terminalization_only"] = True
+            kwargs["terminalization_plan_ownership"] = copied.terminalization_plan_ownership
         return await self.publish_interaction_transition(copied.session_id, **kwargs)
 
     async def load_interaction_transition_receipt(

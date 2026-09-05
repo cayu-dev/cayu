@@ -642,6 +642,21 @@ class RecoveryPlanCoordinator:
             preflight = None
 
         if zero_work is None and registration_status is not RecoveryRegistrationStatus.READY:
+            from cayu.runtime._durable_model_terminalization import inspect_terminalization
+
+            try:
+                await inspect_terminalization(self._session_store, session, checkpoint)
+            except (ValueError, RuntimeError):
+                pass
+            else:
+                registration_status = RecoveryRegistrationStatus.TERMINALIZATION_ONLY
+                registration_reason = "dispatched_model_has_durable_terminalization_authority"
+                preflight = None
+
+        if zero_work is None and registration_status not in {
+            RecoveryRegistrationStatus.READY,
+            RecoveryRegistrationStatus.TERMINALIZATION_ONLY,
+        }:
             blockers.append(
                 RecoveryPlanBlocker(
                     code=(
@@ -1947,18 +1962,43 @@ class RecoveryPlanCoordinator:
                 )
             ):
                 raise StaleRecoveryPlanError("Active model stage changed after planning.")
-            result = await self._recover_model_completion(
-                ModelCompletionManualRecoveryRequest(
-                    session_id=private_session_id,
-                    stage_id=active.stage.stage_id,
-                    expected_run_epoch=item.run_epoch,
-                    terminal_status=(
-                        SessionStatus.FAILED
-                        if decision.action is RecoveryPlanAction.MODEL_MARK_FAILED
-                        else SessionStatus.INTERRUPTED
-                    ),
+            disposition_session = await self._session_store.load(private_session_id)
+            if disposition_session is None:
+                raise StaleRecoveryPlanError("Model session disappeared after planning.")
+            from cayu.runtime._durable_model_terminalization import terminalization_plan_scope
+
+            with terminalization_plan_scope(recovery_ownership):
+                result = await self._recover_model_completion(
+                    ModelCompletionManualRecoveryRequest(
+                        session_id=private_session_id,
+                        stage_id=active.stage.stage_id,
+                        expected_run_epoch=item.run_epoch,
+                        expected_session_instance_id=disposition_session.instance_id,
+                        terminalization_only=item.registration.status
+                        is RecoveryRegistrationStatus.TERMINALIZATION_ONLY,
+                        inactive_for_seconds=0
+                        if inactive_for_seconds is None
+                        else inactive_for_seconds,
+                        terminal_status=(
+                            SessionStatus.FAILED
+                            if decision.action is RecoveryPlanAction.MODEL_MARK_FAILED
+                            else SessionStatus.INTERRUPTED
+                        ),
+                    )
                 )
-            )
+            if item.registration.status is RecoveryRegistrationStatus.TERMINALIZATION_ONLY:
+                terminal_events = await self._session_store.query_events(
+                    EventQuery(
+                        session_id=private_session_id,
+                        event_types=(EventType.SESSION_FAILED, EventType.SESSION_INTERRUPTED),
+                        limit=1,
+                        order_by=EventOrder.SEQUENCE_DESC,
+                    )
+                )
+                return (
+                    (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,),
+                    tuple(_safe_ref("event", e.event.id) for e in terminal_events),
+                )
             settlement = await self._recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=private_session_id,

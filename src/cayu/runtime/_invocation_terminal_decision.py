@@ -64,6 +64,12 @@ class InvocationTerminalDecision(BaseModel):
     task_terminalization_request_sha256: str | None = None
     task_error_payload: dict[str, Any] | None = None
     turn_completed_payload: dict[str, Any] | None = None
+    model_recovery_id: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^model-recovery:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
     record_digest: str
 
     @field_validator(
@@ -124,10 +130,18 @@ class InvocationTerminalDecision(BaseModel):
         if self.outcome is InvocationTerminalOutcome.INTERRUPTED:
             if (
                 self.interruption_request_id is None
+                or self.model_recovery_id is not None
                 or any(value is not None for value in failure_fields)
                 or self.task_terminalization_request_sha256 is not None
             ):
                 raise ValueError("Interrupted decisions require only interruption authority.")
+        elif self.model_recovery_id is not None:
+            if (
+                self.interruption_request_id is not None
+                or any(value is not None for value in failure_fields)
+                or self.task_terminalization_request_sha256 is not None
+            ):
+                raise ValueError("Model failure decisions cannot substitute task authority.")
         elif self.interruption_request_id is not None or any(
             value is None for value in failure_fields
         ):
@@ -157,9 +171,10 @@ class InvocationTerminalDecision(BaseModel):
                 event_kind="session",
             )
         else:
-            assert self.runtime_task_failure_id is not None
-            expected_interaction_event_id = f"{self.runtime_task_failure_id}:interaction_failed"
-            expected_terminal_event_id = f"{self.runtime_task_failure_id}:session_failed"
+            source_id = self.model_recovery_id or self.runtime_task_failure_id
+            assert source_id is not None
+            expected_interaction_event_id = f"{source_id}:interaction_failed"
+            expected_terminal_event_id = f"{source_id}:session_failed"
         if self.outcome is InvocationTerminalOutcome.FAILED and (
             self.predecessor_interaction_event_id is not None
         ):
@@ -289,6 +304,7 @@ def build_invocation_terminal_decision(
     task_terminalization_request_sha256: str | None = None,
     task_error_payload: dict[str, Any] | None = None,
     turn_completed_payload: dict[str, Any] | None = None,
+    model_recovery_id: str | None = None,
 ) -> InvocationTerminalDecision:
     """Build one self-authenticating immutable decision."""
 
@@ -325,6 +341,8 @@ def build_invocation_terminal_decision(
             else copy_durable_json_object(turn_completed_payload, "turn_completed_payload")
         ),
     }
+    if model_recovery_id is not None:
+        payload["model_recovery_id"] = model_recovery_id
     identity_payload = {
         key: value for key, value in payload.items() if key not in {"decision_id", "record_digest"}
     }

@@ -261,6 +261,7 @@ from cayu.runtime._recovery_coordinator import (
     RecoveryAbandonedSessionRequest,
     RecoveryCoordinator,
     _checkpoint_without_active_incomplete_recovery_claim,
+    _IncompleteRecoveryClaim,
     _IncompleteRecoveryClaimLost,
     _run_recovery_cleanup_steps,
 )
@@ -6816,6 +6817,22 @@ class SessionEngine:
         """Conservatively settle one ambiguous model dispatch before clearing it."""
 
         request = copy_model_completion_manual_recovery_request(request)
+        if request.terminalization_only:
+            from cayu.runtime._durable_model_terminalization import terminalize_dispatched_model
+
+            return await terminalize_dispatched_model(self, request)
+        return await self._recover_model_completion_stage(request)
+
+    async def _recover_model_completion_stage(
+        self,
+        request: ModelCompletionManualRecoveryRequest,
+        *,
+        terminalization: tuple[_IncompleteRecoveryClaim, InvocationTerminalDecision, Event]
+        | None = None,
+    ) -> ModelCompletionManualRecoveryResult:
+        from cayu.runtime._durable_model_terminalization import terminalization_plan_owner
+
+        request = copy_model_completion_manual_recovery_request(request)
         session = await self.session_store.load(request.session_id)
         if session is None:
             raise KeyError(f"Session not found: {request.session_id}")
@@ -6906,55 +6923,70 @@ class SessionEngine:
             request.stage_id,
         )
         checkpoint = await self.session_store.load_checkpoint(request.session_id)
-        try:
-            registered_agent = self._get_registered_agent(session.agent_name)
-            # A context-compaction stage may belong to a provider other than
-            # the session's assistant provider. Invocation-profile authority
-            # remains the session provider; the staged effect provider below
-            # is used only for exact budget settlement.
-            registered_provider = self._get_registered_provider(session.provider_name)
-            registered_environment = self._get_registered_environment_for_session(
-                session.environment_name
+        if terminalization is not None:
+            from cayu.runtime._durable_model_terminalization import (
+                require_terminalization_checkpoint,
             )
-        except (KeyError, RuntimeError) as registration_error:
-            raise ModelCompletionManualRecoveryRequired(
-                "Manual model recovery requires the original agent, provider, and "
-                "environment registrations."
-            ) from registration_error
-        budget_policy = self._get_budget_policy()
-        active_profile = await self.validate_execution_profile_continuation(
-            session=session,
-            checkpoint=checkpoint,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            budget_policy=budget_policy,
-            require_open_interaction=prior is None,
-        )
-        invocation_context = _authenticated_invocation_context(
-            active_profile=active_profile,
-            binding=AdmittedInvocationBinding(
-                session_id=session.id,
-                session_instance_id=session.instance_id,
-                interaction_id=active_profile.interaction_id,
-                run_epoch=session.run_epoch,
-                agent_name=session.agent_name,
-                provider_name=session.provider_name,
-                model=session.model,
-                runtime_name=session.runtime_name,
-                runtime_version=session.runtime_version,
-                runtime_build_provenance=session.runtime_build_provenance,
-                environment_name=session.environment_name,
-            ),
-            validated_profile=active_profile.profile,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            runtime_hooks=self._runtime_hooks,
-            loop_policies=self._loop_policies,
-            request_loop_policies=(),
-            budget_policy=budget_policy,
-            tool_capability_ceiling=_session_tool_capability_ceiling(session),
-        )
+
+            active_profile = require_terminalization_checkpoint(session, checkpoint)
+            if (
+                active_profile.interaction_id != interaction_id
+                or active_profile.profile.fingerprint
+                != recovery_context.execution_profile_fingerprint
+            ):
+                raise SessionModelCompletionStageConflict(
+                    "Model terminalization lost exact stage/profile authority."
+                )
+        else:
+            try:
+                registered_agent = self._get_registered_agent(session.agent_name)
+                # A context-compaction stage may belong to a provider other than
+                # the session's assistant provider. Invocation-profile authority
+                # remains the session provider; the staged effect provider below
+                # is used only for exact budget settlement.
+                registered_provider = self._get_registered_provider(session.provider_name)
+                registered_environment = self._get_registered_environment_for_session(
+                    session.environment_name
+                )
+            except (KeyError, RuntimeError) as registration_error:
+                raise ModelCompletionManualRecoveryRequired(
+                    "Manual model recovery requires the original agent, provider, and "
+                    "environment registrations."
+                ) from registration_error
+            budget_policy = self._get_budget_policy()
+            active_profile = await self.validate_execution_profile_continuation(
+                session=session,
+                checkpoint=checkpoint,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                budget_policy=budget_policy,
+                require_open_interaction=prior is None,
+            )
+            _authenticated_invocation_context(
+                active_profile=active_profile,
+                binding=AdmittedInvocationBinding(
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    interaction_id=active_profile.interaction_id,
+                    run_epoch=session.run_epoch,
+                    agent_name=session.agent_name,
+                    provider_name=session.provider_name,
+                    model=session.model,
+                    runtime_name=session.runtime_name,
+                    runtime_version=session.runtime_version,
+                    runtime_build_provenance=session.runtime_build_provenance,
+                    environment_name=session.environment_name,
+                ),
+                validated_profile=active_profile.profile,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                request_loop_policies=(),
+                budget_policy=budget_policy,
+                tool_capability_ceiling=_session_tool_capability_ceiling(session),
+            )
         if prior is not None:
             budget_events = await self._run_limit_controller.recover_pending_budget_settlements(
                 session_id=request.session_id
@@ -7084,6 +7116,14 @@ class SessionEngine:
             "session_id",
             "interaction_id",
         )
+        if terminalization is not None:
+            decision = terminalization[1]
+            recovery_event = recovery_event.model_copy(
+                update={
+                    "id": decision.interaction_event_id,
+                    "timestamp": decision.observed_at,
+                }
+            )
         recovery_event = self._event_writer.prepare(recovery_event)
         try:
             transition_result = await self.session_store.apply_invocation_lifecycle_command(
@@ -7091,12 +7131,21 @@ class SessionEngine:
                     session_id=request.session_id,
                     expected_session_instance_id=current.instance_id,
                     expected_run_epoch=current.run_epoch,
-                    expected_active_profile=invocation_context.active_profile,
+                    expected_active_profile=active_profile,
+                    recovery_claim_id=None
+                    if terminalization is None
+                    else terminalization[0].claim_id,
+                    terminalization_only=terminalization is not None,
+                    terminalization_plan_ownership=terminalization_plan_owner()
+                    if terminalization is not None
+                    else None,
                     transition=InteractionTransitionSpec(
                         event=recovery_event,
                         from_statuses=(current.status,),
                         to_status=request.terminal_status,
                         model_completion_stage_settlement=expected_settlement,
+                        terminal_event=None if terminalization is None else terminalization[2],
+                        terminal_decision=None if terminalization is None else terminalization[1],
                     ),
                 )
             )
@@ -7125,7 +7174,10 @@ class SessionEngine:
                 replayed=True,
             )
 
-        await self._event_writer.fan_out_persisted([transition.event])
+        await self._event_writer.fan_out_persisted(
+            [transition.event]
+            + ([] if transition.terminal_event is None else [transition.terminal_event])
+        )
         settlement = await self.session_store.load_model_completion_stage_settlement(
             request.session_id,
             request.stage_id,
