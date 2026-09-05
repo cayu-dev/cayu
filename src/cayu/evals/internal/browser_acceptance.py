@@ -7,10 +7,11 @@ builds or pulls the image and never calls a live model provider.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import multiprocessing
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -39,7 +40,8 @@ from cayu._task_wait import (
     await_shielded_task_outcome,
     restore_task_cancellation_requests,
 )
-from cayu.core.events import Event, event_durable_sequence
+from cayu._validation import canonical_durable_json_bytes
+from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import TextPart, ToolResultPart
 from cayu.egress import HttpxUpstream
@@ -59,15 +61,21 @@ from cayu.evals.browser_acceptance_manifests import (
     DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION,
     deterministic_browser_acceptance_manifest,
 )
-from cayu.evals.corpus import _content_revision
+from cayu.evals.corpus import EvaluationEvidencePolicySpec, _content_revision
+from cayu.evals.evidence import (
+    ToolCallEvidenceV1,
+    ToolCallValueEvidenceV1,
+    project_assertion_evidence_view,
+)
 from cayu.evals.models import EvalStatus, EvalTrialResult
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import _trajectory_from_terminal_evidence, trajectory_from_session
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand, Runner
 from cayu.runtime._event_projection import public_event_sequence
-from cayu.runtime.egress import VirtualEgressEnvironmentFactory
+from cayu.runtime.egress import VIRTUAL_EGRESS_EVENT_TYPES, VirtualEgressEnvironmentFactory
 from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.sessions import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
@@ -79,16 +87,23 @@ from cayu.runtime.sessions import (
     TerminalSessionEvidenceLimits,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tools.browser_session import BrowserBackendFailure, BrowserBackendResponse
+from cayu.tools.browser_session import (
+    BrowserBackendFailure,
+    BrowserBackendResponse,
+    BrowserSessionTool,
+    _durable_browser_operation_locator_key,
+)
 
 _AGENT = "browser-acceptance"
 _MODEL = "browser-acceptance-deterministic-v1"
 _POLICY = "browser-acceptance"
 _PLANNER_REVISION = _content_revision(
     {
-        "version": 1,
+        "version": 2,
         "case_prompt": "browser acceptance case: <case-id>",
         "selection": "accessible-name exact first match",
+        "detached_element_settlement_ms": 3_000,
+        "browser_crash_wait_ms": 2_000,
         "terminal_output": "browser_acceptance:success",
     },
     "browser acceptance deterministic planner",
@@ -373,6 +388,11 @@ class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
         operation = case.operations[operation_index]
+        if operation_index == 1 and case_id in {
+            "action-detached-control",
+            "action-replaced-element",
+        }:
+            await asyncio.sleep(3)
         arguments = _operation_arguments(
             case_id=case_id,
             operation=operation,
@@ -561,28 +581,86 @@ def _browser_results(request: ModelRequest) -> tuple[dict[str, Any], ...]:
     return tuple(values)
 
 
-def _latest_browser_state(results: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+def _latest_browser_state(results: tuple[Mapping[str, Any], ...]) -> dict[str, Any]:
     for result in reversed(results):
         if all(type(result.get(key)) is str for key in ("session_id", "page_id", "revision")):
-            return result
+            control_epoch = result.get("control_epoch")
+            if type(control_epoch) is int:
+                return dict(result)
+            page_set = result.get("page_set")
+            pages = page_set.get("pages") if isinstance(page_set, Mapping) else None
+            if isinstance(pages, Sequence) and not isinstance(pages, (str, bytes)):
+                page = next(
+                    (
+                        item
+                        for item in pages
+                        if isinstance(item, Mapping) and item.get("page_id") == result["page_id"]
+                    ),
+                    None,
+                )
+                if isinstance(page, Mapping) and type(page.get("control_epoch")) is int:
+                    return {**page, **result, "control_epoch": page["control_epoch"]}
+            return dict(result)
     raise RuntimeError("Browser acceptance operation has no prior browser observation.")
 
 
-def _latest_page_set(results: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+def _compact_recovered_browser_result(
+    structured: Mapping[str, Any], *, is_error: bool
+) -> dict[str, Any]:
+    """Keep the bounded fields consumed by the scorecard, not the full v3 page ledger."""
+
+    portable = structured.get("portable_result_evidence")
+    root = dict(portable) if isinstance(portable, Mapping) else {}
+    portable_structured = root.get("structured")
+    source = dict(portable_structured) if isinstance(portable_structured, Mapping) else structured
+    retained = {
+        key: source[key]
+        for key in (
+            "session_id",
+            "page_id",
+            "revision",
+            "url",
+            "load_state",
+            "access_state",
+            "truncation_reasons",
+            "backend_identity",
+            "artifacts",
+            "allocation_disposition",
+            "execution",
+            "error",
+        )
+        if key in source
+    }
+    return {
+        "content": "",
+        "structured": retained,
+        "is_error": is_error,
+    }
+
+
+def _latest_page_set(results: tuple[Mapping[str, Any], ...]) -> dict[str, Any]:
     for result in reversed(results):
         page_set = result.get("page_set")
-        if isinstance(page_set, dict) and isinstance(page_set.get("pages"), list):
-            return page_set
+        if not isinstance(page_set, Mapping):
+            continue
+        pages = page_set.get("pages")
+        if isinstance(pages, Sequence) and not isinstance(pages, (str, bytes)):
+            copied: dict[str, Any] = {}
+            for key, value in page_set.items():
+                if type(key) is not str:
+                    raise RuntimeError("Browser acceptance page-set key is malformed.")
+                copied[key] = value
+            return copied
     raise RuntimeError("Browser acceptance operation has no prior page-set evidence.")
 
 
-def _popup_page_id(results: tuple[dict[str, Any], ...]) -> str:
+def _popup_page_id(results: tuple[Mapping[str, Any], ...]) -> str:
     page_set = _latest_page_set(results)
     pages = page_set["pages"]
     candidates = [
         page
         for page in pages
-        if isinstance(page, dict)
+        if isinstance(page, Mapping)
         and type(page.get("page_id")) is str
         and type(page.get("opener_page_id")) is str
         and page.get("lifecycle") in {"admitted", "active", "background"}
@@ -592,13 +670,17 @@ def _popup_page_id(results: tuple[dict[str, Any], ...]) -> str:
     return candidates[0]["page_id"]
 
 
-def _ref(state: dict[str, Any], names: tuple[str, ...]) -> str:
+def _ref(state: Mapping[str, Any], names: tuple[str, ...]) -> str:
     refs = state.get("refs")
-    if not isinstance(refs, list | tuple):
+    if not isinstance(refs, Sequence) or isinstance(refs, (str, bytes)):
         raise RuntimeError("Browser acceptance observation has no element references.")
     for name in names:
         for item in refs:
-            if isinstance(item, dict) and item.get("name") == name and type(item.get("ref")) is str:
+            if (
+                isinstance(item, Mapping)
+                and item.get("name") == name
+                and type(item.get("ref")) is str
+            ):
                 return item["ref"]
     raise RuntimeError("Browser acceptance observation lacks the required element reference.")
 
@@ -617,8 +699,6 @@ def _operation_arguments(
         "recovery-exact-terminal-replay",
     }:
         operation_id = f"{case_id}:1:navigate"
-    if case_id == "page-popup-exact-replay" and operation == "click":
-        operation_id = f"{case_id}:2:click"
     if operation == "navigate":
         route = fixture_route or "/basic"
         if case_id == "recovery-conflicting-operation-id" and operation_index == 1:
@@ -628,8 +708,6 @@ def _operation_arguments(
     state = (
         results[0]
         if case_id.startswith("revision-stale-ref-after-") and operation_index == 2 and results
-        else results[0]
-        if case_id == "page-popup-exact-replay" and operation_index == 2 and results
         else _latest_browser_state(results)
     )
     arguments: dict[str, Any] = {
@@ -642,7 +720,7 @@ def _operation_arguments(
         if operation in {"switch_page", "close_page"} and case_id.startswith("page-"):
             page_id = _popup_page_id(results)
         arguments["page_id"] = page_id
-        if operation not in {"switch_page", "close_page"}:
+        if operation not in {"observe", "switch_page", "close_page"}:
             arguments["expected_revision"] = state["revision"]
     if operation in {"click", "fill", "select", "press", "wait", "screenshot", "download"}:
         control_epoch = state.get("control_epoch")
@@ -650,7 +728,7 @@ def _operation_arguments(
             raise RuntimeError("Browser acceptance observation lacks its control epoch.")
         arguments["expected_control_epoch"] = control_epoch
     if operation == "wait":
-        arguments["wait_ms"] = 5_000 if case_id == "crash-during-execution" else 250
+        arguments["wait_ms"] = 2_000 if case_id == "crash-during-execution" else 250
     elif operation == "screenshot":
         arguments["full_page"] = True
     elif operation in {"click", "fill", "select", "press", "download"}:
@@ -712,7 +790,8 @@ def _operation_arguments(
     return arguments
 
 
-def _scenario_request(case: Any, *, session_id: str) -> RunRequest:
+def _case_request(case: Any, *, session_id: str | None = None) -> RunRequest:
+    manifest = deterministic_browser_acceptance_manifest()
     return RunRequest(
         session_id=session_id,
         agent_name=_AGENT,
@@ -720,7 +799,7 @@ def _scenario_request(case: Any, *, session_id: str) -> RunRequest:
         max_steps=len(case.operations) + 1,
         limits=RunLimits(
             max_tool_calls=len(case.operations),
-            max_elapsed_seconds=300,
+            max_elapsed_seconds=max(1, (manifest.limits.max_wall_time_ms + 999) // 1_000),
         ),
     )
 
@@ -737,12 +816,18 @@ def _build_runtime(
     root.mkdir(parents=True, exist_ok=True)
     provider = BrowserAcceptanceDeterministicProvider(cases)
     store = _FaultSQLiteSessionStore(root / "sessions.sqlite", control=control)
+    app = CayuApp(
+        session_store=store,
+        event_sinks=[_AcceptanceEventJournalSink(root / _OBSERVED_EVENTS_FILENAME)],
+        enable_logging=False,
+    )
     factory = VirtualEgressEnvironmentFactory(
         policies={
             _POLICY: BrowserEgressPolicy(
                 name=_POLICY,
                 allowed_hosts=hosts,
                 allowed_path_prefixes=("/",),
+                denied_prefixes=("/private",),
             )
         },
         approved_destinations=tuple(
@@ -752,6 +837,7 @@ def _build_runtime(
         upstream=HttpxUpstream(routes=upstream_routes),
         image=PINNED_BROWSER_SESSION_WORKLOAD.image,
         artifact_store=_FaultArtifactStore(root / "artifacts", control=control),
+        event_emitter=app.scoped_event_emitter(event_types=VIRTUAL_EGRESS_EVENT_TYPES),
         execution_profile_identity=_ENVIRONMENT_EXECUTION_PROFILE_IDENTITY,
     )
     bridge = WebBridge.sandboxed_browser(
@@ -762,7 +848,7 @@ def _build_runtime(
             "max_artifact_bytes": (
                 DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
             ),
-            "max_operations": 16,
+            "max_operations": 8,
             "max_snapshot_bytes": 64 * 1024,
             "max_sessions": 1,
             "multi_page": True,
@@ -777,10 +863,10 @@ def _build_runtime(
             },
             "max_pages": 4,
             "max_provisional_pages": 2,
-            "max_page_creations_per_operation": 2,
+            "max_page_creations_per_operation": 1,
             "max_total_page_creations": 8,
             "max_background_lifetime_seconds": 60,
-            "max_operations_per_page": 16,
+            "max_operations_per_page": 8,
             "max_observations_per_page": 16,
             "max_total_observations": 32,
             "max_refs_per_page": 256,
@@ -789,15 +875,11 @@ def _build_runtime(
             "max_artifacts_per_page": 4,
             "max_total_artifacts": 8,
             "max_page_cleanup_operations": 16,
+            "max_wait_ms": 3_000,
         },
     )
     if control is not None and control.scenario.value.startswith("browser_"):
         _install_browser_crash_fault(bridge, control)
-    app = CayuApp(
-        session_store=store,
-        event_sinks=[_AcceptanceEventJournalSink(root / _OBSERVED_EVENTS_FILENAME)],
-        enable_logging=False,
-    )
     app.register_provider(provider, default=True)
     app.register_environment_factory(
         EnvironmentSpec(
@@ -923,6 +1005,261 @@ async def _recover_scenario(app: CayuApp, session_id: str):
             reason="browser_acceptance_fault_recovery",
         )
     )
+
+
+async def _active_parent_run_epoch(app: CayuApp, session_id: str) -> int | None:
+    checkpoint = await app.session_store.load_checkpoint(session_id)
+    if type(checkpoint) is not dict:
+        return None
+    active = checkpoint.get("active_invocation_execution_profile")
+    if type(active) is not dict or active.get("session_id") != session_id:
+        return None
+    run_epoch = active.get("run_epoch")
+    return run_epoch if type(run_epoch) is int and run_epoch >= 0 else None
+
+
+def _browser_tool_invocation_identity(
+    event: Event,
+    *,
+    invocation_index: int,
+) -> tuple[str, int]:
+    """Rebuild generic evidence identity from one authenticated start event."""
+
+    tool_call_id = event.payload.get("tool_call_id")
+    round_identity = tuple(
+        event.payload.get(name) for name in ("tool_round_id", "model_step_id", "model_attempt_id")
+    )
+    if (
+        type(tool_call_id) is not str
+        or not tool_call_id
+        or type(event.tool_name) is not str
+        or not event.tool_name
+        or any(type(item) is not str or not item for item in round_identity)
+    ):
+        raise RuntimeError("Browser acceptance recovery identity is incomplete.")
+    invocation_document = {
+        "schema_version": 1,
+        "tool_call_id": tool_call_id,
+        "tool_name": event.tool_name,
+        "tool_round_identity": list(round_identity),
+        "invocation_index": invocation_index,
+    }
+    revision = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical_durable_json_bytes(
+                invocation_document,
+                "browser_acceptance_recovery_invocation_identity",
+            )
+        ).hexdigest()
+    )
+    return revision, invocation_index
+
+
+async def _recovered_browser_tool_calls(
+    app: CayuApp,
+    bridge: WebBridge,
+    case: Any,
+    trial: EvalTrialResult,
+    *,
+    parent_run_epoch: int | None,
+) -> tuple[ToolCallEvidenceV1, ...]:
+    """Authenticate browser receipts hidden by conservative interruption projection."""
+
+    trajectory = trial.trajectory
+    if trajectory is None:
+        return ()
+    evidence = project_assertion_evidence_view(
+        app,
+        trajectory,
+        evidence_policy=EvaluationEvidencePolicySpec.create(
+            include_tool_arguments=True,
+            include_tool_results=True,
+        ),
+    )
+    started_events = tuple(
+        event
+        for event in trajectory.events
+        if event.type is EventType.TOOL_CALL_STARTED and event.tool_name == "browser_session"
+    )
+    browser_calls = tuple(
+        item for item in evidence.tool_calls if item.tool_name == "browser_session"
+    )
+    if not started_events:
+        if browser_calls:
+            raise RuntimeError("Browser acceptance recovery has conflicting tool-call evidence.")
+        return ()
+    if len(browser_calls) > len(started_events):
+        raise RuntimeError("Browser acceptance recovery has conflicting tool-call evidence.")
+    calls_by_revision = {item.invocation_revision: item for item in browser_calls}
+    if len(calls_by_revision) != len(browser_calls):
+        raise RuntimeError("Browser acceptance recovery has duplicate tool-call evidence.")
+    started_identities = tuple(
+        _browser_tool_invocation_identity(event, invocation_index=index)
+        for index, event in enumerate(started_events, 1)
+    )
+    if set(calls_by_revision) - {revision for revision, _ in started_identities}:
+        raise RuntimeError("Browser acceptance recovery has conflicting tool-call evidence.")
+    if len(browser_calls) == len(started_events) and all(
+        item.arguments.state == "available" and item.result.state == "available"
+        for item in browser_calls
+    ):
+        return ()
+    if parent_run_epoch is None:
+        raise RuntimeError("Browser acceptance recovery lost its parent run epoch.")
+    browser_tool = bridge.tools[0]
+    if type(browser_tool) is not BrowserSessionTool:
+        raise RuntimeError("Browser acceptance recovery lost its browser tool.")
+
+    prior_results: list[dict[str, Any]] = []
+    recovered: list[ToolCallEvidenceV1] = []
+    for operation_index, (started_event, identity) in enumerate(
+        zip(started_events, started_identities, strict=True)
+    ):
+        if operation_index >= len(case.operations):
+            raise RuntimeError("Browser acceptance recovery observed an extra browser call.")
+        invocation_revision, invocation_index = identity
+        call = calls_by_revision.get(invocation_revision)
+        expected_arguments = _operation_arguments(
+            case_id=case.case_id,
+            operation=case.operations[operation_index],
+            operation_index=operation_index,
+            fixture_route=case.fixture_route,
+            results=tuple(prior_results),
+        )
+        if (
+            call is not None
+            and call.arguments.state == "available"
+            and call.arguments.value != expected_arguments
+        ):
+            raise RuntimeError("Browser acceptance recovery arguments conflict with the corpus.")
+        payload = started_event.payload
+        identity_fields: dict[str, str] = {}
+        for name in (
+            "execution_profile_fingerprint",
+            "idempotency_key",
+            "model_step_id",
+            "model_attempt_id",
+            "tool_round_id",
+            "tool_call_id",
+        ):
+            value = payload.get(name)
+            if type(value) is not str:
+                raise RuntimeError("Browser acceptance recovery identity is incomplete.")
+            identity_fields[name] = value
+        locator_key = _durable_browser_operation_locator_key(
+            parent_session_id=started_event.session_id,
+            parent_run_epoch=parent_run_epoch,
+            model_step_id=identity_fields["model_step_id"],
+            model_attempt_id=identity_fields["model_attempt_id"],
+            tool_round_id=identity_fields["tool_round_id"],
+            tool_call_id=identity_fields["tool_call_id"],
+            idempotency_key=identity_fields["idempotency_key"],
+        )
+        locator = await app.session_store.load_session_operation(
+            started_event.session_id,
+            locator_key,
+        )
+        expected_arguments_sha256 = hashlib.sha256(
+            canonical_durable_json_bytes(
+                expected_arguments,
+                "browser_acceptance_recovery_arguments",
+            )
+        ).hexdigest()
+        expected_locator = {
+            "record_type": "cayu.browser-operation-locator",
+            "schema_version": 1,
+            "parent_session_id": started_event.session_id,
+            "parent_run_epoch": parent_run_epoch,
+            "execution_profile_fingerprint": identity_fields["execution_profile_fingerprint"],
+            "environment_name": started_event.environment_name,
+            "model_step_id": identity_fields["model_step_id"],
+            "model_attempt_id": identity_fields["model_attempt_id"],
+            "tool_round_id": identity_fields["tool_round_id"],
+            "tool_call_id": identity_fields["tool_call_id"],
+            "idempotency_key": identity_fields["idempotency_key"],
+            "effective_arguments_sha256": expected_arguments_sha256,
+        }
+        mismatches = (
+            tuple(expected_locator)
+            if type(locator) is not dict
+            else tuple(
+                name for name, expected in expected_locator.items() if locator.get(name) != expected
+            )
+        )
+        if (
+            type(locator) is not dict
+            or mismatches
+            or type(locator.get("allocation_fingerprint")) is not str
+        ):
+            detail = ",".join(mismatches) or "allocation_fingerprint"
+            raise RuntimeError(
+                f"Browser acceptance durable browser locator is unavailable ({detail})."
+            )
+
+        async def load_operation(
+            storage_key: str,
+            session_id: str = started_event.session_id,
+        ) -> dict[str, Any] | None:
+            return await app.session_store.load_session_operation(
+                session_id,
+                storage_key,
+            )
+
+        result = await browser_tool.reconcile_durable_tool_call(
+            parent_session_id=started_event.session_id,
+            parent_run_epoch=parent_run_epoch,
+            execution_profile_fingerprint=identity_fields["execution_profile_fingerprint"],
+            environment_name=started_event.environment_name,
+            environment_allocation_fingerprint=locator["allocation_fingerprint"],
+            model_step_id=identity_fields["model_step_id"],
+            model_attempt_id=identity_fields["model_attempt_id"],
+            tool_round_id=identity_fields["tool_round_id"],
+            tool_call_id=identity_fields["tool_call_id"],
+            idempotency_key=identity_fields["idempotency_key"],
+            arguments=expected_arguments,
+            started=True,
+            load_operation=load_operation,
+        )
+        if result is None:
+            raise RuntimeError("Browser acceptance durable browser result is unavailable.")
+        structured = dict(result.structured or {})
+        portable = structured.get("portable_result_evidence")
+        portable_structured = portable.get("structured") if isinstance(portable, Mapping) else None
+        recovered_structured = structured
+        if not all(
+            type(recovered_structured.get(key)) is str
+            for key in ("session_id", "page_id", "revision")
+        ) and isinstance(portable_structured, Mapping):
+            recovered_structured = dict(portable_structured)
+        prior_results.append(recovered_structured)
+        if (
+            call is not None
+            and call.arguments.state == "available"
+            and call.result.state == "available"
+        ):
+            continue
+        result_value = _compact_recovered_browser_result(
+            recovered_structured,
+            is_error=result.is_error,
+        )
+        recovered.append(
+            ToolCallEvidenceV1(
+                invocation_index=invocation_index,
+                invocation_revision=invocation_revision,
+                tool_name="browser_session",
+                occurrence=operation_index + 1,
+                arguments=ToolCallValueEvidenceV1(
+                    state="available",
+                    value=expected_arguments,
+                ),
+                result=ToolCallValueEvidenceV1(
+                    state="available",
+                    value=result_value,
+                ),
+            )
+        )
+    return tuple(recovered)
 
 
 async def _drain_acceptance_event_observations(app: CayuApp) -> None:
@@ -1057,7 +1394,7 @@ def _process_scenario_worker(
         )
         await _consume_run(
             app,
-            _scenario_request(case, session_id=session_id),
+            _case_request(case, session_id=session_id),
         )
         raise RuntimeError("Browser acceptance process-loss boundary was not reached.")
 
@@ -1105,6 +1442,7 @@ class _DeterministicScenarioExecutor:
         started_at = datetime.now(UTC)
         process_loss = scenario.value.startswith("process_")
         interrupted = False
+        parent_run_epoch: int | None = None
         if process_loss:
             process = multiprocessing.get_context("spawn").Process(
                 target=self._process_worker,
@@ -1131,7 +1469,7 @@ class _DeterministicScenarioExecutor:
             finally:
                 if process.pid is not None and not process.is_alive():
                     process.close()
-            app, _, _ = _build_runtime(
+            app, bridge, _ = _build_runtime(
                 root=trial_root,
                 upstream_routes=self._upstream_routes,
                 hosts=self._hosts,
@@ -1139,11 +1477,12 @@ class _DeterministicScenarioExecutor:
                 seccomp_profile=self._seccomp_profile,
                 control=None,
             )
+            parent_run_epoch = await _active_parent_run_epoch(app, session_id)
             recovery = await _recover_scenario(app, session_id)
             interrupted = recovery.status is SessionStatus.INTERRUPTED
         else:
             control = _FaultControl(scenario, marker_path, len(case.operations))
-            app, _, _ = _build_runtime(
+            app, bridge, _ = _build_runtime(
                 root=trial_root,
                 upstream_routes=self._upstream_routes,
                 hosts=self._hosts,
@@ -1154,7 +1493,7 @@ class _DeterministicScenarioExecutor:
             run_task = asyncio.create_task(
                 _consume_run(
                     app,
-                    _scenario_request(case, session_id=session_id),
+                    _case_request(case, session_id=session_id),
                 )
             )
             try:
@@ -1174,6 +1513,7 @@ class _DeterministicScenarioExecutor:
             if scenario.value.startswith("cancel_") or scenario is (
                 BrowserAcceptanceFaultScenario.ACKNOWLEDGEMENT_LOSS
             ):
+                parent_run_epoch = await _active_parent_run_epoch(app, session_id)
                 recovery = await _recover_scenario(app, session_id)
                 interrupted = recovery.status is SessionStatus.INTERRUPTED
         await _drain_acceptance_event_observations(app)
@@ -1208,9 +1548,26 @@ class _DeterministicScenarioExecutor:
             duration_ms=max(int((completed_at - started_at).total_seconds() * 1000), 0),
             trajectory=trajectory,
         )
+        recovered_tool_calls = await _recovered_browser_tool_calls(
+            app,
+            bridge,
+            case,
+            trial,
+            parent_run_epoch=parent_run_epoch,
+        )
+        if not await app.drain_environment_cleanups(timeout_s=10.0):
+            raise RuntimeError("Browser acceptance environment cleanup did not quiesce.")
+        session = await app.session_store.load(session_id)
+        if session is None:
+            raise RuntimeError("Browser acceptance fault execution session is unavailable.")
+        execution_profile_fingerprint = execution_profile_from_session_metadata(
+            session.metadata
+        ).fingerprint
         return BrowserAcceptanceScenarioExecutionV1(
             app=app,
             trial=trial,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+            recovered_tool_calls=recovered_tool_calls,
             fault=BrowserAcceptanceFaultEvidenceV1(
                 scenario=scenario,
                 boundary_observed=True,
@@ -1252,17 +1609,7 @@ async def build(fixture: BrowserAcceptanceFixtureV1) -> BrowserAcceptancePlanV1:
         cases=[
             EvalCase(
                 id=case.case_id,
-                request=RunRequest(
-                    agent_name=_AGENT,
-                    messages=[Message.text("user", f"browser acceptance case: {case.case_id}")],
-                    max_steps=len(case.operations) + 1,
-                    limits=RunLimits(
-                        max_tool_calls=len(case.operations),
-                        max_elapsed_seconds=max(
-                            1, (manifest.limits.max_wall_time_ms + 999) // 1_000
-                        ),
-                    ),
-                ),
+                request=_case_request(case),
                 assertions=[SessionCompleted()],
                 metadata={"browser_acceptance_case_revision": case.revision},
             )

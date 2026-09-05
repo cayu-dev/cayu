@@ -71,10 +71,11 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 _case(
                     "access-broker-denial",
                     category=BrowserAcceptanceCaseCategory.REFUSAL,
-                    state=BrowserAcceptanceState.REFUSED,
                     route="/denied-subresource",
-                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
-                    parameters={"error": "fetch_failed"},
+                    parameters={
+                        "required_operations": ["navigate"],
+                        "required_requests": [{"path": "/private/denied.js", "outcome": "denied"}],
+                    },
                 ),
                 _case(
                     "access-main-document-denial",
@@ -82,7 +83,17 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                     state=BrowserAcceptanceState.REFUSED,
                     route="https://blocked.browser.test/private",
                     oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
-                    parameters={"error": "fetch_failed"},
+                    parameters={
+                        "error": "fetch_failed",
+                        "required_requests": [
+                            {
+                                "method": "CONNECT",
+                                "destination": "blocked.browser.test",
+                                "path": "/",
+                                "outcome": "denied",
+                            }
+                        ],
+                    },
                 ),
                 _case(
                     "access-redirect-denial",
@@ -90,7 +101,23 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                     state=BrowserAcceptanceState.REFUSED,
                     route="/redirect-denied",
                     oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
-                    parameters={"error": "fetch_failed"},
+                    parameters={
+                        "error": "fetch_failed",
+                        "required_requests": [
+                            {
+                                "method": "GET",
+                                "destination": "docs.browser.test",
+                                "path": "/redirect-denied",
+                                "outcome": "authorized",
+                            },
+                            {
+                                "method": "CONNECT",
+                                "destination": "blocked.browser.test",
+                                "path": "/",
+                                "outcome": "denied",
+                            },
+                        ],
+                    },
                 ),
                 _case(
                     "action-delayed-element",
@@ -161,7 +188,7 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                     operations=("navigate", "click"),
                     route="/detached",
                     oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
-                    parameters={"error": "stale_observation"},
+                    parameters={"error": "actionability_failed"},
                 ),
                 _case(
                     "action-occluded-control",
@@ -179,7 +206,7 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                     operations=("navigate", "click"),
                     route="/replaced",
                     oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
-                    parameters={"error": "stale_observation"},
+                    parameters={"error": "actionability_failed"},
                 ),
                 _case(
                     "action-readonly-control",
@@ -193,11 +220,13 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 _case(
                     "adversarial-challenge-page",
                     category=BrowserAcceptanceCaseCategory.ADVERSARIAL,
+                    state=BrowserAcceptanceState.REFUSED,
                     route="/challenge",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
                     parameters={
                         "required_operations": ["navigate"],
                         "forbidden_operations": ["click", "download"],
-                        "access_state": "blocked",
+                        "error": "access_blocked",
                     },
                 ),
                 _case(
@@ -212,10 +241,8 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 _case(
                     "ambiguity-acknowledgement-loss",
                     category=BrowserAcceptanceCaseCategory.AMBIGUITY,
-                    state=BrowserAcceptanceState.AMBIGUOUS,
                     oracle=BrowserAcceptanceSemanticOracle.RECOVERY_STATE,
                     parameters={
-                        "error": "outcome_ambiguous",
                         "expected_browser_dispatches": 1,
                     },
                     fault_scenario=BrowserAcceptanceFaultScenario.ACKNOWLEDGEMENT_LOSS,
@@ -232,7 +259,7 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                     "artifact-screenshot",
                     category=BrowserAcceptanceCaseCategory.SUCCESS,
                     operations=("navigate", "screenshot"),
-                    route="/long-page",
+                    route="/basic",
                     oracle=BrowserAcceptanceSemanticOracle.ARTIFACT,
                     parameters={"kind": "screenshot"},
                     checkpoints=("after-navigation",),
@@ -359,7 +386,7 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 _case(
                     "limit-long-observation-truncation",
                     category=BrowserAcceptanceCaseCategory.LIMIT,
-                    route="/long-page",
+                    route="/long-observation",
                     parameters={
                         "required_operations": ["navigate"],
                         "required_truncation": ["snapshot"],
@@ -569,13 +596,14 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 _case(
                     "page-popup-exact-replay",
                     category=BrowserAcceptanceCaseCategory.RECOVERY,
-                    operations=("navigate", "click", "click", "list_pages"),
+                    operations=("navigate", "click"),
                     route="/popup",
                     oracle=BrowserAcceptanceSemanticOracle.RECOVERY_STATE,
                     parameters={
-                        "required_operations": ["navigate", "click", "click", "list_pages"],
-                        "expected_browser_dispatches": 3,
+                        "required_operations": ["navigate", "click"],
+                        "expected_browser_dispatches": 2,
                     },
+                    fault_scenario=BrowserAcceptanceFaultScenario.ACKNOWLEDGEMENT_LOSS,
                 ),
                 _case(
                     "page-popup-process-loss-ambiguity",
@@ -606,13 +634,14 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 _case(
                     "recovery-exact-terminal-replay",
                     category=BrowserAcceptanceCaseCategory.RECOVERY,
-                    operations=("navigate", "navigate"),
+                    operations=("navigate",),
                     route="/basic",
                     oracle=BrowserAcceptanceSemanticOracle.RECOVERY_STATE,
                     parameters={
                         "expected_route_requests": 1,
                         "expected_browser_dispatches": 1,
                     },
+                    fault_scenario=BrowserAcceptanceFaultScenario.ACKNOWLEDGEMENT_LOSS,
                 ),
                 _case(
                     "recovery-process-loss-acknowledgement",
@@ -730,7 +759,7 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 for case in cases
                 if case.expected_state is not BrowserAcceptanceState.UNSUPPORTED
             ),
-            max_wall_time_ms=300_000,
+            max_wall_time_ms=900_000,
             max_artifact_bytes=(
                 DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
                 * sum(

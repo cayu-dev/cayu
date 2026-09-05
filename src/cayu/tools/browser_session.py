@@ -188,6 +188,7 @@ _PAGE_TERMINAL_REASONS = frozenset(
 )
 _BACKEND_FAILURE_CODES = frozenset(
     {
+        "access_blocked",
         "actionability_failed",
         "allocation_lost",
         "artifact_write_failed",
@@ -216,6 +217,7 @@ _BACKEND_FAILURE_CODES = frozenset(
     }
 )
 _ERROR_MESSAGES = {
+    "access_blocked": "The destination returned a classified access barrier.",
     "actionability_failed": "The browser element was not actionable.",
     "artifact_write_failed": "The browser artifact could not be stored safely.",
     "browser_crash": "The interactive browser stopped unexpectedly.",

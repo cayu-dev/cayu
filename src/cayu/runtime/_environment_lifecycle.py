@@ -1612,6 +1612,11 @@ class EnvironmentLifecycle:
                 session_id=session.id,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
+                interaction_id=(
+                    None
+                    if invocation_context is None
+                    else invocation_context.binding.interaction_id
+                ),
                 execution_profile_fingerprint=(
                     None if execution_profile is None else execution_profile.fingerprint
                 ),

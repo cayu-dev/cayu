@@ -54,17 +54,18 @@ from cayu.evals.corpus import (
     _content_revision,
     pricing_profile_identity,
 )
-from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
+from cayu.evals.evidence import (
+    AssertionEvidenceView,
+    ToolCallEvidenceV1,
+    project_assertion_evidence_view,
+)
 from cayu.evals.models import EvalStatus, EvalTrialResult
 from cayu.evals.runner import EvalPlan, EvalSuite, run_eval_suite
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.runtime.costs import PriceBook
 from cayu.runtime.usage import SessionUsageSummary
-from cayu.tools.browser_session import (
-    DEFAULT_BROWSER_SESSION_MAX_ARTIFACT_BYTES,
-    BrowserSessionTool,
-)
+from cayu.tools.browser_session import BrowserSessionTool
 from cayu.tools.webbridge import WebBridge, WebBridgeProfileKind
 
 BROWSER_ACCEPTANCE_SCHEMA_VERSION = 1
@@ -82,18 +83,21 @@ BROWSER_ACCEPTANCE_MAX_OPERATIONS_PER_CASE = 64
 BROWSER_ACCEPTANCE_MAX_CHECKPOINTS_PER_CASE = 32
 BROWSER_ACCEPTANCE_MAX_ERROR_CATEGORIES = 64
 BROWSER_ACCEPTANCE_MAX_TRUNCATION_CATEGORIES = 32
-BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION = DEFAULT_BROWSER_SESSION_MAX_ARTIFACT_BYTES
+BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION = 4 * 1024 * 1024
 
 _REFUSAL_ERRORS = frozenset(
     {
+        "access_blocked",
         "actionability_failed",
-        "allocation_lost",
         "authority_expired",
+        "destination_denied",
         "fetch_failed",
         "incompatible_profile",
+        "missing_element",
         "operation_conflict",
         "operation_not_dispatched",
         "policy_denied",
+        "redirect_denied",
         "resource_exhausted",
         "restoration_required",
         "session_closed",
@@ -1397,6 +1401,8 @@ class BrowserAcceptanceScenarioExecutionV1:
     app: Any
     trial: EvalTrialResult
     fault: BrowserAcceptanceFaultEvidenceV1
+    execution_profile_fingerprint: str
+    recovered_tool_calls: tuple[ToolCallEvidenceV1, ...] = ()
 
     def __post_init__(self) -> None:
         from cayu.runtime.app import CayuApp
@@ -1408,6 +1414,19 @@ class BrowserAcceptanceScenarioExecutionV1:
             self,
             "fault",
             BrowserAcceptanceFaultEvidenceV1.model_validate(self.fault),
+        )
+        object.__setattr__(
+            self,
+            "execution_profile_fingerprint",
+            _fingerprint(
+                self.execution_profile_fingerprint,
+                "scenario execution profile fingerprint",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "recovered_tool_calls",
+            tuple(ToolCallEvidenceV1.model_validate(item) for item in self.recovered_tool_calls),
         )
 
 
@@ -1956,7 +1975,7 @@ async def inspect_browser_acceptance_runtime_identity(
         raise RuntimeError("Browser acceptance plan lost its direct eval application.")
     _registered_browser_acceptance_tool(plan)
 
-    profile_fingerprints: set[str] = set()
+    case_profile_fingerprints: list[dict[str, str]] = []
     model_targets: set[tuple[str, str]] = set()
     environment_materials: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for eval_case in suite.cases:
@@ -1971,7 +1990,15 @@ async def inspect_browser_acceptance_runtime_identity(
             raise ValueError(
                 "Browser acceptance executable case is not bound to its manifest revision."
             )
-        profile_fingerprints.add(await app.inspect_run_execution_profile(eval_case.request))
+        case_profile_fingerprints.append(
+            {
+                "case_id": eval_case.id,
+                "case_revision": manifest_case.revision,
+                "execution_profile_fingerprint": await app.inspect_run_execution_profile(
+                    eval_case.request
+                ),
+            }
+        )
         target = app.resolve_run_model_target(eval_case.request)
         if plan.manifest.mode is BrowserAcceptanceMode.DETERMINISTIC:
             from cayu.evals.internal.browser_acceptance import (
@@ -2008,8 +2035,6 @@ async def inspect_browser_acceptance_runtime_identity(
         egress_material = {"egress_authority": egress.model_dump(mode="json")}
         environment_materials.append((runner_material, egress_material))
 
-    if len(profile_fingerprints) != 1:
-        raise ValueError("Browser acceptance cases do not share one execution profile.")
     if len(model_targets) != 1:
         raise ValueError("Browser acceptance cases do not share one provider/model target.")
     runner_fingerprints = {
@@ -2062,7 +2087,10 @@ async def inspect_browser_acceptance_runtime_identity(
         workload_fingerprint=workload_fingerprint,
         egress_fingerprint=next(iter(egress_fingerprints)),
         artifact_store_fingerprint=artifact_store_fingerprint,
-        execution_profile_fingerprint=next(iter(profile_fingerprints)),
+        execution_profile_fingerprint=_identity_fingerprint(
+            {"case_execution_profiles": case_profile_fingerprints},
+            "browser acceptance case execution profiles",
+        ),
         execution_suite_fingerprint=_browser_acceptance_execution_suite_fingerprint(plan),
         provider_name=provider_name,
         model=model,
@@ -2723,6 +2751,7 @@ async def _run_browser_acceptance_locked(
                 {} if deterministic_fixture is None else deterministic_fixture.request_counts()
             )
             fault_evidence: BrowserAcceptanceFaultEvidenceV1 | None = None
+            recovered_tool_calls: tuple[ToolCallEvidenceV1, ...] = ()
             execution_app = app
             try:
                 if case.fault_scenario is None:
@@ -2754,6 +2783,18 @@ async def _run_browser_acceptance_locked(
                     execution_app = scenario.app
                     trial = scenario.trial
                     fault_evidence = scenario.fault
+                    recovered_tool_calls = scenario.recovered_tool_calls
+                    expected_execution_profile_fingerprint = (
+                        await app.inspect_run_execution_profile(eval_case.request)
+                    )
+                    if (
+                        scenario.execution_profile_fingerprint
+                        != expected_execution_profile_fingerprint
+                    ):
+                        raise RuntimeError(
+                            "Browser acceptance fault execution profile conflicts with "
+                            "its planned case profile."
+                        )
                     trial_started_at = trial.started_at
                     trial_completed_at = trial.completed_at
             except Exception:
@@ -2843,6 +2884,7 @@ async def _run_browser_acceptance_locked(
                     request_summaries_truncated=request_summaries_truncated,
                     agent_report_state=agent_state,
                     fault=fault_evidence,
+                    recovered_tool_calls=recovered_tool_calls,
                     attempt_number=attempt_number,
                     required_cost_currencies=plan.cost_currencies,
                 )
@@ -3036,6 +3078,7 @@ def project_browser_acceptance_diagnostic(
     request_summaries_truncated: bool = False,
     capture_error_code: str | None = None,
     fault: BrowserAcceptanceFaultEvidenceV1 | None = None,
+    recovered_tool_calls: tuple[ToolCallEvidenceV1, ...] = (),
 ) -> BrowserAcceptanceDiagnosticV1:
     """Project the already-bounded eval evidence into browser-only diagnostics."""
 
@@ -3054,6 +3097,50 @@ def project_browser_acceptance_diagnostic(
     browser_calls = tuple(
         call for call in evidence.tool_calls if call.tool_name == "browser_session"
     )
+    recovered_by_revision: dict[str, ToolCallEvidenceV1] = {}
+    for item in recovered_tool_calls:
+        recovered = ToolCallEvidenceV1.model_validate(item)
+        if recovered.tool_name != "browser_session":
+            raise ValueError("Recovered browser evidence names another tool.")
+        if recovered.invocation_revision in recovered_by_revision:
+            raise ValueError("Recovered browser evidence contains duplicate invocations.")
+        recovered_by_revision[recovered.invocation_revision] = recovered
+    merged_calls: list[ToolCallEvidenceV1] = []
+    for call in browser_calls:
+        recovered = recovered_by_revision.pop(call.invocation_revision, None)
+        if recovered is None:
+            merged_calls.append(call)
+            continue
+        if (
+            recovered.invocation_index != call.invocation_index
+            or recovered.occurrence != call.occurrence
+            or recovered.tool_name != call.tool_name
+        ):
+            raise ValueError("Recovered browser evidence conflicts with its invocation.")
+        if call.arguments.state == "available" and call.arguments != recovered.arguments:
+            raise ValueError("Recovered browser arguments conflict with public evidence.")
+        if (
+            call.arguments.state == "available"
+            and call.result.state == "available"
+            and call.result != recovered.result
+        ):
+            raise ValueError("Recovered browser result conflicts with public evidence.")
+        merged_calls.append(recovered)
+    if recovered_by_revision:
+        if evidence.tool_call_evidence_state not in {"unavailable", "incompatible"}:
+            raise ValueError("Recovered browser evidence has no matching public invocation.")
+        additions = tuple(
+            sorted(recovered_by_revision.values(), key=lambda item: item.invocation_index)
+        )
+        if (
+            browser_calls
+            or tuple(item.invocation_index for item in additions)
+            != tuple(range(1, len(additions) + 1))
+            or tuple(item.occurrence for item in additions) != tuple(range(1, len(additions) + 1))
+        ):
+            raise ValueError("Recovered browser evidence conflicts with public invocation order.")
+        merged_calls.extend(additions)
+    browser_calls = tuple(merged_calls)
     if len(browser_calls) > BROWSER_ACCEPTANCE_MAX_OPERATIONS_PER_ROW:
         browser_calls = browser_calls[:BROWSER_ACCEPTANCE_MAX_OPERATIONS_PER_ROW]
         diagnostic_truncation.add("operations")
@@ -3458,6 +3545,74 @@ def _semantic_state(
             or diagnostic.fixture_route_request_count < minimum_route_requests
         ):
             return BrowserAcceptanceSemanticState.FAILED
+    required_requests = parameters.get("required_requests", [])
+    if not isinstance(required_requests, list | tuple):
+        return BrowserAcceptanceSemanticState.FAILED
+    for required_request in required_requests:
+        if not isinstance(required_request, dict):
+            return BrowserAcceptanceSemanticState.FAILED
+        path = required_request.get("path")
+        outcome = required_request.get("outcome")
+        method = required_request.get("method")
+        destination = required_request.get("destination")
+        if (
+            type(path) is not str
+            or type(outcome) is not str
+            or outcome not in {"authorized", "denied"}
+            or (method is not None and type(method) is not str)
+            or (destination is not None and type(destination) is not str)
+        ):
+            return BrowserAcceptanceSemanticState.FAILED
+        route_revision = _content_revision(
+            {"path": path},
+            "browser acceptance request route",
+        )
+        destination_revision = (
+            None
+            if destination is None
+            else _content_revision(
+                {"destination": destination},
+                "browser acceptance request destination",
+            )
+        )
+        if not any(
+            request.route_revision == route_revision
+            and request.outcome == outcome
+            and (method is None or request.method == method)
+            and (
+                destination_revision is None or request.destination_revision == destination_revision
+            )
+            for request in diagnostic.requests
+        ):
+            return BrowserAcceptanceSemanticState.FAILED
+    forbidden_requests = parameters.get("forbidden_requests", [])
+    if not isinstance(forbidden_requests, list | tuple):
+        return BrowserAcceptanceSemanticState.FAILED
+    if forbidden_requests and "requests" in diagnostic.truncated_categories:
+        return BrowserAcceptanceSemanticState.FAILED
+    for forbidden_request in forbidden_requests:
+        if not isinstance(forbidden_request, dict):
+            return BrowserAcceptanceSemanticState.FAILED
+        method = forbidden_request.get("method")
+        destination = forbidden_request.get("destination")
+        path = forbidden_request.get("path")
+        if type(method) is not str or type(destination) is not str or type(path) is not str:
+            return BrowserAcceptanceSemanticState.FAILED
+        destination_revision = _content_revision(
+            {"destination": destination},
+            "browser acceptance request destination",
+        )
+        route_revision = _content_revision(
+            {"path": path},
+            "browser acceptance request route",
+        )
+        if any(
+            request.method == method
+            and request.destination_revision == destination_revision
+            and request.route_revision == route_revision
+            for request in diagnostic.requests
+        ):
+            return BrowserAcceptanceSemanticState.FAILED
     if case.semantic_oracle is BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT:
         expected = parameters.get("expected_effects")
         return (
@@ -3533,6 +3688,7 @@ def project_browser_acceptance_trial(
     ),
     diagnostic_capture_error: str | None = None,
     fault: BrowserAcceptanceFaultEvidenceV1 | None = None,
+    recovered_tool_calls: tuple[ToolCallEvidenceV1, ...] = (),
     attempt_number: int = 1,
     required_cost_currencies: tuple[str, ...] = (),
 ) -> BrowserAcceptanceTrialReceiptV1:
@@ -3558,6 +3714,7 @@ def project_browser_acceptance_trial(
         request_summaries_truncated=request_summaries_truncated,
         capture_error_code=diagnostic_capture_error,
         fault=fault,
+        recovered_tool_calls=recovered_tool_calls,
     )
     infrastructure_state = (
         BrowserAcceptanceInfrastructureState.UNAVAILABLE

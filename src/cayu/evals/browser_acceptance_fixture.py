@@ -30,6 +30,7 @@ _FIXTURE_PAGE_ROUTES = (
     "/frame-controls",
     "/hidden",
     "/hostile",
+    "/long-observation",
     "/long-page",
     "/occluded",
     "/oversized",
@@ -46,7 +47,9 @@ _FIXTURE_PAGE_ROUTES = (
     "/replaced",
     "/same-origin-frame",
 )
-_FIXTURE_OVERSIZED_DOWNLOAD_BYTES = (8 * 1024 * 1024) + 1
+_FIXTURE_OVERSIZED_DOWNLOAD_BYTES = (4 * 1024 * 1024) + 1
+_FIXTURE_LONG_OBSERVATION_BLOCKS = 2
+_FIXTURE_LONG_OBSERVATION_TEXT = "bounded observation " * 2_000
 
 
 def _fixture_pages() -> dict[str, str]:
@@ -73,27 +76,39 @@ def _fixture_pages() -> dict[str, str]:
             </main>""",
         "/delayed": """<!doctype html><title>Delayed control</title><main id="root">waiting</main>
             <script>setTimeout(()=>{root.innerHTML='<button id="continue">Continue</button>';
-            continue.onclick=()=>fetch('/effect/delayed-clicked')},150)</script>""",
+            document.getElementById('continue').onclick=()=>fetch('/effect/delayed-clicked')},150)
+            </script>""",
         "/replaced": """<!doctype html><title>Replaced control</title><button id="target">Old</button>
-            <script>setTimeout(()=>{target.outerHTML='<button id="target">New</button>'},50)</script>""",
+            <script>setTimeout(()=>{document.getElementById('target').outerHTML=
+            '<button id="target">New</button>'},100)</script>""",
         "/actionability": """<!doctype html><title>Actionability</title>
             <button hidden>Hidden</button><button disabled>Disabled</button>
             <button style="position:absolute;left:0;top:0">Covered</button>
             <div style="position:absolute;left:0;top:0;width:200px;height:100px"></div>""",
         "/hidden": """<!doctype html><title>Hidden control</title>
-            <button hidden>Hidden action</button>""",
+            <button onpointerover="this.hidden=true">Hidden action</button>""",
         "/detached": """<!doctype html><title>Detached control</title>
             <button id="target">Detach me</button>
-            <script>setTimeout(()=>target.remove(),50)</script>""",
+            <script>setTimeout(()=>document.getElementById('target').remove(),100)</script>""",
         "/occluded": """<!doctype html><title>Occluded control</title>
             <button style="position:absolute;left:0;top:0">Covered action</button>
             <div style="position:absolute;left:0;top:0;width:200px;height:100px"></div>""",
         "/duplicate-labels": """<!doctype html><title>Duplicate labels</title>
             <button onclick="fetch('/effect/duplicate-first')">Continue</button>
             <button onclick="fetch('/effect/duplicate-second')">Continue</button>""",
-        "/long-page": """<!doctype html><title>Long page</title><main style="height:5000px">
-            <p>top</p><button style="position:absolute;top:4700px"
-            onclick="fetch('/effect/bottom-clicked')">Bottom action</button></main>""",
+        "/long-observation": (
+            "<!doctype html><title>Long observation</title><main>"
+            + "".join(
+                f"<p>{_FIXTURE_LONG_OBSERVATION_TEXT}{index}</p>"
+                for index in range(_FIXTURE_LONG_OBSERVATION_BLOCKS)
+            )
+            + "</main>"
+        ),
+        "/long-page": (
+            '<!doctype html><title>Long page</title><main style="height:5000px">'
+            + '<button style="position:absolute;top:4700px" '
+            "onclick=\"fetch('/effect/bottom-clicked')\">Bottom action</button></main>"
+        ),
         "/download": """<!doctype html><title>Download</title>
             <a href="/download/report.txt" download>Download report</a>""",
         "/download-oversized": """<!doctype html><title>Oversized download</title>
@@ -200,9 +215,11 @@ BROWSER_ACCEPTANCE_FIXTURE_REVISION = _content_revision(
         },
         "semantic_boundaries": {
             "delayed_control_ms": 150,
-            "detached_control_ms": 50,
-            "replaced_control_ms": 50,
+            "detached_control_ms": 100,
+            "replaced_control_ms": 100,
             "long_page_height_px": 5000,
+            "long_observation_blocks": _FIXTURE_LONG_OBSERVATION_BLOCKS,
+            "long_observation_block_bytes": len(_FIXTURE_LONG_OBSERVATION_TEXT.encode("utf-8")),
             "oversized_dom_controls": 20_000,
             "oversized_name_repetitions": 20_000,
             "oversized_response_repetitions": 100_000,

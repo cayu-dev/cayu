@@ -1041,8 +1041,9 @@ telemetry events (payloads never contain the real value): `credential.mode.selec
 and `egress.grant.minted` at start, `egress.request.authorized` /
 `egress.request.denied` per outbound request, and `egress.grant.revoked` at
 teardown. Request events include `authorization_kind`, which is
-`virtual_credential` or `credentialless`; credentialless records have a null
-`grant_id`. They are emitted best-effort from the proxy path and can lag
+`virtual_credential`, `credentialless`, or `transport`; `transport` identifies
+a CONNECT refusal before HTTP credential or path authority exists, and it and
+credentialless records have a null `grant_id`. They are emitted best-effort from the proxy path and can lag
 or reorder around terminal session events; the enforcement decision itself is
 still synchronous inside the broker. Payloads carry grant id, destination,
 method, path, policy name, and decision/status.

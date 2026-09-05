@@ -51,6 +51,7 @@ from cayu import (
     WorkspaceInstructions,
     WorkspaceInstructionsConfig,
     WorkspaceSnapshot,
+    copy_environment_factory_request,
     extract_durable_value_error,
 )
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
@@ -697,6 +698,22 @@ def test_environment_factory_request_preserves_existing_positional_field_order()
 
     assert request.parent_session_id == "parent-session"
     assert request.execution_profile_fingerprint is None
+    assert request.interaction_id is None
+
+
+def test_environment_factory_request_copy_preserves_interaction_identity() -> None:
+    request = EnvironmentFactoryRequest(
+        session_id="session",
+        agent_name="agent",
+        environment_name="environment",
+        interaction_id="interaction",
+    )
+
+    copied = copy_environment_factory_request(request)
+
+    assert copied == request
+    assert copied is not request
+    assert copied.interaction_id == "interaction"
 
 
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.id)

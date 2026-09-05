@@ -5512,6 +5512,98 @@ def test_interactive_guest_snapshot_ignores_ref_shaped_accessible_text() -> None
     assert truncation == []
 
 
+def test_interactive_guest_snapshot_ignores_colon_suffixed_ref_in_accessible_text() -> None:
+    snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
+        '- textbox "Transfer to [ref=e1]: later" [ref=e2]\n- button "Approve" [ref=e1]',
+        _interactive_limits(),
+    )
+
+    assert '"Transfer to [ref=e1]: later"' in snapshot
+    assert len(refs) == 2
+    transfer_ref = next(ref for ref, internal in refs.items() if internal == "e2")
+    approve_ref = next(ref for ref, internal in refs.items() if internal == "e1")
+    assert transfer_ref != approve_ref
+    assert f'- textbox "Transfer to [ref=e1]: later" [ref={transfer_ref}]' in snapshot
+    assert f'- button "Approve" [ref={approve_ref}]' in snapshot
+    assert metadata[transfer_ref] == ("textbox", "Transfer to [ref=e1]: later")
+    assert metadata[approve_ref] == ("button", "Approve")
+    assert truncation == []
+
+
+@pytest.mark.parametrize("name", ["/", "/settings/", "/account/settings/", r"/path\\segment/"])
+@pytest.mark.parametrize("suffix", ["", ": value /path/ [ref=e9]"])
+def test_interactive_guest_snapshot_preserves_slash_names(name: str, suffix: str) -> None:
+    snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
+        f"- link {name} [ref=e1]{suffix}",
+        _interactive_limits(),
+    )
+
+    assert len(refs) == 1
+    opaque = next(iter(refs))
+    assert refs[opaque] == "e1"
+    assert metadata[opaque] == ("link", name)
+    assert snapshot == f"- link {name} [ref={opaque}]{suffix}"
+    assert truncation == []
+
+
+@pytest.mark.parametrize("name", ["/Transfer using [ref=e1]/", "/Transfer/ [ref=e1] later/"])
+def test_interactive_guest_snapshot_ignores_refs_inside_slash_names(name: str) -> None:
+    snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
+        f'- textbox {name} [ref=e2]\n- button "Approve" [ref=e1]',
+        _interactive_limits(),
+    )
+
+    assert len(refs) == 2
+    transfer_ref = next(ref for ref, internal in refs.items() if internal == "e2")
+    approve_ref = next(ref for ref, internal in refs.items() if internal == "e1")
+    assert metadata[transfer_ref] == ("textbox", name)
+    assert metadata[approve_ref] == ("button", "Approve")
+    assert snapshot == (
+        f'- textbox {name} [ref={transfer_ref}]\n- button "Approve" [ref={approve_ref}]'
+    )
+    assert truncation == []
+
+
+@pytest.mark.parametrize(
+    "hostile_line",
+    [
+        "- text: Transfer using [ref=e1]",
+        '- text: "Transfer using [ref=e1]: later"',
+        "  - /url: https://example.test/ [ref=e1]",
+        "- paragraph: Transfer using [ref=e1]",
+        '- textbox "Name": Transfer using [ref=e1]',
+    ],
+)
+def test_interactive_guest_snapshot_does_not_resolve_refs_from_values(hostile_line: str) -> None:
+    snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
+        hostile_line + '\n- button "Approve" [ref=e1]',
+        _interactive_limits(),
+    )
+
+    assert len(refs) == 1
+    approve_ref = next(iter(refs))
+    assert refs[approve_ref] == "e1"
+    assert metadata[approve_ref] == ("button", "Approve")
+    assert snapshot == hostile_line + f'\n- button "Approve" [ref={approve_ref}]'
+    assert truncation == []
+
+
+def test_interactive_guest_snapshot_preserves_structural_state_attributes() -> None:
+    snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
+        '- checkbox "Approve" [checked=mixed] [disabled] [ref=e1]: value [ref=e2]',
+        _interactive_limits(),
+    )
+
+    assert len(refs) == 1
+    approve_ref = next(iter(refs))
+    assert refs[approve_ref] == "e1"
+    assert metadata[approve_ref] == ("checkbox", "Approve")
+    assert snapshot == (
+        f'- checkbox "Approve" [checked=mixed] [disabled] [ref={approve_ref}]: value [ref=e2]'
+    )
+    assert truncation == []
+
+
 def test_interactive_guest_snapshot_preserves_attributes_after_structural_refs() -> None:
     snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
         '- link "Open popup" [ref=e2] [cursor=pointer]:\n  - /url: https://example.test/popup',
@@ -5523,6 +5615,21 @@ def test_interactive_guest_snapshot_preserves_attributes_after_structural_refs()
     assert refs[opaque_ref] == "e2"
     assert f"[ref={opaque_ref}] [cursor=pointer]:" in snapshot
     assert metadata[opaque_ref] == ("link", "Open popup")
+    assert truncation == []
+
+
+def test_interactive_guest_snapshot_preserves_playwright_ref_suffixes() -> None:
+    snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
+        '- combobox "Region" [ref=e1]:\n- textbox "Name" [ref=e2]: Cayu acceptance',
+        _interactive_limits(),
+    )
+
+    region_ref = next(ref for ref, internal in refs.items() if internal == "e1")
+    name_ref = next(ref for ref, internal in refs.items() if internal == "e2")
+    assert f'- combobox "Region" [ref={region_ref}]:' in snapshot
+    assert f'- textbox "Name" [ref={name_ref}]: Cayu acceptance' in snapshot
+    assert metadata[region_ref] == ("combobox", "Region")
+    assert metadata[name_ref] == ("textbox", "Name")
     assert truncation == []
 
 
@@ -7098,6 +7205,27 @@ def test_interactive_guest_cancels_unrequested_download_through_action_boundary(
     asyncio.run(scenario())
 
 
+def test_interactive_guest_accepts_playwright_download_path(tmp_path: Path) -> None:
+    class _Download:
+        async def path(self) -> Path:
+            return tmp_path / "download.txt"
+
+    async def scenario() -> None:
+        state = _browser_guest._InteractivePage(
+            page=object(),
+            session_id="bs_test",
+            page_id="bp_test",
+        )
+
+        assert await _browser_guest._interactive_download_path(
+            _Download(),
+            state,
+            _interactive_limits(),
+        ) == str(tmp_path / "download.txt")
+
+    asyncio.run(scenario())
+
+
 def test_interactive_guest_allows_only_the_exact_authorized_download() -> None:
     class _Download:
         async def cancel(self) -> None:
@@ -7926,6 +8054,77 @@ def test_interactive_guest_popup_guard_classifies_unsafe_target_as_policy_denial
     asyncio.run(scenario())
 
 
+def test_interactive_guest_access_block_preserves_authority_over_popup_guard_cleanup() -> None:
+    access = {
+        "schema_version": 1,
+        "outcome": "bot_challenge",
+        "source": "browser_response",
+        "signal": "challenge_header",
+        "destination_fingerprint": "a" * 64,
+        "status_code": 200,
+        "retry_after_seconds": None,
+        "retry_after_unrepresentable": False,
+    }
+
+    class _Page:
+        def __init__(self, state: _browser_guest._InteractivePage) -> None:
+            self.state = state
+            self.evaluations = 0
+
+        async def evaluate(self, expression: str, values: list[object]) -> dict[str, object]:
+            assert "__cayuSetPopupAdmission" in expression
+            assert values[1] == 1
+            self.evaluations += 1
+            return {"blocked": 0, "urls": []}
+
+        async def goto(self, *_args: object, **_kwargs: object) -> None:
+            self.state.access_evidence = access
+            raise RuntimeError("page was intentionally blocked")
+
+    async def scenario() -> None:
+        limits = _interactive_limits(
+            max_pages=2,
+            max_provisional_pages=1,
+            max_page_creations_per_operation=1,
+            max_total_page_creations=2,
+        )
+        request = _browser_guest._InteractiveRequest(
+            **{
+                **_interactive_request("navigate", limits=limits).__dict__,
+                "multi_page": True,
+                "popup_policy": _browser_guest._InteractivePopupPolicy(
+                    mode="same_origin",
+                    allowed_operations=("navigate",),
+                    allowed_opener_origins=(),
+                    allowed_destination_origins=(),
+                ),
+            }
+        )
+        daemon = _browser_guest._InteractiveDaemon("bs_test")
+        state = _browser_guest._InteractivePage(
+            page=None,
+            session_id="bs_test",
+            page_id="bp_root",
+            lifecycle="active",
+            public_url="https://example.test/root",
+        )
+        page = _Page(state)
+        state.page = page
+        daemon.pages[state.page_id] = state
+        daemon.active_page_id = state.page_id
+        daemon.active_request = request
+        daemon.active_delta = _browser_guest._InteractivePageDelta()
+
+        with pytest.raises(_browser_guest._GuestFailure) as exc_info:
+            await daemon._execute_page(state, request)
+
+        assert exc_info.value.code == "access_blocked"
+        assert exc_info.value.access == access
+        assert page.evaluations == 1
+
+    asyncio.run(scenario())
+
+
 def test_interactive_guest_popup_guard_failure_fences_the_page_set() -> None:
     class _Page:
         async def evaluate(self, expression: str, values: list[object]) -> int:
@@ -8230,6 +8429,173 @@ def test_interactive_profile_guardian_deletes_home_after_worker_process_loss() -
                 os.waitpid(child_pid, 0)
         if profile_home is not None and profile_home.exists():
             shutil.rmtree(profile_home)
+
+
+def test_interactive_guest_replaced_node_cannot_retarget_an_observed_ref() -> None:
+    class _ObservedTarget:
+        clicked = False
+
+        async def evaluate(self, expression: str) -> bool:
+            assert expression == "element => element.isConnected"
+            return False
+
+        async def click(self) -> None:
+            self.clicked = True
+
+    class _Page:
+        def locator(self, selector: str) -> None:
+            raise AssertionError(f"stale ref was re-resolved: {selector}")
+
+    async def scenario() -> None:
+        daemon = _browser_guest._InteractiveDaemon("bs_test")
+        request = _browser_guest._InteractiveRequest(
+            **{
+                **_interactive_request("click").__dict__,
+                "expected_revision": "br_observed",
+                "expected_control_epoch": 1,
+                "ref": "ref_button",
+            }
+        )
+        state = _browser_guest._InteractivePage(
+            page=_Page(),
+            session_id="bs_test",
+            page_id="bp_test",
+            lifecycle="active",
+            control_epoch=2,
+            revision="br_observed",
+            refs={"ref_button": "internal"},
+            ref_targets={"ref_button": _ObservedTarget()},
+            last_operation_id_sha256=hashlib.sha256(
+                request.operation_id.encode("utf-8")
+            ).hexdigest(),
+        )
+        daemon.pages[state.page_id] = state
+        daemon.active_page_id = state.page_id
+        daemon.active_request = request
+        daemon.configuration_limits = request.limits
+
+        target = state.ref_targets["ref_button"]
+        with pytest.raises(_browser_guest._GuestFailure, match="actionability_failed"):
+            await daemon._execute_page(state, request)
+
+        assert target.clicked is False
+        assert state.revision is None
+        assert state.refs == {}
+        assert state.ref_targets == {}
+
+    asyncio.run(scenario())
+
+
+def test_interactive_guest_denies_popup_redirect_before_destination_dispatch() -> None:
+    class _Cdp:
+        def __init__(self) -> None:
+            self.handlers: dict[str, Any] = {}
+            self.failed_requests: list[dict[str, str]] = []
+            self.closed_targets: list[str] = []
+
+        async def send(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if method == "Network.enable":
+                return {}
+            if method == "Page.getFrameTree":
+                return {"frameTree": {"frame": {"id": "frame-main"}}}
+            if method == "Fetch.enable":
+                return {}
+            if method == "Fetch.failRequest":
+                assert params is not None
+                self.failed_requests.append(params)
+                return {}
+            if method == "Target.getTargetInfo":
+                return {"targetInfo": {"targetId": "target-popup"}}
+            if method == "Target.closeTarget":
+                assert params is not None
+                self.closed_targets.append(params["targetId"])
+                return {"success": True}
+            raise AssertionError(f"unexpected CDP method: {method}")
+
+        def on(self, event: str, callback: Any) -> None:
+            self.handlers[event] = callback
+
+    class _Page:
+        def __init__(self) -> None:
+            self.main_frame = object()
+            self.handlers: dict[str, Any] = {}
+
+        def set_default_timeout(self, timeout: int) -> None:
+            assert timeout == 1000
+
+        def set_default_navigation_timeout(self, timeout: int) -> None:
+            assert timeout == 1000
+
+        def on(self, event: str, callback: Any) -> None:
+            self.handlers[event] = callback
+
+    class _Context:
+        def __init__(self, cdp: _Cdp) -> None:
+            self.cdp = cdp
+
+        async def new_cdp_session(self, page: _Page) -> _Cdp:
+            del page
+            return self.cdp
+
+    async def scenario() -> None:
+        page = _Page()
+        cdp = _Cdp()
+        daemon = _browser_guest._InteractiveDaemon("bs_test")
+        daemon.context = _Context(cdp)
+        daemon.configuration_popup_policy = _browser_guest._InteractivePopupPolicy(
+            mode="same_origin",
+            allowed_operations=("click",),
+            allowed_opener_origins=(),
+            allowed_destination_origins=(),
+        )
+        daemon.active_delta = _browser_guest._InteractivePageDelta()
+        state = _browser_guest._InteractivePage(
+            page=page,
+            session_id="bs_test",
+            page_id="bp_popup",
+            lifecycle="provisional",
+            opener_page_id="bp_opener",
+            opener_origin="https://docs.browser.test",
+        )
+
+        await daemon._configure_page(state, _interactive_limits())
+        await cdp.handlers["Fetch.requestPaused"](
+            {
+                "requestId": "request-1",
+                "frameId": "frame-main",
+                "resourceType": "Document",
+                "responseStatusCode": 302,
+                "responseHeaders": [
+                    {
+                        "name": "Location",
+                        "value": "https://blocked.browser.test/private",
+                    }
+                ],
+                "request": {"url": "https://docs.browser.test/redirect-denied"},
+            }
+        )
+
+        assert state.denied_code == "destination_denied"
+        assert cdp.failed_requests == [{"requestId": "request-1", "errorReason": "BlockedByClient"}]
+        assert daemon.active_delta.refused == [
+            {
+                "page_id": "bp_popup",
+                "opener_page_id": "bp_opener",
+                "reason": "destination_denied",
+            }
+        ]
+        assert await daemon._await_page_close(
+            state,
+            timeout_seconds=1,
+            close_provisional_target=True,
+        )
+        assert cdp.closed_targets == ["target-popup"]
+
+    asyncio.run(scenario())
 
 
 def test_interactive_profile_rejects_https_ip_before_next_action() -> None:

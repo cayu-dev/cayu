@@ -46,6 +46,7 @@ from cayu import (
     VirtualEgressEnvironmentFactory,
     WebBridge,
 )
+from cayu._validation import freeze_json_value
 from cayu.egress import (
     EgressAuthorityCutoverStrategy,
     EgressBinding,
@@ -126,8 +127,8 @@ class _ProtocolBrowserRunner(Runner):
                     "opener_page_id": page["opener_page_id"],
                     "creating_operation_id_sha256": page["creating_operation_id_sha256"],
                     "revision": page["revision"],
-                    "url": page["url"],
-                    "title": page["title"],
+                    "url": None if self._profile_active else page["url"],
+                    "title": None if self._profile_active else page["title"],
                     "load_state": "loaded",
                     "access_state": "available",
                     "last_observation_revision": page["last_observation_revision"],
@@ -1021,6 +1022,7 @@ async def _project_scenario_execution(
             acceptance_module._registered_browser_acceptance_tool(plan)
         ),
         fault=result.fault,
+        recovered_tool_calls=result.recovered_tool_calls,
     )
 
 
@@ -1199,6 +1201,52 @@ def test_browser_profile_restores_authenticated_fixture_state_in_a_fresh_process
     )
 
 
+def test_recovered_browser_planner_accepts_immutable_durable_json_wrappers() -> None:
+    recovered = freeze_json_value(
+        {
+            "session_id": "bs_recovered",
+            "page_id": "bp_recovered",
+            "revision": "br_recovered",
+            "refs": [{"ref": "ref_submit", "name": "Submit"}],
+            "page_set": {
+                "pages": [
+                    {
+                        "page_id": "bp_recovered",
+                        "control_epoch": 3,
+                        "lifecycle": "active",
+                    }
+                ]
+            },
+            "portable_result_evidence": {
+                "structured": {
+                    "session_id": "bs_recovered",
+                    "page_id": "bp_recovered",
+                    "revision": "br_recovered",
+                    "allocation_disposition": "live",
+                }
+            },
+        }
+    )
+
+    state = internal_acceptance._latest_browser_state((recovered,))
+    compact = internal_acceptance._compact_recovered_browser_result(
+        recovered,
+        is_error=False,
+    )
+
+    assert state["control_epoch"] == 3
+    assert (
+        internal_acceptance._latest_page_set((recovered,))["pages"][0]["page_id"] == "bp_recovered"
+    )
+    assert internal_acceptance._ref(recovered, ("Submit",)) == "ref_submit"
+    assert compact["structured"] == {
+        "session_id": "bs_recovered",
+        "page_id": "bp_recovered",
+        "revision": "br_recovered",
+        "allocation_disposition": "live",
+    }
+
+
 def test_cayu_owned_deterministic_target_binds_every_executable_manifest_case() -> None:
     with BrowserAcceptanceFixtureV1() as fixture:
         plan = asyncio.run(build_internal_browser_acceptance(fixture))
@@ -1229,6 +1277,30 @@ def test_cayu_owned_deterministic_target_binds_every_executable_manifest_case() 
             if manifest_case.case_id == case.id
         )
         for case in plan.eval_plan.suite.cases
+    )
+
+
+def test_cayu_owned_deterministic_target_binds_each_case_execution_profile() -> None:
+    with BrowserAcceptanceFixtureV1() as fixture:
+        plan = asyncio.run(build_internal_browser_acceptance(fixture))
+        assert plan.eval_plan.app is not None
+        assert plan.eval_plan.suite is not None
+        case_profiles = [
+            {
+                "case_id": eval_case.id,
+                "case_revision": eval_case.metadata["browser_acceptance_case_revision"],
+                "execution_profile_fingerprint": asyncio.run(
+                    plan.eval_plan.app.inspect_run_execution_profile(eval_case.request)
+                ),
+            }
+            for eval_case in plan.eval_plan.suite.cases
+        ]
+        identity = asyncio.run(inspect_browser_acceptance_runtime_identity(plan))
+
+    assert len({item["execution_profile_fingerprint"] for item in case_profiles}) > 1
+    assert identity.execution_profile_fingerprint == acceptance_module._identity_fingerprint(
+        {"case_execution_profiles": case_profiles},
+        "browser acceptance case execution profiles",
     )
 
 
@@ -1309,12 +1381,46 @@ def test_cayu_owned_fault_executor_delivers_real_task_cancellation(
         assert result.fault.cancellation_delivered is True
         assert result.fault.browser_dispatches == expected_dispatches
         assert result.trial.trajectory is not None
-        if case_id in {
-            "cancellation-during-intent-publication",
-            "cancellation-after-dispatched-marker",
-        }:
-            projected = await _project_scenario_execution(plan, case, result, fixture)
-            assert projected.semantic_state.value == "passed"
+        assert plan.eval_plan.app is not None
+        assert plan.eval_plan.suite is not None
+        eval_case = next(item for item in plan.eval_plan.suite.cases if item.id == case_id)
+        assert eval_case.request.limits is not None
+        assert eval_case.request.limits.max_elapsed_seconds == 900
+        assert (
+            result.execution_profile_fingerprint
+            == await plan.eval_plan.app.inspect_run_execution_profile(eval_case.request)
+        )
+        projected = await _project_scenario_execution(plan, case, result, fixture)
+        assert projected.semantic_state.value == "passed", projected.model_dump(mode="json")
+        assert projected.completion_state.value == "complete"
+
+    with BrowserAcceptanceFixtureV1() as fixture:
+        asyncio.run(scenario(fixture))
+
+
+def test_cayu_owned_fault_executor_reconciles_acknowledgement_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(fixture: BrowserAcceptanceFixtureV1) -> None:
+        monkeypatch.setattr(
+            internal_acceptance,
+            "DockerEgressAdapter",
+            lambda **kwargs: _ProtocolEgressAdapter(fixture.upstream_origin),
+        )
+        plan = await build_internal_browser_acceptance(fixture)
+        case = next(
+            item for item in plan.manifest.cases if item.case_id == "ambiguity-acknowledgement-loss"
+        )
+        executor = plan.scenario_executor
+        assert executor is not None
+
+        result = await executor(case, 1, 1, 30)
+
+        assert result.fault.scenario is BrowserAcceptanceFaultScenario.ACKNOWLEDGEMENT_LOSS
+        assert result.fault.browser_dispatches == 1
+        projected = await _project_scenario_execution(plan, case, result, fixture)
+        assert projected.semantic_state.value == "passed", projected.model_dump(mode="json")
+        assert projected.completion_state.value == "complete"
 
     with BrowserAcceptanceFixtureV1() as fixture:
         asyncio.run(scenario(fixture))
@@ -1477,6 +1583,9 @@ def test_cayu_owned_fault_executor_recovers_process_loss_in_fresh_app(
         assert result.fault.recovered_in_fresh_app is True
         assert result.fault.browser_dispatches == expected_dispatches
         assert result.trial.trajectory is not None
+        projected = await _project_scenario_execution(plan, case, result, fixture)
+        assert projected.semantic_state.value == "passed", projected.model_dump(mode="json")
+        assert projected.completion_state.value == "complete"
 
     with BrowserAcceptanceFixtureV1() as fixture:
         asyncio.run(scenario(fixture))

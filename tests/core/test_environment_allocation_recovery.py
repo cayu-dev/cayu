@@ -498,6 +498,26 @@ async def _resolve(
     )
 
 
+def test_context_free_factory_resolution_preserves_optional_interaction_id() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session = await _create_session(store)
+        factory = _FakeRemoteFactory(_FakeRemoteProvider())
+
+        resolution = await _resolve(
+            store,
+            session,
+            factory,
+            operation=EnvironmentFactoryOperation.CREATE,
+        )
+
+        assert resolution.error is None
+        assert len(factory.requests) == 1
+        assert factory.requests[0].interaction_id is None
+
+    asyncio.run(run())
+
+
 def _pending_record(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
     records = checkpoint.get(ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY, {})
     return records.get(_ENVIRONMENT_NAME)

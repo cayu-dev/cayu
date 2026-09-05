@@ -180,11 +180,12 @@ first registered environment is not made the default automatically.
 Notes:
 
 - `EnvironmentFactoryRequest` carries the durable session context: `session_id`,
-  `agent_name`, `environment_name`, `operation`, `parent_session_id`,
-  `causal_budget_id`, `labels`, `metadata`, and `reconnect_metadata`. `operation`
-  is `CREATE` for new sessions and a fork's first child allocation, and
-  `RECONNECT` for resume/recovery. A reconnect operation must fail closed when
-  its durable metadata is missing; it must never silently allocate a replacement.
+  `agent_name`, `environment_name`, `interaction_id`, `operation`,
+  `parent_session_id`, `causal_budget_id`, `labels`, `metadata`, and
+  `reconnect_metadata`. `operation` is `CREATE` for new sessions and a fork's
+  first child allocation, and `RECONNECT` for resume/recovery. A reconnect
+  operation must fail closed when its durable metadata is missing; it must never
+  silently allocate a replacement.
   The request also carries the agent's copied `execution_requirements`; those
   requirements come from application-controlled agent registration, not from a
   per-run request. Factories should key per-session resources off `session_id`.

@@ -209,6 +209,50 @@ def test_connect_destination_accepts_only_active_credentialless_authority() -> N
     assert not asyncio.run(broker.authorize_connect_destination(host="docs.example.com", port=8443))
 
 
+def test_connect_admission_audits_denial_before_http_authority_exists() -> None:
+    decisions: list[EgressDecision] = []
+    broker = TransparentEgressBroker(
+        registry=VirtualCredentialRegistry(),
+        resolver=None,
+        policies={
+            "browser": BrowserEgressPolicy(
+                name="browser",
+                allowed_hosts=["docs.example.com"],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(
+                destination="docs.example.com",
+                policy_name="browser",
+            )
+        ],
+        upstream=_FakeUpstream(CapturedResponse(status_code=200)),
+        audit=decisions.append,
+    )
+
+    admission = asyncio.run(
+        broker.begin_connect_destination_admission(
+            host="blocked.example.com",
+            port=443,
+        )
+    )
+
+    assert admission is None
+    assert decisions == [
+        EgressDecision(
+            allowed=False,
+            status_code=403,
+            destination="blocked.example.com",
+            method="CONNECT",
+            path="/",
+            grant_id=None,
+            policy_name=None,
+            reason="CONNECT destination has no active egress authority.",
+            authorization_kind="transport",
+        )
+    ]
+
+
 def test_broker_revalidates_global_response_limit_for_custom_upstream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

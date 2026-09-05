@@ -291,11 +291,16 @@ _INTERACTIVE_MAX_MESSAGE_BYTES = (
     + _INTERACTIVE_RESPONSE_FIXED_BYTES
 )
 _INTERACTIVE_REF_PATTERN = re.compile(
-    r"(?P<prefix>^|\s)\[ref=(?P<ref>[A-Za-z0-9._:-]{1,128})\]"
-    r"(?=(?:\s+\[[^\]\r\n]{1,256}\])*\s*:?\s*$)"
+    r"(?P<prefix>(?:[ \t]+\[(?:checked(?:=mixed)?|disabled|expanded|active|"
+    r"invalid(?:=grammar|=spelling)?|level=[0-9]+|pressed(?:=mixed)?|selected)\])*"
+    r"[ \t]+)\[ref=(?P<ref>[A-Za-z0-9._:-]{1,128})\]"
+    r"(?=(?:\s+\[[^\]\r\n]{1,256}\])*(?:\s*:\s*[^\r\n]*)?\s*$)"
 )
+# Slash-delimited names are literal in AI snapshots. Never consume a value
+# separator while finding their closing slash: values may contain forged refs.
 _INTERACTIVE_ELEMENT_PATTERN = re.compile(
-    r'^\s*-\s+([A-Za-z][A-Za-z0-9_-]{0,127})(?:\s+"((?:\\.|[^"\\])*)")?'
+    r"^\s*-\s+([A-Za-z][A-Za-z0-9_-]{0,127})"
+    r'(?:[ \t]+(?:"((?:\\.|[^"\\])*)"|(/(?:[^:\r\n]*/)?)))?'
 )
 _INTERACTIVE_SAFE_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$")
 _MAX_ACCESS_RETRY_AFTER_SECONDS = 24 * 60 * 60
@@ -709,6 +714,12 @@ class _InteractivePage:
     revision: str | None = None
     last_observation_revision: str | None = None
     refs: dict[str, str] = field(default_factory=dict)
+    # Playwright's ``aria-ref`` locator is intentionally re-resolvable.  Keep
+    # the exact element observed for each opaque ref so a later action cannot
+    # silently bind to a replacement node with the same accessible identity.
+    # ``None`` exists only for internally constructed/test states that predate
+    # an observation; production observations always install a complete map.
+    ref_targets: dict[str, Any] | None = None
     request_count: int = 0
     redirect_count: int = 0
     response_bytes: int = 0
@@ -723,6 +734,11 @@ class _InteractivePage:
     cleanup_task: asyncio.Task[None] | None = None
     unexpected_download_task: asyncio.Task[bool] | None = None
     authorized_download_operation_id_sha256: str | None = None
+
+    def clear_refs(self) -> None:
+        self.refs.clear()
+        if self.ref_targets is not None:
+            self.ref_targets.clear()
 
 
 @dataclass
@@ -741,9 +757,27 @@ class _InteractivePageDelta:
 def _interactive_page_failure(state: _InteractivePage) -> _GuestFailure | None:
     if state.denied_code is not None:
         return _GuestFailure(state.denied_code)
+    if state.access_evidence is not None:
+        return _GuestFailure("access_blocked", access=state.access_evidence)
     if state.limit_exceeded:
         return _GuestFailure(state.limit_error_code)
     return None
+
+
+async def _settle_interactive_navigation_failure(
+    state: _InteractivePage,
+) -> _GuestFailure | None:
+    """Let already-delivered CDP/proxy evidence outrank Playwright's generic error."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _FINAL_NETWORK_SETTLE_SECONDS
+    while True:
+        if state.denied_code is not None or state.access_evidence is not None:
+            return _interactive_page_failure(state)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return _interactive_page_failure(state)
+        await asyncio.sleep(min(0.01, remaining))
 
 
 def _record_page_denial(state: _PageState, code: str) -> None:
@@ -4395,7 +4429,11 @@ class _InteractiveDaemon:
                 response = await self._execute_page(state, request)
             except BaseException as primary_failure:
                 try:
-                    await self._settle_operation_popups(request, delta)
+                    await self._settle_operation_popups(
+                        request,
+                        delta,
+                        primary_failure=primary_failure,
+                    )
                 except BaseException as settlement_failure:
                     if not isinstance(primary_failure, Exception):
                         raise primary_failure from settlement_failure
@@ -4557,7 +4595,7 @@ class _InteractiveDaemon:
         if not closing:
             state.control_epoch += 1
         state.revision = None
-        state.refs.clear()
+        state.clear_refs()
         if self.active_page_id == state.page_id:
             self.active_page_id = None
             self._select_remaining_active()
@@ -4573,7 +4611,7 @@ class _InteractiveDaemon:
         state.terminal_reason = "browser_crash"
         state.control_epoch += 1
         state.revision = None
-        state.refs.clear()
+        state.clear_refs()
         if self.active_delta is not None:
             self.active_delta.crashed_page_ids.add(state.page_id)
         else:
@@ -4597,7 +4635,7 @@ class _InteractiveDaemon:
         candidate.background_since = None
         candidate.control_epoch += 1
         candidate.revision = f"br_{secrets.token_hex(16)}"
-        candidate.refs.clear()
+        candidate.clear_refs()
         self.active_page_id = candidate.page_id
         return candidate
 
@@ -4622,7 +4660,7 @@ class _InteractiveDaemon:
             request.operation_id.encode("utf-8")
         ).hexdigest()
         state.revision = None
-        state.refs.clear()
+        state.clear_refs()
         cleanup_ok = await self._await_page_close(
             state,
             timeout_seconds=max(0.001, request.limits.max_wait_ms / 1000),
@@ -4669,12 +4707,12 @@ class _InteractiveDaemon:
             current.background_since = now
             current.control_epoch += 1
             current.revision = f"br_{secrets.token_hex(16)}"
-            current.refs.clear()
+            current.clear_refs()
         state.lifecycle = "active"
         state.background_since = None
         state.control_epoch += 1
         state.revision = None
-        state.refs.clear()
+        state.clear_refs()
         state.operation_count += 1
         self.total_operations += 1
         state.last_operation_id_sha256 = hashlib.sha256(
@@ -4714,18 +4752,18 @@ class _InteractiveDaemon:
                 raise _GuestFailure("browser_crash")
         except BaseException:
             state.revision = None
-            state.refs.clear()
+            state.clear_refs()
             state.last_observation_revision = previous_observation_revision
             raise
         if not observation["refs"]:
-            state.refs.clear()
+            state.clear_refs()
         ref_count = len(state.refs)
         if (
             state.ref_count + ref_count > limits.max_refs_per_page
             or self.total_refs + ref_count > limits.max_total_refs
         ):
             state.revision = None
-            state.refs.clear()
+            state.clear_refs()
             state.limit_exceeded = True
             state.limit_error_code = "resource_exhausted"
             raise _GuestFailure("resource_exhausted")
@@ -4740,6 +4778,8 @@ class _InteractiveDaemon:
         self,
         request: _InteractiveRequest,
         delta: _InteractivePageDelta,
+        *,
+        primary_failure: BaseException | None = None,
     ) -> None:
         # Playwright can enqueue the popup callback immediately before the
         # originating action resolves.  Give that already-created callback one
@@ -4773,20 +4813,26 @@ class _InteractiveDaemon:
                 if state.staged_initial_url is not None:
                     staged_initial_url = state.staged_initial_url
                     state.staged_initial_url = None
-                    await state.page.goto(
-                        staged_initial_url,
-                        wait_until="domcontentloaded",
-                        timeout=max(
-                            1,
-                            int(
-                                1_000
-                                * max(
-                                    0.001,
-                                    navigation_deadline - asyncio.get_running_loop().time(),
-                                )
+                    try:
+                        await state.page.goto(
+                            staged_initial_url,
+                            wait_until="domcontentloaded",
+                            timeout=max(
+                                1,
+                                int(
+                                    1_000
+                                    * max(
+                                        0.001,
+                                        navigation_deadline - asyncio.get_running_loop().time(),
+                                    )
+                                ),
                             ),
-                        ),
-                    )
+                        )
+                    except Exception:
+                        failure = _interactive_page_failure(state)
+                        if failure is None:
+                            raise
+                        raise failure from None
                 wait_for_load_state = getattr(state.page, "wait_for_load_state", None)
                 if callable(wait_for_load_state):
                     await wait_for_load_state(
@@ -4843,7 +4889,7 @@ class _InteractiveDaemon:
                 state.lifecycle = "closing"
                 state.control_epoch += 1
                 state.revision = None
-                state.refs.clear()
+                state.clear_refs()
                 if not self._reserve_page_cleanup(request.limits):
                     state.lifecycle = "uncertain"
                     state.terminal_reason = "cleanup_failed"
@@ -4852,6 +4898,7 @@ class _InteractiveDaemon:
                     cleanup_ok = await self._await_page_close(
                         state,
                         timeout_seconds=max(0.001, request.limits.max_wait_ms / 1000),
+                        close_provisional_target=True,
                     )
                     if cleanup_ok:
                         state.lifecycle = "closed"
@@ -4872,7 +4919,7 @@ class _InteractiveDaemon:
                 state.lifecycle = "closing"
                 state.control_epoch += 1
                 state.revision = None
-                state.refs.clear()
+                state.clear_refs()
                 if not self._reserve_page_cleanup(request.limits):
                     state.lifecycle = "uncertain"
                     state.terminal_reason = "cleanup_failed"
@@ -4881,6 +4928,7 @@ class _InteractiveDaemon:
                     cleanup_ok = await self._await_page_close(
                         state,
                         timeout_seconds=max(0.001, request.limits.max_wait_ms / 1000),
+                        close_provisional_target=True,
                     )
                     if cleanup_ok:
                         state.lifecycle = "closed"
@@ -4912,9 +4960,37 @@ class _InteractiveDaemon:
             # A guard failure can fence the allocation without ever creating a
             # popup cleanup task. Retirement always requires the whole owner to
             # settle before the host is allowed to release allocation capacity.
+            authoritative_failure = (
+                primary_failure if isinstance(primary_failure, _GuestFailure) else None
+            )
+            if authoritative_failure is None:
+                denied = next(
+                    (page.denied_code for page in self.pages.values() if page.denied_code),
+                    None,
+                )
+                access = next(
+                    (
+                        page.access_evidence
+                        for page in self.pages.values()
+                        if page.access_evidence is not None
+                    ),
+                    None,
+                )
+                if denied is not None:
+                    authoritative_failure = _GuestFailure(denied)
+                elif access is not None:
+                    authoritative_failure = _GuestFailure("access_blocked", access=access)
             cleanup_ok = await self.close(
                 timeout_seconds=max(1.0, min(10.0, request.limits.max_wait_ms / 1000))
             )
+            if cleanup_ok and authoritative_failure is not None:
+                raise _GuestFailure(
+                    authoritative_failure.code,
+                    status_code=authoritative_failure.status_code,
+                    effective_origin=authoritative_failure.effective_origin,
+                    access=authoritative_failure.access,
+                    allocation_disposition="retired",
+                ) from primary_failure
             raise _GuestFailure(
                 "resource_exhausted" if cleanup_ok else "cleanup_failed",
                 allocation_disposition="retired" if cleanup_ok else "uncertain",
@@ -4937,7 +5013,7 @@ class _InteractiveDaemon:
             state.lifecycle = "closing"
             state.control_epoch += 1
             state.revision = None
-            state.refs.clear()
+            state.clear_refs()
             if not self._reserve_page_cleanup(limits):
                 state.lifecycle = "uncertain"
                 state.terminal_reason = "cleanup_failed"
@@ -4971,6 +5047,7 @@ class _InteractiveDaemon:
         state: _InteractivePage,
         *,
         timeout_seconds: float,
+        close_provisional_target: bool = False,
     ) -> bool:
         task = state.cleanup_task
         if task is not None and task.done():
@@ -4982,7 +5059,11 @@ class _InteractiveDaemon:
             else:
                 return True
         if task is None:
-            task = asyncio.create_task(state.page.close())
+            task = asyncio.create_task(
+                self._close_provisional_page_target(state)
+                if close_provisional_target and state.cdp is not None
+                else state.page.close()
+            )
             state.cleanup_task = task
 
         async def settle() -> tuple[BaseException, ...]:
@@ -5006,6 +5087,33 @@ class _InteractiveDaemon:
                 raise outcome.cancellation
             raise outcome.cancellation from cause
         return not outcome.errors
+
+    @staticmethod
+    async def _close_provisional_page_target(state: _InteractivePage) -> None:
+        target_info = await state.cdp.send("Target.getTargetInfo")
+        if type(target_info) is not dict or type(target_info.get("targetInfo")) is not dict:
+            raise _GuestFailure("browser_crash")
+        target_id = target_info["targetInfo"].get("targetId")
+        if type(target_id) is not str or not target_id:
+            raise _GuestFailure("browser_crash")
+        try:
+            closed = await state.cdp.send("Target.closeTarget", {"targetId": target_id})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Closing the target that owns this CDP session can terminate the
+            # channel before its acknowledgement is delivered.  Accept only
+            # positive readback from the exact Playwright page in that case.
+            for _ in range(25):
+                try:
+                    if state.page.is_closed():
+                        return
+                except Exception:
+                    break
+                await asyncio.sleep(0.01)
+            raise
+        if type(closed) is not dict or closed.get("success") is not True:
+            raise _GuestFailure("browser_crash")
 
     def _schedule_response_limit_abort(self, state: _InteractivePage) -> None:
         if state.limit_abort_task is None:
@@ -5081,6 +5189,8 @@ class _InteractiveDaemon:
             _GuestFailure(
                 failure.code,
                 status_code=failure.status_code,
+                access=failure.access,
+                effective_origin=failure.effective_origin,
                 allocation_disposition="retired",
             )
         )
@@ -5160,7 +5270,7 @@ class _InteractiveDaemon:
                 page.terminal_reason = "popup_guard_failed"
                 page.control_epoch += 1
                 page.revision = None
-                page.refs.clear()
+                page.clear_refs()
         self.active_page_id = None
         self.closing = True
         self.close_after_response = True
@@ -5695,7 +5805,7 @@ class _InteractiveDaemon:
         state.lifecycle = "closing"
         state.control_epoch += 1
         state.revision = None
-        state.refs.clear()
+        state.clear_refs()
         cleanup_ok = await self._await_page_close(
             state,
             timeout_seconds=timeout_seconds,
@@ -5800,6 +5910,34 @@ class _InteractiveDaemon:
                     response_url = params.get("request", {}).get("url")
                     if type(response_url) is not str:
                         raise TypeError("Missing paused browser response URL.")
+                    if state.opener_page_id is not None and status_code in _REDIRECT_STATUS_CODES:
+                        location = next(
+                            (
+                                value
+                                for key, value in headers.items()
+                                if key.lower() == "location" and value
+                            ),
+                            None,
+                        )
+                        if location is not None:
+                            redirect_url = urljoin(response_url, location)
+                            if not _browser_request_is_admissible(
+                                redirect_url
+                            ) or not self._popup_destination_allowed(state, redirect_url):
+                                state.denied_code = "destination_denied"
+                                self._record_popup_refusal(
+                                    page_id=state.page_id,
+                                    opener_page_id=state.opener_page_id,
+                                    reason="destination_denied",
+                                )
+                                await state.cdp.send(
+                                    "Fetch.failRequest",
+                                    {
+                                        "requestId": request_id,
+                                        "errorReason": "BlockedByClient",
+                                    },
+                                )
+                                return
                     access = _guest_http_access(
                         response_url,
                         status_code,
@@ -5912,7 +6050,7 @@ class _InteractiveDaemon:
         )
         if not blocked_navigation_owned_by_current_mutation:
             state.revision = None
-            state.refs.clear()
+            state.clear_refs()
         if not navigation_owned_by_current_mutation:
             if state.control_epoch >= _INTERACTIVE_MAX_OPERATIONS_PER_PAGE:
                 state.limit_exceeded = True
@@ -5949,12 +6087,29 @@ class _InteractiveDaemon:
                 if internal_ref is None:
                     raise _GuestFailure("missing_element")
                 navigation_epoch = state.navigation_epoch
-                locator = page.locator(f"aria-ref={internal_ref}")
-                action_target = await locator.element_handle()
+                if state.ref_targets is None:
+                    # Characterization-only states constructed without going
+                    # through observation retain the former lookup seam.
+                    locator = page.locator(f"aria-ref={internal_ref}")
+                    action_target = await locator.element_handle()
+                else:
+                    action_target = state.ref_targets.get(request.ref)
                 if action_target is None or state.navigation_epoch != navigation_epoch:
                     raise _GuestFailure("missing_element")
-            state.revision = None
-            state.refs.clear()
+                state.revision = None
+                state.clear_refs()
+                if state.ref_targets is not None:
+                    try:
+                        target_connected = await action_target.evaluate(
+                            "element => element.isConnected"
+                        )
+                    except Exception as exc:
+                        raise _GuestFailure("actionability_failed") from exc
+                    if target_connected is not True:
+                        raise _GuestFailure("actionability_failed")
+            else:
+                state.revision = None
+                state.clear_refs()
         guard_effect = request.multi_page and request.operation in (
             _INTERACTIVE_POPUP_EFFECT_OPERATIONS
         )
@@ -5970,12 +6125,18 @@ class _InteractiveDaemon:
                         timeout=max(1_000, request.limits.max_wait_ms),
                     )
                 except Exception:
-                    if state.access_evidence is None:
+                    failure = await _settle_interactive_navigation_failure(state)
+                    if failure is None:
                         raise
+                    raise failure from None
             elif request.operation == "click":
                 if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
                 await action_target.click()
+                # Playwright can deliver the popup callback immediately after
+                # the click await settles. Give that already-dispatched signal
+                # one bounded event-loop turn before accepting the operation.
+                await asyncio.sleep(0)
             elif request.operation == "fill":
                 if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
@@ -5997,7 +6158,11 @@ class _InteractiveDaemon:
             elif request.operation not in {"observe", "screenshot"}:
                 raise _GuestFailure("incompatible_browser")
         finally:
-            if guard_effect:
+            # A positively classified response denial intentionally aborts the
+            # page. The enclosing operation owner retires the allocation next;
+            # querying page JavaScript here would only replace that authority
+            # with Playwright's generic target-closed error.
+            if guard_effect and _interactive_page_failure(state) is None:
                 admitted_urls = await self._end_popup_effect(state, popup_refusal)
                 await self._wait_for_popup_candidates(request, admitted_urls)
         failure = _interactive_page_failure(state)
@@ -6110,11 +6275,11 @@ class _InteractiveDaemon:
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_size > request.limits.max_artifact_bytes
             ):
-                raise _GuestFailure("download_failed")
+                raise _GuestFailure("oversized_artifact")
             with open(path, "rb") as handle:
                 content = handle.read(request.limits.max_artifact_bytes + 1)
             if len(content) > request.limits.max_artifact_bytes:
-                raise _GuestFailure("download_failed")
+                raise _GuestFailure("oversized_artifact")
             filename = Path(str(download.suggested_filename)).name or "download.bin"
             filename = filename[:255]
         except _GuestFailure:
@@ -6214,7 +6379,7 @@ class _InteractiveDaemon:
                     self.active_page_id = None
                 state.control_epoch += 1
                 state.revision = None
-                state.refs.clear()
+                state.clear_refs()
                 task = state.cleanup_task
                 if task is None:
                     task = asyncio.create_task(state.page.close())
@@ -6369,6 +6534,8 @@ async def _interactive_download_path(
     failure = _interactive_page_failure(state)
     if failure is not None:
         raise failure
+    if isinstance(path, Path):
+        return str(path)
     if type(path) is not str:
         raise _GuestFailure("download_failed")
     return path
@@ -6398,6 +6565,7 @@ async def _admit_interactive_snapshot_materialization(
             frame_id,
             max_nodes=remaining_nodes,
             max_source_bytes=remaining_source_bytes,
+            max_scalar_bytes=limits.max_snapshot_bytes,
         )
         if limit_exceeded or node_count > remaining_nodes or source_bytes > remaining_source_bytes:
             raise _GuestFailure("oversized_snapshot")
@@ -6457,6 +6625,7 @@ async def _interactive_frame_snapshot_census(
     *,
     max_nodes: int,
     max_source_bytes: int,
+    max_scalar_bytes: int,
 ) -> tuple[int, int, bool]:
     """Bound one frame's DOM and accessibility-bearing UTF-8 source material."""
 
@@ -6468,25 +6637,30 @@ async def _interactive_frame_snapshot_census(
             "expression": """(() => {
             const nodeLimit = __CAYU_NODE_LIMIT__;
             const sourceLimit = __CAYU_SOURCE_LIMIT__;
+            const scalarLimit = __CAYU_SCALAR_LIMIT__;
             const root = document.documentElement;
             let nodeCount = root ? 1 : 0;
             let sourceBytes = 0;
             let limitExceeded = nodeCount > nodeLimit;
             const consume = value => {
                 if (typeof value !== "string") return;
+                let valueBytes = 0;
                 for (let index = 0; index < value.length; index += 1) {
                     const code = value.charCodeAt(index);
-                    if (code < 0x80) sourceBytes += 1;
-                    else if (code < 0x800) sourceBytes += 2;
+                    let encodedBytes = 0;
+                    if (code < 0x80) encodedBytes = 1;
+                    else if (code < 0x800) encodedBytes = 2;
                     else if (code >= 0xD800 && code <= 0xDBFF &&
                             index + 1 < value.length) {
                         const trailing = value.charCodeAt(index + 1);
                         if (trailing >= 0xDC00 && trailing <= 0xDFFF) {
-                            sourceBytes += 4;
+                            encodedBytes = 4;
                             index += 1;
-                        } else sourceBytes += 3;
-                    } else sourceBytes += 3;
-                    if (sourceBytes > sourceLimit) {
+                        } else encodedBytes = 3;
+                    } else encodedBytes = 3;
+                    sourceBytes += encodedBytes;
+                    valueBytes += encodedBytes;
+                    if (sourceBytes > sourceLimit || valueBytes > scalarLimit) {
                         limitExceeded = true;
                         return;
                     }
@@ -6559,9 +6733,9 @@ async def _interactive_frame_snapshot_census(
                 source_bytes: sourceBytes,
                 limit_exceeded: limitExceeded,
             };
-        })()""".replace("__CAYU_NODE_LIMIT__", str(max_nodes)).replace(
-                "__CAYU_SOURCE_LIMIT__", str(max_source_bytes)
-            ),
+        })()""".replace("__CAYU_NODE_LIMIT__", str(max_nodes))
+            .replace("__CAYU_SOURCE_LIMIT__", str(max_source_bytes))
+            .replace("__CAYU_SCALAR_LIMIT__", str(max_scalar_bytes)),
             "returnByValue": True,
             "awaitPromise": False,
             "userGesture": False,
@@ -6618,6 +6792,7 @@ async def _interactive_observation(
         if blocked:
             snapshot = ""
             refs: dict[str, str] = {}
+            ref_targets: dict[str, Any] = {}
             ref_metadata: dict[str, tuple[str, str]] = {}
             truncation: list[str] = []
         else:
@@ -6633,6 +6808,12 @@ async def _interactive_observation(
                 raw_snapshot,
                 limits,
             )
+            ref_targets = {}
+            for opaque, internal in refs.items():
+                target = await page.locator(f"aria-ref={internal}").element_handle()
+                if target is None:
+                    raise _GuestFailure("browser_crash")
+                ref_targets[opaque] = target
         url = state.public_url if blocked else page.url
         if type(url) is not str:
             raise _GuestFailure("browser_crash")
@@ -6709,6 +6890,7 @@ async def _interactive_observation(
     state.revision = f"br_{secrets.token_hex(16)}"
     state.last_observation_revision = state.revision
     state.refs = refs
+    state.ref_targets = ref_targets
     return {
         "session_id": state.session_id,
         "page_id": state.page_id,
@@ -6790,7 +6972,12 @@ def _interactive_snapshot(
     truncation: list[str] = []
     used_bytes = 0
     for line in raw_snapshot.splitlines():
-        ref_match = _INTERACTIVE_REF_PATTERN.search(line)
+        element_match = _INTERACTIVE_ELEMENT_PATTERN.match(line)
+        ref_match = (
+            None
+            if element_match is None or element_match.group(1) == "text"
+            else _INTERACTIVE_REF_PATTERN.match(line, element_match.end())
+        )
         if ref_match is not None and len(refs) >= limits.max_refs:
             truncation.append("refs")
             continue
@@ -6829,7 +7016,11 @@ def _interactive_element_metadata(line: str) -> tuple[str, str]:
         return "element", ""
     role = matched.group(1)
     raw_name = matched.group(2) or ""
-    name = raw_name.replace(r"\"", '"').replace(r"\\", "\\")
+    name = (
+        matched.group(3)
+        if matched.group(3) is not None
+        else raw_name.replace(r"\"", '"').replace(r"\\", "\\")
+    )
     encoded = name.encode("utf-8", errors="replace")
     if len(encoded) > _INTERACTIVE_MAX_ELEMENT_TEXT_BYTES:
         name = encoded[:_INTERACTIVE_MAX_ELEMENT_TEXT_BYTES].decode("utf-8", errors="ignore")
@@ -6880,6 +7071,7 @@ def _interactive_error_payload(
 ) -> dict[str, Any]:
     stable = error.code
     if stable not in {
+        "access_blocked",
         "actionability_failed",
         "allocation_lost",
         "artifact_write_failed",

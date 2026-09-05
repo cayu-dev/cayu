@@ -2723,8 +2723,9 @@ retains input, output, total-token, and estimated-cost evidence when available.
 
 `BrowserAcceptanceReportV1` binds the case/corpus revisions to runtime build,
 browser protocol and worker, Playwright/Chromium, runner/environment, workload,
-egress, artifact store, execution profile, provider/model, platform, and execution
-mode identities. Timestamps are evidence, not identity. Each immutable trial row
+egress, artifact store, the ordered case-to-execution-profile mapping,
+provider/model, platform, and execution mode identities. Timestamps are evidence,
+not identity. Each immutable trial row
 keeps expected versus observed state, separate fixture-semantic and agent-self-report
 states, operations, artifacts, usage/cost/time, stable errors, truncation, and the
 browser allocation disposition.

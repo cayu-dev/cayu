@@ -563,6 +563,14 @@ _DECLARED_FIXED_CONTROLS: Mapping[
             }
         ),
     },
+    EventType.EGRESS_REQUEST_AUTHORIZED: {
+        ("allowed",): frozenset({True}),
+        ("authorization_kind",): frozenset({"credentialless", "virtual_credential"}),
+    },
+    EventType.EGRESS_REQUEST_DENIED: {
+        ("allowed",): frozenset({False}),
+        ("authorization_kind",): frozenset({"credentialless", "transport", "virtual_credential"}),
+    },
     EventType.WORKSPACE_OBSERVATION_FINALIZED: {
         ("attribution", "confidence"): _WORKSPACE_ATTRIBUTION_CONFIDENCE_VALUES,
         ("attribution", "writer_isolation"): frozenset({"unknown"}),
@@ -3319,7 +3327,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     egress_request_policy = _observed_policy(
-        "action allowed credential destination execution_profile_fingerprint grant_id metadata reason request_id",
+        "action allowed authorization_kind credential destination execution_profile_fingerprint "
+        "grant_id metadata method path policy_name reason request_id status_code",
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"metadata"},

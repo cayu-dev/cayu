@@ -162,6 +162,7 @@ from cayu.runtime.egress_authority_transitions import (
 from cayu.runtime.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
+from cayu.runtime.sessions import _current_session_interaction_id
 from cayu.storage.memory import KnowledgeAccessScope, KnowledgeStore
 from cayu.vaults import SecretRedactor, SecretRef, SecretResolver
 from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace, Workspace
@@ -770,6 +771,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             loop=asyncio.get_running_loop(),
             emitter=self._emitter,
             session_id=authorized.session_id,
+            interaction_id=_current_session_interaction_id(authorized.session_id),
             agent_name=require_clean_nonblank(agent_name, "agent_name"),
             environment_name=authorized.environment_name,
             execution_profile_fingerprint=execution_profile_fingerprint,
@@ -862,6 +864,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             loop=asyncio.get_running_loop(),
             emitter=self._emitter,
             session_id=session_id,
+            interaction_id=_current_session_interaction_id(session_id),
             agent_name=require_clean_nonblank(agent_name, "agent_name"),
             environment_name=environment_name,
             execution_profile_fingerprint=execution_profile_fingerprint,
@@ -1066,6 +1069,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             loop=loop,
             emitter=self._emitter,
             session_id=request.session_id,
+            interaction_id=request.interaction_id,
             agent_name=request.agent_name,
             environment_name=request.environment_name,
             execution_profile_fingerprint=request.execution_profile_fingerprint,
@@ -4137,6 +4141,7 @@ class _EgressAuditBridge:
         loop: asyncio.AbstractEventLoop,
         emitter: EventEmitter | None,
         session_id: str,
+        interaction_id: str | None,
         agent_name: str,
         environment_name: str,
         execution_profile_fingerprint: str | None,
@@ -4144,6 +4149,7 @@ class _EgressAuditBridge:
         self._loop = loop
         self._emitter = emitter
         self._session_id = session_id
+        self._interaction_id = interaction_id
         self._agent_name = agent_name
         self._environment_name = environment_name
         self._execution_profile_fingerprint = execution_profile_fingerprint
@@ -4158,6 +4164,7 @@ class _EgressAuditBridge:
                 if decision.allowed
                 else EventType.EGRESS_REQUEST_DENIED,
                 session_id=self._session_id,
+                interaction_id=self._interaction_id,
                 agent_name=self._agent_name,
                 environment_name=self._environment_name,
                 payload={

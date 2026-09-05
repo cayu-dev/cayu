@@ -20,12 +20,15 @@ from cayu.evals import (
     BrowserAcceptanceCompletionState,
     BrowserAcceptanceDiagnosticState,
     BrowserAcceptanceDiagnosticV1,
+    BrowserAcceptanceFaultEvidenceV1,
+    BrowserAcceptanceFaultScenario,
     BrowserAcceptanceInfrastructureState,
     BrowserAcceptanceLimitsV1,
     BrowserAcceptanceManifestV1,
     BrowserAcceptanceMode,
     BrowserAcceptanceOperationEvidenceV1,
     BrowserAcceptanceOperationState,
+    BrowserAcceptanceRequestSummaryV1,
     BrowserAcceptanceRuntimeIdentityV1,
     BrowserAcceptanceSemanticOracle,
     BrowserAcceptanceSemanticState,
@@ -53,6 +56,7 @@ from cayu.evals.browser_acceptance_manifests import (
     live_authenticated_browser_acceptance_manifest,
     live_public_browser_acceptance_manifest,
 )
+from cayu.evals.corpus import _content_revision
 
 
 def _case(
@@ -555,7 +559,8 @@ def test_checked_browser_manifests_cover_required_categories_and_modes() -> None
         max(len(case.operations) + 1 for case in live.cases) * len(live.cases) * live.trial_count
     )
     assert live.limits.max_artifact_bytes == (
-        8 * 1024 * 1024 * sum(len(case.operations) * live.trial_count for case in live.cases)
+        acceptance_module.BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
+        * sum(len(case.operations) * live.trial_count for case in live.cases)
     )
     assert live.limits.max_input_tokens == 96_000
     assert live.limits.max_output_tokens is not None
@@ -644,7 +649,7 @@ def test_redirect_oracle_requires_the_final_observed_destination() -> None:
     )
 
 
-def test_challenge_oracle_requires_positive_blocked_access_evidence() -> None:
+def test_challenge_oracle_requires_positive_access_block_classification() -> None:
     from cayu.evals.corpus import _content_revision
 
     case = next(
@@ -662,7 +667,6 @@ def test_challenge_oracle_requires_positive_blocked_access_evidence() -> None:
             {"url": "https://docs.browser.test/challenge"},
             "browser acceptance operation target",
         ),
-        access_state=BrowserAcceptanceAccessState.AVAILABLE,
     )
     diagnostic = BrowserAcceptanceDiagnosticV1(
         state=BrowserAcceptanceDiagnosticState.CAPTURED,
@@ -678,7 +682,12 @@ def test_challenge_oracle_requires_positive_blocked_access_evidence() -> None:
     blocked = diagnostic.model_copy(
         update={
             "operations": (
-                operation.model_copy(update={"access_state": BrowserAcceptanceAccessState.BLOCKED}),
+                operation.model_copy(
+                    update={
+                        "allocation_disposition": BrowserAllocationDisposition.RETIRED,
+                        "error_category": "access_blocked",
+                    }
+                ),
             )
         }
     )
@@ -700,22 +709,26 @@ def test_exact_terminal_replay_requires_one_observed_fixture_dispatch() -> None:
         {"url": "https://docs.browser.test/basic"},
         "browser acceptance operation target",
     )
-    operations = tuple(
+    operations = (
         BrowserAcceptanceOperationEvidenceV1(
-            sequence=sequence,
+            sequence=1,
             invocation_revision="sha256:" + "9" * 64,
             operation="navigate",
             state=BrowserAcceptanceOperationState.TERMINAL,
             allocation_disposition=BrowserAllocationDisposition.LIVE,
             target_revision=target_revision,
-        )
-        for sequence in (1, 2)
+        ),
     )
     diagnostic = BrowserAcceptanceDiagnosticV1(
         state=BrowserAcceptanceDiagnosticState.CAPTURED,
         fixture_route_observed=True,
         fixture_route_request_count=1,
         browser_dispatches=1,
+        fault=BrowserAcceptanceFaultEvidenceV1(
+            scenario=BrowserAcceptanceFaultScenario.ACKNOWLEDGEMENT_LOSS,
+            boundary_observed=True,
+            browser_dispatches=1,
+        ),
         operations=operations,
     )
 
@@ -772,3 +785,137 @@ def test_browser_acceptance_request_summary_hashes_destination_and_route() -> No
     assert destination not in encoded
     assert path not in encoded
     assert "BROWSER_REQUEST_SECRET_CANARY" not in encoded
+
+
+def test_browser_acceptance_requires_exact_request_outcome_evidence() -> None:
+    case = BrowserAcceptanceCaseV1.build(
+        case_id="broker-denial",
+        category=BrowserAcceptanceCaseCategory.REFUSAL,
+        expected_state=BrowserAcceptanceState.PASSED,
+        semantic_oracle=BrowserAcceptanceSemanticOracle.OBSERVATION,
+        semantic_success_required=True,
+        required=True,
+        fixture_route="/denied-subresource",
+        operations=("navigate",),
+        screenshot_checkpoints=(),
+        oracle_parameters={
+            "required_operations": ["navigate"],
+            "required_requests": [{"path": "/private/denied.js", "outcome": "denied"}],
+        },
+    )
+    operation = BrowserAcceptanceOperationEvidenceV1(
+        sequence=1,
+        invocation_revision="sha256:" + "1" * 64,
+        operation="navigate",
+        state=BrowserAcceptanceOperationState.TERMINAL,
+        allocation_disposition=BrowserAllocationDisposition.LIVE,
+        target_revision=_content_revision(
+            {"url": "https://docs.browser.test/denied-subresource"},
+            "browser acceptance operation target",
+        ),
+    )
+    denied = BrowserAcceptanceRequestSummaryV1(
+        sequence=1,
+        method="GET",
+        destination_revision="sha256:" + "2" * 64,
+        route_revision=_content_revision(
+            {"path": "/private/denied.js"},
+            "browser acceptance request route",
+        ),
+        outcome="denied",
+        status_code=403,
+    )
+    diagnostic = BrowserAcceptanceDiagnosticV1(
+        state=BrowserAcceptanceDiagnosticState.CAPTURED,
+        fixture_route_observed=True,
+        fixture_route_request_count=1,
+        operations=(operation,),
+        requests=(denied,),
+    )
+
+    assert (
+        _semantic_state(case, diagnostic, public_operations=frozenset({"navigate"}))
+        is BrowserAcceptanceSemanticState.PASSED
+    )
+    assert (
+        _semantic_state(
+            case,
+            diagnostic.model_copy(update={"requests": ()}),
+            public_operations=frozenset({"navigate"}),
+        )
+        is BrowserAcceptanceSemanticState.FAILED
+    )
+
+
+def test_browser_acceptance_required_request_binds_method_and_destination() -> None:
+    destination = "blocked.browser.test"
+    case = BrowserAcceptanceCaseV1.build(
+        case_id="connect-denial",
+        category=BrowserAcceptanceCaseCategory.REFUSAL,
+        expected_state=BrowserAcceptanceState.REFUSED,
+        semantic_oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+        semantic_success_required=False,
+        required=True,
+        fixture_route="https://blocked.browser.test/private",
+        operations=("navigate",),
+        screenshot_checkpoints=(),
+        oracle_parameters={
+            "error": "fetch_failed",
+            "required_requests": [
+                {
+                    "method": "CONNECT",
+                    "destination": destination,
+                    "path": "/",
+                    "outcome": "denied",
+                }
+            ],
+        },
+    )
+    operation = BrowserAcceptanceOperationEvidenceV1(
+        sequence=1,
+        invocation_revision="sha256:" + "1" * 64,
+        operation="navigate",
+        state=BrowserAcceptanceOperationState.TERMINAL,
+        error_category="fetch_failed",
+        allocation_disposition=BrowserAllocationDisposition.RETIRED,
+        target_revision=_content_revision(
+            {"url": "https://blocked.browser.test/private"},
+            "browser acceptance operation target",
+        ),
+    )
+    denied = BrowserAcceptanceRequestSummaryV1(
+        sequence=1,
+        method="CONNECT",
+        destination_revision=_content_revision(
+            {"destination": destination},
+            "browser acceptance request destination",
+        ),
+        route_revision=_content_revision(
+            {"path": "/"},
+            "browser acceptance request route",
+        ),
+        outcome="denied",
+        status_code=403,
+    )
+    diagnostic = BrowserAcceptanceDiagnosticV1(
+        state=BrowserAcceptanceDiagnosticState.CAPTURED,
+        operations=(operation,),
+        requests=(denied,),
+    )
+
+    assert (
+        _semantic_state(case, diagnostic, public_operations=frozenset({"navigate"}))
+        is BrowserAcceptanceSemanticState.PASSED
+    )
+    for changed in (
+        denied.model_copy(update={"method": "GET"}),
+        denied.model_copy(update={"destination_revision": "sha256:" + "2" * 64}),
+    ):
+        assert (
+            _semantic_state(
+                case,
+                diagnostic.model_copy(update={"requests": (changed,)}),
+                public_operations=frozenset({"navigate"}),
+            )
+            is BrowserAcceptanceSemanticState.FAILED
+        )

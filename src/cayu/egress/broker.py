@@ -173,7 +173,9 @@ class EgressDecision:
     grant_id: str | None
     policy_name: str | None
     reason: str | None
-    authorization_kind: Literal["virtual_credential", "credentialless"] = "virtual_credential"
+    authorization_kind: Literal["virtual_credential", "credentialless", "transport"] = (
+        "virtual_credential"
+    )
 
 
 @dataclass(frozen=True)
@@ -855,6 +857,22 @@ class TransparentEgressBroker:
 
         normalized_host = self._authorized_connect_host(host=host, port=port)
         if normalized_host is None:
+            # CONNECT carries no HTTP authorization or path yet. Preserve the
+            # coarse transport refusal as its own audit classification instead
+            # of fabricating credential or credentialless request authority.
+            self._record(
+                EgressDecision(
+                    allowed=False,
+                    status_code=403,
+                    destination=host,
+                    method="CONNECT",
+                    path="/",
+                    grant_id=None,
+                    policy_name=None,
+                    reason="CONNECT destination has no active egress authority.",
+                    authorization_kind="transport",
+                )
+            )
             return None
         admission = _ConnectDestinationAdmission(host=normalized_host, port=port)
         self._active_connect_admissions.add(admission)

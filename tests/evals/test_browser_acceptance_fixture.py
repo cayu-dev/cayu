@@ -35,6 +35,7 @@ def test_browser_acceptance_fixture_routes_both_logical_hosts_locally(
         form = _fetch(fixture, "/forms")
         detached = _fetch(fixture, "/detached")
         challenge = _fetch(fixture, "/challenge")
+        popup = _fetch(fixture, "/popup")
         effect = _fetch(fixture, "/effect/form-saved")
 
         assert fixture.upstream_origin.startswith("http://127.0.0.1:")
@@ -47,8 +48,9 @@ def test_browser_acceptance_fixture_routes_both_logical_hosts_locally(
         assert static.status == 200
         assert b"Frame value" in static.read()
         assert b"required" in form.read()
-        assert b"target.remove()" in detached.read()
+        assert b"getElementById('target').remove()" in detached.read()
         assert challenge.headers["x-cayu-access-block"] == "bot_challenge"
+        assert b"window.open('https://docs.browser.test/basic')" in popup.read()
         assert effect.status == 204
         assert fixture.request_counts() == {
             "/basic": 1,
@@ -57,6 +59,7 @@ def test_browser_acceptance_fixture_routes_both_logical_hosts_locally(
             "/effect/form-saved": 1,
             "/forms": 1,
             "/frame-controls": 1,
+            "/popup": 1,
         }
 
     with pytest.raises(RuntimeError, match="not running"):

@@ -569,6 +569,7 @@ class EnvironmentFactoryRequest:
         default_factory=ExecutionRequirements.trusted
     )
     execution_profile_fingerprint: str | None = None
+    interaction_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.operation, EnvironmentFactoryOperation):
@@ -586,6 +587,12 @@ class EnvironmentFactoryRequest:
             "environment_name",
             require_clean_nonblank(self.environment_name, "environment_name"),
         )
+        if self.interaction_id is not None:
+            object.__setattr__(
+                self,
+                "interaction_id",
+                require_clean_nonblank(self.interaction_id, "interaction_id"),
+            )
         if self.execution_profile_fingerprint is not None and (
             type(self.execution_profile_fingerprint) is not str
             or len(self.execution_profile_fingerprint) != 64
@@ -784,6 +791,7 @@ def copy_environment_factory_request(
         metadata=request.metadata,
         reconnect_metadata=request.reconnect_metadata,
         execution_requirements=request.execution_requirements,
+        interaction_id=request.interaction_id,
     )
 
 
