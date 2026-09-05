@@ -897,12 +897,20 @@ def _trial_section(trial: Any, presentation: EvalTrialPresentationV1) -> str:
         output_block += f"<pre>{_escape(output.text)}</pre>"
     memory = trial.memory_attribution
     memory_summary = eval_memory_attribution_summary(memory)
+    capture_diagnostic = getattr(trial, "capture_diagnostic", None)
+    capture_html = (
+        "<h5>Capture failure</h5><pre>"
+        + _escape(capture_diagnostic.model_dump_json(indent=2))
+        + "</pre>"
+        if capture_diagnostic is not None
+        else ""
+    )
     return (
         f'<section class="trial"><h4>Trial {trial.trial_number} {_badge(trial.status)}</h4>'
         f"<p>Score {_score(trial.score)} · {trial.duration_ms} ms · "
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'} · "
         f"usage {_escape(usage)} · reason <code>{_escape(trial.code)}</code></p>"
-        f"<p>{_escape(trial.message)}</p>"
+        f"<p>{_escape(trial.message)}</p>{capture_html}"
         f"<p>Memory attribution: {_escape(memory_summary)} · revision "
         f"<code>{_escape(memory.revision)}</code></p>"
         "<p>Full memory-attribution record inspection is unsupported in HTML; "

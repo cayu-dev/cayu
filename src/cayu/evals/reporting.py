@@ -558,6 +558,8 @@ def _trial_section(trial: Any) -> str:
         if trial.final_output
         else ""
     )
+    execution = getattr(trial, "execution_status", None)
+    execution_html = f"<p>Workflow execution: {_escape(execution)}.</p>" if execution else ""
     diagnostic = trial.error or trial.unavailable_reason
     diagnostic_html = f"<h5>Diagnostic</h5><pre>{_escape(diagnostic)}</pre>" if diagnostic else ""
     usage = (
@@ -573,7 +575,7 @@ def _trial_section(trial: Any) -> str:
         f"<p>Session <code>{_escape(trial.session_id or 'not created')}</code> · "
         f"score {_format_score(trial.score)} · {trial.duration_ms} ms · "
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'}</p>"
-        f"{diagnostic_html}{final_output}{usage}"
+        f"{execution_html}{diagnostic_html}{final_output}{usage}"
         f"<p>Memory attribution: {_escape(memory_summary)} · revision "
         f"<code>{_escape(memory.revision)}</code></p>"
         "<p>Full memory-attribution record inspection is unsupported in HTML; "

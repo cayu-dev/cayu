@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -39,6 +39,7 @@ from cayu.evals._memory_attribution import (
 )
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY, EvalExecutionCapacity
+from cayu.evals.capture_policy import WorkflowAttemptAnchor, WorkflowCaptureDiagnostic
 from cayu.evals.corpus import EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS
 from cayu.evals.memory_attribution import (
     EVAL_MEMORY_ATTRIBUTION_MAX_BYTES,
@@ -1587,6 +1588,26 @@ def _current_workflow_completion(
     return attempt_id, completion
 
 
+def _workflow_root_sha256(session: Session, records: tuple[EventRecord, ...]) -> str:
+    from cayu._validation import canonical_durable_json_bytes
+
+    return hashlib.sha256(
+        canonical_durable_json_bytes(
+            {
+                "session": session.model_dump(mode="json"),
+                "records": [record.model_dump(mode="json") for record in records],
+            },
+            "workflow attempt root",
+        )
+    ).hexdigest()
+
+
+def _workflow_structured_sha256(value: dict[str, Any] | None) -> str:
+    from cayu._validation import canonical_durable_json_bytes
+
+    return hashlib.sha256(canonical_durable_json_bytes(value, "workflow output")).hexdigest()
+
+
 async def _capture_workflow_child_probes(
     app: CayuApp,
     children: tuple[Trajectory, ...],
@@ -1671,6 +1692,12 @@ async def _run_workflow_case_once_with_public_projection(
     diagnostic_code: EvalTrialDiagnosticCode | None = None
     public_output = EvalTrialOutputPreviewV1.unavailable()
     capture_state: _CaptureState | None = None
+    capture_stage: Literal["child_capture", "capture_revalidation", "post_scoring_revalidation"] = (
+        "child_capture"
+    )
+    capture_diagnostic: WorkflowCaptureDiagnostic | None = None
+    workflow_attempt: WorkflowAttemptAnchor | None = None
+    execution_status = None
     publication_attempt_id: str | None = None
     publication_completion_event_id: str | None = None
     publication_record_identity: tuple[tuple[int, str], ...] | None = None
@@ -1786,6 +1813,7 @@ async def _run_workflow_case_once_with_public_projection(
                 records,
                 workflow_name=target.workflow_spec.name,
             )
+            execution_status = "completed"
             terminal = WorkflowEvalTerminalEvidence(
                 workflow_run_id=root_session_id,
                 workflow_name=target.workflow_spec.name,
@@ -1844,10 +1872,30 @@ async def _run_workflow_case_once_with_public_projection(
                 final_output_sha256=workflow_eval_output_sha256(final_output),
                 structured_output=structured_output,
             )
-            capture_state = _CaptureState(bounds=SessionTrajectoryBounds(), strict=False)
+            workflow_attempt = WorkflowAttemptAnchor(
+                run_id=run_id,
+                suite_id=suite_id,
+                case_id=case.id,
+                trial_number=trial_number,
+                session_id=root_session_id,
+                target_revision=workflow_identity.revision,
+                projector_revision=workflow_identity.result_projector_revision,
+                input_messages_sha256=output_evidence.input_messages_sha256,
+                attempt_id=attempt_id,
+                completion_event_id=completion.event.id,
+                completion_sequence=completion.sequence,
+                root_sha256=_workflow_root_sha256(workflow_session, latest_records),
+                final_output_sha256=output_evidence.final_output_sha256,
+                structured_output_sha256=_workflow_structured_sha256(structured_output),
+            )
+            capture_state = _CaptureState(
+                bounds=target.capture_bounds, strict=False, fail_closed=True
+            )
             children_incomplete = _IncompleteFlag()
             if not runtime_app.session_store.supports_session_lineage:
-                children_incomplete.value = True
+                raise SessionTrajectoryError(
+                    SessionTrajectoryErrorCode.STORE_UNSUPPORTED, session_id=root_session_id
+                )
             children = await _build_child_trajectories(
                 runtime_app,
                 root_session_id,
@@ -1873,10 +1921,11 @@ async def _run_workflow_case_once_with_public_projection(
                 metadata=case.metadata,
             )
             if children_incomplete.value:
-                raise WorkflowEvalFailure(
-                    WorkflowEvalFailureCode.TARGET_FAILED,
-                    "Workflow child-session evidence could not be captured completely.",
+                raise SessionTrajectoryError(
+                    SessionTrajectoryErrorCode.EVIDENCE_INCONSISTENT,
+                    session_id=root_session_id,
                 )
+            capture_stage = "capture_revalidation"
             memory_alias_key = memory_evidence_key(runtime_app._request_footprint)
             first_memory_projection = await _owned_fresh_memory_attribution_projection(
                 runtime_app,
@@ -1941,6 +1990,7 @@ async def _run_workflow_case_once_with_public_projection(
                     portable_evidence_error=prepared_error,
                 )
             )
+            capture_stage = "post_scoring_revalidation"
             assertion_error = _assertion_diagnostic(
                 assertion_results,
                 EvalOutcome.ERROR,
@@ -1986,6 +2036,27 @@ async def _run_workflow_case_once_with_public_projection(
     except TimeoutError:
         run_error = f"Eval case timed out after {timeout_seconds} seconds."
         diagnostic_code = EvalTrialDiagnosticCode.CASE_TIMEOUT
+        public_output = EvalTrialOutputPreviewV1.unavailable()
+        trajectory = None
+        final_output = ""
+        structured_output = None
+    except SessionTrajectoryError as exc:
+        capture_diagnostic = WorkflowCaptureDiagnostic(
+            stage=capture_stage,
+            code=exc.code,
+            session_id=exc.session_id,
+            terminal_code=exc.terminal_code,
+            limit=exc.limit,
+            observed_lower_bound=exc.observed,
+            bounds=target.capture_bounds,
+            consumed_events=0 if capture_state is None else capture_state.event_count,
+            consumed_transcript_records=0
+            if capture_state is None
+            else capture_state.transcript_count,
+            consumed_bytes=0 if capture_state is None else capture_state.total_bytes,
+        )
+        run_error = "Workflow capture failed: " + capture_diagnostic.model_dump_json()
+        diagnostic_code = EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED
         public_output = EvalTrialOutputPreviewV1.unavailable()
         trajectory = None
         final_output = ""
@@ -2111,7 +2182,9 @@ async def _run_workflow_case_once_with_public_projection(
         assertion_results = list(
             _blocked_assertion_results(
                 case.assertions,
-                EvalOutcome.ERROR,
+                EvalOutcome.UNAVAILABLE
+                if diagnostic_code is EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED
+                else EvalOutcome.ERROR,
                 run_error,
                 memory_attribution_evidence=memory_attribution,
             )
@@ -2124,8 +2197,14 @@ async def _run_workflow_case_once_with_public_projection(
         if run_error is None
         else None
     )
+    if diagnostic_code is EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED:
+        unavailable_reason = run_error
+        run_error = None
     status = _trial_status(run_error, unavailable_reason, assertion_results)
-    if unavailable_reason is not None:
+    if (
+        unavailable_reason is not None
+        and diagnostic_code is not EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED
+    ):
         diagnostic_code = EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE
     if diagnostic_code is None:
         diagnostic_code = (
@@ -2140,6 +2219,10 @@ async def _run_workflow_case_once_with_public_projection(
     )
     return (
         EvalTrialResult(
+            execution_status=execution_status,
+            capture_bounds=target.capture_bounds,
+            capture_diagnostic=capture_diagnostic,
+            workflow_attempt=workflow_attempt,
             trial_number=trial_number,
             status=status,
             session_id=root_session_id,

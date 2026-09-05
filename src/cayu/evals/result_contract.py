@@ -47,6 +47,7 @@ class EvalTrialDiagnosticCode(StrEnum):
     WORKFLOW_ATTEMPT_SUPERSEDED = "workflow_attempt_superseded"
     WORKFLOW_PROJECTOR_FAILED = "workflow_projector_failed"
     WORKFLOW_OUTPUT_INVALID = "workflow_output_invalid"
+    WORKFLOW_CAPTURE_FAILED = "workflow_capture_failed"
     WORKFLOW_QUIESCENCE_FAILED = "workflow_quiescence_failed"
     EXECUTION_FAILED = "execution_failed"
     SESSION_FAILED = "session_failed"

@@ -13330,3 +13330,13 @@ Schema revision 80 adds nullable `failure_diagnostic_json`; historical failures
 remain readable with no diagnostic. New eval stores require revision 80 and normal
 storage migration before using an existing database. No diagnostic contains raw
 exception text, tracebacks, corpus values, prompts, provider responses or credentials.
+
+### Workflow evaluation capture and recovery
+
+Workflow eval targets own finite aggregate child capture bounds independently of
+execution budgets. Capture rejection preserves completed execution and blocks scoring.
+Saved-attempt recovery validates exact root/attempt/input/projector identity and
+fresh terminal lineage without dispatching workflows, tools, providers, or judges.
+See [workflow capture and saved-attempt recovery](workflow-eval-recovery.md) for
+policy identities, bounds, diagnostic semantics, immutable capture/score revisions,
+and the explicit historical limits of importing pre-anchor reports.

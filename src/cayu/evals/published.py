@@ -21,6 +21,7 @@ from cayu._validation import (
     json_utf8_size_within_limit,
 )
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
+from cayu.evals.capture_policy import SessionTrajectoryBounds, WorkflowCaptureDiagnostic
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
     _MODEL_JUDGE_RESULT_METADATA_KEY,
@@ -192,6 +193,7 @@ _TRIAL_MESSAGE = {
     EvalTrialDiagnosticCode.WORKFLOW_OUTPUT_INVALID: (
         "The workflow result projector returned invalid output."
     ),
+    EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED: "Workflow completed; evidence capture failed and scoring is unavailable.",
     EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED: (
         "The workflow target did not close cleanly."
     ),
@@ -214,6 +216,7 @@ _TRIAL_CODES_BY_STATUS = {
     "passed": {EvalTrialDiagnosticCode.PASSED},
     "failed": {EvalTrialDiagnosticCode.ASSERTION_FAILED},
     "unavailable": {
+        EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED,
         EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE,
         EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_UNAVAILABLE,
         EvalTrialDiagnosticCode.INTERRUPTED_EVIDENCE_UNAVAILABLE,
@@ -1264,6 +1267,15 @@ def _validate_memory_assertions_for_evidence(
 
 
 class PublishedEvalTrialResult(_PortableModel):
+    execution_status: Literal["completed"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    capture_bounds: SessionTrajectoryBounds | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    capture_diagnostic: WorkflowCaptureDiagnostic | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     source_trial_revision: StrictStr = Field(min_length=64, max_length=64)
     status: PublishedStatus
@@ -2803,6 +2815,9 @@ def _published_case(
             public_data = trial_public_data[index]
         trials.append(
             PublishedEvalTrialResult(
+                execution_status=trial.execution_status,
+                capture_bounds=trial.capture_bounds,
+                capture_diagnostic=trial.capture_diagnostic,
                 trial_number=trial.trial_number,
                 source_trial_revision=eval_trial_result_revision(
                     EvalTrialResult.model_validate(

@@ -1044,7 +1044,7 @@ def _present_fresh_trial(trial: PublishedEvalTrialResult) -> EvalTrialPresentati
         trial.model_dump(mode="python", round_trip=True, warnings="none")
     )
     assertions = tuple(_present_assertion(assertion) for assertion in validated.assertions)
-    runtime = _fresh_runtime(validated.code)
+    runtime = validated.execution_status or _fresh_runtime(validated.code)
     evidence: EvalEvidenceState = (
         "complete"
         if validated.evidence_complete

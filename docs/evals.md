@@ -748,6 +748,9 @@ validation fails before provider dispatch.
 
 ### Application-owned workflow targets
 
+For configurable child capture limits, precise capture failures, and read-only
+recapture/rescoring, see [Workflow capture and saved-attempt recovery](workflow-eval-recovery.md).
+
 `WorkflowEvalTarget` makes a `WorkflowBase` run—not one child agent session—the
 candidate under evaluation. It reuses the same `EvalSuite`, corpus compiler,
 assertions, scheduler, stores, reports, CLI, and server execution path:

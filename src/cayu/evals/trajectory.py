@@ -3,14 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel
 
 from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType, event_payload_authority_is_runtime_generated
 from cayu.core.messages import Message, MessageRole, TextPart, detach_message
+from cayu.evals.capture_policy import SessionTrajectoryBounds, SessionTrajectoryErrorCode
 from cayu.evals.models import (
     Trajectory,
     TrajectoryProbes,
@@ -27,14 +27,6 @@ from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS,
-    TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS,
-    TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
-    TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
-    TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
     RunnerObservedEventIdentity,
     Session,
     SessionInputContractEvidence,
@@ -70,62 +62,6 @@ _SESSION_TRAJECTORY_DEFAULT_MAX_DEPTH = 32
 _SESSION_TRAJECTORY_HARD_MAX_DEPTH = 32
 _SESSION_TRAJECTORY_HARD_MAX_LINEAGE_CANDIDATES = 500
 _ORIGIN_EVENT_TYPES = (EventType.SESSION_STARTED, EventType.SESSION_FORKED)
-
-
-class SessionTrajectoryBounds(BaseModel):
-    """Global retained-evidence limits for one production-session trajectory."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    max_sessions: StrictInt = Field(
-        default=_SESSION_TRAJECTORY_DEFAULT_MAX_SESSIONS,
-        ge=1,
-        le=_SESSION_TRAJECTORY_HARD_MAX_SESSIONS,
-    )
-    max_depth: StrictInt = Field(
-        default=_SESSION_TRAJECTORY_DEFAULT_MAX_DEPTH,
-        ge=1,
-        le=_SESSION_TRAJECTORY_HARD_MAX_DEPTH,
-    )
-    max_events: StrictInt = Field(
-        default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
-        ge=1,
-        le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS,
-    )
-    max_transcript_records: StrictInt = Field(
-        default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS,
-        ge=0,
-        le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
-    )
-    max_record_bytes: StrictInt = Field(
-        default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
-        ge=1,
-        le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
-    )
-    max_total_bytes: StrictInt = Field(
-        default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
-        ge=1,
-        le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
-    )
-    memory_attribution_bounds: MemoryAttributionBounds = Field(
-        default_factory=MemoryAttributionBounds
-    )
-
-
-class SessionTrajectoryErrorCode(StrEnum):
-    """Stable reason a durable session tree cannot become exact eval evidence."""
-
-    STORE_UNSUPPORTED = "store_unsupported"
-    EVIDENCE_READ_FAILED = "evidence_read_failed"
-    TERMINAL_EVIDENCE_REJECTED = "terminal_evidence_rejected"
-    DESCENDANT_ENUMERATION_FAILED = "descendant_enumeration_failed"
-    ORIGIN_EVIDENCE_REJECTED = "origin_evidence_rejected"
-    PARENT_CONTRADICTION = "parent_contradiction"
-    CYCLE_DETECTED = "cycle_detected"
-    SESSION_LIMIT_EXCEEDED = "session_limit_exceeded"
-    DEPTH_LIMIT_EXCEEDED = "depth_limit_exceeded"
-    CLOSURE_CHANGED = "closure_changed"
-    EVIDENCE_INCONSISTENT = "evidence_inconsistent"
 
 
 _SESSION_TRAJECTORY_ERROR_MESSAGES = {
@@ -243,6 +179,7 @@ class _ChildTrajectoryLoad:
 class _CaptureState:
     bounds: SessionTrajectoryBounds
     strict: bool
+    fail_closed: bool = False
     retained_session_ids: set[str] = field(default_factory=set)
     lineage_candidate_parents: dict[str, str] = field(default_factory=dict)
     evidence_by_session_id: dict[str, TerminalSessionEvidence] = field(default_factory=dict)
@@ -964,7 +901,7 @@ async def _build_child_trajectories(
                 candidate for candidate in candidates if isinstance(candidate, Session)
             )
     except SessionTrajectoryError:
-        if capture.strict:
+        if capture.strict or capture.fail_closed:
             raise
         if incomplete is not None:
             incomplete.value = True
@@ -985,7 +922,7 @@ async def _build_child_trajectories(
                 limit=capture.bounds.max_depth,
                 observed=child_depth,
             )
-            if capture.strict:
+            if capture.strict or capture.fail_closed:
                 raise error
             if incomplete is not None:
                 incomplete.value = True
@@ -996,7 +933,7 @@ async def _build_child_trajectories(
                 session_id=child_id,
                 parent_session_id=parent_session_id,
             )
-            if capture.strict:
+            if capture.strict or capture.fail_closed:
                 raise error
             if incomplete is not None:
                 incomplete.value = True
@@ -1014,7 +951,7 @@ async def _build_child_trajectories(
                 before_store_read=before_store_read,
             )
         except SessionTrajectoryError:
-            if capture.strict:
+            if capture.strict or capture.fail_closed:
                 raise
             if incomplete is not None:
                 incomplete.value = True
@@ -1280,6 +1217,15 @@ async def _load_child_trajectory(
                 exc.code != TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED
                 or not app.session_store.supports_runner_owned_interrupted_evidence
             ):
+                if state.fail_closed:
+                    raise SessionTrajectoryError(
+                        SessionTrajectoryErrorCode.TERMINAL_EVIDENCE_REJECTED,
+                        session_id=session_id,
+                        parent_session_id=expected_parent_session_id,
+                        terminal_code=exc.code,
+                        limit=exc.limit,
+                        observed=exc.observed,
+                    ) from None
                 return _ChildTrajectoryLoad()
             try:
                 if before_store_read is not None:
@@ -1290,12 +1236,33 @@ async def _load_child_trajectory(
                     limits=limits,
                 )
                 evidence = _validated_terminal_session_evidence(evidence)
-            except Exception:
+            except TerminalSessionEvidenceError as exc:
+                if state.fail_closed:
+                    raise SessionTrajectoryError(
+                        SessionTrajectoryErrorCode.TERMINAL_EVIDENCE_REJECTED,
+                        session_id=session_id,
+                        parent_session_id=expected_parent_session_id,
+                        terminal_code=exc.code,
+                        limit=exc.limit,
+                        observed=exc.observed,
+                    ) from None
                 return _ChildTrajectoryLoad()
+            except Exception:
+                if state.fail_closed:
+                    raise SessionTrajectoryError(
+                        SessionTrajectoryErrorCode.EVIDENCE_READ_FAILED, session_id=session_id
+                    ) from None
+                return _ChildTrajectoryLoad()
+        except SessionTrajectoryError:
+            raise
         except Exception:
+            if state.fail_closed:
+                raise SessionTrajectoryError(
+                    SessionTrajectoryErrorCode.EVIDENCE_READ_FAILED, session_id=session_id
+                ) from None
             return _ChildTrajectoryLoad()
     if evidence.session.parent_session_id != expected_parent_session_id:
-        if state.strict:
+        if state.strict or state.fail_closed:
             raise SessionTrajectoryError(
                 SessionTrajectoryErrorCode.PARENT_CONTRADICTION,
                 session_id=session_id,
@@ -1306,6 +1273,8 @@ async def _load_child_trajectory(
         try:
             _validate_terminal_origin_lineage(evidence)
         except SessionTrajectoryError:
+            if state.fail_closed:
+                raise
             return _ChildTrajectoryLoad()
     origins = tuple(
         record for record in evidence.events if record.event.type in _ORIGIN_EVENT_TYPES

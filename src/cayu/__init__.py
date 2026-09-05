@@ -1027,6 +1027,13 @@ from cayu.evals import (
     write_html_report,
     write_trajectory_json,
 )
+from cayu.evals.workflow_recovery import (
+    SavedWorkflowEvalCapture,
+    SavedWorkflowEvalScore,
+    capture_workflow_eval_attempt,
+    import_workflow_eval_attempt,
+    score_workflow_eval_capture,
+)
 from cayu.knowledge_curator import (
     CandidatePolicyDisposition,
     KnowledgeCandidateGenerator,
@@ -4778,6 +4785,8 @@ __all__ = [
     "SQLiteMemoryInterventionExecutionStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
+    "SavedWorkflowEvalCapture",
+    "SavedWorkflowEvalScore",
     "SavingsPercentageState",
     "ScenarioApprovalCheckpointEventV2",
     "ScenarioArtifactLaunchBindingV2",
@@ -5310,6 +5319,7 @@ __all__ = [
     "business_approval_routing_metadata",
     "canonical_tool_id",
     "capture_eval_scenario_from_session",
+    "capture_workflow_eval_attempt",
     "captured_evaluation_result_from_json",
     "captured_evaluation_result_to_json",
     "causal_budget_usage_summary",
@@ -5442,6 +5452,7 @@ __all__ = [
     "gated_loop",
     "group_learning_signals",
     "has_run_limits",
+    "import_workflow_eval_attempt",
     "inspect_agent_bundle_container",
     "inspect_eval_corpus",
     "inspect_eval_scenario",
@@ -5554,6 +5565,7 @@ __all__ = [
     "scenario_launch_settings_from_invocation",
     "score_captured_evaluation_candidate",
     "score_promotion_candidate",
+    "score_workflow_eval_capture",
     "scripted_structured_output",
     "secret_env_refs",
     "session_fork_profile_relationship",

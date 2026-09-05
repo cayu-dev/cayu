@@ -36,6 +36,11 @@ from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
+from cayu.evals.capture_policy import (
+    SessionTrajectoryBounds,
+    WorkflowAttemptAnchor,
+    WorkflowCaptureDiagnostic,
+)
 from cayu.evals.memory_attribution import (
     EvalMemoryAttributionEvidenceV1,
     EvalMemoryEvidenceLimitation,
@@ -342,6 +347,18 @@ class EvalTrialResult(BaseModel):
     unavailable_reason: str | None = None
     # Whether the exact run snapshot and complete child tree were captured. Assertion
     # inputs such as a price book can still be unavailable when this is true.
+    execution_status: Literal["completed"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    capture_bounds: SessionTrajectoryBounds | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    capture_diagnostic: WorkflowCaptureDiagnostic | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    workflow_attempt: WorkflowAttemptAnchor | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     evidence_complete: StrictBool = False
     events_count: StrictInt = Field(default=0, ge=0)
     usage_summary: dict[str, Any] | None = None
@@ -407,6 +424,21 @@ class EvalTrialResult(BaseModel):
 
     @model_validator(mode="after")
     def validate_result_contract(self) -> EvalTrialResult:
+        if self.workflow_attempt is not None and (
+            self.execution_status != "completed"
+            or self.workflow_attempt.session_id != self.session_id
+            or self.workflow_attempt.trial_number != self.trial_number
+        ):
+            raise ValueError("Workflow attempt anchor must match the completed trial execution.")
+        if self.capture_diagnostic is not None and (
+            self.execution_status != "completed"
+            or self.evidence_complete
+            or self.score is not None
+            or self.capture_bounds != self.capture_diagnostic.bounds
+        ):
+            raise ValueError(
+                "Capture failure requires completed execution and unavailable scoring."
+            )
         if self.completed_at < self.started_at:
             raise ValueError("completed_at cannot precede started_at.")
         expected_duration = max(

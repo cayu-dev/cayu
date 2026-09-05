@@ -801,6 +801,13 @@ from cayu.evals.trial_policy import (
     EvalSuiteRunExposureV1,
     EvalSuiteTrialPolicyV1,
 )
+from cayu.evals.workflow_recovery import (
+    SavedWorkflowEvalCapture,
+    SavedWorkflowEvalScore,
+    capture_workflow_eval_attempt,
+    import_workflow_eval_attempt,
+    score_workflow_eval_capture,
+)
 from cayu.evals.workflow_target import (
     WORKFLOW_EVAL_DEFAULT_CLOSE_TIMEOUT_SECONDS,
     WORKFLOW_EVAL_MAX_APPLICATION_CONTEXT_BYTES,
@@ -1340,6 +1347,8 @@ __all__ = [
     "RuntimeReplayReport",
     "RuntimeReplayRequest",
     "RuntimeReplayWarning",
+    "SavedWorkflowEvalCapture",
+    "SavedWorkflowEvalScore",
     "ScenarioApprovalCheckpointEventV2",
     "ScenarioArtifactLaunchBindingV2",
     "ScenarioArtifactMaterializationError",
@@ -1425,6 +1434,7 @@ __all__ = [
     "build_memory_experiment_report",
     "build_promotion_candidate",
     "capture_eval_scenario_from_session",
+    "capture_workflow_eval_attempt",
     "captured_evaluation_result_from_json",
     "captured_evaluation_result_to_json",
     "compare_corpus_execution_results",
@@ -1486,6 +1496,7 @@ __all__ = [
     "external_container_environment_revision",
     "external_trial_envelope_from_request",
     "final_output_text",
+    "import_workflow_eval_attempt",
     "inspect_browser_acceptance_runtime_identity",
     "inspect_eval_corpus",
     "inspect_eval_scenario",
@@ -1547,6 +1558,7 @@ __all__ = [
     "scenario_launch_settings_from_invocation",
     "score_captured_evaluation_candidate",
     "score_promotion_candidate",
+    "score_workflow_eval_capture",
     "scripted_structured_output",
     "standard_eval_memory_attribution_bounds",
     "trajectory_from_session",

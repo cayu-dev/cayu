@@ -29,6 +29,7 @@ from cayu.evals.capacity import (
     EVAL_MAX_CONCURRENCY,
     EvalExecutionCapacity,
 )
+from cayu.evals.capture_policy import SessionTrajectoryBounds
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_CASES,
     EVAL_CORPUS_MAX_MESSAGE_CHARS,
@@ -882,6 +883,7 @@ class WorkflowEvalTarget(CorpusTarget):
     candidate execution is performed exclusively by ``workflow_factory``.
     """
 
+    capture_bounds: SessionTrajectoryBounds = Field(default_factory=SessionTrajectoryBounds)
     workflow_spec: WorkflowSpec
     implementation_revision: StrictStr
     result_projector_revision: StrictStr
@@ -957,6 +959,13 @@ class WorkflowEvalTarget(CorpusTarget):
         return self
 
     def identity(self) -> WorkflowEvalTargetIdentityV1:
+        if (
+            self.capture_bounds.memory_attribution_bounds
+            != SessionTrajectoryBounds().memory_attribution_bounds
+        ):
+            raise ValueError(
+                "Workflow capture bounds cannot override the separate Evals memory policy."
+            )
         return WorkflowEvalTargetIdentityV1.create(
             workflow_spec=self.workflow_spec,
             implementation_revision=self.implementation_revision,
@@ -964,6 +973,7 @@ class WorkflowEvalTarget(CorpusTarget):
             execution_scope_revision=self.execution_scope_revision,
             application_context=self.application_context,
             evidence_policy_revision=self.evidence_policy.revision,
+            capture_bounds=self.capture_bounds,
             instance_scope=self.instance_scope,
             close_timeout_seconds=self.close_timeout_seconds,
         )
@@ -998,6 +1008,7 @@ def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
             price_book=target.price_book,
             model_judges=target.model_judges,
             limits=target.limits,
+            capture_bounds=target.capture_bounds,
             workflow_spec=target.workflow_spec,
             implementation_revision=target.implementation_revision,
             result_projector_revision=target.result_projector_revision,

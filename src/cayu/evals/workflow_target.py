@@ -30,6 +30,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
 from cayu.core.workflows import WorkflowSpec, copy_workflow_spec
+from cayu.evals.capture_policy import SessionTrajectoryBounds
 from cayu.runtime.app import CayuApp
 from cayu.workflows import WorkflowBase
 
@@ -92,6 +93,9 @@ class WorkflowEvalTargetIdentityV1(BaseModel):
     execution_scope_revision: StrictStr
     application_context_revision: StrictStr
     evidence_policy_revision: StrictStr
+    capture_bounds: SessionTrajectoryBounds | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     instance_scope: WorkflowEvalInstanceScope
     close_timeout_seconds: float = Field(
         gt=0,
@@ -164,6 +168,7 @@ class WorkflowEvalTargetIdentityV1(BaseModel):
         evidence_policy_revision: str,
         instance_scope: WorkflowEvalInstanceScope | str,
         close_timeout_seconds: float,
+        capture_bounds: SessionTrajectoryBounds | None = None,
     ) -> WorkflowEvalTargetIdentityV1:
         copied = copy_workflow_spec(workflow_spec)
         material = {
@@ -193,6 +198,8 @@ class WorkflowEvalTargetIdentityV1(BaseModel):
             "instance_scope": WorkflowEvalInstanceScope(instance_scope).value,
             "close_timeout_seconds": close_timeout_seconds,
         }
+        if capture_bounds is not None and capture_bounds != SessionTrajectoryBounds():
+            material["capture_bounds"] = capture_bounds.model_dump(mode="json")
         revision = (
             "sha256:"
             + hashlib.sha256(
