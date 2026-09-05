@@ -70,6 +70,7 @@ from cayu.providers.base import (
 from cayu.providers.deadlines import (
     ProviderProgressKind,
     ProviderStreamDeadlines,
+    _provider_deadline_material,
     _resolve_provider_stream_deadlines,
     observe_provider_semantic_progress,
 )
@@ -2248,3 +2249,40 @@ def _is_chat_context_overflow(
     ):
         return True
     return status_code in {400, 500, 504} and "context" in normalized and "too large" in normalized
+
+
+def _execution_profile_material(provider: ChatCompletionsProvider) -> dict[str, Any] | None:
+    """Bounded configuration material for runtime exact-type identity selection."""
+    if type(provider.transport) is not HttpxChatCompletionsTransport or provider.extra_headers:
+        return None
+    return {
+        "base_url": provider.base_url,
+        "endpoint_url": provider.endpoint_url,
+        "api_key_env": provider.api_key_env,
+        "auth_header": provider.auth_header,
+        "auth_value_prefix": provider.auth_value_prefix,
+        "allow_http": provider.allow_http,
+        "stream_include_usage": provider.stream_include_usage,
+        "timeout_s": provider.timeout_s,
+        "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
+        "api_version": provider.api_version,
+        "default_route": bool(
+            provider.base_url == DEFAULT_CHAT_COMPLETIONS_BASE_URL
+            and provider.endpoint_url is None
+            and (provider.api_key_env == DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV)
+            and (provider.auth_header == DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER)
+            and (provider.auth_value_prefix == DEFAULT_CHAT_COMPLETIONS_AUTH_VALUE_PREFIX)
+            and (not provider.allow_http)
+            and (provider.api_version is None)
+            and (provider.openrouter_http_referer is None)
+            and (provider.openrouter_app_title is None)
+            and (not provider.openrouter_router_metadata)
+        ),
+        "clean_schemas": provider.clean_schemas,
+        "strip_additional_properties": provider.strip_additional_properties,
+        "document_encoding": provider.document_encoding,
+        "usage_dialect": provider.usage_dialect.value,
+        "openrouter_http_referer_configured": provider.openrouter_http_referer is not None,
+        "openrouter_app_title_configured": provider.openrouter_app_title is not None,
+        "openrouter_router_metadata": provider.openrouter_router_metadata,
+    }

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 
 from cayu.artifacts import ArtifactScope
+from cayu.core.events import EventType
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.corpus import (
     _MODEL_JUDGE_RESULT_METADATA_KEY,
@@ -68,7 +70,7 @@ from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, copy_price_book
 from cayu.runtime.manifest import AppManifest
 
-MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION = 2
+MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION = 3
 
 _ROOT_TERMINAL_PROCESS_EVENTS = frozenset(
     {
@@ -104,6 +106,66 @@ class _TrustedModelJudgeBinding:
     price_book: PriceBook | None = None
     candidate_route_relation: str = "independent_model"
     structured_app: CayuApp | None = None
+
+
+def _judge_relation(binding: _TrustedModelJudgeBinding, context: EvalContext) -> str:
+    """Resolve workflow routes from the captured session tree, never the profile probe.
+
+    Every observed route participates (including retries and compaction). Multiple
+    routes are independent only when all are known and none matches the judge.
+    Missing route evidence is unknown, even when same-model use was opted into.
+    """
+    if binding.candidate_route_relation != "unknown":
+        return binding.candidate_route_relation
+    from cayu.evals.models import _trajectory_nodes
+    from cayu.workflows.journal import WORKFLOW_JOURNAL_PROVIDER
+
+    profile = binding.profile
+    if profile is None or not context.root_evidence_available:
+        return "unknown"
+    trajectory = context.trajectory
+    if trajectory.workflow_output is None:
+        return "unknown"
+    routes: set[tuple[str, str]] = set()
+    incomplete = False
+    for node in _trajectory_nodes(trajectory):
+        session = node.session
+        if node.children_incomplete or session is None:
+            incomplete = True
+        if session is None:
+            continue
+        starts = [event for event in node.events if event.type == EventType.MODEL_STARTED]
+        if session.provider_name != WORKFLOW_JOURNAL_PROVIDER and not starts:
+            incomplete = True
+        for event in starts:
+            provider = event.payload.get("provider")
+            model = event.payload.get("model")
+            if (
+                type(provider) is not str
+                or not provider.strip()
+                or type(model) is not str
+                or not model.strip()
+            ):
+                incomplete = True
+            else:
+                routes.add((provider, model))
+    if incomplete or not routes:
+        return "unknown"
+    if (profile.provider_name, profile.model) in routes:
+        return "same_model"
+    return "independent_model"
+
+
+def _judge_route_rejection(binding: _TrustedModelJudgeBinding, relation: str) -> str | None:
+    if relation == "unknown":
+        return "Candidate execution-route evidence is unavailable; judge dispatch was withheld."
+    if (
+        relation == "same_model"
+        and binding.profile is not None
+        and binding.profile.same_model_use != "allowed_and_labeled"
+    ):
+        return "Judge profile forbids the observed same-model route; dispatch was withheld."
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,8 +266,10 @@ def _trusted_model_judge_binding(
         raise ValueError("Trusted private judge reference keys must be unique.")
     if price_book is not None and type(price_book) is not PriceBook:
         raise TypeError("price_book must be an exact PriceBook or None.")
-    if candidate_route_relation not in {"independent_model", "same_model"}:
-        raise ValueError("candidate_route_relation must identify same or independent routing.")
+    if candidate_route_relation not in {"independent_model", "same_model", "unknown"}:
+        raise ValueError(
+            "candidate_route_relation must identify same, independent, or unknown routing."
+        )
     implementation_revision = _model_judge_implementation_revision(
         key=validated_key,
         app=app,
@@ -528,6 +592,8 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
     def _with_public_contract(
         self,
         result: EvalAssertionResult,
+        *,
+        relation: str | None = None,
     ) -> EvalAssertionResult:
         """Preserve the trusted profile and safe accounting for every outcome."""
 
@@ -541,7 +607,8 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
                 "metadata": {
                     _MODEL_JUDGE_RESULT_METADATA_KEY: {
                         "judge_profile": profile.model_dump(mode="json"),
-                        "candidate_route_relation": self._binding.candidate_route_relation,
+                        "candidate_route_relation": relation
+                        or self._binding.candidate_route_relation,
                         **accounting,
                     }
                 }
@@ -567,6 +634,11 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
         evidence: AssertionEvidenceView,
         context: EvalContext,
     ) -> EvalAssertionResult:
+        relation = _judge_relation(self._binding, context)
+        publish = partial(self._with_public_contract, relation=relation)
+        rejection = _judge_route_rejection(self._binding, relation)
+        if rejection is not None:
+            return publish(self.unavailable(rejection))
         try:
             current_revision = _model_judge_implementation_revision(
                 key=self._binding.key,
@@ -574,24 +646,20 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
                 agent_name=self._binding.agent_name,
             )
         except Exception:
-            return self._with_public_contract(
-                self.error("Trusted model judge configuration became invalid.")
-            )
+            return publish(self.error("Trusted model judge configuration became invalid."))
         if current_revision != self._binding.implementation_revision:
-            return self._with_public_contract(
+            return publish(
                 self.error("Trusted model judge implementation changed after compilation.")
             )
         if evidence.final_output_state != "complete":
-            return self._with_public_contract(
-                self.unavailable("Final-output evidence was not retained completely.")
-            )
+            return publish(self.unavailable("Final-output evidence was not retained completely."))
         task = _redacted_text(
             self._app,
             _first_user_text(context.transcript),
             "model judge task",
         )
         if len(task) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
-            return self._with_public_contract(
+            return publish(
                 self.unavailable("Model-judge task evidence exceeded its portable bound.")
             )
         transcript = None
@@ -602,7 +670,7 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
                 "model judge transcript",
             )
             if len(transcript) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
-                return self._with_public_contract(
+                return publish(
                     self.unavailable("Model-judge transcript evidence exceeded its portable bound.")
                 )
         result = await self._judge._evaluate_material(
@@ -610,7 +678,7 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
             final_output=evidence.final_output,
             transcript_text=transcript,
         )
-        return self._with_public_contract(
+        return publish(
             EvalAssertionResult(
                 name=self.name,
                 assertion_revision=self.assertion_revision,
@@ -786,7 +854,9 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
     def assertion_revision(self) -> str:
         return self._assertion_revision
 
-    def _with_public_contract(self, result: EvalAssertionResult) -> EvalAssertionResult:
+    def _with_public_contract(
+        self, result: EvalAssertionResult, *, relation: str | None = None
+    ) -> EvalAssertionResult:
         profile = self._binding.profile
         if profile is None:
             raise RuntimeError("Compiled structured judge lost its trusted profile.")
@@ -794,7 +864,7 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
         judgment = dict(raw_judgment) if type(raw_judgment) is dict else {}
         public_record = {
             "judge_profile": profile.model_dump(mode="json"),
-            "candidate_route_relation": self._binding.candidate_route_relation,
+            "candidate_route_relation": relation or self._binding.candidate_route_relation,
             "rubric_id": self._spec.rubric.id,
             "rubric_revision": self._spec.rubric.revision,
             "reference": self._reference_identity,
@@ -809,6 +879,11 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
         )
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        relation = _judge_relation(self._binding, context)
+        publish = partial(self._with_public_contract, relation=relation)
+        rejection = _judge_route_rejection(self._binding, relation)
+        if rejection is not None:
+            return publish(self.unavailable(rejection))
         evidence = _build_assertion_evidence_view(
             context.trajectory,
             evidence_policy=self._evidence_policy,
@@ -821,16 +896,14 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
             bind_pricing_profile=True,
         )
         if evidence.final_output_state != "complete":
-            return self._with_public_contract(
-                self.unavailable("Final-output evidence was not retained completely.")
-            )
+            return publish(self.unavailable("Final-output evidence was not retained completely."))
         task = _redacted_text(
             self._app,
             _first_user_text(context.transcript),
             "structured model judge task",
         )
         if len(task) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
-            return self._with_public_contract(
+            return publish(
                 self.unavailable("Structured judge task evidence exceeded its portable bound.")
             )
         transcript = None
@@ -841,7 +914,7 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
                 "structured model judge transcript",
             )
             if len(transcript) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
-                return self._with_public_contract(
+                return publish(
                     self.unavailable(
                         "Structured judge transcript evidence exceeded its portable bound."
                     )
@@ -850,6 +923,7 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
             task=task,
             final_output=evidence.final_output,
             transcript_text=transcript,
+            candidate_route_relation=relation,
         )
 
     async def evaluate_retained_material(
@@ -858,11 +932,17 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
         task: str,
         final_output: str,
         transcript_text: str | None,
+        candidate_route_relation: str | None = None,
     ) -> EvalAssertionResult:
         """Judge one fixed evidence snapshot without candidate runtime execution."""
 
+        relation = candidate_route_relation or self._binding.candidate_route_relation
+        publish = partial(self._with_public_contract, relation=relation)
+        rejection = _judge_route_rejection(self._binding, relation)
+        if rejection is not None:
+            return publish(self.unavailable(rejection))
         if self._spec.evidence.include_transcript != (transcript_text is not None):
-            return self._with_public_contract(
+            return publish(
                 self.unavailable("Fixed evidence does not match the transcript selection.")
             )
         try:
@@ -872,26 +952,24 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
                 agent_name=self._binding.agent_name,
             )
         except Exception:
-            return self._with_public_contract(
-                self.error("Trusted structured judge configuration became invalid.")
-            )
+            return publish(self.error("Trusted structured judge configuration became invalid."))
         if current_revision != self._binding.implementation_revision:
-            return self._with_public_contract(
+            return publish(
                 self.error("Trusted structured judge implementation changed after compilation.")
             )
         if len(task) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
-            return self._with_public_contract(
+            return publish(
                 self.unavailable("Structured judge task evidence exceeded its portable bound.")
             )
         if len(final_output) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
-            return self._with_public_contract(
+            return publish(
                 self.unavailable("Structured judge final-output evidence exceeded its bound.")
             )
         if (
             transcript_text is not None
             and len(transcript_text) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS
         ):
-            return self._with_public_contract(
+            return publish(
                 self.unavailable("Structured judge transcript evidence exceeded its bound.")
             )
         result = await self._judge._evaluate_material(
@@ -899,7 +977,7 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
             final_output=final_output,
             transcript_text=transcript_text,
         )
-        return self._with_public_contract(
+        return publish(
             EvalAssertionResult(
                 name=self.name,
                 assertion_revision=self.assertion_revision,

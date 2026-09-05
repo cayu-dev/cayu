@@ -15,8 +15,10 @@ from cayu.runtime.tasks import (
     Task,
     TaskClaimLost,
     TaskStatus,
+    TaskTerminalizationConflict,
     _ensure_active_task_lease,
     _ensure_can_transition,
+    _task_cancellation_requested,
 )
 from cayu.runtime.work_contracts import (
     CompletionDecision,
@@ -224,6 +226,11 @@ def plan_decision_application(
     matching_gap_count: int,
     now: datetime,
 ) -> tuple[Task, CompletionDecisionApplicationReceipt]:
+    # A verifier decision cannot settle the worker or erase its cancellation intent.
+    if _task_cancellation_requested(task):
+        raise TaskTerminalizationConflict(
+            "Task cancellation is still draining under its current owner."
+        )
     applied_at = lifecycle_now(task, now)
     updated = task
     if decision.verdict is CompletionVerdict.ACCEPTED:
@@ -248,6 +255,7 @@ def plan_decision_application(
                 "error": None,
                 "worker_id": None,
                 "lease_expires_at": None,
+                "interrupted_handoff_id": None,
                 "started_at": task.started_at or applied_at,
                 "completed_at": applied_at,
                 "updated_at": applied_at,

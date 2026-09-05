@@ -5372,86 +5372,22 @@ class InMemoryTaskStore(TaskStore):
                 raise WorkCompletionConflict(
                     "Completion decision has no exact verifier-profile authority."
                 )
-            applied_at = _task_lifecycle_now(task)
-            task_changed = False
-            if decision.verdict is CompletionVerdict.ACCEPTED:
-                if request.result is None or request.result_reference is None:
-                    raise ValueError(
-                        "Accepted completion decisions require a verified task result."
-                    )
-                if request.result_reference != proposal.result:
-                    raise WorkCompletionConflict(
-                        "Decision application result conflicts with the accepted proposal."
-                    )
-                task = self._prepare_finished_task(
-                    task.id,
-                    TaskStatus.COMPLETED,
-                    result=request.result,
-                    error=None,
-                    worker_id=None,
-                    expected_lease_expires_at=None,
-                    accepted_decision_id=decision.decision_id,
-                    now=applied_at,
-                )
-                task_changed = True
-            else:
-                if request.result is not None:
-                    raise ValueError("Non-accepted completion decisions cannot carry a result.")
-                if decision.verdict is CompletionVerdict.BLOCKED:
-                    task = self._prepare_held_task_from_completion_decision(
-                        task,
-                        TaskStatus.BLOCKED,
-                        decision=decision,
-                        now=applied_at,
-                    )
-                    task_changed = True
-                elif decision.verdict is CompletionVerdict.NEEDS_REVIEW:
-                    task = self._prepare_held_task_from_completion_decision(
-                        task,
-                        TaskStatus.NEEDS_ATTENTION,
-                        decision=decision,
-                        now=applied_at,
-                    )
-                    task_changed = True
-                elif decision.verdict is CompletionVerdict.REJECTED:
-                    rejection_hold = self._completion_rejection_hold(
-                        contract,
-                        decision,
-                        attempt,
-                    )
-                    if rejection_hold is not None:
-                        hold_status, status_reason = rejection_hold
-                        task = self._prepare_held_task_from_completion_decision(
-                            task,
-                            hold_status,
-                            decision=decision,
-                            now=applied_at,
-                            status_reason=status_reason,
-                        )
-                        task_changed = True
-                    elif task.worker_id is not None or task.lease_expires_at is not None:
-                        # A decision closes the attempt and fences its worker. A
-                        # verifier-aware owner can begin the next attempt without
-                        # inheriting authority from the prior attempt's lease.
-                        task = task.model_copy(
-                            update={
-                                "worker_id": None,
-                                "lease_expires_at": None,
-                                "updated_at": applied_at,
-                            }
-                        )
-                        task_changed = True
-            receipt = CompletionDecisionApplicationReceipt(
-                task_id=task.id,
-                decision_id=decision.decision_id,
-                verifier_profile_fingerprint=decision.verifier_profile_fingerprint,
-                idempotency_key=request.idempotency_key,
+            from cayu.runtime._verified_work_policy import plan_decision_application
+
+            updated, receipt = plan_decision_application(
+                request,
                 request_sha256=request_sha256,
                 task=task,
-                applied_at=applied_at,
+                decision=decision,
+                proposal=proposal,
+                attempt=attempt,
+                contract=contract,
+                matching_gap_count=self._matching_completion_gap_count(decision),
+                now=self._ownership_clock(),
             )
-            if task_changed:
-                self._store_task(task)
+            if updated != task:
+                self._store_task(updated)
+            task = updated
             self._decision_application_receipts[receipt_key] = receipt
             self._decision_application_key_by_decision[decision.decision_id] = receipt_key
             return task.model_copy(deep=True)
@@ -7456,45 +7392,7 @@ class InMemoryTaskStore(TaskStore):
         )
         return updated
 
-    def _prepare_held_task_from_completion_decision(
-        self,
-        task: Task,
-        status: TaskStatus,
-        *,
-        decision: CompletionDecision,
-        now: datetime,
-        status_reason: str | None = None,
-    ) -> Task:
-        if status not in {TaskStatus.PAUSED, TaskStatus.BLOCKED, TaskStatus.NEEDS_ATTENTION}:
-            raise ValueError("Completion decisions can only apply supported held statuses.")
-        if task.status is not TaskStatus.RUNNING:
-            raise WorkCompletionConflict("Completion decision no longer owns a running task.")
-        return task.model_copy(
-            update={
-                "status": status,
-                "status_reason": status_reason or f"work_contract_{decision.verdict.value}",
-                "status_payload": {
-                    "completion_decision_id": decision.decision_id,
-                    "gap_fingerprint": decision.gap_fingerprint,
-                    "verifier_profile_fingerprint": decision.verifier_profile_fingerprint,
-                    "verdict": decision.verdict.value,
-                },
-                "worker_id": None,
-                "lease_expires_at": None,
-                "updated_at": now,
-            }
-        )
-
-    def _completion_rejection_hold(
-        self,
-        contract: WorkContract,
-        decision: CompletionDecision,
-        attempt: WorkAttempt,
-    ) -> tuple[TaskStatus, str] | None:
-        policy = contract.continuation_policy
-        if attempt.ordinal >= policy.max_attempts:
-            return (TaskStatus.NEEDS_ATTENTION, "work_contract_attempt_limit")
-
+    def _matching_completion_gap_count(self, decision: CompletionDecision) -> int:
         matching_gap_count = 0
         for attempt_id in self._attempt_ids_by_task.get(decision.task_id, []):
             proposal_id = self._proposal_id_by_attempt.get(attempt_id)
@@ -7508,12 +7406,7 @@ class InMemoryTaskStore(TaskStore):
                 and candidate.gap_fingerprint == decision.gap_fingerprint
             ):
                 matching_gap_count += 1
-        repeated_gap_count = max(0, matching_gap_count - 1)
-        if repeated_gap_count >= policy.max_repeated_gap_count:
-            return (TaskStatus.NEEDS_ATTENTION, "work_contract_repeated_gap_limit")
-        if policy.rejection_action is CompletionRejectionAction.INTERRUPT:
-            return (TaskStatus.PAUSED, "work_contract_rejected")
-        return None
+        return matching_gap_count
 
     async def _hold_task(
         self,

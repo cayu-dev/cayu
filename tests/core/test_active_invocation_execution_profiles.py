@@ -470,6 +470,8 @@ async def collect(events: AsyncIterator[Event]) -> list[Event]:
     [
         ("future-schema", CheckpointCompatibilityError),
         ("changed-interaction", RuntimeError),
+        ("forged-context", TypeError),
+        ("changed-incarnation", ValueError),
     ],
 )
 def test_recovery_session_boundary_validates_full_active_profile_authority(
@@ -504,6 +506,15 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
             from_statuses={SessionStatus.PENDING},
             to_status=SessionStatus.RUNNING,
         )
+        from cayu.runtime.tool_exposure import session_metadata_with_tool_capability_ceiling
+
+        session = session.model_copy(
+            update={
+                "metadata": session_metadata_with_tool_capability_ceiling(
+                    session.metadata, ToolCapabilityCeiling(tool_names=())
+                )
+            }
+        )
         expected_profile = ActiveInvocationExecutionProfile(
             session_id=session_id,
             interaction_id=interaction_id,
@@ -532,23 +543,25 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
             raise AssertionError("Invalid recovery authority reached session execution.")
             yield
 
-        monkeypatch.setattr(app, "_run_session", unexpected_run_session)
+        monkeypatch.setattr(app._session_engine, "_run_session", unexpected_run_session)
         request = RecoverySessionRunRequest(
             session=session,
-            registered_agent=app._agents["assistant"],
-            registered_provider=app._providers["fake"],
-            registered_environment=None,
-            active_invocation_profile=expected_profile,
+            invocation_context=app._recovery_coordinator._reconstruct_invocation_context(
+                session=session,
+                execution_profile_snapshot=expected_profile,
+                registered_agent=app._agents["assistant"],
+                registered_provider=app._providers["fake"],
+                registered_environment=None,
+                budget_policy=None,
+            ),
             messages=[],
             messages_to_append=[],
             max_steps=1,
             limits=RunLimits(),
             budget_limits=(),
-            budget_policy=None,
             retry_policy=RetryPolicy(),
             structured_output=None,
             thinking=None,
-            request_loop_policies=(),
             request_metadata={},
             task_id=None,
             task_worker_id=None,
@@ -559,9 +572,15 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
             release_run_fence_on_exit=False,
         )
 
+        if checkpoint_variant == "forged-context":
+            object.__setattr__(request.invocation_context, "_authority_token", object())
+        elif checkpoint_variant == "changed-incarnation":
+            object.__setattr__(
+                request, "session", session.model_copy(update={"instance_id": "replacement"})
+            )
         with pytest.raises(
             expected_error,
-            match="active invocation|checkpoint schema|newer root checkpoint",
+            match="active invocation|checkpoint schema|newer root checkpoint|runtime authority|admitted session",
         ):
             await collect(app._run_recovery_session(request))
 

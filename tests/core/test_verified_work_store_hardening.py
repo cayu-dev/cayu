@@ -36,6 +36,7 @@ from cayu import (
     TaskCreate,
     TaskQuery,
     TaskStatus,
+    TaskStore,
     WorkAttempt,
     WorkAttemptCreate,
     WorkCompletionConflict,
@@ -102,11 +103,12 @@ def _contract(*, contract_id: str) -> WorkContract:
 
 
 async def _prepare_decision(
-    store: InMemoryTaskStore,
+    store: TaskStore,
     contract: WorkContract,
     *,
     verdict: CompletionVerdict,
     suffix: str,
+    task_worker_id: str | None = None,
 ) -> tuple[
     Task,
     WorkAttempt,
@@ -116,18 +118,37 @@ async def _prepare_decision(
     dict[str, object],
 ]:
     session_id = f"session:clock:{suffix}"
-    task = await store.create_running_task(
-        TaskCreate(
-            task_id=f"task-{suffix}",
-            type="verified-work",
+    if task_worker_id is None:
+        task = await store.create_running_task(
+            TaskCreate(
+                task_id=f"task-{suffix}",
+                type="verified-work",
+                session_id=session_id,
+                work_contract=contract.reference(),
+            ),
+            session_invocation=unattributed_session_invocation_binding(session_id),
+        )
+    else:
+        task = await store.create_task(
+            TaskCreate(
+                task_id=f"task-{suffix}",
+                type="verified-work",
+                work_contract=contract.reference(),
+            )
+        )
+        claimed = await store.claim_task(task_worker_id, lease_seconds=300)
+        assert claimed is not None and claimed.id == task.id
+        task = await store.attach_task(
+            task.id,
             session_id=session_id,
-            work_contract=contract.reference(),
-        ),
-        session_invocation=unattributed_session_invocation_binding(session_id),
-    )
+            session_invocation=await task_backed_session_invocation(store, task.id, session_id),
+            worker_id=task_worker_id,
+            lease_expires_at=claimed.lease_expires_at,
+        )
     attempt = await store.begin_work_attempt(
         WorkAttemptCreate(
             attempt_id=f"attempt-{suffix}",
+            worker_id=task_worker_id,
             task_id=task.id,
             session_id=session_id,
             contract=contract.reference(),
@@ -241,7 +262,9 @@ def test_decision_application_keeps_verification_and_task_clock_domains_separate
         return verification_now[0]
 
     async def scenario() -> None:
-        store = InMemoryTaskStore(clock=verification_clock)
+        store = InMemoryTaskStore(
+            clock=verification_clock, ownership_clock=lambda: LifecycleDatetime.now(UTC)
+        )
         contract = _contract(contract_id=f"clock-domain-{verdict.value}")
         await store.publish_work_contract(contract)
         task, attempt, proposal, claim, decision, result = await _prepare_decision(
@@ -253,8 +276,8 @@ def test_decision_application_keeps_verification_and_task_clock_domains_separate
 
         assert attempt.started_at == verification_time
         assert proposal.proposed_at == verification_time
-        assert claim.claimed_at == verification_time
-        assert claim.lease_expires_at == verification_time + timedelta(seconds=300)
+        assert claim.claimed_at == lifecycle_time[0]
+        assert claim.lease_expires_at == lifecycle_time[0] + timedelta(seconds=300)
         assert decision.decided_at == verification_time
         assert task.updated_at == lifecycle_time[0]
 
@@ -320,7 +343,7 @@ def test_decision_application_clamps_regressed_lifecycle_wall_clock(
     monkeypatch.setattr(tasks_module, "datetime", LifecycleDatetime)
 
     async def scenario() -> None:
-        store = InMemoryTaskStore()
+        store = InMemoryTaskStore(ownership_clock=lambda: LifecycleDatetime.now(UTC))
         contract = _contract(contract_id=f"regressed-lifecycle-{verdict.value}")
         await store.publish_work_contract(contract)
         task, _, proposal, _, decision, result = await _prepare_decision(

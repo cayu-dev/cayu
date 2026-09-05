@@ -2471,7 +2471,7 @@ def test_task_worker_lease_uses_wall_clock_not_verification_clock(store_factory)
                     "session:separate-clock",
                 ),
                 worker_id="task-worker",
-                lease_expires_at=task.lease_expires_at,
+                lease_expires_at=claimed.lease_expires_at,
             )
 
             attempt = await store.begin_work_attempt(
@@ -2606,7 +2606,7 @@ def test_durable_decision_applies_after_originating_task_lease_expires() -> None
                 "session:decision-after-worker-expiry",
             ),
             worker_id="task-worker",
-            lease_expires_at=task.lease_expires_at,
+            lease_expires_at=claimed.lease_expires_at,
         )
         attempt = await store.begin_work_attempt(
             WorkAttemptCreate(
@@ -2693,7 +2693,7 @@ def test_rejected_continue_decision_fences_live_attempt_worker() -> None:
                 "session:continue-fences-attempt-worker",
             ),
             worker_id="originating-worker",
-            lease_expires_at=task.lease_expires_at,
+            lease_expires_at=claimed.lease_expires_at,
         )
         attempt = await store.begin_work_attempt(
             WorkAttemptCreate(
@@ -2746,13 +2746,13 @@ def test_rejected_continue_decision_fences_live_attempt_worker() -> None:
             await store.heartbeat(
                 task.id,
                 "originating-worker",
-                lease_expires_at=task.lease_expires_at,
+                lease_expires_at=claimed.lease_expires_at,
             )
         with pytest.raises(TaskClaimLost):
             await store.release_attached_task_worker(
                 task.id,
                 "originating-worker",
-                lease_expires_at=task.lease_expires_at,
+                lease_expires_at=claimed.lease_expires_at,
             )
 
         next_attempt = await store.begin_work_attempt(
@@ -3010,9 +3010,21 @@ def test_explicit_verifier_assertions_cover_outcomes_without_evidence_requiremen
     [InMemoryTaskStore, lambda: SQLiteTaskStore(":memory:")],
     ids=("memory", "sqlite"),
 )
-def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limits(
+def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limits(store_factory):
+    asyncio.run(assert_completion_rejection_policy(store_factory))
+
+
+async def assert_completion_rejection_policy(
     store_factory,
 ) -> None:
+    stores = []
+    original_factory = store_factory
+
+    def store_factory():
+        store = original_factory()
+        stores.append(store)
+        return store
+
     async def reject_attempt(
         store: TaskStore,
         contract: WorkContract,
@@ -3179,7 +3191,13 @@ def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limit
         assert repeated.status is TaskStatus.NEEDS_ATTENTION
         assert repeated.status_reason == "work_contract_repeated_gap_limit"
 
-    asyncio.run(scenario())
+    try:
+        await scenario()
+    finally:
+        for store in stores:
+            close = getattr(store, "close", None)
+            if close is not None:
+                await close()
 
 
 def test_decision_application_prepares_receipt_before_publishing_task_transition(
@@ -3197,7 +3215,9 @@ def test_decision_application_prepares_receipt_before_publishing_task_transition
                 return now if tz is not None else now.replace(tzinfo=None)
 
         monkeypatch.setattr(tasks_module, "datetime", ApplicationDatetime)
-        store = InMemoryTaskStore(clock=lambda: now, ownership_clock=lambda: now)
+        store = InMemoryTaskStore(
+            clock=lambda: now, ownership_clock=lambda: ApplicationDatetime.now(UTC)
+        )
         contract = _contract()
         await store.publish_work_contract(contract)
         task = await store.create_running_task(
@@ -3445,7 +3465,7 @@ def test_decision_application_holds_attached_tasks(
                 f"session:{verdict.value}",
             ),
             worker_id="task-worker",
-            lease_expires_at=task.lease_expires_at,
+            lease_expires_at=claimed.lease_expires_at,
         )
         attempt = await store.begin_work_attempt(
             WorkAttemptCreate(

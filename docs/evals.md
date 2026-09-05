@@ -12,6 +12,20 @@ The built-in runner evaluates normal `CayuApp.run(...)` sessions and then
 asserts over the durable runtime state Cayu already owns: sessions, events,
 transcripts, tool calls, usage, workspaces, and artifacts.
 
+Acceptance fixtures and reference campaigns load only when their supported
+`cayu.evals` exports or implementation entry points are requested. Importing a
+core contract such as `cayu.core.events.Event` does not initialize these optional
+features; their public imports remain available from the installed wheel.
+
+Ordinary and scenario trials share the scheduler that owns recovered slots,
+per-run concurrency, shared capacity, ordered aggregation, and checkpoint
+publication. Scenario drivers retain their stimulus/recovery state machine and
+reconcile terminal progress before returning for publication. A completed trial
+keeps its capacity slot through checkpoint contention retries, using the worker's
+poll interval clamped to 0.05–1 seconds and the same retry/write diagnostics.
+Ordinary sequential execution preserves direct exception/cancellation behavior;
+scenarios retain their TaskGroup exception behavior even at concurrency one.
+
 ## Start with the workflow you need
 
 The installed package includes three focused, version-matched guides:
@@ -790,6 +804,15 @@ execution-profile fingerprint as the trusted target application. A per-trial
 factory that rebuilds process-local providers, tools, policies, hooks, or
 environments must give those components stable behavior identities when the
 rebuilt instances are intended to be equivalent.
+
+Workflow model judges use the retained child execution routes; the profile-probe
+agent does not identify the candidate model. Both model-judge assertion types
+check every observed model-start route, including retries and compaction, before
+judge dispatch. Any route matching the judge is labeled `same_model` and requires
+`allow_same_model=True`. Multiple routes are labeled `independent_model` only
+when all are known and none matches. Missing route evidence or a workflow with no
+model calls is `unknown` and withholds judging, even with same-model opt-in.
+Withheld judgments publish an unavailable assertion and the observed relationship.
 
 The root ID is deterministic for the target revision and concrete run/case/trial
 slot. A replacement durable worker therefore re-enters the same workflow journal

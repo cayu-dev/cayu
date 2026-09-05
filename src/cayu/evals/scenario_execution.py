@@ -18,6 +18,7 @@ from cayu.artifacts import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import FilePart, Message, MessageRole, TextPart
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
+from cayu.evals._trial_publication import save_trial_checkpoint_with_retry
 from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
@@ -51,9 +52,9 @@ from cayu.evals.result_contract import (
     PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
 )
 from cayu.evals.runner import (
-    _aggregate_trials,
     _FreshMemoryAttributionReadLifecycle,
     _run_case_once_with_public_projection,
+    _schedule_suite_trials,
 )
 from cayu.evals.scenario import (
     EvalScenarioDocumentV2,
@@ -77,14 +78,12 @@ from cayu.evals.store import (
     EvalRunCostBudget,
     EvalRunStateConflict,
     EvalRunStatus,
-    EvalRunTrialCheckpoint,
     EvalScenarioRunInvocation,
     EvalScenarioRunProgress,
     EvalScenarioTrialFailureCode,
     EvalScenarioTrialPhase,
     EvalScenarioTrialProgress,
     EvalStore,
-    EvalStoreTransientContention,
 )
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.runtime.approvals import (
@@ -870,16 +869,14 @@ async def run_compiled_eval_scenario(
         binding.trials
     )
     memory_attribution_max_bytes = eval_memory_attribution_max_bytes_for_trial_count(binding.trials)
-    slots = [None] * binding.trials
     checkpoints = await store.load_trial_checkpoints(claim)
     for checkpoint in checkpoints:
         if checkpoint.case_id != case.id or checkpoint.trial_number > binding.trials:
             raise EvalRunStateConflict("Recovered scenario trial does not match its run.")
-        slots[checkpoint.trial_number - 1] = (
-            checkpoint.result,
-            checkpoint.public_data,
-        )
-    semaphore = asyncio.Semaphore(max_concurrency)
+    completed_trials = {
+        (checkpoint.case_id, checkpoint.trial_number): (checkpoint.result, checkpoint.public_data)
+        for checkpoint in checkpoints
+    }
     memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(
         max_operations=max_concurrency
     )
@@ -902,7 +899,7 @@ async def run_compiled_eval_scenario(
             for trial_number in range(1, binding.trials + 1)
         )
 
-    async def execute_trial(trial_number: int) -> None:
+    async def execute_trial(case, trial_number: int):
         driver = _ScenarioTrialDriver(
             target=target,
             scenario=scenario,
@@ -921,68 +918,52 @@ async def run_compiled_eval_scenario(
                 else ExternalTrialEnvelopeV1(trial=external_trials[trial_number - 1])
             ),
         )
-        async with semaphore:
-            capacity_slot = (
-                contextlib.nullcontext()
-                if execution_capacity is None
-                else execution_capacity.slot()
-            )
-            async with capacity_slot:
-                execution = await _run_case_once_with_public_projection(
-                    target.app,
-                    case,
-                    trial_number=trial_number,
-                    suite_id=compiled.suite.id,
-                    retain_final_output=False,
-                    timeout_seconds=binding.timeout_seconds,
-                    public_output_preview_bytes=output_preview_bytes,
-                    memory_attribution_bounds=memory_attribution_bounds,
-                    memory_attribution_source_limit=memory_attribution_source_limit,
-                    memory_attribution_max_bytes=memory_attribution_max_bytes,
-                    run_stream=driver,
-                    memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
-                )
-                await driver.reconcile_terminal_progress()
-                result, public_data = execution
-                if public_data is None:
-                    raise RuntimeError("Scenario trial execution lost its public projection.")
-                checkpoint = EvalRunTrialCheckpoint(
-                    case_id=case.id,
-                    result=result,
-                    public_data=public_data,
-                )
-                while True:
-                    try:
-                        await store.save_trial_checkpoint(
-                            claim,
-                            checkpoint,
-                            redact_json=target.app.redact_json,
-                        )
-                        break
-                    except EvalStoreTransientContention:
-                        await asyncio.sleep(0.25)
-                slots[trial_number - 1] = execution
+        execution = await _run_case_once_with_public_projection(
+            target.app,
+            case,
+            trial_number=trial_number,
+            suite_id=compiled.suite.id,
+            retain_final_output=False,
+            timeout_seconds=binding.timeout_seconds,
+            public_output_preview_bytes=output_preview_bytes,
+            memory_attribution_bounds=memory_attribution_bounds,
+            memory_attribution_source_limit=memory_attribution_source_limit,
+            memory_attribution_max_bytes=memory_attribution_max_bytes,
+            run_stream=driver,
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+        )
+        await driver.reconcile_terminal_progress()
+        return execution
 
-    async with memory_attribution_read_lifecycle, asyncio.TaskGroup() as group:
-        for trial_number in range(1, binding.trials + 1):
-            if slots[trial_number - 1] is None:
-                group.create_task(execute_trial(trial_number))
-    executions = [item for item in slots if item is not None]
-    if len(executions) != binding.trials:
-        raise RuntimeError("Scenario execution lost a trial result.")
-    trial_results = [item[0] for item in executions]
-    started_at = min(result.started_at for result in trial_results)
-    completed_at = max(result.completed_at for result in trial_results)
-    public_data = tuple(item[1] for item in executions)
-    if any(item is None for item in public_data):
-        raise RuntimeError("Scenario execution lost a public trial projection.")
-    case_result = _aggregate_trials(
-        case,
-        trial_results,
-        started_at=started_at,
-        completed_at=completed_at,
-        trial_policy=compiled.run_contract.trial_policy,
-    )
+    async def trial_completed(case_id, result, public_data):
+        await save_trial_checkpoint_with_retry(
+            store=store,
+            claim=claim,
+            case_id=case_id,
+            result=result,
+            public_data=public_data,
+            redact_json=target.app.redact_json,
+            poll_seconds=poll_seconds,
+        )
+
+    async with memory_attribution_read_lifecycle:
+        results, public_data_by_case = await _schedule_suite_trials(
+            compiled.suite,
+            trials=binding.trials,
+            max_concurrency=max_concurrency,
+            trial_policy=compiled.run_contract.trial_policy,
+            public_output_preview_bytes=output_preview_bytes,
+            execution_capacity=execution_capacity,
+            completed_trials=completed_trials,
+            trial_completed=trial_completed,
+            execute_trial=execute_trial,
+            group_serial_trials=True,
+        )
+    case_result = results[0]
+    started_at = case_result.started_at
+    completed_at = case_result.completed_at
+    if public_data_by_case is None:
+        raise RuntimeError("Scenario execution lost its public trial projection.")
     internal_run = EvalRun(
         suite_id=compiled.suite.id,
         status=aggregate_eval_status((case_result.status,)),
@@ -999,7 +980,7 @@ async def run_compiled_eval_scenario(
         compiled,
         target_before,
         internal_run,
-        {case.id: public_data},
+        public_data_by_case,
         manifest_project_root,
         external_trials,
         accepted_exposure,

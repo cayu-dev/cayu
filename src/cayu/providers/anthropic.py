@@ -83,6 +83,7 @@ from cayu.providers.cache import (
 from cayu.providers.deadlines import (
     ProviderProgressKind,
     ProviderStreamDeadlines,
+    _provider_deadline_material,
     _resolve_provider_stream_deadlines,
     observe_provider_semantic_progress,
 )
@@ -1982,3 +1983,25 @@ def _safe_error_json(decoded: Mapping[str, Any]) -> str:
         if safe_error:
             return json_error_text(safe_error)
     return truncate_error_text(json_error_text(dict(decoded)))
+
+
+def _execution_profile_material(provider: AnthropicProvider) -> dict[str, Any] | None:
+    """Bounded configuration material for runtime exact-type identity selection."""
+    if (
+        type(provider.transport) is not HttpxAnthropicTransport
+        or provider.extra_headers
+        or provider.credential_proxy is not None
+    ):
+        return None
+    return {
+        "base_url": provider.base_url,
+        "default_route": provider.base_url == DEFAULT_ANTHROPIC_BASE_URL,
+        "credential_mode": "brokered" if provider.api_key_ref is not None else "direct",
+        "anthropic_version": provider.anthropic_version,
+        "max_tokens": provider.max_tokens,
+        "timeout_s": provider.timeout_s,
+        "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
+        "cache_policy": None
+        if provider.cache_policy is None
+        else provider.cache_policy.model_dump(mode="json"),
+    }

@@ -1589,6 +1589,16 @@ privacy/evidence permissions, timeout/token/optional priced-cost ceilings, and
 same-model posture. The target catalog exposes these snapshots under
 `judge_profiles`; Cayu does not infer one from the candidate route.
 
+For workflow corpus targets, the shared input/profile probe does not identify the
+candidate model. Both judge assertion types resolve the candidate relationship
+from model-start routes in the retained workflow session tree before judge
+dispatch. All routes must be known to claim `independent_model`; any matching
+route requires the judge profile's same-model opt-in. Empty or incomplete route
+evidence is `unknown` and withholds dispatch regardless of that opt-in. Withheld
+judgments retain an unavailable outcome and relationship; public validation
+rejects recorded judgments with unknown or forbidden same-model relationships.
+Workflow unavailable trials retain their required reason and diagnostic code.
+
 Structured judge compilation compare-and-sets the profile, privacy policy, and
 private-reference content revision before candidate dispatch. Private content
 remains only in `PrivateJudgeReferenceTarget`, enters only the judge prompt, and
@@ -2753,6 +2763,23 @@ every grant record to match the enclosing exported session before exposing the
 snapshot to restoration tooling.
 
 ## Execution profiles
+
+Recovery hands off one authenticated `InvocationContext` to the session engine.
+The recovery boundary reconstructs it from the validated durable profile when
+needed; the handoff does not separately transport agent/provider/environment,
+budget-policy, or invocation-policy authority. The engine authenticates the
+context and session incarnation, checks exact active-profile checkpoint readback,
+and derives collaborators and frozen tool exposure from that context. Task
+admission, targeted-grant reconstruction, run fencing, and cancellation-settled
+stream cleanup remain required before or around execution. Messages, limits,
+and other continuation state travel separately from collaborator authority.
+
+Built-in provider modules own bounded configuration extraction. Runtime owns the
+closed exact-type selector, adapter/schema versions, validation, redaction, and
+fingerprinting. Subclasses and opaque transports do not inherit trusted built-in
+identity; they require the existing application declaration or remain
+process-local. Moving extraction does not change the material for an unchanged
+configuration.
 
 Every fresh `CayuApp.run(...)` freezes a versioned `ExecutionProfileIdentity` in runtime-owned session metadata in the same transaction that creates the running session. The immutable `baseline` is that creation profile; the `expected` profile is the identity a later invocation must match. The invocation snapshot is the candidate profile resolved once by a particular public run or resume before admission and then held fixed for that invocation. The profile is a sorted set of typed component identities covering the runtime, provider/model target and adapter, durable system projection, context selection, automatic recall, compaction, provider request controls, application and invocation budgets, structured output, finalization, direct tool declarations, tool implementations, tool-view grants, registered execution policies, invocation policies, ordered hooks, environment and runner semantics, effect authority, and governed egress authority. The system component fingerprints the fully rendered system message, including statically resolvable workspace instructions, that is subsequently persisted in the authoritative transcript. If factory materialization would change that projection after the profile is frozen, setup fails closed before model or tool work.
 
@@ -4666,6 +4693,18 @@ publication. This slice defines no implicit inherited or replacement contract:
 a future fork entrance must either bind the complete exact lineage before the
 child executes, or accept an explicit superseding contract version only at a
 safe pre-attempt boundary.
+Memory, SQLite, and PostgreSQL apply completion decisions through one pure
+reducer supplied with validated task/contract/attempt/proposal/decision snapshots,
+the matching-gap count, and the backend's authoritative lifecycle time. The
+reducer owns verdict selection, repetition and attempt limits, terminal cleanup,
+and receipt construction. Each backend retains its authority reads, lease checks,
+lock/transaction, exact replay lookup, and atomic snapshot/receipt publication.
+Replay does not consult either clock or reapply the transition. A new decision
+application, for any verdict, cannot clear a draining task cancellation: it
+raises `TaskTerminalizationConflict` without changing the task or publishing an
+application receipt. The cancellation owner retains its worker and lease until
+settlement.
+
 `CayuApp.create_task(...)` also requires a caller-stable `task_id` for a
 contract-bound task, so cancellation or acknowledgement loss cannot discard the
 only handle to a mutation that durably completed. The lower-level `TaskStore`

@@ -15,6 +15,7 @@ from weakref import ReferenceType, ref
 from cayu._validation import canonical_durable_json_bytes
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authority_identity
+from cayu.providers.deadlines import _provider_deadline_material
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -1719,155 +1720,44 @@ def _nested_provider_material(
     return material
 
 
-def _provider_deadline_material(deadlines: object) -> dict[str, float | int]:
-    from cayu.providers.deadlines import ProviderStreamDeadlines
+@lru_cache(maxsize=1)
+def _cayu_provider_material_extractors() -> dict[
+    type[object], tuple[str, int, _ExecutionProfileMaterialExtractor]
+]:
+    """Runtime owns the closed trust set and material schema versions."""
+    from cayu.evals.testing import ScriptedModelProvider
+    from cayu.evals.testing import _execution_profile_material as extract_0
+    from cayu.providers.anthropic import AnthropicProvider
+    from cayu.providers.anthropic import _execution_profile_material as extract_3
+    from cayu.providers.bedrock import BedrockProvider
+    from cayu.providers.bedrock import _execution_profile_material as extract_4
+    from cayu.providers.chat_completions import ChatCompletionsProvider
+    from cayu.providers.chat_completions import _execution_profile_material as extract_2
+    from cayu.providers.openai import OpenAIProvider
+    from cayu.providers.openai import _execution_profile_material as extract_1
 
-    if type(deadlines) is not ProviderStreamDeadlines:
-        raise TypeError("Model provider stream_deadlines must be ProviderStreamDeadlines.")
     return {
-        "transport_idle_timeout_s": deadlines.transport_idle_timeout_s,
-        "protocol_idle_timeout_s": deadlines.protocol_idle_timeout_s,
-        "semantic_progress_timeout_s": deadlines.semantic_progress_timeout_s,
-        "absolute_stream_timeout_s": deadlines.absolute_stream_timeout_s,
-        "max_concurrent_streams": deadlines.max_concurrent_streams,
+        ScriptedModelProvider: ("scripted-model-provider", 1, extract_0),
+        OpenAIProvider: ("openai-responses", 6, extract_1),
+        ChatCompletionsProvider: ("chat-completions", 3, extract_2),
+        AnthropicProvider: ("anthropic-messages", 2, extract_3),
+        BedrockProvider: ("bedrock-converse-stream", 2, extract_4),
     }
 
 
 def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
-    """Return bounded behavior material only for transparent built-in adapters."""
-
-    from cayu.evals.testing import ScriptedModelProvider
-    from cayu.providers.anthropic import (
-        DEFAULT_ANTHROPIC_BASE_URL,
-        AnthropicProvider,
-        HttpxAnthropicTransport,
-    )
-    from cayu.providers.bedrock import BedrockProvider
-    from cayu.providers.chat_completions import (
-        DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV,
-        DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER,
-        DEFAULT_CHAT_COMPLETIONS_AUTH_VALUE_PREFIX,
-        DEFAULT_CHAT_COMPLETIONS_BASE_URL,
-        ChatCompletionsProvider,
-        HttpxChatCompletionsTransport,
-    )
-    from cayu.providers.openai import (
-        DEFAULT_OPENAI_BASE_URL,
-        HttpxOpenAITransport,
-        OpenAIProvider,
-    )
-    from cayu.providers.openai_subscription import OpenAISubscriptionProvider
-
-    if type(provider) is ScriptedModelProvider:
-        return {
-            "adapter": "scripted-model-provider",
-            "version": 1,
-            "background": provider.provider_operations is not None,
-        }
-
-    if type(provider) is OpenAIProvider:
-        if type(provider.transport) is not HttpxOpenAITransport or provider.extra_headers:
-            return None
-        return {
-            "adapter": "openai-responses",
-            "version": 6,
-            "base_url": provider.base_url,
-            "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
-            "reasoning_state": provider.reasoning_state,
-            "background": provider.background,
-            "additional_tools_models": sorted(provider.additional_tools_models),
-            "client_tool_search_models": sorted(provider.client_tool_search_models),
-            "hosted_tool_search_models": sorted(provider.hosted_tool_search_models),
-            "timeout_s": provider.timeout_s,
-            "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
-        }
-    if type(provider) is ChatCompletionsProvider:
-        if type(provider.transport) is not HttpxChatCompletionsTransport or provider.extra_headers:
-            return None
-        return {
-            "adapter": "chat-completions",
-            "version": 3,
-            "base_url": provider.base_url,
-            "endpoint_url": provider.endpoint_url,
-            "api_key_env": provider.api_key_env,
-            "auth_header": provider.auth_header,
-            "auth_value_prefix": provider.auth_value_prefix,
-            "allow_http": provider.allow_http,
-            "stream_include_usage": provider.stream_include_usage,
-            "timeout_s": provider.timeout_s,
-            "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
-            "api_version": provider.api_version,
-            "default_route": bool(
-                provider.base_url == DEFAULT_CHAT_COMPLETIONS_BASE_URL
-                and provider.endpoint_url is None
-                and provider.api_key_env == DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV
-                and provider.auth_header == DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER
-                and provider.auth_value_prefix == DEFAULT_CHAT_COMPLETIONS_AUTH_VALUE_PREFIX
-                and not provider.allow_http
-                and provider.api_version is None
-                and provider.openrouter_http_referer is None
-                and provider.openrouter_app_title is None
-                and not provider.openrouter_router_metadata
-            ),
-            "clean_schemas": provider.clean_schemas,
-            "strip_additional_properties": provider.strip_additional_properties,
-            "document_encoding": provider.document_encoding,
-            "usage_dialect": provider.usage_dialect.value,
-            # Attribution values are request headers, not durable runtime
-            # evidence. Only their presence affects inspectable behavior
-            # material so the values never enter profile events or metadata.
-            "openrouter_http_referer_configured": (provider.openrouter_http_referer is not None),
-            "openrouter_app_title_configured": provider.openrouter_app_title is not None,
-            "openrouter_router_metadata": provider.openrouter_router_metadata,
-        }
-    if type(provider) is AnthropicProvider:
-        if (
-            type(provider.transport) is not HttpxAnthropicTransport
-            or provider.extra_headers
-            or provider.credential_proxy is not None
-        ):
-            return None
-        return {
-            "adapter": "anthropic-messages",
-            "version": 2,
-            "base_url": provider.base_url,
-            "default_route": provider.base_url == DEFAULT_ANTHROPIC_BASE_URL,
-            "credential_mode": ("brokered" if provider.api_key_ref is not None else "direct"),
-            "anthropic_version": provider.anthropic_version,
-            "max_tokens": provider.max_tokens,
-            "timeout_s": provider.timeout_s,
-            "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
-            "cache_policy": (
-                None
-                if provider.cache_policy is None
-                else provider.cache_policy.model_dump(mode="json")
-            ),
-        }
-    if type(provider) is BedrockProvider:
-        if any(
-            (
-                not provider._owns_client,
-                provider.region_name is None,
-            )
-        ):
-            return None
-        return {
-            "adapter": "bedrock-converse-stream",
-            "version": 2,
-            "region_name": provider.region_name,
-            "profile_name": provider.profile_name,
-            "endpoint_url": provider.endpoint_url,
-            "max_tokens": provider.max_tokens,
-            "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
-            "stream_close_timeout_s": provider.stream_close_timeout_s,
-        }
-    if type(provider) is OpenAISubscriptionProvider:
-        # Authentication and transport collaborators are opaque unless the app
-        # declares a stable provider identity.
+    entry = _cayu_provider_material_extractors().get(type(provider))
+    if entry is None:
+        # Subclasses, subscription/Vertex adapters, and other opaque providers
+        # need application-declared identity or remain process-local.
         return None
-    # Vertex configuration includes project and credential-routing authority;
-    # it likewise requires an application identity for cross-process reuse.
-    return None
+    adapter, version, extract = entry
+    material = extract(provider)
+    if material is None:
+        return None
+    if "adapter" in material or "version" in material:
+        raise ValueError("Provider material cannot replace runtime schema identity.")
+    return {"adapter": adapter, "version": version, **material}
 
 
 def _environment_identity_material(

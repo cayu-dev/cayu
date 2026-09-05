@@ -642,6 +642,8 @@ def _candidate_judge_route_relation(
     target: CorpusTarget,
     judge_profile: JudgeProfileIdentityV1,
 ) -> Literal["independent_model", "same_model"]:
+    if type(target) is WorkflowEvalTarget:
+        raise ValueError("Workflow judge relationships require retained execution routes.")
     request_target = target.request_base.target
     if request_target is None:
         manifest = target.app.describe()
@@ -1151,7 +1153,11 @@ def _compile_prepared_corpus_suite(
                 ),
                 price_book=judge.price_book if profile is not None else None,
                 candidate_route_relation=(
-                    _candidate_judge_route_relation(validated_target, profile)
+                    (
+                        "unknown"
+                        if type(validated_target) is WorkflowEvalTarget
+                        else _candidate_judge_route_relation(validated_target, profile)
+                    )
                     if profile is not None
                     else "independent_model"
                 ),

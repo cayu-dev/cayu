@@ -674,3 +674,15 @@ __all__ = [
     "reset_provider_deadline_admission",
     "reset_provider_deadline_controller",
 ]
+
+
+def _provider_deadline_material(deadlines: object) -> dict[str, float | int]:
+    if type(deadlines) is not ProviderStreamDeadlines:
+        raise TypeError("Model provider stream_deadlines must be ProviderStreamDeadlines.")
+    return {
+        "transport_idle_timeout_s": deadlines.transport_idle_timeout_s,
+        "protocol_idle_timeout_s": deadlines.protocol_idle_timeout_s,
+        "semantic_progress_timeout_s": deadlines.semantic_progress_timeout_s,
+        "absolute_stream_timeout_s": deadlines.absolute_stream_timeout_s,
+        "max_concurrent_streams": deadlines.max_concurrent_streams,
+    }

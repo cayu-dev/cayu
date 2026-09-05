@@ -10,6 +10,7 @@ from enum import StrEnum
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
+from cayu.evals._trial_publication import save_trial_checkpoint_with_retry
 from cayu.evals.corpus import (
     EvalCorpusDocument,
     ModelJudgeAssertionSpec,
@@ -42,7 +43,6 @@ from cayu.evals.store import (
     EvalRunLease,
     EvalRunStateConflict,
     EvalRunStatus,
-    EvalRunTrialCheckpoint,
     EvalScenarioTrialFailureCode,
     EvalStoreTransientContention,
 )
@@ -651,43 +651,17 @@ class EvalRunCoordinator:
     ) -> None:
         target = prepared.target
 
-        async def persist_trial_checkpoint(checkpoint: EvalRunTrialCheckpoint) -> None:
-            retry_seconds = min(max(self._config.poll_interval_seconds, 0.05), 1.0)
-            while True:
-                try:
-                    await self._config.store.save_trial_checkpoint(
-                        lease.claim,
-                        checkpoint,
-                        redact_json=target.app.redact_json,
-                    )
-                    return
-                except EvalStoreTransientContention:
-                    logger.warning(
-                        "Durable eval checkpoint publication exhausted its transient "
-                        "contention budget; the completed trial remains attached and "
-                        "will be retried."
-                    )
-                    await asyncio.sleep(retry_seconds)
-
         async def save_trial_checkpoint(case_id, result, public_data) -> None:
-            started_at = asyncio.get_running_loop().time()
-            try:
-                await persist_trial_checkpoint(
-                    EvalRunTrialCheckpoint(
-                        case_id=case_id,
-                        result=result,
-                        public_data=public_data,
-                    )
-                )
-            finally:
-                logger.debug(
-                    "Durable eval checkpoint write finished.",
-                    extra={
-                        "cayu_eval_store_event": "checkpoint_write",
-                        "eval_run_id": lease.claim.run_id,
-                        "duration_seconds": (asyncio.get_running_loop().time() - started_at),
-                    },
-                )
+            await save_trial_checkpoint_with_retry(
+                store=self._config.store,
+                claim=lease.claim,
+                case_id=case_id,
+                result=result,
+                public_data=public_data,
+                redact_json=target.app.redact_json,
+                poll_seconds=self._config.poll_interval_seconds,
+                logger=logger,
+            )
 
         if prepared.scenario is None:
             checkpoints = await self._config.store.load_trial_checkpoints(lease.claim)

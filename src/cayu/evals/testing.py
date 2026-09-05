@@ -293,3 +293,8 @@ def _require_complete_batch(batch: tuple[ModelStreamEvent, ...]) -> tuple[ModelS
     if batch[-1].type != ModelStreamEventType.COMPLETED:
         raise ValueError("ScriptedModelProvider batch must end with a COMPLETED event.")
     return batch
+
+
+def _execution_profile_material(provider: ScriptedModelProvider) -> dict[str, Any] | None:
+    """Bounded configuration material for runtime exact-type identity selection."""
+    return {"background": provider.provider_operations is not None}

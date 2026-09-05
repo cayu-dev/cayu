@@ -68,6 +68,7 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlineController,
     ProviderStreamDeadlineExceeded,
     ProviderStreamDeadlines,
+    _provider_deadline_material,
     _resolve_provider_stream_deadlines,
     current_provider_deadline_controller,
     observe_provider_semantic_progress,
@@ -1533,3 +1534,17 @@ def _optional_clean_string(value: str | None, field_name: str) -> str | None:
 
 def _positive_float(value: float, field_name: str) -> float:
     return positive_finite_seconds(value, field_name)
+
+
+def _execution_profile_material(provider: BedrockProvider) -> dict[str, Any] | None:
+    """Bounded configuration material for runtime exact-type identity selection."""
+    if any((not provider._owns_client, provider.region_name is None)):
+        return None
+    return {
+        "region_name": provider.region_name,
+        "profile_name": provider.profile_name,
+        "endpoint_url": provider.endpoint_url,
+        "max_tokens": provider.max_tokens,
+        "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
+        "stream_close_timeout_s": provider.stream_close_timeout_s,
+    }

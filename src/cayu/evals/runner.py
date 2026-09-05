@@ -1176,6 +1176,57 @@ async def _run_suite_cases(
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
 ]:
+    async def execute_trial(case: EvalCase, trial_number: int):
+        return await _run_case_once_with_public_projection(
+            app,
+            case,
+            trial_number=trial_number,
+            suite_id=suite.id,
+            retain_trajectory=retain_trajectory,
+            retain_final_output=retain_final_output,
+            timeout_seconds=case_timeout_seconds,
+            public_output_preview_bytes=public_output_preview_bytes,
+            memory_attribution_bounds=memory_attribution_bounds,
+            memory_attribution_source_limit=memory_attribution_source_limit,
+            memory_attribution_max_bytes=memory_attribution_max_bytes,
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+            run_stream=run_stream,
+            trial_request_transform=trial_request_transform,
+            run_id=run_id,
+            workflow_target=workflow_target,
+            workflow_instance_tracker=workflow_instance_tracker,
+            workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
+        )
+
+    return await _schedule_suite_trials(
+        suite,
+        trials=trials,
+        max_concurrency=max_concurrency,
+        trial_policy=trial_policy,
+        public_output_preview_bytes=public_output_preview_bytes,
+        execution_capacity=execution_capacity,
+        completed_trials=completed_trials,
+        trial_completed=trial_completed,
+        execute_trial=execute_trial,
+    )
+
+
+async def _schedule_suite_trials(
+    suite: EvalSuite,
+    *,
+    trials: int,
+    max_concurrency: int,
+    trial_policy: EvalSuiteTrialPolicyV1,
+    public_output_preview_bytes: int | None,
+    execution_capacity: EvalExecutionCapacity | None,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]],
+    trial_completed: TrialCompletionCallback | None,
+    execute_trial: Callable[
+        [EvalCase, int], Awaitable[tuple[EvalTrialResult, _EvalTrialPublicData | None]]
+    ],
+    group_serial_trials: bool = False,
+) -> tuple[list[EvalCaseResult], dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
+    """Own capacity through reconciliation/publication and preserve ordered recovered slots."""
     # Schedule concrete trials, not whole cases, so one repeated case can consume
     # the configured concurrency. Positional slots preserve authored case order
     # and numeric trial order regardless of completion order.
@@ -1207,26 +1258,7 @@ async def _run_suite_cases(
                 nullcontext() if execution_capacity is None else execution_capacity.slot()
             )
             async with capacity_slot:
-                execution = await _run_case_once_with_public_projection(
-                    app,
-                    case,
-                    trial_number=trial_number,
-                    suite_id=suite.id,
-                    retain_trajectory=retain_trajectory,
-                    retain_final_output=retain_final_output,
-                    timeout_seconds=case_timeout_seconds,
-                    public_output_preview_bytes=public_output_preview_bytes,
-                    memory_attribution_bounds=memory_attribution_bounds,
-                    memory_attribution_source_limit=memory_attribution_source_limit,
-                    memory_attribution_max_bytes=memory_attribution_max_bytes,
-                    memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
-                    run_stream=run_stream,
-                    trial_request_transform=trial_request_transform,
-                    run_id=run_id,
-                    workflow_target=workflow_target,
-                    workflow_instance_tracker=workflow_instance_tracker,
-                    workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
-                )
+                execution = await execute_trial(case, trial_number)
                 result, public_data = execution
                 if trial_completed is not None:
                     if public_data is None:
@@ -1240,7 +1272,7 @@ async def _run_suite_cases(
         for trial_number in range(1, trials + 1)
         if slots[index][trial_number - 1] is None
     )
-    if max_concurrency == 1:
+    if max_concurrency == 1 and not group_serial_trials:
         # Preserve direct cancellation identity and avoid TaskGroup overhead for
         # the common sequential policy while still honoring recovered slots.
         for index, case, trial_number in pending_slots:
@@ -2085,7 +2117,16 @@ async def _run_workflow_case_once_with_public_projection(
             )
         )
     completed_at = datetime.now(UTC)
-    status = _trial_status(run_error, None, assertion_results)
+    unavailable_reason = (
+        _assertion_diagnostic(
+            assertion_results, EvalOutcome.UNAVAILABLE, "Assertion evidence was unavailable"
+        )
+        if run_error is None
+        else None
+    )
+    status = _trial_status(run_error, unavailable_reason, assertion_results)
+    if unavailable_reason is not None:
+        diagnostic_code = EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE
     if diagnostic_code is None:
         diagnostic_code = (
             EvalTrialDiagnosticCode.PASSED
@@ -2107,6 +2148,7 @@ async def _run_workflow_case_once_with_public_projection(
             structured_output=structured_output if retain_final_output else None,
             assertions=tuple(assertion_results),
             error=run_error,
+            unavailable_reason=unavailable_reason,
             evidence_complete=trajectory is not None and not trajectory.children_incomplete,
             events_count=0 if trajectory is None else _workflow_event_count(trajectory),
             usage_summary=(

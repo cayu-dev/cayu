@@ -107,6 +107,7 @@ from cayu.memory_evidence import (
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
+from cayu.runtime import _verified_work_policy as verified_work_support
 from cayu.runtime._child_session_notifications import (
     ChildSessionLifecycleOccurrence,
     ChildSessionLifecycleOccurrenceSource,
@@ -682,7 +683,6 @@ from cayu.runtime.work_contracts import WorkCompletionConflict
 from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
-from cayu.storage import _verified_work_support as verified_work_support
 from cayu.storage import migration_authority
 from cayu.storage import migrations as schema
 from cayu.storage._diagnostic_inspection import (

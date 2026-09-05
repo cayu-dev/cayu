@@ -1,5 +1,79 @@
 """Runtime-native evals for Cayu agent applications."""
 
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from cayu.evals.browser_acceptance import (
+        BROWSER_ACCEPTANCE_HTML_MAX_BYTES,
+        BROWSER_ACCEPTANCE_MANIFEST_MAX_BYTES,
+        BROWSER_ACCEPTANCE_REPORT_MAX_BYTES,
+        BROWSER_ACCEPTANCE_SCHEMA_VERSION,
+        BrowserAcceptanceAccessState,
+        BrowserAcceptanceAgentReportState,
+        BrowserAcceptanceAggregateV1,
+        BrowserAcceptanceArtifactEvidenceV1,
+        BrowserAcceptanceCaseAggregateV1,
+        BrowserAcceptanceCaseCategory,
+        BrowserAcceptanceCaseV1,
+        BrowserAcceptanceCompletionState,
+        BrowserAcceptanceConformance,
+        BrowserAcceptanceDiagnosticState,
+        BrowserAcceptanceDiagnosticV1,
+        BrowserAcceptanceFaultEvidenceV1,
+        BrowserAcceptanceFaultScenario,
+        BrowserAcceptanceInfrastructureState,
+        BrowserAcceptanceLimitsV1,
+        BrowserAcceptanceManifestV1,
+        BrowserAcceptanceMode,
+        BrowserAcceptanceOperationEvidenceV1,
+        BrowserAcceptanceOperationState,
+        BrowserAcceptancePlanV1,
+        BrowserAcceptanceReportV1,
+        BrowserAcceptanceRequestSummaryV1,
+        BrowserAcceptanceRuntimeIdentityV1,
+        BrowserAcceptanceScenarioExecutionV1,
+        BrowserAcceptanceSemanticOracle,
+        BrowserAcceptanceSemanticState,
+        BrowserAcceptanceState,
+        BrowserAcceptanceTrialReceiptV1,
+        BrowserAcceptanceUsageV1,
+        BrowserAcceptanceVariabilityState,
+        BrowserAllocationDisposition,
+        browser_acceptance_report_from_json,
+        browser_acceptance_report_to_json,
+        build_browser_acceptance_report,
+        build_browser_acceptance_retry_report,
+        inspect_browser_acceptance_runtime_identity,
+        project_browser_acceptance_diagnostic,
+        project_browser_acceptance_trial,
+        render_browser_acceptance_html,
+        run_browser_acceptance,
+        write_browser_acceptance_report,
+    )
+    from cayu.evals.browser_acceptance_fixture import (
+        BROWSER_ACCEPTANCE_FIXTURE_REVISION,
+        BrowserAcceptanceFixtureV1,
+    )
+    from cayu.evals.browser_acceptance_manifests import (
+        DETERMINISTIC_BROWSER_ACCEPTANCE_SUITE_ID,
+        LIVE_AUTHENTICATED_BROWSER_ACCEPTANCE_SUITE_ID,
+        LIVE_PUBLIC_BROWSER_ACCEPTANCE_SUITE_ID,
+        deterministic_browser_acceptance_manifest,
+        live_authenticated_browser_acceptance_manifest,
+        live_public_browser_acceptance_manifest,
+    )
+    from cayu.evals.causal_memory_campaign import (
+        CAUSAL_MEMORY_CAMPAIGN_EXPERIMENT_ID,
+        CAUSAL_MEMORY_CAMPAIGN_REPETITIONS,
+        CAUSAL_MEMORY_CAMPAIGN_SUITE_ID,
+        CAUSAL_MEMORY_CAMPAIGN_TARGET_KEY,
+        CAUSAL_MEMORY_CAMPAIGN_VARIANTS,
+        build_causal_memory_reference_corpus,
+        load_causal_memory_reference_corpus,
+        run_causal_memory_reference_campaign,
+    )
+
 from cayu.evals.assertions import (
     ArtifactCreated,
     ChildSessionCompleted,
@@ -27,65 +101,6 @@ from cayu.evals.assertions import (
     WorkspaceFileContains,
     WorkspaceFileExists,
 )
-from cayu.evals.browser_acceptance import (
-    BROWSER_ACCEPTANCE_HTML_MAX_BYTES,
-    BROWSER_ACCEPTANCE_MANIFEST_MAX_BYTES,
-    BROWSER_ACCEPTANCE_REPORT_MAX_BYTES,
-    BROWSER_ACCEPTANCE_SCHEMA_VERSION,
-    BrowserAcceptanceAccessState,
-    BrowserAcceptanceAgentReportState,
-    BrowserAcceptanceAggregateV1,
-    BrowserAcceptanceArtifactEvidenceV1,
-    BrowserAcceptanceCaseAggregateV1,
-    BrowserAcceptanceCaseCategory,
-    BrowserAcceptanceCaseV1,
-    BrowserAcceptanceCompletionState,
-    BrowserAcceptanceConformance,
-    BrowserAcceptanceDiagnosticState,
-    BrowserAcceptanceDiagnosticV1,
-    BrowserAcceptanceFaultEvidenceV1,
-    BrowserAcceptanceFaultScenario,
-    BrowserAcceptanceInfrastructureState,
-    BrowserAcceptanceLimitsV1,
-    BrowserAcceptanceManifestV1,
-    BrowserAcceptanceMode,
-    BrowserAcceptanceOperationEvidenceV1,
-    BrowserAcceptanceOperationState,
-    BrowserAcceptancePlanV1,
-    BrowserAcceptanceReportV1,
-    BrowserAcceptanceRequestSummaryV1,
-    BrowserAcceptanceRuntimeIdentityV1,
-    BrowserAcceptanceScenarioExecutionV1,
-    BrowserAcceptanceSemanticOracle,
-    BrowserAcceptanceSemanticState,
-    BrowserAcceptanceState,
-    BrowserAcceptanceTrialReceiptV1,
-    BrowserAcceptanceUsageV1,
-    BrowserAcceptanceVariabilityState,
-    BrowserAllocationDisposition,
-    browser_acceptance_report_from_json,
-    browser_acceptance_report_to_json,
-    build_browser_acceptance_report,
-    build_browser_acceptance_retry_report,
-    inspect_browser_acceptance_runtime_identity,
-    project_browser_acceptance_diagnostic,
-    project_browser_acceptance_trial,
-    render_browser_acceptance_html,
-    run_browser_acceptance,
-    write_browser_acceptance_report,
-)
-from cayu.evals.browser_acceptance_fixture import (
-    BROWSER_ACCEPTANCE_FIXTURE_REVISION,
-    BrowserAcceptanceFixtureV1,
-)
-from cayu.evals.browser_acceptance_manifests import (
-    DETERMINISTIC_BROWSER_ACCEPTANCE_SUITE_ID,
-    LIVE_AUTHENTICATED_BROWSER_ACCEPTANCE_SUITE_ID,
-    LIVE_PUBLIC_BROWSER_ACCEPTANCE_SUITE_ID,
-    deterministic_browser_acceptance_manifest,
-    live_authenticated_browser_acceptance_manifest,
-    live_public_browser_acceptance_manifest,
-)
 from cayu.evals.calibration import (
     EVAL_JUDGE_CALIBRATION_MAX_BYTES,
     EVAL_JUDGE_CALIBRATION_MAX_TRIALS,
@@ -106,16 +121,6 @@ from cayu.evals.calibration import (
     run_eval_judge_calibration_trial,
 )
 from cayu.evals.capacity import DEFAULT_EVAL_MAX_ACTIVE_TRIALS, EvalExecutionCapacity
-from cayu.evals.causal_memory_campaign import (
-    CAUSAL_MEMORY_CAMPAIGN_EXPERIMENT_ID,
-    CAUSAL_MEMORY_CAMPAIGN_REPETITIONS,
-    CAUSAL_MEMORY_CAMPAIGN_SUITE_ID,
-    CAUSAL_MEMORY_CAMPAIGN_TARGET_KEY,
-    CAUSAL_MEMORY_CAMPAIGN_VARIANTS,
-    build_causal_memory_reference_corpus,
-    load_causal_memory_reference_corpus,
-    run_causal_memory_reference_campaign,
-)
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
@@ -1562,3 +1567,89 @@ __all__ = [
     "write_html_report",
     "write_trajectory_json",
 ]
+
+
+_LAZY_MODULE_EXPORTS = {
+    "cayu.evals.browser_acceptance": (
+        "BROWSER_ACCEPTANCE_HTML_MAX_BYTES",
+        "BROWSER_ACCEPTANCE_MANIFEST_MAX_BYTES",
+        "BROWSER_ACCEPTANCE_REPORT_MAX_BYTES",
+        "BROWSER_ACCEPTANCE_SCHEMA_VERSION",
+        "BrowserAcceptanceAccessState",
+        "BrowserAcceptanceAgentReportState",
+        "BrowserAcceptanceAggregateV1",
+        "BrowserAcceptanceArtifactEvidenceV1",
+        "BrowserAcceptanceCaseAggregateV1",
+        "BrowserAcceptanceCaseCategory",
+        "BrowserAcceptanceCaseV1",
+        "BrowserAcceptanceCompletionState",
+        "BrowserAcceptanceConformance",
+        "BrowserAcceptanceDiagnosticState",
+        "BrowserAcceptanceDiagnosticV1",
+        "BrowserAcceptanceFaultEvidenceV1",
+        "BrowserAcceptanceFaultScenario",
+        "BrowserAcceptanceInfrastructureState",
+        "BrowserAcceptanceLimitsV1",
+        "BrowserAcceptanceManifestV1",
+        "BrowserAcceptanceMode",
+        "BrowserAcceptanceOperationEvidenceV1",
+        "BrowserAcceptanceOperationState",
+        "BrowserAcceptancePlanV1",
+        "BrowserAcceptanceReportV1",
+        "BrowserAcceptanceRequestSummaryV1",
+        "BrowserAcceptanceRuntimeIdentityV1",
+        "BrowserAcceptanceScenarioExecutionV1",
+        "BrowserAcceptanceSemanticOracle",
+        "BrowserAcceptanceSemanticState",
+        "BrowserAcceptanceState",
+        "BrowserAcceptanceTrialReceiptV1",
+        "BrowserAcceptanceUsageV1",
+        "BrowserAcceptanceVariabilityState",
+        "BrowserAllocationDisposition",
+        "browser_acceptance_report_from_json",
+        "browser_acceptance_report_to_json",
+        "build_browser_acceptance_report",
+        "build_browser_acceptance_retry_report",
+        "inspect_browser_acceptance_runtime_identity",
+        "project_browser_acceptance_diagnostic",
+        "project_browser_acceptance_trial",
+        "render_browser_acceptance_html",
+        "run_browser_acceptance",
+        "write_browser_acceptance_report",
+    ),
+    "cayu.evals.browser_acceptance_fixture": (
+        "BROWSER_ACCEPTANCE_FIXTURE_REVISION",
+        "BrowserAcceptanceFixtureV1",
+    ),
+    "cayu.evals.browser_acceptance_manifests": (
+        "DETERMINISTIC_BROWSER_ACCEPTANCE_SUITE_ID",
+        "LIVE_AUTHENTICATED_BROWSER_ACCEPTANCE_SUITE_ID",
+        "LIVE_PUBLIC_BROWSER_ACCEPTANCE_SUITE_ID",
+        "deterministic_browser_acceptance_manifest",
+        "live_authenticated_browser_acceptance_manifest",
+        "live_public_browser_acceptance_manifest",
+    ),
+    "cayu.evals.causal_memory_campaign": (
+        "CAUSAL_MEMORY_CAMPAIGN_EXPERIMENT_ID",
+        "CAUSAL_MEMORY_CAMPAIGN_REPETITIONS",
+        "CAUSAL_MEMORY_CAMPAIGN_SUITE_ID",
+        "CAUSAL_MEMORY_CAMPAIGN_TARGET_KEY",
+        "CAUSAL_MEMORY_CAMPAIGN_VARIANTS",
+        "build_causal_memory_reference_corpus",
+        "load_causal_memory_reference_corpus",
+        "run_causal_memory_reference_campaign",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    for module_name, exports in _LAZY_MODULE_EXPORTS.items():
+        if name in exports:
+            value = getattr(import_module(module_name), name)
+            globals()[name] = value
+            return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

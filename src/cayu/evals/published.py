@@ -815,7 +815,7 @@ class PublishedModelJudgeDetail(_PublishedAssertionDetail):
     include_transcript: StrictBool
     diagnostic: PublishedModelJudgeDiagnostic
     judge_profile: JudgeProfileIdentityV1
-    candidate_route_relation: Literal["independent_model", "same_model"]
+    candidate_route_relation: Literal["independent_model", "same_model", "unknown"]
     usage: PublishedModelJudgeUsageV1 | None = None
     cost: PublishedModelJudgeCostV1 | None = None
 
@@ -858,9 +858,12 @@ class PublishedModelJudgeDetail(_PublishedAssertionDetail):
             or self.evaluator_implementation_revision != self.judge_profile.implementation_revision
         ):
             raise ValueError("Published model-judge identity contradicts its profile.")
-        if (
-            self.candidate_route_relation == "same_model"
-            and self.judge_profile.same_model_use != "allowed_and_labeled"
+        if self.diagnostic == "judgment_recorded" and (
+            self.candidate_route_relation == "unknown"
+            or (
+                self.candidate_route_relation == "same_model"
+                and self.judge_profile.same_model_use != "allowed_and_labeled"
+            )
         ):
             raise ValueError("Published model judgment used a forbidden same-model route.")
         if self.include_transcript and "transcript" not in self.judge_profile.allowed_evidence:
@@ -982,7 +985,7 @@ class PublishedStructuredModelJudgeDetail(_PublishedAssertionDetail):
 
     kind: Literal["structured_model_judge"] = "structured_model_judge"
     judge_profile: JudgeProfileIdentityV1
-    candidate_route_relation: Literal["independent_model", "same_model"]
+    candidate_route_relation: Literal["independent_model", "same_model", "unknown"]
     rubric_id: StrictStr
     rubric_revision: StrictStr
     reference: PublishedJudgeReferenceIdentityV1 | None = None
@@ -1032,9 +1035,12 @@ class PublishedStructuredModelJudgeDetail(_PublishedAssertionDetail):
 
     @model_validator(mode="after")
     def validate_judgment(self) -> PublishedStructuredModelJudgeDetail:
-        if (
-            self.candidate_route_relation == "same_model"
-            and self.judge_profile.same_model_use != "allowed_and_labeled"
+        if self.diagnostic == "judgment_recorded" and (
+            self.candidate_route_relation == "unknown"
+            or (
+                self.candidate_route_relation == "same_model"
+                and self.judge_profile.same_model_use != "allowed_and_labeled"
+            )
         ):
             raise ValueError("Published structured judgment used a forbidden same-model route.")
         if (
@@ -2574,9 +2580,12 @@ def _published_detail(
         if profile.key != spec.evaluator_key:
             raise ValueError("Internal model-judge profile does not match the corpus.")
         route_relation = raw.get("candidate_route_relation")
-        if route_relation not in {"independent_model", "same_model"}:
+        if route_relation not in {"independent_model", "same_model", "unknown"}:
             raise ValueError("Internal model-judge route relation is invalid.")
-        if route_relation == "same_model" and profile.same_model_use != "allowed_and_labeled":
+        if result.outcome.value in {"passed", "failed"} and (
+            route_relation == "unknown"
+            or (route_relation == "same_model" and profile.same_model_use != "allowed_and_labeled")
+        ):
             raise ValueError("Internal model judge used a forbidden same-model route.")
         usage = None
         cost = None
@@ -2613,9 +2622,12 @@ def _published_detail(
         ):
             raise ValueError("Internal structured judgment profile does not match the corpus.")
         route_relation = raw.get("candidate_route_relation")
-        if route_relation not in {"independent_model", "same_model"}:
+        if route_relation not in {"independent_model", "same_model", "unknown"}:
             raise ValueError("Internal structured judgment route relation is invalid.")
-        if route_relation == "same_model" and profile.same_model_use != "allowed_and_labeled":
+        if result.outcome.value in {"passed", "failed"} and (
+            route_relation == "unknown"
+            or (route_relation == "same_model" and profile.same_model_use != "allowed_and_labeled")
+        ):
             raise ValueError("Internal structured judgment used a forbidden same-model route.")
         if (raw.get("rubric_id"), raw.get("rubric_revision")) != (
             spec.rubric.id,

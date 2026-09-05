@@ -111,6 +111,7 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlineController,
     ProviderStreamDeadlineExceeded,
     ProviderStreamDeadlines,
+    _provider_deadline_material,
     _resolve_provider_stream_deadlines,
     bind_provider_deadline_controller,
     observe_provider_semantic_progress,
@@ -6833,3 +6834,20 @@ def _validate_reasoning_state(value: str) -> str:
     if value not in _VALID_REASONING_STATES:
         raise ValueError(f"reasoning_state must be one of {sorted(_VALID_REASONING_STATES)}.")
     return value
+
+
+def _execution_profile_material(provider: OpenAIProvider) -> dict[str, Any] | None:
+    """Bounded configuration material for runtime exact-type identity selection."""
+    if type(provider.transport) is not HttpxOpenAITransport or provider.extra_headers:
+        return None
+    return {
+        "base_url": provider.base_url,
+        "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
+        "reasoning_state": provider.reasoning_state,
+        "background": provider.background,
+        "additional_tools_models": sorted(provider.additional_tools_models),
+        "client_tool_search_models": sorted(provider.client_tool_search_models),
+        "hosted_tool_search_models": sorted(provider.hosted_tool_search_models),
+        "timeout_s": provider.timeout_s,
+        "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
+    }

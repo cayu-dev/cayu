@@ -1171,20 +1171,15 @@ async def _run_recovery_cleanup_steps(
 @dataclass(frozen=True)
 class RecoverySessionRunRequest:
     session: Session
-    registered_agent: runtime_records.RegisteredAgentState
-    registered_provider: runtime_records.RegisteredProvider
-    registered_environment: runtime_records.RegisteredEnvironment | None
-    active_invocation_profile: ActiveInvocationExecutionProfile
+    invocation_context: InvocationContext
     messages: list[Message]
     messages_to_append: list[Message]
     max_steps: int
     limits: RunLimits
     budget_limits: tuple[BudgetLimit, ...]
-    budget_policy: BudgetPolicy | None
     retry_policy: RetryPolicy
     structured_output: StructuredOutputSpec | None
     thinking: ThinkingConfig | None
-    request_loop_policies: tuple[LoopPolicy, ...]
     request_metadata: dict[str, Any]
     task_id: str | None
     task_worker_id: str | None
@@ -1199,7 +1194,12 @@ class RecoverySessionRunRequest:
     initial_model_step_tool_exposure: ResolvedToolExposureAuthority | None = None
     previous_tool_exposure_profile_id: str | None = None
     preserve_failure_until_initial_provider_dispatch: bool = False
-    invocation_context: InvocationContext | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.invocation_context) is not InvocationContext:
+            raise TypeError("Recovery requires an authenticated InvocationContext.")
+        self.invocation_context._validate()
+        self.invocation_context.with_admitted_session(self.session)
 
 
 def _rebound_active_invocation_profile(
@@ -6670,29 +6670,14 @@ class RecoveryCoordinator:
         session_stream = self._run_session(
             RecoverySessionRunRequest(
                 session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-                active_invocation_profile=_rebound_active_invocation_profile(
-                    session,
-                    execution_profile_snapshot,
-                )
-                if invocation_context is None
-                else invocation_context.active_profile,
                 messages=transcript,
                 messages_to_append=[],
                 max_steps=recovery_context.max_steps,
                 limits=recovery_context.limits,
                 budget_limits=recovery_context.budget_limits,
-                budget_policy=(
-                    copy_budget_policy(budget_policy)
-                    if invocation_context is None
-                    else invocation_context.budget_policy
-                ),
                 retry_policy=recovery_context.retry_policy,
                 structured_output=recovery_context.structured_output,
                 thinking=recovery_context.thinking,
-                request_loop_policies=(),
                 request_metadata=recovery_context.request_metadata,
                 task_id=recovery_context.task_id,
                 task_worker_id=task_worker_id,
@@ -6714,7 +6699,19 @@ class RecoveryCoordinator:
                     )
                 ),
                 preserve_failure_until_initial_provider_dispatch=True,
-                invocation_context=invocation_context,
+                invocation_context=(
+                    invocation_context
+                    if invocation_context is not None
+                    else self._reconstruct_invocation_context(
+                        session=session,
+                        execution_profile_snapshot=execution_profile_snapshot,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        registered_environment=registered_environment,
+                        budget_policy=copy_budget_policy(budget_policy),
+                        request_loop_policies=(),
+                    )
+                ),
             )
         )
         authoritative_failure: BaseException | None = None
@@ -8222,31 +8219,14 @@ class RecoveryCoordinator:
             session_stream = self._run_session(
                 RecoverySessionRunRequest(
                     session=session,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    registered_environment=registered_environment,
-                    active_invocation_profile=(
-                        _rebound_active_invocation_profile(
-                            session,
-                            execution_profile_snapshot,
-                        )
-                        if invocation_context is None
-                        else invocation_context.active_profile
-                    ),
                     messages=transcript,
                     messages_to_append=[],
                     max_steps=effective_max_steps,
                     limits=effective_limits,
                     budget_limits=effective_budget_limits,
-                    budget_policy=(
-                        copy_budget_policy(budget_policy)
-                        if invocation_context is None
-                        else invocation_context.budget_policy
-                    ),
                     retry_policy=effective_retry_policy,
                     structured_output=invocation_semantics.structured_output,
                     thinking=invocation_semantics.thinking,
-                    request_loop_policies=response.loop_policies,
                     request_metadata=response.metadata,
                     task_id=pending.task_id,
                     task_worker_id=response.task_worker_id,
@@ -8259,7 +8239,19 @@ class RecoveryCoordinator:
                     previous_tool_exposure_profile_id=(
                         _continued_tool_exposure_profile_id(pending.tool_exposure)
                     ),
-                    invocation_context=invocation_context,
+                    invocation_context=(
+                        invocation_context
+                        if invocation_context is not None
+                        else self._reconstruct_invocation_context(
+                            session=session,
+                            execution_profile_snapshot=execution_profile_snapshot,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            registered_environment=registered_environment,
+                            budget_policy=copy_budget_policy(budget_policy),
+                            request_loop_policies=response.loop_policies,
+                        )
+                    ),
                 )
             )
             forwarded_stream = self._session_control.stream_with_out_of_band_events(
@@ -9763,31 +9755,14 @@ class RecoveryCoordinator:
             session_stream = self._run_session(
                 RecoverySessionRunRequest(
                     session=session,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    registered_environment=registered_environment,
-                    active_invocation_profile=(
-                        _rebound_active_invocation_profile(
-                            session,
-                            execution_profile_snapshot,
-                        )
-                        if invocation_context is None
-                        else invocation_context.active_profile
-                    ),
                     messages=transcript,
                     messages_to_append=[],
                     max_steps=effective_max_steps,
                     limits=effective_limits,
                     budget_limits=effective_budget_limits,
-                    budget_policy=(
-                        copy_budget_policy(budget_policy)
-                        if invocation_context is None
-                        else invocation_context.budget_policy
-                    ),
                     retry_policy=effective_retry_policy,
                     structured_output=invocation_semantics.structured_output,
                     thinking=invocation_semantics.thinking,
-                    request_loop_policies=request.loop_policies,
                     request_metadata=request.metadata,
                     task_id=pending_approval.task_id,
                     task_worker_id=request.task_worker_id,
@@ -9800,7 +9775,19 @@ class RecoveryCoordinator:
                     previous_tool_exposure_profile_id=(
                         _continued_tool_exposure_profile_id(durable_round.tool_exposure)
                     ),
-                    invocation_context=invocation_context,
+                    invocation_context=(
+                        invocation_context
+                        if invocation_context is not None
+                        else self._reconstruct_invocation_context(
+                            session=session,
+                            execution_profile_snapshot=execution_profile_snapshot,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            registered_environment=registered_environment,
+                            budget_policy=copy_budget_policy(budget_policy),
+                            request_loop_policies=request.loop_policies,
+                        )
+                    ),
                 )
             )
             forwarded_stream = self._session_control.stream_with_out_of_band_events(
@@ -12849,31 +12836,14 @@ class RecoveryCoordinator:
             session_stream = self._run_session(
                 RecoverySessionRunRequest(
                     session=session,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    registered_environment=registered_environment,
-                    active_invocation_profile=(
-                        _rebound_active_invocation_profile(
-                            session,
-                            execution_profile_snapshot,
-                        )
-                        if invocation_context is None
-                        else invocation_context.active_profile
-                    ),
                     messages=transcript,
                     messages_to_append=[],
                     max_steps=invocation_semantics.max_steps,
                     limits=invocation_semantics.limits,
                     budget_limits=invocation_semantics.budget_limits,
-                    budget_policy=(
-                        copy_budget_policy(budget_policy)
-                        if invocation_context is None
-                        else invocation_context.budget_policy
-                    ),
                     retry_policy=invocation_semantics.retry_policy,
                     structured_output=invocation_semantics.structured_output,
                     thinking=invocation_semantics.thinking,
-                    request_loop_policies=request.loop_policies,
                     request_metadata=request.metadata,
                     task_id=pending_round.task_id,
                     task_worker_id=request.task_worker_id,
@@ -12886,7 +12856,19 @@ class RecoveryCoordinator:
                     previous_tool_exposure_profile_id=(
                         _continued_tool_exposure_profile_id(pending_round.tool_exposure)
                     ),
-                    invocation_context=invocation_context,
+                    invocation_context=(
+                        invocation_context
+                        if invocation_context is not None
+                        else self._reconstruct_invocation_context(
+                            session=session,
+                            execution_profile_snapshot=execution_profile_snapshot,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            registered_environment=registered_environment,
+                            budget_policy=copy_budget_policy(budget_policy),
+                            request_loop_policies=request.loop_policies,
+                        )
+                    ),
                 )
             )
             async for event in session_stream:

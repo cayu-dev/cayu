@@ -16,6 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
+from cayu.runtime import _verified_work_policy as verified_work_support
 from cayu.runtime.completion_verifier_profiles import (
     CompletionVerifierProfilePreparationRequest,
     CompletionVerifierProfileRecord,
@@ -94,7 +95,6 @@ from cayu.runtime.work_contracts import (
     work_attempt_request_sha256,
 )
 from cayu.storage import _postgres_support as pg_support
-from cayu.storage import _verified_work_support as verified_work_support
 
 _T = TypeVar("_T")
 _POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS = 1.0

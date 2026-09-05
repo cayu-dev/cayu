@@ -151,6 +151,7 @@ from cayu.runtime._continuation_task_failure import (
     runtime_task_failure_turn_payload,
     runtime_task_terminalization_idempotency_key,
 )
+from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._diagnostics import (
     ExceptionDiagnostic,
     exception_diagnostic,
@@ -260,6 +261,7 @@ from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired,
     RecoveryAbandonedSessionRequest,
     RecoveryCoordinator,
+    RecoverySessionRunRequest,
     _checkpoint_without_active_incomplete_recovery_claim,
     _IncompleteRecoveryClaim,
     _IncompleteRecoveryClaimLost,
@@ -719,6 +721,7 @@ from cayu.runtime.tool_exposure import (
     ToolCapabilityCeiling,
     ToolExposure,
     resolve_tool_capability_ceiling,
+    resolved_tool_exposure_from_authority,
     session_metadata_with_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
     validate_resolved_tool_exposure_authority,
@@ -20921,6 +20924,167 @@ class SessionEngine:
         if cancellation is not None:
             raise cancellation
         return outcome.result
+
+    async def _run_recovery_session(
+        self, request: RecoverySessionRunRequest
+    ) -> AsyncGenerator[Event, None]:
+        invocation_context = request.invocation_context
+        invocation_context._validate()
+        invocation_context.with_admitted_session(request.session)
+        if (
+            invocation_context.runtime_hooks is not self._runtime_hooks
+            or invocation_context.loop_policies is not self._loop_policies
+        ):
+            raise RuntimeError("Recovery run substituted frozen invocation authority.")
+        checkpoint = await self.session_store.load_checkpoint(request.session.id)
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        expected_profile = request.invocation_context.active_profile
+        if (
+            active_profile != expected_profile
+            or expected_profile.session_id != request.session.id
+            or expected_profile.run_epoch != request.session.run_epoch
+        ):
+            raise RuntimeError(
+                "Recovery run does not reference the active invocation execution profile."
+            )
+        initial_tool_exposure = (
+            None
+            if request.initial_model_step_tool_exposure is None
+            else resolved_tool_exposure_from_authority(
+                request.initial_model_step_tool_exposure,
+                invocation_context.registered_agent.tool_capabilities,
+                catalogue_revision=invocation_context.registered_agent.tool_catalogue.revision,
+            )
+        )
+        stream = self._run_recovered_session(
+            session=request.session,
+            invocation_context=invocation_context,
+            messages=request.messages,
+            messages_to_append=request.messages_to_append,
+            max_steps=request.max_steps,
+            limits=request.limits,
+            budget_limits=request.budget_limits,
+            retry_policy=request.retry_policy,
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+            request_metadata=request.request_metadata,
+            task_id=request.task_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+            start_event_type=request.start_event_type,
+            start_event_payload=request.start_event_payload,
+            start_task_on_enter=request.start_task_on_enter,
+            release_run_fence_on_exit=request.release_run_fence_on_exit,
+            deliver_queued_input_before_first_step=False,
+            run_limit_accounting=request.run_limit_accounting,
+            initial_model_step_identity=request.initial_model_step_identity,
+            initial_model_step_number=request.initial_model_step_number,
+            initial_model_step_tool_exposure=initial_tool_exposure,
+            previous_tool_exposure_profile_id=(request.previous_tool_exposure_profile_id),
+            preserve_failure_until_initial_provider_dispatch=(
+                request.preserve_failure_until_initial_provider_dispatch
+            ),
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _run_recovered_session(
+        self,
+        *,
+        session: Session,
+        invocation_context: InvocationContext,
+        messages: list[Message],
+        messages_to_append: list[Message],
+        max_steps: int,
+        limits: RunLimits,
+        budget_limits: tuple[BudgetLimit, ...],
+        retry_policy: RetryPolicy,
+        structured_output: StructuredOutputSpec | None,
+        thinking: ThinkingConfig | None,
+        request_metadata: dict[str, Any],
+        task_id: str | None,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+        start_event_type: EventType | None,
+        start_event_payload: dict[str, Any],
+        start_task_on_enter: bool = True,
+        release_run_fence_on_exit: bool = True,
+        deliver_queued_input_before_first_step: bool = True,
+        run_limit_accounting: RunLimitAccountingContext | None = None,
+        initial_model_step_identity: ModelStepIdentity | None = None,
+        initial_model_step_number: int | None = None,
+        initial_model_step_tool_exposure: ResolvedToolExposure | None = None,
+        previous_tool_exposure_profile_id: str | None = None,
+        preserve_failure_until_initial_provider_dispatch: bool = False,
+    ) -> AsyncGenerator[Event, None]:
+        if type(invocation_context) is not InvocationContext:
+            raise TypeError("invocation_context must be an authenticated InvocationContext.")
+        registered_agent = invocation_context.registered_agent
+        registered_provider = invocation_context.registered_provider
+        interaction_id = _current_session_interaction_id(session.id)
+        targeted_tool_projection = resolve_targeted_tool_projection(
+            registered_agent.targeted_tool_mode,
+            provider=registered_provider.provider,
+            model=session.model,
+        )
+        targeted_tool_grant_records: tuple[TargetedToolGrantRecord, ...] = ()
+        targeted_tool_grant_events: tuple[Event, ...] = ()
+        if interaction_id is not None:
+            (
+                targeted_tool_grant_records,
+                targeted_tool_grant_events,
+            ) = await self._reconstruct_targeted_tool_grants(
+                session=session,
+                interaction_id=interaction_id,
+                task_id=task_id,
+                registered_agent=registered_agent,
+                capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
+                observed_at=self._clock(),
+                preserve_native_projection_snapshot=(
+                    targeted_tool_projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+                ),
+            )
+        stream = self._run_session(
+            session=session,
+            invocation_context=invocation_context,
+            messages=messages,
+            messages_to_append=messages_to_append,
+            max_steps=max_steps,
+            limits=limits,
+            budget_limits=budget_limits,
+            retry_policy=retry_policy,
+            structured_output=structured_output,
+            thinking=thinking,
+            request_metadata=request_metadata,
+            request_trace_metadata=request_metadata,
+            targeted_tool_grants=targeted_tool_grant_footprint(
+                targeted_tool_grant_records,
+                projection=targeted_tool_projection,
+            ),
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_lease_expires_at=None,
+            task_handoff_id=task_handoff_id,
+            start_event_type=start_event_type,
+            start_event_payload=start_event_payload,
+            start_task_on_enter=start_task_on_enter,
+            release_run_fence_on_exit=release_run_fence_on_exit,
+            deliver_queued_input_before_first_step=(deliver_queued_input_before_first_step),
+            run_limit_accounting=run_limit_accounting,
+            initial_model_step_identity=initial_model_step_identity,
+            initial_model_step_number=initial_model_step_number,
+            initial_model_step_tool_exposure=initial_model_step_tool_exposure,
+            previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
+            preserve_failure_until_initial_provider_dispatch=(
+                preserve_failure_until_initial_provider_dispatch
+            ),
+        )
+        for grant_event in targeted_tool_grant_events:
+            yield grant_event
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
 
     async def _run_session(
         self,

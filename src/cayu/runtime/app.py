@@ -6,7 +6,6 @@ import mimetypes
 import os
 import traceback as traceback_module
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -19,13 +18,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 from uuid import uuid4
 
-from cayu._exception_groups import (
-    exception_cause,
-    exception_tree_contains,
-    set_exception_cause,
-)
 from cayu._knowledge_publication_owner import KnowledgePublicationLifecycle
-from cayu._task_wait import capture_awaitable_outcome, unexpected_child_cancellation_error
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_json_value,
@@ -106,6 +99,12 @@ from cayu.runtime._completion_result_resolver_coordinator import (
 )
 from cayu.runtime._completion_verifier_coordinator import CompletionVerifierCoordinator
 from cayu.runtime._continuation_task_failure import ApprovalTaskFailureIdentity
+from cayu.runtime._delegated_event_stream import (
+    _close_delegated_event_stream as _close_delegated_event_stream,
+)
+from cayu.runtime._delegated_event_stream import (
+    _RunFenceOwnedEventStream,
+)
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._durable_subagent_coordinator import (
     DurableSubagentCoordinator,
@@ -138,10 +137,8 @@ from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
 )
 from cayu.runtime._invocation_lifecycle import (
-    AdmittedInvocationBinding,
     InvocationContext,
     InvocationMutationResult,
-    _authenticated_invocation_context,
     invocation_lifecycle_receipt_history_present,
     prepare_rebind_invocation_command,
 )
@@ -170,7 +167,6 @@ from cayu.runtime._recovery_coordinator import (
     RecoveryTerminalEventRequest,
 )
 from cayu.runtime._recovery_plan_coordinator import RecoveryPlanCoordinator
-from cayu.runtime._run_limit_accounting import RunLimitAccountingContext
 from cayu.runtime._run_limits import (
     RunLimitController,
     SessionUsageTracker,
@@ -316,7 +312,6 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
     unavailable_execution_profile_components,
 )
-from cayu.runtime.execution_units import ModelStepIdentity
 from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookPhase,
@@ -370,7 +365,6 @@ from cayu.runtime.recovery_plans import (
 from cayu.runtime.request_footprints import (
     RequestFootprintConfig,
     copy_request_footprint_config,
-    targeted_tool_grant_footprint,
 )
 from cayu.runtime.retry_policy import (
     RetryPolicy,
@@ -412,14 +406,12 @@ from cayu.runtime.sessions import (
     _activate_session_interaction,
     _activate_session_run_fence,
     _checkpoint_after_queued_dispatch_acknowledgement,
-    _current_session_interaction_id,
     _deactivate_session_run_fence,
     _fork_source_session_instance_fingerprint,
     _initial_transcript_pending_interaction_id,
     _queued_dispatch_session_instance_fingerprint,
     _queued_dispatch_terminal_receipts_from_checkpoint,
     _session_run_operation_from_checkpoint,
-    _SessionRunFenceContext,
     copy_fork_session_request,
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
@@ -441,9 +433,7 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.targeted_tool_projection import (
     TargetedToolMode,
-    TargetedToolProjectionKind,
     copy_targeted_tool_mode,
-    resolve_targeted_tool_projection,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -488,13 +478,11 @@ from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
     StaticToolExposurePolicy,
     ToolExposurePolicy,
-    resolved_tool_exposure_from_authority,
     tool_capability_ceiling_from_session_metadata,
 )
 from cayu.runtime.tool_grants import (
     TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
     TargetedToolGrantInspection,
-    TargetedToolGrantRecord,
     targeted_tool_grant_inspection,
 )
 from cayu.runtime.tool_policy import (
@@ -562,10 +550,6 @@ from cayu.runtime.work_contracts import (
     copy_work_contract,
     copy_work_contract_ref,
     work_contract_from_draft,
-)
-from cayu.runtime.workspace_observation_recovery import (
-    retain_workspace_observation_pending_cancellation_requests,
-    workspace_observation_pending_cancellation_requests,
 )
 from cayu.storage.memory import (
     KnowledgeAccessScope,
@@ -733,309 +717,6 @@ class _ArtifactStoreRegistration:
     store_id: str
     store: ArtifactStore
     fingerprint: str
-
-
-class _RunFenceOwnedEventStream:
-    """Advance and close one delegated stream under its captured run fences."""
-
-    def __init__(self, stream: AsyncGenerator[Event, None]) -> None:
-        self._stream = stream
-        self._run_fences = _SessionRunFenceContext.current_or_new()
-
-    def __aiter__(self) -> _RunFenceOwnedEventStream:
-        return self
-
-    async def __anext__(self) -> Event:
-        with self._run_fences.activate():
-            return await anext(self._stream)
-
-    async def aclose(self) -> None:
-        with self._run_fences.activate():
-            await self._stream.aclose()
-
-
-def _attach_delegated_failure_causes(
-    authoritative_failure: BaseException,
-    failures: Iterable[BaseException | None],
-    *,
-    message: str,
-) -> None:
-    evidence: list[BaseException] = []
-    for failure in (*failures, exception_cause(authoritative_failure)):
-        if failure is None or failure is authoritative_failure:
-            continue
-        if any(candidate is failure for candidate in evidence):
-            continue
-        evidence.append(failure)
-    if not evidence:
-        return
-    set_exception_cause(
-        authoritative_failure,
-        evidence[0] if len(evidence) == 1 else BaseExceptionGroup(message, evidence),
-    )
-
-
-async def _close_owned_event_stream_resisting_cancellation(
-    owned_stream: _RunFenceOwnedEventStream,
-    *,
-    cancellation: asyncio.CancelledError | None = None,
-) -> tuple[tuple[asyncio.CancelledError, ...], BaseException | None]:
-    """Finish delegated cleanup despite cancellation of the awaiting task."""
-
-    cleanup_task = asyncio.create_task(
-        capture_awaitable_outcome(owned_stream.aclose),
-        name="cayu-delegated-stream-cleanup",
-    )
-    cancellations = [] if cancellation is None else [cancellation]
-    while not cleanup_task.done():
-        try:
-            await asyncio.wait(
-                (cleanup_task,),
-                return_when=asyncio.ALL_COMPLETED,
-            )
-        except asyncio.CancelledError as exc:
-            # asyncio.wait raises only when this caller is cancelled. A cancelled
-            # cleanup task completes the wait and is inspected through result() below.
-            cancellations.append(exc)
-            if cleanup_task.cancelled():
-                break
-            continue
-
-    cleanup_outcome = cleanup_task.result()
-    cleanup_failure = cleanup_outcome.error
-    if isinstance(cleanup_failure, asyncio.CancelledError):
-        cleanup_failure = unexpected_child_cancellation_error(
-            cleanup_failure,
-            operation="Delegated runtime stream cleanup",
-        )
-    return tuple(cancellations), cleanup_failure
-
-
-@asynccontextmanager
-async def _close_delegated_event_stream(
-    stream: AsyncGenerator[Event, None],
-) -> AsyncIterator[_RunFenceOwnedEventStream]:
-    """Close a delegated stream synchronously without hiding its exit signal."""
-
-    owned_stream = _RunFenceOwnedEventStream(stream)
-    authoritative_failure: BaseException | None = None
-    try:
-        yield owned_stream
-    except BaseException as exc:
-        authoritative_failure = exc
-        raise
-    finally:
-        current_task = asyncio.current_task()
-        workspace_cancellation_requests = (
-            0
-            if authoritative_failure is None
-            else workspace_observation_pending_cancellation_requests(authoritative_failure)
-        )
-        cancellation_requests_at_cleanup_entry = (
-            0 if current_task is None else current_task.cancelling()
-        )
-        cancellation_pending_at_cleanup_entry = bool(
-            current_task is not None and getattr(current_task, "_must_cancel", False)
-        )
-        cancellation_requests_to_preserve_at_entry = (
-            0
-            if workspace_cancellation_requests == 0
-            else max(
-                workspace_cancellation_requests,
-                cancellation_requests_at_cleanup_entry,
-            )
-        )
-        pending_at_cleanup_entry: asyncio.CancelledError | None = None
-        # ``Task.cancelling()`` includes historical requests that were already
-        # delivered. A real checkpoint is the only positive evidence that one
-        # of the entry-time requests is still pending for this cleanup.
-        try:
-            await asyncio.sleep(0)
-        except asyncio.CancelledError as exc:
-            pending_at_cleanup_entry = exc
-        cancellation_requests_after_checkpoint = (
-            0 if current_task is None else current_task.cancelling()
-        )
-        new_checkpoint_cancellation_requests = max(
-            cancellation_requests_after_checkpoint - cancellation_requests_at_cleanup_entry,
-            0,
-        )
-        try:
-            cancellations, cleanup_failure = await _close_owned_event_stream_resisting_cancellation(
-                owned_stream,
-                cancellation=pending_at_cleanup_entry,
-            )
-            new_cancellations = list(cancellations)
-            if new_cancellations:
-                cancellation_requests_after_cleanup = (
-                    0 if current_task is None else current_task.cancelling()
-                )
-                new_cancellation_requests = max(
-                    cancellation_requests_after_cleanup - cancellation_requests_at_cleanup_entry,
-                    0,
-                )
-                authoritative_cancellation_failure = isinstance(
-                    authoritative_failure,
-                    asyncio.CancelledError,
-                ) or (
-                    isinstance(authoritative_failure, BaseExceptionGroup)
-                    and exception_tree_contains(authoritative_failure, asyncio.CancelledError)
-                )
-                pending_entry_cancellation_is_historical = (
-                    pending_at_cleanup_entry is not None
-                    and authoritative_cancellation_failure
-                    and workspace_cancellation_requests > 0
-                    and cancellation_requests_at_cleanup_entry <= workspace_cancellation_requests
-                    and cancellation_pending_at_cleanup_entry
-                    and new_checkpoint_cancellation_requests == 0
-                )
-                historical_group_cancellation = (
-                    pending_entry_cancellation_is_historical and new_cancellation_requests == 0
-                )
-                if pending_entry_cancellation_is_historical:
-                    new_cancellations = [
-                        candidate
-                        for candidate in new_cancellations
-                        if candidate is not pending_at_cleanup_entry
-                    ]
-                if (
-                    historical_group_cancellation
-                    and authoritative_failure is not None
-                    and not new_cancellations
-                ):
-                    process_control = exception_tree_contains(
-                        authoritative_failure,
-                        (GeneratorExit, KeyboardInterrupt, SystemExit),
-                    )
-                    authoritative_failure.add_note(
-                        "Delegated runtime stream cleanup observed the already-grouped "
-                        "caller cancellation. The authoritative failure group remains "
-                        + (
-                            "intact with concurrent process control."
-                            if process_control
-                            else "intact."
-                        )
-                    )
-                    _attach_delegated_failure_causes(
-                        authoritative_failure,
-                        (cleanup_failure,),
-                        message="Delegated runtime stream cleanup and concurrent control causes",
-                    )
-            if new_cancellations:
-                authoritative_process_control = (
-                    authoritative_failure is not None
-                    and not isinstance(authoritative_failure, GeneratorExit)
-                    and (
-                        isinstance(authoritative_failure, (KeyboardInterrupt, SystemExit))
-                        or (
-                            isinstance(authoritative_failure, BaseExceptionGroup)
-                            and exception_tree_contains(
-                                authoritative_failure,
-                                (GeneratorExit, KeyboardInterrupt, SystemExit),
-                            )
-                        )
-                    )
-                )
-                cleanup_process_control = cleanup_failure is not None and exception_tree_contains(
-                    cleanup_failure,
-                    (GeneratorExit, KeyboardInterrupt, SystemExit),
-                )
-                if (
-                    workspace_cancellation_requests > 0
-                    or authoritative_cancellation_failure
-                    or authoritative_process_control
-                    or cleanup_process_control
-                ):
-                    failures: list[BaseException] = []
-                    if authoritative_failure is not None:
-                        failures.append(authoritative_failure)
-                    failures.extend(new_cancellations)
-                    if cleanup_failure is not None and all(
-                        cleanup_failure is not failure for failure in failures
-                    ):
-                        failures.append(cleanup_failure)
-                    propagated_failure = BaseExceptionGroup(
-                        "Delegated runtime stream cleanup received additional failures.",
-                        failures,
-                    )
-                    current_cancellation_requests = (
-                        0 if current_task is None else current_task.cancelling()
-                    )
-                    cancellation_requests_after_entry = max(
-                        current_cancellation_requests - cancellation_requests_at_cleanup_entry,
-                        0,
-                    )
-                    pending_entry_request_count = int(
-                        pending_at_cleanup_entry is not None
-                        and cancellation_pending_at_cleanup_entry
-                    )
-                    authenticated_cancellation_requests = (
-                        cancellation_requests_to_preserve_at_entry
-                        + cancellation_requests_after_entry
-                        if workspace_cancellation_requests > 0
-                        else cancellation_requests_after_entry + pending_entry_request_count
-                    )
-                    if authenticated_cancellation_requests:
-                        retain_workspace_observation_pending_cancellation_requests(
-                            propagated_failure,
-                            authenticated_cancellation_requests,
-                        )
-                    raise propagated_failure from None
-                if (
-                    authoritative_failure is not None
-                    and authoritative_failure is not new_cancellations[0]
-                ):
-                    new_cancellations[0].add_note(
-                        "Delegated runtime stream cleanup was cancelled after an earlier "
-                        f"{type(authoritative_failure).__name__}."
-                    )
-                if cleanup_failure is not None and cleanup_failure is not new_cancellations[0]:
-                    new_cancellations[0].add_note(
-                        "Delegated runtime stream cleanup also failed: "
-                        f"{type(cleanup_failure).__name__}."
-                    )
-                _attach_delegated_failure_causes(
-                    new_cancellations[0],
-                    (authoritative_failure, cleanup_failure),
-                    message="Delegated runtime stream cancellation evidence",
-                )
-                raise new_cancellations[0]
-            if cleanup_failure is not None:
-                if authoritative_failure is None or isinstance(
-                    authoritative_failure, GeneratorExit
-                ):
-                    raise cleanup_failure
-                authoritative_failure.add_note(
-                    "Delegated runtime stream cleanup failed: "
-                    f"{type(cleanup_failure).__name__}. "
-                    "The original stream failure remains authoritative."
-                )
-                if cleanup_failure is not authoritative_failure:
-                    _attach_delegated_failure_causes(
-                        authoritative_failure,
-                        (cleanup_failure,),
-                        message="Delegated runtime stream cleanup and prior failure causes",
-                    )
-        finally:
-            if current_task is not None:
-                cancellation_requests_after_cleanup = current_task.cancelling()
-                cancellation_requests_to_preserve = (
-                    0
-                    if workspace_cancellation_requests == 0
-                    else cancellation_requests_to_preserve_at_entry
-                    + max(
-                        cancellation_requests_after_cleanup
-                        - cancellation_requests_at_cleanup_entry,
-                        0,
-                    )
-                )
-                for _request in range(
-                    max(
-                        cancellation_requests_to_preserve - cancellation_requests_after_cleanup,
-                        0,
-                    )
-                ):
-                    current_task.cancel()
 
 
 _CAYU_CONFIG_FIELD_OWNERS = {
@@ -7020,99 +6701,7 @@ class CayuApp:
             raise TaskCompletionDecisionRequired(
                 "Contracted tasks require the verifier-aware execution entrance."
             ) from None
-        checkpoint = await self._runtime_session_store.load_checkpoint(request.session.id)
-        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        expected_profile = request.active_invocation_profile
-        if (
-            active_profile != expected_profile
-            or expected_profile.session_id != request.session.id
-            or expected_profile.run_epoch != request.session.run_epoch
-        ):
-            raise RuntimeError(
-                "Recovery run does not reference the active invocation execution profile."
-            )
-        invocation_context = request.invocation_context
-        if invocation_context is None:
-            execution_profile = expected_profile.profile
-            invocation_context = _authenticated_invocation_context(
-                active_profile=expected_profile,
-                binding=AdmittedInvocationBinding(
-                    session_id=request.session.id,
-                    session_instance_id=request.session.instance_id,
-                    interaction_id=expected_profile.interaction_id,
-                    run_epoch=request.session.run_epoch,
-                    agent_name=request.session.agent_name,
-                    provider_name=request.session.provider_name,
-                    model=request.session.model,
-                    runtime_name=request.session.runtime_name,
-                    runtime_version=request.session.runtime_version,
-                    runtime_build_provenance=(request.session.runtime_build_provenance),
-                    environment_name=request.session.environment_name,
-                ),
-                validated_profile=execution_profile,
-                registered_agent=request.registered_agent,
-                registered_provider=request.registered_provider,
-                registered_environment=request.registered_environment,
-                runtime_hooks=self._runtime_hooks,
-                loop_policies=self._loop_policies,
-                request_loop_policies=request.request_loop_policies,
-                budget_policy=request.budget_policy,
-                tool_capability_ceiling=tool_capability_ceiling_from_session_metadata(
-                    request.session.metadata
-                ),
-            )
-        else:
-            execution_profile = invocation_context.profile
-            if (
-                invocation_context.active_profile is not expected_profile
-                or invocation_context.active_profile.profile is not expected_profile.profile
-                or invocation_context.registered_agent is not request.registered_agent
-                or invocation_context.registered_provider is not request.registered_provider
-                or invocation_context.registered_environment is not request.registered_environment
-                or invocation_context.runtime_hooks is not self._runtime_hooks
-                or invocation_context.loop_policies is not self._loop_policies
-                or invocation_context.request_loop_policies is not request.request_loop_policies
-                or invocation_context.budget_policy is not request.budget_policy
-            ):
-                raise RuntimeError("Recovery run substituted frozen invocation authority.")
-        initial_tool_exposure = (
-            None
-            if request.initial_model_step_tool_exposure is None
-            else resolved_tool_exposure_from_authority(
-                request.initial_model_step_tool_exposure,
-                request.registered_agent.tool_capabilities,
-                catalogue_revision=request.registered_agent.tool_catalogue.revision,
-            )
-        )
-        stream = self._run_session(
-            session=request.session,
-            invocation_context=invocation_context,
-            messages=request.messages,
-            messages_to_append=request.messages_to_append,
-            max_steps=request.max_steps,
-            limits=request.limits,
-            budget_limits=request.budget_limits,
-            retry_policy=request.retry_policy,
-            structured_output=request.structured_output,
-            thinking=request.thinking,
-            request_metadata=request.request_metadata,
-            task_id=request.task_id,
-            task_worker_id=request.task_worker_id,
-            task_handoff_id=request.task_handoff_id,
-            start_event_type=request.start_event_type,
-            start_event_payload=request.start_event_payload,
-            start_task_on_enter=request.start_task_on_enter,
-            release_run_fence_on_exit=request.release_run_fence_on_exit,
-            deliver_queued_input_before_first_step=False,
-            run_limit_accounting=request.run_limit_accounting,
-            initial_model_step_identity=request.initial_model_step_identity,
-            initial_model_step_number=request.initial_model_step_number,
-            initial_model_step_tool_exposure=initial_tool_exposure,
-            previous_tool_exposure_profile_id=(request.previous_tool_exposure_profile_id),
-            preserve_failure_until_initial_provider_dispatch=(
-                request.preserve_failure_until_initial_provider_dispatch
-            ),
-        )
+        stream = self._session_engine._run_recovery_session(request)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -7808,103 +7397,6 @@ class CayuApp:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
-
-    async def _run_session(
-        self,
-        *,
-        session: Session,
-        invocation_context: InvocationContext,
-        messages: list[Message],
-        messages_to_append: list[Message],
-        max_steps: int,
-        limits: RunLimits,
-        budget_limits: tuple[BudgetLimit, ...],
-        retry_policy: RetryPolicy,
-        structured_output: StructuredOutputSpec | None,
-        thinking: ThinkingConfig | None,
-        request_metadata: dict[str, Any],
-        task_id: str | None,
-        task_worker_id: str | None,
-        task_handoff_id: str | None,
-        start_event_type: EventType | None,
-        start_event_payload: dict[str, Any],
-        start_task_on_enter: bool = True,
-        release_run_fence_on_exit: bool = True,
-        deliver_queued_input_before_first_step: bool = True,
-        run_limit_accounting: RunLimitAccountingContext | None = None,
-        initial_model_step_identity: ModelStepIdentity | None = None,
-        initial_model_step_number: int | None = None,
-        initial_model_step_tool_exposure: ResolvedToolExposure | None = None,
-        previous_tool_exposure_profile_id: str | None = None,
-        preserve_failure_until_initial_provider_dispatch: bool = False,
-    ) -> AsyncGenerator[Event, None]:
-        if type(invocation_context) is not InvocationContext:
-            raise TypeError("invocation_context must be an authenticated InvocationContext.")
-        registered_agent = invocation_context.registered_agent
-        registered_provider = invocation_context.registered_provider
-        interaction_id = _current_session_interaction_id(session.id)
-        targeted_tool_projection = resolve_targeted_tool_projection(
-            registered_agent.targeted_tool_mode,
-            provider=registered_provider.provider,
-            model=session.model,
-        )
-        targeted_tool_grant_records: tuple[TargetedToolGrantRecord, ...] = ()
-        targeted_tool_grant_events: tuple[Event, ...] = ()
-        if interaction_id is not None:
-            (
-                targeted_tool_grant_records,
-                targeted_tool_grant_events,
-            ) = await self._session_engine._reconstruct_targeted_tool_grants(
-                session=session,
-                interaction_id=interaction_id,
-                task_id=task_id,
-                registered_agent=registered_agent,
-                capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
-                observed_at=self._clock(),
-                preserve_native_projection_snapshot=(
-                    targeted_tool_projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
-                ),
-            )
-        stream = self._session_engine._run_session(
-            session=session,
-            invocation_context=invocation_context,
-            messages=messages,
-            messages_to_append=messages_to_append,
-            max_steps=max_steps,
-            limits=limits,
-            budget_limits=budget_limits,
-            retry_policy=retry_policy,
-            structured_output=structured_output,
-            thinking=thinking,
-            request_metadata=request_metadata,
-            request_trace_metadata=request_metadata,
-            targeted_tool_grants=targeted_tool_grant_footprint(
-                targeted_tool_grant_records,
-                projection=targeted_tool_projection,
-            ),
-            task_id=task_id,
-            task_worker_id=task_worker_id,
-            task_lease_expires_at=None,
-            task_handoff_id=task_handoff_id,
-            start_event_type=start_event_type,
-            start_event_payload=start_event_payload,
-            start_task_on_enter=start_task_on_enter,
-            release_run_fence_on_exit=release_run_fence_on_exit,
-            deliver_queued_input_before_first_step=(deliver_queued_input_before_first_step),
-            run_limit_accounting=run_limit_accounting,
-            initial_model_step_identity=initial_model_step_identity,
-            initial_model_step_number=initial_model_step_number,
-            initial_model_step_tool_exposure=initial_model_step_tool_exposure,
-            previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
-            preserve_failure_until_initial_provider_dispatch=(
-                preserve_failure_until_initial_provider_dispatch
-            ),
-        )
-        for targeted_tool_grant_event in targeted_tool_grant_events:
-            yield targeted_tool_grant_event
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
 
     async def _emit_turn_completed_once(
         self,

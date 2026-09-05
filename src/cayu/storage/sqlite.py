@@ -68,6 +68,7 @@ from cayu.memory_evidence import (
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
+from cayu.runtime import _verified_work_policy as verified_work_support
 from cayu.runtime._child_session_notifications import (
     ChildSessionLifecycleOccurrence,
     ChildSessionLifecycleOccurrenceSource,
@@ -661,7 +662,6 @@ from cayu.runtime.work_contracts import (
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_support as sqlite_support
-from cayu.storage import _verified_work_support as verified_work_support
 from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
