@@ -729,3 +729,77 @@ def test_shared_heartbeat_propagates_unreconciled_failure() -> None:
     with pytest.raises(KeyError, match="heartbeat unavailable") as raised:
         asyncio.run(scenario())
     assert raised.value is heartbeat_failure
+
+
+def test_polling_turn_skips_busy_handler_without_admission_hints() -> None:
+    now = 0.0
+    group = DurableWorkerPollerGroup()
+    policy = DurableWorkerDemandPolicy(
+        dispatch_latency_s=1.0, minimum_idle_delay_s=0.1, jitter_ratio=0.0
+    )
+    pollers = [group.subscribe(policy, clock=lambda: now) for _ in range(3)]
+
+    async def scenario() -> None:
+        nonlocal now
+
+        async def claim() -> str:
+            return "claimed"
+
+        async def empty() -> None:
+            return None
+
+        # Worker 1 handles a child. Workers 2 and 0 audit empty namespaces;
+        # their rotation must skip worker 1 until its handler completes.
+        assert (await pollers[0].claim(empty)).attempted
+        now += 0.1
+        assert (await pollers[1].claim(claim)).value == "claimed"
+        assert (await pollers[2].claim(empty)).attempted
+        now += 0.1
+        assert (await pollers[0].claim(empty)).attempted
+        now += 0.2
+        assert (await pollers[2].claim(claim)).value == "claimed"
+        assert (await pollers[0].claim(claim)).value == "claimed"
+        # All handlers were occupied; finishing one restores polling capacity.
+        pollers[1].begin_step()
+        assert (await pollers[1].claim(empty)).attempted
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        for poller in pollers:
+            poller.close()
+    assert group.subscriber_count == 0
+
+
+def test_closing_preferred_poller_skips_busy_handler() -> None:
+    now = 0.0
+    group = DurableWorkerPollerGroup()
+    policy = DurableWorkerDemandPolicy(
+        dispatch_latency_s=1.0, minimum_idle_delay_s=0.1, jitter_ratio=0.0
+    )
+    closing, busy, ready = [group.subscribe(policy, clock=lambda: now) for _ in range(3)]
+
+    async def scenario() -> None:
+        nonlocal now
+
+        async def claim() -> str:
+            return "task"
+
+        async def empty() -> None:
+            return None
+
+        assert (await closing.claim(empty)).attempted
+        now = 0.1
+        assert (await busy.claim(claim)).value == "task"
+        assert (await ready.claim(empty)).attempted
+        closing.close()
+        now = 0.2
+        assert (await ready.claim(claim)).value == "task"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        closing.close()
+        busy.close()
+        ready.close()
+    assert group.subscriber_count == 0

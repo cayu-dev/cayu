@@ -343,6 +343,7 @@ class DurableWorkerPollerGroup:
         self._on_empty = on_empty
         self._policy: DurableWorkerDemandPolicy | None = None
         self._tokens: list[int] = []
+        self._busy_tokens: set[int] = set()
         self._next_token = 1
         self._preferred_token: int | None = None
         self._active_token: int | None = None
@@ -465,6 +466,10 @@ class DurableWorkerPollerGroup:
             self._active_token = None
             self._active_until = None
             self._metrics.active_pollers(0)
+            if claimed:
+                # A successful claimant may execute a long-running handler before
+                # its next step. Do not hand the polling turn back to it meanwhile.
+                self._busy_tokens.add(token)
             self._preferred_token = self._successor_token(token)
             policy = self._required_policy()
             if claimed:
@@ -483,6 +488,12 @@ class DurableWorkerPollerGroup:
                 policy.maximum_idle_delay_s,
                 self._next_empty_delay_s * policy.backoff_multiplier,
             )
+
+    def _begin_step(self, token: int) -> None:
+        with self._lock:
+            self._busy_tokens.discard(token)
+            if self._preferred_token is None and token in self._tokens:
+                self._preferred_token = token
 
     def _reset(
         self,
@@ -518,7 +529,9 @@ class DurableWorkerPollerGroup:
             policy = self._required_policy()
             if forced and self._active_token is None:
                 return now
-            if self._active_token is not None or token != self._preferred_token:
+            if self._active_token is not None or (
+                self._preferred_token is not None and token != self._preferred_token
+            ):
                 return max(self._next_poll_at, now + policy.minimum_idle_delay_s)
             return max(self._next_poll_at, now)
 
@@ -530,13 +543,19 @@ class DurableWorkerPollerGroup:
                 return
             index = self._tokens.index(token)
             self._tokens.remove(token)
+            self._busy_tokens.discard(token)
             if self._active_token == token:
                 self._active_token = None
                 self._active_until = None
                 self._metrics.active_pollers(0)
             if self._preferred_token == token:
-                self._preferred_token = (
-                    None if not self._tokens else self._tokens[index % len(self._tokens)]
+                self._preferred_token = next(
+                    (
+                        candidate
+                        for candidate in self._tokens[index:] + self._tokens[:index]
+                        if candidate not in self._busy_tokens
+                    ),
+                    None,
                 )
             if not self._tokens:
                 self._policy = None
@@ -555,7 +574,11 @@ class DurableWorkerPollerGroup:
             index = self._tokens.index(token)
         except ValueError:
             return self._tokens[0]
-        return self._tokens[(index + 1) % len(self._tokens)]
+        for offset in range(1, len(self._tokens) + 1):
+            candidate = self._tokens[(index + offset) % len(self._tokens)]
+            if candidate not in self._busy_tokens:
+                return candidate
+        return None
 
     def _required_policy(self) -> DurableWorkerDemandPolicy:
         if self._policy is None:
@@ -609,6 +632,7 @@ class DurableWorkerPoller:
         return self._group._reserve_claim_query_index(query_count)
 
     def begin_step(self) -> None:
+        self._group._begin_step(self._token)
         self._last_attempted = False
         self._last_claimed = False
 
