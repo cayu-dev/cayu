@@ -17,6 +17,7 @@ from cayu.evals.browser_acceptance_fixture import BROWSER_ACCEPTANCE_FIXTURE_REV
 from cayu.evals.corpus import _content_revision
 
 DETERMINISTIC_BROWSER_ACCEPTANCE_SUITE_ID = "browser-acceptance-deterministic-v1"
+DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION = 4 * 1024 * 1024
 LIVE_PUBLIC_BROWSER_ACCEPTANCE_SUITE_ID = "browser-acceptance-live-public-v1"
 LIVE_AUTHENTICATED_BROWSER_ACCEPTANCE_SUITE_ID = "browser-acceptance-live-authenticated-v1"
 
@@ -464,15 +465,131 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                         "expected_effects": {"bottom-clicked": 1},
                     },
                 ),
-                _unsupported("page-multiple", "list_pages"),
                 _case(
-                    "page-popup-refused",
+                    "page-about-blank-popup-transition",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "click", "list_pages"),
+                    route="/popup-about-blank",
+                ),
+                _case(
+                    "page-active-page-crash",
+                    category=BrowserAcceptanceCaseCategory.CRASH,
+                    operations=("navigate", "click", "list_pages"),
+                    route="/popup",
+                    parameters={
+                        "required_operations": ["navigate", "click", "list_pages"],
+                        "expected_browser_dispatches": 3,
+                    },
+                    fault_scenario=BrowserAcceptanceFaultScenario.BROWSER_ACTIVE_PAGE_CRASH,
+                ),
+                _case(
+                    "page-allocation-loss",
+                    category=BrowserAcceptanceCaseCategory.CRASH,
+                    state=BrowserAcceptanceState.FAILED,
+                    operations=("navigate", "wait"),
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={
+                        "required_operations": ["navigate", "wait"],
+                        "error": "allocation_lost",
+                        "allocation_disposition": "retired",
+                        "expected_browser_dispatches": 1,
+                    },
+                    fault_scenario=BrowserAcceptanceFaultScenario.BROWSER_ALLOCATION_LOSS,
+                ),
+                _case(
+                    "page-background-page-crash",
+                    category=BrowserAcceptanceCaseCategory.CRASH,
+                    operations=("navigate", "click", "list_pages"),
+                    route="/popup",
+                    parameters={
+                        "required_operations": ["navigate", "click", "list_pages"],
+                        "expected_browser_dispatches": 3,
+                    },
+                    fault_scenario=BrowserAcceptanceFaultScenario.BROWSER_BACKGROUND_PAGE_CRASH,
+                ),
+                _case(
+                    "page-complete-cleanup",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "click", "close"),
+                    route="/popup",
+                ),
+                _case(
+                    "page-cross-origin-popup",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "click", "list_pages", "switch_page"),
+                    route="/popup-cross-origin",
+                ),
+                _case(
+                    "page-cross-page-stale-ref",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.REFUSED,
+                    operations=("navigate", "click", "switch_page", "click"),
+                    route="/popup",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={"error": "unknown_element"},
+                ),
+                _case(
+                    "page-popup-burst",
                     category=BrowserAcceptanceCaseCategory.REFUSAL,
                     state=BrowserAcceptanceState.REFUSED,
                     operations=("navigate", "click"),
-                    route="/popup",
+                    route="/popup-burst",
                     oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
-                    parameters={"error": "actionability_failed"},
+                    parameters={"error": "resource_exhausted"},
+                ),
+                _case(
+                    "page-popup-redirect-pivot",
+                    category=BrowserAcceptanceCaseCategory.REFUSAL,
+                    state=BrowserAcceptanceState.REFUSED,
+                    operations=("navigate", "click"),
+                    route="/popup-redirect",
+                    oracle=BrowserAcceptanceSemanticOracle.STABLE_ERROR,
+                    parameters={"error": "policy_denied"},
+                ),
+                _case(
+                    "page-multiple-popup-tab-switch-close",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=(
+                        "navigate",
+                        "click",
+                        "list_pages",
+                        "switch_page",
+                        "close_page",
+                        "list_pages",
+                        "close",
+                    ),
+                    route="/popup",
+                ),
+                _case(
+                    "page-popup-opener-navigation",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "click", "list_pages"),
+                    route="/popup-opener-navigation",
+                ),
+                _case(
+                    "page-popup-exact-replay",
+                    category=BrowserAcceptanceCaseCategory.RECOVERY,
+                    operations=("navigate", "click", "click", "list_pages"),
+                    route="/popup",
+                    oracle=BrowserAcceptanceSemanticOracle.RECOVERY_STATE,
+                    parameters={
+                        "required_operations": ["navigate", "click", "click", "list_pages"],
+                        "expected_browser_dispatches": 3,
+                    },
+                ),
+                _case(
+                    "page-popup-process-loss-ambiguity",
+                    category=BrowserAcceptanceCaseCategory.RECOVERY,
+                    operations=("navigate", "click"),
+                    route="/popup",
+                    state=BrowserAcceptanceState.AMBIGUOUS,
+                    oracle=BrowserAcceptanceSemanticOracle.RECOVERY_STATE,
+                    parameters={
+                        "required_operations": ["navigate", "click"],
+                        "error": "outcome_ambiguous",
+                        "expected_browser_dispatches": 2,
+                    },
+                    fault_scenario=BrowserAcceptanceFaultScenario.PROCESS_BEFORE_TERMINAL,
                 ),
                 _case(
                     "recovery-conflicting-operation-id",
@@ -615,7 +732,7 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
             ),
             max_wall_time_ms=300_000,
             max_artifact_bytes=(
-                BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
+                DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
                 * sum(
                     len(case.operations)
                     for case in cases

@@ -444,7 +444,7 @@ factory = VirtualEgressEnvironmentFactory(
     adapter=DockerEgressAdapter(
         seccomp_profile="/absolute/path/to/browser_fetch/seccomp_profile.json",
     ),
-    image="cayu-browser-fetch:6-playwright-1.62.0",
+    image="cayu-browser-fetch:7-playwright-1.62.0",
     artifact_store=S3ArtifactStore("production-artifacts"),
 )
 

@@ -8755,12 +8755,14 @@ and benchmark evidence must preserve the blocked source separately from any
 configured replacement.
 
 The opt-in interactive sandboxed profile exposes one ordinary
-`browser_session` tool backed by `cayu.browser-session.v2` worker version 6 in
+`browser_session` tool backed by `cayu.browser-session.v3` worker version 7 in
 the same pinned Playwright/Chromium worker image. Cayu owns browser session and
-page identities.
+random opaque page identities; Chromium targets, contexts, handles, CDP
+sessions, and raw opener objects never cross the guest boundary.
 Each bounded AI-mode ARIA observation produces a new opaque revision and opaque
-refs; ref actions require that exact revision plus a stable operation id and
-invalidate the old refs before dispatch. Stale revisions, unknown refs, and
+refs; ref actions require the exact session, allocation, page, revision,
+control epoch, and stable operation id and invalidate the old refs before
+dispatch. Stale revisions/control epochs, cross-page or unknown refs, and
 operation-id conflicts fail before runner interaction. Runner acknowledgement
 loss after dispatch is projected as `outcome_ambiguous` and is never blindly
 replayed. Screenshots and downloads publish only bounded ArtifactStore
@@ -8771,24 +8773,64 @@ rendered pixels or binary downloads. The runner candidate, exact workload,
 egress admission, and artifact
 store are revalidated at dispatch. Requests, redirect hops, response bytes,
 URL/title bytes, DOM nodes, snapshot depth and bytes, refs, waits, screenshot
-dimensions and pixels, artifacts, live allocations, parent state, and operation
-identities are independently bounded. DOM-node and accessibility-source
+dimensions and pixels, artifacts, live/provisional/total pages, page creations,
+background lifetime, per-page and aggregate operations/observations, per-observation
+and cumulative per-page/aggregate refs, per-page/aggregate requests/artifacts,
+page cleanup, live allocations, parent state, and operation
+identities are independently bounded. Inconsistent or unbounded page
+configuration fails at construction. Page and aggregate ref counters record
+cumulative allocation consumption; they never imply that historical or
+background-page refs remain actionable. DOM-node and accessibility-source
 admission share one script-and-animation-frozen page window before Playwright AI snapshot
 materialization; a conservative node/source/escaping envelope also rejects
-computed-content and repeated-name amplification before that call. Explicit close has separately bounded idempotency
-evidence and acknowledges only after browser/context/driver cleanup settles.
+computed-content and repeated-name amplification before that call.
+`close_page` and whole-session `close` have separate bounded cleanup/idempotency
+evidence; whole close acknowledges only after every admitted or provisional
+page, pending cleanup task, context, browser, driver, and temporary profile has
+settled, and it cannot hide one failed cleanup behind another success.
 The application-owned idle deadline defaults to 900 seconds, resets after each
 completed response, and never expires through an active operation. Every
 positively settled daemon exit, including startup failure and idle cleanup,
 records positive guest-owned retirement evidence. Initial launch retains a
 separate bounded startup-cleanup settlement window after the ordinary
 connection deadline so late positive retirement evidence reaches the parent;
-absence of that evidence remains ambiguous and capacity-bearing. Live
-page/cookie/storage/tab continuity lasts only for the admitted allocation
-lifetime; this initial profile admits one page, restores Chromium popup
-blocking, and installs a pre-document popup guard for explicit and inherited
-targets plus ordinary and prototype popup APIs. Any unexpected second page
-is a fail-safe resource violation that retires the allocation.
+absence of that evidence remains ambiguous and capacity-bearing.
+
+Single-page behavior remains the default: it restores Chromium popup blocking,
+installs the pre-document target/`window.open` guard, and treats an unexpected
+second page as a fail-safe resource violation that retires the allocation.
+Multi-page behavior requires explicit application configuration, a closed
+`BrowserPopupPolicy`, and finite page bounds. `list_pages` returns only bounded
+safe registry state; `switch_page` selects one admitted opaque page and returns
+a fresh observation; `close_page` idempotently closes one opaque page and
+selects the earliest surviving admitted page. There is no model-facing
+`new_page`; pages are created only as an admitted effect of an allowed active
+post-navigation `click`, `fill`, `select`, `press`, or `wait` operation. Initial
+navigation never receives popup authority. The model cannot select or relax popup policy, context,
+profile, proxy, headers, credentials, egress, provider, extensions, or runner.
+
+Every page shares the exact one admitted context, cookie/storage/profile,
+credential, egress, request, artifact, and cleanup authority. Pages are not
+independent browser profiles or security boundaries. A new target begins as
+untrusted provisional state. An immutable token-gated init guard defaults
+closed in every document and is armed only across the exact admitted action;
+the context route owner applies the same
+pre-document and broker boundary throughout `about:blank`, opener inheritance,
+immediate redirects, self-navigation, subresources, downloads, and final
+admission. Refused or excess targets are closed/quarantined under bounded
+cleanup and emit only bounded refusal evidence; a popup burst cannot grow page,
+task, event, or diagnostic state without limit. Initial popup document requests
+support GET; non-GET requests are refused before network dispatch and never
+replayed as GET. Staged requests
+are bound to their exact provisional browser frame, independently of changing
+URLs and callback ordering. One action may return a bounded
+page-set delta, but acknowledgement loss after page creation remains ambiguous
+and never causes an automatic re-click. Exact duplicate recovery may return the
+original delta only when the same live allocation and exact guest receipt prove
+it.
+Only the exact active-page `download` operation admits a download event.
+Automatic and popup-initiated downloads are cancelled and quarantine their
+originating page through one of the same bounded page-cleanup owners.
 
 When an environment factory has published reconnect metadata, the runtime
 derives a content-free allocation fingerprint and binds it with the parent
@@ -8796,23 +8838,30 @@ session/run epoch, execution profile, model attempt, tool round/call,
 idempotency key, and effective arguments before browser dispatch. Each browser
 operation publishes one durable `intent`, a pre-dispatch `dispatched` marker,
 and at most one terminal result through the session run fence. The guest also
-retains an independently bounded exact-operation ledger. A fenced parent
-record preserves the normal-operation count, cleanup-operation count, and live
-browser-session identities, so worker replacement does not grant fresh
-resource allowance and explicit cleanup remains separately bounded. Fresh Cayu
-processes may reconnect only to the exact same live allocation and restore the
-last terminal revision/ref authority; uncertain evidence invalidates old refs
-and requires a new observation. Pending-round recovery receives only a read-only
-operation-record loader and never dispatches the tool. It returns exact terminal
+retains an independently bounded exact-operation ledger. A fenced parent record
+preserves the normal-operation count, in-flight cleanup count, and live
+browser-session identities. Each corresponding per-session record preserves its
+complete bounded page registry and cumulative counters, so worker replacement
+does not grant fresh resource allowance and explicit cleanup remains separately
+bounded. Fresh Cayu processes may reconnect only to the exact
+same live allocation and reconstruct only its exact surviving pages. Closed or
+crashed target evidence is reconciled; uncertain evidence invalidates old refs
+and requires a fresh observation. Pending-round recovery receives only a
+read-only operation-record loader and never lists, switches, closes, creates,
+navigates, or otherwise dispatches the tool. It returns exact terminal
 evidence, `operation_not_dispatched`, or fail-closed `outcome_ambiguous` rather
 than replaying an action. Lost allocations, profile mismatches, expired
 authority, unsupported restoration, and cleanup failure remain distinct typed
 outcomes with bounded operator guidance. Durable browser continuity/session
-records exclude credentials, browser-profile contents, snapshots, and artifact
-bytes. A sealed terminal operation receipt retains its bounded `ToolResult`,
+records exclude credentials, cookies/storage, browser-profile contents, DOM,
+history, screenshots/downloads, Chromium identifiers, and artifact bytes. A
+sealed terminal operation receipt retains its bounded `ToolResult`,
 including bounded observation content required for exact replay, but excludes
-raw binary artifact bytes and browser-profile contents. Cayu supports no profile
-recreation or full process/VM snapshot when the live allocation is gone. See
+raw binary artifact bytes and browser-profile contents. Losing an allocation
+loses its page set; Cayu never recreates tabs from stored URLs or history.
+Profile restoration, when separately authorized, creates a fresh page set and
+never reuses old page IDs, refs, tabs, or operation receipts. Cayu supports no
+full process/VM snapshot when the live allocation is gone. See
 `docs/browser-session.md` for the precise reconnect, restoration, reload, and
 replay terminology.
 

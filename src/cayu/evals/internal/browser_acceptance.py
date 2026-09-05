@@ -48,7 +48,6 @@ from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
 from cayu.evals.browser_acceptance import (
-    BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION,
     BrowserAcceptanceFaultEvidenceV1,
     BrowserAcceptanceFaultScenario,
     BrowserAcceptancePlanV1,
@@ -57,6 +56,7 @@ from cayu.evals.browser_acceptance import (
 )
 from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
 from cayu.evals.browser_acceptance_manifests import (
+    DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION,
     deterministic_browser_acceptance_manifest,
 )
 from cayu.evals.corpus import _content_revision
@@ -132,6 +132,55 @@ for entry in os.listdir("/proc"):
     found = True
 raise SystemExit(0 if found else 3)
 """.strip()
+_BROWSER_PAGE_FAULT_CONTROL_SCRIPT = """
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import time
+
+mode, session_id = sys.argv[1:3]
+digest = hashlib.sha256(b"cayu-browser-session-socket-v1\\0" + session_id.encode()).hexdigest()
+root = Path("/tmp/cayu-browser-sessions")
+root.mkdir(mode=0o700, exist_ok=True)
+control = root / (digest + ".page-fault.sock")
+if mode == "launch":
+    source = sys.stdin.buffer.read(32769)
+    if len(source) > 32768:
+        raise SystemExit(2)
+    path = root / (digest + ".page-fault.py")
+    with path.open("xb") as stream:
+        stream.write(source)
+    process = subprocess.Popen(
+        [sys.executable, "-I", str(path), "--interactive-daemon", session_id],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while not control.exists() or not (root / (digest + ".sock")).exists():
+        if process.poll() is not None or time.monotonic() >= deadline:
+            raise SystemExit(3)
+        time.sleep(.02)
+elif mode == "crash":
+    page_id = sys.argv[3]
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(7)
+        client.connect(str(control))
+        client.sendall(json.dumps({"page_id": page_id}).encode() + b"\\n")
+        response = b""
+        while not response.endswith(b"\\n") and len(response) <= 1024:
+            chunk = client.recv(1024)
+            if not chunk:
+                break
+            response += chunk
+    if json.loads(response) != {"page_id": page_id, "crashed": True}:
+        raise SystemExit(4)
+else:
+    raise SystemExit(2)
+""".strip()
 _PROVIDER_EXECUTION_PROFILE_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="cayu:browser-acceptance-provider",
     behavior_version="1",
@@ -150,6 +199,10 @@ def _scenario_stage(scenario: BrowserAcceptanceFaultScenario) -> tuple[str, str]
             "browser",
             "before_dispatch",
         ),
+        BrowserAcceptanceFaultScenario.BROWSER_ALLOCATION_LOSS: (
+            "browser",
+            "allocation_loss",
+        ),
         BrowserAcceptanceFaultScenario.BROWSER_DURING_EXECUTION: (
             "browser",
             "during_execution",
@@ -158,6 +211,11 @@ def _scenario_stage(scenario: BrowserAcceptanceFaultScenario) -> tuple[str, str]
         BrowserAcceptanceFaultScenario.BROWSER_DURING_CLEANUP: (
             "browser",
             "during_cleanup",
+        ),
+        BrowserAcceptanceFaultScenario.BROWSER_ACTIVE_PAGE_CRASH: ("browser", "active_page_crash"),
+        BrowserAcceptanceFaultScenario.BROWSER_BACKGROUND_PAGE_CRASH: (
+            "browser",
+            "background_page_crash",
         ),
     }
     if scenario in browser_stages:
@@ -353,8 +411,37 @@ async def _signal_browser_daemon(ctx: Any, session_id: str, signal_number: int) 
         raise RuntimeError("Browser acceptance could not signal the exact browser daemon.")
 
 
+async def _control_browser_page_fault(
+    ctx: Any, session_id: str, *, page_id: str | None = None
+) -> None:
+    raw_runner = getattr(ctx.runner, "_InvocationRunnerHandle__runner", None)
+    if not isinstance(raw_runner, Runner):
+        raise RuntimeError("Browser acceptance could not resolve the owned runner.")
+    source = (
+        Path(__file__).with_name("_browser_page_fault_guest.py").read_text(encoding="utf-8")
+        if page_id is None
+        else None
+    )
+    result = await raw_runner.exec_system(
+        ExecCommand.process(
+            "/usr/local/bin/python",
+            "-I",
+            "-c",
+            _BROWSER_PAGE_FAULT_CONTROL_SCRIPT,
+            "launch" if page_id is None else "crash",
+            session_id,
+            *(() if page_id is None else (page_id,)),
+        ),
+        stdin=source,
+        timeout_s=15,
+        output_limit_bytes=1024,
+    )
+    if result.exit_code != 0 or result.timed_out or result.cancelled:
+        raise RuntimeError("Browser acceptance could not deliver the exact page crash.")
+
+
 def _install_browser_crash_fault(bridge: WebBridge, control: _FaultControl) -> None:
-    """Inject one real guest-daemon crash while keeping the Cayu process alive."""
+    """Deliver a real page-target or daemon crash in the owned allocation."""
 
     browser_tool = bridge.tools[0]
     backend = getattr(browser_tool, "_backend", None)
@@ -362,22 +449,71 @@ def _install_browser_crash_fault(bridge: WebBridge, control: _FaultControl) -> N
     if not callable(original_execute):
         raise RuntimeError("Browser acceptance browser backend is unavailable.")
     operation_number = 0
+    previous_response: BrowserBackendResponse | None = None
+    page_fault = control.scenario in {
+        BrowserAcceptanceFaultScenario.BROWSER_ACTIVE_PAGE_CRASH,
+        BrowserAcceptanceFaultScenario.BROWSER_BACKGROUND_PAGE_CRASH,
+    }
 
     async def execute_with_browser_fault(
         ctx: Any, request: dict[str, Any]
     ) -> BrowserBackendResponse:
-        nonlocal operation_number
+        nonlocal operation_number, previous_response
         operation_number += 1
+        if page_fault and operation_number == 1:
+            await _control_browser_page_fault(ctx, request["session_id"])
         if operation_number != control.target_operation_number:
-            return await original_execute(ctx, request)
+            previous_response = await original_execute(ctx, request)
+            return previous_response
         scenario = control.scenario
         session_id = request["session_id"]
+        if page_fault:
+            before = None if previous_response is None else previous_response.page_set
+            if before is None or len(before.pages) != 2:
+                raise RuntimeError("Page crash acceptance requires two exact admitted pages.")
+            lifecycle = (
+                "active"
+                if scenario is BrowserAcceptanceFaultScenario.BROWSER_ACTIVE_PAGE_CRASH
+                else "background"
+            )
+            target = next(page for page in before.pages if page.lifecycle == lifecycle)
+            survivor = next(page for page in before.pages if page.page_id != target.page_id)
+            await _control_browser_page_fault(ctx, session_id, page_id=target.page_id)
+            response = await original_execute(ctx, request)
+            after = response.page_set
+            if (
+                response.failure is not None
+                or response.allocation_disposition != "live"
+                or after is None
+            ):
+                raise RuntimeError("Page crash did not preserve its browser allocation.")
+            crashed = next(page for page in after.pages if page.page_id == target.page_id)
+            remaining = next(page for page in after.pages if page.page_id == survivor.page_id)
+            if (
+                crashed.lifecycle != "crashed"
+                or crashed.revision is not None
+                or crashed.control_epoch <= target.control_epoch
+                or after.active_page_id != survivor.page_id
+                or remaining.lifecycle != "active"
+                or (lifecycle == "background" and remaining != survivor)
+                or (lifecycle == "active" and remaining.control_epoch <= survivor.control_epoch)
+            ):
+                raise RuntimeError("Page crash corrupted page lifecycle or reference authority.")
+            control.trigger("browser", lifecycle + "_page_crash", operation_number)
+            return response
         if scenario is BrowserAcceptanceFaultScenario.BROWSER_BEFORE_DISPATCH:
             await _signal_browser_daemon(ctx, session_id, 9)
             control.trigger("browser", "before_dispatch", operation_number)
             return BrowserBackendResponse(
                 failure=BrowserBackendFailure("browser_crash"),
                 allocation_disposition="uncertain",
+            )
+        if scenario is BrowserAcceptanceFaultScenario.BROWSER_ALLOCATION_LOSS:
+            await _signal_browser_daemon(ctx, session_id, 9)
+            control.trigger("browser", "allocation_loss", operation_number)
+            return BrowserBackendResponse(
+                failure=BrowserBackendFailure("allocation_lost"),
+                allocation_disposition="retired",
             )
         if scenario is BrowserAcceptanceFaultScenario.BROWSER_AFTER_EFFECT:
             await original_execute(ctx, request)
@@ -432,6 +568,30 @@ def _latest_browser_state(results: tuple[dict[str, Any], ...]) -> dict[str, Any]
     raise RuntimeError("Browser acceptance operation has no prior browser observation.")
 
 
+def _latest_page_set(results: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    for result in reversed(results):
+        page_set = result.get("page_set")
+        if isinstance(page_set, dict) and isinstance(page_set.get("pages"), list):
+            return page_set
+    raise RuntimeError("Browser acceptance operation has no prior page-set evidence.")
+
+
+def _popup_page_id(results: tuple[dict[str, Any], ...]) -> str:
+    page_set = _latest_page_set(results)
+    pages = page_set["pages"]
+    candidates = [
+        page
+        for page in pages
+        if isinstance(page, dict)
+        and type(page.get("page_id")) is str
+        and type(page.get("opener_page_id")) is str
+        and page.get("lifecycle") in {"admitted", "active", "background"}
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError("Browser acceptance page set lacks one admitted popup.")
+    return candidates[0]["page_id"]
+
+
 def _ref(state: dict[str, Any], names: tuple[str, ...]) -> str:
     refs = state.get("refs")
     if not isinstance(refs, list | tuple):
@@ -457,6 +617,8 @@ def _operation_arguments(
         "recovery-exact-terminal-replay",
     }:
         operation_id = f"{case_id}:1:navigate"
+    if case_id == "page-popup-exact-replay" and operation == "click":
+        operation_id = f"{case_id}:2:click"
     if operation == "navigate":
         route = fixture_route or "/basic"
         if case_id == "recovery-conflicting-operation-id" and operation_index == 1:
@@ -466,6 +628,8 @@ def _operation_arguments(
     state = (
         results[0]
         if case_id.startswith("revision-stale-ref-after-") and operation_index == 2 and results
+        else results[0]
+        if case_id == "page-popup-exact-replay" and operation_index == 2 and results
         else _latest_browser_state(results)
     )
     arguments: dict[str, Any] = {
@@ -473,13 +637,18 @@ def _operation_arguments(
         "session_id": state["session_id"],
         "operation_id": operation_id,
     }
-    if operation != "close":
-        arguments.update(
-            {
-                "page_id": state["page_id"],
-                "expected_revision": state["revision"],
-            }
-        )
+    if operation not in {"close", "list_pages"}:
+        page_id = state["page_id"]
+        if operation in {"switch_page", "close_page"} and case_id.startswith("page-"):
+            page_id = _popup_page_id(results)
+        arguments["page_id"] = page_id
+        if operation not in {"switch_page", "close_page"}:
+            arguments["expected_revision"] = state["revision"]
+    if operation in {"click", "fill", "select", "press", "wait", "screenshot", "download"}:
+        control_epoch = state.get("control_epoch")
+        if type(control_epoch) is not int:
+            raise RuntimeError("Browser acceptance observation lacks its control epoch.")
+        arguments["expected_control_epoch"] = control_epoch
     if operation == "wait":
         arguments["wait_ms"] = 5_000 if case_id == "crash-during-execution" else 250
     elif operation == "screenshot":
@@ -503,7 +672,18 @@ def _operation_arguments(
                 ("action-replaced-element", "click"): ("Old", "New"),
                 ("action-readonly-control", "fill"): ("Account",),
                 ("navigation-scroll-dependent-control", "click"): ("Bottom action",),
-                ("page-popup-refused", "click"): ("Open popup",),
+                ("page-about-blank-popup-transition", "click"): ("Open blank popup",),
+                ("page-active-page-crash", "click"): ("Open popup",),
+                ("page-background-page-crash", "click"): ("Open popup",),
+                ("page-complete-cleanup", "click"): ("Open popup",),
+                ("page-cross-origin-popup", "click"): ("Open cross-origin popup",),
+                ("page-cross-page-stale-ref", "click"): ("Open popup",),
+                ("page-popup-burst", "click"): ("Open popup burst",),
+                ("page-popup-exact-replay", "click"): ("Open popup",),
+                ("page-popup-opener-navigation", "click"): ("Open navigating popup",),
+                ("page-popup-process-loss-ambiguity", "click"): ("Open popup",),
+                ("page-popup-redirect-pivot", "click"): ("Open redirecting popup",),
+                ("page-multiple-popup-tab-switch-close", "click"): ("Open popup",),
                 ("iframe-cross-origin", "fill"): ("Frame value",),
                 ("iframe-cross-origin", "click"): ("Apply",),
                 ("iframe-same-origin", "fill"): ("Frame value",),
@@ -519,7 +699,10 @@ def _operation_arguments(
         )
         if names is None:
             raise RuntimeError("Browser acceptance planner lacks an operation target.")
-        arguments["ref"] = _ref(state, names)
+        ref_state = (
+            results[1] if case_id == "page-cross-page-stale-ref" and operation_index == 3 else state
+        )
+        arguments["ref"] = _ref(ref_state, names)
         if operation == "fill":
             arguments["value"] = "Cayu acceptance"
         elif operation == "select":
@@ -576,10 +759,36 @@ def _build_runtime(
         browser_image=PINNED_BROWSER_SESSION_WORKLOAD.image,
         interactive=True,
         interactive_options={
-            "max_artifact_bytes": BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION,
-            "max_operations": 8,
+            "max_artifact_bytes": (
+                DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
+            ),
+            "max_operations": 16,
             "max_snapshot_bytes": 64 * 1024,
             "max_sessions": 1,
+            "multi_page": True,
+            "popup_policy": {
+                "mode": "destination_policy",
+                "allowed_operations": ["click"],
+                "allowed_opener_origins": ["https://docs.browser.test/"],
+                "allowed_destination_origins": [
+                    "https://docs.browser.test/",
+                    "https://static.browser.test/",
+                ],
+            },
+            "max_pages": 4,
+            "max_provisional_pages": 2,
+            "max_page_creations_per_operation": 2,
+            "max_total_page_creations": 8,
+            "max_background_lifetime_seconds": 60,
+            "max_operations_per_page": 16,
+            "max_observations_per_page": 16,
+            "max_total_observations": 32,
+            "max_refs_per_page": 256,
+            "max_total_refs": 512,
+            "max_total_requests": 256,
+            "max_artifacts_per_page": 4,
+            "max_total_artifacts": 8,
+            "max_page_cleanup_operations": 16,
         },
     )
     if control is not None and control.scenario.value.startswith("browser_"):

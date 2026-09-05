@@ -4522,22 +4522,40 @@ def test_browser_adapter_dom_limit_changes_implementation_profile_before_work() 
     asyncio.run(exercise())
 
 
-def test_browser_session_dom_node_limit_changes_implementation_profile_before_work() -> None:
+@pytest.mark.parametrize(
+    ("original_options", "changed_options"),
+    (
+        ({"max_dom_nodes": 100}, {"max_dom_nodes": 101}),
+        (
+            {"multi_page": True, "max_pages": 4},
+            {"multi_page": True, "max_pages": 5},
+        ),
+        (
+            {"max_refs": 4, "max_refs_per_page": 8, "max_total_refs": 16},
+            {"max_refs": 4, "max_refs_per_page": 9, "max_total_refs": 16},
+        ),
+    ),
+    ids=("dom-nodes", "page-policy", "per-page-refs"),
+)
+def test_browser_session_configuration_changes_implementation_profile_before_work(
+    original_options: dict[str, Any],
+    changed_options: dict[str, Any],
+) -> None:
     async def exercise() -> None:
         session_id = "execution-profile-browser-session-response-limit"
         store = InMemorySessionStore()
 
-        def configured_app(*, max_dom_nodes: int) -> tuple[CayuApp, ScriptedModelProvider]:
+        def configured_app(options: dict[str, Any]) -> tuple[CayuApp, ScriptedModelProvider]:
             provider = _completed_provider()
             app = CayuApp(session_store=store, enable_logging=False)
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
-                tools=[BrowserSessionTool(max_dom_nodes=max_dom_nodes)],
+                tools=[BrowserSessionTool(**options)],
             )
             return app, provider
 
-        original_app, _original_provider = configured_app(max_dom_nodes=100)
+        original_app, _original_provider = configured_app(original_options)
         await _collect(
             original_app.run(
                 RunRequest(
@@ -4548,7 +4566,7 @@ def test_browser_session_dom_node_limit_changes_implementation_profile_before_wo
             )
         )
 
-        unchanged_app, _unchanged_provider = configured_app(max_dom_nodes=100)
+        unchanged_app, _unchanged_provider = configured_app(original_options)
         resumed = await _collect(
             unchanged_app.resume(
                 ResumeRequest(
@@ -4559,7 +4577,7 @@ def test_browser_session_dom_node_limit_changes_implementation_profile_before_wo
         )
         assert resumed[0].type is EventType.INTERACTION_STARTED
 
-        changed_app, changed_provider = configured_app(max_dom_nodes=101)
+        changed_app, changed_provider = configured_app(changed_options)
         with pytest.raises(ExecutionProfileMismatchError) as caught:
             await _collect(
                 changed_app.resume(

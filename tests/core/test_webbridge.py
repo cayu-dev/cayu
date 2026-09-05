@@ -671,6 +671,9 @@ def test_sandboxed_interactive_profile_exposes_one_closed_browser_session_tool(
         interactive=True,
         interactive_options={
             "max_dom_nodes": 500,
+            "max_refs": 4,
+            "max_refs_per_page": 12,
+            "max_total_refs": 20,
             "max_parent_sessions": 2,
             "max_sessions": 1,
             "max_operations": 32,
@@ -678,11 +681,14 @@ def test_sandboxed_interactive_profile_exposes_one_closed_browser_session_tool(
     )
 
     assert [tool.spec.name for tool in bridge.tools] == ["browser_session"]
-    assert bridge.browser_protocol == "cayu.browser-session.v2"
-    assert bridge.browser_worker_version == "6"
+    assert bridge.browser_protocol == "cayu.browser-session.v3"
+    assert bridge.browser_worker_version == "7"
     assert bridge.playwright_version == BROWSER_FETCH_PLAYWRIGHT_VERSION
     tool = bridge.tools[0]
     assert tool.max_dom_nodes == 500
+    assert tool.max_refs == 4
+    assert tool.max_refs_per_page == 12
+    assert tool.max_total_refs == 20
     assert tool.max_parent_sessions == 2
     assert tool.max_sessions == 1
     assert tool.max_operations == 32

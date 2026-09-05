@@ -37,8 +37,8 @@ from urllib.parse import urljoin, urlsplit
 PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
-INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v2"
-INTERACTIVE_WORKER_VERSION = "6"
+INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v3"
+INTERACTIVE_WORKER_VERSION = "7"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -87,6 +87,24 @@ _INTERACTIVE_MAX_REDIRECTS = 10
 _INTERACTIVE_MAX_REQUESTS = 512
 _INTERACTIVE_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 _INTERACTIVE_MAX_OPERATIONS = 16_384
+_INTERACTIVE_MAX_PAGES = 16
+_INTERACTIVE_MAX_PROVISIONAL_PAGES = 16
+_INTERACTIVE_MAX_PAGE_CREATIONS_PER_OPERATION = 16
+_INTERACTIVE_MAX_TOTAL_PAGE_CREATIONS = 128
+_INTERACTIVE_MAX_BACKGROUND_LIFETIME_SECONDS = 60 * 60
+_INTERACTIVE_MAX_OPERATIONS_PER_PAGE = 16_384
+_INTERACTIVE_MAX_OBSERVATIONS_PER_PAGE = 16_384
+_INTERACTIVE_MAX_TOTAL_OBSERVATIONS = 16_384
+_INTERACTIVE_MAX_REFS_PER_PAGE = 16_384
+_INTERACTIVE_MAX_TOTAL_REFS = 16_384
+_INTERACTIVE_MAX_TOTAL_REQUESTS = 65_536
+_INTERACTIVE_MAX_ARTIFACTS_PER_PAGE = 16_384
+_INTERACTIVE_MAX_TOTAL_ARTIFACTS = 16_384
+_INTERACTIVE_MAX_PAGE_CLEANUP_OPERATIONS = 16_384
+_INTERACTIVE_MAX_POPUP_POLICY_ORIGINS = 64
+_INTERACTIVE_POPUP_EFFECT_OPERATIONS = frozenset(
+    {"navigate", "click", "fill", "select", "press", "wait", "download"}
+)
 _INTERACTIVE_OPERATION_LEDGER_BYTES = 16 * 1024 * 1024
 _INTERACTIVE_MAX_ELEMENT_TEXT_BYTES = 2 * 1024
 _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES = 4 * 1024
@@ -95,63 +113,160 @@ _INTERACTIVE_ACCESSIBILITY_SERIALIZATION_MULTIPLIER = 8
 _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES = 64 * 1024 * 1024
 _INTERACTIVE_ACCESSIBILITY_NODE_ENVELOPE_BYTES = 512
 _INTERACTIVE_RETIREMENT_BUCKET_HEX_LENGTH = 3
-_INTERACTIVE_POPUP_GUARD = r"""(() => {
+_INTERACTIVE_POPUP_GUARD = r"""(configuration => {
+    const admissionToken = configuration.token;
+    const isSafeInteger = Number.isSafeInteger;
+    const apply = Reflect.apply;
+    const NativeURL = URL;
+    const getAttribute = Element.prototype.getAttribute;
+    const querySelector = Document.prototype.querySelector;
+    const composedPath = Event.prototype.composedPath;
+    const preventDefault = Event.prototype.preventDefault;
+    const stopImmediatePropagation = Event.prototype.stopImmediatePropagation;
+    const trim = String.prototype.trim;
+    const toLowerCase = String.prototype.toLowerCase;
+    const urlToString = URL.prototype.toString;
+    const stringify = String;
+    const Anchor = HTMLAnchorElement;
+    const Area = HTMLAreaElement;
+    const Form = HTMLFormElement;
+    const HtmlElement = HTMLElement;
+    let remainingCreations = 0;
+    let admittedURLs = [];
+    let blockedAttempts = 0;
+    const normalized = value => apply(
+        toLowerCase,
+        apply(trim, stringify(value), []),
+        [],
+    );
+    const attribute = (element, name) => apply(getAttribute, element, [name]);
+    const recordBlocked = reason => {
+        blockedAttempts |= reason;
+        return false;
+    };
+    const consumeAdmission = () => {
+        if (remainingCreations <= 0) {
+            return recordBlocked(1);
+        }
+        remainingCreations -= 1;
+        return true;
+    };
+    const setAdmission = (candidate, count) => {
+        if (candidate !== admissionToken || !isSafeInteger(count) || count < 0) {
+            return -1;
+        }
+        const outcome = {blocked: blockedAttempts, urls: admittedURLs};
+        remainingCreations = count;
+        admittedURLs = [];
+        blockedAttempts = 0;
+        return outcome;
+    };
+    Object.defineProperty(window, "__cayuSetPopupAdmission", {
+        value: setAdmission,
+        writable: false,
+        configurable: false,
+        enumerable: false,
+    });
     const sameContextTarget = target => {
-        const normalized = String(target || "").trim().toLowerCase();
-        return normalized === "" || normalized === "_self" ||
-            normalized === "_parent" || normalized === "_top";
+        const value = normalized(target || "");
+        return value === "" || value === "_self" ||
+            value === "_parent" || value === "_top";
+    };
+    const popupTargetAllowed = target => normalized(target || "_blank") === "_blank";
+    const popupURL = raw => {
+        const value = apply(trim, stringify(raw == null ? "" : raw), []);
+        if (value === "" || value === "about:blank") return "about:blank";
+        try {
+            const parsed = new NativeURL(value, document.baseURI);
+            if (parsed.protocol !== "https:") return null;
+            return apply(urlToString, parsed, []);
+        } catch {
+            return null;
+        }
     };
     const declaredTarget = element => {
-        const explicitTarget = element.getAttribute("target");
+        const explicitTarget = attribute(element, "target");
         if (explicitTarget !== null) return explicitTarget;
-        const base = element.ownerDocument.querySelector("base[target]");
-        return base === null ? "" : base.getAttribute("target");
+        const base = apply(querySelector, element.ownerDocument, ["base[target]"]);
+        return base === null ? "" : attribute(base, "target");
     };
     const formTarget = (form, submitter) => {
-        if (submitter instanceof HTMLElement) {
-            const override = submitter.getAttribute("formtarget");
+        if (submitter instanceof HtmlElement) {
+            const override = attribute(submitter, "formtarget");
             if (override !== null) return override;
         }
         return declaredTarget(form);
     };
-    const blockedOpen = () => null;
+    const formURL = (form, submitter) => {
+        if (submitter instanceof HtmlElement) {
+            const override = attribute(submitter, "formaction");
+            if (override !== null) return override;
+        }
+        return attribute(form, "action");
+    };
+    const admitPopup = (target, url) => {
+        const resolvedURL = popupURL(url);
+        if (!popupTargetAllowed(target) || resolvedURL === null) {
+            return recordBlocked(2);
+        }
+        if (!consumeAdmission()) return false;
+        admittedURLs.push(resolvedURL);
+        return true;
+    };
+    const stop = event => {
+        apply(preventDefault, event, []);
+        apply(stopImmediatePropagation, event, []);
+    };
+    const nativeOpen = window.open;
+    const guardedOpen = function(...args) {
+        const target = args.length > 1 ? args[1] : "_blank";
+        if (sameContextTarget(target)) return apply(nativeOpen, this, args);
+        if (!admitPopup(target, args[0])) return null;
+        return apply(nativeOpen, this, args);
+    };
     Object.defineProperty(Window.prototype, "open", {
-        value: blockedOpen,
+        value: guardedOpen,
         writable: false,
         configurable: false,
     });
     Object.defineProperty(window, "open", {
-        value: blockedOpen,
+        value: guardedOpen,
         writable: false,
         configurable: false,
     });
     window.addEventListener("click", event => {
-        for (const item of event.composedPath()) {
-            if ((item instanceof HTMLAnchorElement || item instanceof HTMLAreaElement) &&
-                    !sameContextTarget(declaredTarget(item))) {
-                event.preventDefault();
-                event.stopImmediatePropagation();
+        for (const item of apply(composedPath, event, [])) {
+            if ((item instanceof Anchor || item instanceof Area) &&
+                    !sameContextTarget(declaredTarget(item)) &&
+                    !admitPopup(declaredTarget(item), attribute(item, "href"))) {
+                stop(event);
                 return;
             }
         }
     }, true);
     window.addEventListener("submit", event => {
-        if (event.target instanceof HTMLFormElement &&
-                !sameContextTarget(formTarget(event.target, event.submitter))) {
-            event.preventDefault();
-            event.stopImmediatePropagation();
+        if (event.target instanceof Form &&
+                !sameContextTarget(formTarget(event.target, event.submitter)) &&
+                !admitPopup(
+                    formTarget(event.target, event.submitter),
+                    formURL(event.target, event.submitter),
+                )) {
+            stop(event);
         }
     }, true);
-    const nativeSubmit = HTMLFormElement.prototype.submit;
-    Object.defineProperty(HTMLFormElement.prototype, "submit", {
+    const nativeSubmit = Form.prototype.submit;
+    Object.defineProperty(Form.prototype, "submit", {
         value: function(...args) {
-            if (!sameContextTarget(declaredTarget(this))) return undefined;
-            return Reflect.apply(nativeSubmit, this, args);
+            if (!sameContextTarget(declaredTarget(this)) &&
+                    !admitPopup(declaredTarget(this), attribute(this, "action"))) {
+                return undefined;
+            }
+            return apply(nativeSubmit, this, args);
         },
         writable: false,
         configurable: false,
     });
-})()"""
+})(__CAYU_POPUP_CONFIGURATION__)"""
 _INTERACTIVE_RESPONSE_FIXED_BYTES = 1024 * 1024
 _INTERACTIVE_REF_ENVELOPE_BYTES = 6 * 128 + 6 * 128 + 6 * _INTERACTIVE_MAX_ELEMENT_TEXT_BYTES + 256
 _INTERACTIVE_MAX_MESSAGE_BYTES = (
@@ -159,16 +274,33 @@ _INTERACTIVE_MAX_MESSAGE_BYTES = (
     + 6 * _INTERACTIVE_MAX_SNAPSHOT_BYTES
     + _INTERACTIVE_MAX_REFS * _INTERACTIVE_REF_ENVELOPE_BYTES
     + 6 * (_MAX_URL_LENGTH + _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES)
+    + _INTERACTIVE_MAX_TOTAL_PAGE_CREATIONS
+    * (6 * (_MAX_URL_LENGTH + _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES + 256) + 4_096)
     + _INTERACTIVE_RESPONSE_FIXED_BYTES
 )
 _INTERACTIVE_REF_PATTERN = re.compile(
-    r"(?P<prefix>^|\s)\[ref=(?P<ref>[A-Za-z0-9._:-]{1,128})\]\s*$"
+    r"(?P<prefix>^|\s)\[ref=(?P<ref>[A-Za-z0-9._:-]{1,128})\]"
+    r"(?=(?:\s+\[[^\]\r\n]{1,256}\])*\s*:?\s*$)"
 )
 _INTERACTIVE_ELEMENT_PATTERN = re.compile(
     r'^\s*-\s+([A-Za-z][A-Za-z0-9_-]{0,127})(?:\s+"((?:\\.|[^"\\])*)")?'
 )
 _INTERACTIVE_SAFE_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$")
 _MAX_ACCESS_RETRY_AFTER_SECONDS = 24 * 60 * 60
+
+
+def _interactive_popup_guard(admission_token: str) -> str:
+    """Bind one unguessable daemon-owned admission token into the init script."""
+
+    return _INTERACTIVE_POPUP_GUARD.replace(
+        "__CAYU_POPUP_CONFIGURATION__",
+        json.dumps(
+            {"token": admission_token},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
 
 
 class _GuestFailure(RuntimeError):
@@ -438,6 +570,28 @@ class _InteractiveLimits:
     max_requests: int
     max_response_bytes: int
     max_operations: int
+    max_pages: int
+    max_provisional_pages: int
+    max_page_creations_per_operation: int
+    max_total_page_creations: int
+    max_background_lifetime_seconds: int
+    max_operations_per_page: int
+    max_observations_per_page: int
+    max_total_observations: int
+    max_refs_per_page: int
+    max_total_refs: int
+    max_total_requests: int
+    max_artifacts_per_page: int
+    max_total_artifacts: int
+    max_page_cleanup_operations: int
+
+
+@dataclass(frozen=True)
+class _InteractivePopupPolicy:
+    mode: Literal["deny", "same_origin", "destination_policy"]
+    allowed_operations: tuple[str, ...]
+    allowed_opener_origins: tuple[str, ...]
+    allowed_destination_origins: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -452,11 +606,15 @@ class _InteractiveRequest:
         "wait",
         "screenshot",
         "download",
+        "list_pages",
+        "switch_page",
+        "close_page",
         "close",
     ]
     session_id: str
     page_id: str | None
     expected_revision: str | None
+    expected_control_epoch: int | None
     ref: str | None
     operation_id: str
     url: str | None
@@ -465,6 +623,9 @@ class _InteractiveRequest:
     wait_ms: int | None
     full_page: bool
     limits: _InteractiveLimits
+    multi_page: bool
+    popup_policy: _InteractivePopupPolicy
+    reconcile_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -479,13 +640,41 @@ class _InteractivePage:
     page: Any
     session_id: str
     page_id: str
+    creation_epoch: int = 1
+    control_epoch: int = 1
+    lifecycle: Literal[
+        "provisional",
+        "admitted",
+        "active",
+        "background",
+        "closing",
+        "closed",
+        "crashed",
+        "uncertain",
+    ] = "provisional"
+    opener_page_id: str | None = None
+    opener_origin: str | None = None
+    creating_operation_id_sha256: str | None = None
+    last_operation_id_sha256: str | None = None
+    terminal_reason: str | None = None
+    created_monotonic: float = 0.0
+    background_since: float | None = None
+    operation_count: int = 0
+    observation_count: int = 0
+    ref_count: int = 0
+    artifact_count: int = 0
+    configured: bool = False
+    staged_initial_url: str | None = None
     public_url: str | None = None
+    title: str | None = None
     cdp: Any = None
     revision: str | None = None
+    last_observation_revision: str | None = None
     refs: dict[str, str] = field(default_factory=dict)
     request_count: int = 0
     redirect_count: int = 0
     response_bytes: int = 0
+    navigation_epoch: int = 0
     limit_exceeded: bool = False
     limit_error_code: Literal["oversized_response", "oversized_snapshot", "resource_exhausted"] = (
         "oversized_response"
@@ -493,6 +682,22 @@ class _InteractivePage:
     denied_code: str | None = None
     access_evidence: dict[str, Any] | None = None
     limit_abort_task: asyncio.Task[bool] | None = None
+    cleanup_task: asyncio.Task[None] | None = None
+    unexpected_download_task: asyncio.Task[bool] | None = None
+    authorized_download_operation_id_sha256: str | None = None
+
+
+@dataclass
+class _InteractivePageDelta:
+    created_page_ids: set[str] = field(default_factory=set)
+    admitted_page_ids: set[str] = field(default_factory=set)
+    closed_page_ids: set[str] = field(default_factory=set)
+    crashed_page_ids: set[str] = field(default_factory=set)
+    refused: list[dict[str, str]] = field(default_factory=list)
+    candidate_count: int = 0
+    candidate_identities: set[int] = field(default_factory=set)
+    candidate_pages: list[Any] = field(default_factory=list)
+    staged_frames: dict[Any, tuple[str, str]] = field(default_factory=dict)
 
 
 def _interactive_page_failure(state: _InteractivePage) -> _GuestFailure | None:
@@ -713,6 +918,9 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             "wait",
             "screenshot",
             "download",
+            "list_pages",
+            "switch_page",
+            "close_page",
             "close",
         }
     ):
@@ -722,11 +930,12 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "limits",
         "operation",
         "protocol_version",
+        "page_policy",
         "session_id",
         "worker_version",
     }
     page = base | {"page_id", "operation_id"}
-    revision = page | {"expected_revision"}
+    revision = page | {"expected_revision", "expected_control_epoch"}
     expected: dict[str, set[str]] = {
         "navigate": base | {"page_id", "operation_id", "url"},
         "observe": page,
@@ -737,9 +946,13 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "wait": revision | {"wait_ms"},
         "screenshot": revision,
         "download": revision | {"ref"},
+        "list_pages": base | {"operation_id"},
+        "switch_page": page,
+        "close_page": page,
         "close": base | {"operation_id"},
     }
     allowed = set(expected[operation])
+    allowed.add("reconcile_only")
     if operation == "screenshot":
         allowed.add("full_page")
     if set(raw) - allowed or expected[operation] - set(raw):
@@ -755,6 +968,20 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "max_requests",
         "max_response_bytes",
         "max_operations",
+        "max_pages",
+        "max_provisional_pages",
+        "max_page_creations_per_operation",
+        "max_total_page_creations",
+        "max_background_lifetime_seconds",
+        "max_operations_per_page",
+        "max_observations_per_page",
+        "max_total_observations",
+        "max_refs_per_page",
+        "max_total_refs",
+        "max_total_requests",
+        "max_artifacts_per_page",
+        "max_total_artifacts",
+        "max_page_cleanup_operations",
         "max_snapshot_bytes",
         "max_dom_nodes",
         "max_wait_ms",
@@ -827,7 +1054,140 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             minimum=1,
             maximum=_INTERACTIVE_MAX_OPERATIONS,
         ),
+        max_pages=_bounded_int(raw_limits["max_pages"], minimum=1, maximum=_INTERACTIVE_MAX_PAGES),
+        max_provisional_pages=_bounded_int(
+            raw_limits["max_provisional_pages"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_PROVISIONAL_PAGES,
+        ),
+        max_page_creations_per_operation=_bounded_int(
+            raw_limits["max_page_creations_per_operation"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_PAGE_CREATIONS_PER_OPERATION,
+        ),
+        max_total_page_creations=_bounded_int(
+            raw_limits["max_total_page_creations"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_TOTAL_PAGE_CREATIONS,
+        ),
+        max_background_lifetime_seconds=_bounded_int(
+            raw_limits["max_background_lifetime_seconds"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_BACKGROUND_LIFETIME_SECONDS,
+        ),
+        max_operations_per_page=_bounded_int(
+            raw_limits["max_operations_per_page"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_OPERATIONS_PER_PAGE,
+        ),
+        max_observations_per_page=_bounded_int(
+            raw_limits["max_observations_per_page"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_OBSERVATIONS_PER_PAGE,
+        ),
+        max_total_observations=_bounded_int(
+            raw_limits["max_total_observations"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_TOTAL_OBSERVATIONS,
+        ),
+        max_refs_per_page=_bounded_int(
+            raw_limits["max_refs_per_page"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_REFS_PER_PAGE,
+        ),
+        max_total_refs=_bounded_int(
+            raw_limits["max_total_refs"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_TOTAL_REFS,
+        ),
+        max_total_requests=_bounded_int(
+            raw_limits["max_total_requests"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_TOTAL_REQUESTS,
+        ),
+        max_artifacts_per_page=_bounded_int(
+            raw_limits["max_artifacts_per_page"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_ARTIFACTS_PER_PAGE,
+        ),
+        max_total_artifacts=_bounded_int(
+            raw_limits["max_total_artifacts"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_TOTAL_ARTIFACTS,
+        ),
+        max_page_cleanup_operations=_bounded_int(
+            raw_limits["max_page_cleanup_operations"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_PAGE_CLEANUP_OPERATIONS,
+        ),
     )
+    raw_page_policy = raw.get("page_policy")
+    if type(raw_page_policy) is not dict or set(raw_page_policy) != {"multi_page", "popup"}:
+        raise _GuestFailure("incompatible_browser")
+    multi_page = raw_page_policy.get("multi_page")
+    raw_popup = raw_page_policy.get("popup")
+    if (
+        type(multi_page) is not bool
+        or type(raw_popup) is not dict
+        or set(raw_popup)
+        != {
+            "mode",
+            "allowed_operations",
+            "allowed_opener_origins",
+            "allowed_destination_origins",
+        }
+    ):
+        raise _GuestFailure("incompatible_browser")
+    popup_mode = raw_popup.get("mode")
+    allowed_operations = raw_popup.get("allowed_operations")
+    allowed_opener_origins = raw_popup.get("allowed_opener_origins")
+    allowed_destination_origins = raw_popup.get("allowed_destination_origins")
+    if (
+        popup_mode not in {"deny", "same_origin", "destination_policy"}
+        or type(allowed_operations) is not list
+        or any(
+            type(value) is not str or value not in {"click", "fill", "select", "press", "wait"}
+            for value in allowed_operations
+        )
+        or allowed_operations != sorted(set(allowed_operations))
+        or type(allowed_opener_origins) is not list
+        or type(allowed_destination_origins) is not list
+        or len(allowed_opener_origins) > _INTERACTIVE_MAX_POPUP_POLICY_ORIGINS
+        or len(allowed_destination_origins) > _INTERACTIVE_MAX_POPUP_POLICY_ORIGINS
+    ):
+        raise _GuestFailure("incompatible_browser")
+    for origins in (allowed_opener_origins, allowed_destination_origins):
+        if any(type(value) is not str or _interactive_origin(value) != value for value in origins):
+            raise _GuestFailure("incompatible_browser")
+        if origins != sorted(set(origins)):
+            raise _GuestFailure("incompatible_browser")
+    if popup_mode == "deny":
+        if allowed_operations or allowed_opener_origins or allowed_destination_origins:
+            raise _GuestFailure("incompatible_browser")
+    elif not allowed_operations:
+        raise _GuestFailure("incompatible_browser")
+    if not multi_page and (
+        popup_mode != "deny"
+        or limits.max_pages != 1
+        or limits.max_provisional_pages != 1
+        or limits.max_page_creations_per_operation != 1
+        or limits.max_total_page_creations != 1
+    ):
+        raise _GuestFailure("incompatible_browser")
+    if (
+        (multi_page and limits.max_pages < 2)
+        or limits.max_provisional_pages > limits.max_pages
+        or limits.max_page_creations_per_operation > limits.max_provisional_pages
+        or limits.max_total_page_creations < limits.max_pages
+        or limits.max_background_lifetime_seconds > limits.idle_timeout_seconds
+        or limits.max_operations_per_page > limits.max_operations
+        or limits.max_observations_per_page > limits.max_total_observations
+        or limits.max_refs > limits.max_refs_per_page
+        or limits.max_refs_per_page > limits.max_total_refs
+        or limits.max_requests > limits.max_total_requests
+        or limits.max_artifacts_per_page > limits.max_total_artifacts
+    ):
+        raise _GuestFailure("incompatible_browser")
     session_id = _interactive_identifier(raw.get("session_id"))
     page_id = None if "page_id" not in raw else _interactive_identifier(raw["page_id"])
     expected_revision = (
@@ -835,6 +1195,11 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         if "expected_revision" not in raw
         else _interactive_identifier(raw["expected_revision"])
     )
+    expected_control_epoch = None
+    if "expected_control_epoch" in raw:
+        expected_control_epoch = _bounded_int(
+            raw["expected_control_epoch"], minimum=1, maximum=2**63 - 1
+        )
     ref = None if "ref" not in raw else _interactive_identifier(raw["ref"])
     operation_id = _interactive_identifier(raw.get("operation_id"))
     url = None
@@ -850,11 +1215,15 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
     full_page = raw.get("full_page", False)
     if type(full_page) is not bool:
         raise _GuestFailure("incompatible_browser")
+    reconcile_only = raw.get("reconcile_only", False)
+    if type(reconcile_only) is not bool:
+        raise _GuestFailure("incompatible_browser")
     return _InteractiveRequest(
         operation=operation,
         session_id=session_id,
         page_id=page_id,
         expected_revision=expected_revision,
+        expected_control_epoch=expected_control_epoch,
         ref=ref,
         operation_id=operation_id,
         url=url,
@@ -863,6 +1232,14 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         wait_ms=wait_ms,
         full_page=full_page,
         limits=limits,
+        multi_page=multi_page,
+        popup_policy=_InteractivePopupPolicy(
+            mode=popup_mode,
+            allowed_operations=tuple(allowed_operations),
+            allowed_opener_origins=tuple(allowed_opener_origins),
+            allowed_destination_origins=tuple(allowed_destination_origins),
+        ),
+        reconcile_only=reconcile_only,
     )
 
 
@@ -1038,6 +1415,7 @@ def _temporary_profile_cleanup_main(raw_home: str, raw_timeout_seconds: str) -> 
 async def _start_temporary_profile_owner(
     *,
     timeout_seconds: float,
+    startup_timeout_seconds: float | None = None,
 ) -> _TemporaryProfileOwner:
     try:
         home = Path(
@@ -1094,11 +1472,23 @@ async def _start_temporary_profile_owner(
     ready = b""
     try:
         os.set_blocking(ready_read, False)
+        ready_timeout_seconds = (
+            timeout_seconds if startup_timeout_seconds is None else startup_timeout_seconds
+        )
+        ready_deadline = asyncio.get_running_loop().time() + max(
+            0.001,
+            ready_timeout_seconds,
+        )
         while True:
             try:
                 ready = os.read(ready_read, 1)
             except BlockingIOError:
-                await asyncio.sleep(0.001)
+                remaining = ready_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Temporary browser profile cleanup owner did not become ready."
+                    ) from None
+                await asyncio.sleep(min(0.001, remaining))
                 continue
             break
     except BaseException as exc:
@@ -1822,6 +2212,36 @@ def _browser_request_is_admissible(url: Any) -> bool:
         and split.password is None
         and port in {None, 443}
     )
+
+
+def _interactive_origin(url: Any) -> str | None:
+    if type(url) is not str:
+        return None
+    try:
+        split = urlsplit(url)
+        port = split.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        split.scheme.lower() != "https"
+        or split.hostname is None
+        or split.username is not None
+        or split.password is not None
+        or port not in {None, 443}
+    ):
+        return None
+    try:
+        hostname = split.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    except UnicodeError:
+        return None
+    else:
+        return None
+    if not hostname:
+        return None
+    return f"https://{hostname}/"
 
 
 async def _capture_page_screenshot(
@@ -2794,6 +3214,10 @@ async def _run(request: _Request) -> dict[str, Any]:
                 try:
                     temporary_profile = await _start_temporary_profile_owner(
                         timeout_seconds=profile_cleanup_reserve,
+                        startup_timeout_seconds=max(
+                            0.001,
+                            total_deadline - loop.time(),
+                        ),
                     )
                 except asyncio.CancelledError:
                     profile_cleanup_failed = True
@@ -3008,7 +3432,7 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
         ):
             return {**response, "allocation_disposition": "retired"}
         return response
-    if request.operation != "navigate":
+    if request.operation != "navigate" or request.reconcile_only:
         retired = await _await_interactive_retirement(request.session_id)
         disposition: Literal["retired", "uncertain"] = "retired" if retired else "uncertain"
         return _interactive_error_payload(
@@ -3111,6 +3535,7 @@ class _InteractiveDaemon:
         self.browser: Any = None
         self.context: Any = None
         self.pages: dict[str, _InteractivePage] = {}
+        self.active_page_id: str | None = None
         self.browser_version = "unknown"
         self.lock = asyncio.Lock()
         self.close_requested = asyncio.Event()
@@ -3118,11 +3543,36 @@ class _InteractiveDaemon:
         self.close_after_response = False
         self.idle_expired = False
         self.operations: dict[str, _InteractiveOperationRecord] = {}
-        self.cleanup_operations: dict[str, _InteractiveOperationRecord] = {}
+        self.page_cleanup_operations: dict[str, _InteractiveOperationRecord] = {}
+        self.session_cleanup_operations: dict[str, _InteractiveOperationRecord] = {}
         self.operation_ledger_bytes = 0
+        self.total_page_creations = 0
+        self.total_operations = 0
+        self.total_observations = 0
+        self.total_refs = 0
+        self.total_requests = 0
+        self.total_artifacts = 0
+        self.cleanup_operation_count = 0
+        self.configuration_fingerprint: str | None = None
+        self.configuration_limits: _InteractiveLimits | None = None
+        self.configuration_multi_page: bool | None = None
+        self.configuration_popup_policy: _InteractivePopupPolicy | None = None
+        self.popup_guard_token = secrets.token_hex(32)
+        self.active_request: _InteractiveRequest | None = None
+        self.active_delta: _InteractivePageDelta | None = None
+        self.popup_cleanup_task: asyncio.Task[bool] | None = None
+        self.popup_candidate_observed = asyncio.Event()
+        self.popup_effect_opener_page_id: str | None = None
+        self.popup_effect_opener_origin: str | None = None
+        self.popup_cleanup_pages: list[Any] = []
+        self.popup_cleanup_retire = False
+        self.session_cleanup_tasks: dict[str, asyncio.Task[Any]] = {}
+        self.pending_closed_page_ids: set[str] = set()
+        self.pending_crashed_page_ids: set[str] = set()
         self.idle_timeout_seconds = _INTERACTIVE_IDLE_SECONDS
         self.last_activity = 0.0
         self.home: Path | None = None
+        self.profile_owner: _TemporaryProfileOwner | None = None
 
     async def start(self) -> None:
         try:
@@ -3131,9 +3581,10 @@ class _InteractiveDaemon:
             raise _GuestFailure("browser_unavailable") from exc
         proxy, ca_path = _proxy_and_ca()
         try:
-            self.home = Path(
-                tempfile.mkdtemp(prefix="cayu-browser-session-", dir=str(_TEMPORARY_PROFILE_ROOT))
+            self.profile_owner = await _start_temporary_profile_owner(
+                timeout_seconds=_MAX_PROFILE_CLEANUP_RESERVE_SECONDS,
             )
+            self.home = self.profile_owner.home
             _sanitize_environment(self.home, proxy=proxy, ca_path=ca_path)
             await _install_browser_ca(self.home, ca_path)
             self.playwright = await async_playwright().start()
@@ -3168,7 +3619,6 @@ class _InteractiveDaemon:
                 viewport={"width": 1280, "height": 720},
                 device_scale_factor=1,
             )
-            await self.context.add_init_script(_INTERACTIVE_POPUP_GUARD)
         except _GuestFailure:
             await self.close()
             raise
@@ -3183,18 +3633,32 @@ class _InteractiveDaemon:
             fingerprint = _interactive_operation_fingerprint(request)
             existing = self.operations.get(request.operation_id)
             if existing is None:
-                existing = self.cleanup_operations.get(request.operation_id)
+                existing = self.page_cleanup_operations.get(request.operation_id)
+            if existing is None:
+                existing = self.session_cleanup_operations.get(request.operation_id)
             if existing is not None:
                 if existing.fingerprint != fingerprint:
                     return _interactive_error_payload(_GuestFailure("operation_conflict"))
                 return json.loads(json.dumps(existing.response))
             if self.closing or self.close_requested.is_set():
                 raise _GuestFailure("session_closed")
+            await self._ensure_configuration(request)
+            if request.reconcile_only:
+                return _interactive_error_payload(
+                    _GuestFailure("operation_not_dispatched", allocation_disposition="live")
+                )
             operation_records = (
-                self.cleanup_operations if request.operation == "close" else self.operations
+                self.session_cleanup_operations
+                if request.operation == "close"
+                else self.page_cleanup_operations
+                if request.operation == "close_page"
+                else self.operations
             )
             if request.operation == "close":
                 if operation_records:
+                    return _interactive_error_payload(_GuestFailure("resource_exhausted"))
+            elif request.operation == "close_page":
+                if len(operation_records) >= request.limits.max_page_cleanup_operations:
                     return _interactive_error_payload(_GuestFailure("resource_exhausted"))
             elif len(operation_records) >= request.limits.max_operations:
                 return _interactive_error_payload(_GuestFailure("resource_exhausted"))
@@ -3234,54 +3698,174 @@ class _InteractiveDaemon:
             self.operation_ledger_bytes += len(encoded)
             return response
 
+    async def _ensure_configuration(self, request: _InteractiveRequest) -> None:
+        material = {
+            "limits": asdict(request.limits),
+            "multi_page": request.multi_page,
+            "popup_policy": asdict(request.popup_policy),
+        }
+        fingerprint = hashlib.sha256(
+            b"cayu-browser-page-configuration-v1\0"
+            + json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if self.configuration_fingerprint is not None:
+            if self.configuration_fingerprint != fingerprint:
+                raise _GuestFailure("incompatible_browser")
+            return
+        if self.context is None:
+            raise _GuestFailure("browser_crash")
+        try:
+            await self.context.add_init_script(_interactive_popup_guard(self.popup_guard_token))
+            await self.context.route("**/*", self._route_interactive_request)
+        except asyncio.CancelledError:
+            self._mark_popup_guard_uncertain()
+            raise
+        except Exception as exc:
+            self._mark_popup_guard_uncertain()
+            raise _GuestFailure("browser_crash") from exc
+        self.configuration_fingerprint = fingerprint
+        self.configuration_limits = request.limits
+        self.configuration_multi_page = request.multi_page
+        self.configuration_popup_policy = request.popup_policy
+
     async def _execute_locked(self, request: _InteractiveRequest) -> dict[str, Any]:
         """Execute while the caller owns the daemon lifecycle lock."""
 
         self.idle_timeout_seconds = request.limits.idle_timeout_seconds
-        if request.operation == "close":
-            self.closing = True
-            cleanup_ok = await self.close(
-                timeout_seconds=max(1.0, min(10.0, request.limits.max_wait_ms / 1000))
-            )
-            self.close_requested.set()
-            if not cleanup_ok:
-                return _interactive_error_payload(_GuestFailure("cleanup_failed"))
-            return _interactive_closed_payload()
-        state = self.pages.get(request.page_id or "")
+        delta = _InteractivePageDelta()
+        delta.closed_page_ids.update(self.pending_closed_page_ids)
+        delta.crashed_page_ids.update(self.pending_crashed_page_ids)
+        self.pending_closed_page_ids.clear()
+        self.pending_crashed_page_ids.clear()
+        self.active_request = request
+        self.active_delta = delta
+        state: _InteractivePage | None = None
         created_page = False
-        if request.operation == "navigate":
-            if request.page_id is None or request.url is None:
-                raise _GuestFailure("incompatible_browser")
-            if state is not None:
-                raise _GuestFailure("incompatible_browser")
-            if self.pages:
-                raise _GuestFailure("resource_exhausted")
-            try:
-                page = await self.context.new_page()
-            except Exception:
-                return await self._retire_failed_allocation(
-                    _GuestFailure("browser_crash"),
-                    request,
-                )
-            state = _InteractivePage(
-                page=page,
-                session_id=request.session_id,
-                page_id=request.page_id,
-                public_url=request.url,
-            )
-            self.pages[request.page_id] = state
-            created_page = True
-        elif state is None:
-            raise _GuestFailure("session_closed")
         try:
+            await self._expire_background_pages(request.limits, delta=delta)
+            if request.operation == "close":
+                self.closing = True
+                cleanup_ok = await self.close(
+                    timeout_seconds=max(1.0, min(10.0, request.limits.max_wait_ms / 1000))
+                )
+                self.close_requested.set()
+                if not cleanup_ok:
+                    return _interactive_error_payload(_GuestFailure("cleanup_failed"))
+                return _interactive_closed_payload()
+            if request.operation == "list_pages":
+                if self.total_operations >= request.limits.max_operations:
+                    raise _GuestFailure("resource_exhausted")
+                self.total_operations += 1
+                return _interactive_success_payload(
+                    None,
+                    page_set=self._page_set_payload(),
+                    page_delta=self._page_delta_payload(delta),
+                )
+            state = self.pages.get(request.page_id or "")
+            if request.operation == "navigate":
+                if request.page_id is None or request.url is None:
+                    raise _GuestFailure("incompatible_browser")
+                if state is not None or self.pages:
+                    raise _GuestFailure("resource_exhausted")
+                if request.limits.max_total_page_creations < 1:
+                    raise _GuestFailure("resource_exhausted")
+                try:
+                    page = await self.context.new_page()
+                except Exception:
+                    return await self._retire_failed_allocation(
+                        _GuestFailure("browser_crash"),
+                        request,
+                    )
+                self.total_page_creations = 1
+                state = _InteractivePage(
+                    page=page,
+                    session_id=request.session_id,
+                    page_id=request.page_id,
+                    creation_epoch=1,
+                    control_epoch=1,
+                    lifecycle="active",
+                    created_monotonic=asyncio.get_running_loop().time(),
+                    public_url=request.url,
+                )
+                self.pages[request.page_id] = state
+                self.active_page_id = request.page_id
+                delta.created_page_ids.add(request.page_id)
+                delta.admitted_page_ids.add(request.page_id)
+                created_page = True
+            elif state is None:
+                raise _GuestFailure("session_closed")
+            if request.operation == "close_page":
+                return await self._close_page(state, request, delta)
+            if request.operation == "switch_page":
+                return await self._switch_page(state, request, delta)
+            if state.lifecycle not in {"active", "admitted", "background"}:
+                raise _GuestFailure("session_closed")
+            if request.operation != "navigate" and self.active_page_id != state.page_id:
+                raise _GuestFailure("missing_element")
+            if request.operation not in {"navigate", "observe"}:
+                if (
+                    state.revision is None
+                    or request.expected_revision != state.revision
+                    or request.expected_control_epoch != state.control_epoch
+                ):
+                    raise _GuestFailure("incompatible_browser")
+                if request.ref is not None and request.ref not in state.refs:
+                    raise _GuestFailure("missing_element")
+            if (
+                state.operation_count >= request.limits.max_operations_per_page
+                or self.total_operations >= request.limits.max_operations
+            ):
+                raise _GuestFailure("resource_exhausted")
+            state.operation_count += 1
+            self.total_operations += 1
+            state.last_operation_id_sha256 = hashlib.sha256(
+                request.operation_id.encode("utf-8")
+            ).hexdigest()
+            if request.operation not in {"navigate", "observe"}:
+                state.control_epoch += 1
+            if request.operation in {"screenshot", "download"} and (
+                state.artifact_count >= request.limits.max_artifacts_per_page
+                or self.total_artifacts >= request.limits.max_total_artifacts
+            ):
+                raise _GuestFailure("resource_exhausted")
             if created_page:
                 await self._configure_page(state, request.limits)
-            return await self._execute_page(state, request)
+            try:
+                response = await self._execute_page(state, request)
+            except BaseException as primary_failure:
+                try:
+                    await self._settle_operation_popups(request, delta)
+                except BaseException as settlement_failure:
+                    if not isinstance(primary_failure, Exception):
+                        raise primary_failure from settlement_failure
+                    raise settlement_failure from primary_failure
+                raise
+            await self._settle_operation_popups(request, delta)
+            if delta.refused:
+                reason = delta.refused[0]["reason"]
+                code = "resource_exhausted" if reason == "capacity_refused" else "policy_denied"
+                return _interactive_error_payload(
+                    _GuestFailure(code, allocation_disposition="live"),
+                    page_set=self._page_set_payload(),
+                    page_delta=self._page_delta_payload(delta),
+                )
+            return self._with_page_evidence(response, delta)
         except _GuestFailure as exc:
-            if created_page or state.limit_exceeded:
+            if state is not None and (created_page or state.limit_exceeded):
                 return await self._retire_failed_allocation(exc, request)
-            raise
+            return _interactive_error_payload(
+                exc,
+                page_set=self._page_set_payload() if self.pages else None,
+                page_delta=self._page_delta_payload(delta),
+            )
         except Exception as exc:
+            if state is None:
+                return _interactive_error_payload(_GuestFailure("browser_crash"))
             if state.denied_code is not None:
                 failure = _GuestFailure(state.denied_code)
             elif state.limit_exceeded:
@@ -3303,7 +3887,554 @@ class _InteractiveDaemon:
                 )
             if created_page or state.limit_exceeded:
                 return await self._retire_failed_allocation(failure, request)
-            return _interactive_error_payload(failure)
+            return _interactive_error_payload(
+                failure,
+                page_set=self._page_set_payload(),
+                page_delta=self._page_delta_payload(delta),
+            )
+        finally:
+            self.active_request = None
+            self.active_delta = None
+            self.popup_effect_opener_page_id = None
+            self.popup_effect_opener_origin = None
+
+    def _page_set_payload(self) -> dict[str, Any]:
+        pages = []
+        for state in sorted(self.pages.values(), key=lambda item: item.creation_epoch):
+            url = state.public_url
+            if url is None:
+                raw_url = getattr(state.page, "url", None)
+                if raw_url == "about:blank":
+                    url = "about:blank"
+                elif _interactive_origin(raw_url) is not None:
+                    url = raw_url
+            if type(url) is str and len(url.encode("utf-8", errors="replace")) > _MAX_URL_LENGTH:
+                url = _interactive_origin(url)
+            title = state.title
+            if title is not None and len(title.encode("utf-8", errors="replace")) > (
+                _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES
+            ):
+                title = title.encode("utf-8", errors="replace")[
+                    :_INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES
+                ].decode("utf-8", errors="ignore")
+            pages.append(
+                {
+                    "page_id": state.page_id,
+                    "lifecycle": state.lifecycle,
+                    "creation_epoch": state.creation_epoch,
+                    "control_epoch": state.control_epoch,
+                    "opener_page_id": state.opener_page_id,
+                    "creating_operation_id_sha256": state.creating_operation_id_sha256,
+                    "revision": state.revision,
+                    "url": url,
+                    "title": title,
+                    "load_state": (
+                        "failed"
+                        if state.lifecycle in {"crashed", "uncertain"}
+                        else "loading"
+                        if state.lifecycle == "provisional"
+                        else "loaded"
+                    ),
+                    "access_state": (
+                        "blocked"
+                        if state.access_evidence is not None
+                        else "unknown"
+                        if state.lifecycle in {"provisional", "uncertain"}
+                        else "available"
+                    ),
+                    "last_observation_revision": state.last_observation_revision,
+                    "last_operation_id_sha256": state.last_operation_id_sha256,
+                    "terminal_reason": state.terminal_reason,
+                    "operation_count": state.operation_count,
+                    "observation_count": state.observation_count,
+                    "ref_count": state.ref_count,
+                    "request_count": state.request_count,
+                    "artifact_count": state.artifact_count,
+                }
+            )
+        return {
+            "session_id": self.session_id,
+            "active_page_id": self.active_page_id,
+            "pages": pages,
+            "total_page_creations": self.total_page_creations,
+            "total_operations": self.total_operations,
+            "total_observations": self.total_observations,
+            "total_refs": self.total_refs,
+            "total_requests": self.total_requests,
+            "total_artifacts": self.total_artifacts,
+            "cleanup_operation_count": self.cleanup_operation_count,
+        }
+
+    @staticmethod
+    def _page_delta_payload(delta: _InteractivePageDelta) -> dict[str, Any]:
+        return {
+            "created_page_ids": sorted(delta.created_page_ids),
+            "admitted_page_ids": sorted(delta.admitted_page_ids),
+            "closed_page_ids": sorted(delta.closed_page_ids),
+            "crashed_page_ids": sorted(delta.crashed_page_ids),
+            "refused": sorted(delta.refused, key=lambda item: item["page_id"]),
+        }
+
+    def _with_page_evidence(
+        self,
+        response: dict[str, Any],
+        delta: _InteractivePageDelta,
+    ) -> dict[str, Any]:
+        return {
+            **response,
+            "page_set": self._page_set_payload(),
+            "page_delta": self._page_delta_payload(delta),
+        }
+
+    def _mark_page_closed(self, state: _InteractivePage, reason: str) -> None:
+        if state.lifecycle in {"closed", "crashed", "uncertain"}:
+            return
+        closing = state.lifecycle == "closing"
+        state.lifecycle = "closed"
+        state.terminal_reason = reason
+        if not closing:
+            state.control_epoch += 1
+        state.revision = None
+        state.refs.clear()
+        if self.active_page_id == state.page_id:
+            self.active_page_id = None
+            self._select_remaining_active()
+        if self.active_delta is not None:
+            self.active_delta.closed_page_ids.add(state.page_id)
+        else:
+            self.pending_closed_page_ids.add(state.page_id)
+
+    def _mark_page_crashed(self, state: _InteractivePage) -> None:
+        if state.lifecycle in {"closed", "crashed"}:
+            return
+        state.lifecycle = "crashed"
+        state.terminal_reason = "browser_crash"
+        state.control_epoch += 1
+        state.revision = None
+        state.refs.clear()
+        if self.active_delta is not None:
+            self.active_delta.crashed_page_ids.add(state.page_id)
+        else:
+            self.pending_crashed_page_ids.add(state.page_id)
+        if self.active_page_id == state.page_id:
+            self.active_page_id = None
+            self._select_remaining_active()
+
+    def _select_remaining_active(self) -> _InteractivePage | None:
+        candidate = next(
+            (
+                state
+                for state in sorted(self.pages.values(), key=lambda item: item.creation_epoch)
+                if state.lifecycle in {"admitted", "background"}
+            ),
+            None,
+        )
+        if candidate is None:
+            return None
+        candidate.lifecycle = "active"
+        candidate.background_since = None
+        candidate.control_epoch += 1
+        candidate.revision = f"br_{secrets.token_hex(16)}"
+        candidate.refs.clear()
+        self.active_page_id = candidate.page_id
+        return candidate
+
+    async def _close_page(
+        self,
+        state: _InteractivePage,
+        request: _InteractiveRequest,
+        delta: _InteractivePageDelta,
+    ) -> dict[str, Any]:
+        if state.lifecycle in {"closed", "crashed"}:
+            delta.closed_page_ids.add(state.page_id)
+            return _interactive_success_payload(
+                None,
+                page_set=self._page_set_payload(),
+                page_delta=self._page_delta_payload(delta),
+            )
+        if not self._reserve_page_cleanup(request.limits):
+            raise _GuestFailure("resource_exhausted")
+        state.lifecycle = "closing"
+        state.control_epoch += 1
+        state.last_operation_id_sha256 = hashlib.sha256(
+            request.operation_id.encode("utf-8")
+        ).hexdigest()
+        state.revision = None
+        state.refs.clear()
+        cleanup_ok = await self._await_page_close(
+            state,
+            timeout_seconds=max(0.001, request.limits.max_wait_ms / 1000),
+        )
+        if not cleanup_ok:
+            state.lifecycle = "uncertain"
+            state.terminal_reason = "cleanup_failed"
+            if self.active_page_id == state.page_id:
+                self.active_page_id = None
+            return _interactive_error_payload(
+                _GuestFailure("cleanup_failed", allocation_disposition="uncertain"),
+                page_set=self._page_set_payload(),
+                page_delta=self._page_delta_payload(delta),
+            )
+        state.lifecycle = "closed"
+        state.terminal_reason = "closed_by_model"
+        delta.closed_page_ids.add(state.page_id)
+        if self.active_page_id == state.page_id:
+            self.active_page_id = None
+            self._select_remaining_active()
+        return _interactive_success_payload(
+            None,
+            page_set=self._page_set_payload(),
+            page_delta=self._page_delta_payload(delta),
+        )
+
+    async def _switch_page(
+        self,
+        state: _InteractivePage,
+        request: _InteractiveRequest,
+        delta: _InteractivePageDelta,
+    ) -> dict[str, Any]:
+        if state.lifecycle not in {"active", "admitted", "background"}:
+            raise _GuestFailure("session_closed")
+        if (
+            state.operation_count >= request.limits.max_operations_per_page
+            or self.total_operations >= request.limits.max_operations
+        ):
+            raise _GuestFailure("resource_exhausted")
+        current = self.pages.get(self.active_page_id or "")
+        now = asyncio.get_running_loop().time()
+        if current is not None and current.page_id != state.page_id:
+            current.lifecycle = "background"
+            current.background_since = now
+            current.control_epoch += 1
+            current.revision = f"br_{secrets.token_hex(16)}"
+            current.refs.clear()
+        state.lifecycle = "active"
+        state.background_since = None
+        state.control_epoch += 1
+        state.revision = None
+        state.refs.clear()
+        state.operation_count += 1
+        self.total_operations += 1
+        state.last_operation_id_sha256 = hashlib.sha256(
+            request.operation_id.encode("utf-8")
+        ).hexdigest()
+        self.active_page_id = state.page_id
+        observation = await self._observe_page(state, request.limits)
+        return _interactive_success_payload(
+            observation,
+            page_set=self._page_set_payload(),
+            page_delta=self._page_delta_payload(delta),
+        )
+
+    async def _observe_page(
+        self,
+        state: _InteractivePage,
+        limits: _InteractiveLimits,
+    ) -> dict[str, Any]:
+        if (
+            state.observation_count >= limits.max_observations_per_page
+            or self.total_observations >= limits.max_total_observations
+        ):
+            raise _GuestFailure("resource_exhausted")
+        navigation_epoch = state.navigation_epoch
+        observation = await _interactive_observation(
+            state,
+            limits,
+            browser_version=self.browser_version,
+        )
+        if (
+            state.access_evidence is None and state.navigation_epoch != navigation_epoch
+        ) or state.revision != observation.get("revision"):
+            state.revision = None
+            state.refs.clear()
+            raise _GuestFailure("browser_crash")
+        ref_count = len(state.refs)
+        if (
+            state.ref_count + ref_count > limits.max_refs_per_page
+            or self.total_refs + ref_count > limits.max_total_refs
+        ):
+            state.revision = None
+            state.refs.clear()
+            state.limit_exceeded = True
+            state.limit_error_code = "resource_exhausted"
+            raise _GuestFailure("resource_exhausted")
+        state.observation_count += 1
+        state.ref_count += ref_count
+        self.total_observations += 1
+        self.total_refs += ref_count
+        state.title = observation.get("title")
+        return observation
+
+    async def _settle_operation_popups(
+        self,
+        request: _InteractiveRequest,
+        delta: _InteractivePageDelta,
+    ) -> None:
+        # Playwright can enqueue the popup callback immediately before the
+        # originating action resolves.  Give that already-created callback one
+        # scheduling turn so this operation's exact delta cannot omit it.
+        await asyncio.sleep(0)
+        settled_page_ids: set[str] = set()
+        while pending_page_ids := sorted(delta.created_page_ids - settled_page_ids):
+            page_id = pending_page_ids[0]
+            settled_page_ids.add(page_id)
+            state = self.pages.get(page_id)
+            if state is None or state.lifecycle != "provisional":
+                continue
+            admission_failure: _GuestFailure | None = None
+            try:
+                failure = _interactive_page_failure(state)
+                if failure is not None:
+                    raise failure
+                if not state.configured:
+                    await self._configure_page(state, request.limits)
+                navigation_deadline = asyncio.get_running_loop().time() + max(
+                    0.001,
+                    request.limits.max_wait_ms / 1000,
+                )
+                raw_url = getattr(state.page, "url", "about:blank")
+                while raw_url == "about:blank" and state.staged_initial_url is None:
+                    remaining = navigation_deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise _GuestFailure("fetch_failed")
+                    await asyncio.sleep(min(0.01, remaining))
+                    raw_url = getattr(state.page, "url", "about:blank")
+                if state.staged_initial_url is not None:
+                    staged_initial_url = state.staged_initial_url
+                    state.staged_initial_url = None
+                    await state.page.goto(
+                        staged_initial_url,
+                        wait_until="domcontentloaded",
+                        timeout=max(
+                            1,
+                            int(
+                                1_000
+                                * max(
+                                    0.001,
+                                    navigation_deadline - asyncio.get_running_loop().time(),
+                                )
+                            ),
+                        ),
+                    )
+                wait_for_load_state = getattr(state.page, "wait_for_load_state", None)
+                if callable(wait_for_load_state):
+                    await wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=max(
+                            1,
+                            int(
+                                1_000
+                                * max(
+                                    0.001,
+                                    navigation_deadline - asyncio.get_running_loop().time(),
+                                )
+                            ),
+                        ),
+                    )
+                raw_url = getattr(state.page, "url", "about:blank")
+                failure = _interactive_page_failure(state)
+                if failure is not None:
+                    raise failure
+                if raw_url == "about:blank" or not self._popup_destination_allowed(state, raw_url):
+                    raise _GuestFailure("destination_denied")
+                state.public_url = (
+                    raw_url if _interactive_origin(raw_url) is not None else state.public_url
+                )
+                state.lifecycle = "background"
+                state.background_since = asyncio.get_running_loop().time()
+                state.revision = f"br_{secrets.token_hex(16)}"
+                delta.admitted_page_ids.add(page_id)
+            except asyncio.CancelledError:
+                self._schedule_popup_cleanup(state.page)
+                raise
+            except _GuestFailure as exc:
+                refusal_reason = (
+                    "capacity_refused"
+                    if exc.code
+                    in {"oversized_response", "oversized_snapshot", "resource_exhausted"}
+                    else "policy_denied"
+                    if exc.code == "policy_denied"
+                    else "destination_denied"
+                )
+                if exc.code not in {
+                    "destination_denied",
+                    "redirect_denied",
+                    "fetch_failed",
+                    "policy_denied",
+                }:
+                    admission_failure = exc
+                opener_page_id = state.opener_page_id or self.active_page_id or state.page_id
+                self._record_popup_refusal(
+                    page_id=state.page_id,
+                    opener_page_id=opener_page_id,
+                    reason=refusal_reason,
+                )
+                state.lifecycle = "closing"
+                state.control_epoch += 1
+                state.revision = None
+                state.refs.clear()
+                if not self._reserve_page_cleanup(request.limits):
+                    state.lifecycle = "uncertain"
+                    state.terminal_reason = "cleanup_failed"
+                    self._schedule_popup_cleanup(state.page, retire=True)
+                else:
+                    cleanup_ok = await self._await_page_close(
+                        state,
+                        timeout_seconds=max(0.001, request.limits.max_wait_ms / 1000),
+                    )
+                    if cleanup_ok:
+                        state.lifecycle = "closed"
+                        state.terminal_reason = refusal_reason
+                        delta.closed_page_ids.add(state.page_id)
+                    else:
+                        state.lifecycle = "uncertain"
+                        state.terminal_reason = "cleanup_failed"
+                if admission_failure is not None:
+                    if state.lifecycle == "closed":
+                        raise
+                    raise _GuestFailure(
+                        "cleanup_failed",
+                        allocation_disposition="uncertain",
+                    ) from admission_failure
+            except Exception as exc:
+                admission_failure = _GuestFailure("browser_crash")
+                state.lifecycle = "closing"
+                state.control_epoch += 1
+                state.revision = None
+                state.refs.clear()
+                if not self._reserve_page_cleanup(request.limits):
+                    state.lifecycle = "uncertain"
+                    state.terminal_reason = "cleanup_failed"
+                    self._schedule_popup_cleanup(state.page, retire=True)
+                else:
+                    cleanup_ok = await self._await_page_close(
+                        state,
+                        timeout_seconds=max(0.001, request.limits.max_wait_ms / 1000),
+                    )
+                    if cleanup_ok:
+                        state.lifecycle = "closed"
+                        state.terminal_reason = "browser_crash"
+                        delta.closed_page_ids.add(state.page_id)
+                    else:
+                        state.lifecycle = "uncertain"
+                        state.terminal_reason = "cleanup_failed"
+                if state.lifecycle == "closed":
+                    raise admission_failure from exc
+                raise _GuestFailure(
+                    "cleanup_failed",
+                    allocation_disposition="uncertain",
+                ) from exc
+        cleanup = self.popup_cleanup_task
+        if cleanup is not None:
+            try:
+                async with asyncio.timeout(max(0.001, request.limits.max_wait_ms / 1000)):
+                    cleanup_ok = await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                raise
+            except (TimeoutError, Exception):
+                cleanup_ok = False
+            if not cleanup_ok:
+                self.closing = True
+                self.close_after_response = True
+                raise _GuestFailure("cleanup_failed", allocation_disposition="uncertain")
+        if self.closing:
+            # A guard failure can fence the allocation without ever creating a
+            # popup cleanup task. Retirement always requires the whole owner to
+            # settle before the host is allowed to release allocation capacity.
+            cleanup_ok = await self.close(
+                timeout_seconds=max(1.0, min(10.0, request.limits.max_wait_ms / 1000))
+            )
+            raise _GuestFailure(
+                "resource_exhausted" if cleanup_ok else "cleanup_failed",
+                allocation_disposition="retired" if cleanup_ok else "uncertain",
+            )
+
+    async def _expire_background_pages(
+        self,
+        limits: _InteractiveLimits,
+        *,
+        delta: _InteractivePageDelta | None,
+    ) -> None:
+        now = asyncio.get_running_loop().time()
+        for state in tuple(self.pages.values()):
+            if (
+                state.lifecycle != "background"
+                or state.background_since is None
+                or now - state.background_since < limits.max_background_lifetime_seconds
+            ):
+                continue
+            state.lifecycle = "closing"
+            state.control_epoch += 1
+            state.revision = None
+            state.refs.clear()
+            if not self._reserve_page_cleanup(limits):
+                state.lifecycle = "uncertain"
+                state.terminal_reason = "cleanup_failed"
+                cleanup_ok = await self._retire_limited_allocation(timeout_seconds=5.0)
+                raise _GuestFailure(
+                    "resource_exhausted" if cleanup_ok else "cleanup_failed",
+                    allocation_disposition="retired" if cleanup_ok else "uncertain",
+                )
+            cleanup_ok = await self._await_page_close(state, timeout_seconds=1.0)
+            if not cleanup_ok:
+                state.lifecycle = "uncertain"
+                state.terminal_reason = "cleanup_failed"
+                raise _GuestFailure(
+                    "cleanup_failed",
+                    allocation_disposition="uncertain",
+                )
+            else:
+                state.lifecycle = "closed"
+                state.terminal_reason = "background_expired"
+                if delta is not None:
+                    delta.closed_page_ids.add(state.page_id)
+
+    def _reserve_page_cleanup(self, limits: _InteractiveLimits) -> bool:
+        if self.cleanup_operation_count >= limits.max_page_cleanup_operations:
+            return False
+        self.cleanup_operation_count += 1
+        return True
+
+    async def _await_page_close(
+        self,
+        state: _InteractivePage,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        task = state.cleanup_task
+        if task is not None and task.done():
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                state.cleanup_task = None
+                task = None
+            else:
+                return True
+        if task is None:
+            task = asyncio.create_task(state.page.close())
+            state.cleanup_task = task
+
+        async def settle() -> tuple[BaseException, ...]:
+            done, _ = await asyncio.wait({task}, timeout=max(0.001, timeout_seconds))
+            if not done:
+                return (TimeoutError("Browser page cleanup did not settle within its bound."),)
+            try:
+                task.result()
+            except asyncio.CancelledError as exc:
+                failure = RuntimeError("Browser page cleanup was cancelled unexpectedly.")
+                failure.__cause__ = exc
+                return (failure,)
+            except Exception as exc:
+                return (exc,)
+            return ()
+
+        outcome = await _await_browser_cleanup_resisting_cancellation(asyncio.create_task(settle()))
+        if outcome.cancellation is not None:
+            cause = _browser_cleanup_evidence(None, outcome.errors)
+            if cause is None:
+                raise outcome.cancellation
+            raise outcome.cancellation from cause
+        return not outcome.errors
 
     def _schedule_response_limit_abort(self, state: _InteractivePage) -> None:
         if state.limit_abort_task is None:
@@ -3383,6 +4514,597 @@ class _InteractiveDaemon:
             )
         )
 
+    def _state_for_page(self, page: Any) -> _InteractivePage | None:
+        return next((state for state in self.pages.values() if state.page == page), None)
+
+    @staticmethod
+    def _current_page_origin(state: _InteractivePage) -> str | None:
+        """Resolve opener policy from the live page before retained safe metadata."""
+
+        try:
+            current = _interactive_origin(state.page.url)
+        except Exception:
+            current = None
+        return current or _interactive_origin(state.public_url)
+
+    def _popup_policy_refusal(
+        self,
+        opener: _InteractivePage,
+        request: _InteractiveRequest | None,
+        *,
+        opener_origin: str | None,
+    ) -> str | None:
+        if request is None or not request.multi_page:
+            return "policy_denied"
+        policy = request.popup_policy
+        if policy.mode == "deny":
+            return "policy_denied"
+        if request.operation not in policy.allowed_operations:
+            return "operation_refused"
+        if self.active_page_id != opener.page_id or opener.lifecycle != "active":
+            return "operation_refused"
+        if opener_origin is None:
+            return "policy_denied"
+        if policy.allowed_opener_origins and opener_origin not in policy.allowed_opener_origins:
+            return "policy_denied"
+        return None
+
+    def _popup_creation_allowance(
+        self,
+        opener: _InteractivePage,
+        request: _InteractiveRequest,
+        *,
+        opener_origin: str | None,
+    ) -> tuple[int, str | None]:
+        refusal = self._popup_policy_refusal(
+            opener,
+            request,
+            opener_origin=opener_origin,
+        )
+        if refusal is not None:
+            return 0, refusal
+        limits = request.limits
+        live_pages = sum(
+            page.lifecycle in {"provisional", "admitted", "active", "background"}
+            for page in self.pages.values()
+        )
+        provisional_pages = sum(page.lifecycle == "provisional" for page in self.pages.values())
+        operation_creations = (
+            0 if self.active_delta is None else len(self.active_delta.created_page_ids)
+        )
+        allowance = min(
+            limits.max_pages - live_pages,
+            limits.max_provisional_pages - provisional_pages,
+            limits.max_page_creations_per_operation - operation_creations,
+            limits.max_total_page_creations - self.total_page_creations,
+        )
+        if allowance <= 0:
+            return 0, "capacity_refused"
+        return allowance, None
+
+    def _mark_popup_guard_uncertain(self) -> None:
+        for page in self.pages.values():
+            if page.lifecycle in {"provisional", "admitted", "active", "background"}:
+                page.lifecycle = "uncertain"
+                page.terminal_reason = "popup_guard_failed"
+                page.control_epoch += 1
+                page.revision = None
+                page.refs.clear()
+        self.active_page_id = None
+        self.closing = True
+        self.close_after_response = True
+
+    async def _set_popup_creation_allowance(
+        self,
+        state: _InteractivePage,
+        allowance: int,
+    ) -> tuple[int, tuple[str, ...]]:
+        try:
+            result = await state.page.evaluate(
+                "values => globalThis.__cayuSetPopupAdmission(values[0], values[1])",
+                [self.popup_guard_token, allowance],
+            )
+        except asyncio.CancelledError:
+            self._mark_popup_guard_uncertain()
+            raise
+        except Exception as exc:
+            self._mark_popup_guard_uncertain()
+            raise _GuestFailure("browser_crash") from exc
+        if type(result) is not dict or set(result) != {"blocked", "urls"}:
+            self._mark_popup_guard_uncertain()
+            raise _GuestFailure("incompatible_browser")
+        blocked = result["blocked"]
+        urls = result["urls"]
+        if (
+            type(blocked) is not int
+            or blocked not in {0, 1, 2, 3}
+            or type(urls) is not list
+            or len(urls) > _INTERACTIVE_MAX_PAGE_CREATIONS_PER_OPERATION
+            or any(
+                type(url) is not str
+                or len(url.encode("utf-8", errors="replace")) > _MAX_URL_LENGTH
+                or (url != "about:blank" and not _browser_request_is_admissible(url))
+                for url in urls
+            )
+        ):
+            self._mark_popup_guard_uncertain()
+            raise _GuestFailure("incompatible_browser")
+        return blocked, tuple(urls)
+
+    async def _begin_popup_effect(
+        self,
+        state: _InteractivePage,
+        request: _InteractiveRequest,
+    ) -> str | None:
+        opener_origin = self._current_page_origin(state)
+        allowance, refusal = self._popup_creation_allowance(
+            state,
+            request,
+            opener_origin=opener_origin,
+        )
+        self.popup_candidate_observed.clear()
+        self.popup_effect_opener_page_id = state.page_id
+        self.popup_effect_opener_origin = opener_origin
+        try:
+            blocked, urls = await self._set_popup_creation_allowance(state, allowance)
+        except BaseException:
+            self.popup_effect_opener_page_id = None
+            self.popup_effect_opener_origin = None
+            raise
+        if blocked or urls:
+            await self._set_popup_creation_allowance(state, 0)
+            if urls:
+                self._mark_popup_guard_uncertain()
+                raise _GuestFailure(
+                    "browser_crash",
+                    allocation_disposition="uncertain",
+                )
+            self._record_popup_refusal(
+                page_id=f"bp_{secrets.token_hex(16)}",
+                opener_page_id=state.page_id,
+                reason="policy_denied" if blocked & 2 else "capacity_refused",
+            )
+            raise _GuestFailure(
+                "policy_denied" if blocked & 2 else "resource_exhausted",
+                allocation_disposition="live",
+            )
+        return refusal
+
+    async def _end_popup_effect(
+        self,
+        state: _InteractivePage,
+        refusal: str | None,
+    ) -> tuple[str, ...]:
+        blocked, urls = await self._set_popup_creation_allowance(state, 0)
+        if blocked:
+            self._record_popup_refusal(
+                page_id=f"bp_{secrets.token_hex(16)}",
+                opener_page_id=state.page_id,
+                reason=refusal or ("policy_denied" if blocked & 2 else "capacity_refused"),
+            )
+        return urls
+
+    async def _wait_for_popup_candidates(
+        self,
+        request: _InteractiveRequest,
+        expected_urls: tuple[str, ...],
+    ) -> None:
+        delta = self.active_delta
+        expected_count = len(expected_urls)
+        if delta is None or expected_count > request.limits.max_page_creations_per_operation:
+            self._mark_popup_guard_uncertain()
+            raise _GuestFailure("browser_crash", allocation_disposition="uncertain")
+        deadline = asyncio.get_running_loop().time() + max(
+            0.001,
+            request.limits.max_wait_ms / 1000,
+        )
+        try:
+            while delta.candidate_count < expected_count:
+                self.popup_candidate_observed.clear()
+                if delta.candidate_count >= expected_count:
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError
+                async with asyncio.timeout(remaining):
+                    await self.popup_candidate_observed.wait()
+            if delta.candidate_count != expected_count:
+                self._mark_popup_guard_uncertain()
+                raise _GuestFailure(
+                    "browser_crash",
+                    allocation_disposition="uncertain",
+                )
+            # The guard authenticates the bounded number of creations in this
+            # action. Exact Playwright page/frame objects bind their lineage and
+            # staged requests. URLs can change immediately (including from
+            # about:blank), and callbacks need not follow JavaScript call order.
+            if delta.staged_frames:
+                self._mark_popup_guard_uncertain()
+                raise _GuestFailure("browser_crash", allocation_disposition="uncertain")
+        except asyncio.CancelledError:
+            self._mark_popup_guard_uncertain()
+            raise
+        except TimeoutError as exc:
+            self._mark_popup_guard_uncertain()
+            raise _GuestFailure(
+                "cleanup_failed",
+                allocation_disposition="uncertain",
+            ) from exc
+
+    def _record_popup_refusal(
+        self,
+        *,
+        page_id: str,
+        opener_page_id: str,
+        reason: str,
+    ) -> None:
+        delta = self.active_delta
+        if delta is None:
+            return
+        if any(item["page_id"] == page_id for item in delta.refused):
+            return
+        if len(delta.refused) >= (
+            self.active_request.limits.max_page_creations_per_operation
+            if self.active_request is not None
+            else 1
+        ):
+            return
+        delta.refused.append(
+            {
+                "page_id": page_id,
+                "opener_page_id": opener_page_id,
+                "reason": reason,
+            }
+        )
+
+    def _schedule_popup_cleanup(self, page: Any, *, retire: bool = False) -> None:
+        limits = self.configuration_limits
+        maximum = 1 if limits is None else limits.max_provisional_pages
+        if page not in self.popup_cleanup_pages and len(self.popup_cleanup_pages) < maximum:
+            self.popup_cleanup_pages.append(page)
+        else:
+            retire = True
+        self.popup_cleanup_retire = self.popup_cleanup_retire or retire
+        if self.popup_cleanup_task is None or self.popup_cleanup_task.done():
+            self.popup_cleanup_task = asyncio.create_task(self._drain_popup_cleanup())
+
+    async def _drain_popup_cleanup(self) -> bool:
+        cleanup_ok = True
+        while self.popup_cleanup_pages:
+            page = self.popup_cleanup_pages.pop(0)
+            limits = self.configuration_limits
+            if limits is None or not self._reserve_page_cleanup(limits):
+                cleanup_ok = False
+                self.popup_cleanup_retire = True
+                break
+            try:
+                await page.close()
+            except asyncio.CancelledError:
+                self.popup_cleanup_pages.insert(0, page)
+                raise
+            except Exception:
+                cleanup_ok = False
+                self.popup_cleanup_retire = True
+        if self.popup_cleanup_retire:
+            cleanup_ok = await self._close_context_after_limit_abort() and cleanup_ok
+            self.closing = True
+            self.close_after_response = True
+        return cleanup_ok
+
+    def _register_popup_candidate(
+        self,
+        opener: _InteractivePage,
+        popup: Any,
+    ) -> _InteractivePage | None:
+        existing = self._state_for_page(popup)
+        if existing is not None:
+            return existing
+        request = self.active_request
+        page_id = f"bp_{secrets.token_hex(16)}"
+        if request is None or self.active_delta is None:
+            if not bool(self.configuration_multi_page):
+                self._schedule_popup_limit_abort(opener, popup)
+            else:
+                self._schedule_popup_cleanup(popup)
+            return None
+        limits = request.limits
+        if self.total_page_creations >= limits.max_total_page_creations:
+            refusal = "capacity_refused"
+            creation_epoch = None
+        else:
+            self.total_page_creations += 1
+            creation_epoch = self.total_page_creations
+            if self.popup_effect_opener_page_id != opener.page_id:
+                refusal = "operation_refused"
+            else:
+                refusal = self._popup_policy_refusal(
+                    opener,
+                    request,
+                    opener_origin=self.popup_effect_opener_origin,
+                )
+        live_count = sum(
+            page.lifecycle in {"provisional", "admitted", "active", "background"}
+            for page in self.pages.values()
+        )
+        provisional_count = sum(page.lifecycle == "provisional" for page in self.pages.values())
+        if refusal is None and (
+            live_count >= limits.max_pages
+            or provisional_count >= limits.max_provisional_pages
+            or len(self.active_delta.created_page_ids) >= limits.max_page_creations_per_operation
+        ):
+            refusal = "capacity_refused"
+        if refusal is not None:
+            self._record_popup_refusal(
+                page_id=page_id,
+                opener_page_id=opener.page_id,
+                reason=refusal,
+            )
+            if not request.multi_page:
+                self._schedule_popup_limit_abort(opener, popup)
+            else:
+                self._schedule_popup_cleanup(
+                    popup,
+                    retire=refusal == "capacity_refused",
+                )
+            return None
+        if creation_epoch is None:  # pragma: no cover - capacity refusal returns above
+            return None
+        state = _InteractivePage(
+            page=popup,
+            session_id=self.session_id,
+            page_id=page_id,
+            creation_epoch=creation_epoch,
+            control_epoch=1,
+            lifecycle="provisional",
+            opener_page_id=opener.page_id,
+            opener_origin=self.popup_effect_opener_origin,
+            creating_operation_id_sha256=hashlib.sha256(
+                request.operation_id.encode("utf-8")
+            ).hexdigest(),
+            created_monotonic=asyncio.get_running_loop().time(),
+            public_url=opener.public_url,
+        )
+        self.pages[page_id] = state
+        self.active_delta.created_page_ids.add(page_id)
+        frame = getattr(getattr(popup, "main_frame", None), "_impl_obj", None)
+        staged = self.active_delta.staged_frames.pop(frame, None)
+        if staged is not None:
+            url, method = staged
+            state.request_count += 1
+            if method != "GET":
+                state.denied_code = "policy_denied"
+            else:
+                state.staged_initial_url = url
+        return state
+
+    def _observe_popup_candidate(
+        self,
+        opener: _InteractivePage,
+        popup: Any,
+    ) -> None:
+        self._register_popup_candidate(opener, popup)
+        self._note_popup_candidate(popup)
+
+    def _note_popup_candidate(self, popup: Any) -> None:
+        if self.active_request is None or self.active_delta is None:
+            return
+        identity = id(popup)
+        if identity in self.active_delta.candidate_identities:
+            return
+        self.active_delta.candidate_identities.add(identity)
+        self.active_delta.candidate_pages.append(popup)
+        self.active_delta.candidate_count += 1
+        self.popup_candidate_observed.set()
+
+    def _popup_destination_allowed(
+        self,
+        state: _InteractivePage,
+        request_url: str,
+    ) -> bool:
+        policy = self.configuration_popup_policy
+        if policy is None or policy.mode == "deny":
+            return False
+        destination = _interactive_origin(request_url)
+        opener_origin = state.opener_origin
+        if destination is None or opener_origin is None:
+            return False
+        if policy.mode == "same_origin" and destination != opener_origin:
+            return False
+        return not policy.allowed_destination_origins or (
+            destination in policy.allowed_destination_origins
+        )
+
+    async def _route_interactive_request(self, route: Any, browser_request: Any) -> None:
+        try:
+            request_page = browser_request.frame.page
+        except Exception:
+            # Pinned Playwright 1.62 exposes the provisional Frame channel
+            # before its public Frame.page exists. Retain that exact object,
+            # never a URL/order guess, until the popup callback publishes it.
+            delta = self.active_delta
+            request = self.active_request
+            if delta is not None and request is not None and self.popup_effect_opener_page_id:
+                implementation = getattr(browser_request, "_impl_obj", None)
+                initializer = getattr(implementation, "_initializer", None)
+                channel = initializer.get("frame") if type(initializer) is dict else None
+                frame = getattr(channel, "_object", None)
+                self.total_requests += 1
+                if (
+                    frame is None
+                    or not browser_request.is_navigation_request()
+                    or frame in delta.staged_frames
+                    or len(delta.staged_frames) >= request.limits.max_page_creations_per_operation
+                    or self.total_requests > request.limits.max_total_requests
+                    or type(browser_request.url) is not str
+                    or len(browser_request.url.encode("utf-8")) > _MAX_URL_LENGTH
+                ):
+                    self._mark_popup_guard_uncertain()
+                else:
+                    delta.staged_frames[frame] = (browser_request.url, browser_request.method)
+            await route.abort("blockedbyclient")
+            return
+        state = self._state_for_page(request_page)
+        if state is None:
+            # A popup's first request can reach the context route before
+            # Playwright emits the opener's ``popup`` callback.  Authenticate
+            # lineage from Playwright's exact opener object; never infer it
+            # from whichever page happens to be active.
+            opener_method = getattr(request_page, "opener", None)
+            opener_page = None
+            if callable(opener_method):
+                try:
+                    opener_page = await opener_method()
+                except Exception:
+                    opener_page = None
+            opener = self._state_for_page(opener_page)
+            if opener is None and self.popup_effect_opener_page_id is not None:
+                opener = self.pages.get(self.popup_effect_opener_page_id)
+            if opener is not None:
+                state = self._register_popup_candidate(opener, request_page)
+                self._note_popup_candidate(request_page)
+            if state is None:
+                await route.abort("blockedbyclient")
+                return
+        limits = self.configuration_limits
+        if limits is None:
+            await route.abort("blockedbyclient")
+            return
+        state.request_count += 1
+        self.total_requests += 1
+        if state.access_evidence is not None:
+            await route.abort("blockedbyclient")
+            return
+        if (
+            state.request_count > limits.max_requests
+            or self.total_requests > limits.max_total_requests
+        ):
+            state.limit_exceeded = True
+            state.limit_error_code = "resource_exhausted"
+            self._schedule_response_limit_abort(state)
+            await route.abort("blockedbyclient")
+            return
+        is_main_navigation = (
+            browser_request.is_navigation_request()
+            and browser_request.frame == request_page.main_frame
+        )
+        is_redirect = is_main_navigation and browser_request.redirected_from is not None
+        if is_redirect:
+            state.redirect_count += 1
+            if state.redirect_count > limits.max_redirects:
+                state.denied_code = "redirect_denied"
+                await route.abort("blockedbyclient")
+                return
+        if not _browser_request_is_admissible(browser_request.url):
+            state.denied_code = "redirect_denied" if is_redirect else "destination_denied"
+            await route.abort("blockedbyclient")
+            return
+        if (
+            state.opener_page_id is not None
+            and is_main_navigation
+            and not self._popup_destination_allowed(state, browser_request.url)
+        ):
+            state.denied_code = "destination_denied"
+            self._record_popup_refusal(
+                page_id=state.page_id,
+                opener_page_id=state.opener_page_id,
+                reason="destination_denied",
+            )
+            if (
+                self.active_request is None
+                or self.active_delta is None
+                or state.page_id not in self.active_delta.created_page_ids
+            ):
+                self._schedule_popup_cleanup(state.page)
+            await route.abort("blockedbyclient")
+            return
+        if not state.configured:
+            # Do not let the first popup document execute before its CDP
+            # response guard exists.  The same operation installs the guard
+            # and performs this staged navigation under the ordinary route,
+            # redirect, response, egress, and size policies.
+            if not is_main_navigation:
+                await route.abort("blockedbyclient")
+                return
+            if browser_request.method != "GET":
+                state.denied_code = "policy_denied"
+                await route.abort("blockedbyclient")
+                return
+            state.staged_initial_url = browser_request.url
+            await route.abort("blockedbyclient")
+            return
+        await route.continue_()
+
+    def _handle_page_download(self, state: _InteractivePage, download: Any) -> None:
+        request = self.active_request
+        expected_operation = state.authorized_download_operation_id_sha256
+        if (
+            request is not None
+            and request.operation == "download"
+            and request.page_id == state.page_id
+            and expected_operation
+            == hashlib.sha256(request.operation_id.encode("utf-8")).hexdigest()
+        ):
+            return
+        state.denied_code = "policy_denied"
+        task = state.unexpected_download_task
+        if task is not None and not task.done():
+            state.limit_exceeded = True
+            state.limit_error_code = "resource_exhausted"
+            self._schedule_response_limit_abort(state)
+            return
+        limits = self.configuration_limits
+        if limits is None or not self._reserve_page_cleanup(limits):
+            state.limit_exceeded = True
+            state.limit_error_code = "resource_exhausted"
+            self._schedule_response_limit_abort(state)
+            return
+        state.unexpected_download_task = asyncio.create_task(
+            self._cancel_unexpected_download(state, download, limits=limits)
+        )
+
+    async def _cancel_unexpected_download(
+        self,
+        state: _InteractivePage,
+        download: Any,
+        *,
+        limits: _InteractiveLimits,
+    ) -> bool:
+        timeout_seconds = max(0.001, limits.max_wait_ms / 1000)
+        try:
+            await asyncio.wait_for(download.cancel(), timeout=timeout_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            state.lifecycle = "uncertain"
+            state.terminal_reason = "cleanup_failed"
+            self.closing = True
+            self.close_after_response = True
+            return await self._close_context_after_limit_abort()
+        state.lifecycle = "closing"
+        state.control_epoch += 1
+        state.revision = None
+        state.refs.clear()
+        cleanup_ok = await self._await_page_close(
+            state,
+            timeout_seconds=timeout_seconds,
+        )
+        if cleanup_ok:
+            state.lifecycle = "closed"
+            state.terminal_reason = "policy_denied"
+            if self.active_page_id == state.page_id:
+                self.active_page_id = None
+                self._select_remaining_active()
+            if self.active_delta is not None:
+                self.active_delta.closed_page_ids.add(state.page_id)
+            else:
+                self.pending_closed_page_ids.add(state.page_id)
+            return True
+        state.lifecycle = "uncertain"
+        state.terminal_reason = "cleanup_failed"
+        self.closing = True
+        self.close_after_response = True
+        return False
+
     async def _configure_page(
         self,
         state: _InteractivePage,
@@ -3392,55 +5114,24 @@ class _InteractiveDaemon:
         page.set_default_timeout(max(1_000, limits.max_wait_ms))
         page.set_default_navigation_timeout(max(1_000, limits.max_wait_ms))
 
-        async def route_request(route: Any, browser_request: Any) -> None:
-            state.request_count += 1
-            if state.access_evidence is not None:
-                await route.abort("blockedbyclient")
-                return
-            if state.request_count > limits.max_requests:
-                state.limit_exceeded = True
-                self._schedule_response_limit_abort(state)
-                await route.abort("blockedbyclient")
-                return
-            try:
-                request_page = browser_request.frame.page
-            except Exception:
-                state.denied_code = "fetch_failed"
-                await route.abort("blockedbyclient")
-                return
-            if request_page != page:
-                await route.abort("blockedbyclient")
-                return
-            if (
-                browser_request.is_navigation_request()
-                and browser_request.frame == page.main_frame
-                and browser_request.redirected_from is not None
-            ):
-                state.redirect_count += 1
-                if state.redirect_count > limits.max_redirects:
-                    state.denied_code = "redirect_denied"
-                    await route.abort("blockedbyclient")
-                    return
-            if not _browser_request_is_admissible(browser_request.url):
-                state.denied_code = (
-                    "redirect_denied"
-                    if browser_request.is_navigation_request()
-                    and browser_request.frame == page.main_frame
-                    and browser_request.redirected_from is not None
-                    else "destination_denied"
-                )
-                await route.abort("blockedbyclient")
-                return
-            await route.continue_()
-
-        await self.context.route("**/*", route_request)
-
         state.cdp = await self.context.new_cdp_session(page)
         await state.cdp.send("Network.enable")
         frame_tree = await state.cdp.send("Page.getFrameTree")
         main_frame_id = frame_tree["frameTree"]["frame"]["id"]
         if type(main_frame_id) is not str:
             raise _GuestFailure("browser_crash")
+        # Request URLs omit fragments. After aborting an unguarded initial
+        # navigation, Chromium retains the full target on this exact frame.
+        # Restore only a fragment; never replace request authority with an
+        # unrelated frame URL.
+        unreachable_url = frame_tree["frameTree"]["frame"].get("unreachableUrl")
+        if (
+            state.staged_initial_url is not None
+            and type(unreachable_url) is str
+            and len(unreachable_url.encode("utf-8")) <= _MAX_URL_LENGTH
+            and urlsplit(unreachable_url)._replace(fragment="").geturl() == state.staged_initial_url
+        ):
+            state.staged_initial_url = unreachable_url
         await state.cdp.send(
             "Fetch.enable",
             {
@@ -3581,7 +5272,47 @@ class _InteractiveDaemon:
                 self._schedule_response_limit_abort(state)
 
         page.on("response", response_observed)
-        page.on("popup", lambda popup: self._schedule_popup_limit_abort(state, popup))
+        page.on("download", lambda download: self._handle_page_download(state, download))
+        page.on("popup", lambda popup: self._observe_popup_candidate(state, popup))
+        page.on("framenavigated", lambda frame: self._mark_page_navigated(state, frame))
+        page.on("close", lambda: self._mark_page_closed(state, "closed_by_page"))
+        page.on("crash", lambda: self._mark_page_crashed(state))
+        state.configured = True
+
+    def _mark_page_navigated(self, state: _InteractivePage, frame: Any) -> None:
+        try:
+            if frame != state.page.main_frame:
+                return
+        except Exception:
+            state.denied_code = "fetch_failed"
+            return
+        state.navigation_epoch += 1
+        request = self.active_request
+        navigation_owned_by_current_mutation = (
+            request is not None
+            and request.operation != "observe"
+            and request.page_id == state.page_id
+            and state.last_operation_id_sha256
+            == hashlib.sha256(request.operation_id.encode("utf-8")).hexdigest()
+        )
+        blocked_navigation_owned_by_current_mutation = (
+            state.access_evidence is not None and navigation_owned_by_current_mutation
+        )
+        if not blocked_navigation_owned_by_current_mutation:
+            state.revision = None
+            state.refs.clear()
+        if not navigation_owned_by_current_mutation:
+            if state.control_epoch >= _INTERACTIVE_MAX_OPERATIONS_PER_PAGE:
+                state.limit_exceeded = True
+                state.limit_error_code = "resource_exhausted"
+                self._schedule_response_limit_abort(state)
+                return
+            state.control_epoch += 1
+        limits = self.configuration_limits
+        if limits is not None and state.navigation_epoch > limits.max_requests:
+            state.limit_exceeded = True
+            state.limit_error_code = "resource_exhausted"
+            self._schedule_response_limit_abort(state)
 
     async def _execute_page(
         self,
@@ -3592,55 +5323,71 @@ class _InteractiveDaemon:
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
-        if request.operation == "navigate":
-            try:
-                await page.goto(
-                    request.url,
-                    wait_until="load",
-                    timeout=max(1_000, request.limits.max_wait_ms),
-                )
-            except Exception:
-                if state.access_evidence is None:
-                    raise
-        elif request.operation != "observe":
-            if state.revision is None or request.expected_revision != state.revision:
+        action_target = None
+        if request.operation not in {"navigate", "observe"}:
+            if (
+                state.revision is None
+                or request.expected_revision != state.revision
+                or request.expected_control_epoch != state.control_epoch - 1
+            ):
                 raise _GuestFailure("incompatible_browser")
             internal_ref = None
             if request.ref is not None:
                 internal_ref = state.refs.get(request.ref)
                 if internal_ref is None:
                     raise _GuestFailure("missing_element")
+                navigation_epoch = state.navigation_epoch
                 locator = page.locator(f"aria-ref={internal_ref}")
-                if await locator.count() == 0:
+                action_target = await locator.element_handle()
+                if action_target is None or state.navigation_epoch != navigation_epoch:
                     raise _GuestFailure("missing_element")
-            else:
-                locator = None
             state.revision = None
             state.refs.clear()
-            if request.operation == "click":
-                if locator is None:  # pragma: no cover - parser invariant
+        guard_effect = request.multi_page and request.operation in (
+            _INTERACTIVE_POPUP_EFFECT_OPERATIONS
+        )
+        popup_refusal: str | None = None
+        if guard_effect:
+            popup_refusal = await self._begin_popup_effect(state, request)
+        try:
+            if request.operation == "navigate":
+                try:
+                    await page.goto(
+                        request.url,
+                        wait_until="load",
+                        timeout=max(1_000, request.limits.max_wait_ms),
+                    )
+                except Exception:
+                    if state.access_evidence is None:
+                        raise
+            elif request.operation == "click":
+                if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
-                await locator.click()
+                await action_target.click()
             elif request.operation == "fill":
-                if locator is None:  # pragma: no cover - parser invariant
+                if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
-                await locator.fill(request.value)
+                await action_target.fill(request.value)
             elif request.operation == "select":
-                if locator is None:  # pragma: no cover - parser invariant
+                if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
-                await locator.select_option(request.value)
+                await action_target.select_option(request.value)
             elif request.operation == "press":
-                if locator is None:  # pragma: no cover - parser invariant
+                if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
-                await locator.press(request.key)
+                await action_target.press(request.key)
             elif request.operation == "wait":
                 await page.wait_for_timeout(request.wait_ms)
             elif request.operation == "download":
-                if locator is None:  # pragma: no cover - parser invariant
+                if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
-                return await self._download_and_observe(state, request, locator)
-            elif request.operation != "screenshot":
+                return await self._download_and_observe(state, request, action_target)
+            elif request.operation not in {"observe", "screenshot"}:
                 raise _GuestFailure("incompatible_browser")
+        finally:
+            if guard_effect:
+                admitted_urls = await self._end_popup_effect(state, popup_refusal)
+                await self._wait_for_popup_candidates(request, admitted_urls)
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
@@ -3653,11 +5400,9 @@ class _InteractiveDaemon:
                 "content_type": "image/png",
                 "content_base64": base64.b64encode(screenshot).decode("ascii"),
             }
-        observation = await _interactive_observation(
-            state,
-            request.limits,
-            browser_version=self.browser_version,
-        )
+            state.artifact_count += 1
+            self.total_artifacts += 1
+        observation = await self._observe_page(state, request.limits)
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
@@ -3669,6 +5414,9 @@ class _InteractiveDaemon:
         request: _InteractiveRequest,
         locator: Any,
     ) -> dict[str, Any]:
+        state.authorized_download_operation_id_sha256 = hashlib.sha256(
+            request.operation_id.encode("utf-8")
+        ).hexdigest()
         try:
             async with state.page.expect_download(
                 timeout=max(1_000, request.limits.max_wait_ms)
@@ -3694,11 +5442,9 @@ class _InteractiveDaemon:
             raise
         except Exception as exc:
             raise _interactive_playwright_error("download", exc) from exc
-        observation = await _interactive_observation(
-            state,
-            request.limits,
-            browser_version=self.browser_version,
-        )
+        finally:
+            state.authorized_download_operation_id_sha256 = None
+        observation = await self._observe_page(state, request.limits)
         failure = _interactive_page_failure(state)
         if failure is not None:
             raise failure
@@ -3708,48 +5454,157 @@ class _InteractiveDaemon:
             "content_type": "application/octet-stream",
             "content_base64": base64.b64encode(content).decode("ascii"),
         }
+        state.artifact_count += 1
+        self.total_artifacts += 1
         return _interactive_success_payload(observation, artifact=artifact)
 
     async def close(self, *, timeout_seconds: float = 5.0) -> bool:
         deadline = asyncio.get_running_loop().time() + max(0.001, timeout_seconds)
-        cleanup_ok = True
-        limit_abort_tasks = tuple(
-            state.limit_abort_task
-            for state in self.pages.values()
-            if state.limit_abort_task is not None
-        )
-        for task in limit_abort_tasks:
+
+        async def settle_owned_task(
+            task: asyncio.Task[Any],
+            *,
+            label: str,
+        ) -> tuple[bool, tuple[BaseException, ...]]:
             if task is asyncio.current_task():
-                continue
+                return True, ()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False, (TimeoutError(f"Browser {label} cleanup exceeded its bound."),)
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+            if not done:
+                # Do not cancel opaque Playwright cleanup.  Cancellation does
+                # not prove that the owned mutation stopped; retain the task so
+                # a later/final close joins the exact same owner.
+                return False, (TimeoutError(f"Browser {label} cleanup exceeded its bound."),)
             try:
-                remaining = max(0.001, deadline - asyncio.get_running_loop().time())
-                async with asyncio.timeout(remaining):
-                    cleanup_ok = await asyncio.shield(task) and cleanup_ok
-            except BaseException:
-                cleanup_ok = False
-        for attribute, operation_name in (
-            ("context", "close"),
-            ("browser", "close"),
-            ("playwright", "stop"),
-        ):
-            owner = getattr(self, attribute)
-            if owner is None:
-                continue
-            try:
-                remaining = max(0.001, deadline - asyncio.get_running_loop().time())
-                async with asyncio.timeout(remaining):
-                    await getattr(owner, operation_name)()
-                setattr(self, attribute, None)
-            except BaseException:
-                cleanup_ok = False
-        if self.home is not None:
-            try:
-                shutil.rmtree(self.home)
-                self.home = None
-            except OSError:
-                cleanup_ok = False
+                value = task.result()
+            except asyncio.CancelledError as exc:
+                failure = RuntimeError(f"Browser {label} cleanup was cancelled unexpectedly.")
+                failure.__cause__ = exc
+                return False, (failure,)
+            except BaseException as exc:
+                return False, (exc,)
+            return value is not False, ()
+
+        async def settle_all() -> tuple[BaseException, ...]:
+            errors: list[BaseException] = []
+            popup_cleanup = self.popup_cleanup_task
+            if popup_cleanup is not None:
+                _, failures = await settle_owned_task(
+                    popup_cleanup,
+                    label="provisional-page",
+                )
+                errors.extend(failures)
+                if popup_cleanup.done():
+                    self.popup_cleanup_task = None
+
+            for state in tuple(self.pages.values()):
+                limit_abort = state.limit_abort_task
+                if limit_abort is None:
+                    continue
+                _, failures = await settle_owned_task(
+                    limit_abort,
+                    label=f"page-limit-{state.creation_epoch}",
+                )
+                errors.extend(failures)
+                if limit_abort.done():
+                    state.limit_abort_task = None
+
+            for state in tuple(self.pages.values()):
+                unexpected_download = state.unexpected_download_task
+                if unexpected_download is None:
+                    continue
+                _, failures = await settle_owned_task(
+                    unexpected_download,
+                    label=f"unexpected-download-{state.creation_epoch}",
+                )
+                errors.extend(failures)
+                if unexpected_download.done():
+                    state.unexpected_download_task = None
+
+            for state in tuple(self.pages.values()):
+                if state.lifecycle in {"closed", "crashed"}:
+                    continue
+                state.lifecycle = "closing"
+                if self.active_page_id == state.page_id:
+                    self.active_page_id = None
+                state.control_epoch += 1
+                state.revision = None
+                state.refs.clear()
+                task = state.cleanup_task
+                if task is None:
+                    task = asyncio.create_task(state.page.close())
+                    state.cleanup_task = task
+                settled, failures = await settle_owned_task(
+                    task,
+                    label=f"page-{state.creation_epoch}",
+                )
+                errors.extend(failures)
+                if settled:
+                    state.lifecycle = "closed"
+                    state.terminal_reason = "session_closed"
+                else:
+                    state.lifecycle = "uncertain"
+                    state.terminal_reason = "cleanup_failed"
+                    if task.done():
+                        state.cleanup_task = None
+
+            for attribute, operation_name in (
+                ("context", "close"),
+                ("browser", "close"),
+                ("playwright", "stop"),
+            ):
+                owner = getattr(self, attribute)
+                if owner is None:
+                    continue
+                task = self.session_cleanup_tasks.get(attribute)
+                if task is None:
+                    task = asyncio.create_task(getattr(owner, operation_name)())
+                    self.session_cleanup_tasks[attribute] = task
+                settled, failures = await settle_owned_task(task, label=attribute)
+                errors.extend(failures)
+                if settled:
+                    setattr(self, attribute, None)
+                    self.session_cleanup_tasks.pop(attribute, None)
+                elif task.done():
+                    self.session_cleanup_tasks.pop(attribute, None)
+
+            profile_owner = self.profile_owner
+            if profile_owner is not None:
+                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                profile_errors = await _cleanup_temporary_profile_owner(
+                    profile_owner,
+                    timeout_seconds=remaining,
+                )
+                errors.extend(profile_errors)
+                if not profile_errors:
+                    self.profile_owner = None
+                    self.home = None
+            return tuple(errors)
+
+        outcome = await _await_browser_cleanup_resisting_cancellation(
+            asyncio.create_task(settle_all())
+        )
+        cleanup_ok = not outcome.errors
         if cleanup_ok:
             self.pages.clear()
+            self.active_page_id = None
+        if outcome.cancellation is not None:
+            cause = _browser_cleanup_evidence(None, outcome.errors)
+            if cause is None:
+                raise outcome.cancellation
+            raise outcome.cancellation from cause
+        process_control = next(
+            (
+                error
+                for error in outcome.errors
+                if isinstance(error, (GeneratorExit, KeyboardInterrupt, SystemExit))
+            ),
+            None,
+        )
+        if process_control is not None:
+            raise process_control
         return cleanup_ok
 
 
@@ -4155,11 +6010,14 @@ async def _interactive_observation(
                 )
             primary_failure.add_note("Browser observation guard cleanup also failed.")
     state.revision = f"br_{secrets.token_hex(16)}"
+    state.last_observation_revision = state.revision
     state.refs = refs
     return {
         "session_id": state.session_id,
         "page_id": state.page_id,
         "revision": state.revision,
+        "creation_epoch": state.creation_epoch,
+        "control_epoch": state.control_epoch,
         "url": url,
         "title": title,
         "snapshot": snapshot,
@@ -4251,7 +6109,12 @@ def _interactive_snapshot(
                 ref_metadata[opaque] = _interactive_element_metadata(line)
             else:
                 opaque = next(key for key, value in refs.items() if value == internal)
-            replaced = line[: ref_match.start()] + ref_match.group("prefix") + f"[ref={opaque}]"
+            replaced = (
+                line[: ref_match.start()]
+                + ref_match.group("prefix")
+                + f"[ref={opaque}]"
+                + line[ref_match.end() :]
+            )
         if not replaced:
             continue
         encoded = (replaced + "\n").encode("utf-8", errors="replace")
@@ -4277,19 +6140,27 @@ def _interactive_element_metadata(line: str) -> tuple[str, str]:
 
 
 def _interactive_success_payload(
-    observation: dict[str, Any],
+    observation: dict[str, Any] | None,
     *,
-    artifact: dict[str, Any] | None,
+    artifact: dict[str, Any] | None = None,
+    page_set: dict[str, Any] | None = None,
+    page_delta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "protocol_version": INTERACTIVE_PROTOCOL_VERSION,
         "worker_version": INTERACTIVE_WORKER_VERSION,
         "playwright_version": PLAYWRIGHT_VERSION,
         "kind": "success",
         "allocation_disposition": "live",
-        "observation": observation,
         "artifacts": [] if artifact is None else [artifact],
     }
+    if observation is not None:
+        payload["observation"] = observation
+    if page_set is not None:
+        payload["page_set"] = page_set
+    if page_delta is not None:
+        payload["page_delta"] = page_delta
+    return payload
 
 
 def _interactive_closed_payload() -> dict[str, Any]:
@@ -4302,7 +6173,12 @@ def _interactive_closed_payload() -> dict[str, Any]:
     }
 
 
-def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
+def _interactive_error_payload(
+    error: _GuestFailure,
+    *,
+    page_set: dict[str, Any] | None = None,
+    page_delta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     stable = error.code
     if stable not in {
         "actionability_failed",
@@ -4319,6 +6195,7 @@ def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
         "missing_element",
         "navigation_timeout",
         "operation_conflict",
+        "operation_not_dispatched",
         "outcome_ambiguous",
         "oversized_artifact",
         "oversized_response",
@@ -4330,7 +6207,7 @@ def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
         "timeout",
     }:
         stable = "browser_crash"
-    return {
+    payload: dict[str, Any] = {
         "protocol_version": INTERACTIVE_PROTOCOL_VERSION,
         "worker_version": INTERACTIVE_WORKER_VERSION,
         "playwright_version": PLAYWRIGHT_VERSION,
@@ -4339,11 +6216,18 @@ def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
         "error": stable,
         **({"access": error.access} if error.access is not None else {}),
     }
+    if page_set is not None:
+        payload["page_set"] = page_set
+    if page_delta is not None:
+        payload["page_delta"] = page_delta
+    return payload
 
 
 def _interactive_operation_fingerprint(request: _InteractiveRequest) -> str:
+    material = asdict(request)
+    material.pop("reconcile_only", None)
     encoded = json.dumps(
-        asdict(request),
+        material,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -4507,12 +6391,42 @@ async def _wait_for_interactive_shutdown(daemon: _InteractiveDaemon) -> None:
         async with daemon.lock:
             if daemon.close_requested.is_set():
                 return
+            if daemon.configuration_limits is not None:
+                try:
+                    await daemon._expire_background_pages(
+                        daemon.configuration_limits,
+                        delta=None,
+                    )
+                except _GuestFailure:
+                    # No request owns this expiry failure.  Retire through the
+                    # daemon's final cleanup owner; only a fully settled close
+                    # publishes the allocation-retirement marker.
+                    daemon.closing = True
+                    daemon.close_after_response = True
+                    daemon.close_requested.set()
+                    return
             remaining = max(
                 0.0,
                 daemon.last_activity
                 + daemon.idle_timeout_seconds
                 - asyncio.get_running_loop().time(),
             )
+            background_remaining = (
+                tuple(
+                    max(
+                        0.0,
+                        state.background_since
+                        + daemon.configuration_limits.max_background_lifetime_seconds
+                        - asyncio.get_running_loop().time(),
+                    )
+                    for state in daemon.pages.values()
+                    if state.lifecycle == "background" and state.background_since is not None
+                )
+                if daemon.configuration_limits is not None
+                else ()
+            )
+            if background_remaining:
+                remaining = min(remaining, min(background_remaining))
             if remaining == 0:
                 daemon.closing = True
                 daemon.idle_expired = True

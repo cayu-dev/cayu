@@ -34,6 +34,12 @@ _FIXTURE_PAGE_ROUTES = (
     "/oversized-name",
     "/oversized-response",
     "/popup",
+    "/popup-about-blank",
+    "/popup-burst",
+    "/popup-cross-origin",
+    "/popup-opener-child",
+    "/popup-opener-navigation",
+    "/popup-redirect",
     "/replaced",
     "/same-origin-frame",
 )
@@ -94,6 +100,33 @@ def _fixture_pages() -> dict[str, str]:
             <button id="open">Open popup</button><script>
             document.getElementById('open').onclick=()=>
             window.open('https://docs.browser.test/basic')</script>""",
+        "/popup-about-blank": """<!doctype html><title>Popup blank transition</title>
+            <button id="open">Open blank popup</button><script>
+            document.getElementById('open').onclick=()=>{
+              const child=window.open('about:blank');
+              child.location='https://docs.browser.test/basic';
+            }</script>""",
+        "/popup-burst": """<!doctype html><title>Popup burst</title>
+            <button id="open">Open popup burst</button><script>
+            document.getElementById('open').onclick=()=>{
+              for(let index=0;index<8;index++)
+                window.open('https://docs.browser.test/basic?popup='+index);
+            }</script>""",
+        "/popup-cross-origin": """<!doctype html><title>Cross-origin popup</title>
+            <button id="open">Open cross-origin popup</button><script>
+            document.getElementById('open').onclick=()=>
+            window.open('https://static.browser.test/basic')</script>""",
+        "/popup-opener-navigation": """<!doctype html><title>Popup opener navigation</title>
+            <button id="open">Open navigating popup</button><script>
+            document.getElementById('open').onclick=()=>
+            window.open('https://docs.browser.test/popup-opener-child')</script>""",
+        "/popup-opener-child": """<!doctype html><title>Popup opener child</title>
+            <script>if(opener) opener.location='https://docs.browser.test/basic'</script>
+            <main>child ready</main>""",
+        "/popup-redirect": """<!doctype html><title>Popup redirect pivot</title>
+            <button id="open">Open redirecting popup</button><script>
+            document.getElementById('open').onclick=()=>
+            window.open('https://docs.browser.test/redirect-denied')</script>""",
         "/denied-subresource": """<!doctype html><title>Denied subresource</title>
             <script src="https://static.browser.test/private/denied.js"></script><main>shell</main>""",
         "/challenge": """<!doctype html><title>Challenge</title><main>

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import copy
+import hashlib
 import http.client
 import json
 import multiprocessing
@@ -93,14 +94,131 @@ from cayu.runtime._event_projection import public_event_id, public_event_sequenc
 class _ProtocolBrowserRunner(Runner):
     def __init__(self, upstream_origin: str) -> None:
         self._upstream_origin = upstream_origin
-        self._current_url = "https://docs.browser.test/basic"
         self._revision = 0
+        self._pages: dict[str, dict[str, Any]] = {}
+        self._active_page_id: str | None = None
+        self._total_operations = 0
+        self._total_observations = 0
+        self._total_page_creations = 0
+
+    def _page_set(self) -> dict[str, Any]:
+        return {
+            "session_id": next(iter(self._pages.values()))["session_id"],
+            "active_page_id": self._active_page_id,
+            "pages": [
+                {
+                    "page_id": page["page_id"],
+                    "lifecycle": page["lifecycle"],
+                    "creation_epoch": page["creation_epoch"],
+                    "control_epoch": page["control_epoch"],
+                    "opener_page_id": page["opener_page_id"],
+                    "creating_operation_id_sha256": page["creating_operation_id_sha256"],
+                    "revision": page["revision"],
+                    "url": page["url"],
+                    "title": page["title"],
+                    "load_state": "loaded",
+                    "access_state": "available",
+                    "last_observation_revision": page["last_observation_revision"],
+                    "last_operation_id_sha256": page["last_operation_id_sha256"],
+                    "terminal_reason": page["terminal_reason"],
+                    "operation_count": page["operation_count"],
+                    "observation_count": page["observation_count"],
+                    "ref_count": page["ref_count"],
+                    "request_count": 0,
+                    "artifact_count": page["artifact_count"],
+                }
+                for page in sorted(self._pages.values(), key=lambda item: item["creation_epoch"])
+            ],
+            "total_page_creations": self._total_page_creations,
+            "total_operations": self._total_operations,
+            "total_observations": self._total_observations,
+            "total_refs": sum(page["ref_count"] for page in self._pages.values()),
+            "total_requests": 0,
+            "total_artifacts": sum(page["artifact_count"] for page in self._pages.values()),
+            "cleanup_operation_count": sum(
+                page["lifecycle"] == "closed" for page in self._pages.values()
+            ),
+        }
+
+    def _observe(self, page: dict[str, Any]) -> dict[str, Any]:
+        self._revision += 1
+        self._total_observations += 1
+        page["observation_count"] += 1
+        page["ref_count"] += 22
+        page["revision"] = f"br_acceptance_revision_{self._revision}"
+        page["last_observation_revision"] = page["revision"]
+        names = (
+            "Account",
+            "Apply",
+            "Bottom action",
+            "Continue",
+            "Covered action",
+            "Detach me",
+            "Download oversized file",
+            "Download report",
+            "Frame value",
+            "Hidden action",
+            "Name",
+            "New",
+            "Old",
+            "Open blank popup",
+            "Open cross-origin popup",
+            "Open navigating popup",
+            "Open popup",
+            "Open popup burst",
+            "Open redirecting popup",
+            "Region",
+            "Save",
+            "Unavailable",
+        )
+        refs = [
+            {
+                "ref": "ref_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:16],
+                "role": "textbox" if name in {"Account", "Frame value", "Name"} else "button",
+                "name": name,
+            }
+            for name in names
+        ]
+        return {
+            "session_id": page["session_id"],
+            "page_id": page["page_id"],
+            "revision": page["revision"],
+            "creation_epoch": page["creation_epoch"],
+            "control_epoch": page["control_epoch"],
+            "url": page["url"],
+            "title": page["title"],
+            "snapshot": "\n".join(
+                f'- button "{item["name"]}" [ref={item["ref"]}]' for item in refs
+            ),
+            "refs": refs,
+            "load_state": "loaded",
+            "access_state": "available",
+            "idle_timeout_seconds": 900,
+            "truncation_reasons": [],
+            "backend_identity": {
+                "backend": "playwright",
+                "backend_version": "1.62.0",
+                "browser": "chromium",
+                "browser_version": "acceptance-fixture",
+                "worker_protocol": "cayu.browser-session.v3",
+                "worker_version": "7",
+            },
+        }
 
     async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
         assert command.argv == list(PINNED_BROWSER_SESSION_WORKLOAD.command)
         request = json.loads(kwargs["stdin"])
-        if request["operation"] == "navigate":
-            self._current_url = request["url"]
+        operation = request["operation"]
+        delta: dict[str, Any] = {
+            "created_page_ids": [],
+            "admitted_page_ids": [],
+            "closed_page_ids": [],
+            "crashed_page_ids": [],
+            "refused": [],
+        }
+        failure: str | None = None
+        observation: dict[str, Any] | None = None
+        if operation == "navigate":
             upstream = urlsplit(self._upstream_origin)
             target = urlsplit(request["url"])
             assert upstream.hostname is not None
@@ -113,9 +231,134 @@ class _ProtocolBrowserRunner(Runner):
                 assert response.status < 500
             finally:
                 connection.close()
-        self._revision += 1
+            page = {
+                "session_id": request["session_id"],
+                "page_id": request["page_id"],
+                "lifecycle": "active",
+                "creation_epoch": 1,
+                "control_epoch": 1,
+                "opener_page_id": None,
+                "creating_operation_id_sha256": None,
+                "revision": None,
+                "url": request["url"],
+                "title": "Acceptance fixture",
+                "last_observation_revision": None,
+                "last_operation_id_sha256": hashlib.sha256(
+                    request["operation_id"].encode("utf-8")
+                ).hexdigest(),
+                "terminal_reason": None,
+                "operation_count": 1,
+                "observation_count": 0,
+                "ref_count": 0,
+                "artifact_count": 0,
+            }
+            self._pages[page["page_id"]] = page
+            self._active_page_id = page["page_id"]
+            self._total_page_creations = 1
+            self._total_operations += 1
+            observation = self._observe(page)
+            delta["created_page_ids"] = [page["page_id"]]
+            delta["admitted_page_ids"] = [page["page_id"]]
+        elif operation == "list_pages":
+            self._total_operations += 1
+        elif operation == "close":
+            return ExecResult(
+                stdout=json.dumps(
+                    {
+                        "protocol_version": "cayu.browser-session.v3",
+                        "worker_version": "7",
+                        "playwright_version": "1.62.0",
+                        "kind": "success",
+                        "allocation_disposition": "retired",
+                        "closed": True,
+                    }
+                )
+            )
+        else:
+            page = self._pages[request["page_id"]]
+            if operation == "switch_page":
+                if self._active_page_id is not None and self._active_page_id != page["page_id"]:
+                    current = self._pages[self._active_page_id]
+                    current["lifecycle"] = "background"
+                    current["control_epoch"] += 1
+                    current["revision"] = f"br_acceptance_revision_{self._revision + 1}"
+                page["lifecycle"] = "active"
+                page["control_epoch"] += 1
+                self._active_page_id = page["page_id"]
+                page["operation_count"] += 1
+                page["last_operation_id_sha256"] = hashlib.sha256(
+                    request["operation_id"].encode("utf-8")
+                ).hexdigest()
+                self._total_operations += 1
+                observation = self._observe(page)
+            elif operation == "close_page":
+                page["lifecycle"] = "closed"
+                page["control_epoch"] += 1
+                page["revision"] = None
+                page["terminal_reason"] = "closed_by_model"
+                delta["closed_page_ids"] = [page["page_id"]]
+                if self._active_page_id == page["page_id"]:
+                    self._active_page_id = next(
+                        (
+                            candidate["page_id"]
+                            for candidate in sorted(
+                                self._pages.values(),
+                                key=lambda item: item["creation_epoch"],
+                            )
+                            if candidate["lifecycle"] == "background"
+                        ),
+                        None,
+                    )
+                    if self._active_page_id is not None:
+                        self._pages[self._active_page_id]["lifecycle"] = "active"
+            else:
+                page["control_epoch"] += 1
+                page["operation_count"] += 1
+                page["last_operation_id_sha256"] = hashlib.sha256(
+                    request["operation_id"].encode("utf-8")
+                ).hexdigest()
+                self._total_operations += 1
+                if operation == "click" and urlsplit(page["url"]).path.startswith("/popup"):
+                    path = urlsplit(page["url"]).path
+                    if path == "/popup-burst":
+                        failure = "resource_exhausted"
+                    elif path == "/popup-redirect":
+                        failure = "policy_denied"
+                    else:
+                        self._total_page_creations += 1
+                        popup_id = f"bp_acceptance_popup_{self._total_page_creations}"
+                        popup_url = (
+                            "https://static.browser.test/popup"
+                            if path == "/popup-cross-origin"
+                            else "https://docs.browser.test/popup-child"
+                        )
+                        popup = {
+                            **page,
+                            "page_id": popup_id,
+                            "lifecycle": "background",
+                            "creation_epoch": self._total_page_creations,
+                            "control_epoch": 1,
+                            "opener_page_id": page["page_id"],
+                            "creating_operation_id_sha256": hashlib.sha256(
+                                request["operation_id"].encode("utf-8")
+                            ).hexdigest(),
+                            "revision": f"br_acceptance_popup_{self._total_page_creations}",
+                            "url": popup_url,
+                            "title": "Acceptance popup",
+                            "last_observation_revision": None,
+                            "last_operation_id_sha256": None,
+                            "terminal_reason": None,
+                            "operation_count": 0,
+                            "observation_count": 0,
+                            "ref_count": 0,
+                            "artifact_count": 0,
+                        }
+                        self._pages[popup_id] = popup
+                        delta["created_page_ids"] = [popup_id]
+                        delta["admitted_page_ids"] = [popup_id]
+                observation = self._observe(page)
         artifacts = []
-        if request["operation"] == "screenshot":
+        if operation == "screenshot":
             artifacts.append(
                 {
                     "kind": "screenshot",
@@ -124,39 +367,23 @@ class _ProtocolBrowserRunner(Runner):
                     "content_base64": base64.b64encode(b"acceptance-screenshot").decode("ascii"),
                 }
             )
-        return ExecResult(
-            stdout=json.dumps(
-                {
-                    "protocol_version": "cayu.browser-session.v2",
-                    "worker_version": "6",
-                    "playwright_version": "1.62.0",
-                    "kind": "success",
-                    "allocation_disposition": "live",
-                    "observation": {
-                        "session_id": request["session_id"],
-                        "page_id": request["page_id"],
-                        "revision": f"br_acceptance_revision_{self._revision}",
-                        "url": self._current_url,
-                        "title": "Acceptance fixture",
-                        "snapshot": "- document Acceptance fixture",
-                        "refs": [],
-                        "load_state": "loaded",
-                        "access_state": "available",
-                        "idle_timeout_seconds": 900,
-                        "truncation_reasons": [],
-                        "backend_identity": {
-                            "backend": "playwright",
-                            "backend_version": "1.62.0",
-                            "browser": "chromium",
-                            "browser_version": "acceptance-fixture",
-                            "worker_protocol": "cayu.browser-session.v2",
-                            "worker_version": "6",
-                        },
-                    },
-                    "artifacts": artifacts,
-                }
-            )
-        )
+            self._pages[request["page_id"]]["artifact_count"] += 1
+        page_set = self._page_set()
+        payload: dict[str, Any] = {
+            "protocol_version": "cayu.browser-session.v3",
+            "worker_version": "7",
+            "playwright_version": "1.62.0",
+            "kind": "error" if failure is not None else "success",
+            "allocation_disposition": "live",
+            "page_set": page_set,
+            "page_delta": delta,
+            "artifacts": artifacts,
+        }
+        if failure is not None:
+            payload["error"] = failure
+        elif observation is not None:
+            payload["observation"] = observation
+        return ExecResult(stdout=json.dumps(payload))
 
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
         return ExecutionAdmissionCandidate(
@@ -583,6 +810,7 @@ def test_stale_reference_cases_reuse_pre_action_revision_and_reference(action: s
         "session_id": "browser-session",
         "page_id": "browser-page",
         "revision": "before-action",
+        "control_epoch": 1,
         "refs": [
             {"name": "Save", "ref": "save-before"},
             {"name": "Name", "ref": "name-before"},
@@ -593,6 +821,7 @@ def test_stale_reference_cases_reuse_pre_action_revision_and_reference(action: s
     after = {
         **before,
         "revision": "after-action",
+        "control_epoch": 2,
         "refs": [
             {"name": "Save", "ref": "save-after"},
             {"name": "Download report", "ref": "download-after"},
@@ -662,6 +891,7 @@ def test_cayu_owned_fault_executor_delivers_real_task_cancellation(
         ("crash-during-execution", 2),
         ("crash-after-effect", 1),
         ("crash-during-cleanup", 2),
+        ("page-allocation-loss", 1),
     ],
 )
 def test_cayu_owned_fault_executor_crashes_browser_without_crashing_cayu(

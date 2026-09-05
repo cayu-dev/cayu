@@ -99,6 +99,22 @@ _INTERACTIVE_OPTION_NAMES = frozenset(
         "max_parent_sessions",
         "max_sessions",
         "max_operations",
+        "multi_page",
+        "popup_policy",
+        "max_pages",
+        "max_provisional_pages",
+        "max_page_creations_per_operation",
+        "max_total_page_creations",
+        "max_background_lifetime_seconds",
+        "max_operations_per_page",
+        "max_observations_per_page",
+        "max_total_observations",
+        "max_refs_per_page",
+        "max_total_refs",
+        "max_total_requests",
+        "max_artifacts_per_page",
+        "max_total_artifacts",
+        "max_page_cleanup_operations",
     }
 )
 

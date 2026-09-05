@@ -15,6 +15,11 @@ from cayu.tools.browser import (
 from cayu.tools.browser_session import (
     BROWSER_SESSION_PROTOCOL_VERSION,
     BROWSER_SESSION_WORKER_VERSION,
+    BrowserPageRefusal,
+    BrowserPageSetDelta,
+    BrowserPageSetState,
+    BrowserPageSummary,
+    BrowserPopupPolicy,
     BrowserSessionTool,
 )
 from cayu.tools.child_sessions import ChildSessionResultTool
@@ -164,6 +169,11 @@ __all__ = [
     "ArtifactReadRequest",
     "ArtifactReader",
     "BackgroundSubagentTaskRegistry",
+    "BrowserPageRefusal",
+    "BrowserPageSetDelta",
+    "BrowserPageSetState",
+    "BrowserPageSummary",
+    "BrowserPopupPolicy",
     "BrowserSessionTool",
     "BrowserWebFetchAdapter",
     "ChildSessionResultTool",

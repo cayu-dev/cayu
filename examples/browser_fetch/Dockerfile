@@ -13,11 +13,11 @@ RUN python -m pip install --no-cache-dir "playwright==1.62.0" \
 FROM ${PYTHON_IMAGE}
 
 LABEL org.opencontainers.image.title="Cayu browser inspection worker" \
-      org.opencontainers.image.version="6-playwright-1.62.0" \
+      org.opencontainers.image.version="7-playwright-1.62.0" \
       dev.cayu.browser-fetch.protocol="cayu.browser-fetch.v4" \
       dev.cayu.browser-fetch.worker="4" \
-      dev.cayu.browser-session.protocol="cayu.browser-session.v2" \
-      dev.cayu.browser-session.worker="6" \
+      dev.cayu.browser-session.protocol="cayu.browser-session.v3" \
+      dev.cayu.browser-session.worker="7" \
       dev.cayu.browser-fetch.playwright="1.62.0"
 
 USER root

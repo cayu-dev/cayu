@@ -20,6 +20,7 @@ import pytest
 from cayu import (
     ApprovedEgressDestination,
     BrowserEgressPolicy,
+    BrowserPopupPolicy,
     BrowserSessionTool,
     BrowserWebFetchAdapter,
     ExecCommand,
@@ -241,10 +242,23 @@ window.open('https://docs.browser.test/popup-target');
         if self.path == "/interactive-popup-guard":
             body = b"""<!doctype html>
 <html><head><base target="_blank"><title>Popup guard</title></head>
-<body><a href="https://docs.browser.test/interactive-popup-target">Open target</a><script>
-Window.prototype.open.call(window, 'https://docs.browser.test/interactive-popup-target');
+<body><a href="https://docs.browser.test/interactive-popup-blocked-target">Open target</a><script>
+Window.prototype.open.call(window, 'https://docs.browser.test/interactive-popup-blocked-target');
 document.querySelector('a').click();
 </script></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/interactive-popup-click":
+            body = b"""<!doctype html>
+<html><head><title>Popup opener</title></head>
+<body><a aria-label="Open popup" target="_blank"
+href="https://docs.browser.test/interactive-popup-target">Open popup</a></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/interactive-popup-target":
+            body = b"""<!doctype html>
+<html><head><title>Popup target</title></head>
+<body><main>Admitted secondary page</main></body></html>"""
             self._send(200, "text/html; charset=utf-8", body)
             return
         if self.path == "/interactive-accessibility-amplification":
@@ -507,6 +521,83 @@ async def _drive_browser_fetch() -> dict[str, Any]:
                 "operation_id": "interactive-popup-close-1",
             },
         )
+        multi_page_tool = BrowserSessionTool(
+            expected_runner_candidate="docker",
+            max_snapshot_bytes=32 * 1024,
+            max_refs=64,
+            max_artifact_bytes=1024 * 1024,
+            max_wait_ms=30_000,
+            multi_page=True,
+            popup_policy=BrowserPopupPolicy(
+                mode="same_origin",
+                allowed_operations=("click",),
+            ),
+            max_pages=2,
+            max_provisional_pages=1,
+            max_page_creations_per_operation=1,
+            max_total_page_creations=2,
+        )
+        multi_page_navigate = await multi_page_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive-popup-click",
+                "operation_id": "multi-page-navigate-1",
+            },
+        )
+        assert multi_page_navigate.is_error is False
+        multi_page_root = dict(multi_page_navigate.structured or {})
+        popup_ref = _snapshot_ref(multi_page_root["snapshot"], "Open popup")
+        multi_page_click = await multi_page_tool.run(
+            interactive_context,
+            {
+                "operation": "click",
+                "session_id": multi_page_root["session_id"],
+                "page_id": multi_page_root["page_id"],
+                "expected_revision": multi_page_root["revision"],
+                "expected_control_epoch": multi_page_root["control_epoch"],
+                "ref": popup_ref,
+                "operation_id": "multi-page-click-1",
+            },
+        )
+        assert multi_page_click.is_error is False
+        admitted_page_ids = multi_page_click.structured["page_delta"]["admitted_page_ids"]
+        assert len(admitted_page_ids) == 1, multi_page_click
+        multi_page_popup_id = admitted_page_ids[0]
+        multi_page_list = await multi_page_tool.run(
+            interactive_context,
+            {
+                "operation": "list_pages",
+                "session_id": multi_page_root["session_id"],
+                "operation_id": "multi-page-list-1",
+            },
+        )
+        multi_page_switch = await multi_page_tool.run(
+            interactive_context,
+            {
+                "operation": "switch_page",
+                "session_id": multi_page_root["session_id"],
+                "page_id": multi_page_popup_id,
+                "operation_id": "multi-page-switch-1",
+            },
+        )
+        multi_page_close_page = await multi_page_tool.run(
+            interactive_context,
+            {
+                "operation": "close_page",
+                "session_id": multi_page_root["session_id"],
+                "page_id": multi_page_popup_id,
+                "operation_id": "multi-page-close-page-1",
+            },
+        )
+        multi_page_close = await multi_page_tool.run(
+            interactive_context,
+            {
+                "operation": "close",
+                "session_id": multi_page_root["session_id"],
+                "operation_id": "multi-page-close-1",
+            },
+        )
         interactive_accessibility_amplification = await browser_session_tool.run(
             interactive_context,
             {
@@ -579,6 +670,7 @@ async def _drive_browser_fetch() -> dict[str, Any]:
                 "session_id": interactive_open["session_id"],
                 "page_id": interactive_open["page_id"],
                 "expected_revision": interactive_open["revision"],
+                "expected_control_epoch": interactive_open["control_epoch"],
                 "ref": name_ref,
                 "value": "Alice",
                 "operation_id": "interactive-fill-1",
@@ -594,6 +686,7 @@ async def _drive_browser_fetch() -> dict[str, Any]:
                 "session_id": interactive_filled["session_id"],
                 "page_id": interactive_filled["page_id"],
                 "expected_revision": interactive_filled["revision"],
+                "expected_control_epoch": interactive_filled["control_epoch"],
                 "ref": save_ref,
                 "operation_id": "interactive-click-1",
             },
@@ -607,6 +700,7 @@ async def _drive_browser_fetch() -> dict[str, Any]:
                 "session_id": interactive_clicked["session_id"],
                 "page_id": interactive_clicked["page_id"],
                 "expected_revision": interactive_clicked["revision"],
+                "expected_control_epoch": interactive_clicked["control_epoch"],
                 "operation_id": "interactive-screenshot-1",
             },
         )
@@ -971,6 +1065,12 @@ asyncio.run(main())
             "interactive_navigate": interactive_navigate,
             "interactive_popup_guard": interactive_popup_guard,
             "interactive_popup_close": interactive_popup_close,
+            "multi_page_navigate": multi_page_navigate,
+            "multi_page_click": multi_page_click,
+            "multi_page_list": multi_page_list,
+            "multi_page_switch": multi_page_switch,
+            "multi_page_close_page": multi_page_close_page,
+            "multi_page_close": multi_page_close,
             "interactive_accessibility_amplification": (interactive_accessibility_amplification),
             "interactive_accessibility_url_amplification": (
                 interactive_accessibility_url_amplification
@@ -1062,7 +1162,22 @@ def test_interactive_browser_preserves_state_and_publishes_artifacts(
     assert stored.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert browser_fetch_results["interactive_close"].structured["closed"] is True
     denied = browser_fetch_results["interactive_denied"].structured
-    assert set(denied) == {"error", "execution", "session_id", "page_id"}
+    assert set(denied) == {
+        "allocation_disposition",
+        "error",
+        "execution",
+        "page_delta",
+        "page_id",
+        "session_id",
+    }
+    assert denied["allocation_disposition"] == "retired"
+    assert denied["page_delta"] == {
+        "admitted_page_ids": [],
+        "closed_page_ids": [],
+        "crashed_page_ids": [],
+        "created_page_ids": [],
+        "refused": [],
+    }
     assert denied["error"] == "fetch_failed"
     assert denied["execution"] == {
         "admission": "admitted",
@@ -1084,9 +1199,38 @@ def test_interactive_browser_blocks_inherited_and_prototype_popup_entrances(
     assert opened.is_error is False
     assert opened.structured["url"] == "https://docs.browser.test/interactive-popup-guard"
     assert closed.structured["closed"] is True
-    assert ("docs.browser.test", "/interactive-popup-target") not in browser_fetch_results[
-        "requests"
-    ]
+    assert (
+        "docs.browser.test",
+        "/interactive-popup-blocked-target",
+    ) not in browser_fetch_results["requests"]
+
+
+def test_interactive_browser_admits_and_controls_bounded_same_origin_popup(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    opened = browser_fetch_results["multi_page_navigate"]
+    clicked = browser_fetch_results["multi_page_click"]
+    listed = browser_fetch_results["multi_page_list"]
+    switched = browser_fetch_results["multi_page_switch"]
+    closed_page = browser_fetch_results["multi_page_close_page"]
+    closed_session = browser_fetch_results["multi_page_close"]
+
+    assert opened.is_error is False
+    assert clicked.is_error is False
+    popup_ids = clicked.structured["page_delta"]["admitted_page_ids"]
+    assert len(popup_ids) == 1
+    popup_id = popup_ids[0]
+    pages = {page["page_id"]: page for page in listed.structured["pages"]}
+    assert set(pages) == {opened.structured["page_id"], popup_id}
+    assert pages[popup_id]["lifecycle"] == "background"
+    assert pages[popup_id]["opener_page_id"] == opened.structured["page_id"]
+    assert switched.structured["page_id"] == popup_id
+    assert switched.structured["title"] == "Popup target"
+    assert "Admitted secondary page" in switched.structured["snapshot"]
+    assert closed_page.structured["page_delta"]["closed_page_ids"] == [popup_id]
+    assert closed_page.structured["active_page_id"] == opened.structured["page_id"]
+    assert closed_session.structured["closed"] is True
+    assert ("docs.browser.test", "/interactive-popup-target") in browser_fetch_results["requests"]
 
 
 def test_interactive_browser_rejects_accessibility_amplification_before_snapshot(

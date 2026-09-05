@@ -1902,8 +1902,12 @@ def test_guest_profile_owner_start_preserves_caller_cancellation() -> None:
         ),
     )
 
-    async def blocked_start(*, timeout_seconds: float) -> guest._TemporaryProfileOwner:
-        del timeout_seconds
+    async def blocked_start(
+        *,
+        timeout_seconds: float,
+        startup_timeout_seconds: float | None = None,
+    ) -> guest._TemporaryProfileOwner:
+        del timeout_seconds, startup_timeout_seconds
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
@@ -1978,8 +1982,12 @@ def test_guest_profile_owner_start_timeout_reports_unproven_cleanup() -> None:
         ),
     )
 
-    async def blocked_start(*, timeout_seconds: float) -> guest._TemporaryProfileOwner:
-        del timeout_seconds
+    async def blocked_start(
+        *,
+        timeout_seconds: float,
+        startup_timeout_seconds: float | None = None,
+    ) -> guest._TemporaryProfileOwner:
+        del timeout_seconds, startup_timeout_seconds
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 

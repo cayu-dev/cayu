@@ -21,8 +21,8 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:6-playwright-1.62.0` image, the
-`cayu.browser-session.v2` protocol and worker version 6, brokered deny-by-default egress,
+`cayu-browser-fetch:7-playwright-1.62.0` image, the
+`cayu.browser-session.v3` protocol and worker version 7, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -32,8 +32,11 @@ host Playwright, host HTTP, another provider, a CLI, or MCP.
 
 One ordinary `browser_session` tool exposes only `navigate`, `observe`,
 `click`, `fill`, `select`, `press`, bounded `wait`, `screenshot`, `download`,
-and `close`. The first navigation creates Cayu-owned opaque `session_id` and
-`page_id` values. Every observation returns:
+`list_pages`, `switch_page`, `close_page`, and `close`. The first navigation
+creates Cayu-owned opaque `session_id` and `page_id` values. Cayu does not
+currently expose `new_page`: additional pages can arise only as a
+policy-admitted effect of an action on the active page. Every observation
+returns:
 
 - an opaque page `revision` and revision-bound Cayu element refs;
 - a byte- and ref-bounded Playwright AI-mode ARIA snapshot;
@@ -44,17 +47,91 @@ Playwright `aria-ref` values remain private inside the guest worker. Every
 operation requires a stable `operation_id`. Cayu
 replaces them with random opaque refs and resolves them only through strict
 Playwright locators. Ref actions require the matching Cayu session, page,
-revision, ref, and a stable `operation_id`. Cayu rejects a stale revision or
-unknown ref before runner dispatch. Once an action is admitted, the old refs
-are invalid even if the action fails; observe again before interacting.
+revision, control epoch, ref, and stable `operation_id`. Cayu rejects a stale
+revision, stale control epoch, cross-page ref, or unknown ref before runner
+dispatch. Once an action is admitted, the old refs are invalid even if the
+action fails; observe again before interacting. Switching pages invalidates
+both the prior and selected page namespaces and returns a fresh observation for
+the selected page. Closing a page invalidates that page and deterministically
+selects the earliest surviving admitted page when possible.
 
-The worker keeps one bounded live Playwright allocation with one page/tab
-inside the selected runner, so page state, cookies, web storage, tab identity,
-and navigation state survive ordinary model turns for that allocation's
-lifetime. A pre-document guard denies explicit and inherited browsing-context
-targets and both ordinary and prototype `window.open` calls; the context popup
-observer remains a fail-safe that retires the allocation if an extra page still
-appears. The default idle lifetime is 900 seconds and
+The default remains single-page mode. Its pre-document guard denies explicit
+and inherited browsing-context targets and both ordinary and prototype
+`window.open` calls; the page popup observer and context-wide request guard
+remain fail-safes that retire the allocation if an extra page still appears.
+Applications opt into bounded multi-page behavior with `multi_page=True`, an application-owned
+`BrowserPopupPolicy`, and finite page limits. The model cannot relax the policy
+or select a new context, profile, proxy, credential, header, extension,
+provider, or runner in an action. Popup authority can be granted only around an
+explicit post-navigation `click`, `fill`, `select`, `press`, or `wait`; initial
+`navigate` never receives popup authority, so document-load scripts start with
+the pre-document guard closed. For example:
+
+```python
+from cayu import (
+    DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE,
+    BrowserPopupPolicy,
+    WebBridge,
+)
+
+browser = WebBridge.sandboxed_browser(
+    environment=browser_environment_factory,
+    browser_image=DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE,
+    interactive=True,
+    interactive_options={
+        "multi_page": True,
+        "popup_policy": BrowserPopupPolicy(
+            mode="destination_policy",
+            allowed_operations=("click",),
+            allowed_opener_origins=("https://app.example/",),
+            allowed_destination_origins=(
+                "https://app.example/",
+                "https://login.example/",
+            ),
+        ),
+        "max_pages": 3,
+        "max_provisional_pages": 1,
+        "max_page_creations_per_operation": 1,
+        "max_total_page_creations": 8,
+    },
+)
+```
+
+`list_pages` returns only the bounded page registry: opaque IDs, lifecycle and
+lineage, revision/control identities, bounded canonical URL/title/access/load
+state, terminal reason, and counters. It never returns DOM, history, cookies,
+storage, screenshots, Chromium targets, CDP sessions, or window handles.
+`switch_page` and `close_page` accept only Cayu page IDs. All pages remain in
+one browser context, so they intentionally share cookies, web storage, selected
+profile authority, credential routing, and egress policy. They are tabs in one
+security boundary—not independent browser profiles or independent security
+boundaries.
+
+A popup begins as an untrusted provisional effect. A token-gated context init
+guard is installed before the first page is created, defaults closed in every
+new document, and is armed only for the exact bounded application-admitted
+action. The context-wide route guard applies the same brokered
+egress, destination/redirect/access checks, response/request limits, download
+policy, and credential isolation throughout `about:blank`, opener inheritance,
+immediate redirect, and self-navigation. Model-visible admission occurs only
+after that transition settles inside the configured popup policy. A denied or
+over-capacity popup is closed through bounded cleanup and appears only as a
+bounded refusal. A popup burst cannot grow the registry, cleanup queue, event
+stream, or diagnostics beyond the configured limits.
+Initial popup document requests support GET. Non-GET requests, including POST
+forms targeting a new page, are refused before network dispatch; they are never
+converted into GET requests. Provisional requests follow their exact browser
+frame identity independently of URL changes or callback order.
+Downloads are admitted only for the exact active-page `download` operation;
+an automatic or popup-initiated download is cancelled and its page is
+quarantined through the same bounded cleanup owner.
+
+One action that creates pages is still one operation. Its terminal result
+contains a bounded `page_delta` and complete bounded `page_set`. An
+acknowledgement lost after popup creation is `outcome_ambiguous`; Cayu never
+re-clicks to recreate a page. An exact duplicate may recover the original delta
+only from the same live allocation's exact guest receipt. The default idle
+lifetime is 900 seconds and
 applications may configure `idle_timeout_seconds` from 1 through 3,600. The
 deadline resets only after an operation has produced its response; expiration
 waits for an already-admitted operation and rejects newly queued work before
@@ -67,8 +144,18 @@ outcome-ambiguous and capacity-bearing.
 
 Requests, redirect hops, response bytes, URL/title bytes, observation bytes,
 DOM nodes, snapshot depth, refs, operation wait, artifact bytes, screenshot
-width, height, and pixel count, live allocations, parent-session state, and
-operation identities have independent application-owned ceilings. DOM-node and
+width, height, and pixel count, live and provisional pages, page creations per
+operation and per allocation, background lifetime, per-page and aggregate
+operations/observations, per-observation and cumulative per-page/aggregate
+refs, per-page/aggregate requests and artifacts, page cleanup, live
+allocations, parent-session state, and operation identities have independent
+application-owned ceilings. Construction rejects unbounded or inconsistent
+settings. `max_refs` bounds one observation, while `max_refs_per_page` and
+`max_total_refs` independently bound cumulative allocation consumption.
+Per-page and page-set `ref_count` values are cumulative allocation
+consumption counters rather than the number of refs still actionable; only refs
+from the active page's exact latest returned observation carry action authority.
+DOM-node and
 accessibility-source admission share one script-and-animation-frozen page window before
 Playwright materializes the depth-bounded AI snapshot. Cayu also applies a
 conservative aggregate expansion ceiling across nodes, source-derived names,
@@ -78,11 +165,13 @@ unbounded accessible scalar or repeated-name amplification.
 Full-page geometry is measured and admitted before Chromium captures the
 raster. Downloads are cancelled as soon as request policy or the response-byte
 ceiling fails and are read only after a bounded regular-file result settles.
-`close` remains admissible after the
-normal operation-id table is full and owns a separately bounded idempotency
-receipt. It settles browser/context/driver cleanup before acknowledging;
-cleanup failure returns `cleanup_failed`. Environment teardown remains the
-outer cleanup fence.
+`close_page` and `close` remain admissible after the normal operation-id table
+is full and own separate bounded idempotency/cleanup capacity. Whole-session
+close settles every admitted or provisional page, pending cleanup task,
+context, browser, driver, and temporary profile before acknowledging. One page
+failure cannot be hidden by another resource closing successfully; failure is
+reported as bounded `cleanup_failed`/uncertain evidence. Environment teardown
+remains the outer cleanup fence.
 
 ## Effects, evidence, and failure
 
@@ -134,14 +223,17 @@ therefore do not reset when a fresh Cayu process reconnects, while `close`
 retains its separate bounded cleanup allowance.
 
 A fresh Cayu process may reconnect only to the exact still-live allocation
-identified by that durable receipt. It reconstructs the last terminal browser
-session/page revision and opaque refs, then revalidates the materialized runner
-and worker before dispatch. A recovered `observe` uses a new operation identity,
-advances the revision, and publishes fresh refs. Evidence marked uncertain does
-not authorize pre-loss refs; observe again before an action. The durable
-continuity/session records contain only opaque identities, bounded status,
-revisions, and refs—not cookies, local/session storage, profile files,
-credentials, page content, or artifact bytes. A sealed terminal operation
+identified by that durable receipt. It reconstructs the exact bounded surviving
+page registry, counters, lifecycles, revisions, control epochs, and ref
+authority, then revalidates the materialized runner and worker before dispatch.
+Closed or crashed targets are reconciled from guest evidence; uncertain pages
+do not authorize pre-loss refs and require a new observation before an action.
+Pending recovery itself never lists, switches, closes, creates, navigates, or
+otherwise operates a page. A recovered `observe` is a new admitted operation
+with a new identity. The durable continuity/session records contain only opaque
+identities, bounded safe status and counters, revisions, and refs—not cookies,
+local/session storage, profile files, credentials, page content, history,
+screenshots, downloads, or Chromium identifiers. A sealed terminal operation
 receipt necessarily retains its bounded `ToolResult`, including bounded URL,
 title, snapshot, and refs needed for exact replay; it never retains raw binary
 artifact bytes or browser-profile contents.
@@ -169,9 +261,12 @@ The failure categories are deliberately distinct:
 - `cleanup_failed` means explicit browser cleanup did not settle.
 
 These terms are not interchangeable. A **live-allocation reconnect** continues
-the same admitted browser process and its surviving page, cookies, storage, and
-navigation state. **Browser-profile restoration** would recreate only a
-separately declared persisted subset; Cayu does not currently offer that mode.
+the same admitted browser process and its exact surviving page set, cookies,
+storage, and navigation state. Losing that allocation loses the entire page set;
+Cayu never rebuilds tabs from stored URLs or history. **Browser-profile
+restoration** would create a fresh page set under separately declared persisted
+profile authority and must never reuse old page IDs, refs, tabs, URLs, or
+operation receipts; Cayu does not currently offer that mode.
 A **page reload** is a new navigation and may change external state. An
 **operation replay** repeats an old request and is forbidden after ambiguity. A
 **full execution-environment snapshot** would preserve process/VM state; this

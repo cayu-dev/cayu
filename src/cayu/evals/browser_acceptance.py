@@ -309,9 +309,12 @@ class BrowserAcceptanceFaultScenario(StrEnum):
     PROCESS_AFTER_ARTIFACT = "process_after_artifact"
     PROCESS_AFTER_TERMINAL = "process_after_terminal"
     BROWSER_BEFORE_DISPATCH = "browser_before_dispatch"
+    BROWSER_ALLOCATION_LOSS = "browser_allocation_loss"
     BROWSER_DURING_EXECUTION = "browser_during_execution"
     BROWSER_AFTER_EFFECT = "browser_after_effect"
     BROWSER_DURING_CLEANUP = "browser_during_cleanup"
+    BROWSER_ACTIVE_PAGE_CRASH = "browser_active_page_crash"
+    BROWSER_BACKGROUND_PAGE_CRASH = "browser_background_page_crash"
     ACKNOWLEDGEMENT_LOSS = "acknowledgement_loss"
 
 

@@ -246,7 +246,7 @@ Prefer `WebBridge.sandboxed_browser(environment=..., browser_image=...)` for
 application setup. It validates those runner claims and artifact storage before
 agent registration, binds their identities plus the exact environment/factory
 egress authority into the constructed tools, and
-requires the pinned `cayu-browser-fetch:6-playwright-1.62.0` image declaration.
+requires the pinned `cayu-browser-fetch:7-playwright-1.62.0` image declaration.
 The versioned worker handshake still verifies protocol, worker, and Playwright
 versions on every dispatch. Browser inspection needs no mutable workspace; the
 profile records `workspace_requirement="none"` instead of silently depending

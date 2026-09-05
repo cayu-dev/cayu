@@ -95,13 +95,13 @@ factory = VirtualEgressEnvironmentFactory(
         destination="docs.example.com", policy_name=policy.name,
     )],
     runner_kind="docker",
-    image="cayu-browser-fetch:6-playwright-1.62.0",
+    image="cayu-browser-fetch:7-playwright-1.62.0",
     artifact_store=artifacts,
     execution_profile_identity=browser_environment_identity,
 )
 bridge = WebBridge.sandboxed_browser(
     environment=factory,
-    browser_image="cayu-browser-fetch:6-playwright-1.62.0",
+    browser_image="cayu-browser-fetch:7-playwright-1.62.0",
 )
 app.register_environment_factory(
     EnvironmentSpec(
