@@ -420,6 +420,101 @@ class SecretRedactor:
             omitted_leading_atomic_piece or boundary_truncated,
         )
 
+    def redact_utf8_page_with_progress(
+        self,
+        value: bytes,
+        *,
+        window_offset: int,
+        page_offset: int,
+        page_end: int,
+        total_bytes: int,
+        max_bytes: int,
+    ) -> tuple[str, int]:
+        """Return a framed text page and the exact next stored-byte position.
+
+        Unlike prefix capture, this operation requires lookbehind and lookahead
+        proving the page's redaction context. It never splits an atomic redaction
+        span or advances past output omitted by the byte bound. A source span or
+        replacement that cannot fit raises ValueError rather than losing text.
+        """
+        if type(value) is not bytes:
+            raise TypeError("SecretRedactor page source must be bytes.")
+        for name, number in (
+            ("window_offset", window_offset),
+            ("page_offset", page_offset),
+            ("page_end", page_end),
+            ("total_bytes", total_bytes),
+            ("max_bytes", max_bytes),
+        ):
+            if type(number) is not int or number < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
+        if max_bytes == 0 or not window_offset <= page_offset <= page_end <= total_bytes:
+            raise ValueError("Invalid redaction page bounds.")
+        overlap = self.pagination_overlap_utf8_bytes if self.has_values else 0
+        if (
+            window_offset > (max(0, page_offset - overlap - 3) if overlap else page_offset)
+            or window_offset + len(value) < min(total_bytes, page_end + overlap + 4)
+            or window_offset + len(value) > total_bytes
+        ):
+            raise ValueError("Redaction page requires a complete bounded framing window.")
+        start = page_offset - window_offset
+        end = page_end - window_offset
+        if not self.has_values:
+            raw = value[start:end][:max_bytes]
+            # Callers supply scalar-aligned source bounds; an output bound may
+            # shorten the last scalar without consuming it.
+            try:
+                text = raw.decode("utf-8", "strict")
+            except UnicodeDecodeError as exc:
+                if exc.reason != "unexpected end of data":
+                    raise
+                raw = raw[: exc.start]
+                text = raw.decode("utf-8")
+            if not raw and page_offset < total_bytes:
+                raise ValueError("The next UTF-8 scalar cannot fit this page.")
+            return text, page_offset + len(raw)
+        pieces = _stabilize_redacted_piece_sequence(
+            _source_redaction_pieces(value, ordered_patterns=self._ordered_byte_patterns()),
+            secret_patterns=self._secret_byte_patterns(),
+        )
+        projected = bytearray()
+        consumed = start
+        for piece in pieces:
+            if piece.source_end <= start:
+                continue
+            if piece.source_start >= end:
+                break
+            if not piece.linear:
+                if piece.source_start < start:
+                    raise ValueError("Page offset splits an atomic redaction span.")
+                if piece.source_end > end or len(projected) + len(piece.value) > max_bytes:
+                    break
+                projected.extend(piece.value)
+                consumed = piece.source_end
+            else:
+                local_start = max(start, piece.source_start)
+                local_end = min(end, piece.source_end, local_start + max_bytes - len(projected))
+                raw = piece.value[local_start - piece.source_start : local_end - piece.source_start]
+                try:
+                    raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    if exc.reason != "unexpected end of data":
+                        raise
+                    raw = raw[: exc.start]
+                projected.extend(raw)
+                consumed = local_start + len(raw)
+                if consumed < min(end, piece.source_end):
+                    break
+        if consumed == start and page_offset < total_bytes:
+            raise ValueError("The next atomic redaction span cannot fit this page.")
+        stable = _stabilize_redacted_bytes(
+            bytes(projected),
+            secret_patterns=self._secret_byte_patterns(),
+        )
+        if len(stable) > max_bytes:
+            raise ValueError("Stabilized redaction output cannot fit this page.")
+        return stable.decode("utf-8"), window_offset + consumed
+
     def redact_bytes_page(
         self,
         value: bytes,

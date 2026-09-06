@@ -3965,7 +3965,7 @@ def test_staged_result_projection_preserves_externalized_artifact_authority(tmp_
         app = CayuApp(
             session_store=store,
             tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
-                max_inline_bytes=64,
+                max_inline_bytes=256,
                 max_inline_token_estimate=None,
                 preview_bytes=10,
             ),
@@ -4072,7 +4072,7 @@ def test_observational_stage_tracks_projected_result_after_lost_acknowledgement(
         app = CayuApp(
             session_store=store,
             tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
-                max_inline_bytes=64,
+                max_inline_bytes=256,
                 max_inline_token_estimate=None,
                 preview_bytes=10,
             ),

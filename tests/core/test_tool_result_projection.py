@@ -532,12 +532,12 @@ def _attest_runtime_projection(event: Event) -> Event:
 def test_artifact_externalizing_policy_keeps_exact_byte_threshold_unchanged(tmp_path) -> None:
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=32,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
         preview_bytes=3,
     )
     result = ToolResult(
-        content="é" * 16,
+        content="é" * 128,
         structured={"rows": 2},
         artifacts=[{"type": "existing", "artifact_id": "existing"}],
         is_error=True,
@@ -550,10 +550,10 @@ def test_artifact_externalizing_policy_keeps_exact_byte_threshold_unchanged(tmp_
         "schema_version": 1,
         "status": "unchanged",
         "policy_id": "cayu.artifact_externalizing_tool_result.v1",
-        "original_bytes": 32,
-        "projected_bytes": 32,
-        "original_token_estimate": 4,
-        "projected_token_estimate": 4,
+        "original_bytes": 256,
+        "projected_bytes": 256,
+        "original_token_estimate": 32,
+        "projected_token_estimate": 32,
         "token_estimation_method": "unicode_codepoints_divided_by_4_ceiling_v1",
     }
     assert asyncio.run(store.list(session_id="sess_projection")).artifacts == ()
@@ -562,12 +562,12 @@ def test_artifact_externalizing_policy_keeps_exact_byte_threshold_unchanged(tmp_
 def test_artifact_externalizing_policy_externalizes_unicode_and_reuses_identity(tmp_path) -> None:
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=32,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
         preview_bytes=3,
     )
     result = ToolResult(
-        content=("é" * 16) + "a",
+        content=("é" * 128) + "a",
         structured={"rows": 3},
         artifacts=[
             {"type": "existing", "artifact_id": "existing"},
@@ -589,7 +589,7 @@ def test_artifact_externalizing_policy_externalizes_unicode_and_reuses_identity(
 
     assert first == second
     assert first.record.status == "externalized"
-    assert first.record.original_bytes == 33
+    assert first.record.original_bytes == 257
     assert first.record.artifact_id is not None
     assert first.record.artifact_sha256 is not None
     assert first.result.is_error is True
@@ -603,15 +603,15 @@ def test_artifact_externalizing_policy_externalizes_unicode_and_reuses_identity(
         "store_id": "artifacts",
         "filename": f"tool-result-{first.record.artifact_id}.txt",
         "content_type": "text/plain; charset=utf-8",
-        "size_bytes": 33,
+        "size_bytes": 257,
         "sha256": first.record.artifact_sha256,
         "scope": "session",
         "session_id_sha256": hashlib.sha256(b"sess_projection").hexdigest(),
         "projection_authority": "cayu.tool_result_projection.v1",
-        "readback_max_bytes": 14,
+        "readback_max_bytes": 64,
     }
     assert "\né\n" in first.result.content
-    assert ("é" * 16) + "a" not in first.result.content
+    assert ("é" * 128) + "a" not in first.result.content
     assert first.record.projected_bytes == len(first.result.content.encode("utf-8"))
     assert (
         first.record.projected_token_estimate
@@ -621,7 +621,7 @@ def test_artifact_externalizing_policy_externalizes_unicode_and_reuses_identity(
     listed = asyncio.run(store.list(session_id="sess_projection"))
     assert len(listed.artifacts) == 1
     stored = asyncio.run(store.read_bytes(first.record.artifact_id))
-    assert stored.content == (("é" * 16) + "a").encode()
+    assert stored.content == (("é" * 128) + "a").encode()
     assert stored.metadata.metadata == {
         "type": "cayu.tool_result_artifact.v1",
         "logical_identity_sha256": first.record.logical_identity_sha256,
@@ -635,14 +635,14 @@ def test_artifact_externalizing_policy_uses_declared_token_estimate_threshold(tm
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     policy = ArtifactExternalizingToolResultPolicy(
         max_inline_bytes=None,
-        max_inline_token_estimate=5,
+        max_inline_token_estimate=64,
         preview_bytes=0,
     )
 
     exact = asyncio.run(
         policy.project(
             _request(
-                result=ToolResult(content="a" * 20),
+                result=ToolResult(content="a" * 256),
                 artifact_store=store,
             )
         )
@@ -650,7 +650,7 @@ def test_artifact_externalizing_policy_uses_declared_token_estimate_threshold(tm
     over = asyncio.run(
         policy.project(
             _request(
-                result=ToolResult(content="a" * 21),
+                result=ToolResult(content="a" * 257),
                 artifact_store=store,
             )
         )
@@ -665,13 +665,13 @@ def test_artifact_externalizing_policy_uses_declared_token_estimate_threshold(tm
     )
 
     assert exact.record.status == "unchanged"
-    assert exact.record.original_token_estimate == 5
+    assert exact.record.original_token_estimate == 64
     assert over.record.status == "externalized"
-    assert over.record.original_token_estimate == 6
+    assert over.record.original_token_estimate == 65
     assert empty.record.status == "unchanged"
     custom_estimator = ArtifactExternalizingToolResultPolicy(
         max_inline_bytes=None,
-        max_inline_token_estimate=10,
+        max_inline_token_estimate=128,
         preview_bytes=0,
         chars_per_token=2,
     )
@@ -709,7 +709,7 @@ def test_artifact_externalizing_policy_uses_declared_token_estimate_threshold(tm
 
 def test_artifact_externalizing_policy_fails_bounded_without_artifact_store() -> None:
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=64,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
         preview_bytes=0,
     )
@@ -740,14 +740,14 @@ def test_artifact_externalizing_policy_bounds_the_store_identity_before_persiste
         store_id="store-" + ("s" * 1_000),
     )
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=64,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
     )
 
     projection = asyncio.run(
         policy.project(
             _request(
-                result=ToolResult(content="oversized" * 10),
+                result=ToolResult(content="oversized" * 100),
                 artifact_store=store,
             )
         )
@@ -765,7 +765,7 @@ def test_artifact_reference_is_bounded_for_an_extreme_session_identity(tmp_path)
         store_id="bounded-store",
     )
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=64,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
         preview_bytes=0,
     )
@@ -774,7 +774,7 @@ def test_artifact_reference_is_bounded_for_an_extreme_session_identity(tmp_path)
     projection = asyncio.run(
         policy.project(
             ToolResultProjectionRequest(
-                result=ToolResult(content="oversized" * 10),
+                result=ToolResult(content="oversized" * 100),
                 session_id=session_id,
                 agent_name="assistant",
                 environment_name="local",
@@ -826,7 +826,7 @@ def test_cayu_app_keeps_large_tool_results_unchanged_when_policy_is_absent(tmp_p
 def test_cayu_app_keeps_below_threshold_result_durable_and_model_visible(tmp_path) -> None:
     original = "small"
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=64,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
         preview_bytes=0,
     )
@@ -852,7 +852,7 @@ def test_cayu_app_externalizes_after_redaction_before_terminal_publication(tmp_p
     secret = "projection-secret-canary"
     original = f"public:{secret}:" + ("z" * 10_000)
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=64,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
         preview_bytes=32,
     )
@@ -904,7 +904,7 @@ def test_cayu_app_externalizes_after_redaction_before_terminal_publication(tmp_p
 def test_cayu_app_preserves_runtime_owned_projection_identity_after_redaction(tmp_path) -> None:
     original = "runtime-owned-identity-" + ("b" * 10_000)
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=64,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
         preview_bytes=0,
     )
@@ -2041,7 +2041,7 @@ def test_cayu_app_publishes_bounded_failure_without_oversized_fallback(tmp_path)
         store_id="failing-artifacts",
     )
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=64,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
         preview_bytes=16,
     )
@@ -2097,7 +2097,7 @@ def test_cayu_app_projects_local_orphan_candidate_without_artifact_authority(
         fail_cleanup,
     )
     policy = ArtifactExternalizingToolResultPolicy(
-        max_inline_bytes=64,
+        max_inline_bytes=256,
         max_inline_token_estimate=None,
     )
 
@@ -2415,7 +2415,7 @@ def test_externalized_tool_result_can_be_read_through_bounded_read_file(tmp_path
     assert provider.externalized_artifact_id is not None
     assert provider.readback_arguments == {
         "artifact_id": provider.externalized_artifact_id,
-        "max_bytes": 2030,
+        "max_bytes": 1856,
     }
     assert len(provider.requests) == 3
     readback_result = next(
@@ -2473,7 +2473,7 @@ def test_mcp_tool_results_cross_the_same_projection_boundary(tmp_path) -> None:
     app = CayuApp(
         enable_logging=False,
         tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
-            max_inline_bytes=64,
+            max_inline_bytes=256,
             max_inline_token_estimate=None,
             preview_bytes=16,
         ),
@@ -2517,6 +2517,12 @@ def test_mcp_tool_results_cross_the_same_projection_boundary(tmp_path) -> None:
 def test_effectful_terminal_failure_crosses_projection_before_observational_hooks(
     tmp_path,
 ) -> None:
+    class AlwaysExternalize(ArtifactExternalizingToolResultPolicy):
+        # Exercise short fixed terminal errors through publication independently
+        # of the minimum inline capacity needed for bounded readback pages.
+        def _exceeds_threshold(self, *, byte_count: int, token_estimate: int) -> bool:
+            return True
+
     store = LocalArtifactStore(tmp_path / "effectful-artifacts", store_id="effectful-artifacts")
     provider = _FakeProvider(
         [
@@ -2536,8 +2542,8 @@ def test_effectful_terminal_failure_crosses_projection_before_observational_hook
     )
     app = CayuApp(
         enable_logging=False,
-        tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
-            max_inline_bytes=20,
+        tool_result_projection_policy=AlwaysExternalize(
+            max_inline_bytes=256,
             max_inline_token_estimate=None,
             preview_bytes=0,
         ),
@@ -2721,7 +2727,7 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
         app = CayuApp(
             enable_logging=False,
             tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
-                max_inline_bytes=64,
+                max_inline_bytes=256,
                 max_inline_token_estimate=None,
             ),
         )
@@ -2818,7 +2824,7 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
         app = CayuApp(
             enable_logging=False,
             tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
-                max_inline_bytes=64,
+                max_inline_bytes=256,
                 max_inline_token_estimate=None,
             ),
         )
@@ -2920,7 +2926,7 @@ def test_late_projection_completion_is_an_identifiable_publication_orphan(
         app = CayuApp(
             enable_logging=False,
             tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
-                max_inline_bytes=64,
+                max_inline_bytes=256,
                 max_inline_token_estimate=None,
             ),
         )

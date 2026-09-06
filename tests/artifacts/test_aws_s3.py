@@ -65,11 +65,22 @@ class _S3Client:
             value = self.objects[(kwargs["Bucket"], kwargs["Key"])]
         except KeyError as exc:
             raise _ClientError("NoSuchKey") from exc
+        total = len(value)
         byte_range = kwargs.get("Range")
         if byte_range is not None:
             start, end = byte_range.removeprefix("bytes=").split("-", 1)
             value = value[int(start) : int(end) + 1]
-        return {"Body": io.BytesIO(value), "ContentLength": len(value)}
+        response = {"Body": io.BytesIO(value), "ContentLength": len(value)}
+        if byte_range is not None:
+            response["ContentRange"] = f"bytes {start}-{int(start) + len(value) - 1}/{total}"
+        return response
+
+    def head_object(self, **kwargs: Any) -> dict[str, Any]:
+        try:
+            value = self.objects[(kwargs["Bucket"], kwargs["Key"])]
+        except KeyError as exc:
+            raise _ClientError("NoSuchKey") from exc
+        return {"ContentLength": len(value)}
 
     def list_objects_v2(self, **kwargs: Any) -> dict[str, Any]:
         keys = sorted(

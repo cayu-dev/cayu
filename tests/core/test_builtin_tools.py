@@ -2134,10 +2134,9 @@ def test_read_file_discards_text_artifact_secret_prefix_after_pretruncated_read(
     rendered = json.dumps(result.model_dump(mode="json"))
     assert secret not in rendered
     assert secret[:16] not in rendered
-    assert "[file truncated]" in result.content
-    assert result.structured["bytes"] == 16
-    assert result.structured["total_bytes"] == len(secret.encode())
-    assert result.structured["truncated"] is True
+    assert result.is_error
+    assert result.structured["error"] == "artifact_redaction_page_unavailable"
+    assert "custom inspection tool" in result.content
 
 
 def test_read_file_snapshots_workspace_pdf_as_artifact_attachment(tmp_path):
@@ -3082,6 +3081,8 @@ def test_artifact_store_tools_read_and_list_artifacts(tmp_path):
         "environment_name": "local-dev",
         "truncated": False,
         "encoding": "utf-8",
+        "offset": 0,
+        "next_offset": None,
     }
     assert artifact.id in list_session_result.content
     assert list_session_result.structured["scope"] == "session"

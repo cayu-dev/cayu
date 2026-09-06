@@ -5999,7 +5999,10 @@ def _copy_upload_artifact_read_result(
         truncated=value.truncated,
         source_bytes_read=value.source_bytes_read,
         redaction_truncated=value.redaction_truncated,
+        offset=value.offset,
     )
+    if copied.offset != 0:
+        raise ValueError("Artifact store returned a range instead of upload prefix evidence.")
     if copied.metadata.id != expected_artifact_id:
         raise ValueError("Artifact store returned evidence for another artifact.")
     if len(copied.content) > max_content_bytes:

@@ -74,6 +74,7 @@ MAX_LIST_OFFSET = 1_000_000
 DEFAULT_LIST_SCAN_LIMIT = 100_000
 MAX_LIST_SCAN_LIMIT = 1_000_000
 _READ_FILE_TRUNCATION_MARKER = "\n\n[file truncated]"
+_ARTIFACT_PAGE_METADATA_MAX_BYTES = 192
 
 _READ_FILE_ARGUMENTS = frozenset(
     {"path", "artifact_id", "max_bytes", "offset", "max_attachment_bytes", "pages"}
@@ -137,6 +138,7 @@ class ReadFileOptions:
     max_attachment_bytes: int = DEFAULT_ATTACHMENT_LIMIT_BYTES
     max_attachment_validation_bytes: int = DEFAULT_MAX_ATTACHMENT_LIMIT_BYTES
     pages: str | None = None
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -188,7 +190,10 @@ def _read_file_tool_spec(
             "Use `path` for workspace files and `artifact_id` for uploaded/generated artifacts. "
             "Workspace text results begin with model-visible JSON metadata. A complete offset-zero "
             "read includes the opaque revision required by edit_file, write_file overwrite mode, "
-            "and delete_file; paged reads include next_offset. Workspace image/PDF files are "
+            "and delete_file. Text artifact pages append JSON continuation metadata; repeat the "
+            "same artifact_id and max_bytes with offset=next_offset until next_offset is null. "
+            "Initial complete text reads have no footer. "
+            "Workspace image/PDF files are "
             "captured as artifact snapshots when an artifact store is configured. Image and PDF "
             "artifacts return provider-neutral file attachments that capable providers can inspect "
             "natively."
@@ -215,7 +220,7 @@ def _read_file_tool_spec(
                     "type": "integer",
                     "minimum": 0,
                     "default": 0,
-                    "description": "Byte offset for pageable workspace text reads.",
+                    "description": "Stored byte offset for workspace or artifact text reads; use next_offset.",
                 },
                 "max_attachment_bytes": {
                     "type": "integer",
@@ -337,6 +342,7 @@ class ReadFileTool(Tool):
                 max_attachment_bytes=max_attachment_bytes,
                 max_attachment_validation_bytes=self.max_attachment_limit_bytes,
                 pages=pages,
+                offset=offset,
             )
         if path is not None:
             return await _read_workspace_file(
@@ -347,10 +353,6 @@ class ReadFileTool(Tool):
                 options=options,
             )
         if artifact_id is not None:
-            if offset != 0:
-                return invalid_tool_arguments_result(
-                    ValueError("Tool argument `offset` is only valid for workspace text files.")
-                )
             return await _read_artifact(
                 ctx,
                 artifact_id=artifact_id,
@@ -1041,7 +1043,7 @@ async def _read_artifact(
         result = await _read_artifact_store(
             artifact_store,
             artifact_id,
-            max_bytes=options.max_bytes,
+            max_bytes=1 if options.offset else options.max_bytes,
         )
     except InvalidArtifactIdError as exc:
         return invalid_tool_arguments_result(exc)
@@ -1053,6 +1055,10 @@ async def _read_artifact(
     access_error = _artifact_access_error(ctx, artifact)
     if access_error is not None:
         return access_error
+    if options.offset and not _is_text_content_type(artifact.content_type):
+        return invalid_tool_arguments_result(
+            ValueError("Tool argument `offset` is only valid for text files and artifacts.")
+        )
     structured = {
         "source": "artifact",
         "artifact_id": artifact.id,
@@ -1078,6 +1084,11 @@ async def _read_artifact(
     )
     for reader in artifact_readers:
         if reader.can_read(artifact):
+            if options.offset and not isinstance(reader, TextArtifactReader):
+                return _artifact_page_error(
+                    "artifact_reader_range_unsupported",
+                    "This custom artifact reader does not support text offsets. Use a bounded custom inspection tool.",
+                )
             try:
                 reader_result = await reader.read(request)
                 return await _admit_artifact_reader_attachments(request, reader_result)
@@ -1186,20 +1197,153 @@ class TextArtifactReader:
             return invalid_tool_arguments_result(
                 ValueError("Tool argument `pages` is only valid for PDF artifacts.")
             )
-        text, redaction_truncated = active_secret_redactor(request.ctx).redact_utf8_head(
-            request.initial_read.content,
-            max_bytes=request.options.max_bytes,
-            source_complete=not request.initial_read.truncated,
+        return await _read_text_artifact_page(request)
+
+
+async def _read_text_artifact_page(request: ArtifactReadRequest) -> ToolResult:
+    offset = request.options.offset
+    limit = request.options.max_bytes
+    if offset > request.artifact.size_bytes:
+        return invalid_tool_arguments_result(ValueError("offset exceeds artifact size."))
+
+    async def read_window(redactor):
+        overlap = redactor.pagination_overlap_utf8_bytes if redactor.has_values else 0
+        start = max(0, offset - overlap - 3) if overlap else offset
+        bound = offset - start + limit + overlap + 4
+        result = copy_artifact_read_result(
+            await request.artifact_store.read_range(
+                request.artifact.id, offset=start, max_bytes=bound
+            ),
+            expected_artifact_id=request.artifact.id,
+            max_content_bytes=bound,
+            expected_offset=start,
         )
-        truncated = request.initial_read.truncated or redaction_truncated
-        return ToolResult(
-            content=f"{text}{_READ_FILE_TRUNCATION_MARKER}" if truncated else text,
-            structured={
-                **request.structured,
-                "encoding": "utf-8",
-                "truncated": truncated,
-            },
+        if result.metadata != request.artifact or result.offset != start:
+            raise ValueError("Artifact range identity or offset changed.")
+        if result.redaction_truncated or result.source_bytes_read != len(result.content):
+            raise NotImplementedError("Artifact ranges must preserve stored byte coordinates.")
+        expected = min(bound, result.total_bytes - start)
+        if len(result.content) != expected:
+            raise ValueError("Artifact store returned an incomplete range.")
+        return result
+
+    try:
+        captured = await await_revision_stable_secret_output(request.ctx, read_window)
+    except NotImplementedError:
+        # Existing prefix-only adapters remain usable for complete initial reads.
+        if (
+            offset == 0
+            and not request.initial_read.truncated
+            and not request.initial_read.redaction_truncated
+        ):
+            text, truncated = active_secret_redactor(request.ctx).redact_utf8_head(
+                request.initial_read.content,
+                max_bytes=limit,
+                source_complete=True,
+            )
+            if not truncated:
+                return ToolResult(
+                    content=text,
+                    structured={
+                        **request.structured,
+                        "encoding": "utf-8",
+                        "offset": 0,
+                        "next_offset": None,
+                        "truncated": False,
+                    },
+                )
+        return _artifact_page_error(
+            "artifact_range_unsupported",
+            "This store cannot page artifact text. Configure a range-capable artifact adapter or a bounded custom inspection tool.",
         )
+    except FileNotFoundError:
+        if request._missing_as_result:
+            return _missing_artifact_result(request.artifact.id)
+        raise
+    if captured is None:
+        return unstable_secret_redaction_result()
+    result, snapshot = captured
+    redactor = snapshot.redactor
+    relative_start = offset - result.offset
+    available = result.content[relative_start:]
+    page = available[:limit]
+    if offset and page and page[0] & 0xC0 == 0x80:
+        return invalid_tool_arguments_result(
+            ValueError("offset splits a UTF-8 character; use the previous next_offset.")
+        )
+    while page:
+        try:
+            page.decode("utf-8")
+            break
+        except UnicodeDecodeError as exc:
+            if exc.reason != "unexpected end of data":
+                return _artifact_page_error(
+                    "artifact_text_encoding_unsupported",
+                    "Artifact text is not valid UTF-8. Use a custom reader for this encoding.",
+                )
+            page = page[: exc.start]
+    if not page and offset < result.total_bytes:
+        return _artifact_page_error(
+            "text_page_too_small",
+            "Text page cannot fit the next UTF-8 character; retry this offset with max_bytes of at least 4.",
+        )
+    end = offset + len(page)
+    next_offset = end if end < result.total_bytes else None
+    if redactor.has_values and page:
+        try:
+            text, end = redactor.redact_utf8_page_with_progress(
+                result.content,
+                window_offset=result.offset,
+                page_offset=offset,
+                page_end=end,
+                total_bytes=result.total_bytes,
+                max_bytes=limit,
+            )
+        except ValueError:
+            return _artifact_page_error(
+                "artifact_redaction_page_unavailable",
+                "Active redaction cannot preserve this text page. Use a bounded custom inspection tool for this secret scope.",
+            )
+        next_offset = end if end < result.total_bytes else None
+    else:
+        text = page.decode("utf-8")
+    if next_offset is not None or offset:
+        record_ambiguous_secret_output(request.ctx, snapshot)
+        footer = (
+            "\n[read_file "
+            + json.dumps(
+                {
+                    "offset": offset,
+                    "next_offset": next_offset,
+                    "total_bytes": result.total_bytes,
+                    "truncated": next_offset is not None,
+                },
+                separators=(",", ":"),
+            )
+            + "]"
+        )
+        if len(footer.encode()) > _ARTIFACT_PAGE_METADATA_MAX_BYTES:
+            return _artifact_page_error(
+                "artifact_size_unsupported", "Artifact size exceeds paging metadata capacity."
+            )
+        content = text + footer
+    else:
+        content = text
+    return ToolResult(
+        content=content,
+        structured={
+            **request.structured,
+            "bytes": end - offset,
+            "offset": offset,
+            "next_offset": next_offset,
+            "encoding": "utf-8",
+            "truncated": next_offset is not None,
+        },
+    )
+
+
+def _artifact_page_error(reason: str, message: str) -> ToolResult:
+    return ToolResult(content=message, structured={"error": reason}, is_error=True)
 
 
 class ImageArtifactReader:

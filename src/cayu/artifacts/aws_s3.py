@@ -355,6 +355,57 @@ class S3ArtifactStore(ArtifactStore):
             truncated=len(content) < metadata.size_bytes,
         )
 
+    async def read_range(
+        self, artifact_id: str, *, offset: int, max_bytes: int
+    ) -> ArtifactReadResult:
+        artifact_id = _validate_artifact_id(artifact_id)
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a non-negative integer.")
+        limit = _validate_limit(max_bytes, "max_bytes")
+        if limit is None:
+            raise ValueError("max_bytes is required for range reads.")
+        client = await self._get_client()
+        metadata = await self._read_metadata(client, artifact_id)
+        if offset > metadata.size_bytes:
+            raise ValueError("offset exceeds artifact size.")
+        length = min(limit, metadata.size_bytes - offset)
+        content = b""
+        try:
+            if length:
+                response = await asyncio.to_thread(
+                    client.get_object,
+                    Bucket=self.bucket,
+                    Key=self._artifact_key(artifact_id, "content"),
+                    Range=f"bytes={offset}-{offset + length - 1}",
+                )
+                content = await asyncio.to_thread(_response_body_bytes, response, length)
+                if (
+                    response.get("ContentLength") != length
+                    or response.get("ContentRange")
+                    != f"bytes {offset}-{offset + length - 1}/{metadata.size_bytes}"
+                    or len(content) != length
+                ):
+                    raise ValueError("S3 range length did not match committed metadata.")
+            else:
+                response = await asyncio.to_thread(
+                    client.head_object,
+                    Bucket=self.bucket,
+                    Key=self._artifact_key(artifact_id, "content"),
+                )
+                if response.get("ContentLength") != metadata.size_bytes:
+                    raise ValueError("S3 artifact size did not match committed metadata.")
+        except Exception as exc:
+            if _aws_error_code(exc) in _NOT_FOUND_CODES:
+                raise FileNotFoundError(f"Artifact not found: {artifact_id}") from exc
+            raise ArtifactStoreUnavailableError("S3 artifact range read failed.") from exc
+        return ArtifactReadResult(
+            metadata=metadata,
+            content=content,
+            total_bytes=metadata.size_bytes,
+            truncated=offset + len(content) < metadata.size_bytes,
+            offset=offset,
+        )
+
     async def list(
         self,
         *,
@@ -663,7 +714,7 @@ async def _run_s3_sync_call(
     return await _await_owned_sync_call(reporter, callback, *args, **kwargs)
 
 
-def _response_body_bytes(response: Any) -> bytes:
+def _response_body_bytes(response: Any, max_bytes: int | None = None) -> bytes:
     if not isinstance(response, Mapping):
         raise TypeError("S3 object response must be a mapping.")
     body = response.get("Body")
@@ -671,7 +722,7 @@ def _response_body_bytes(response: Any) -> bytes:
     if read is None or not callable(read):
         raise TypeError("S3 object response omitted a readable body.")
     try:
-        value = read()
+        value = read() if max_bytes is None else read(max_bytes)
     finally:
         close = getattr(body, "close", None)
         if callable(close):

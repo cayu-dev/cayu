@@ -32,7 +32,7 @@ from cayu.artifacts.settlement import (
     copy_artifact_write_settlement,
 )
 from cayu.core.tools import ToolResult
-from cayu.tools.files import _READ_FILE_TRUNCATION_MARKER
+from cayu.tools.files import _ARTIFACT_PAGE_METADATA_MAX_BYTES
 
 TOOL_RESULT_ARTIFACT_TYPE = "cayu.tool_result_artifact.v1"
 TOOL_RESULT_PROJECTION_AUTHORITY = "cayu.tool_result_projection.v1"
@@ -339,8 +339,8 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
             maximum=MAX_TOOL_RESULT_PREVIEW_BYTES,
         )
         resolved_chars_per_token = _positive_int(chars_per_token, "chars_per_token")
-        marker_bytes = len(_READ_FILE_TRUNCATION_MARKER.encode("utf-8"))
-        marker_characters = len(_READ_FILE_TRUNCATION_MARKER)
+        marker_bytes = _ARTIFACT_PAGE_METADATA_MAX_BYTES
+        marker_characters = _ARTIFACT_PAGE_METADATA_MAX_BYTES
         if resolved_max_inline_bytes is not None and resolved_max_inline_bytes <= marker_bytes:
             raise ValueError("max_inline_bytes must leave room for a bounded read_file result.")
         if (
@@ -375,13 +375,11 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
 
         capacities = [_MAX_GENERATED_READBACK_BYTES]
         if self.max_inline_bytes is not None:
-            capacities.append(
-                self.max_inline_bytes - len(_READ_FILE_TRUNCATION_MARKER.encode("utf-8"))
-            )
+            capacities.append(self.max_inline_bytes - _ARTIFACT_PAGE_METADATA_MAX_BYTES)
         if self.max_inline_token_estimate is not None:
             capacities.append(
                 self.max_inline_token_estimate * self.chars_per_token
-                - len(_READ_FILE_TRUNCATION_MARKER)
+                - _ARTIFACT_PAGE_METADATA_MAX_BYTES
             )
         return min(capacities)
 
@@ -874,7 +872,10 @@ def _tool_result_projection_reference_instruction(
         "Use read_file with "
         f'{{"artifact_id":"{artifact_id}","max_bytes":{readback_max_bytes}}} '
         "to inspect the "
-        "complete redacted result through the bounded artifact-reading workflow."
+        "first page of the redacted result. If next_offset is not null, repeat read_file "
+        "with the same artifact_id and max_bytes and offset=next_offset until next_offset "
+        "is null. A successful read without a continuation footer is complete. "
+        "Offsets address stored UTF-8 bytes; use only advertised offsets."
     )
 
 

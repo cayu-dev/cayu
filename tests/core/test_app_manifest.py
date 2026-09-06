@@ -440,7 +440,7 @@ def test_tool_result_projection_policy_is_manifested_and_fingerprinted() -> None
     tuned = CayuApp(
         enable_logging=False,
         tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
-            max_inline_bytes=64,
+            max_inline_bytes=256,
             max_inline_token_estimate=None,
             preview_bytes=1,
             chars_per_token=2,
@@ -462,7 +462,7 @@ def test_tool_result_projection_policy_is_manifested_and_fingerprinted() -> None
     assert tuned.runtime.tool_result_projection_policy.identity == (
         externalizing.runtime.tool_result_projection_policy.identity
     )
-    assert tuned.runtime.tool_result_projection_policy.max_inline_bytes == 64
+    assert tuned.runtime.tool_result_projection_policy.max_inline_bytes == 256
     assert tuned.runtime.tool_result_projection_policy.max_inline_token_estimate is None
     assert tuned.runtime.tool_result_projection_policy.preview_bytes == 1
     assert tuned.runtime.tool_result_projection_policy.token_estimation_method == (

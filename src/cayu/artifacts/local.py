@@ -236,6 +236,23 @@ class LocalArtifactStore(ArtifactStore):
                 "Local artifact store could not read artifact content."
             ) from exc
 
+    async def read_range(
+        self, artifact_id: str, *, offset: int, max_bytes: int
+    ) -> ArtifactReadResult:
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a non-negative integer.")
+        limit = _validate_limit(max_bytes, "max_bytes")
+        if limit is None:
+            raise ValueError("max_bytes is required for range reads.")
+        try:
+            return await asyncio.to_thread(
+                _read_artifact, self.root, self._root_identity, artifact_id, limit, offset
+            )
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                raise
+            raise ArtifactStoreUnavailableError("Local artifact range read failed.") from exc
+
     async def list(
         self,
         *,
@@ -1088,6 +1105,7 @@ def _read_artifact(
     root_identity: tuple[int, int],
     artifact_id: str,
     max_bytes: int | None,
+    offset: int = 0,
 ) -> ArtifactReadResult:
     target = _artifact_dir(root, artifact_id)
     with (
@@ -1110,6 +1128,10 @@ def _read_artifact(
             missing_message=f"Artifact content not found: {artifact_id}",
         )
         with os.fdopen(content_fd, "rb") as file:
+            total_bytes = os.fstat(file.fileno()).st_size
+            if offset > total_bytes:
+                raise ValueError("offset exceeds artifact size.")
+            file.seek(offset)
             content = file.read() if max_bytes is None else file.read(max_bytes)
             total_bytes = os.fstat(file.fileno()).st_size
     total_bytes = max(total_bytes, len(content))
@@ -1117,7 +1139,8 @@ def _read_artifact(
         metadata=metadata,
         content=content,
         total_bytes=total_bytes,
-        truncated=total_bytes > len(content),
+        truncated=total_bytes > offset + len(content),
+        offset=offset,
     )
 
 

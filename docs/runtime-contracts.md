@@ -10741,11 +10741,15 @@ byte threshold, token-estimate threshold, preview bound, and estimation-method
 identity, so deployments with different projection bounds remain
 distinguishable even though they use the same policy implementation.
 Each enabled threshold must also leave room for at least one byte of text plus
-`read_file`'s truncation marker. The typed artifact reference and generated
+192 bytes reserved for `read_file` continuation metadata. Thresholds at or below
+192 bytes (or their configured token-estimate equivalent) are rejected. The typed artifact reference and generated
 instruction carry a derived `max_bytes` no larger than 32 KiB and small enough
-that the resulting text plus marker remains at or below every configured byte
-and token-estimate threshold. Following the generated instruction verbatim
-therefore cannot immediately externalize the readback result again.
+that the resulting text plus continuation metadata remains at or below every
+configured byte and token-estimate threshold. The instruction requests the first
+page, then tells the model to repeat the same artifact ID and byte budget with
+`offset=next_offset` until `next_offset` is null. Following those instructions
+does not externalize each successful readback page again. It never labels a
+truncated first page as the complete result.
 
 Direct tools and MCP tools cross one shared runtime boundary. Cayu validates
 and redacts the result, runs `after_tool_call`, re-redacts any hook
@@ -10848,7 +10852,47 @@ oversized prompt-file fallback, stream progress from a running tool, compact
 older conversation context, or semantically summarize tool output. Artifact
 readback remains explicit and bounded through `ReadFileTool`.
 
-Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. `ArtifactStore.read_bytes(..., max_bytes=N)` is a hard materialization contract: implementations must not read into application memory or return more than `N` content bytes, and must mark the result truncated when more bytes exist. Server and tool callers rely on this guarantee for custom stores as well as `LocalArtifactStore`. Store implementations raise `InvalidArtifactIdError` for ids that are syntactically invalid for that store, `FileNotFoundError` for valid ids that do not exist, and `ArtifactStoreUnavailableError` for operational backend failures; other validation failures indicate invalid store data. The control-plane artifact APIs consistently expose operational failures as typed `503` responses and invalid store results as typed `500` responses. Read consumers revalidate store results, reject content returned beyond the requested bound, require returned metadata to identify the requested artifact, and require `metadata.size_bytes` to equal the reported full byte count. Artifact metadata records and their nested JSON metadata are immutable after construction. Text artifacts are decoded as UTF-8 with replacement for invalid bytes. Workspace image/PDF path reads are first captured into session-scoped artifact snapshots so the inspected bytes are durable across replay, resume, fork, and provider projection. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
+Textual artifact reads support stored-byte `offset` continuation. Each incomplete
+page and every nonzero-offset page appends a `[read_file {...}]` JSON footer with
+`offset`, `next_offset`, `total_bytes`, and `truncated`; these values are also in
+structured metadata. The footer is framing, not artifact content. Initial complete
+reads retain their plain-text representation. `max_bytes` bounds source page bytes
+and rendered text, excluding the at-most-192-byte footer. UTF-8 scalars are never
+split: follow `next_offset`, rather than calculating it from rendered text (active
+redaction can change text length). EOF is an empty successful page; offsets beyond
+EOF or inside a scalar are invalid arguments. Nonzero offsets on artifact images
+and PDFs are rejected, and their native attachment readers are unchanged.
+
+`ArtifactStore.read_range(id, offset=..., max_bytes=...)` is an optional public
+capability for immutable stored bytes. Deletion invalidates continuations; callers
+must not reuse a deleted identity for different content. Its `ArtifactReadResult.offset` identifies
+the exact returned range; `source_bytes_read` counts bytes in this range and
+`truncated` means `offset + source_bytes_read < total_bytes`. Prefix consumers
+continue to require offset zero. Local storage seeks before reading; S3 requests
+an HTTP byte range, bounds body materialization and validates the returned range
+and committed size. Neither adapter scans or loads the preceding content.
+Metadata I/O is separate from content I/O. `read_file` first checks metadata and
+scope through a bounded prefix read (one byte on continuation, at most `max_bytes`
+on an initial read), then requests a range with a bounded UTF-8/redaction window:
+at most `max_bytes + 2 * redactor.pagination_overlap_utf8_bytes + 7` content bytes.
+The overlap is zero without active secret values. Read amplification is independent
+of the artifact offset, and every page rechecks scope and immutable metadata.
+The Runtime-owned reader uses its authoritative store under the invocation's
+revision-stable secret-redaction capture; the public invocation facade does not
+expose unredacted ranges.
+
+Prefix-only adapters remain usable for complete initial reads; incomplete reads
+return `artifact_range_unsupported`, with instructions to configure a range-capable
+adapter or bounded custom inspection tool. Active redaction that cannot preserve
+a page returns `artifact_redaction_page_unavailable` with a custom inspection
+fallback rather than advancing past omitted text. A page too small for a scalar
+returns `text_page_too_small` and a bounded retry instruction at the same offset. Active redaction uses a framed source window and
+atomic-span progress accounting: a marker is emitted once, never split, and the
+next offset advances only through source bytes whose output fit the page. These
+capability errors do not claim completion or advertise a non-progressing continuation. Already-redacted projected artifacts
+retain their redacted bytes and stable ID across local-store reconstruction.
+
+Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. `ArtifactStore.read_bytes(..., max_bytes=N)` is a hard materialization contract: implementations must not read into application memory or return more than `N` content bytes, and must mark the result truncated when more bytes exist. Server and tool callers rely on this guarantee for custom stores as well as `LocalArtifactStore`. Store implementations raise `InvalidArtifactIdError` for ids that are syntactically invalid for that store, `FileNotFoundError` for valid ids that do not exist, and `ArtifactStoreUnavailableError` for operational backend failures; other validation failures indicate invalid store data. The control-plane artifact APIs consistently expose operational failures as typed `503` responses and invalid store results as typed `500` responses. Read consumers revalidate store results, reject content returned beyond the requested bound, require returned metadata to identify the requested artifact, and require `metadata.size_bytes` to equal the reported full byte count. Artifact metadata records and their nested JSON metadata are immutable after construction. Built-in textual artifact paging requires valid UTF-8; invalid bytes return an explicit encoding capability error with a custom-reader fallback. Workspace image/PDF path reads are first captured into session-scoped artifact snapshots so the inspected bytes are durable across replay, resume, fork, and provider projection. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
 
 `read_file` re-admits every file attachment returned by a built-in or custom artifact reader at the final tool-result boundary. Admission uses a bounded store read to verify current scope, content type, actual stored size, and the call's current `max_attachment_bytes`; rejection returns no attachment reference and does not delete a reusable artifact. Cached image/PDF derivations also verify their stored content hash before reuse, so missing or corrupt cache entries are rebuilt while an intact oversized derivation is rejected without being recomputed. The later provider-request boundary independently reapplies the application's per-file, aggregate-byte, and attachment-count limits across the complete model request.
 

@@ -166,6 +166,7 @@ class ArtifactReadResult:
     truncated: bool = False
     source_bytes_read: int | None = None
     redaction_truncated: bool = False
+    offset: int = 0
 
     def __post_init__(self) -> None:
         if type(self.metadata) is not ArtifactMetadata:
@@ -192,7 +193,11 @@ class ArtifactReadResult:
             raise ValueError(
                 "ArtifactReadResult total_bytes cannot be smaller than content or source progress."
             )
-        expected_truncated = source_bytes_read < self.total_bytes
+        if type(self.offset) is not int or not 0 <= self.offset <= self.total_bytes:
+            raise ValueError("ArtifactReadResult offset must be within the artifact.")
+        if self.offset + source_bytes_read > self.total_bytes:
+            raise ValueError("ArtifactReadResult range exceeds artifact size.")
+        expected_truncated = self.offset + source_bytes_read < self.total_bytes
         if self.truncated != expected_truncated:
             raise ValueError(
                 "ArtifactReadResult truncated must match source progress and total_bytes."
@@ -210,6 +215,7 @@ def copy_artifact_read_result(
     *,
     expected_artifact_id: str | None = None,
     max_content_bytes: int | None = None,
+    expected_offset: int = 0,
 ) -> ArtifactReadResult:
     """Copy and revalidate a store read at a consumer boundary."""
 
@@ -227,7 +233,10 @@ def copy_artifact_read_result(
         truncated=value.truncated,
         source_bytes_read=value.source_bytes_read,
         redaction_truncated=value.redaction_truncated,
+        offset=value.offset,
     )
+    if copied.offset != expected_offset:
+        raise ValueError("Artifact store returned a different offset.")
     if expected_artifact_id is not None and copied.metadata.id != expected_artifact_id:
         raise ValueError("Artifact store returned metadata for a different artifact id.")
     if max_content_bytes is not None and len(copied.content) > max_content_bytes:
@@ -370,6 +379,21 @@ class ArtifactStore(ABC):
         Other validation failures indicate invalid store data rather than a
         malformed caller request.
         """
+
+    async def read_range(
+        self, artifact_id: str, *, offset: int, max_bytes: int
+    ) -> ArtifactReadResult:
+        """Read a bounded range of an immutable artifact, without scanning its prefix.
+
+        Offsets address stored bytes. Return the exact offset, full committed size,
+        and at most max_bytes bytes; truncated means bytes remain after this range.
+        Offset equal to size returns an empty final range; beyond size is invalid.
+        Content read amplification must not grow with offset. Metadata I/O is extra.
+        Adapters without range support raise NotImplementedError; callers must not
+        emulate this operation by fetching ever larger prefixes. Identity and
+        content must remain immutable across calls (deletion may yield not found).
+        """
+        raise NotImplementedError("Artifact store does not support bounded range reads.")
 
     @abstractmethod
     async def list(
