@@ -65,9 +65,14 @@ from cayu.core.tools import (
     DurableToolRecoveryAuthority,
     ToolResult,
 )
-from cayu.deadlines import current_execution_deadline, effective_deadline
+from cayu.deadlines import (
+    current_execution_deadline,
+    effective_deadline,
+    expired_execution_deadline,
+)
 from cayu.environments import EnvironmentFactoryOperation
 from cayu.environments.bindings import _runtime_owned_workspace_observer_name
+from cayu.failure_evidence import FailureEvidence
 from cayu.memory_evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.providers import (
     ProviderOperationAdapter,
@@ -14700,6 +14705,17 @@ class RecoveryCoordinator:
         )
         if deadline.expires_at is not None:
             payload["execution_deadline"] = deadline.inspection()
+        expired_boundary = expired_execution_deadline()
+        payload["failure_evidence"] = FailureEvidence(
+            classification="deadline" if expired_boundary is not None else "interruption",
+            deadline=expired_boundary,
+            deadline_phase="in_flight" if expired_boundary is not None else None,
+            session_id=request.session.id,
+            run_epoch=request.session.run_epoch,
+            secondary_failures=bool(
+                request.interaction_transition_failures or request.provider_cancellation_failures
+            ),
+        ).model_dump(mode="json")
         if request.interaction_transition_failures:
             copied_failures = copy_durable_json_value(
                 list(request.interaction_transition_failures),

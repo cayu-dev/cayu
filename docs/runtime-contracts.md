@@ -9459,6 +9459,76 @@ from the execution timeout. A durable settled outcome can still be reconciled; a
 unfinished operation is never turned into success merely because its deadline elapsed.
 Unconfigured executions retain the existing unbounded behavior.
 
+### Workflow failure evidence
+
+`StepError.evidence` and `StepFailure.evidence` expose public
+`FailureEvidence`; `ParallelStepError.failures` preserves the same objects.
+`classification` is `deadline`, `timeout`, `interruption`, `failure`, or `unknown`.
+Native child admission denial raises `StepError` with the original
+`ExecutionDeadlineExceeded` as its cause; parent admission denial still propagates.
+A Runtime deadline observation includes `deadline` (UTC expiry, source, scope)
+and `deadline_phase` (`admission` or `in_flight`). An unrelated `TimeoutError`
+has `classification="timeout"` and no deadline. Expired wall-clock metadata on
+an old interruption event is insufficient to classify it as deadline-caused.
+In-flight durable evidence is recorded while the owning Runtime timer is expired,
+including when cancellation cleanup raises another exception.
+
+`step_id` and `session_id` identify the branch. `workflow_attempt_id` identifies
+the observing workflow attempt; `evidence.run_epoch` identifies the child run
+that produced the failure. `evidence.terminal_event_id` references a stored
+terminal event, never the public stream's presentation alias. These fields may
+be absent, for example before admission, for plain awaitables, or on older events.
+Replaying an interrupted child or explicitly attaching a failed child preserves
+stored evidence without model dispatch. Existing automatic new-child behavior
+for failed generated steps remains unchanged: use the recorded child session ID
+when inspecting that exact failure instead of requesting another attempt.
+
+`settlement` is always `unknown`: these diagnostics introduce no cleanup authority.
+Use the referenced session events/checkpoint and the existing
+`CayuApp.recover_incomplete_session(IncompleteSessionRecoveryRequest(...))` /
+`IncompleteSessionRecoveryResult` contract for recovery. Inspect its actions,
+status, events, pending work, and the existing provider/tool/environment receipts;
+an interrupted/failed status or an expired deadline alone proves neither known
+effects nor complete physical cleanup. Recovery can perform settlement work and
+must follow the application's existing ownership policy. `secondary_failures`
+flags observed secondary errors, not the absence of all possible cleanup errors.
+Missing receipts, retained work, failed cleanup, and unavailable evidence remain
+unresolved even when the provider's cancellation handler returned successfully.
+
+Application handling can retain successful verifier outputs while keeping an
+explicit policy boundary (the two policy functions below are application-owned):
+
+```python
+result = await parallel(verifier_steps)
+reports = tuple(item.output for item in result.successes)
+if result.failures:
+    if any(f.evidence.classification != "deadline" for f in result.failures):
+        result.raise_for_failures()
+    await require_existing_runtime_settlement(result.failures)
+    require_incomplete_verification_policy(reports)
+(await ctx.execution_deadline()).require_admission("best_effort_finalization")
+# Only now use reports for an explicitly permitted best-effort final answer.
+```
+
+A completed negative verification output is still a successful step outcome.
+`outputs` and `raise_for_failures()` remain fail-closed. Parent cancellation,
+parent deadline expiry, duplicate-step claims, and workflow supersession still
+stop the fan-out, including stop signals grouped with cleanup errors. A group
+containing cancellation consumed by the child's own deadline timer and ordinary
+cleanup exceptions remains a failed branch; successful siblings can complete.
+This requires live timer ownership, not serialized deadline metadata, and still
+leaves settlement unknown. The helper does not retry, resume expired work, or
+decide whether incomplete verification
+is acceptable.
+
+Serialize diagnostics with `failure.evidence.model_dump(mode="json")` or
+`model_dump_json()`. The evidence contains at most 16 exception type identifiers
+of at most 128 characters, bounded deadline labels and correlation IDs, and a
+`truncated` indicator. It contains no exception messages, notes, prompts, or tool
+payloads. Existing `error`/`message` fields are legacy human-readable diagnostics;
+they are not the bounded evidence export. Unknown or malformed old evidence is
+never promoted to expiry or successful settlement.
+
 ## Runner
 
 Runner execution failures publish fixed-message `cayu.runner_execution_error.v1`

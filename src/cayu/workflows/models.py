@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+from cayu.failure_evidence import FailureEvidence, exception_evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,8 @@ class StepFailure:
     error_type: str
     step_id: str | None = None
     session_id: str | None = None
+    evidence: FailureEvidence = field(default_factory=FailureEvidence)
+    workflow_attempt_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,11 +83,24 @@ class StepError(Exception):
         *,
         step_id: str | None = None,
         session_id: str | None = None,
+        evidence: FailureEvidence | None = None,
+        workflow_attempt_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.step_id = step_id
         self.session_id = session_id
+        self._evidence = evidence
+        self.workflow_attempt_id = workflow_attempt_id
+
+    @property
+    def evidence(self) -> FailureEvidence:
+        """Structured snapshot, including a direct exception cause when present."""
+        return (
+            self._evidence
+            if self._evidence is not None
+            else exception_evidence(self.__cause__ or self)
+        )
 
 
 class ParallelStepError(Exception):

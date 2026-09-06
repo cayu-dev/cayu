@@ -98,6 +98,7 @@ from cayu.environments import (
     EnvironmentFactoryResult,
     WorkspaceInstructions,
 )
+from cayu.failure_evidence import exception_evidence
 from cayu.providers import (
     CacheBreakpoint,
     CachePolicy,
@@ -21640,6 +21641,7 @@ class SessionEngine:
                     environment_name=environment_name,
                     payload={
                         **start_event_payload,
+                        "run_epoch": session.run_epoch,
                         **(
                             {"execution_deadline": current_execution_deadline().inspection()}
                             if current_execution_deadline().expires_at is not None
@@ -23712,6 +23714,11 @@ class SessionEngine:
                     error,
                     diagnostic=failure_diagnostic,
                     redactor=self._secret_redactor,
+                )
+                failure_payload["failure_evidence"] = (
+                    exception_evidence(error)
+                    .model_copy(update={"session_id": session.id, "run_epoch": session.run_epoch})
+                    .model_dump(mode="json")
                 )
                 provider_cleanup_failure = budget_provider_cleanup_failure(error)
                 if provider_cleanup_failure is not None:

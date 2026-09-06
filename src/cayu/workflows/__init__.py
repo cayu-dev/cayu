@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cayu.failure_evidence import FailureEvidence
 from cayu.workflows.journal import (
     WORKFLOW_ATTEMPT_EVENT_TYPE,
     WORKFLOW_JOURNAL_MODEL,
@@ -40,6 +41,7 @@ __all__ = [
     "WORKFLOW_JOURNAL_MODEL",
     "WORKFLOW_JOURNAL_PROVIDER",
     "EventStoreJournal",
+    "FailureEvidence",
     "GateOutcome",
     "JournalFactory",
     "ParallelResult",

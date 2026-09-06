@@ -534,7 +534,7 @@ def test_failed_step_retry_does_not_receive_a_fresh_child_duration(clock):
                 )
             clock.wall += timedelta(seconds=10)
             clock.mono += 10
-            with pytest.raises(ExecutionDeadlineExceeded):
+            with pytest.raises(StepError) as denied:
                 await step(
                     workflow.context("retry"),
                     agent="worker",
@@ -542,6 +542,9 @@ def test_failed_step_retry_does_not_receive_a_fresh_child_duration(clock):
                     prompt="go",
                     run_options=StepRunOptions(execution_deadline=ExecutionDeadline.after(10)),
                 )
+        assert isinstance(denied.value.__cause__, ExecutionDeadlineExceeded)
+        assert denied.value.evidence.deadline_phase == "admission"
+        assert denied.value.evidence.deadline.expires_at == original_child.expires_at
         assert len(provider.requests) == 1
 
     asyncio.run(run())

@@ -135,6 +135,21 @@ def effective_deadline(*boundaries: ExecutionDeadline) -> ExecutionDeadline:
 
 
 _CURRENT: ContextVar[ExecutionDeadline | None] = ContextVar("cayu_execution_deadline", default=None)
+_TIMERS: ContextVar[tuple[tuple[asyncio.Timeout, ExecutionDeadline], ...]] = ContextVar(
+    "cayu_deadline_timers", default=()
+)
+
+
+def _deadline_expired_in_task(exc: BaseException, task: asyncio.Future[Any]) -> bool:
+    """Check live timer ownership, never reconstruct it from diagnostic metadata."""
+    return exc.__dict__.get("_cayu_deadline_expiry_task") is task
+
+
+def expired_execution_deadline() -> ExecutionDeadline | None:
+    """Timer-owned expiry evidence during cancellation settlement, never clock inference."""
+    return next((deadline for timer, deadline in reversed(_TIMERS.get()) if timer.expired()), None)
+
+
 _OWNER: ContextVar[asyncio.Task[Any] | None] = ContextVar("cayu_deadline_owner", default=None)
 
 
@@ -167,7 +182,11 @@ async def execution_deadline_scope(deadline: ExecutionDeadline) -> AsyncIterator
         async with asyncio.timeout(
             None if already_owned else selected.remaining_seconds()
         ) as timer:
-            yield timer
+            timer_token = _TIMERS.set((*_TIMERS.get(), (timer, selected)))
+            try:
+                yield timer
+            finally:
+                _TIMERS.reset(timer_token)
             # Cooperative extension code may consume cancellation, or return
             # after CPU work without another await. Neither grants completion
             # after the authoritative boundary has been observed expired.
@@ -177,6 +196,11 @@ async def execution_deadline_scope(deadline: ExecutionDeadline) -> AsyncIterator
             # Keep the original exception/cause, including secondary cleanup
             # failures. Expiry evidence does not claim effects have stopped.
             exc.__dict__["execution_deadline"] = selected.inspection()
+            if task is not None and task.cancelling() == 0:
+                # asyncio.timeout has consumed its own cancellation request.
+                # Keep this process-local authority on the escaping exception;
+                # public/serialized deadline observations are not stop authority.
+                exc.__dict__["_cayu_deadline_expiry_task"] = task
         raise
     finally:
         _OWNER.reset(owner_token)

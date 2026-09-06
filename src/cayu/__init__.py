@@ -1075,6 +1075,7 @@ from cayu.evals.workflow_recovery import (
     import_workflow_eval_attempt,
     score_workflow_eval_capture,
 )
+from cayu.failure_evidence import FailureEvidence
 from cayu.knowledge_curator import (
     CandidatePolicyDisposition,
     KnowledgeCandidateGenerator,
@@ -4124,6 +4125,7 @@ __all__ = [
     "ExternalProcessTargetIdentityV1",
     "ExternalTrialEnvelopeV1",
     "ExternalTrialIdentityV1",
+    "FailureEvidence",
     "FileAttachment",
     "FileAttachmentKind",
     "FilePart",

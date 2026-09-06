@@ -39,11 +39,14 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.core.workflows import Workflow, WorkflowSpec, copy_workflow_spec
 from cayu.deadlines import (
     ExecutionDeadline,
+    ExecutionDeadlineExceeded,
+    _deadline_expired_in_task,
     current_execution_deadline,
     deadline_stream,
     effective_deadline,
     resumed_execution_deadline,
 )
+from cayu.failure_evidence import FailureEvidence, event_failure_evidence, exception_evidence
 from cayu.runtime import (
     BudgetLimit,
     CayuApp,
@@ -246,9 +249,23 @@ class _StepRunEventState:
         self.output_validated = False
         self.failure: str | None = None
         self.interrupted: str | None = None
+        self.evidence = FailureEvidence()
+        self.run_epoch: int | None = None
 
     def record(self, event: Event) -> None:
         event_type = event.type
+        if event_type in {EventType.SESSION_STARTED, EventType.SESSION_RESUMED}:
+            epoch = event.payload.get("run_epoch")
+            self.run_epoch = epoch if type(epoch) is int and epoch >= 0 else None
+            self.failure = self.interrupted = None
+            self.evidence = FailureEvidence()
+        if event_type in {EventType.SESSION_FAILED, EventType.SESSION_INTERRUPTED}:
+            self.evidence = event_failure_evidence(
+                event.payload,
+                session_id=event.session_id,
+                event_id=event.id,
+                interrupted=event_type == EventType.SESSION_INTERRUPTED,
+            )
         if event_type == EventType.MODEL_STARTED:
             self.text_buffer = []
         elif event_type == EventType.MODEL_TEXT_DELTA:
@@ -856,7 +873,6 @@ async def _run_step(
         parent_session_id=parent_session_id,
         causal_budget_id=causal_budget_id,
     )
-    request.execution_deadline.require_admission("workflow_step")
     run_default_overrides: dict[str, object] = {}
     if "max_steps" in opts.model_fields_set:
         run_default_overrides["max_steps"] = opts.max_steps
@@ -972,16 +988,22 @@ async def _run_step(
             await _append_step_completed(ctx, agent, result)
             return result
         if existing_child.status == SessionStatus.INTERRUPTED:
-            interrupted = await _latest_child_interruption_type(ctx, child_session_id)
+            replay_state = await _child_failure_state(ctx, child_session_id)
+            interrupted = replay_state.interrupted or "interrupted"
             raise StepError(
                 f"child session interrupted ({interrupted}); "
                 f"resolve the pause on session {child_session_id!r} before re-running",
+                evidence=replay_state.evidence,
+                workflow_attempt_id=ctx.attempt_id,
                 step_id=step_id,
                 session_id=child_session_id,
             )
         if existing_child.status == SessionStatus.FAILED:
+            replay_state = await _child_failure_state(ctx, child_session_id)
             raise StepError(
                 f"child session already failed: {child_session_id!r}",
+                evidence=replay_state.evidence,
+                workflow_attempt_id=ctx.attempt_id,
                 step_id=step_id,
                 session_id=child_session_id,
             )
@@ -992,6 +1014,17 @@ async def _run_step(
             session_id=child_session_id,
         )
 
+    try:
+        request.execution_deadline.require_admission("workflow_step")
+    except ExecutionDeadlineExceeded as exc:
+        (await ctx.execution_deadline()).require_admission("workflow_step")
+        raise StepError(
+            str(exc),
+            step_id=step_id,
+            session_id=child_session_id,
+            workflow_attempt_id=ctx.attempt_id,
+            evidence=exception_evidence(exc),
+        ) from exc
     state = _StepRunEventState()
     capture_structured_output = spec is not None
     if capture_structured_output:
@@ -1158,8 +1191,39 @@ async def _run_step(
                 )
         else:
             await close_unattached_generated_child()
+        if (
+            isinstance(exc, BaseExceptionGroup)
+            and exc.subgroup(
+                (asyncio.CancelledError, DuplicateStepIdError, WorkflowSupersededError)
+            )
+            is not None
+        ):
+            raise
+        (await ctx.execution_deadline()).require_admission("workflow_step_completion")
+        durable_state = _StepRunEventState()
+        # Diagnostic lookup failure must not replace the primary failure.
+        with contextlib.suppress(Exception):
+            durable_state = await _child_failure_state(ctx, child_session_id)
+        evidence = exception_evidence(exc)
+        if (
+            state.run_epoch is not None
+            and durable_state.evidence.run_epoch == state.run_epoch
+            and durable_state.evidence.terminal_event_id is not None
+        ):
+            evidence = evidence.model_copy(
+                update={
+                    "session_id": durable_state.evidence.session_id,
+                    "run_epoch": durable_state.evidence.run_epoch,
+                    "terminal_event_id": durable_state.evidence.terminal_event_id,
+                    "secondary_failures": (
+                        evidence.secondary_failures or durable_state.evidence.secondary_failures
+                    ),
+                }
+            )
         raise StepError(
             str(exc),
+            evidence=evidence,
+            workflow_attempt_id=ctx.attempt_id,
             step_id=step_id,
             session_id=child_session_id,
         ) from exc
@@ -1176,14 +1240,32 @@ async def _run_step(
             raw_output_available,
             raw_output,
         ) = ctx.app._session_engine.take_workflow_structured_output(child_session_id)
+    if state.failure is not None or state.interrupted is not None:
+        (await ctx.execution_deadline()).require_admission("workflow_step_completion")
+        # Public stream IDs can be presentation aliases. Only a store event is
+        # a durable reference, and it must belong to the observed run epoch.
+        evidence = state.evidence.model_copy(update={"terminal_event_id": None})
+        with contextlib.suppress(Exception):
+            durable_state = await _child_failure_state(ctx, child_session_id)
+            if state.run_epoch is not None and durable_state.evidence.run_epoch == state.run_epoch:
+                evidence = durable_state.evidence
+        state.evidence = evidence
     if state.failure is not None:
-        raise StepError(state.failure, step_id=step_id, session_id=child_session_id)
+        raise StepError(
+            state.failure,
+            step_id=step_id,
+            session_id=child_session_id,
+            evidence=state.evidence,
+            workflow_attempt_id=ctx.attempt_id,
+        )
     if state.interrupted is not None:
         if _current_task_is_cancelling():
             raise asyncio.CancelledError()
         raise StepError(
             f"child session interrupted ({state.interrupted}); "
             f"resolve the pause on session {child_session_id!r} before re-running",
+            evidence=state.evidence,
+            workflow_attempt_id=ctx.attempt_id,
             step_id=step_id,
             session_id=child_session_id,
         )
@@ -1369,12 +1451,11 @@ async def _raw_structured_output_from_transcript(
     return latest
 
 
-async def _latest_child_interruption_type(ctx: WorkflowContext, child_session_id: str) -> str:
-    events = await ctx.app.session_store.load_events(child_session_id)
-    for event in reversed(events):
-        if event.type == EventType.SESSION_INTERRUPTED:
-            return str(event.payload.get("interruption_type") or "interrupted")
-    return "interrupted"
+async def _child_failure_state(ctx: WorkflowContext, child_session_id: str) -> _StepRunEventState:
+    state = _StepRunEventState()
+    for event in await ctx.app.session_store.load_events(child_session_id):
+        state.record(event)
+    return state
 
 
 async def parallel(steps: Iterable[Awaitable[StepResult]]) -> ParallelResult:
@@ -1384,6 +1465,11 @@ async def parallel(steps: Iterable[Awaitable[StepResult]]) -> ParallelResult:
     signals propagate because the whole workflow must stop.
     """
     step_list = list(steps)
+    try:
+        current_execution_deadline().require_admission("workflow_parallel")
+    except ExecutionDeadlineExceeded:
+        _close_unscheduled_awaitables(step_list)
+        raise
     await _preclaim_parallel_step_ids(step_list)
     tasks = [asyncio.ensure_future(step) for step in step_list]
     if not tasks:
@@ -1396,25 +1482,34 @@ async def parallel(steps: Iterable[Awaitable[StepResult]]) -> ParallelResult:
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
+                current_execution_deadline().require_admission("workflow_parallel_completion")
                 index = task_indexes[task]
-                if task.cancelled():
-                    # cancelling() counts cancel() requests. Zero means the
-                    # step raised CancelledError itself (e.g. a leaked cancel
-                    # scope) — that fails this one branch; nobody asked the
-                    # fan-out to cancel, so healthy siblings keep going. A
-                    # requested cancellation propagates to the whole fan-out.
-                    if task.cancelling() == 0:
-                        invocation = step_list[index]
-                        converted = StepError(
-                            "step raised CancelledError without being cancelled",
-                            step_id=invocation.step_id
-                            if isinstance(invocation, _StepInvocation)
-                            else None,
-                        )
-                        converted.__cause__ = asyncio.CancelledError()
-                        gathered[index] = converted
-                        continue
+                invocation = step_list[index]
+                if isinstance(invocation, _StepInvocation):
+                    (await invocation.ctx.execution_deadline()).require_admission(
+                        "workflow_parallel_completion"
+                    )
+                if isinstance(task, asyncio.Task) and task.cancelling() > 0:
                     raise asyncio.CancelledError()
+                if task.cancelled():
+                    if not isinstance(task, asyncio.Task):
+                        # A Future is cancelled only through cancel(); unlike a
+                        # Task, it cannot raise CancelledError on its own.
+                        raise asyncio.CancelledError()
+                    # No cancel() request: the branch raised CancelledError
+                    # itself. Preserve the existing branch-local semantics.
+                    converted = StepError(
+                        "step raised CancelledError without being cancelled",
+                        step_id=invocation.step_id
+                        if isinstance(invocation, _StepInvocation)
+                        else None,
+                        workflow_attempt_id=invocation.ctx.attempt_id
+                        if isinstance(invocation, _StepInvocation)
+                        else None,
+                    )
+                    converted.__cause__ = asyncio.CancelledError()
+                    gathered[index] = converted
+                    continue
                 try:
                     gathered[index] = task.result()
                 except (DuplicateStepIdError, WorkflowSupersededError):
@@ -1423,13 +1518,36 @@ async def parallel(steps: Iterable[Awaitable[StepResult]]) -> ParallelResult:
                     # filter-and-continue caller keep double-running steps.
                     raise
                 except BaseException as exc:
+                    child_deadline_group = False
+                    if isinstance(exc, BaseExceptionGroup):
+                        if (
+                            exc.subgroup((DuplicateStepIdError, WorkflowSupersededError))
+                            is not None
+                        ):
+                            raise
+                        if _deadline_expired_in_task(exc, task):
+                            # A child timeout may preserve its cancellation with
+                            # cleanup errors. Never collect other BaseExceptions
+                            # (SystemExit, KeyboardInterrupt, etc.) with it.
+                            _, fatal = exc.split((Exception, asyncio.CancelledError))
+                            child_deadline_group = fatal is None
+                        if (
+                            exc.subgroup(asyncio.CancelledError) is not None
+                            and not child_deadline_group
+                        ):
+                            raise
+                    if not isinstance(exc, Exception) and not child_deadline_group:
+                        raise
                     gathered[index] = exc
     finally:
         if pending:
             for task in pending:
                 task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+        # Retrieve every completed exception, including siblings completed in
+        # the same batch as a propagated stop signal.
+        await asyncio.gather(*tasks, return_exceptions=True)
 
+    current_execution_deadline().require_admission("workflow_parallel_completion")
     results: list[StepResult | StepFailure] = []
     for outcome in gathered:
         if isinstance(outcome, StepResult):
@@ -1437,6 +1555,8 @@ async def parallel(steps: Iterable[Awaitable[StepResult]]) -> ParallelResult:
         elif isinstance(outcome, StepError):
             results.append(
                 StepFailure(
+                    evidence=outcome.evidence,
+                    workflow_attempt_id=outcome.workflow_attempt_id,
                     error=outcome.message,
                     error_type=type(outcome.__cause__ or outcome).__name__,
                     step_id=outcome.step_id,
@@ -1444,7 +1564,13 @@ async def parallel(steps: Iterable[Awaitable[StepResult]]) -> ParallelResult:
                 )
             )
         elif isinstance(outcome, BaseException):
-            results.append(StepFailure(error=str(outcome), error_type=type(outcome).__name__))
+            results.append(
+                StepFailure(
+                    error=str(outcome),
+                    error_type=type(outcome).__name__,
+                    evidence=exception_evidence(outcome),
+                )
+            )
         else:  # pragma: no cover - gather only yields results or exceptions
             raise TypeError("parallel() steps must resolve to StepResult values.")
     return ParallelResult(results=tuple(results))
