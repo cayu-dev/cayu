@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-from cayu import AgentSpec, CayuApp, InMemorySessionStore, ResumeRequest, RunRequest
+from cayu import AgentSpec, CayuApp, InMemorySessionStore, ResumeRequest, RetryPolicy, RunRequest
 from cayu.core import EventType, Message
 from cayu.core.messages import MessageRole, ProviderStatePart, TextPart
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
@@ -2647,7 +2647,8 @@ async def test_openai_background_recovery_does_not_leave_late_terminal_state_pen
 
 
 @pytest.mark.anyio
-async def test_openai_background_live_failure_is_visible_in_generic_inspection() -> None:
+@pytest.mark.parametrize("error_code", [None, "server_is_overloaded", "future_unknown_code"])
+async def test_openai_background_live_failure_is_visible_in_generic_inspection(error_code) -> None:
     transport = BackgroundTransport()
     transport.start_batches.append(
         [
@@ -2659,7 +2660,10 @@ async def test_openai_background_live_failure_is_visible_in_generic_inspection()
                     "id": "resp_background_123",
                     "model": "gpt-test",
                     "status": "failed",
-                    "error": {"message": "provider rejected background execution"},
+                    "error": {
+                        "code": error_code,
+                        "message": "provider rejected background execution",
+                    },
                 },
             },
         ]
@@ -2671,17 +2675,20 @@ async def test_openai_background_live_failure_is_visible_in_generic_inspection()
     app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
     session_id = "openai-live-background-failure"
 
-    _ = [
+    events = [
         event
         async for event in app.run(
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "fail after identity publication")],
+                retry_policy=RetryPolicy(max_attempts=3, initial_delay_s=0.0),
             )
         )
     ]
 
+    assert len(transport.start_calls) == 1
+    assert not any(event.type is EventType.MODEL_RETRY for event in events)
     inspection = await inspect_provider_operation(store, session_id)
     assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE
     assert inspection.recovery_reason is ProviderOperationUnavailableReason.FAILED

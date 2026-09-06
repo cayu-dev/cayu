@@ -8187,7 +8187,7 @@ def test_server_recovery_payload_drops_chain_and_provider_state():
 
 @pytest.mark.parametrize(
     "failure_kind",
-    ["cleanup", "post_completion_provider", "post_completion_overflow"],
+    ["cleanup", "post_completion_provider", "post_completion_overflow", "post_completion_overload"],
 )
 def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
     failure_kind: str,
@@ -8231,6 +8231,8 @@ def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
                         "message": "retryable failure after completion",
                     }
                 )
+                if failure_kind == "post_completion_overload":
+                    error = {"code": "server_is_overloaded"}
                 return {
                     "type": "response.failed",
                     "response": {"error": error},

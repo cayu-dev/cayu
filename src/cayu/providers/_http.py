@@ -303,6 +303,7 @@ _SAFE_PROVIDER_ERROR_CODES = {
             "previous_response_not_found",
             "rate_limit_exceeded",
             "server_error",
+            "server_is_overloaded",
         }
     ),
     "vertex": frozenset(
@@ -964,6 +965,7 @@ def credential_safe_error_event(
             "error_type": safe_provider_exception_type_name(exc),
         }
         if isinstance(exc, ModelProviderError):
+            payload["model_provider_error"] = True
             if type(exc.status_code) is int:
                 payload["status_code"] = exc.status_code
             if type(exc.retryable) is bool:
@@ -986,6 +988,8 @@ def credential_safe_error_event(
             cause=safe_exception,
         )
         payload = dict(event.payload)
+        # Preserve typed origin independently of optional, allowlisted identity.
+        payload["model_provider_error"] = True
         payload["error_type"] = safe_provider_exception_type_name(exc)
         if isinstance(exc, ProviderStreamCleanupError):
             payload["stream_cleanup_failed"] = True

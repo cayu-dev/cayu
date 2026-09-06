@@ -5032,6 +5032,7 @@ _OPENAI_ERROR_CODE_CLASSIFICATION = {
     "previous_response_not_found": (404, False),
     "rate_limit_exceeded": (429, True),
     "server_error": (500, True),
+    "server_is_overloaded": (500, True),
 }
 _OPENAI_RETRYABLE_SERVER_STATUS_CODES = frozenset({500, 502, 503, 504})
 
@@ -5071,6 +5072,10 @@ def _openai_retry_metadata(
                 transport_status_code in _OPENAI_RETRYABLE_SERVER_STATUS_CODES,
             )
         return transport_status_code, False
+    # Overload is a recognized stream identity, not evidence of an HTTP status.
+    # Keep the canonical server class only for conflict checking above.
+    if error_code == "server_is_overloaded":
+        return transport_status_code, retryable
     return canonical_status, retryable
 
 

@@ -1088,6 +1088,8 @@ def _payload_claims_stream_deadline(payload: dict[str, Any]) -> bool:
 
 
 def _has_provider_error_payload_fields(payload: dict[str, Any]) -> bool:
+    if payload.get("model_provider_error") is True:
+        return True
     if payload.get("error_type") in _PROVIDER_ERROR_TYPE_MARKERS:
         return True
     return any(key in payload for key in _PROVIDER_ERROR_PAYLOAD_KEYS)

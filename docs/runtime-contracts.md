@@ -13927,6 +13927,20 @@ and the explicit historical limits of importing pre-anchor reports.
 
 ### Model retry decision evidence
 
+The OpenAI Responses adapter recognizes `server_is_overloaded` by error code,
+including code-only stream failures. It retains the allowlisted code and
+`retryable=true`; `status_code` is absent unless the failure explicitly reports
+one. The canonical server class used for conflict checking is not published as
+an observed HTTP status for this code. Conflicting recognized type/code/status
+identities remain nonretryable.
+
+Credential-safe provider error events carry `model_provider_error=true` when
+constructed from a typed `ModelProviderError`, even when every optional identity
+string is omitted. Runtime reconstruction accepts only the boolean `true` marker;
+this preserves the existing bounded unknown-provider policy without retaining
+arbitrary codes, messages, request IDs, or raw payloads. The marker grants no
+authority to replay completed effects or unresolved provider operations.
+
 `RetryDecision.disposition` explains both retry and terminal outcomes. Model
 error, retry, and discarded-attempt events expose the same content-free fields:
 `retry`, `retry_disposition`, `retry_suppression`, and `provider_retryable`, together
