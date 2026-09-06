@@ -455,7 +455,57 @@ class RunCommandTool(Tool):
         schema = copy_json_value(type(self).spec.input_schema, "run_command.input_schema")
         schema["properties"]["selector"]["enum"] = [item.selector for item in authorities]
         schema["properties"]["args"]["maxItems"] = max(item.max_arguments for item in authorities)
-        super().__init__(type(self).spec.model_copy(update={"input_schema": schema}))
+        schema["properties"]["timeoutSeconds"]["maximum"] = max(
+            item.timeout_seconds for item in authorities
+        )
+        schema["properties"]["workingDirectory"]["enum"] = sorted(
+            {directory for item in authorities for directory in item.allowed_working_directories}
+        )
+        # The union schema alone cannot express each selector's narrower contract.
+        # Publish only model-callable inputs; executable paths and fixed environment
+        # values remain application-owned and are not part of model arguments.
+        catalogue = [
+            {
+                "selector": item.selector,
+                "description": item.description,
+                "args": {
+                    "minItems": item.min_arguments,
+                    "maxItems": item.max_arguments,
+                    "allowed_flags": list(item.allowed_flags),
+                    "required_flags": list(item.required_flags),
+                    "flags_with_values": list(item.flags_with_values),
+                    "path_value_flags": list(item.path_value_flags),
+                    "allowed_literals": list(item.allowed_literals),
+                    "allow_positional_arguments": item.allow_positional_arguments,
+                    "positional_arguments_are_paths": item.positional_arguments_are_paths,
+                    "positional_path_prefixes": list(item.positional_path_prefixes),
+                    "positional_path_suffixes": list(item.positional_path_suffixes),
+                    "allow_pytest_node_ids": item.allow_pytest_node_ids,
+                    "max_argument_bytes": item.max_argument_bytes,
+                    "max_total_argument_bytes": item.max_total_argument_bytes,
+                },
+                "workingDirectory": {
+                    "default": item.default_working_directory,
+                    "enum": list(item.allowed_working_directories),
+                },
+                "timeoutSeconds": {
+                    "default": item.timeout_seconds,
+                    "maximum": item.timeout_seconds,
+                },
+            }
+            for item in authorities
+        ]
+        description = (
+            type(self).spec.description
+            + " Select a catalogue entry and follow its limits. Omit optional fields to use "
+            "that selector's defaults. args contains only additional arguments, not the "
+            "executable or fixed command arguments. A selector with maxItems=0 uses args=[]. "
+            "workingDirectory is relative to the workspace root. Catalogue: "
+            + canonical_durable_json_bytes(catalogue, "run_command.catalogue").decode("utf-8")
+        )
+        super().__init__(
+            type(self).spec.model_copy(update={"input_schema": schema, "description": description})
+        )
         self._profile = owned_profile
         self._authorities = {item.selector: item for item in authorities}
         self._command_policies = {

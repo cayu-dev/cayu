@@ -88,6 +88,13 @@ replace the built-in profile in `environments/coding.py`; profile selection must
 remain application configuration, not repository auto-detection or prompt
 instructions.
 
+The model-facing `run_command` schema bounds working directories and timeouts
+to the selected profile. Its description includes each selector's argument, path,
+flag, literal, working-directory, and timeout contract. `args` contains only
+additional arguments; a no-argument selector uses `args=[]`. Omit optional fields
+to use that selector's defaults. The catalogue does not disclose fixed environment
+values or executable paths, and policy still validates every call independently.
+
 Structured commands also capture bounded content-and-Git-mode manifests immediately
 before dispatch and after complete process settlement. Read-only selectors must
 leave the manifest unchanged; mutating selectors may change only their declared

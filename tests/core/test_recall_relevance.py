@@ -46,6 +46,160 @@ def test_concept_support_independent_of_rank(query, text, eligible):
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_title_aware_coding_recall_keeps_related_contracts_and_rejects_control(tmp_path, backend):
+    from test_memory_admission import _policy
+
+    from cayu import WeightedReciprocalRankFusionConfig
+
+    async def run():
+        scope = KnowledgeAccessScope.for_namespace("default")
+        store = (
+            InMemoryKnowledgeStore(access_scope=scope)
+            if backend == "memory"
+            else SQLiteKnowledgeStore(tmp_path / "coding.sqlite", access_scope=scope)
+        )
+        entries = [
+            KnowledgeEntry(
+                id="cache",
+                title="Harbor cache contract",
+                text="Caller-owned batch caches must use tenant-scoped keys and copy returned records.",
+            ),
+            KnowledgeEntry(
+                id="retry",
+                title="Harbor retry contract",
+                text="retry_batch persists the receipt before acknowledgement; a failed send is never settled.",
+            ),
+            KnowledgeEntry(
+                id="window",
+                title="Harbor reporting bucket contract",
+                text="Reporting buckets are half-open; counts compare aware timestamps in UTC.",
+            ),
+        ]
+        try:
+            for entry in entries:
+                await store.create_entry(entry)
+            policy = _policy(
+                relevance_policy="cayu.query_concepts.v2",
+                minimum_inject_score=0.01,
+                minimum_offer_score=0.005,
+            )
+            engine = RecallEngine(
+                (KnowledgeRecallSource(store),),
+                fusion_config=WeightedReciprocalRankFusionConfig(
+                    configuration_version=policy.fusion_configuration_version,
+                    channel_weights={"knowledge.lexical": 1.0, "knowledge.semantic": 1.0},
+                ),
+            )
+            for query, expected in [
+                ("Add cached batch lookup to Harbor.", "cache"),
+                ("Add retry batch delivery to Harbor.", "retry"),
+                ("Add reporting bucket counts to Harbor.", "window"),
+                ("Add item pagination to Harbor.", None),
+                ("Harbor authentication credential rotation", None),
+            ]:
+                result = await engine.recall(
+                    RecallSituation(query=query, knowledge_access_scope=scope)
+                )
+                contribution = admit_recall(result, policy)
+                focused = (
+                    []
+                    if contribution.focus is None
+                    else [
+                        item.candidate.record.locator["entry_id"]
+                        for item in contribution.focus.items
+                    ]
+                )
+                assert focused == ([] if expected is None else [expected])
+                for candidate in result.candidates:
+                    assert candidate.record.title is not None
+                    assert candidate.record.content_hash
+                if expected == "cache":
+                    legacy = admit_recall(
+                        result, _policy(relevance_policy="cayu.query_concepts.v1")
+                    )
+                    assert legacy.focus is None
+        finally:
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "query,text,expected",
+    [
+        ("cached caches caching", "cache", True),
+        ("retry retries retrying", "retry", True),
+        ("cache-42", "caches-42", False),
+        ("src/cache.py", "src/caches.py", False),
+        ("deployment rollback safeguards", "deployment picnic", False),
+    ],
+)
+def test_v2_inflections_do_not_inflate_concepts_or_fuzz_identifiers(query, text, expected):
+    assert (
+        query_concept_eligibility(query, text, version="cayu.query_concepts.v2")[0] == "eligible"
+    ) is expected
+
+
+@pytest.mark.parametrize(
+    "relevance_policy", ["rank_only.v1", "cayu.query_concepts.v1", "cayu.query_concepts.v2"]
+)
+@pytest.mark.parametrize("bound", ["below_body", "body", "below_combined", "combined"])
+def test_title_byte_admission_and_candidate_diagnostics_agree(relevance_policy, bound):
+    from test_memory_admission import _candidate, _policy, _result
+
+    candidate = _candidate("cache", score=0.04, text="batch caches")
+    candidate = candidate.model_copy(
+        update={"record": candidate.record.model_copy(update={"title": "Caché contract"})}
+    )
+    body_bytes = len(candidate.record.text.encode("utf-8"))
+    combined_bytes = body_bytes + len(candidate.record.title.encode("utf-8"))
+    limit = {
+        "below_body": body_bytes - 1,
+        "body": body_bytes,
+        "below_combined": combined_bytes - 1,
+        "combined": combined_bytes,
+    }[bound]
+    result = _result(candidate).model_copy(update={"relevance_query": "batch caches"})
+    contribution = admit_recall(
+        result, _policy(relevance_policy=relevance_policy, max_candidate_text_bytes=limit)
+    )
+    oversized = bound == "below_body" or (
+        relevance_policy == "cayu.query_concepts.v2" and bound != "combined"
+    )
+    assert (contribution.focus is None) is oversized
+    assert contribution.diagnostics.oversized_candidate_omitted == int(oversized)
+    assert contribution.diagnostics.candidate_decisions[0].outcome == (
+        "oversized" if oversized else "focused"
+    )
+
+
+def test_v2_policy_identity_and_title_byte_bound():
+    from test_memory_admission import _candidate, _policy, _result
+
+    from cayu.recall_relevance import TITLE_RELEVANCE_TEXT_VERSION
+
+    legacy = _policy(relevance_policy="cayu.query_concepts.v1")
+    policy = _policy(relevance_policy="cayu.query_concepts.v2")
+    assert policy.relevance_text_version == TITLE_RELEVANCE_TEXT_VERSION
+    assert legacy.fingerprint() != policy.fingerprint()
+    with pytest.raises(ValueError, match="Unicode version"):
+        policy.model_copy(update={"relevance_text_version": legacy.relevance_text_version})
+    candidate = _candidate("cache", score=0.04, text="batch caches")
+    candidate = candidate.model_copy(
+        update={"record": candidate.record.model_copy(update={"title": "Harbor cache"})}
+    )
+    result = _result(candidate).model_copy(update={"relevance_query": "Harbor cached batch"})
+    assert admit_recall(result, policy).focus is not None
+    bounded = policy.model_copy(
+        update={"max_candidate_text_bytes": len(candidate.record.text.encode())}
+    )
+    assert admit_recall(result, bounded).focus is None
+    with pytest.raises(ValueError, match="1024 bytes"):
+        type(candidate.record).model_validate({**candidate.record.model_dump(), "title": "é" * 513})
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("population", [1, 20])
 def test_generated_default_rejects_picnics_and_keeps_useful_procedure(
     tmp_path, backend, population
@@ -53,7 +207,7 @@ def test_generated_default_rejects_picnics_and_keeps_useful_procedure(
     assert main(["new", "relevance_app", "--dir", str(tmp_path)]) == 0
     with project_context(tmp_path / "relevance_app"):
         policy = importlib.import_module("memory.context").build_context_policy()
-    assert policy.admission_policy.relevance_policy == "cayu.query_concepts.v1"
+    assert policy.admission_policy.relevance_policy == "cayu.query_concepts.v2"
 
     async def run():
         scope = KnowledgeAccessScope.for_namespace("default")

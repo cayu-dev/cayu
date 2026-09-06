@@ -40,6 +40,70 @@ def _digest(content: bytes) -> str:
     return "sha256:" + sha256(content).hexdigest()
 
 
+def test_model_catalogue_exposes_each_selectors_actual_input_contract():
+    import json
+
+    profile = DockerCodingToolchainProfile(
+        profile_id="catalogue",
+        revision="1",
+        image_identity=DockerImageIdentity(reference="registry.example/python@sha256:" + "b" * 64),
+        platform_architecture="amd64",
+        command_authorities=(
+            DockerCodingCommandAuthority(
+                selector="diagnose",
+                revision="1",
+                description="Reproduce an incident.",
+                exposure="structured_command",
+                executable="/opt/private/python",
+                fixed_arguments=("private_diagnostics.py",),
+                allowed_literals=("cache", "retries"),
+                allow_positional_arguments=True,
+                min_arguments=1,
+                max_arguments=1,
+                timeout_seconds=20,
+            ),
+            DockerCodingCommandAuthority(
+                selector="tests",
+                revision="1",
+                description="Run all repository tests.",
+                exposure="structured_command",
+                executable="/opt/private/python",
+                fixed_arguments=("-m", "unittest"),
+                max_arguments=0,
+                timeout_seconds=30,
+            ),
+        ),
+    )
+    tool = structured_commands.RunCommandTool(toolchain_profile=profile)
+    schema = tool.spec.input_schema
+    assert schema["properties"]["timeoutSeconds"]["maximum"] == 30
+    assert schema["properties"]["workingDirectory"]["enum"] == ["."]
+    assert "/opt/private/python" not in tool.spec.description
+    assert "private_diagnostics.py" not in tool.spec.description
+    catalogue = json.loads(tool.spec.description.split("Catalogue: ", 1)[1])
+    authorities = {item.selector: item for item in profile.command_authorities}
+    for contract in catalogue:
+        args = (
+            [] if contract["args"]["maxItems"] == 0 else [contract["args"]["allowed_literals"][0]]
+        )
+        request = {
+            "selector": contract["selector"],
+            "args": args,
+            "workingDirectory": contract["workingDirectory"]["default"],
+            "timeoutSeconds": contract["timeoutSeconds"]["default"],
+        }
+        resolved = structured_commands._resolve_structured_command_request(authorities, request)
+        assert resolved[0].selector == contract["selector"]
+    with pytest.raises(ValueError, match="timeout ceiling"):
+        structured_commands._resolve_structured_command_request(
+            authorities, {"selector": "tests", "timeoutSeconds": 60}
+        )
+    with pytest.raises(ValueError):
+        structured_commands._resolve_structured_command_request(
+            authorities, {"selector": "tests", "args": ["-m", "unittest"]}
+        )
+
+
 def _profile(lock_content: bytes = b"locked\n") -> DockerCodingToolchainProfile:
     return DockerCodingToolchainProfile(
         profile_id="python-existing-repo",

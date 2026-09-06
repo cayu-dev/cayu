@@ -12,6 +12,8 @@ from cayu.retrieval import RetrievalCandidateIdentity
 
 RELEVANCE_VERSION = "cayu.query_concepts.v1"
 RELEVANCE_TEXT_VERSION = f"{RELEVANCE_VERSION}+unicode-{unicodedata.unidata_version}"
+TITLE_RELEVANCE_VERSION = "cayu.query_concepts.v2"
+TITLE_RELEVANCE_TEXT_VERSION = f"{TITLE_RELEVANCE_VERSION}+unicode-{unicodedata.unidata_version}"
 # Fixed calibration vocabulary; changing it requires a new version.
 _STOP = frozenset(
     [
@@ -75,6 +77,18 @@ _CONCEPTS = {
     "deadlines": "timeout",
     "deadline": "timeout",
 }
+# Deliberately bounded vocabulary, not general stemming or semantic similarity.
+# v1 remains unchanged for persisted policies and replay.
+_V2_CONCEPTS = {
+    **_CONCEPTS,
+    "cached": "cache",
+    "caches": "cache",
+    "caching": "cache",
+    "retries": "retry",
+    "retried": "retry",
+    "retrying": "retry",
+    "buckets": "bucket",
+}
 
 
 class RecallCandidateDecision(BaseModel):
@@ -101,22 +115,34 @@ class RecallCandidateDecision(BaseModel):
     ]
 
 
-def _concepts(text: str) -> set[str]:
+def _concepts(text: str, *, version: str = RELEVANCE_VERSION) -> set[str]:
+    vocabulary = _V2_CONCEPTS if version == TITLE_RELEVANCE_VERSION else _CONCEPTS
     return {
-        _CONCEPTS.get(term, term)
+        vocabulary.get(term, term)
         for term in re.findall(r"[^\W_]+(?:[-./][^\W_]+)*", text.casefold())
         if term not in _STOP
     }
 
 
-def query_concept_eligibility(query: str | None, text: str) -> tuple[str, str]:
+def query_concept_eligibility(
+    query: str | None,
+    text: str,
+    *,
+    version: str = RELEVANCE_VERSION,
+    title: str | None = None,
+) -> tuple[str, str]:
     """At most 8,192 query bytes / 128,000 text bytes; no channel confidence."""
+    if version not in {RELEVANCE_VERSION, TITLE_RELEVANCE_VERSION}:
+        raise ValueError("Unsupported query concept version.")
     if query is None:
         return "insufficient_evidence", "missing_query_evidence"
-    terms = _concepts(query)
+    terms = _concepts(query, version=version)
     if not terms:
         return "insufficient_evidence", "missing_query_evidence"
-    supported = terms & _concepts(text)
+    evidence = _concepts(text, version=version)
+    if version == TITLE_RELEVANCE_VERSION and title is not None:
+        evidence |= _concepts(title, version=version)
+    supported = terms & evidence
     # One exact identifier is useful; a multi-concept question needs two concepts
     # and a majority of its evidence. Repetition/volume cannot change the result.
     if len(supported) >= min(2, len(terms)) and len(supported) / len(terms) >= 0.6:

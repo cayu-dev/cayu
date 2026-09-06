@@ -513,6 +513,7 @@ class RecallRecord(BaseModel):
     text: str
     text_complete: bool
     content_hash: str
+    title: str | None = Field(default=None, exclude_if=lambda value: value is None)
     locator: Mapping[str, Any]
     lineage: KnowledgeLineageResult | None = Field(
         default=None,
@@ -535,6 +536,15 @@ class RecallRecord(BaseModel):
     @classmethod
     def validate_text(cls, value: str) -> str:
         return require_nonblank(value, "text")
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str | None) -> str | None:
+        if value is not None:
+            value = require_nonblank(value, "title")
+            if len(value.encode("utf-8")) > 1024:
+                raise ValueError("Recall record title exceeds 1024 bytes.")
+        return value
 
     @field_validator("text_complete", mode="before")
     @classmethod
@@ -2125,6 +2135,9 @@ def _knowledge_recall_record(
         text=preview,
         text_complete=len(preview.encode("utf-8")) == len(encoded),
         content_hash=sha256(encoded).hexdigest(),
+        title=(hit.entry.title.encode("utf-8")[:1024].decode("utf-8", errors="ignore") or None)
+        if hit.entry.title
+        else None,
         locator=locator,
     )
 

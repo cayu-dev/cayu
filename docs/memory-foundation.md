@@ -1912,13 +1912,18 @@ explicit `work_context` remains supported. Scope and admission are independent.
 
 ### Shipped relevance eligibility
 
-Generated projects select `cayu.query_concepts.v1` with calibration
-`standard-local-recall-query-concepts-v2`. Rank fusion still orders candidates;
+Generated projects select `cayu.query_concepts.v2` with calibration
+`standard-local-recall-query-concepts-v3`. Rank fusion still orders candidates;
 rank, list population, ties, repeated words, and channel agreement cannot establish
 eligibility. The gate compares unique normalized current-query concepts against
-bounded authorized candidate text: one exact concept/identifier, or at least two
+bounded authorized candidate text and its revision-exact knowledge title (up to
+1,024 UTF-8 bytes, included in the candidate admission byte limit): one exact
+concept/identifier, or at least two
 concepts covering 60% of a multi-concept query. The versioned vocabulary includes
-limited release/rollback, authentication, and timeout paraphrases. This is a
+limited release/rollback, authentication, and timeout paraphrases, plus cache,
+retry, and bucket inflections. Exact path and hyphenated identifiers are not
+stemmed. `cayu.query_concepts.v1` retains its original body-only vocabulary and
+policy identity; existing applications opt into v2 explicitly. This is a
 conservative text heuristic, not a general semantic-confidence estimator.
 
 Lexical-only defaults remain useful. Supported semantic/hybrid hits use the same

@@ -32,6 +32,7 @@ from cayu.recall import (
 )
 from cayu.recall_relevance import (
     RELEVANCE_TEXT_VERSION,
+    TITLE_RELEVANCE_TEXT_VERSION,
     RecallCandidateDecision,
     query_concept_eligibility,
 )
@@ -91,9 +92,9 @@ class AutomaticRecallPolicy(BaseModel):
     calibration_version: str
     fusion_strategy_version: str
     fusion_configuration_version: str
-    relevance_policy: Literal["rank_only.v1", "cayu.query_concepts.v1"] = Field(
-        default="rank_only.v1", exclude_if=lambda value: value == "rank_only.v1"
-    )
+    relevance_policy: Literal[
+        "rank_only.v1", "cayu.query_concepts.v1", "cayu.query_concepts.v2"
+    ] = Field(default="rank_only.v1", exclude_if=lambda value: value == "rank_only.v1")
     relevance_text_version: str | None = Field(default=None, exclude_if=lambda value: value is None)
     mode: AutomaticRecallMode = AutomaticRecallMode.OFFER_AND_STRONG_MATCHES
     minimum_inject_score: float
@@ -168,10 +169,15 @@ class AutomaticRecallPolicy(BaseModel):
 
     @model_validator(mode="after")
     def validate_policy(self) -> AutomaticRecallPolicy:
-        if self.relevance_policy == "cayu.query_concepts.v1":
+        if self.relevance_policy in {"cayu.query_concepts.v1", "cayu.query_concepts.v2"}:
+            text_version = (
+                TITLE_RELEVANCE_TEXT_VERSION
+                if self.relevance_policy == "cayu.query_concepts.v2"
+                else RELEVANCE_TEXT_VERSION
+            )
             if self.relevance_text_version is None:
-                object.__setattr__(self, "relevance_text_version", RELEVANCE_TEXT_VERSION)
-            elif self.relevance_text_version != RELEVANCE_TEXT_VERSION:
+                object.__setattr__(self, "relevance_text_version", text_version)
+            elif self.relevance_text_version != text_version:
                 raise ValueError(
                     "Relevance text semantics do not match this runtime's Unicode version."
                 )
@@ -835,15 +841,23 @@ def admit_recall(
     unevaluated_count = len(result.candidates) - len(evaluated)
     strong: list[tuple[int, RecallCandidate]] = []
     plausible: list[tuple[int, RecallCandidate]] = []
-    oversized_count = 0
+    oversized_candidates: set[tuple[str, str, str]] = set()
     eligibility = {}
     for fused_rank, candidate in enumerate(evaluated, start=1):
-        if len(candidate.record.text.encode("utf-8")) > policy.max_candidate_text_bytes:
-            oversized_count += 1
+        evidence_bytes = len(candidate.record.text.encode("utf-8"))
+        if policy.relevance_policy == "cayu.query_concepts.v2":
+            evidence_bytes += len((candidate.record.title or "").encode("utf-8"))
+        if evidence_bytes > policy.max_candidate_text_bytes:
+            oversized_candidates.add(candidate.record.identity.sort_key())
             continue
         decision = (
-            query_concept_eligibility(result.relevance_query, candidate.record.text)
-            if policy.relevance_policy == "cayu.query_concepts.v1"
+            query_concept_eligibility(
+                result.relevance_query,
+                candidate.record.text,
+                version=policy.relevance_policy,
+                title=candidate.record.title,
+            )
+            if policy.relevance_policy != "rank_only.v1"
             else ("legacy_rank_only", "rank_only_calibration")
         )
         eligibility[candidate.record.identity.sort_key()] = decision
@@ -965,7 +979,7 @@ def admit_recall(
             )
             if index >= policy.max_evaluated_candidates:
                 outcome = "unevaluated"
-            elif len(candidate.record.text.encode("utf-8")) > policy.max_candidate_text_bytes:
+            elif identity in oversized_candidates:
                 outcome = "oversized"
             elif identity in focused:
                 outcome = "focused"
@@ -1002,13 +1016,13 @@ def admit_recall(
             offered_count=len(offer_items),
             silent_count=len(result.candidates) - len(focus_items) - len(offer_items),
             duplicate_content_omitted=duplicate_count,
-            oversized_candidate_omitted=oversized_count,
+            oversized_candidate_omitted=len(oversized_candidates),
             focus_bound_omitted=focus_bound_count,
             offer_bound_omitted=offer_bound_count,
             unevaluated_count=unevaluated_count,
             recall_truncated=result.truncated,
             admission_truncated=bool(
-                oversized_count
+                oversized_candidates
                 or duplicate_count
                 or focus_bound_count
                 or offer_bound_count
