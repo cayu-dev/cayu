@@ -46,6 +46,7 @@ from cayu.evals.memory_attribution import (
     EvalMemoryEvidenceLimitation,
     eval_memory_attribution_fingerprint,
 )
+from cayu.evals.operation_outcomes import OperationOutcomeSummary, trajectory_operation_outcomes
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.evals.workflow_target import WorkflowEvalOutputEvidenceV1
 from cayu.memory_attribution import MemoryAttribution
@@ -347,6 +348,9 @@ class EvalTrialResult(BaseModel):
     unavailable_reason: str | None = None
     # Whether the exact run snapshot and complete child tree were captured. Assertion
     # inputs such as a price book can still be unavailable when this is true.
+    operation_outcomes: OperationOutcomeSummary | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     execution_status: Literal["completed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -493,6 +497,11 @@ class EvalTrialResult(BaseModel):
         ):
             raise ValueError("Assertion cost summaries must belong to the trial session_id.")
         if self.trajectory is not None:
+            if (
+                self.operation_outcomes is not None
+                and self.operation_outcomes != trajectory_operation_outcomes(self.trajectory)
+            ):
+                raise ValueError("operation_outcomes must match retained trajectory evidence.")
             _validate_trajectory_record_contract(self.trajectory)
             if self.evidence_complete != _trajectory_tree_is_complete(self.trajectory):
                 raise ValueError("evidence_complete must match the retained trajectory child tree.")

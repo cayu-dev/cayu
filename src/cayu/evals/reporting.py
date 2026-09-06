@@ -29,6 +29,7 @@ from cayu.evals.models import (
     _revalidate_model_iterable,
     _validate_trajectory_record_contract,
 )
+from cayu.evals.operation_outcomes import OperationOutcomeSummary, operation_outcome_summary_text
 from cayu.runtime.usage import aggregate_usage_metrics_from_json_payload
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -567,6 +568,9 @@ def _trial_section(trial: Any) -> str:
         if trial.usage_summary is not None
         else ""
     )
+    operations = operation_outcome_summary_text(
+        trial.operation_outcomes or OperationOutcomeSummary()
+    )
     memory = trial.memory_attribution
     memory_summary = eval_memory_attribution_summary(memory)
     return (
@@ -576,6 +580,7 @@ def _trial_section(trial: Any) -> str:
         f"score {_format_score(trial.score)} · {trial.duration_ms} ms · "
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'}</p>"
         f"{execution_html}{diagnostic_html}{final_output}{usage}"
+        f"<p>{_escape(operations)}</p>"
         f"<p>Memory attribution: {_escape(memory_summary)} · revision "
         f"<code>{_escape(memory.revision)}</code></p>"
         "<p>Full memory-attribution record inspection is unsupported in HTML; "

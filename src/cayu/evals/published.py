@@ -108,6 +108,7 @@ from cayu.evals.models import (
     EvalTrialResult,
     _model_instance_python_input,
 )
+from cayu.evals.operation_outcomes import OperationOutcomeSummary
 from cayu.evals.result_contract import (
     PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
     EvalTrialDiagnosticCode,
@@ -1267,6 +1268,9 @@ def _validate_memory_assertions_for_evidence(
 
 
 class PublishedEvalTrialResult(_PortableModel):
+    operation_outcomes: OperationOutcomeSummary | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     execution_status: Literal["completed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -2815,6 +2819,7 @@ def _published_case(
             public_data = trial_public_data[index]
         trials.append(
             PublishedEvalTrialResult(
+                operation_outcomes=trial.operation_outcomes,
                 execution_status=trial.execution_status,
                 capture_bounds=trial.capture_bounds,
                 capture_diagnostic=trial.capture_diagnostic,

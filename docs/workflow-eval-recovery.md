@@ -183,3 +183,6 @@ smoke stores, applying their actual deterministic assertions, and recording thei
 actual scores. Synthetic tests prove the API and no-dispatch behavior; they do not
 establish the smoke answers' correctness. Deployments or GAIA dependency updates
 must record the exact Runtime revision used for those results.
+
+For invocation health versus nonzero command exits, timeout, cancellation, and
+structured HTTP evidence, see [operation outcome monitoring](operation-outcomes.md).

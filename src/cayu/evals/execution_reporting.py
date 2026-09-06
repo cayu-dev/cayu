@@ -27,6 +27,7 @@ from cayu.evals.execution_comparison import (
     EvalToolJsonAssertionComparisonV1,
 )
 from cayu.evals.memory_attribution import eval_memory_attribution_summary
+from cayu.evals.operation_outcomes import OperationOutcomeSummary, operation_outcome_summary_text
 from cayu.evals.result_presentation import (
     EVAL_RESULT_REPORT_MAX_BYTES,
     EvalAssertionPresentationV1,
@@ -895,6 +896,9 @@ def _trial_section(trial: Any, presentation: EvalTrialPresentationV1) -> str:
     )
     if output.text:
         output_block += f"<pre>{_escape(output.text)}</pre>"
+    operations = operation_outcome_summary_text(
+        trial.operation_outcomes or OperationOutcomeSummary()
+    )
     memory = trial.memory_attribution
     memory_summary = eval_memory_attribution_summary(memory)
     capture_diagnostic = getattr(trial, "capture_diagnostic", None)
@@ -911,6 +915,7 @@ def _trial_section(trial: Any, presentation: EvalTrialPresentationV1) -> str:
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'} · "
         f"usage {_escape(usage)} · reason <code>{_escape(trial.code)}</code></p>"
         f"<p>{_escape(trial.message)}</p>{capture_html}"
+        f"<p>{_escape(operations)}</p>"
         f"<p>Memory attribution: {_escape(memory_summary)} · revision "
         f"<code>{_escape(memory.revision)}</code></p>"
         "<p>Full memory-attribution record inspection is unsupported in HTML; "

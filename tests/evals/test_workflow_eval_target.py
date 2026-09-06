@@ -1353,3 +1353,64 @@ def test_durable_server_worker_executes_registered_workflow_target(tmp_path) -> 
             await session_store.close()
 
     asyncio.run(run())
+
+
+def test_workflow_command_outcomes_reach_portable_reports() -> None:
+    from cayu.evals.operation_outcomes import HttpOperationOutcomeV1
+
+    class ReportedOutcomeTool(_EchoTool):
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            return ToolResult(
+                content="expected probe",
+                structured={
+                    "exit_code": 1,
+                    "timed_out": False,
+                    "cancelled": False,
+                    "operation_outcome": HttpOperationOutcomeV1(status_code=403).model_dump(),
+                },
+            )
+
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                response
+                for agent in ("first", "second")
+                for response in (
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="reused-call", name="echo", arguments={"text": agent}
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta(f"{agent} done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                )
+            ]
+        ),
+        default=True,
+    )
+    for agent in ("first", "second"):
+        app.register_agent(
+            AgentSpec(name=agent, model="scripted-model"), tools=[ReportedOutcomeTool()]
+        )
+    result = asyncio.run(
+        run_corpus_suite(
+            _target(app, _TwoChildWorkflow),
+            _corpus(FinalOutputEqualsAssertionSpec(id="output", expected="second done")),
+            "workflow-suite",
+        )
+    )
+    loaded = corpus_execution_result_from_json(corpus_execution_result_to_json(result))
+    trial = loaded.run.cases[0].trials[0]
+    assert trial.score == 1.0
+    assert trial.operation_outcomes is not None
+    counts = trial.operation_outcomes.counts
+    assert counts.invocation_completed == 2
+    assert counts.invocation_failed == 0
+    assert counts.command_nonzero_exit == 2
+    assert counts.http_error == 2
+    assert len({row.session_id for row in trial.operation_outcomes.evidence}) == 2
+    assert "2 nonzero exit" in render_corpus_execution_html(loaded)

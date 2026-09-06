@@ -75,6 +75,7 @@ from cayu.evals.models import (
     aggregate_eval_score,
     aggregate_eval_status,
 )
+from cayu.evals.operation_outcomes import trajectory_operation_outcomes
 from cayu.evals.result_contract import (
     EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
     EvalTrialDiagnosticCode,
@@ -2239,6 +2240,7 @@ async def _run_workflow_case_once_with_public_projection(
                 if trajectory is None or trajectory.usage_summary is None
                 else session_usage_summary_payload(trajectory.usage_summary)
             ),
+            operation_outcomes=trajectory_operation_outcomes(trajectory),
             memory_attribution=memory_attribution,
             started_at=started_at,
             completed_at=completed_at,
@@ -2828,6 +2830,7 @@ async def _run_case_once_with_public_projection(
             usage_summary=session_usage_summary_payload(usage_summary)
             if usage_summary is not None
             else None,
+            operation_outcomes=trajectory_operation_outcomes(trajectory),
             memory_attribution=memory_attribution,
             started_at=started_at,
             completed_at=completed_at,

@@ -12,6 +12,7 @@ from pathlib import Path
 from threading import Lock
 from time import monotonic
 from typing import Any, Literal, NoReturn, cast
+from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -1051,6 +1052,7 @@ async def _capture_runner_dispatch_outcome(
     started_at = monotonic()
     if type(command_evidence_revision) is not int or command_evidence_revision < 0:
         raise TypeError("command_evidence_revision must be a non-negative integer.")
+    execution_id = str(uuid4())
     command_evidence = None
     if execution_observer is not None:
         command_evidence = _runner_command_evidence(
@@ -1062,6 +1064,7 @@ async def _capture_runner_dispatch_outcome(
             await execution_observer(
                 "started",
                 {
+                    "execution_id": execution_id,
                     "adapter": _safe_runner_adapter(runner),
                     "command": command_evidence,
                 },
@@ -1109,6 +1112,7 @@ async def _capture_runner_dispatch_outcome(
     if command_evidence is None:  # pragma: no cover - observer construction invariant
         raise AssertionError("Runner execution observer has no command evidence.")
     completed_payload: dict[str, Any] = {
+        "execution_id": execution_id,
         "adapter": _safe_runner_adapter(runner),
         "command": command_evidence,
         "duration_ms": min(
@@ -1121,8 +1125,11 @@ async def _capture_runner_dispatch_outcome(
             {
                 "exit_code": result.exit_code,
                 "timed_out": result.timed_out,
+                "cancelled": result.cancelled,
             }
         )
+    if isinstance(error, asyncio.CancelledError):
+        completed_payload["cancelled"] = True
     if error is not None:
         completed_payload["error_type"] = (
             trusted_runner_exception_type_name(error) or "runner_execution_error"

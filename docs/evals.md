@@ -795,6 +795,10 @@ validation fails before provider dispatch.
 For configurable child capture limits, precise capture failures, and read-only
 recapture/rescoring, see [Workflow capture and saved-attempt recovery](workflow-eval-recovery.md).
 
+Trial JSON and HTML expose invocation health separately from command exit, timeout,
+and cancellation observations. See [Operation outcome monitoring](operation-outcomes.md)
+for evidence references, bounded counts, and typed HTTP integration.
+
 `WorkflowEvalTarget` makes a `WorkflowBase` run—not one child agent session—the
 candidate under evaluation. It reuses the same `EvalSuite`, corpus compiler,
 assertions, scheduler, stores, reports, CLI, and server execution path:

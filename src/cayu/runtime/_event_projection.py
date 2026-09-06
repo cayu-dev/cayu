@@ -3600,7 +3600,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         untrusted_container_keys={"results"},
     )
     runner_policy = _observed_policy(
-        "adapter approval_id command duration_ms error error_type execution_profile_fingerprint "
+        "adapter approval_id cancelled command duration_ms error error_type execution_id execution_profile_fingerprint "
         "exit_code idempotency_key input_id model_attempt_id model_step_id timed_out tool_call_id "
         "tool_round_id",
         authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,

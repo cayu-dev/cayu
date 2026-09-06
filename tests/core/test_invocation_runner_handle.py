@@ -706,7 +706,10 @@ def test_runner_execution_observer_brackets_dispatch_with_bounded_evidence() -> 
     assert [phase for phase, _payload in observations] == ["started", "completed"]
     started = observations[0][1]
     completed = observations[1][1]
+    assert completed["execution_id"] == started["execution_id"]
+    assert completed["cancelled"] is False
     assert started == {
+        "execution_id": started["execution_id"],
         "adapter": "unknown",
         "command": {
             "kind": "process",
@@ -5285,3 +5288,33 @@ def test_invocation_runner_handle_sanitizes_cleanup_without_replacing_cancellati
             "error_type": "RuntimeError",
         }
     ]
+
+
+def test_runner_cancellation_observation_retains_execution_identity() -> None:
+    observations = []
+
+    async def observe(phase, payload, revision):
+        observations.append((phase, payload))
+
+    async def scenario():
+        runner = _BlockingRunner()
+        runner.started = asyncio.Event()
+        handle = InvocationRunnerHandle(
+            runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(),
+            ),
+            execution_observer=observe,
+        )
+        task = asyncio.create_task(handle.exec(ExecCommand.process("blocked")))
+        await runner.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert [phase for phase, _ in observations] == ["started", "completed"]
+    assert observations[0][1]["execution_id"] == observations[1][1]["execution_id"]
+    assert observations[1][1]["cancelled"] is True
+    assert "exit_code" not in observations[1][1]
