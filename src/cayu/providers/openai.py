@@ -73,6 +73,7 @@ from cayu.providers._http import (
     validate_url,
 )
 from cayu.providers._openai_protocol import protocol_diagnostic_fields
+from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
     MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -1190,6 +1191,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
+        validate_thinking_effort(request.options, protocol="openai", model=request.model)
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: OpenAIContextOverflowError | None = None
         post_completion_failure: ModelProviderError | None = None
@@ -1760,11 +1762,11 @@ def _openai_embedding_options(options: Mapping[str, Any]) -> dict[str, Any]:
 def _apply_thinking_options(payload: dict[str, Any], neutral: Any) -> None:
     """Map the neutral ``options["thinking"]`` payload onto OpenAI ``reasoning`` keys.
 
-    OpenAI reasoning models cannot disable reasoning and expose no token budget, so only
+    The adapter exposes no token budget, so only
     ``effort`` maps (authoritative — overwrites a raw value). ``summary="auto"`` is added
     as a default to surface readable reasoning, so a caller's raw ``reasoning.summary``
     (and any other raw ``reasoning`` sibling) is preserved. ``enabled=False`` is a no-op
-    (the model reasons at its default).
+    (the model uses its default). Explicit effort="none" is forwarded unchanged.
     """
     if not isinstance(neutral, Mapping) or not neutral.get("enabled", True):
         return
@@ -5109,7 +5111,10 @@ def _openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return copied
 
 
-def _effective_openai_request_options(options: Mapping[str, Any]) -> dict[str, Any]:
+def _effective_openai_request_options(
+    options: Mapping[str, Any], *, model: str = ""
+) -> dict[str, Any]:
+    validate_thinking_effort(options, protocol="openai", model=model)
     effective = _openai_options(options)
     _apply_thinking_options(effective, options.get("thinking"))
     return effective
@@ -5122,7 +5127,7 @@ def _effective_openai_request_options_for_request(
 
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
-    effective = _effective_openai_request_options(request.options)
+    effective = _effective_openai_request_options(request.options, model=request.model)
     anchor_name = targeted_tool_native_cache_anchor_name(request.options)
     if anchor_name is None:
         if request.targeted_tool_projection is not None:
@@ -6618,7 +6623,7 @@ def _preflight_openai_hosted_tools(
         raise HostedToolCapabilityError(
             f"OpenAI hosted web search support is not established for model {model!r}."
         )
-    effective = _effective_openai_request_options(options)
+    effective = _effective_openai_request_options(options, model=model)
     reasoning = effective.get("reasoning")
     if isinstance(reasoning, Mapping) and reasoning.get("effort") == "minimal":
         raise HostedToolCapabilityError(

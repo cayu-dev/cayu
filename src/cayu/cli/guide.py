@@ -42,6 +42,7 @@ _GUIDES = {
         "structured-output.md",
         "Credential-free structured-output runtime proof.",
     ),
+    "thinking": ("thinking.md", "Reasoning effort vocabulary and provider compatibility."),
     "tool-effects": ("tool-effects.md", "Replay and mutation effect decisions."),
 }
 _INCLUDES = {
@@ -66,7 +67,8 @@ _RELATED = {
     "evals-ai-quality": ("evals-first", "evals-production", "authoring"),
     "evals-first": ("evals-ai-quality", "evals-production", "authoring"),
     "evals-production": ("evals-first", "evals-ai-quality", "durable-operations"),
-    "providers": ("authoring", "diagnostics"),
+    "providers": ("thinking", "authoring", "diagnostics"),
+    "thinking": ("providers", "authoring"),
     "references": ("authoring", "durable-operations"),
     "structured-output": ("authoring", "diagnostics"),
     "tool-effects": ("authoring", "durable-operations"),

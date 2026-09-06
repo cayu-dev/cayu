@@ -47,6 +47,7 @@ from cayu.providers._http import (
     sanitize_provider_cancellation,
     validate_base_url,
 )
+from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountResult,
     ModelContextOverflowError,
@@ -678,12 +679,12 @@ class OpenAISubscriptionProvider(ModelProvider):
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         projected = privacy_safe_provider_option_projection(
-            _effective_openai_request_options(request.options)
+            _effective_openai_request_options(request.options, model=request.model)
         )
         return {"openai": projected} if projected else {}
 
     def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
-        effective = _effective_openai_request_options(request.options)
+        effective = _effective_openai_request_options(request.options, model=request.model)
         return {"openai": effective} if effective else {}
 
     async def billing_identity_for_request(self, request: ModelRequest) -> BillingIdentity:
@@ -751,6 +752,7 @@ class OpenAISubscriptionProvider(ModelProvider):
     @_terminal_preserving_provider_stream
     @detach_provider_stream_traceback
     async def stream(self, request: ModelRequest):
+        validate_thinking_effort(request.options, protocol="openai", model=request.model)
         credentials: OpenAISubscriptionCredentials | None = None
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: ModelContextOverflowError | None = None
@@ -759,8 +761,8 @@ class OpenAISubscriptionProvider(ModelProvider):
         error_event: ModelStreamEvent | None = None
         completion_emitted = False
         try:
-            credentials = await self.auth.credentials()
             payload = build_openai_payload(request, stream=True, reasoning_state="inline")
+            credentials = await self.auth.credentials()
             raw_events = self.transport.stream_response_events(
                 url=f"{self.base_url}/responses",
                 headers=self._headers(credentials),

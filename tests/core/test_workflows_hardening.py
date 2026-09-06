@@ -2367,7 +2367,8 @@ def test_step_preserves_an_omitted_app_owned_step_budget():
     assert "max_steps" not in request.model_fields_set
 
 
-def test_step_forwards_run_options_and_preserves_owned_lineage():
+@pytest.mark.parametrize("effort", ["low", "none", "minimal", "xhigh", "max"])
+def test_step_forwards_run_options_and_preserves_owned_lineage(effort):
     app = RecordingApp()
     _register_scripted_assistant(
         app,
@@ -2376,7 +2377,7 @@ def test_step_forwards_run_options_and_preserves_owned_lineage():
     )
     app.register_environment(Environment(EnvironmentSpec(name="docker")))
     retry_policy = RetryPolicy(max_attempts=2)
-    thinking = ThinkingConfig(effort="low")
+    thinking = ThinkingConfig(effort=effort)
     limit = _budget_limit()
     ctx = TinyWorkflow(app).context("wf-options")
 
@@ -2420,7 +2421,8 @@ def test_step_forwards_run_options_and_preserves_owned_lineage():
     assert request.budget_limits == (limit,)
     assert request.budget_limits[0] is not limit
     assert request.retry_policy is retry_policy
-    assert request.thinking is thinking
+    assert request.thinking == thinking
+    assert request.thinking is not thinking
     assert request.task_id == "task-1"
     assert request.task_worker_id == "worker-1"
     assert request.task_lease_expires_at == datetime(2026, 1, 1, tzinfo=UTC)

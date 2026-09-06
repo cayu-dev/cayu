@@ -54,6 +54,7 @@ from cayu.providers._http import (
     stream_sse_json_events,
     validate_url,
 )
+from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     ModelContextOverflowError,
     ModelProvider,
@@ -552,6 +553,7 @@ class ChatCompletionsProvider(ModelProvider):
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         effective_options = _effective_chat_completions_request_options(
             request.options,
+            model=request.model,
             options_key=self.name,
         )
         projected = privacy_safe_provider_option_projection(effective_options)
@@ -560,6 +562,7 @@ class ChatCompletionsProvider(ModelProvider):
     def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
         effective = _effective_chat_completions_request_options(
             request.options,
+            model=request.model,
             options_key=self.name,
         )
         return {self.name: effective} if effective else {}
@@ -574,6 +577,7 @@ class ChatCompletionsProvider(ModelProvider):
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
+        validate_thinking_effort(request.options, protocol="chat_completions", model=request.model)
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: ChatCompletionsContextOverflowError | None = None
         post_completion_failure: ModelProviderError | None = None
@@ -752,6 +756,7 @@ def build_chat_completions_payload(
 
     options = _effective_chat_completions_request_options(
         request.options,
+        model=request.model,
         options_key=options_key,
     )
     resolved_attachments = resolved_file_attachments_from_options(request.options)
@@ -798,13 +803,10 @@ def build_chat_completions_payload(
 def _chat_completions_reasoning_options(neutral: Mapping[str, Any]) -> dict[str, Any]:
     """Map the neutral ``options["thinking"]`` payload to Chat Completions request keys.
 
-    The portable knob is ``reasoning_effort`` (low/medium/high), which OpenAI-compatible
-    reasoning providers accept. There is no portable way to *disable* reasoning here (the
-    ``reasoning_effort="none"`` value is backend-specific — Gemini/DeepSeek accept it,
-    OpenAI/Azure reject it), and this generic adapter can't know the backend, so
-    ``enabled=False`` is a no-op; pass a raw ``reasoning_effort`` via provider_options to
-    target a backend that supports it. There is no portable token budget, so ``max_tokens``
-    is not mapped.
+    Explicit effort is forwarded unchanged as ``reasoning_effort``. Model-specific
+    compatibility is validated by the effective-options builder. Unknown compatible
+    backends must establish acceptance themselves; no level is silently substituted.
+    ``enabled=False`` and enabled with no effort retain their historical no-op.
     """
     if not neutral.get("enabled", True):
         return {}
@@ -2047,8 +2049,10 @@ def _chat_completions_options(options: Mapping[str, Any], options_key: str) -> d
 def _effective_chat_completions_request_options(
     options: Mapping[str, Any],
     *,
+    model: str = "",
     options_key: str,
 ) -> dict[str, Any]:
+    validate_thinking_effort(options, protocol="chat_completions", model=model)
     effective = _chat_completions_options(options, options_key)
     # Cayu models one provider response as one assistant step; n>1 would return
     # multiple `choices` that the stream loop cannot represent. Reject it.

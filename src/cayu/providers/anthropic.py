@@ -58,6 +58,7 @@ from cayu.providers._reasoning_state import (
     reasoning_state,
     reasoning_state_matches,
 )
+from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -445,6 +446,7 @@ class AnthropicProvider(ModelProvider):
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         effective_options = _effective_anthropic_request_options(
             request.options,
+            model=request.model,
             default_max_tokens=self.max_tokens,
         )
         projected = privacy_safe_provider_option_projection(effective_options)
@@ -454,6 +456,7 @@ class AnthropicProvider(ModelProvider):
         return {
             "anthropic": _effective_anthropic_request_options(
                 request.options,
+                model=request.model,
                 default_max_tokens=self.max_tokens,
             )
         }
@@ -537,6 +540,7 @@ class AnthropicProvider(ModelProvider):
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
+        validate_thinking_effort(request.options, protocol="anthropic", model=request.model)
         resolved_api_key = self.api_key
         headers: dict[str, str] | None = None
         cancellation: asyncio.CancelledError | None = None
@@ -810,6 +814,7 @@ def build_anthropic_payload(
         raise TypeError("request must be a ModelRequest.")
     options = _effective_anthropic_request_options(
         request.options,
+        model=request.model,
         default_max_tokens=default_max_tokens,
     )
     payload: dict[str, Any] = {
@@ -861,8 +866,8 @@ def build_anthropic_token_count_payload(
 def _anthropic_thinking_options(neutral: Mapping[str, Any]) -> dict[str, Any]:
     """Map the neutral ``options["thinking"]`` payload to Anthropic request keys.
 
-    Field-driven so no model lookup is needed (the request shape differs by model
-    generation): ``effort`` -> adaptive thinking + ``output_config.effort``;
+    After local compatibility validation, ``effort`` maps to adaptive thinking
+    plus ``output_config.effort``;
     ``max_tokens`` -> legacy ``thinking.budget_tokens``; otherwise adaptive.
     ``display="summarized"`` is requested whenever thinking is enabled so the newest
     models (where the default is ``omitted``) still return readable reasoning text.
@@ -1546,8 +1551,10 @@ def _anthropic_options(options: Mapping[str, Any]) -> dict[str, Any]:
 def _effective_anthropic_request_options(
     options: Mapping[str, Any],
     *,
+    model: str = "",
     default_max_tokens: int,
 ) -> dict[str, Any]:
+    validate_thinking_effort(options, protocol="anthropic", model=model)
     if type(default_max_tokens) is not int:
         raise TypeError("default_max_tokens must be an integer.")
     if default_max_tokens <= 0:

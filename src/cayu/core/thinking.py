@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, field_validator, model_validator
 
-ThinkingEffort = Literal["low", "medium", "high"]
+ThinkingEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 MIN_THINKING_BUDGET_TOKENS = 1024
 
@@ -12,27 +12,28 @@ MIN_THINKING_BUDGET_TOKENS = 1024
 class ThinkingConfig(BaseModel):
     """Provider-neutral thinking/reasoning configuration.
 
-    The runtime carries this as a neutral ``options["thinking"]`` payload and each
-    provider maps it to its own request shape (field-driven, no model lookup):
+    Effort names are native values, not a portable scale. Supported vocabulary is
+    ``none``, ``minimal``, ``low``, ``medium``, ``high``, ``xhigh``, and ``max``;
+    adapters reject known incompatible model/transport combinations before dispatch.
+    Unknown model compatibility remains backend-dependent. ``xlow`` is not a verified
+    native value in the maintained adapters and is not an alias for ``minimal``.
 
-    - ``effort`` set -> adaptive thinking (Anthropic ``thinking={"type": "adaptive"}``
-      + ``output_config={"effort": ...}``; OpenAI ``reasoning={"effort": ...}``). This
-      is the path the current Claude and OpenAI reasoning models use.
-    - ``max_tokens`` set (and no ``effort``) -> legacy budgeted thinking (Anthropic
-      ``thinking={"type": "enabled", "budget_tokens": ...}``). Only the older Claude
-      models accept a token budget; OpenAI has no budget knob and ignores it.
-    - neither set, ``enabled=True`` -> adaptive thinking with provider defaults (on the
-      Chat Completions path this is a no-op: the model reasons by its own default).
-    - ``enabled=False`` is best-effort and provider-dependent: Anthropic disables
-      (``thinking={"type": "disabled"}``); OpenAI reasoning models cannot be disabled, so
-      it is a no-op (the model still reasons); the generic Chat Completions adapter also
-      no-ops (disabling isn't portable — pass a raw ``reasoning_effort`` via
-      ``provider_options`` to target a backend like Gemini that accepts ``"none"``).
+    Explicit effort maps unchanged to OpenAI ``reasoning.effort``, compatible Chat
+    Completions ``reasoning_effort``, or Anthropic adaptive thinking plus
+    ``output_config.effort``. Bedrock Converse has no typed effort mapping and rejects
+    it. See ``cayu guide thinking`` for the matrix.
 
-    ``effort`` and ``max_tokens`` select mutually exclusive modes. Disabling thinking
-    cannot be combined with either enabled-mode control. Provider-specific support is
-    still validated by the provider; contradictory neutral controls fail here before a
-    provider request can be built.
+    ``none`` requests the backend's native non-reasoning effort; ``minimal`` still
+    permits reasoning. Both require ``enabled=True`` (the default), which enables
+    this configuration, not a promise that the model thinks. Neither is silently
+    mapped to ``enabled=False``. The latter retains its historical best-effort
+    behavior: Anthropic disables thinking; OpenAI and generic Chat Completions no-op.
+
+    ``effort`` and ``max_tokens`` are mutually exclusive. A token budget selects
+    Anthropic legacy thinking (OpenAI and generic Chat Completions historically
+    ignore it). Disabling thinking cannot be combined with either control. With
+    neither control, enabled thinking uses existing provider defaults. Typed effort
+    wins over conflicting raw effort; unrelated provider options remain intact.
     """
 
     model_config = ConfigDict(

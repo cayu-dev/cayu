@@ -30,6 +30,7 @@ def test_bare_guide_lists_topics_and_help_describes_them(capsys) -> None:
     assert "evals-first" in listing
     assert "evals-production" in listing
     assert "providers" in listing
+    assert "thinking" in listing
 
     with pytest.raises(SystemExit) as excinfo:
         main(["guide", "--help"])

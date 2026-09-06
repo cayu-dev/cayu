@@ -210,7 +210,7 @@ def _chat_completions_payload(config: ThinkingConfig) -> dict:
 def test_chat_completions_payload_maps_effort_to_reasoning_effort() -> None:
     assert _chat_completions_payload(ThinkingConfig(effort="low"))["reasoning_effort"] == "low"
     # enabled=False is a no-op for the generic adapter (disabling isn't portable; the
-    # non-portable "none" is left to a raw provider_options override).
+    # native effort="none" must be explicitly requested on a supporting backend).
     assert "reasoning_effort" not in _chat_completions_payload(ThinkingConfig(enabled=False))
     # Enabled with no effort -> let the provider/model default decide (no knob sent).
     assert "reasoning_effort" not in _chat_completions_payload(ThinkingConfig())
@@ -664,10 +664,11 @@ def _thinking_parts(transcript: list[Message]) -> list[ThinkingPart]:
     ]
 
 
-def test_agentspec_thinking_reaches_request_options() -> None:
-    provider, _events, transcript = asyncio.run(_run(agent_thinking=ThinkingConfig(effort="high")))
+@pytest.mark.parametrize("effort", ["high", "none", "minimal", "xhigh", "max"])
+def test_agentspec_thinking_reaches_request_options(effort) -> None:
+    provider, _events, transcript = asyncio.run(_run(agent_thinking=ThinkingConfig(effort=effort)))
     assert provider.options is not None
-    assert provider.options["thinking"] == thinking_config_payload(ThinkingConfig(effort="high"))
+    assert provider.options["thinking"] == thinking_config_payload(ThinkingConfig(effort=effort))
     assert _thinking_parts(transcript)[0].text == "let me think"
 
 

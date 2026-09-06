@@ -24,6 +24,13 @@ Google AI Studio automatically uses Gemini usage accounting. For Gemini through
 another OpenAI-compatible Vertex or gateway endpoint, pass
 `usage_dialect=UsageDialect.GEMINI` explicitly.
 
+## Thinking effort compatibility
+
+Use `ThinkingConfig` for typed reasoning settings. Supported values, model/transport
+restrictions, precedence, and backend acceptance boundaries are in
+`cayu guide thinking` ([compatibility matrix](thinking.md)). `xlow` is not a verified
+native value; Runtime does not equate it with `minimal` or `low`.
+
 ## Recoverable OpenAI background responses
 
 Long OpenAI Responses calls can opt into provider-owned background execution:

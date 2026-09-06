@@ -33,6 +33,7 @@ from cayu.providers._reasoning_state import (
     ANTHROPIC_REASONING_PROTOCOL,
     ReasoningStateProvenance,
 )
+from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.anthropic import (
     _anthropic_overflow_message,
     _anthropic_tool,
@@ -321,6 +322,7 @@ class VertexProvider(ModelProvider):
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         effective_options = _effective_anthropic_request_options(
             request.options,
+            model=request.model,
             default_max_tokens=self.max_tokens,
         )
         projected = privacy_safe_provider_option_projection(effective_options)
@@ -330,6 +332,7 @@ class VertexProvider(ModelProvider):
         return {
             "anthropic": _effective_anthropic_request_options(
                 request.options,
+                model=request.model,
                 default_max_tokens=self.max_tokens,
             )
         }
@@ -396,6 +399,7 @@ class VertexProvider(ModelProvider):
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
+        validate_thinking_effort(request.options, protocol="anthropic", model=request.model)
         token: str | None = None
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: VertexContextOverflowError | None = None

@@ -8,6 +8,11 @@ For local development, the supported loop is:
 
 `edit the requested behavior -> inspect -> check -> test -> eval`
 
+Configure reasoning through `ThinkingConfig` on the agent, run/resume request, or
+workflow `StepRunOptions`. Effort values are provider-specific; consult
+`cayu guide thinking` for the exact vocabulary,
+precedence, local rejection rules, and backend acceptance boundaries.
+
 ## 1. Start with one model-only agent
 
 In a fresh generated project, edit the existing agent, test, and eval in place.

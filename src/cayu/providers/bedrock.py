@@ -47,6 +47,7 @@ from cayu.providers._reasoning_state import (
     reasoning_state,
     reasoning_state_matches,
 )
+from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -487,6 +488,7 @@ class BedrockProvider(ModelProvider):
     @_terminal_preserving_provider_stream
     @detach_provider_stream_traceback
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        validate_thinking_effort(request.options, protocol="bedrock", model=request.model)
         client: Any = None
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: BedrockContextOverflowError | None = None
@@ -752,6 +754,7 @@ def _bedrock_request_options(
     *,
     default_max_tokens: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    validate_thinking_effort(options, protocol="bedrock")
     if type(default_max_tokens) is not int or default_max_tokens <= 0:
         raise ValueError("default_max_tokens must be a positive integer.")
     raw = options.get("bedrock", {})

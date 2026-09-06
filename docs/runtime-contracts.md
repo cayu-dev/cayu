@@ -8444,6 +8444,15 @@ combined with either enabled-mode control; contradictory configurations fail at
 `enabled=False` is best effort: Anthropic can disable thinking, while providers
 without a portable disable control may ignore it. Typed thinking settings win
 over conflicting raw provider options.
+The exact effort vocabulary is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`; `xlow` is not a verified native value and remains invalid. Values are never
+coerced into one another. `none` and `minimal` require `enabled=True` and retain
+native semantics, distinct from `enabled=False`. Built-in adapters reject known
+model/transport incompatibilities before dispatch; Bedrock rejects typed effort
+because it has no mapping. Unknown compatible endpoints receive unchanged values
+without a claim of backend acceptance. See the shipped
+[effort compatibility matrix](../src/cayu/guides/thinking.md)
+for exact rules, sources, precedence, and operational-proof boundaries.
 
 Readable reasoning streams as `model.thinking.delta` and is persisted as a
 `ThinkingPart`. `include_in_transcript=False` omits newly produced display-only
