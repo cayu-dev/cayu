@@ -13250,6 +13250,13 @@ and repeated fixed-candidate memory experiments remain the causal layer.
 Portable corpus schema version 4 admits this new closed assertion kind; earlier
 corpus versions are rejected rather than widened implicitly.
 
+Native private memory-ablation reports preserve missing trials and terminal trials
+without portable evaluation as unavailable placeholders. Memory-attribution
+placeholders retain the canonical missing-evidence revision and limitation, with
+no admitted-item or provider-exposure counts. That revision identifies unavailable
+evidence, not an observed zero exposure. Incomplete report construction preserves
+the original schedule coordinates and stopping reason without dispatching trials.
+
 `ProbeRequirements.workspace_structure_paths` is separate from the existing
 private `workspace_paths` content capture. The fresh runner reads the union once
 but stores bytes only for a direct Python content assertion; the portable path

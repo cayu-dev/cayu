@@ -27,6 +27,7 @@ from cayu.agent_snapshots import (
 )
 from cayu.core import AgentSpec, Message
 from cayu.evals.corpus import (
+    MemoryAttributionAssertionSpec,
     PrivateJudgeReferenceV1,
     StructuredModelJudgeAssertionSpec,
     StructuredRubricCriterionV1,
@@ -69,6 +70,7 @@ from cayu.evals.external_private_memory_ablation import (
     run_external_private_memory_ablation,
     write_external_private_memory_ablation_artifacts,
 )
+from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
 from cayu.evals.memory_reporting import (
     MemoryExperimentCase,
     MemoryExperimentGatePolicy,
@@ -271,7 +273,11 @@ async def _campaign_fixture(
         ExternalPrivateMemoryAblationScheduleStrategy.FIXED
     ),
     budgeted_live: bool = False,
+    memory_attribution: bool = False,
 ) -> _CampaignFixture:
+    variant_ids = reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS
+    if memory_attribution:
+        variant_ids = variant_ids[:2]
     private_root.mkdir(parents=True, exist_ok=True)
     corpus_path = private_root / "private-corpus.json"
     state_directory = private_root / "state"
@@ -291,6 +297,30 @@ async def _campaign_fixture(
     private_document = reference_campaign.build_causal_memory_reference_corpus(
         app_manifest=target.app.describe()
     )
+    if memory_attribution:
+        private_document = type(private_document).create(
+            target_key=private_document.target_key,
+            evidence_policy=private_document.evidence_policy,
+            suites=private_document.suites,
+            cases=tuple(
+                type(case).create(
+                    id=case.id,
+                    suite_id=case.suite_id,
+                    name=case.name,
+                    source=case.source,
+                    input=case.input,
+                    assertions=(
+                        *case.assertions,
+                        MemoryAttributionAssertionSpec(
+                            id="memory-attribution",
+                            min_admitted_items=0,
+                            min_provider_exposures=0,
+                        ),
+                    ),
+                )
+                for case in private_document.cases
+            ),
+        )
     pricing = None
     if budgeted_live:
         # Live-classified authority with a credential-free scripted transport.
@@ -359,7 +389,7 @@ async def _campaign_fixture(
         (case.id, repetition, variant_id)
         for case in corpus.document.cases
         for repetition in range(1, reference_campaign.CAUSAL_MEMORY_CAMPAIGN_REPETITIONS + 1)
-        for variant_id in reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS
+        for variant_id in variant_ids
     )
     provider.set_outputs(
         tuple(
@@ -414,7 +444,7 @@ async def _campaign_fixture(
             if variant_id == "automatic-recall-off"
             else (prepared_profile.snapshot, prepared_profile.binding)
         )
-        for variant_id in reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS
+        for variant_id in variant_ids
     }
     variants = tuple(
         MemoryExperimentVariant(
@@ -425,7 +455,7 @@ async def _campaign_fixture(
             execution_profile_binding=profiles[variant_id][1],
             evaluator_fingerprint=reference_campaign._EVALUATOR_FINGERPRINT,
         )
-        for variant_id in reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS
+        for variant_id in variant_ids
     )
     metric_bindings = tuple(
         MemoryMetricBinding(
@@ -486,7 +516,7 @@ async def _campaign_fixture(
         )
         for case in corpus.document.cases
         for repetition in range(1, reference_campaign.CAUSAL_MEMORY_CAMPAIGN_REPETITIONS + 1)
-        for variant_id in reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS
+        for variant_id in variant_ids
     )
     if budgeted_live:
         compiled = compile_corpus_suite(
@@ -556,7 +586,7 @@ async def _campaign_fixture(
             else ExternalPrivateMemoryAblationExecutionMode.HERMETIC
         ),
         live_execution_authorization_id="approved-fixture-live" if budgeted_live else None,
-        allowed_variant_ids=tuple(sorted(reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS)),
+        allowed_variant_ids=tuple(sorted(variant_ids)),
         allowed_variant_kinds=tuple(sorted({variant.spec.kind for variant in variants}, key=str)),
         minimum_cases=len(corpus.document.cases),
         maximum_cases=len(corpus.document.cases),
@@ -3334,3 +3364,109 @@ def test_trial_budget_binding_rejects_unapproved_request_changes(
             await fixture.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("terminal_without_evaluation", [False, True])
+def test_private_incomplete_memory_attribution_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_without_evaluation: bool,
+) -> None:
+    async def exercise():
+        fixture = await _campaign_fixture(
+            tmp_path,
+            artifact_name="incomplete-memory-attribution",
+            memory_attribution=True,
+        )
+        original_execute = MemoryInterventionExecutor.execute_trial
+        original_publish = private_ablation._publish_variant
+        dispatches = []
+        attempts = []
+        publications = []
+        retained_count = 3 if terminal_without_evaluation else 2
+
+        async def bounded_execute(executor, request, **kwargs):
+            attempts.append(request.trial_id)
+            if len(dispatches) == retained_count:
+                raise RuntimeError("bounded stop before the remaining schedule")
+            dispatches.append(request.trial_id)
+            outcome = await original_execute(executor, request, **kwargs)
+            if terminal_without_evaluation and len(dispatches) == 3:
+                return outcome.model_copy(update={"eval_result": None})
+            return outcome
+
+        def capture_publication(**kwargs):
+            published = original_publish(**kwargs)
+            publications.append(published)
+            return published
+
+        monkeypatch.setattr(MemoryInterventionExecutor, "execute_trial", bounded_execute)
+        monkeypatch.setattr(private_ablation, "_publish_variant", capture_publication)
+        try:
+            result = await run_external_private_memory_ablation(
+                fixture.prepared,
+                fixture.executor,
+                clock=lambda: _NOW,
+            )
+            schedule = fixture.prepared.schedule
+            assert len(attempts) == retained_count + 1
+            assert len(set(attempts)) == len(attempts)
+            assert len(dispatches) == retained_count
+            assert len(set(dispatches)) == retained_count
+            assert len(fixture.provider.requests) == retained_count
+            # Both constructors validate the serialized report and methodology.
+            assert (
+                ExternalPrivateMemoryAblationResult(
+                    report=result.report,
+                    methodology=result.methodology,
+                )
+                == result
+            )
+        finally:
+            fixture.prepared.close()
+            await fixture.close()
+        return result, schedule, publications, retained_count
+
+    result, schedule, publications, retained_count = asyncio.run(exercise())
+    assert result.methodology.status is ExternalPrivateMemoryAblationRunStatus.INCOMPLETE
+    assert (
+        result.methodology.run_failure_code
+        is ExternalPrivateMemoryAblationRunFailureCode.EXECUTION_FAILED
+    )
+    assert result.methodology.failure_ordinal == retained_count + 1
+    assert [(row.case_id, row.repetition, row.variant_id) for row in result.methodology.trials] == [
+        (entry.case_id, entry.repetition, entry.variant_id) for entry in schedule
+    ]
+    assert all(
+        row.execution_status is MemoryInterventionExecutionStatus.COMPLETED
+        for row in result.methodology.trials[:retained_count]
+    )
+    assert all(
+        row.availability is MemoryTrialAvailability.MISSING
+        for row in result.methodology.trials[retained_count:]
+    )
+    if terminal_without_evaluation:
+        assert result.methodology.trials[2].availability is MemoryTrialAvailability.UNMATCHED
+    assert len(publications) == 2
+    unavailable = []
+    observed = []
+    for published in publications:
+        assert type(published).model_validate_json(published.model_dump_json()) == published
+        for case in published.run.cases:
+            for trial in case.trials:
+                assertion = next(
+                    item for item in trial.assertions if item.assertion_id == "memory-attribution"
+                )
+                if assertion.outcome == "unavailable":
+                    unavailable.append(assertion.detail)
+                else:
+                    observed.append(assertion.detail)
+    assert len(observed) == 2
+    assert len(unavailable) == len(schedule) - 2
+    assert all(detail.observation_state == "complete" for detail in observed)
+    for detail in unavailable:
+        assert detail.observation_state == "unavailable"
+        assert detail.evidence_revision == EvalMemoryAttributionEvidenceV1.unavailable().revision
+        assert tuple(item.value for item in detail.limitations) == ("missing",)
+        assert detail.admitted_item_count is None
+        assert detail.provider_exposure_count is None

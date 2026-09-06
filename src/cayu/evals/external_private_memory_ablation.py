@@ -63,6 +63,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_JUDGE_EXPLANATION_CHARS,
     EvalCaseSpec,
     EvalCorpusDocument,
+    MemoryAttributionAssertionSpec,
     PrivateJudgeReferenceV1,
     StructuredModelJudgeAssertionSpec,
     assertion_spec_revision,
@@ -79,6 +80,7 @@ from cayu.evals.execution import (
     evaluation_target_identity,
 )
 from cayu.evals.execution_profiles import _eval_execution_target_material_identity
+from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
 from cayu.evals.memory_reporting import (
     MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
     MemoryExperimentCase,
@@ -3029,6 +3031,9 @@ def _unavailable_trial_result(
     completed_at: datetime,
 ) -> EvalTrialResult:
     reason = "Portable evaluation evidence was not produced for this terminal trial."
+    # This revision identifies explicit missing evidence, never an observation of
+    # zero memory exposure. Keep the strict published-result revision contract.
+    memory_evidence = EvalMemoryAttributionEvidenceV1.unavailable()
     return EvalTrialResult(
         trial_number=repetition,
         status=EvalStatus.UNAVAILABLE,
@@ -3040,6 +3045,16 @@ def _unavailable_trial_result(
                 assertion_revision=assertion_spec_revision(assertion),
                 outcome=EvalOutcome.UNAVAILABLE,
                 message=reason,
+                metadata=(
+                    {
+                        "evidence_area": "memory attribution",
+                        "evidence_state": memory_evidence.completeness.value,
+                        "evidence_revision": memory_evidence.revision,
+                        "limitations": [item.value for item in memory_evidence.limitations],
+                    }
+                    if type(assertion) is MemoryAttributionAssertionSpec
+                    else {}
+                ),
             )
             for assertion in case.assertions
         ),
