@@ -5,7 +5,7 @@
       "backend": "memory",
       "cases": [
         {
-          "admission_latency_ms": 1.562583,
+          "admission_latency_ms": 1.573708,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -29,7 +29,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.383833,
+          "latency_ms": 3.546208,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -54,7 +54,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.622875,
+          "admission_latency_ms": 1.60425,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -78,7 +78,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.497792,
+          "latency_ms": 3.552875,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -103,7 +103,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 3.463792,
+          "admission_latency_ms": 3.393625,
           "admission_truncated": true,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -114,11 +114,11 @@
             "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
-          "contribution_bytes": 4336,
+          "contribution_bytes": 4414,
           "correct_injected_count": 1,
           "correct_offered_count": 1,
           "correct_silent_count": 0,
-          "estimated_contribution_tokens": 1084,
+          "estimated_contribution_tokens": 1104,
           "false_complete": false,
           "false_injection_count": 0,
           "false_result_count": 0,
@@ -127,7 +127,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.490333,
+          "latency_ms": 4.253834,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [
@@ -155,7 +155,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 3.253541,
+          "admission_latency_ms": 3.376542,
           "admission_truncated": true,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -166,11 +166,11 @@
             "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
-          "contribution_bytes": 4329,
+          "contribution_bytes": 4414,
           "correct_injected_count": 1,
           "correct_offered_count": 1,
           "correct_silent_count": 0,
-          "estimated_contribution_tokens": 1083,
+          "estimated_contribution_tokens": 1104,
           "false_complete": false,
           "false_injection_count": 0,
           "false_result_count": 0,
@@ -179,7 +179,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.303791,
+          "latency_ms": 4.2015,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [
@@ -207,7 +207,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 2.661333,
+          "admission_latency_ms": 2.662084,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -232,7 +232,7 @@
           ],
           "injected_source_diversity": 2,
           "language": "en",
-          "latency_ms": 4.216375,
+          "latency_ms": 4.21575,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [],
@@ -258,7 +258,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.446166,
+          "admission_latency_ms": 1.690875,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -282,7 +282,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "es",
-          "latency_ms": 2.97425,
+          "latency_ms": 3.957917,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -307,7 +307,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.612083,
+          "admission_latency_ms": 1.671542,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -331,7 +331,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "ru",
-          "latency_ms": 3.288042,
+          "latency_ms": 3.794833,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -356,7 +356,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.524333,
+          "admission_latency_ms": 1.481958,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -380,7 +380,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.42725,
+          "latency_ms": 3.121,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -405,7 +405,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.629292,
+          "admission_latency_ms": 1.589333,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -429,7 +429,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.494709,
+          "latency_ms": 3.398334,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -454,7 +454,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.541167,
+          "admission_latency_ms": 1.585334,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -478,7 +478,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.260041,
+          "latency_ms": 3.361375,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -503,7 +503,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.538166,
+          "admission_latency_ms": 1.748916,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -527,7 +527,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "de",
-          "latency_ms": 3.169375,
+          "latency_ms": 3.357416,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -552,7 +552,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.661833,
+          "admission_latency_ms": 1.789708,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -578,7 +578,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.428834,
+          "latency_ms": 3.743917,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -603,7 +603,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.498667,
+          "admission_latency_ms": 1.594542,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -627,7 +627,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.206625,
+          "latency_ms": 3.623417,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -652,7 +652,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.547833,
+          "admission_latency_ms": 1.5615,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -676,7 +676,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.33725,
+          "latency_ms": 3.34825,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -701,7 +701,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 3.50375,
+          "admission_latency_ms": 3.75775,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 3,
@@ -712,11 +712,11 @@
             "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
-          "contribution_bytes": 4987,
+          "contribution_bytes": 5057,
           "correct_injected_count": 1,
           "correct_offered_count": 1,
           "correct_silent_count": 1,
-          "estimated_contribution_tokens": 1247,
+          "estimated_contribution_tokens": 1265,
           "false_complete": false,
           "false_injection_count": 0,
           "false_result_count": 0,
@@ -725,7 +725,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 5.656292,
+          "latency_ms": 5.857542,
           "locator_correct_count": 3,
           "locator_evaluated_count": 3,
           "offered_identities": [
@@ -756,7 +756,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.514333,
+          "admission_latency_ms": 1.538959,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -780,7 +780,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.103542,
+          "latency_ms": 3.7745,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1165,20 +1165,20 @@
       "corpus_origin": "hermetic_public",
       "corpus_revision": "public-cross-source-admission-v2",
       "metrics": {
-        "admission_latency_p50_ms": 1.562583,
-        "admission_latency_p95_ms": 3.50375,
+        "admission_latency_p50_ms": 1.60425,
+        "admission_latency_p95_ms": 3.75775,
         "admission_truncated_case_count": 2,
         "authorization_leak_rate": 0.0,
         "case_count": 16,
-        "contribution_bytes": 54703,
-        "estimated_contribution_tokens": 13676,
+        "contribution_bytes": 54936,
+        "estimated_contribution_tokens": 13734,
         "estimated_result_tokens": 11720,
         "false_complete_rate": 0.0,
         "false_injection_rate": 0.0,
         "false_result_rate": 0.0,
         "injected_precision": 1.0,
-        "latency_p50_ms": 3.383833,
-        "latency_p95_ms": 5.656292,
+        "latency_p50_ms": 3.623417,
+        "latency_p95_ms": 5.857542,
         "locator_correctness": 1.0,
         "mean_candidate_count": 1.3125,
         "mean_injected_source_diversity": 1.0625,
@@ -1200,7 +1200,7 @@
       "backend": "sqlite",
       "cases": [
         {
-          "admission_latency_ms": 1.584167,
+          "admission_latency_ms": 1.517167,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1224,7 +1224,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.363,
+          "latency_ms": 4.216292,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1249,7 +1249,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.568917,
+          "admission_latency_ms": 1.574792,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1273,7 +1273,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.901458,
+          "latency_ms": 4.174584,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1298,7 +1298,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 3.314792,
+          "admission_latency_ms": 3.4685,
           "admission_truncated": true,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -1309,11 +1309,11 @@
             "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
-          "contribution_bytes": 4356,
+          "contribution_bytes": 4434,
           "correct_injected_count": 1,
           "correct_offered_count": 1,
           "correct_silent_count": 0,
-          "estimated_contribution_tokens": 1089,
+          "estimated_contribution_tokens": 1109,
           "false_complete": false,
           "false_injection_count": 0,
           "false_result_count": 0,
@@ -1322,7 +1322,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.71125,
+          "latency_ms": 5.443666,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [
@@ -1350,7 +1350,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 3.384833,
+          "admission_latency_ms": 3.380792,
           "admission_truncated": true,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -1361,11 +1361,11 @@
             "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
-          "contribution_bytes": 4349,
+          "contribution_bytes": 4434,
           "correct_injected_count": 1,
           "correct_offered_count": 1,
           "correct_silent_count": 0,
-          "estimated_contribution_tokens": 1088,
+          "estimated_contribution_tokens": 1109,
           "false_complete": false,
           "false_injection_count": 0,
           "false_result_count": 0,
@@ -1374,7 +1374,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.778375,
+          "latency_ms": 5.0875,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [
@@ -1402,7 +1402,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 2.857875,
+          "admission_latency_ms": 2.870541,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -1427,7 +1427,7 @@
           ],
           "injected_source_diversity": 2,
           "language": "en",
-          "latency_ms": 5.273167,
+          "latency_ms": 5.445334,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [],
@@ -1453,7 +1453,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.484542,
+          "admission_latency_ms": 1.59,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1477,7 +1477,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "es",
-          "latency_ms": 3.323834,
+          "latency_ms": 3.735459,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1502,7 +1502,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.570666,
+          "admission_latency_ms": 1.678333,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1526,7 +1526,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "ru",
-          "latency_ms": 3.784125,
+          "latency_ms": 4.240625,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1551,7 +1551,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.504875,
+          "admission_latency_ms": 1.701792,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1575,7 +1575,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.460125,
+          "latency_ms": 3.797417,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1600,7 +1600,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.575125,
+          "admission_latency_ms": 1.714042,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1624,7 +1624,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 5.080709,
+          "latency_ms": 3.934916,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1649,7 +1649,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.638667,
+          "admission_latency_ms": 1.713541,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1673,7 +1673,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.301,
+          "latency_ms": 4.04325,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1698,7 +1698,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.600208,
+          "admission_latency_ms": 1.779709,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1722,7 +1722,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "de",
-          "latency_ms": 3.7065,
+          "latency_ms": 4.04425,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1747,7 +1747,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.691833,
+          "admission_latency_ms": 1.858792,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1773,7 +1773,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.99525,
+          "latency_ms": 4.772834,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1798,7 +1798,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.561916,
+          "admission_latency_ms": 1.545834,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1822,7 +1822,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.681375,
+          "latency_ms": 4.881958,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1847,7 +1847,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.864458,
+          "admission_latency_ms": 1.575333,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1871,7 +1871,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.210625,
+          "latency_ms": 4.432959,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1896,7 +1896,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 3.621542,
+          "admission_latency_ms": 3.664875,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 3,
@@ -1907,11 +1907,11 @@
             "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
-          "contribution_bytes": 4987,
+          "contribution_bytes": 5057,
           "correct_injected_count": 1,
           "correct_offered_count": 1,
           "correct_silent_count": 1,
-          "estimated_contribution_tokens": 1247,
+          "estimated_contribution_tokens": 1265,
           "false_complete": false,
           "false_injection_count": 0,
           "false_result_count": 0,
@@ -1920,7 +1920,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 6.573208,
+          "latency_ms": 6.742375,
           "locator_correct_count": 3,
           "locator_evaluated_count": 3,
           "offered_identities": [
@@ -1951,7 +1951,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.570375,
+          "admission_latency_ms": 1.657708,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1975,7 +1975,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.528292,
+          "latency_ms": 4.007666,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -2360,20 +2360,20 @@
       "corpus_origin": "hermetic_public",
       "corpus_revision": "public-cross-source-admission-v2",
       "metrics": {
-        "admission_latency_p50_ms": 1.584167,
-        "admission_latency_p95_ms": 3.621542,
+        "admission_latency_p50_ms": 1.701792,
+        "admission_latency_p95_ms": 3.664875,
         "admission_truncated_case_count": 2,
         "authorization_leak_rate": 0.0,
         "case_count": 16,
-        "contribution_bytes": 54860,
-        "estimated_contribution_tokens": 13715,
+        "contribution_bytes": 55093,
+        "estimated_contribution_tokens": 13774,
         "estimated_result_tokens": 11759,
         "false_complete_rate": 0.0,
         "false_injection_rate": 0.0,
         "false_result_rate": 0.0,
         "injected_precision": 1.0,
-        "latency_p50_ms": 3.99525,
-        "latency_p95_ms": 6.573208,
+        "latency_p50_ms": 4.216292,
+        "latency_p95_ms": 6.742375,
         "locator_correctness": 1.0,
         "mean_candidate_count": 1.3125,
         "mean_injected_source_diversity": 1.0625,

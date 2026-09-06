@@ -1946,3 +1946,34 @@ no provider calls. Local tests exercise in-memory and SQLite stores, generated
 configuration, deterministic replay, weak hybrid agreement and semantic timeout.
 These are focused regression controls; broader held-out quality and real embedding
 provider effectiveness belong to the shipped-default evaluation gate.
+
+### Compact automatic-memory presentation (v2)
+
+The model receives focused text and bounded offer previews, typed source references,
+exact read arguments, completeness flags, and source coverage notices. Every value
+remains untrusted reference evidence. Knowledge references use the existing
+`read_knowledge` arguments (`entry_id`, exact `revision`, and `chunk_index` for
+chunks); transcript references keep session/index/text-part semantics.
+
+An offer preview is the first at most 240 UTF-8 bytes of the already authorized
+candidate representation, with a completeness flag. No current-revision lookup,
+title fallback, or extra store read occurs. Missing descriptions are explicitly
+unavailable. The offer ticket and frozen projection bind the preview, and the
+normal redactor and escaping run before provider exposure. Full hashes, scores,
+channel matches, selection reasons, and configuration fingerprints remain in the
+durable audit data. Per-item exposure hashes cover the exact escaped rendered JSON;
+the receipt-to-manifest HMAC and complete composition fingerprint remain enforced.
+
+There is one renderer/composer: its compact view is derived deterministically from
+the frozen audit projection. Presentation v2 changes the configuration identity and
+automatic-recall checkpoint version to 3. Old frames fail closed under the existing
+schema transition policy; retry/recovery of current frames retains the exact output.
+Context pressure and provider counting consume the rendered envelope.
+
+`PYTHONPATH=src python scripts/run_memory_presentation_benchmark.py` reproduces the
+committed UTF-8 measurements in `benchmarks/memory/presentation-v2.json`. The fixed
+five-focus/five-offer fixture renders at 2,017 bytes versus the pinned 6,879-byte v1
+reference (70.7% reduction), retaining 215 bytes of focused text and all ten exact
+references. The benchmark also covers empty, one/five items, long text, Unicode,
+and redacted/escaped text. Token counts are explicitly byte-based estimates; no
+provider token counter is configured and no live-model attention claim is made.

@@ -354,6 +354,22 @@ class RecallOfferItem(BaseModel):
     score: float
     matches: tuple[FusedChannelMatch, ...]
     reason: _RecallOfferReason
+    preview: str | None = None
+    preview_complete: bool = False
+
+    @field_validator("preview")
+    @classmethod
+    def validate_preview(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or len(value.encode("utf-8")) > 240):
+            raise ValueError("Offer preview must be nonblank and at most 240 UTF-8 bytes.")
+        return value
+
+    @field_validator("preview_complete", mode="before")
+    @classmethod
+    def validate_preview_complete(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("preview_complete must be a boolean.")
+        return value
 
     @field_validator("identity", mode="before")
     @classmethod
@@ -419,6 +435,8 @@ class RecallOfferItem(BaseModel):
 
     @model_validator(mode="after")
     def validate_match_evidence(self) -> RecallOfferItem:
+        if self.preview is None and self.preview_complete:
+            raise ValueError("An unavailable preview cannot be complete.")
         if any(match.content_hash != self.content_hash for match in self.matches):
             raise ValueError("Recall offer channel provenance conflicts with its content hash.")
         return self
@@ -1092,6 +1110,8 @@ def _recall_offer_item(
     fused_rank: int,
     reason: _RecallOfferReason,
 ) -> RecallOfferItem:
+    encoded = candidate.record.text.encode("utf-8")
+    preview = encoded[:240].decode("utf-8", errors="ignore")
     return RecallOfferItem(
         identity=candidate.record.identity,
         representation=candidate.record.representation,
@@ -1101,6 +1121,10 @@ def _recall_offer_item(
         score=candidate.fused.score,
         matches=candidate.fused.matches,
         reason=reason,
+        preview=preview if preview.strip() else None,
+        preview_complete=candidate.record.text_complete
+        and len(encoded) <= 240
+        and bool(preview.strip()),
     )
 
 

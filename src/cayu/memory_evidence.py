@@ -949,6 +949,13 @@ class RecallItemExposure(BaseModel):
     identity: RetrievalCandidateIdentity
     representation_id: str
     content_sha256: str
+    provider_representation_sha256: str | None = None
+
+    @field_validator("provider_representation_sha256")
+    @classmethod
+    def validate_provider_representation_sha256(cls, value: str | None) -> str | None:
+        return None if value is None else _digest(value, "provider_representation_sha256")
+
     locator: RecallEvidenceLocator
     admission: RecallItemAdmission
     selection_reason: RecallItemSelectionReason

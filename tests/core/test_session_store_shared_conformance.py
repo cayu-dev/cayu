@@ -4674,7 +4674,7 @@ def test_session_store_conformance_recovers_one_frozen_automatic_recall_frame(
                 if message.role is MessageRole.USER
                 for part in message.content
                 if type(part) is TextPart
-                and part.text.startswith('<cayu_automatic_memory version="1">')
+                and part.text.startswith('<cayu_automatic_memory version="2">')
             )
             assert knowledge.search_count == 1
             assert [event.type for event in first_events].count(
@@ -4723,7 +4723,7 @@ def test_session_store_conformance_recovers_one_frozen_automatic_recall_frame(
                 if message.role is MessageRole.USER
                 for part in message.content
                 if type(part) is TextPart
-                and part.text.startswith('<cayu_automatic_memory version="1">')
+                and part.text.startswith('<cayu_automatic_memory version="2">')
             )
 
             assert recovered_manifest == first_manifest

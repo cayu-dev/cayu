@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -52,7 +53,7 @@ from cayu.runtime.tool_exposure import ResolvedToolExposure
 
 _MEMORY_EVIDENCE_KEY_DERIVATION_CONTEXT = b"cayu.memory-evidence.request-footprint-key.v1"
 _AUTOMATIC_RECALL_CHECKPOINT_BINDING_CONTEXT = b"cayu.automatic-recall-checkpoint-binding.v1"
-_AUTOMATIC_RECALL_OPEN_TAG = '<cayu_automatic_memory version="1">'
+_AUTOMATIC_RECALL_OPEN_TAG = '<cayu_automatic_memory version="2">'
 _AUTOMATIC_RECALL_CLOSE_TAG = "</cayu_automatic_memory>"
 
 
@@ -410,6 +411,13 @@ async def prepare_context_exposure(
         reference.manifest_sha256,
     )
 
+    representation_hashes = (
+        _provider_representation_hashes(model_request, reference.manifest_sha256)
+        if include_items
+        else {}
+    )
+    if include_items and set(representation_hashes) != {item.fused_rank for item in receipt.items}:
+        raise RuntimeError("The rendered recall items do not match the durable receipt.")
     provider_attempt_id = new_provider_attempt_id()
     exposure_id = new_context_exposure_id()
     composition_sha256 = _payload_sha256(
@@ -492,6 +500,7 @@ async def prepare_context_exposure(
                 receipt_id=receipt.receipt_id,
                 ordinal=ordinal,
                 receipt_item_ordinal=item.ordinal,
+                provider_representation_sha256=representation_hashes[item.fused_rank],
                 identity=item.identity,
                 representation_id=item.representation_id,
                 content_sha256=item.content_sha256,
@@ -978,6 +987,35 @@ def _evidence_locator(
             key,
         )
     )
+
+
+def _provider_representation_hashes(
+    request: ModelRequest, manifest_sha256: str | None
+) -> dict[int, str]:
+    from cayu.core.messages import TextPart
+    from cayu.runtime.memory_context import _serialize_provider_value
+
+    for message in request.messages:
+        for part in message.content:
+            if (
+                type(part) is TextPart
+                and hashlib.sha256(part.text.encode("utf-8")).hexdigest() == manifest_sha256
+            ):
+                payload = json.loads(part.text.split("\n", 1)[1].rsplit("\n", 1)[0])
+                items = [
+                    item
+                    for section in ("focus", "offer")
+                    for item in payload.get(section, {}).get("items", [])
+                ]
+                if len({item["ref"] for item in items}) != len(items):
+                    raise RuntimeError("The rendered recall repeats an item reference.")
+                return {
+                    item["ref"]: hashlib.sha256(
+                        _serialize_provider_value(item).encode("utf-8")
+                    ).hexdigest()
+                    for item in items
+                }
+    return {}
 
 
 def _request_manifest_count(request: ModelRequest, manifest_sha256: str) -> int:

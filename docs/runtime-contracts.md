@@ -12450,12 +12450,15 @@ input transcript and its messages are copied defensively and never mutated.
 
 For a new real user interaction, recall runs once and the redacted contribution
 is rendered as valid deterministic JSON inside
-`<cayu_automatic_memory version="1">` markers. Retrieved values are untrusted
+`<cayu_automatic_memory version="2">` markers. Retrieved values are untrusted
 reference data, not user instructions; marker characters in values are escaped
-so recalled text cannot close or forge the envelope. Focus items retain their
-exact candidate identity, revision, representation, content hash, locator,
-fused rank, score, and matched-channel provenance. Offers retain exact locators
-for application-registered read/search tools. No hidden tool is registered and
+so recalled text cannot close or forge the envelope. The compact view contains
+focused text, completeness, typed source provenance and exact read arguments;
+offers contain at most 240 UTF-8 bytes of preview from the selected revision.
+Knowledge read arguments use `entry_id`, `revision`, and optional `chunk_index`;
+transcript references retain transcript semantics. The frozen audit projection
+retains exact candidate identity, revision, representation, content hash, locator,
+fused rank, score, and matched-channel provenance. No hidden tool is registered and
 no assistant tool call or tool-result history is fabricated.
 
 The wrapped context policy projects the original transcript without receiving
@@ -12477,7 +12480,11 @@ anchor digest/index, admission-policy and complete automatic-recall configuratio
 fingerprints, situation and contribution/projection/manifest digests, receipt
 ID, exact receipt-document digest, purpose-separated receipt-to-manifest HMAC,
 byte count, and runtime-authored anchors are stored under the versioned
-`automatic_recall` checkpoint root. The delimited manifest is reconstructed
+`automatic_recall` checkpoint root (version 3; older frames are rejected).
+Presentation version 2 participates in the complete configuration fingerprint.
+Each exposed item's `provider_representation_sha256` binds the exact escaped JSON
+item in the actual manifest, including redacted previews and read arguments.
+The delimited manifest is reconstructed
 deterministically from that typed JSON projection rather than stored as opaque
 prompt text. The
 same frozen contribution is reused across tool rounds, retries, structured-output

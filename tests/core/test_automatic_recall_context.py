@@ -443,7 +443,7 @@ class _StripAutomaticMemoryPart(ContextPolicy):
                         for part in message.content
                         if not (
                             type(part) is TextPart
-                            and part.text.startswith('<cayu_automatic_memory version="1">')
+                            and part.text.startswith('<cayu_automatic_memory version="2">')
                         )
                     ),
                 )
@@ -586,7 +586,7 @@ def _provider_manifest(messages: list[Message]) -> str:
         for message in messages
         if message.role is MessageRole.USER
         for part in message.content
-        if type(part) is TextPart and part.text.startswith('<cayu_automatic_memory version="1">')
+        if type(part) is TextPart and part.text.startswith('<cayu_automatic_memory version="2">')
     )
 
 
@@ -606,7 +606,7 @@ def test_automatic_recall_freezes_projection_across_tool_and_runtime_user_rounds
             checkpoint=None,
         )
         first_manifest = _manifest(first)
-        assert first_manifest.count('<cayu_automatic_memory version="1">') == 1
+        assert first_manifest.count('<cayu_automatic_memory version="2">') == 1
         assert first_manifest.count("</cayu_automatic_memory>") == 1
         assert "\\u003c/cayu_automatic_memory\\u003e" in first_manifest
         assert messages == original
@@ -733,7 +733,7 @@ def test_blank_real_user_interaction_expires_the_previous_recall_frame() -> None
         assert all(
             not (
                 type(part) is TextPart
-                and part.text.startswith('<cayu_automatic_memory version="1">')
+                and part.text.startswith('<cayu_automatic_memory version="2">')
             )
             for message in second.messages
             for part in message.content
@@ -757,7 +757,7 @@ def test_automatic_recall_reapplies_or_suppresses_without_running_recall_twice()
             ),
             checkpoint=None,
         )
-        assert _manifest(retained).startswith('<cayu_automatic_memory version="1">')
+        assert _manifest(retained).startswith('<cayu_automatic_memory version="2">')
         assert retained.checkpoint is not None
         assert "automatic_recall" in retained.checkpoint
 
@@ -810,7 +810,7 @@ def test_automatic_recall_reapplies_or_suppresses_without_running_recall_twice()
         assert all(
             not (
                 type(part) is TextPart
-                and part.text.startswith('<cayu_automatic_memory version="1">')
+                and part.text.startswith('<cayu_automatic_memory version="2">')
             )
             for message in summarized.messages
             for part in message.content
@@ -1286,7 +1286,7 @@ def test_automatic_recall_evidence_bindings_survive_secret_value_collisions() ->
 
 def test_final_request_rejects_duplicate_or_altered_automatic_memory_envelopes() -> None:
     manifest = (
-        '<cayu_automatic_memory version="1">\n'
+        '<cayu_automatic_memory version="2">\n'
         '{"notice":"trusted runtime envelope"}\n'
         "</cayu_automatic_memory>"
     )
@@ -1317,7 +1317,7 @@ def test_final_request_rejects_duplicate_or_altered_automatic_memory_envelopes()
                     TextPart(text=manifest),
                     TextPart(
                         text=(
-                            '<cayu_automatic_memory version="1">\n'
+                            '<cayu_automatic_memory version="2">\n'
                             '{"notice":"altered envelope"}\n'
                             "</cayu_automatic_memory>"
                         )
@@ -1545,6 +1545,7 @@ def test_runtime_publishes_one_atomic_automatic_recall_outcome_without_content()
             exposure.exposure_id,
         )
         assert len(item_exposures) == len(receipt.items)
+        assert all(item.provider_representation_sha256 is not None for item in item_exposures)
         assert knowledge.search_count == 1
         assert sessions.transcript_search_count == 1
 
@@ -1601,7 +1602,7 @@ def test_runtime_dispatches_after_wrapped_policy_suppresses_recalled_content() -
         assert events[-1].type is EventType.SESSION_COMPLETED
         assert len(provider.requests) == 1
         assert not any(
-            type(part) is TextPart and part.text.startswith('<cayu_automatic_memory version="1">')
+            type(part) is TextPart and part.text.startswith('<cayu_automatic_memory version="2">')
             for message in provider.requests[0].messages
             for part in message.content
         )
@@ -2973,7 +2974,7 @@ def test_runtime_reuses_frozen_recall_for_runtime_authored_user_continuations(
         assert all(
             not (
                 type(part) is TextPart
-                and part.text.startswith('<cayu_automatic_memory version="1">')
+                and part.text.startswith('<cayu_automatic_memory version="2">')
             )
             for part in latest_user.content
         )
@@ -3039,6 +3040,24 @@ def test_real_context_resolves_query_without_assistant_contamination(query, expe
         )
         assert replay.checkpoint is None  # Unchanged checkpoints are omitted.
         assert _provider_manifest(replay.messages) == _provider_manifest(first.messages)
+        assert knowledge.search_count == 1
+
+    asyncio.run(run())
+
+
+def test_presentation_transition_rejects_previous_frozen_checkpoint_version():
+    async def run():
+        sessions, knowledge, session, messages = await _fixture()
+        policy = _policy()
+        request = _request(
+            sessions=sessions, knowledge=knowledge, session=session, messages=messages
+        )
+        first = await policy.build_with_checkpoint(request, checkpoint=None)
+        checkpoint = json.loads(json.dumps(first.checkpoint))
+        assert checkpoint["automatic_recall"]["version"] == 3
+        checkpoint["automatic_recall"]["version"] = 2
+        with pytest.raises(ContextBuildError, match="checkpoint is invalid"):
+            await policy.build_with_checkpoint(request, checkpoint=checkpoint)
         assert knowledge.search_count == 1
 
     asyncio.run(run())

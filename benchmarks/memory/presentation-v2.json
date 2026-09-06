@@ -1,0 +1,63 @@
+{
+  "version": "cayu.memory_presentation_benchmark.v2",
+  "pinned_v1_five_focus_five_offer_bytes": 6879,
+  "token_measurement": "Estimate only: ceil(UTF-8 bytes / 4); no provider counter configured.",
+  "results": [
+    {
+      "case": "empty",
+      "focused": 0,
+      "offered": 0,
+      "focused_text_bytes": 0,
+      "manifest_utf8_bytes": 0,
+      "estimated_tokens_bytes_div_4": 0
+    },
+    {
+      "case": "one",
+      "focused": 1,
+      "offered": 0,
+      "focused_text_bytes": 42,
+      "manifest_utf8_bytes": 541,
+      "estimated_tokens_bytes_div_4": 136
+    },
+    {
+      "case": "five",
+      "focused": 5,
+      "offered": 0,
+      "focused_text_bytes": 210,
+      "manifest_utf8_bytes": 1157,
+      "estimated_tokens_bytes_div_4": 290
+    },
+    {
+      "case": "five_focus_five_offer",
+      "focused": 5,
+      "offered": 5,
+      "focused_text_bytes": 215,
+      "manifest_utf8_bytes": 2017,
+      "estimated_tokens_bytes_div_4": 505
+    },
+    {
+      "case": "long",
+      "focused": 5,
+      "offered": 5,
+      "focused_text_bytes": 25210,
+      "manifest_utf8_bytes": 28000,
+      "estimated_tokens_bytes_div_4": 7000
+    },
+    {
+      "case": "unicode",
+      "focused": 5,
+      "offered": 5,
+      "focused_text_bytes": 290,
+      "manifest_utf8_bytes": 2165,
+      "estimated_tokens_bytes_div_4": 542
+    },
+    {
+      "case": "redacted_escaped",
+      "focused": 5,
+      "offered": 5,
+      "focused_text_bytes": 435,
+      "manifest_utf8_bytes": 2605,
+      "estimated_tokens_bytes_div_4": 652
+    }
+  ]
+}

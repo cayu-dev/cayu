@@ -57,7 +57,7 @@ def test_automatic_recall_runtime_contract_pins_interaction_scoped_focus() -> No
         "never falls back to an earlier turn",
         "structured-output repair and before-stop continuation",
         "never mutated",
-        '`<cayu_automatic_memory version="1">`',
+        '`<cayu_automatic_memory version="2">`',
         "exact candidate identity, revision, representation, content hash, locator",
         "No hidden tool is registered",
         "first text part",
