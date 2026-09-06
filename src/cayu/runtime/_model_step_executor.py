@@ -14704,7 +14704,16 @@ def _file_attachment_refs(
 
 
 def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bool:
-    return left.model_dump(mode="json") == right.model_dump(mode="json")
+    # Native image/PDF derivations are cached by source bytes and read options,
+    # so distinct source snapshots may legitimately name the same derived file.
+    # Keep per-read provenance in ordered_refs and the durable transcript; it
+    # is not authority to resolve the source or part of the derived identity.
+    # All other metadata stays strict, including page selections, content
+    # digests, browser publication constraints, and unknown extension fields.
+    exclude = {"metadata": {"source_artifact_id"}}
+    return left.model_dump(mode="json", exclude=exclude) == right.model_dump(
+        mode="json", exclude=exclude
+    )
 
 
 def _validate_stream_event(

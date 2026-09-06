@@ -52,6 +52,12 @@ class FileAttachment(BaseModel):
     This record is JSON-safe and safe to persist in tool results. It does not
     contain file bytes. The runtime resolves it from the active ArtifactStore
     immediately before a provider request.
+
+    Repeated references to one artifact must agree on all fields except
+    metadata.source_artifact_id, which describes the source snapshot for that
+    read, not resolution authority. Native image/PDF derivations may reuse one
+    artifact for identical source bytes. Each occurrence retains its metadata
+    in the transcript; the request's byte map uses the first occurrence.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)

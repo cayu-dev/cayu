@@ -11167,6 +11167,18 @@ Artifact reads and listings are bounded through `max_bytes`, `max_attachment_byt
 
 `read_file` re-admits every file attachment returned by a built-in or custom artifact reader at the final tool-result boundary. Admission uses a bounded store read to verify current scope, content type, actual stored size, and the call's current `max_attachment_bytes`; rejection returns no attachment reference and does not delete a reusable artifact. Cached image/PDF derivations also verify their stored content hash before reuse, so missing or corrupt cache entries are rebuilt while an intact oversized derivation is rejected without being recomputed. The later provider-request boundary independently reapplies the application's per-file, aggregate-byte, and attachment-count limits across the complete model request.
 
+Repeated file references to the same artifact must agree on type, kind, filename,
+MIME type, size, and metadata except `metadata.source_artifact_id`. That field is
+per-read provenance: identical source bytes and reader options can reuse one
+derived image or PDF across distinct source snapshots. It grants no access to
+the source artifact. Every occurrence retains its own provenance in the durable
+transcript and context; the resolved request byte map uses the first occurrence's
+metadata. PDF `pages`, content digests, browser publication constraints, and
+unknown metadata fields remain strict compatibility constraints. This also
+applies to retained historical references and references shared by prompt and
+tool results; any tool-result occurrence keeps resolution fail-closed. Each
+occurrence still counts toward request attachment limits.
+
 ### Lineage-scoped shared-artifact handoff
 
 Cayu provides two optional application-sealed tools for explicitly handing one
