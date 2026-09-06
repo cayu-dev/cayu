@@ -28,6 +28,7 @@ from cayu._task_wait import consume_pending_task_cancellation
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     DurableValueError,
+    canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
     copy_json_value,
@@ -258,6 +259,39 @@ def copy_context_pressure_estimate(
     return ContextPressureEstimate(**estimate.model_dump())
 
 
+class ContextInputCoverage(BaseModel):
+    """The transcript boundary and exact message prefix measured by provider usage.
+
+    Message count is separate from the absolute transcript cursor because retention
+    and context projection can change the number of messages sent to the provider.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    message_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    messages_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def context_input_coverage(
+    messages: list[Message], *, transcript_cursor: int
+) -> ContextInputCoverage:
+    """Capture a content-free identity for one actual model-input projection."""
+
+    digest = hashlib.sha256()
+    for message in messages:
+        encoded = canonical_durable_json_bytes(
+            message.model_dump(mode="json"), "context_input_message"
+        )
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return ContextInputCoverage(
+        transcript_cursor=transcript_cursor,
+        message_count=len(messages),
+        messages_sha256=digest.hexdigest(),
+    )
+
+
 class ContextUsageState(BaseModel):
     """Actual provider usage from the previous completed model request."""
 
@@ -267,6 +301,7 @@ class ContextUsageState(BaseModel):
     last_output_tokens: StrictInt | None = Field(default=None, ge=0)
     last_total_tokens: StrictInt | None = Field(default=None, ge=0)
     last_transcript_cursor: StrictInt | None = Field(default=None, ge=0)
+    input_coverage: ContextInputCoverage | None = None
     last_context_overhead_input_tokens: StrictInt | None = Field(default=None, ge=0)
     last_provider_name: str | None = None
     last_requested_model: str | None = None
@@ -326,12 +361,20 @@ class ObservedDeltaContextEstimator:
     ) -> ContextPressureEstimate | None:
         if type(usage) is not ContextUsageState:
             raise TypeError("usage must be a ContextUsageState.")
-        if usage.last_input_tokens is None or usage.last_transcript_cursor is None:
+        coverage = usage.input_coverage
+        if usage.last_input_tokens is None or coverage is None:
             return None
         current_cursor = len(messages)
-        if usage.last_transcript_cursor > current_cursor:
+        if coverage.message_count > current_cursor:
             return None
-        tail_messages = messages[usage.last_transcript_cursor :]
+        current_prefix = context_input_coverage(
+            messages[: coverage.message_count], transcript_cursor=coverage.transcript_cursor
+        )
+        if current_prefix != coverage:
+            # Compaction, retention, redaction, or provider projection changed the
+            # measured prefix. An old usage observation cannot anchor this view.
+            return None
+        tail_messages = messages[coverage.message_count :]
         message_tokens = sum(self.estimate_message_tokens(message) for message in tail_messages)
         attachment_tokens = sum(
             self.estimate_message_attachment_tokens(
@@ -357,8 +400,8 @@ class ObservedDeltaContextEstimator:
             estimated_context_input_tokens=usage.last_input_tokens + delta_tokens,
             reserved_output_tokens=0,
             estimated_context_window_tokens=usage.last_input_tokens + delta_tokens,
-            anchor_transcript_cursor=usage.last_transcript_cursor,
-            current_transcript_cursor=current_cursor,
+            anchor_transcript_cursor=coverage.transcript_cursor,
+            current_transcript_cursor=coverage.transcript_cursor + len(tail_messages),
             estimated_message_count=len(tail_messages),
             chars_per_token=self.chars_per_token,
             json_chars_per_token=self.json_chars_per_token,
@@ -5899,6 +5942,13 @@ def _prompt_cache_extension_messages(
         messages[:previous_input_cursor],
         max_attachment_results=max_attachment_results,
     )
+    coverage = request.context_usage.input_coverage
+    if (
+        coverage is not None
+        and context_input_coverage(previous_projection, transcript_cursor=previous_input_cursor)
+        != coverage
+    ):
+        return None
     return previous_projection + [
         copy_message(message) for message in messages[previous_input_cursor:]
     ]
@@ -5907,6 +5957,13 @@ def _prompt_cache_extension_messages(
 def _prompt_cache_previous_input_cursor(request: ContextRequest) -> int | None:
     """Return the reconstructable prior provider-input boundary, if available."""
 
+    coverage = request.context_usage.input_coverage
+    if coverage is not None:
+        return (
+            coverage.transcript_cursor
+            if 0 < coverage.transcript_cursor <= len(request.messages)
+            else None
+        )
     completed_cursor = request.context_usage.last_transcript_cursor
     if completed_cursor is None or completed_cursor < 1 or completed_cursor > len(request.messages):
         return None

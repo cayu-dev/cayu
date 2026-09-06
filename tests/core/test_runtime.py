@@ -43488,7 +43488,17 @@ def test_context_policy_receives_previous_actual_context_usage_on_next_call():
 
 def test_observed_delta_context_estimator_estimates_only_messages_after_cursor():
     estimator = ObservedDeltaContextEstimator(chars_per_token=4, json_chars_per_token=2)
-    usage = ContextUsageState(last_input_tokens=40, last_transcript_cursor=2)
+    usage = ContextUsageState(
+        last_input_tokens=40,
+        last_transcript_cursor=2,
+        input_coverage=runtime_context_module.context_input_coverage(
+            [
+                Message.text("user", "already counted"),
+                Message.text("assistant", "already counted answer"),
+            ],
+            transcript_cursor=2,
+        ),
+    )
     messages = [
         Message.text("user", "already counted"),
         Message.text("assistant", "already counted answer"),
@@ -43577,6 +43587,10 @@ def test_observed_delta_context_estimator_counts_only_overhead_delta_after_ancho
     usage = ContextUsageState(
         last_input_tokens=100,
         last_transcript_cursor=1,
+        input_coverage=runtime_context_module.context_input_coverage(
+            [Message.text("user", "already counted")],
+            transcript_cursor=1,
+        ),
         last_context_overhead_input_tokens=overhead_tokens,
     )
     messages = [
@@ -43821,12 +43835,12 @@ def test_context_policy_receives_estimated_context_pressure_on_next_call():
     pressure = policy.requests[1].context_usage.input_pressure
     assert pressure is not None
     assert pressure.observed_context_input_tokens == 40
-    assert pressure.estimated_delta_input_tokens == 4
-    assert pressure.estimated_context_input_tokens == 44
-    assert pressure.estimated_context_window_tokens == 44
-    assert pressure.anchor_transcript_cursor == 2
+    assert pressure.estimated_delta_input_tokens == 7
+    assert pressure.estimated_context_input_tokens == 47
+    assert pressure.estimated_context_window_tokens == 47
+    assert pressure.anchor_transcript_cursor == 1
     assert pressure.current_transcript_cursor == 3
-    assert pressure.estimated_message_count == 1
+    assert pressure.estimated_message_count == 2
 
 
 def test_context_policy_input_pressure_uses_provider_profile_image_floor():

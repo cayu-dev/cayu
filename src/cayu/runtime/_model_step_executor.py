@@ -249,6 +249,7 @@ from cayu.runtime.context import (
     ContextBuildError,
     ContextCompactionTelemetry,
     ContextCompactor,
+    ContextInputCoverage,
     ContextPolicy,
     ContextPressureEstimate,
     ContextPressureOverhead,
@@ -273,6 +274,7 @@ from cayu.runtime.context import (
     _defer_billing_identity_cancellation_scope,
     automatic_compaction_failure_disposition_payload,
     context_build_termination_compaction_telemetry,
+    context_input_coverage,
     copy_context_messages,
     copy_context_pressure_estimate,
     estimate_context_pressure,
@@ -1533,6 +1535,7 @@ def _model_completion_stage_intent(
     source_transcript_cursor: int,
     request_fingerprint: str,
     recovery_context: ModelCompletionRecoveryContext | None,
+    input_coverage: ContextInputCoverage | None = None,
     provider_operation_start: dict[str, Any] | None = None,
     context_exposure: dict[str, str] | None = None,
     child_session_notifications: ChildSessionNotificationStageBinding | None = None,
@@ -1559,6 +1562,8 @@ def _model_completion_stage_intent(
         intent["recovery_context"] = recovery_context.model_dump(mode="json")
         if recovery_context.interaction_id is not None:
             intent["interaction_id"] = recovery_context.interaction_id
+    if input_coverage is not None:
+        intent["input_coverage"] = input_coverage.model_dump(mode="json")
     if provider_operation_start is not None:
         intent["provider_operation_start"] = copy_durable_json_object(
             provider_operation_start,
@@ -5278,6 +5283,11 @@ class ModelStepExecutor:
                 stage.source_transcript_cursor
                 + int(assistant_message is not None and not tool_calls)
             ),
+            input_coverage=(
+                ContextInputCoverage.model_validate(stage.intent["input_coverage"])
+                if "input_coverage" in stage.intent
+                else None
+            ),
             usage_dialect=registered_provider.usage_dialect,
             billing_identity=billing_identity,
             accounting_usage_metrics=completed_boundary.accounting_usage_metrics,
@@ -6651,6 +6661,9 @@ class ModelStepExecutor:
         child_session_notification_binding: ChildSessionNotificationStageBinding | None,
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
+        input_coverage = context_input_coverage(
+            model_request.messages, transcript_cursor=transcript_cursor_before_request
+        )
         retry_policy = copy_retry_policy(retry_policy)
         if type(deadline_admission) is not ProviderStreamDeadlineAdmission:
             raise TypeError("deadline_admission must be ProviderStreamDeadlineAdmission.")
@@ -7836,6 +7849,7 @@ class ModelStepExecutor:
                                 else 0
                             )
                         ),
+                        input_coverage=input_coverage,
                         usage_dialect=registered_provider.usage_dialect,
                         billing_identity=billing_identity,
                         accounting_usage_metrics=boundary_value.accounting_usage_metrics,
@@ -10082,6 +10096,10 @@ class ModelStepRun:
                         source_transcript_cursor=source_transcript_cursor,
                         request_fingerprint=request_fingerprint,
                         recovery_context=recovery_context,
+                        input_coverage=context_input_coverage(
+                            attempt_model_request.messages,
+                            transcript_cursor=source_transcript_cursor,
+                        ),
                         provider_operation_start=provider_operation_start,
                         context_exposure=(
                             None
@@ -14334,16 +14352,26 @@ async def _context_usage_state_for_session(
 def _context_usage_state_from_model_completed_event(event: Event) -> ContextUsageState:
     if event.type != EventType.MODEL_COMPLETED:
         return ContextUsageState()
+    input_coverage = None
+    if "input_coverage" in event.payload:
+        try:
+            input_coverage = ContextInputCoverage.model_validate(event.payload["input_coverage"])
+        except ValueError:
+            # Imported or historical evidence can still report actual usage,
+            # but malformed coverage must never become an estimator anchor.
+            input_coverage = None
     metrics = usage_metrics_from_event_payload(event.payload)
     if metrics is None:
         return ContextUsageState(
-            last_transcript_cursor=_transcript_cursor_from_model_completed_event(event)
+            last_transcript_cursor=_transcript_cursor_from_model_completed_event(event),
+            input_coverage=input_coverage,
         )
     return ContextUsageState(
         last_input_tokens=metrics.input_tokens,
         last_output_tokens=metrics.output_tokens,
         last_total_tokens=metrics.total_tokens,
         last_transcript_cursor=_transcript_cursor_from_model_completed_event(event),
+        input_coverage=input_coverage,
         last_context_overhead_input_tokens=(
             _context_overhead_input_tokens_from_model_completed_event(event)
         ),
@@ -15193,6 +15221,7 @@ def _model_stream_event_to_runtime_event(
     classification: dict[str, str] | None = None,
     context_pressure_estimate: ContextPressureEstimate | None = None,
     transcript_cursor_after_completion: int | None = None,
+    input_coverage: ContextInputCoverage | None = None,
     usage_dialect: str | None = None,
     billing_identity: BillingIdentity | None = None,
     accounting_usage_metrics: dict[str, Any] | None = None,
@@ -15324,6 +15353,10 @@ def _model_stream_event_to_runtime_event(
             }
         if transcript_cursor_after_completion is not None:
             payload["transcript_cursor"] = transcript_cursor_after_completion
+        # This is runtime-owned evidence, never a provider-supplied anchor.
+        payload.pop("input_coverage", None)
+        if input_coverage is not None:
+            payload["input_coverage"] = input_coverage.model_dump(mode="json")
         if completion_diagnostics:
             payload.update(
                 copy_durable_json_object(

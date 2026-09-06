@@ -11,11 +11,14 @@ from cayu.runtime import (
     EventQuery,
     EventRecord,
     InMemorySessionStore,
+    ObservedDeltaContextEstimator,
     RunRequest,
     SessionStatus,
+    context_input_coverage,
 )
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime._event_projection import public_event_sequence
+from cayu.runtime._model_step_executor import _context_usage_state_for_session
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -610,3 +613,12 @@ def test_model_promotion_acknowledgement_loss_replays_without_duplication() -> N
     assert sum(event.type == EventType.MODEL_COMPLETED for event in durable_events) == 1
     assert receipt is not None
     assert asyncio.run(store.load_active_model_completion_stage(session.id)) is None
+
+    usage = asyncio.run(
+        _context_usage_state_for_session(session_store=store, session_id=session.id)
+    )
+    assert usage.input_coverage == context_input_coverage(transcript[:1], transcript_cursor=1)
+    estimate = ObservedDeltaContextEstimator().estimate(usage=usage, messages=transcript)
+    assert estimate is not None
+    assert estimate.estimated_message_count == 1
+    assert estimate.estimated_delta_input_tokens > 0

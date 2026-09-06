@@ -98,6 +98,7 @@ from cayu.runtime import (
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
     ToolPolicy,
+    context_input_coverage,
 )
 from cayu.runtime import _model_step_executor as model_step_executor
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
@@ -1156,6 +1157,7 @@ async def _stage_offline_operation(
     session_id: str,
     provider: _OfflineOperationProvider,
     recovery_context: dict | None = None,
+    record_input_coverage: bool = False,
     started_at: datetime | None = None,
     prior_events: tuple[Event, ...] = (),
     tools: tuple[Tool, ...] = (),
@@ -1263,6 +1265,10 @@ async def _stage_offline_operation(
     typed_recovery_context = typed_recovery_context.model_copy(
         update={"execution_profile_fingerprint": execution_profile.fingerprint}
     )
+    if record_input_coverage:
+        intent["input_coverage"] = context_input_coverage(
+            [user_message], transcript_cursor=1
+        ).model_dump(mode="json")
     intent["recovery_context"] = typed_recovery_context.model_dump(mode="json")
     await store.prepare_model_completion_stage(
         session_id,
@@ -1893,6 +1899,7 @@ async def assert_offline_provider_operation_recovery(store: SessionStore) -> Non
         store,
         session_id="offline-completed",
         provider=provider,
+        record_input_coverage=True,
     )
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
@@ -1916,6 +1923,9 @@ async def assert_offline_provider_operation_recovery(store: SessionStore) -> Non
     events = await store.load_events("offline-completed")
     completed_events = [event for event in events if event.type is EventType.MODEL_COMPLETED]
     assert len(completed_events) == 1
+    assert completed_events[0].payload["input_coverage"] == context_input_coverage(
+        [user_message], transcript_cursor=1
+    ).model_dump(mode="json")
     assert completed_events[0].payload["usage_metrics"]["input_tokens"] == 3
     assert completed_events[0].payload["usage_metrics"]["output_tokens"] == 4
     profiled_events = [

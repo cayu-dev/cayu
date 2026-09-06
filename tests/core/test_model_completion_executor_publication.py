@@ -24,6 +24,7 @@ from cayu.runtime import (
     RunRequest,
     Session,
     ToolCapabilityCeiling,
+    context_input_coverage,
 )
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
@@ -690,6 +691,13 @@ def test_model_executor_stages_each_retry_and_promotes_before_returning_result()
     assert second_stage.dispatch_ordinal == 1
     assert first_stage.logical_step_id == second_stage.logical_step_id
     assert first_stage.intent["request_fingerprint"] == second_stage.intent["request_fingerprint"]
+    expected_coverage = context_input_coverage([user_message], transcript_cursor=1).model_dump(
+        mode="json"
+    )
+    assert first_stage.intent["input_coverage"] == expected_coverage
+    assert second_stage.intent["input_coverage"] == expected_coverage
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["input_coverage"] == expected_coverage
     assert len(observed) == 1
     assert observed[0].dispatch.stage_id == second_stage.stage_id
     assert observed[0].authoritative_assistant_message is not None
@@ -794,6 +802,11 @@ def test_model_executor_does_not_dispatch_after_ambiguous_prepare_acknowledgemen
     active = asyncio.run(store.load_active_model_completion_stage(session.id))
     assert active is not None
     assert active.stage.state == "in_flight"
+    assert not [
+        event
+        for event in asyncio.run(store.load_events(session.id))
+        if event.type == EventType.MODEL_COMPLETED
+    ]
 
 
 def test_model_executor_preserves_cancellation_after_non_turn_publication() -> None:

@@ -1102,6 +1102,9 @@ _MODEL_ACCOUNTING_UNTRUSTED_CONTAINER_PATHS = frozenset(
 )
 _MODEL_CONTEXT_PRESSURE_NESTED_PATHS = frozenset(
     {
+        ("input_coverage", "transcript_cursor"),
+        ("input_coverage", "message_count"),
+        ("input_coverage", "messages_sha256"),
         ("context_pressure", "estimated_tool_schema_input_tokens"),
         ("context_pressure", "estimated_structured_output_input_tokens"),
         ("context_pressure", "estimated_request_options_input_tokens"),
@@ -2115,6 +2118,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "incomplete_details",
         "instruction_digest",
         "instruction_present",
+        "input_coverage",
         "max_attempts",
         "metadata",
         "mode",
