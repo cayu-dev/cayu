@@ -60,6 +60,23 @@ hierarchy must also have reviewed subclass-creation behavior: builtin exceptions
 bases remain unproven because enum metaclasses can execute inherited member
 initializers; mixing a local base with an enum has the same restriction.
 
+Direct Pydantic `BaseModel` declarations (including named import aliases) may register `@field_validator` and
+`@model_validator` methods. Import these helpers explicitly from `pydantic`
+(named aliases and `import pydantic as pd` are supported). Field names must be
+literal strings; `mode` must be a supported literal string and `check_fields`
+a literal boolean or `None`. Model validators require an explicit `mode` of
+`before`, `after`, or `wrap`; field validators also accept `plain` and default
+to `after`. Validator bodies run during validation, not registration. Direct model
+assignments may also use explicitly imported `ConfigDict` and `Field` with
+literal data arguments; callbacks and computed defaults remain unproven.
+Unknown options, computed arguments, unpacking, shadowed/rebound imports,
+project-local substitutes for Pydantic, opaque/quoted model field annotations,
+explicit `__annotations__`, `__annotate__`, or `__annotate_func__` bindings,
+and model construction/schema hooks
+remain unproven. This does not permit arbitrary decorator factories or prove
+inheritance from application-owned Pydantic models. Attribute and subscription
+base expressions such as `BaseModel.__mro__[0]` remain unproven.
+
 ## Planning
 
 Discover the package-shipped catalog before choosing a plan:

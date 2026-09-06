@@ -827,8 +827,17 @@ def _unsafe_import_time_expression(
             )
             else node.value
         )
+    declarative_pydantic_calls: set[ast.Call] = set()
     for decorator, class_rebound_names in _import_time_decorator_uses(node):
         decorator_rebound_names = rebound_names | class_rebound_names
+        if isinstance(decorator, ast.Call) and _pydantic_validator_is_declarative(
+            decorator,
+            import_bindings=import_bindings,
+            rebound_names=decorator_rebound_names,
+            project_root=project_root,
+        ):
+            declarative_pydantic_calls.add(decorator)
+            continue
         for call in _evaluated_calls(decorator):
             if not _import_call_is_declarative(
                 call,
@@ -860,6 +869,56 @@ def _unsafe_import_time_expression(
     # A newly admitted local base must not allow an opaque descriptor into the
     # subclass namespace: type.__new__ would execute its __set_name__ hook.
     for definition in _import_time_class_nodes(node):
+        if any(
+            isinstance(base, ast.Name) and import_bindings.get(base.id) == ("pydantic", "BaseModel")
+            for base in definition.bases
+        ):
+            class_scope = rebound_names | _scope_rebound_names(
+                definition.body, include_imports=True
+            )
+            for statement in definition.body:
+                if isinstance(statement, ast.AnnAssign) and not _pydantic_annotation_is_declarative(
+                    statement.annotation,
+                    import_bindings=import_bindings,
+                    rebound_names=class_scope,
+                    project_root=project_root,
+                ):
+                    return statement.annotation
+                if isinstance(statement, (ast.Assign, ast.AnnAssign)) and isinstance(
+                    statement.value, ast.Call
+                ):
+                    call = statement.value
+                    if (
+                        isinstance(call.func, ast.Name)
+                        and call.func.id not in class_scope
+                        and import_bindings.get(call.func.id)
+                        in {("pydantic", "ConfigDict"), ("pydantic", "Field")}
+                        and all(_literal_collection_is_data_only(arg) for arg in call.args)
+                        and all(
+                            keyword.arg is not None
+                            and _literal_collection_is_data_only(keyword.value)
+                            for keyword in call.keywords
+                        )
+                    ):
+                        declarative_pydantic_calls.add(call)
+            unsafe_namespace = _unsafe_class_namespace(
+                definition, import_bindings, declarative_calls=declarative_pydantic_calls
+            )
+            if unsafe_namespace is not None:
+                return unsafe_namespace
+            # Pydantic evaluates explicit annotation dictionaries and invokes
+            # Python 3.14 annotation hooks and schema hooks during construction.
+            for statement in definition.body:
+                if _scope_rebound_names([statement], include_imports=True) & {
+                    "__annotations__",
+                    "__annotate__",
+                    "__annotate_func__",
+                    "__get_pydantic_core_schema__",
+                    "__get_pydantic_json_schema__",
+                    "__pydantic_init_subclass__",
+                    "__pydantic_on_complete__",
+                }:
+                    return statement
         if any(
             isinstance(base, ast.Name) and base.id in declarative_bases for base in definition.bases
         ):
@@ -907,6 +966,8 @@ def _unsafe_import_time_expression(
             ):
                 return subscript
         for call in _evaluated_calls(expression):
+            if call in declarative_pydantic_calls:
+                continue
             if not _import_call_is_declarative(
                 call,
                 import_bindings=import_bindings,
@@ -915,6 +976,117 @@ def _unsafe_import_time_expression(
             ):
                 return call
     return None
+
+
+def _pydantic_annotation_is_declarative(
+    annotation: ast.expr,
+    *,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+    project_root: Path,
+) -> bool:
+    """Model construction evaluates annotations and invokes custom schema hooks."""
+
+    def safe(node: ast.expr) -> bool:
+        if isinstance(node, ast.Constant):
+            return node.value is None or node.value is Ellipsis
+        if isinstance(node, ast.Name) and node.id not in rebound_names:
+            binding = import_bindings.get(node.id)
+            if binding is None:
+                return node.id in {
+                    "str",
+                    "int",
+                    "float",
+                    "bool",
+                    "bytes",
+                    "list",
+                    "dict",
+                    "tuple",
+                    "set",
+                    "frozenset",
+                }
+            if _import_binding_is_project_local(project_root, binding):
+                return False
+            module, name = binding
+            return (
+                module == "cayu"
+                or module.startswith("cayu.")
+                or (
+                    module == "typing"
+                    and name in {"Any", "Optional", "Union", "Literal", "ClassVar"}
+                )
+            )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return safe(node.left) and safe(node.right)
+        if isinstance(node, ast.Subscript):
+            arguments = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if isinstance(node.value, ast.Name) and import_bindings.get(node.value.id) == (
+                "typing",
+                "Literal",
+            ):
+                return safe(node.value) and all(isinstance(arg, ast.Constant) for arg in arguments)
+            return safe(node.value) and all(safe(arg) for arg in arguments)
+        return False
+
+    return safe(annotation)
+
+
+def _pydantic_validator_is_declarative(
+    call: ast.Call,
+    *,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+    project_root: Path,
+) -> bool:
+    """Recognize registration only, with literal options and verified import identity."""
+    if isinstance(call.func, ast.Name):
+        root = call.func.id
+        module, helper = import_bindings.get(root, ("", None))
+    elif isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+        root = call.func.value.id
+        module, imported = import_bindings.get(root, ("", None))
+        if imported is not None:
+            return False
+        helper = call.func.attr
+    else:
+        return False
+    if (
+        root in rebound_names
+        or module != "pydantic"
+        or helper not in {"field_validator", "model_validator"}
+        or _import_binding_is_project_local(project_root, (module, helper))
+    ):
+        return False
+    # No unpacking, lookups, operators or calls: even an apparently innocuous
+    # option can invoke application code via iteration or a descriptor.
+    if any(
+        not isinstance(arg, ast.Constant) or not isinstance(arg.value, str) for arg in call.args
+    ):
+        return False
+    if (helper == "field_validator" and not call.args) or (
+        helper == "model_validator" and call.args
+    ):
+        return False
+    options: dict[str, object] = {}
+    for keyword in call.keywords:
+        if (
+            keyword.arg is None
+            or keyword.arg in options
+            or not isinstance(keyword.value, ast.Constant)
+        ):
+            return False
+        options[keyword.arg] = keyword.value.value
+    modes = {"before", "after", "wrap"}
+    if helper == "field_validator":
+        modes.add("plain")
+        if set(options) - {"mode", "check_fields"}:
+            return False
+        if type(options.get("check_fields")) not in {bool, type(None)}:
+            return False
+    elif set(options) != {"mode"}:
+        return False
+    mode = options.get("mode", "after")
+    return isinstance(mode, str) and mode in modes
 
 
 def _bare_decorator_is_declarative(
@@ -986,6 +1158,10 @@ def _class_base_is_declarative(
         return False
     binding = import_bindings.get(name)
     if binding is not None:
+        # Only direct imported names enter the model safeguards above. An
+        # attribute or subscription rooted at BaseModel is not the same proof.
+        if binding == ("pydantic", "BaseModel") and not isinstance(base, ast.Name):
+            return False
         if require_inert_metaclass and (
             not isinstance(base, ast.Name) or binding not in _INERT_METACLASS_BASE_IMPORTS
         ):
@@ -997,6 +1173,8 @@ def _class_base_is_declarative(
 def _unsafe_class_namespace(
     node: ast.ClassDef,
     import_bindings: Mapping[str, tuple[str, str | None]],
+    *,
+    declarative_calls: set[ast.Call] | frozenset[ast.Call] = frozenset(),
 ) -> ast.expr | ast.stmt | None:
     for statement in node.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Pass)):
@@ -1005,7 +1183,11 @@ def _unsafe_class_namespace(
             continue
         if isinstance(statement, (ast.Assign, ast.AnnAssign)):
             value = statement.value
-            if value is None or _literal_collection_is_data_only(value):
+            if (
+                value is None
+                or _literal_collection_is_data_only(value)
+                or value in declarative_calls
+            ):
                 continue
             # Tool declarations contain reviewed immutable Runtime data, not
             # application descriptor instances. The normal expression scan still
@@ -1284,6 +1466,7 @@ def _imported_class_base_is_declarative(
         return True
     return binding in {
         ("abc", "ABC"),
+        ("pydantic", "BaseModel"),
         ("enum", "Enum"),
         ("enum", "IntEnum"),
         ("enum", "StrEnum"),
@@ -1556,10 +1739,13 @@ def _import_time_class_base_uses(
 
 def _import_bindings(tree: ast.Module) -> dict[str, tuple[str, str | None]]:
     bindings: dict[str, tuple[str, str | None]] = {}
+    ambiguous: set[str] = set()
     for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 local_name = alias.asname or alias.name.partition(".")[0]
+                if local_name in bindings:
+                    ambiguous.add(local_name)
                 bindings[local_name] = (alias.name, None)
         elif isinstance(node, ast.ImportFrom) and (node.module is not None or node.level > 0):
             module = "." * node.level + (node.module or "")
@@ -1567,8 +1753,18 @@ def _import_bindings(tree: ast.Module) -> dict[str, tuple[str, str | None]]:
                 if alias.name == "*":
                     continue
                 local_name = alias.asname or alias.name
+                if local_name in bindings:
+                    ambiguous.add(local_name)
                 bindings[local_name] = (module, alias.name)
-    return bindings
+    if any(
+        isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+        for node in ast.walk(tree)
+    ):
+        ambiguous.update(bindings)
+        ambiguous.update(vars(builtins))
+    # Retain an opaque binding instead of making an ambiguous import look like
+    # an unshadowed builtin (for example tuple or classmethod).
+    return {**bindings, **{name: ("<ambiguous>", None) for name in ambiguous}}
 
 
 def _module_rebound_names(tree: ast.Module) -> frozenset[str]:
@@ -1634,7 +1830,7 @@ def _scope_rebound_names(
         names.update(
             item.id
             for item in ast.walk(target)
-            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
+            if isinstance(item, ast.Name) and isinstance(item.ctx, (ast.Store, ast.Del))
         )
 
     def add_expression(expression: ast.expr | None) -> None:
@@ -1666,10 +1862,11 @@ def _scope_rebound_names(
                 names.update(
                     alias.asname or alias.name for alias in statement.names if alias.name != "*"
                 )
-            elif isinstance(statement, ast.Assign):
+            elif isinstance(statement, (ast.Assign, ast.Delete)):
                 for target in statement.targets:
                     add_target(target)
-                add_expression(statement.value)
+                if isinstance(statement, ast.Assign):
+                    add_expression(statement.value)
             elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
                 add_target(statement.target)
                 add_expression(statement.value)
