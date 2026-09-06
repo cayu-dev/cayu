@@ -1803,7 +1803,12 @@ class CayuApp:
         return await self._recovery_cleanup_supervisor.drain(timeout_s=timeout_s)
 
     async def drain_environment_cleanups(self, *, timeout_s: float = 10.0) -> bool:
-        """Settle retained environment cleanup without cancelling live mutations."""
+        """Settle this process's retained cleanup without cancelling live mutations.
+
+        This is not a durable allocation census. After restart, use
+        ``recover_incomplete_session`` (including for terminal sessions) to
+        reconcile pending allocation intents before treating cleanup as closed.
+        """
 
         if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be a finite positive number.")

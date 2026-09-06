@@ -524,6 +524,11 @@ class EnvironmentAllocationContext(ABC):
         """Return the last reconciled durable state."""
 
     @property
+    def dispatch_precluded(self) -> bool:
+        """Whether cleanup atomically fenced a prepared, never-dispatched intent."""
+        return False
+
+    @property
     @abstractmethod
     def acknowledged_reconnect_metadata(self) -> dict[str, Any] | None:
         """Return detached provider acknowledgement, when known."""
@@ -750,6 +755,23 @@ class EnvironmentFactory(ABC):
         raise EnvironmentAllocationUnsupportedError(
             "Environment factory declared remote allocation without implementing "
             "crash-safe creation and recovery."
+        )
+
+    async def reap_allocation(
+        self,
+        request: EnvironmentFactoryRequest,
+        allocation: EnvironmentAllocationContext,
+    ) -> None:
+        """Reap abandoned setup without allocating, binding, or running guest work.
+
+        Validate the exact intent and adapter scope before taking the durable
+        cleanup fence. Record REAPED only after disposal and dependent reference
+        release are positively complete. Ambiguity must retain retryable ownership.
+        Wrappers forwarding a recoverable factory must forward this hook too.
+        """
+        del request, allocation
+        raise EnvironmentAllocationUnsupportedError(
+            "Environment factory cannot reap an unpublished allocation."
         )
 
     async def recover_finalization_disposal(

@@ -1797,6 +1797,37 @@ may be ambiguous; `ACKNOWLEDGED` carries the exact reconnect identity;
 resource, retry the same provider-idempotency key, or reap that resource. It
 must never allocate a replacement and describe that as recovery.
 
+`recover_incomplete_session` inventories pending allocation authority even when
+setup never returned a factory result, no binding event exists, or the session
+already has terminal evidence. Cleanup runs through `EnvironmentFactory.reap_allocation`
+under the existing recovery claim, heartbeat, and exact execution-profile checks.
+It does not reconstruct a missing initial transcript or dispatch a model/tool.
+For initial setup that never published its transcript, recovery may also atomically
+reclaim the exact published allocation receipt into `REAPING`; this closes the
+publication-to-completion-event crash window without revoking a valid continuation.
+
+Prepared-intent cleanup atomically precludes provider dispatch. Its `REAPING`
+record retains `dispatch_precluded=true` across restart, so reference release can
+be retried without mistaking a never-dispatched intent for an ambiguous create.
+An acknowledged allocation is removed by its immutable resource identity.
+Docker creation carries a non-secret digest of the complete allocation intent
+in immutable container labels. Recovery of an unacknowledged create validates
+that label by exact container ID before recording acknowledgement and reaping.
+A historical unacknowledged container without that identity is not adopted or
+deleted on the strength of its reusable name alone. An empty lookup cannot
+rule out a late create and therefore cannot establish `REAPED`.
+
+Factory cleanup has a ten-second attempt deadline. A failure or ambiguous
+outcome retains the durable intent and returns `pending_allocation_cleanup`;
+calling `recover_incomplete_session` again is the bounded public retry path.
+Cancellation retains ownership and propagates the original cancellation.
+`reaped_allocation` means disposal and allocation-owned immutable-input reference
+release completed and the `REAPED` checkpoint record is durable. A lost cleanup
+acknowledgement or process death between those effects remains retry-safe.
+`drain_environment_cleanups` settles this process's retained work; its boolean
+is not a durable resource census. After restart, recover the relevant sessions,
+including terminal sessions, before claiming physical closure.
+
 Acknowledgement and final reconnect publication reconcile lost store
 acknowledgements by exact durable readback. Final publication atomically
 installs reconnect identity, allocation owner, and an immutable receipt while

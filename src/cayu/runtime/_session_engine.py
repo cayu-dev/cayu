@@ -6755,7 +6755,13 @@ class SessionEngine:
                 retain_invocation_context if interaction_id is not None else None
             ),
         )
-        if IncompleteSessionRecoveryAction.AMBIGUOUS_PENDING_USER_INPUT in result.actions:
+        if any(
+            action in result.actions
+            for action in (
+                IncompleteSessionRecoveryAction.AMBIGUOUS_PENDING_USER_INPUT,
+                IncompleteSessionRecoveryAction.PENDING_ALLOCATION_CLEANUP,
+            )
+        ):
             return result
         if interaction_id is not None:
             _activate_session_interaction(request.session_id, interaction_id)

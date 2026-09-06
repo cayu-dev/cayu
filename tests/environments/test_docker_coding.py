@@ -1346,6 +1346,7 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
     restrictions = DockerWorkloadRestrictions()
     calls: list[list[str]] = []
     container_exists = False
+    container_labels: dict[str, str] = {}
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         nonlocal container_exists
@@ -1358,9 +1359,14 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
             return ExecResult(stdout=(_CONTAINER_ID + "\n") if container_exists else "")
         if docker_args[0] == "run":
             container_exists = True
+            if "--label" in docker_args:
+                key, value = docker_args[docker_args.index("--label") + 1].split("=", 1)
+                container_labels[key] = value
             return ExecResult(stdout=_CONTAINER_ID)
         if docker_args[0] == "inspect":
-            return ExecResult(stdout=json.dumps(_inspection(restrictions)))
+            inspection = _inspection(restrictions)
+            inspection["Config"]["Labels"] = container_labels
+            return ExecResult(stdout=json.dumps(inspection))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
             return ExecResult(stdout=restrictions.user)
         if docker_args[:2] == ["rm", "-f"]:
@@ -1412,7 +1418,8 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
     asyncio.run(run())
 
     assert sum(call[1] == "run" for call in calls) == 1
-    assert sum(call[1] == "inspect" for call in calls) == 2
+    # Creation and strict reconnect each inspect; adoption also verifies the intent label.
+    assert sum(call[1] == "inspect" for call in calls) == 3
     assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
 
 
@@ -2679,6 +2686,7 @@ def test_docker_immutable_allocation_retry_and_concurrent_reconstruction(
     restrictions = DockerWorkloadRestrictions()
     calls: list[list[str]] = []
     container_exists = False
+    container_labels: dict[str, str] = {}
     mount_source = None
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -2705,15 +2713,16 @@ def test_docker_immutable_allocation_retry_and_concurrent_reconstruction(
             return ExecResult(stdout=(_CONTAINER_ID + "\n") if container_exists else "")
         if docker_args[0] == "run":
             container_exists = True
+            if "--label" in docker_args:
+                key, value = docker_args[docker_args.index("--label") + 1].split("=", 1)
+                container_labels[key] = value
             mount_argument = docker_args[docker_args.index("--mount") + 1]
             mount_source = mount_argument.split("source=", 1)[1].split(",", 1)[0]
             return ExecResult(stdout=_CONTAINER_ID)
         if docker_args[0] == "inspect":
-            return ExecResult(
-                stdout=json.dumps(
-                    _inspection(restrictions, immutable_mount=(mount_source, "/evidence"))
-                )
-            )
+            inspection = _inspection(restrictions, immutable_mount=(mount_source, "/evidence"))
+            inspection["Config"]["Labels"] = container_labels
+            return ExecResult(stdout=json.dumps(inspection))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
             return ExecResult(stdout=restrictions.user)
         if docker_args[:2] == ["rm", "-f"]:

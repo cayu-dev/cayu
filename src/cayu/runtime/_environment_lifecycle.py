@@ -133,6 +133,7 @@ from cayu.runtime._environment_allocation import (
     DurableEnvironmentAllocationContext,
     EnvironmentAllocationCoordinator,
     EnvironmentAllocationReceipt,
+    EnvironmentAllocationRecord,
     environment_allocation_parent_session_id,
     environment_allocation_source_owner_session_id,
 )
@@ -188,6 +189,7 @@ from cayu.runtime.sessions import (
     _current_session_invocation_terminal_event,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
+    _initial_transcript_pending_interaction_id,
     _session_run_operation_from_checkpoint,
     session_user_metadata,
 )
@@ -656,6 +658,133 @@ class EnvironmentLifecycle:
                 ).hexdigest()[:32]
             ),
         )
+
+    async def pending_allocation_names(self, session: Session) -> tuple[str, ...]:
+        """Inventory durable setup authority independently of binding events."""
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        records = (checkpoint or {}).get(ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY, {})
+        if type(records) is not dict:
+            raise ValueError("Environment allocation intents must be an object.")
+        pending: list[str] = []
+        for name in records:
+            record = self._allocation_coordinator.record_from_checkpoint(
+                checkpoint,
+                environment_name=name,
+            )
+            assert record is not None
+            if record.intent.session_id != session.id:
+                if record.intent.session_id == environment_allocation_source_owner_session_id(
+                    session,
+                    environment_name=name,
+                ):
+                    continue
+                raise ValueError("Pending allocation belongs to another session.")
+            if record.intent.environment_name != name:
+                raise ValueError("Pending allocation environment identity changed.")
+            if record.state is not EnvironmentAllocationState.REAPED:
+                pending.append(name)
+        if _initial_transcript_pending_interaction_id(checkpoint) is not None:
+            receipts = (checkpoint or {}).get(
+                ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY, {}
+            )
+            if type(receipts) is not dict:
+                raise ValueError("Environment allocation receipts must be an object.")
+            for name in receipts:
+                receipt = self._allocation_coordinator.receipt_from_checkpoint(
+                    checkpoint,
+                    environment_name=name,
+                )
+                assert receipt is not None
+                if receipt.intent.session_id != session.id:
+                    if receipt.intent.session_id == environment_allocation_source_owner_session_id(
+                        session,
+                        environment_name=name,
+                    ):
+                        continue
+                    raise ValueError("Allocation receipt belongs to another session.")
+                if name in records or receipt.intent.environment_name != name:
+                    raise ValueError("Allocation receipt conflicts with pending ownership.")
+                pending.append(name)
+        return tuple(pending)
+
+    async def reap_pending_allocation(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity,
+        invocation_context: InvocationContext,
+    ) -> None:
+        """Dispose exact unpublished ownership under the caller's recovery claim."""
+        name = registered_environment.spec.name
+        factory = registered_environment.factory
+        if factory is None:
+            raise RuntimeError("Pending allocation lost its registered factory.")
+        record = await self._allocation_coordinator.load_record(
+            session_id=session.id,
+            environment_name=name,
+        )
+        receipt = None
+        if record is None:
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            receipt = self._allocation_coordinator.receipt_from_checkpoint(
+                checkpoint,
+                environment_name=name,
+            )
+            if receipt is None:
+                raise RuntimeError("Pending allocation ownership changed before cleanup.")
+            record = EnvironmentAllocationRecord(
+                intent=receipt.intent,
+                state=EnvironmentAllocationState.ACKNOWLEDGED,
+                reconnect_metadata=receipt.reconnect_metadata,
+            )
+        if record.state is EnvironmentAllocationState.REAPED:
+            return
+        request = EnvironmentFactoryRequest(
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=name,
+            parent_session_id=environment_allocation_parent_session_id(session),
+            causal_budget_id=session.causal_budget_id,
+            labels=session.labels,
+            metadata=session_user_metadata(session.metadata),
+            execution_requirements=registered_agent.execution_requirements,
+            execution_profile_fingerprint=execution_profile.fingerprint,
+            interaction_id=invocation_context.binding.interaction_id,
+        )
+        scope = factory.allocation_scope(request)
+        if scope is None:
+            raise RuntimeError("Pending allocation lost its provider scope.")
+        if record.intent.scope != scope:
+            raise RuntimeError("Pending allocation provider or adapter generation changed.")
+        if receipt is not None:
+            record = await self._allocation_coordinator.reclaim_abandoned_publication(
+                session=session,
+                receipt=receipt,
+            )
+        allocation = self._allocation_coordinator.context(
+            session_id=session.id,
+            inherited_owner_session_id=None,
+            environment_name=name,
+            scope=scope,
+            existing=record,
+        )
+        async with asyncio.timeout(10.0):
+            await factory.reap_allocation(request, allocation)
+        current = await self._allocation_coordinator.load_record(
+            session_id=session.id,
+            environment_name=name,
+        )
+        if current is None:
+            raise RuntimeError("Allocation publication won; physical cleanup is not complete.")
+        if (
+            current.intent != record.intent
+            or current.state is not EnvironmentAllocationState.REAPED
+        ):
+            raise RuntimeError(
+                "Factory cleanup remains pending; retry incomplete-session recovery."
+            )
 
     async def has_unsettled_progress(
         self,

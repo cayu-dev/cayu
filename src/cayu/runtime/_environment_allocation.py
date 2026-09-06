@@ -34,6 +34,7 @@ from cayu.runtime.sessions import (
     CheckpointTransform,
     Session,
     SessionStore,
+    _initial_transcript_pending_interaction_id,
     session_fork_profile_relationship,
 )
 from cayu.vaults import SecretRedactor
@@ -114,10 +115,22 @@ class EnvironmentAllocationRecord:
     intent: EnvironmentAllocationIntent
     state: EnvironmentAllocationState
     reconnect_metadata: dict[str, Any] | None = None
+    dispatch_precluded: bool = False
 
     def __post_init__(self) -> None:
         if self.state is EnvironmentAllocationState.UNPREPARED:
             raise ValueError("Unprepared environment allocation state is not durable.")
+        if type(self.dispatch_precluded) is not bool or (
+            self.dispatch_precluded
+            and (
+                self.state
+                not in {EnvironmentAllocationState.REAPING, EnvironmentAllocationState.REAPED}
+                or self.reconnect_metadata is not None
+            )
+        ):
+            raise ValueError(
+                "Precluded dispatch requires cleanup without a provider acknowledgement."
+            )
         reconnect_metadata = self.reconnect_metadata
         if reconnect_metadata is not None:
             reconnect_metadata = copy_durable_json_object(
@@ -149,6 +162,8 @@ class EnvironmentAllocationRecord:
             "state": self.state.value,
             "intent": self.intent.to_payload(),
         }
+        if self.dispatch_precluded:
+            payload["dispatch_precluded"] = True
         if self.reconnect_metadata is not None:
             payload["reconnect_metadata"] = copy_durable_json_object(
                 self.reconnect_metadata,
@@ -164,6 +179,8 @@ class EnvironmentAllocationRecord:
         expected = {"schema_version", "state", "intent"}
         if "reconnect_metadata" in copied:
             expected.add("reconnect_metadata")
+        if "dispatch_precluded" in copied:
+            expected.add("dispatch_precluded")
         if set(copied) != expected:
             raise ValueError("Environment allocation record has an invalid schema.")
         if (
@@ -179,6 +196,7 @@ class EnvironmentAllocationRecord:
             intent=EnvironmentAllocationIntent.from_payload(copied["intent"]),
             state=state,
             reconnect_metadata=copied.get("reconnect_metadata"),
+            dispatch_precluded=copied.get("dispatch_precluded", False),
         )
 
 
@@ -587,6 +605,87 @@ class EnvironmentAllocationCoordinator:
             return expected
         return None
 
+    async def reclaim_abandoned_publication(
+        self,
+        *,
+        session: Session,
+        receipt: EnvironmentAllocationReceipt,
+    ) -> EnvironmentAllocationRecord:
+        """Fence an exact published resource whose initial setup never completed.
+
+        This requires a claimed session epoch and the still-unpublished initial
+        transcript. It cannot revoke an allocation from a valid continuation.
+        """
+        name = receipt.intent.environment_name
+        desired = EnvironmentAllocationRecord(
+            intent=receipt.intent,
+            state=EnvironmentAllocationState.REAPING,
+            reconnect_metadata=receipt.reconnect_metadata,
+        )
+
+        def transform(current_session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
+            if (current_session.instance_id, current_session.run_epoch) != (
+                session.instance_id,
+                session.run_epoch,
+            ) or receipt.intent.session_id != session.id:
+                raise EnvironmentAllocationTransitionConflict(
+                    "Abandoned allocation recovery lost its epoch."
+                )
+            checkpoint = {} if current is None else copy_json_value(current, "checkpoint")
+            existing = allocation_record_from_checkpoint(checkpoint, environment_name=name)
+            if existing == desired:
+                return checkpoint
+            if _initial_transcript_pending_interaction_id(checkpoint) is None:
+                raise EnvironmentAllocationTransitionConflict(
+                    "Initial setup is no longer abandoned."
+                )
+            if existing is not None or not _publication_payload_matches(
+                checkpoint,
+                environment_name=name,
+                session_id=session.id,
+                receipt=receipt,
+            ):
+                raise EnvironmentAllocationTransitionConflict(
+                    "Abandoned publication identity changed."
+                )
+            for key in (
+                ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+            ):
+                values = checkpoint_object_map(checkpoint, key)
+                values.pop(name, None)
+                if values:
+                    checkpoint[key] = values
+                else:
+                    checkpoint.pop(key, None)
+            records = checkpoint_object_map(
+                checkpoint, ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY
+            )
+            records[name] = desired.to_payload()
+            checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY] = records
+            transformed = self._checkpoint_transform(checkpoint)(current_session, current)
+            if transformed is None or (
+                allocation_record_from_checkpoint(transformed, environment_name=name) != desired
+                or allocation_receipt_from_checkpoint(transformed, environment_name=name)
+                is not None
+                or name
+                in checkpoint_object_map(transformed, ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
+                or name
+                in checkpoint_object_map(
+                    transformed, ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY
+                )
+            ):
+                raise RuntimeError(
+                    "Abandoned allocation cleanup fence was removed by its checkpoint transform."
+                )
+            return transformed
+
+        # If acknowledgement is lost, no provider mutation has occurred. The
+        # exact REAPING record remains discoverable by the next public recovery.
+        await self._session_store.transform_checkpoint(session.id, transform)
+        return desired
+
     async def publish(
         self,
         *,
@@ -841,6 +940,10 @@ class DurableEnvironmentAllocationContext(EnvironmentAllocationContext):
         return self._state
 
     @property
+    def dispatch_precluded(self) -> bool:
+        return self._record is not None and self._record.dispatch_precluded
+
+    @property
     def acknowledged_reconnect_metadata(self) -> dict[str, Any] | None:
         record = self._record
         if record is None or record.reconnect_metadata is None:
@@ -913,17 +1016,29 @@ class DurableEnvironmentAllocationContext(EnvironmentAllocationContext):
             field_name="environment allocation acknowledgement",
         )
         require_bounded_reconnect_metadata(copied)
-        if self._state is EnvironmentAllocationState.ACKNOWLEDGED:
+        if self._state is EnvironmentAllocationState.ACKNOWLEDGED or (
+            self._state is EnvironmentAllocationState.REAPING
+            and self.acknowledged_reconnect_metadata is not None
+        ):
             if self.acknowledged_reconnect_metadata != copied:
                 raise RuntimeError(
                     "Environment allocation acknowledgement changed after publication."
                 )
             return
-        if self._state is not EnvironmentAllocationState.DISPATCHED or self._record is None:
+        if (
+            self._state
+            not in {EnvironmentAllocationState.DISPATCHED, EnvironmentAllocationState.REAPING}
+            or self._record is None
+            or self.dispatch_precluded
+        ):
             raise RuntimeError("Environment allocation must be dispatched before acknowledgement.")
         desired = EnvironmentAllocationRecord(
             intent=self._intent,
-            state=EnvironmentAllocationState.ACKNOWLEDGED,
+            state=(
+                EnvironmentAllocationState.REAPING
+                if self._state is EnvironmentAllocationState.REAPING
+                else EnvironmentAllocationState.ACKNOWLEDGED
+            ),
             reconnect_metadata=copied,
         )
         persisted = await self._coordinator.transition(
@@ -945,6 +1060,7 @@ class DurableEnvironmentAllocationContext(EnvironmentAllocationContext):
             intent=self._intent,
             state=EnvironmentAllocationState.REAPED,
             reconnect_metadata=self.acknowledged_reconnect_metadata,
+            dispatch_precluded=self.dispatch_precluded,
         )
         persisted = await self._coordinator.transition(
             session_id=self._intent.session_id,
@@ -962,19 +1078,21 @@ class DurableEnvironmentAllocationContext(EnvironmentAllocationContext):
         if (
             self._state
             not in {
+                EnvironmentAllocationState.PREPARED,
                 EnvironmentAllocationState.DISPATCHED,
                 EnvironmentAllocationState.ACKNOWLEDGED,
             }
             or self._record is None
         ):
             raise RuntimeError(
-                "Only a dispatched environment allocation can acquire the cleanup fence."
+                "Only a prepared or dispatched allocation can acquire the cleanup fence."
             )
         expected = self._record
         desired = EnvironmentAllocationRecord(
             intent=self._intent,
             state=EnvironmentAllocationState.REAPING,
             reconnect_metadata=self.acknowledged_reconnect_metadata,
+            dispatch_precluded=self._state is EnvironmentAllocationState.PREPARED,
         )
         try:
             persisted = await self._coordinator.transition(

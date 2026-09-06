@@ -1647,7 +1647,13 @@ class RecoveryPlanCoordinator:
                         inactive_for_seconds=request.plan.request.selection.inactive_for_seconds,
                         recoverable_task=recoverable_task,
                     )
-                    if IncompleteSessionRecoveryAction.SKIPPED_ACTIVE in recovery_actions:
+                    if (
+                        IncompleteSessionRecoveryAction.PENDING_ALLOCATION_CLEANUP
+                        in recovery_actions
+                    ):
+                        item_status = RecoveryItemExecutionStatus.BLOCKED
+                        error_code = "pending_allocation_cleanup"
+                    elif IncompleteSessionRecoveryAction.SKIPPED_ACTIVE in recovery_actions:
                         item_status = RecoveryItemExecutionStatus.BLOCKED
                         error_code = RecoveryPlanExecutionFenced.__name__
                     elif IncompleteSessionRecoveryAction.FAILED in recovery_actions:

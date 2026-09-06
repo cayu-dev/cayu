@@ -15134,6 +15134,8 @@ class RecoveryCoordinator:
         before_mutation: RecoveryMutationHook | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> IncompleteSessionRecoveryResult:
+        if IncompleteSessionRecoveryAction.PENDING_ALLOCATION_CLEANUP in recovered.actions:
+            return recovered
         pending_resolution = await load_pending_provider_operation_disposition(
             self._session_store,
             recovered.session_id,
@@ -15805,6 +15807,7 @@ class RecoveryCoordinator:
             raise RuntimeError(
                 "Active invocation execution profile does not match the recovery epoch."
             )
+        pending_allocations = await self._environment_lifecycle.pending_allocation_names(session)
         unsettled_environment_lifecycle = await self._environment_lifecycle.has_unsettled_progress(
             session_id=session.id,
             interaction_id=(
@@ -15864,6 +15867,7 @@ class RecoveryCoordinator:
                 or pending_provider_disposition is not None
                 or pending_completion_finalization is not None
                 or unsettled_environment_lifecycle
+                or bool(pending_allocations)
             )
             if not terminal_repair and not has_pending_work:
                 if active_invocation_profile is not None and not (
@@ -15974,7 +15978,8 @@ class RecoveryCoordinator:
                 execution_profile_from_session_metadata(session.metadata)
                 pre_admission_profiled_session = True
         requires_execution_profile = (
-            pending_approval is not None
+            bool(pending_allocations)
+            or pending_approval is not None
             or pending_user_input is not None
             or pending_tool_round is not None
             or deferred_input is not None
@@ -16019,7 +16024,7 @@ class RecoveryCoordinator:
                     budget_policy=budget_policy_snapshot,
                     require_open_interaction=not (
                         (
-                            terminal_repair_required
+                            (terminal_repair_required or bool(pending_allocations))
                             and session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
                         )
                         or pending_provider_disposition_effect_is_durable
@@ -16117,6 +16122,34 @@ class RecoveryCoordinator:
                 await provider_disposition_after_admission()
 
             async def recover_claimed_session() -> IncompleteSessionRecoveryResult:
+                if pending_allocations:
+                    if (
+                        registered_environment is None
+                        or pending_allocations != (registered_environment.spec.name,)
+                        or execution_profile_snapshot is None
+                        or invocation_context is None
+                    ):
+                        raise RuntimeError("Pending allocation lost exact recovery authority.")
+                    try:
+                        await self._environment_lifecycle.reap_pending_allocation(
+                            session=claim.session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=execution_profile_snapshot.profile,
+                            invocation_context=invocation_context,
+                        )
+                    except Exception as exc:
+                        diagnostic = exception_diagnostic(exc, redactor=self._secret_redactor)
+                        return IncompleteSessionRecoveryResult(
+                            session_id=session.id,
+                            previous_status=previous_status,
+                            status=claim.session.status,
+                            actions=(IncompleteSessionRecoveryAction.PENDING_ALLOCATION_CLEANUP,),
+                            message=bound_diagnostic_text(
+                                "Allocation cleanup remains durably owned; retry "
+                                "recover_incomplete_session. " + diagnostic.message
+                            ),
+                        )
                 lifecycle_events = await self._environment_lifecycle.reconcile_orphaned_progress(
                     session_id=claim.session.id,
                     interaction_id=(
@@ -16145,6 +16178,20 @@ class RecoveryCoordinator:
                     provider_disposition_task_handoff_id=(provider_disposition_task_handoff_id),
                     interrupt_for_manual_tool_recovery=(interrupt_for_manual_tool_recovery),
                 )
+                if pending_allocations:
+                    recovered = recovered.model_copy(
+                        update={
+                            "actions": (
+                                IncompleteSessionRecoveryAction.REAPED_ALLOCATION,
+                                *(
+                                    action
+                                    for action in recovered.actions
+                                    if action
+                                    is not IncompleteSessionRecoveryAction.SKIPPED_TERMINAL
+                                ),
+                            ),
+                        }
+                    )
                 if not lifecycle_events:
                     return recovered
                 retained_actions = tuple(

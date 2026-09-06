@@ -259,6 +259,18 @@ def _docker_coding_container_name(
     )
 
 
+def _docker_allocation_identity(allocation: EnvironmentAllocationContext) -> str:
+    return (
+        "sha256:"
+        + sha256(
+            canonical_durable_json_bytes(
+                allocation.intent.to_payload(),
+                "docker_allocation_intent",
+            )
+        ).hexdigest()
+    )
+
+
 async def _release_immutable_input_attachments(
     store: ImmutableInputStore,
     attachments: tuple[ImmutableInputAttachment, ...],
@@ -967,7 +979,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         if allocation.intent.provider_metadata != expected_metadata:
             raise RuntimeError("Docker coding allocation intent changed after preparation.")
         if allocation.state is EnvironmentAllocationState.REAPING:
-            await self._reap_interrupted_allocation(allocation, container_name=expected_name)
+            await self._reap_allocation(request, allocation)
             raise RuntimeError("A reaping Docker coding allocation cannot be replaced.")
         if allocation.state is EnvironmentAllocationState.REAPED:
             raise RuntimeError("A reaped Docker coding allocation cannot be replaced.")
@@ -977,6 +989,105 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self._validate_request(request)
         async with self._allocation_lock(request):
             return await self._create(request, allocation=None)
+
+    async def reap_allocation(
+        self,
+        request: EnvironmentFactoryRequest,
+        allocation: EnvironmentAllocationContext,
+    ) -> None:
+        self._validate_request(request)
+        async with self._allocation_lock(request):
+            await self._reap_allocation(request, allocation)
+
+    async def _reap_allocation(
+        self,
+        request: EnvironmentFactoryRequest,
+        allocation: EnvironmentAllocationContext,
+    ) -> None:
+        self._validate_request(request)
+        intent = allocation.intent
+        if (
+            request.operation is not EnvironmentFactoryOperation.CREATE
+            or intent.session_id != request.session_id
+            or intent.environment_name != request.environment_name
+            or intent.scope != self.allocation_scope(request)
+        ):
+            raise ValueError("Docker cleanup allocation authority changed.")
+        expected_name = _docker_coding_container_name(
+            request,
+            configuration_fingerprint=self._configuration_fingerprint,
+            allocation_id=intent.allocation_id,
+        )
+        if intent.provider_metadata != {
+            "container_name": expected_name,
+            "configuration_fingerprint": self._configuration_fingerprint,
+        }:
+            raise ValueError("Docker cleanup configuration changed.")
+        if allocation.state is EnvironmentAllocationState.REAPED:
+            return
+        if allocation.state is EnvironmentAllocationState.PREPARED:
+            await allocation.mark_reaping()
+        acknowledged = allocation.acknowledged_reconnect_metadata
+        if acknowledged is None and not allocation.dispatch_precluded:
+            if allocation.state not in {
+                EnvironmentAllocationState.DISPATCHED,
+                EnvironmentAllocationState.REAPING,
+            }:
+                raise RuntimeError("Docker cleanup lacks an acknowledged allocation identity.")
+            container_id = await DockerRunner.resolve_container_id(
+                expected_name,
+                docker_path=self.docker_path,
+            )
+            if container_id is None:
+                # An empty observation cannot rule out a late daemon create.
+                raise RuntimeError("Docker create remains ambiguous; retry allocation recovery.")
+            await DockerRunner.require_allocation_identity(
+                container_id,
+                allocation_identity=_docker_allocation_identity(allocation),
+                docker_path=self.docker_path,
+            )
+            acknowledged = _docker_coding_reconnect_metadata(
+                container_id=container_id,
+                configuration_fingerprint=self._configuration_fingerprint,
+                image_fingerprint=self.image_identity.fingerprint,
+                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+                allocation_id=intent.allocation_id,
+            )
+            await allocation.acknowledge(acknowledged)
+        if acknowledged is not None:
+            self._validate_request(
+                EnvironmentFactoryRequest(
+                    session_id=request.session_id,
+                    agent_name=request.agent_name,
+                    environment_name=request.environment_name,
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata=acknowledged,
+                )
+            )
+            if acknowledged.get("allocation_id") != intent.allocation_id:
+                raise ValueError("Docker cleanup acknowledgement belongs to another allocation.")
+            if not await allocation.mark_reaping():
+                return
+            container_id = acknowledged["container_id"]
+            if await DockerRunner.container_exists(container_id, docker_path=self.docker_path):
+                await DockerRunner(
+                    container_id,
+                    close_action="remove",
+                    docker_path=self.docker_path,
+                    _container_id=container_id,
+                ).close()
+        store = self.immutable_input_store
+        if store is not None:
+            outcome = await await_shielded_task_outcome(
+                asyncio.create_task(
+                    asyncio.to_thread(store.release_allocation_sync, intent.allocation_id),
+                )
+            )
+            if outcome.error is not None:
+                raise outcome.error
+            if outcome.cancellation is not None:
+                raise outcome.cancellation
+        await allocation.mark_reaped()
 
     async def recover_finalization_disposal(
         self,
@@ -1101,6 +1212,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                         runner = await self._create_or_recover_runner(
                             container_name,
                             immutable_mounts=immutable_mounts,
+                            allocation_identity=_docker_allocation_identity(allocation),
                         )
                     else:
                         raise RuntimeError("Docker coding allocation is not dispatchable.")
@@ -1285,12 +1397,19 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         container_name: str,
         *,
         immutable_mounts: tuple[DockerImmutableInputMount, ...],
+        allocation_identity: str | None = None,
     ) -> DockerRunner:
         existing_id = await DockerRunner.resolve_container_id(
             container_name,
             docker_path=self.docker_path,
         )
         if existing_id is not None:
+            if allocation_identity is not None:
+                await DockerRunner.require_allocation_identity(
+                    existing_id,
+                    allocation_identity=allocation_identity,
+                    docker_path=self.docker_path,
+                )
             return await self._reconnect_runner(
                 existing_id,
                 immutable_mounts=immutable_mounts,
@@ -1315,6 +1434,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 required_executables=self.required_executables,
                 toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
                 immutable_input_mounts=immutable_mounts,
+                allocation_identity=allocation_identity,
             )
         except Exception:
             recovered_id = await DockerRunner.resolve_container_id(
@@ -1323,6 +1443,12 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             )
             if recovered_id is None:
                 raise
+            if allocation_identity is not None:
+                await DockerRunner.require_allocation_identity(
+                    recovered_id,
+                    allocation_identity=allocation_identity,
+                    docker_path=self.docker_path,
+                )
             return await self._reconnect_runner(
                 recovered_id,
                 immutable_mounts=immutable_mounts,
@@ -1377,40 +1503,6 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             raise RuntimeError(
                 "Docker immutable input cleanup completed after the container disappeared."
             )
-
-    async def _reap_interrupted_allocation(
-        self,
-        allocation: EnvironmentAllocationContext,
-        *,
-        container_name: str,
-    ) -> None:
-        container_id = await DockerRunner.resolve_container_id(
-            container_name,
-            docker_path=self.docker_path,
-        )
-        if container_id is not None:
-            runner = DockerRunner(
-                container_name,
-                close_action="remove",
-                docker_path=self.docker_path,
-                _container_id=container_id,
-            )
-            await runner.close()
-        store = self.immutable_input_store
-        if store is not None:
-            outcome = await await_shielded_task_outcome(
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        store.release_allocation_sync,
-                        allocation.intent.allocation_id,
-                    )
-                )
-            )
-            if outcome.error is not None:
-                raise outcome.error
-            if outcome.cancellation is not None:
-                raise outcome.cancellation
-        await allocation.mark_reaped()
 
     async def _attach_immutable_inputs(
         self,

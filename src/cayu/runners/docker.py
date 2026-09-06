@@ -1144,6 +1144,32 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         return None if not identifiers else identifiers[0]
 
     @classmethod
+    async def require_allocation_identity(
+        cls,
+        container_id: str,
+        *,
+        allocation_identity: str,
+        docker_path: str | None = None,
+    ) -> None:
+        """Validate immutable creation metadata by exact ID without guest execution."""
+        del cls
+        if _DOCKER_CONTAINER_ID_PATTERN.fullmatch(container_id) is None:
+            raise ValueError("container_id must be a full lowercase Docker container ID.")
+        inspection = await _inspect_strict_container(
+            _require_docker(docker_path),
+            container_id,
+            docker_cli_env_allowlist=(),
+        )
+        config = _require_mapping(inspection.get("Config"), "container_config_missing")
+        labels = _require_mapping(config.get("Labels"), "container_allocation_identity_missing")
+        if inspection.get("Id") != container_id or (
+            labels.get("io.cayu.allocation-identity") != allocation_identity
+        ):
+            raise DockerContainerOwnershipError(
+                "Docker allocation identity belongs to another owner."
+            )
+
+    @classmethod
     async def container_exists(
         cls,
         container_id: str,
@@ -1199,6 +1225,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         required_executables: Sequence[str] = (),
         toolchain_profile_fingerprint: str | None = None,
         immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
+        allocation_identity: str | None = None,
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -1236,6 +1263,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             raise ValueError(
                 "image_identity and workload_restrictions must be configured together."
             )
+        if allocation_identity is not None and (
+            type(allocation_identity) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", allocation_identity) is None
+        ):
+            raise ValueError("allocation_identity must be a lowercase SHA-256 identity.")
         strict_mode = image_identity is not None
         owned_image_identity = (
             None
@@ -1359,6 +1391,8 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             if seccomp_profile is not None:
                 run_argv += ["--security-opt", f"seccomp={seccomp_profile}"]
             run_argv += ["--name", name]
+            if allocation_identity is not None:
+                run_argv += ["--label", f"io.cayu.allocation-identity={allocation_identity}"]
             if network is not None:
                 run_argv += ["--network", require_clean_nonblank(network, "network")]
             for host_entry in extra_hosts:
