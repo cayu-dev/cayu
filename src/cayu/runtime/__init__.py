@@ -630,8 +630,10 @@ from cayu.runtime.request_footprints import (
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
+    RetryDisposition,
     RetryPolicy,
     RetryReason,
+    RetrySuppression,
     classify_retryable_error,
     copy_retry_policy,
     retry_decision,
@@ -1638,8 +1640,10 @@ __all__ = [
     "ResolvedToolExposure",
     "ResumeRequest",
     "RetryDecision",
+    "RetryDisposition",
     "RetryPolicy",
     "RetryReason",
+    "RetrySuppression",
     "RunDefaults",
     "RunLimits",
     "RunOutcome",

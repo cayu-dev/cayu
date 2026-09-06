@@ -14264,6 +14264,10 @@ def test_cayu_app_classifies_provider_created_stream_cancellation_as_failure(
         sort_keys=True,
     )
 
+    error = next(e for e in events if e.type is EventType.MODEL_ERROR)
+    assert error.payload["retry_suppression"] == "cancellation"
+    assert error.payload["retry"] is False
+
 
 def test_chat_completions_adapter_preserves_nested_cancellation_diagnostics() -> None:
     class BlockingRawEvents:
@@ -27460,6 +27464,8 @@ def test_cayu_app_fences_typed_semantic_stream_deadline_until_manual_settlement(
     assert deadline.payload["provider_recovery_disposition"] == "manual_settlement_required"
     assert deadline.payload["retryable"] is False
     assert deadline.payload["effective_max_attempts"] == 1
+    assert deadline.payload["retry_disposition"] == "suppressed"
+    assert deadline.payload["retry_suppression"] == "deadline"
     assert deadline.payload["model_step_id"] == events[1].payload["model_step_id"]
     assert deadline.payload["model_attempt_id"] == events[1].payload["model_attempt_id"]
     assert "partial answer" not in repr(deadline.payload)
@@ -27763,6 +27769,10 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         "max_attempts": 2,
         "effective_max_attempts": 2,
         "reason": "timeout",
+        "retry": True,
+        "retry_disposition": "retry_scheduled",
+        "retry_suppression": None,
+        "provider_retryable": None,
         "model_step_id": events[1].payload["model_step_id"],
         "model_attempt_id": events[1].payload["model_attempt_id"],
         "execution_profile_fingerprint": events[1].payload["execution_profile_fingerprint"],
@@ -27777,6 +27787,10 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         "max_attempts": 2,
         "effective_max_attempts": 2,
         "reason": "timeout",
+        "retry": False,
+        "retry_disposition": "configured_attempt_exhaustion",
+        "retry_suppression": None,
+        "provider_retryable": None,
         "model_step_id": events[5].payload["model_step_id"],
         "model_attempt_id": events[5].payload["model_attempt_id"],
         "execution_profile_fingerprint": events[5].payload["execution_profile_fingerprint"],
@@ -27879,7 +27893,7 @@ def test_cayu_app_does_not_retry_when_provider_marks_error_non_retryable():
     assert len(provider.requests) == 1
 
 
-def test_cayu_app_does_not_emit_model_error_for_non_retryable_contract_failure():
+def test_cayu_app_explains_non_retryable_contract_failure():
     provider = FakeProvider(
         [
             ModelStreamEvent(
@@ -27913,9 +27927,13 @@ def test_cayu_app_does_not_emit_model_error_for_non_retryable_contract_failure()
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
+
+    assert events[2].payload["retry_disposition"] == "classification_unavailable"
+    assert events[2].payload["retry"] is False
 
 
 def _assert_unattached_task_failure_payload(
@@ -57124,6 +57142,7 @@ def test_cayu_app_fails_when_provider_emits_text_after_completed():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
@@ -57132,6 +57151,10 @@ def test_cayu_app_fails_when_provider_emits_text_after_completed():
     )
     assert session is not None
     assert session.status == SessionStatus.FAILED
+
+    assert sum(e.type is EventType.MODEL_STARTED for e in events) == 1
+    assert events[3].payload["retry"] is False
+    assert events[3].payload["retry_suppression"] == "completion_observed"
 
 
 def test_cayu_app_fails_without_tool_execution_when_provider_emits_tool_after_completed():
@@ -57170,6 +57193,7 @@ def test_cayu_app_fails_without_tool_execution_when_provider_emits_tool_after_co
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
@@ -57179,6 +57203,10 @@ def test_cayu_app_fails_without_tool_execution_when_provider_emits_tool_after_co
     assert tool.calls == []
     assert session is not None
     assert session.status == SessionStatus.FAILED
+
+    assert sum(e.type is EventType.MODEL_STARTED for e in events) == 1
+    assert events[3].payload["retry"] is False
+    assert events[3].payload["retry_suppression"] == "completion_observed"
 
 
 def test_cayu_app_fails_session_when_provider_stream_ends_without_completion():
@@ -57204,12 +57232,16 @@ def test_cayu_app_fails_session_when_provider_stream_ends_without_completion():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == ("Model provider stream ended without a completed event.")
     assert session is not None
     assert session.status == SessionStatus.FAILED
+
+    assert sum(e.type is EventType.MODEL_STARTED for e in events) == 1
+    assert events[3].payload["retry"] is False
 
 
 def test_cayu_app_ignores_blank_text_deltas():

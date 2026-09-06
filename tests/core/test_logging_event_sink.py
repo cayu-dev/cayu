@@ -446,3 +446,30 @@ def test_default_logging_sink_does_not_replace_custom_sinks() -> None:
 
 async def _collect_run(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
+
+
+def test_model_error_and_retry_log_the_same_decision(caplog: pytest.LogCaptureFixture) -> None:
+    logger = logging.getLogger("cayu.test.retry_diagnostics")
+    sink = LoggingEventSink(logger=logger)
+    caplog.set_level(logging.INFO, logger=logger.name)
+    for event_type in (EventType.MODEL_ERROR, EventType.MODEL_RETRY):
+        asyncio.run(
+            sink.emit(
+                Event(
+                    type=event_type,
+                    session_id="retry-logs",
+                    payload={
+                        "retry_disposition": "retry_scheduled",
+                        "provider_retryable": True,
+                        "attempt": 1,
+                        "max_attempts": 10,
+                        "effective_max_attempts": 2,
+                    },
+                )
+            )
+        )
+    assert len(caplog.records) == 2
+    for record in caplog.records:
+        assert "retry_disposition=retry_scheduled" in record.message
+        assert "effective_max_attempts=2" in record.message
+        assert "provider_retryable=True" in record.message

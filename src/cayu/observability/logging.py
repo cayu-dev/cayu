@@ -148,12 +148,11 @@ def _summarize_event(
         _append(parts, "provider", payload.get("provider"), redactor=redactor)
         _append(parts, "model", payload.get("model"), redactor=redactor)
         _append(parts, "step", payload.get("step"), redactor=redactor)
-        _append(parts, "attempt", payload.get("attempt"), redactor=redactor)
         _append(parts, "next_attempt", payload.get("next_attempt"), redactor=redactor)
-        _append(parts, "max_attempts", payload.get("max_attempts"), redactor=redactor)
         _append(parts, "reason", payload.get("reason"), redactor=redactor)
         _append(parts, "delay_seconds", payload.get("delay_seconds"), redactor=redactor)
         _append_error(parts, payload, limit=error_summary_limit, redactor=redactor)
+        _append_retry_diagnostics(parts, payload, redactor=redactor)
     elif event_type == EventType.SESSION_LIMIT_REACHED:
         _append(parts, "limit", payload.get("limit"), redactor=redactor)
         _append(parts, "actual", payload.get("actual"), redactor=redactor)
@@ -200,6 +199,8 @@ def _summarize_event(
         EventType.CONTEXT_COMPACTION_FAILED,
     }:
         _append_error(parts, payload, limit=error_summary_limit, redactor=redactor)
+        if event_type == EventType.MODEL_ERROR:
+            _append_retry_diagnostics(parts, payload, redactor=redactor)
     elif event_type in {
         EventType.TASK_CREATED,
         EventType.TASK_STARTED,
@@ -223,6 +224,20 @@ def _identity(event: Event, *, redactor: SecretRedactor) -> str:
     if event.environment_name:
         parts.append(f"env={_clean(event.environment_name, redactor=redactor)}")
     return " ".join(parts)
+
+
+def _append_retry_diagnostics(
+    parts: list[str], payload: dict[str, Any], *, redactor: SecretRedactor
+) -> None:
+    for key in (
+        "retry_disposition",
+        "retry_suppression",
+        "provider_retryable",
+        "attempt",
+        "max_attempts",
+        "effective_max_attempts",
+    ):
+        _append(parts, key, payload.get(key), redactor=redactor)
 
 
 def _append(

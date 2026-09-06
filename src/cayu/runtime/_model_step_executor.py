@@ -344,8 +344,10 @@ from cayu.runtime.request_footprints import (
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryPolicy,
+    RetrySuppression,
     copy_retry_policy,
     retry_decision,
+    retry_diagnostic_payload,
     retry_event_payload,
 )
 from cayu.runtime.sessions import (
@@ -863,6 +865,7 @@ class ModelAttemptFailed(Exception):
         provider_effect_observed: bool = False,
         automatic_retry_disabled: bool = False,
         retry_decision: RetryDecision | None = None,
+        retry_suppression: RetrySuppression | None = None,
     ) -> None:
         if type(provider_effect_observed) is not bool:
             raise TypeError("provider_effect_observed must be a bool.")
@@ -877,6 +880,9 @@ class ModelAttemptFailed(Exception):
         self.automatic_retry_disabled = automatic_retry_disabled
         if retry_decision is not None and type(retry_decision) is not RetryDecision:
             raise TypeError("retry_decision must be a RetryDecision or None.")
+        if retry_suppression is not None and type(retry_suppression) is not RetrySuppression:
+            raise TypeError("retry_suppression must be a RetrySuppression or None.")
+        self.retry_suppression = retry_suppression
         self.retry_decision = retry_decision
         super().__init__(self.message)
 
@@ -6266,6 +6272,7 @@ class ModelStepExecutor:
                         retryable=retryable,
                         retry_after_s=retry_after_s,
                         unknown_provider_error=unknown_provider_error,
+                        suppression=_attempt_retry_suppression(exc),
                     )
                 elif (
                     decision.attempt != attempt
@@ -6274,9 +6281,7 @@ class ModelStepExecutor:
                     raise RuntimeError(
                         "Model attempt retained a retry decision for different attempt authority."
                     ) from exc
-                if not exc.emitted_error_event and (
-                    decision.reason is not None or isinstance(exc.cause, ModelStreamDeadlineError)
-                ):
+                if not exc.emitted_error_event:
                     error_event = event_with_execution_profile_authority(
                         Event(
                             type=EventType.MODEL_ERROR,
@@ -7939,14 +7944,17 @@ class ModelStepExecutor:
                             if isinstance(provider_error, ModelProviderError)
                             else None
                         ),
-                        retryable=(
-                            False
+                        suppression=(
+                            RetrySuppression.DEADLINE
+                            if isinstance(provider_error, ModelStreamDeadlineError)
+                            else RetrySuppression.PROVIDER_OPERATION
                             if provider_operation_state is not None
-                            else (
-                                provider_error.retryable
-                                if isinstance(provider_error, ModelProviderError)
-                                else None
-                            )
+                            else None
+                        ),
+                        retryable=(
+                            provider_error.retryable
+                            if isinstance(provider_error, ModelProviderError)
+                            else None
                         ),
                         retry_after_s=(
                             None
@@ -8145,6 +8153,7 @@ class ModelStepExecutor:
                         cause=provider_failure,
                         provider_effect_observed=provider_effect_observed,
                         automatic_retry_disabled=True,
+                        retry_suppression=RetrySuppression.CANCELLATION,
                     )
                 else:
                     post_completion_failure = provider_failure
@@ -8169,6 +8178,7 @@ class ModelStepExecutor:
                         cause=operational_failure,
                         provider_effect_observed=provider_effect_observed,
                         automatic_retry_disabled=True,
+                        retry_suppression=RetrySuppression.CANCELLATION,
                     )
                 else:
                     post_completion_failure = operational_failure
@@ -8271,6 +8281,7 @@ class ModelStepExecutor:
                             cause=late_failure,
                             provider_effect_observed=True,
                             automatic_retry_disabled=True,
+                            retry_suppression=RetrySuppression.PROVIDER_EFFECT_OBSERVED,
                         ) from exc
                 raise
             post_completion_failure = exc
@@ -8296,6 +8307,12 @@ class ModelStepExecutor:
                         completion_observed=exc.completion_observed,
                         provider_effect_observed=exc.provider_effect_observed,
                         automatic_retry_disabled=True,
+                        retry_decision=(
+                            exc.retry_decision
+                            if exc.retry_decision is not None and not exc.retry_decision.retry
+                            else None
+                        ),
+                        retry_suppression=RetrySuppression.PROVIDER_OPERATION,
                     ) from exc
                 raise
             durable_stream_failure = exc
@@ -8400,6 +8417,19 @@ class ModelStepExecutor:
                         model_completion_publisher is not None and model_completed
                     ),
                     provider_effect_observed=provider_effect_observed,
+                    retry_decision=retry_decision(
+                        policy=retry_policy,
+                        attempt=attempt,
+                        error=str(provider_error),
+                        retryable=provider_error.retryable,
+                        suppression=(
+                            RetrySuppression.COMPLETION_OBSERVED
+                            if model_completion_publisher is not None and model_completed
+                            else RetrySuppression.PROVIDER_OPERATION
+                            if background_dispatch_invoked
+                            else None
+                        ),
+                    ),
                 )
                 if model_completion_publisher is None or not model_completed:
                     yield (
@@ -8416,6 +8446,7 @@ class ModelStepExecutor:
                                         attempt=attempt,
                                         max_attempts=max_attempts,
                                         model_attempt_identity=model_attempt_identity,
+                                        decision=durable_stream_failure.retry_decision,
                                     ),
                                 ),
                                 execution_profile,
@@ -8672,6 +8703,7 @@ class ModelStepExecutor:
                 cause=post_dispatch_failure,
                 provider_effect_observed=provider_effect_observed,
                 automatic_retry_disabled=True,
+                retry_suppression=RetrySuppression.PROVIDER_OPERATION,
             ) from post_dispatch_failure
         if type(provider_control_failure) is ModelContextOverflowError:
             yield (
@@ -8704,6 +8736,13 @@ class ModelStepExecutor:
                     completion_observed=durable_stream_failure.completion_observed,
                     provider_effect_observed=(durable_stream_failure.provider_effect_observed),
                     automatic_retry_disabled=True,
+                    retry_decision=(
+                        durable_stream_failure.retry_decision
+                        if durable_stream_failure.retry_decision is not None
+                        and not durable_stream_failure.retry_decision.retry
+                        else None
+                    ),
+                    retry_suppression=RetrySuppression.PROVIDER_OPERATION,
                 )
             raise durable_stream_failure from None
         if post_completion_failure is not None:
@@ -8717,6 +8756,9 @@ class ModelStepExecutor:
                 cause=RuntimeError(message),
                 provider_effect_observed=provider_effect_observed,
                 automatic_retry_disabled=background_dispatch_invoked,
+                retry_suppression=(
+                    RetrySuppression.PROVIDER_OPERATION if background_dispatch_invoked else None
+                ),
             )
         await self._session_control.raise_if_interrupted(session.id)
         if completed_stream_event is None:
@@ -15398,16 +15440,24 @@ def _require_unique_tool_call_ids(
         raise ValueError("Model provider emitted duplicate tool-call identifiers.")
 
 
+def _attempt_retry_suppression(exc: ModelAttemptFailed) -> RetrySuppression | None:
+    if exc.completion_observed:
+        return RetrySuppression.COMPLETION_OBSERVED
+    if isinstance(exc.cause, ModelStreamDeadlineError):
+        return RetrySuppression.DEADLINE
+    if exc.automatic_retry_disabled and exc.retry_suppression is not None:
+        return exc.retry_suppression
+    if exc.automatic_retry_disabled:
+        # This flag is also used for unresolved effects and publication failures.
+        # Do not invent a more specific operation authority when it is unavailable.
+        return RetrySuppression.AUTOMATIC_RETRY_DISABLED
+    return None
+
+
 def _typed_retry_fields(
     exc: ModelAttemptFailed,
 ) -> tuple[int | None, bool | None, float | None, bool]:
     cause = exc.cause
-    if exc.completion_observed or exc.automatic_retry_disabled:
-        # A valid completed frame is the authoritative terminal attempt. A
-        # later transport/control failure cannot authorize another provider
-        # charge for the same logical step.
-        status_code = cause.status_code if isinstance(cause, ModelProviderError) else None
-        return status_code, False, None, False
     if isinstance(cause, ModelProviderError):
         return (
             cause.status_code,
@@ -15489,6 +15539,7 @@ def _model_attempt_discarded_event(
                 "attempt": decision.attempt,
                 "next_attempt": decision.next_attempt,
                 "max_attempts": decision.max_attempts,
+                **retry_diagnostic_payload(decision),
                 "effective_max_attempts": decision.effective_max_attempts,
                 "reason": None if decision.reason is None else decision.reason.value,
                 "status_code": decision.status_code,
@@ -15509,6 +15560,8 @@ def _retry_attempt_payload(
     decision: RetryDecision | None = None,
 ) -> dict[str, Any]:
     enriched = dict(payload)
+    for key in ("retry", "retry_disposition", "retry_suppression", "provider_retryable"):
+        enriched.pop(key, None)
     strip_runtime_owned_execution_identity(enriched)
     enriched["step"] = step
     enriched["attempt"] = attempt
@@ -15520,6 +15573,7 @@ def _retry_attempt_payload(
             raise ValueError("Retry decision does not match the model-attempt evidence.")
         enriched.pop("effective_max_attempts", None)
         enriched.pop("reason", None)
+        enriched.update(retry_diagnostic_payload(decision))
         enriched["effective_max_attempts"] = decision.effective_max_attempts
         if decision.reason is not None:
             enriched["reason"] = decision.reason.value

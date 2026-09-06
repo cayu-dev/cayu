@@ -60,6 +60,26 @@ class RetryReason(StrEnum):
     UNKNOWN_PROVIDER = "unknown_provider"
 
 
+class RetryDisposition(StrEnum):
+    RETRY_SCHEDULED = "retry_scheduled"
+    PERMANENT_PROVIDER_ERROR = "permanent_provider_error"
+    EXPLICIT_NONRETRYABLE = "explicit_nonretryable"
+    UNKNOWN_PROVIDER_ATTEMPT_CAP = "unknown_provider_attempt_cap"
+    CONFIGURED_ATTEMPT_EXHAUSTION = "configured_attempt_exhaustion"
+    POLICY_DISALLOWED = "policy_disallowed"
+    CLASSIFICATION_UNAVAILABLE = "classification_unavailable"
+    SUPPRESSED = "suppressed"
+
+
+class RetrySuppression(StrEnum):
+    COMPLETION_OBSERVED = "completion_observed"
+    PROVIDER_OPERATION = "provider_operation"
+    PROVIDER_EFFECT_OBSERVED = "provider_effect_observed"
+    CANCELLATION = "cancellation"
+    DEADLINE = "deadline"
+    AUTOMATIC_RETRY_DISABLED = "automatic_retry_disabled"
+
+
 class RetryPolicy(BaseModel):
     """Retry controls for one provider model step.
 
@@ -101,6 +121,9 @@ class RetryDecision(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     retry: StrictBool
+    disposition: RetryDisposition = RetryDisposition.CLASSIFICATION_UNAVAILABLE
+    suppression: RetrySuppression | None = None
+    provider_retryable: StrictBool | None = None
     reason: RetryReason | None = None
     status_code: StrictInt | None = Field(default=None, ge=100, le=599)
     delay_seconds: StrictFloat = Field(default=0.0, ge=0.0)
@@ -133,6 +156,7 @@ def retry_decision(
     retryable: bool | None = None,
     retry_after_s: float | None = None,
     unknown_provider_error: bool = False,
+    suppression: RetrySuppression | None = None,
 ) -> RetryDecision:
     """Classify one failed model attempt into a retry decision.
 
@@ -145,7 +169,9 @@ def retry_decision(
     `unknown_provider_error=True` identifies a provider failure that retained no
     safe retry classification after typed parsing. Such failures use the stricter
     `max_unknown_attempts` ceiling and never consume the caller's full general
-    retry budget by default.
+    retry budget by default. `suppression` carries existing runtime authority
+    independently of the provider verdict and always prevents another attempt.
+    `disposition` explains terminal decisions even when `reason` is absent.
     """
 
     policy = copy_retry_policy(policy)
@@ -167,6 +193,8 @@ def retry_decision(
         if not math.isfinite(retry_after_s) or retry_after_s < 0:
             raise ValueError("retry_after_s must be a finite non-negative number.")
 
+    if suppression is not None and type(suppression) is not RetrySuppression:
+        raise TypeError("suppression must be a RetrySuppression or None.")
     reason, classified_status = classify_retryable_error(
         policy=policy,
         error=error,
@@ -175,6 +203,8 @@ def retry_decision(
     )
     if reason is None and unknown_provider_error and status_code is None and retryable is None:
         reason = RetryReason.UNKNOWN_PROVIDER
+    if suppression is not None:
+        reason = None
     if reason is RetryReason.UNKNOWN_PROVIDER:
         effective_max_attempts = min(policy.max_attempts, policy.max_unknown_attempts)
     elif reason is None:
@@ -185,8 +215,33 @@ def retry_decision(
     else:
         effective_max_attempts = policy.max_attempts
     can_retry = reason is not None and attempt < effective_max_attempts
+    if suppression is not None:
+        disposition = RetryDisposition.SUPPRESSED
+    elif can_retry:
+        disposition = RetryDisposition.RETRY_SCHEDULED
+    elif reason is RetryReason.UNKNOWN_PROVIDER and effective_max_attempts < policy.max_attempts:
+        disposition = RetryDisposition.UNKNOWN_PROVIDER_ATTEMPT_CAP
+    elif reason is not None:
+        disposition = RetryDisposition.CONFIGURED_ATTEMPT_EXHAUSTION
+    elif retryable is False:
+        disposition = RetryDisposition.EXPLICIT_NONRETRYABLE
+    elif _is_permanent_provider_error(
+        status_code=classified_status, normalized_error=error.lower()
+    ):
+        disposition = RetryDisposition.PERMANENT_PROVIDER_ERROR
+    elif (
+        classified_status is not None
+        or retryable is True
+        or _recognized_message_retry_reasons(error.lower())
+    ):
+        disposition = RetryDisposition.POLICY_DISALLOWED
+    else:
+        disposition = RetryDisposition.CLASSIFICATION_UNAVAILABLE
     return RetryDecision(
         retry=can_retry,
+        disposition=disposition,
+        suppression=suppression,
+        provider_retryable=retryable,
         reason=reason,
         status_code=classified_status,
         delay_seconds=(
@@ -239,17 +294,14 @@ def classify_retryable_error(
     if effective_status is not None and effective_status in policy.retry_on_status_codes:
         return RetryReason.HTTP_STATUS, effective_status
 
-    if policy.retry_on_rate_limit and any(
-        pattern in normalized for pattern in _RATE_LIMIT_PATTERNS
-    ):
+    recognized_reasons = _recognized_message_retry_reasons(normalized)
+    if policy.retry_on_rate_limit and RetryReason.RATE_LIMIT in recognized_reasons:
         return RetryReason.RATE_LIMIT, effective_status
 
-    if policy.retry_on_timeout and any(pattern in normalized for pattern in _TIMEOUT_PATTERNS):
+    if policy.retry_on_timeout and RetryReason.TIMEOUT in recognized_reasons:
         return RetryReason.TIMEOUT, effective_status
 
-    if policy.retry_on_connection_error and any(
-        pattern in normalized for pattern in _CONNECTION_PATTERNS
-    ):
+    if policy.retry_on_connection_error and RetryReason.CONNECTION in recognized_reasons:
         return RetryReason.CONNECTION, effective_status
 
     # The provider explicitly flagged the failure retryable, but neither its
@@ -260,6 +312,23 @@ def classify_retryable_error(
         return RetryReason.CONNECTION, effective_status
 
     return None, effective_status
+
+
+def _recognized_message_retry_reasons(normalized_error: str) -> tuple[RetryReason, ...]:
+    """Recognize message categories independently of policy eligibility.
+
+    Keep every match: disabling one category must not mask another enabled
+    category or the existing typed-provider fallback.
+    """
+    return tuple(
+        reason
+        for reason, patterns in (
+            (RetryReason.RATE_LIMIT, _RATE_LIMIT_PATTERNS),
+            (RetryReason.TIMEOUT, _TIMEOUT_PATTERNS),
+            (RetryReason.CONNECTION, _CONNECTION_PATTERNS),
+        )
+        if any(pattern in normalized_error for pattern in patterns)
+    )
 
 
 def retry_event_payload(
@@ -273,6 +342,7 @@ def retry_event_payload(
     if type(decision) is not RetryDecision:
         raise TypeError("decision must be a RetryDecision.")
     return {
+        **retry_diagnostic_payload(decision),
         "provider": provider_name,
         "model": model,
         "step": step,
@@ -284,6 +354,16 @@ def retry_event_payload(
         "reason": None if decision.reason is None else decision.reason.value,
         "status_code": decision.status_code,
         "error": error,
+    }
+
+
+def retry_diagnostic_payload(decision: RetryDecision) -> dict[str, Any]:
+    """Content-free decision evidence shared by error, retry, and discard events."""
+    return {
+        "retry": decision.retry,
+        "retry_disposition": decision.disposition.value,
+        "retry_suppression": None if decision.suppression is None else decision.suppression.value,
+        "provider_retryable": decision.provider_retryable,
     }
 
 

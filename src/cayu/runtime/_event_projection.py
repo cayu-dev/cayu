@@ -2178,6 +2178,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "error",
         "error_code",
         "error_type",
+        "retry",
+        "retry_disposition",
+        "retry_suppression",
+        "provider_retryable",
         "effective_max_attempts",
         "max_attempts",
         "model",
@@ -2230,6 +2234,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.MODEL_ATTEMPT_DISCARDED] = _policy(
         "attempt",
+        "retry",
+        "retry_disposition",
+        "retry_suppression",
+        "provider_retryable",
         "effective_max_attempts",
         "max_attempts",
         "model",

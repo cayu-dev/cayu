@@ -13777,3 +13777,37 @@ fresh terminal lineage without dispatching workflows, tools, providers, or judge
 See [workflow capture and saved-attempt recovery](workflow-eval-recovery.md) for
 policy identities, bounds, diagnostic semantics, immutable capture/score revisions,
 and the explicit historical limits of importing pre-anchor reports.
+
+### Model retry decision evidence
+
+`RetryDecision.disposition` explains both retry and terminal outcomes. Model
+error, retry, and discarded-attempt events expose the same content-free fields:
+`retry`, `retry_disposition`, `retry_suppression`, and `provider_retryable`, together
+with `attempt`, configured `max_attempts`, and `effective_max_attempts`. The
+existing `reason` remains the transient classification; it can be absent for a
+terminal decision. `provider_retryable` preserves `null`, `false`, and `true`.
+
+Dispositions distinguish `retry_scheduled`, `explicit_nonretryable`,
+`permanent_provider_error`, `policy_disallowed`, `unknown_provider_attempt_cap`,
+`configured_attempt_exhaustion`, `suppressed`, and `classification_unavailable`.
+The last value is a diagnostic limitation, never evidence of a permanent upstream
+failure. Unknown-provider exhaustion uses the configured-exhaustion disposition
+when the general ceiling is the binding limit.
+
+Suppression identifies existing runtime authority: `completion_observed`,
+`provider_operation`, `provider_effect_observed`, `deadline`, `cancellation`, or
+`automatic_retry_disabled`. The last value
+reports the runtime flag when a more specific authority is unavailable. Deadline
+records retain the existing `provider_recovery_disposition` and effect-outcome
+fields; they do not authorize redispatch. Cancellation remains the authoritative
+session interruption boundary, including cancellation during retry backoff: a
+recorded retry decision is permission under the attempt policy, not proof that a
+subsequent dispatch occurred. Inspect subsequent `model.started` evidence.
+
+These additive fields survive event projection and session-store readback and
+appear in model error/retry log summaries. Existing safe provider status, code,
+type, request ID, and model step/attempt correlation fields retain their redaction
+rules. No response body or upstream message is needed to explain suppression.
+Old records without these fields remain unknown; no historical classification is
+inferred. The diagnostic fields do not increase budgets or override completion,
+operation, deadline, or cancellation authority.
