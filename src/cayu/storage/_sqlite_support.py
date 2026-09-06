@@ -945,6 +945,14 @@ _MIGRATIONS_TABLE_DDL = """
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    81: """
+        CREATE TABLE IF NOT EXISTS cayu_event_watcher_settlements (
+            watcher_name TEXT NOT NULL,
+            claim_id TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            PRIMARY KEY (watcher_name, claim_id)
+        );
+    """,
     2: """
         CREATE TABLE IF NOT EXISTS cayu_session_labels (
             session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,

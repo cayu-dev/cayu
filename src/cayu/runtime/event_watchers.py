@@ -7,10 +7,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
+from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     require_durable_nonblank,
@@ -31,6 +33,8 @@ class EventWatcherDeliveryStatus(StrEnum):
     FAILED = "failed"
     DEAD_LETTERED = "dead_lettered"
     LEASED = "leased"
+    LEASE_LOST = "lease_lost"
+    PUBLICATION_FAILED = "publication_failed"
 
 
 class EventWatcherState(BaseModel):
@@ -210,6 +214,7 @@ class EventWatcherRunResult(BaseModel):
     watcher_name: str
     deliveries: list[EventWatcherDelivery] = Field(default_factory=list)
     blocked_by_active_lease: bool = False
+    error: str | None = None
 
     @field_validator("watcher_name")
     @classmethod
@@ -246,11 +251,24 @@ class EventWatcherStore(ABC):
         watcher_name: str,
         record: EventRecord,
         lease_seconds: float,
-    ) -> EventWatcherClaim | None:
+        max_attempts: int = 3,
+    ) -> EventWatcherClaim | EventWatcherDelivery | None:
         """Claim one event for at-least-once processing.
 
-        Returns ``None`` when another live claim still owns the watcher.
+        Returns ``None`` when another live claim owns the watcher or the cursor
+        already passed the event. Returns a dead-letter delivery when reclaim
+        exhausts the maximum; no handler may run for that result.
         """
+
+    async def renew_claim(
+        self, claim: EventWatcherClaim, *, lease_seconds: float
+    ) -> EventWatcherClaim:
+        """Renew a live exact claim under authoritative store time.
+
+        Custom stores must implement this before Runtime dispatches a handler.
+        Expired or replaced claims raise EventWatcherLeaseLost.
+        """
+        raise NotImplementedError("Event watcher lease renewal is required by this store contract.")
 
     @abstractmethod
     async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
@@ -297,6 +315,206 @@ class EventWatcherStore(ABC):
         raise NotImplementedError("Event watcher dead letters are not supported by this store.")
 
 
+class EventWatcherLeaseLost(ValueError):
+    """The store can no longer authorize this watcher delivery claim."""
+
+
+class EventWatcherSettlement(BaseModel):
+    """Immutable receipt for one exact handler acknowledgement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim: EventWatcherClaim
+    operation: Literal["success", "failure"]
+    error: str | None = None
+    max_attempts: StrictInt | None = None
+    delivery: EventWatcherDelivery
+
+
+def replay_event_watcher_settlement(
+    receipt: EventWatcherSettlement,
+    claim: EventWatcherClaim,
+    *,
+    error: str | None,
+    max_attempts: int | None,
+) -> EventWatcherDelivery:
+    if (
+        receipt.claim.model_dump(exclude={"lease_expires_at"})
+        != claim.model_dump(exclude={"lease_expires_at"})
+        or receipt.operation != ("success" if error is None else "failure")
+        or receipt.error != error
+        or receipt.max_attempts != max_attempts
+    ):
+        raise EventWatcherLeaseLost("Watcher acknowledgement conflicts with its durable receipt.")
+    return receipt.delivery.model_copy(deep=True)
+
+
+@dataclass(frozen=True)
+class EventWatcherTransition:
+    state: EventWatcherState
+    outcome: EventWatcherClaim | EventWatcherDelivery | None
+    dead_letter: EventWatcherDeadLetter | None = None
+
+
+def claim_event_watcher_transition(
+    state: EventWatcherState,
+    record: EventRecord,
+    *,
+    now: datetime,
+    lease_seconds: float,
+    max_attempts: int,
+) -> EventWatcherTransition:
+    """Apply admission/exhaustion under the adapter's transaction and clock."""
+
+    max_attempts = _validate_max_attempts(max_attempts)
+    lease_seconds = require_positive_timedelta_seconds(
+        lease_seconds, "lease_seconds", relative_to=now
+    )
+    if state.cursor_sequence >= record.sequence:
+        return EventWatcherTransition(state, None)
+    if (
+        state.delivery_status is EventWatcherDeliveryStatus.LEASED
+        and state.lease_expires_at is not None
+        and state.lease_expires_at > now
+    ):
+        return EventWatcherTransition(state, None)
+    pending = state.pending_event_id is not None
+    if pending and (
+        state.pending_event_id != record.event.id or state.pending_event_sequence != record.sequence
+    ):
+        raise EventWatcherLeaseLost("An earlier pending watcher event must settle first.")
+    if pending and state.pending_attempt >= max_attempts:
+        exhausted = EventWatcherClaim(
+            watcher_name=state.watcher_name,
+            event_id=record.event.id,
+            event_sequence=record.sequence,
+            attempt=state.pending_attempt,
+            claim_id=state.pending_claim_id or str(uuid4()),
+            lease_expires_at=state.lease_expires_at or now,
+        )
+        error = "Event watcher attempt limit exhausted before durable handler acknowledgement."
+        updated = _terminal_watcher_state(
+            state,
+            exhausted,
+            status=EventWatcherDeliveryStatus.DEAD_LETTERED,
+            error=error,
+            now=now,
+        )
+        return EventWatcherTransition(
+            updated,
+            _delivery_from_claim(
+                exhausted,
+                status=EventWatcherDeliveryStatus.DEAD_LETTERED,
+                cursor_sequence=updated.cursor_sequence,
+                error=error,
+            ),
+            _dead_letter_from_claim(exhausted, error=error, now=now),
+        )
+    claim = EventWatcherClaim(
+        watcher_name=state.watcher_name,
+        event_id=record.event.id,
+        event_sequence=record.sequence,
+        attempt=state.pending_attempt + 1 if pending else 1,
+        lease_expires_at=now + timedelta(seconds=lease_seconds),
+    )
+    return EventWatcherTransition(
+        state.model_copy(
+            update={
+                "pending_event_id": claim.event_id,
+                "pending_event_sequence": claim.event_sequence,
+                "pending_attempt": claim.attempt,
+                "pending_claim_id": claim.claim_id,
+                "delivery_status": EventWatcherDeliveryStatus.LEASED,
+                "lease_expires_at": claim.lease_expires_at,
+                "last_error": None,
+                "updated_at": now,
+            },
+            deep=True,
+        ),
+        claim,
+    )
+
+
+def renew_event_watcher_transition(
+    state: EventWatcherState, claim: EventWatcherClaim, *, now: datetime, lease_seconds: float
+) -> EventWatcherTransition:
+    _matching_claim_state(state, claim, now=now)
+    lease_seconds = require_positive_timedelta_seconds(
+        lease_seconds, "lease_seconds", relative_to=now
+    )
+    assert state.lease_expires_at is not None
+    expires = max(state.lease_expires_at, now + timedelta(seconds=lease_seconds))
+    renewed = claim.model_copy(update={"lease_expires_at": expires}, deep=True)
+    return EventWatcherTransition(
+        state.model_copy(update={"lease_expires_at": expires, "updated_at": now}, deep=True),
+        renewed,
+    )
+
+
+def settle_event_watcher_transition(
+    state: EventWatcherState,
+    claim: EventWatcherClaim,
+    *,
+    now: datetime,
+    error: str | None,
+    max_attempts: int | None,
+) -> EventWatcherTransition:
+    _matching_claim_state(state, claim, now=now)
+    dead_letter = None
+    if error is None:
+        status = EventWatcherDeliveryStatus.SUCCEEDED
+        updated = _terminal_watcher_state(state, claim, status=status, error=None, now=now)
+    elif claim.attempt >= _validate_max_attempts(max_attempts):
+        status = EventWatcherDeliveryStatus.DEAD_LETTERED
+        updated = _terminal_watcher_state(state, claim, status=status, error=error, now=now)
+        dead_letter = _dead_letter_from_claim(claim, error=error, now=now)
+    else:
+        status = EventWatcherDeliveryStatus.FAILED
+        updated = state.model_copy(
+            update={
+                "delivery_status": status,
+                "pending_claim_id": None,
+                "lease_expires_at": None,
+                "last_error": error,
+                "updated_at": now,
+            },
+            deep=True,
+        )
+    return EventWatcherTransition(
+        updated,
+        _delivery_from_claim(
+            claim, status=status, cursor_sequence=updated.cursor_sequence, error=error
+        ),
+        dead_letter,
+    )
+
+
+def _terminal_watcher_state(
+    state: EventWatcherState,
+    claim: EventWatcherClaim,
+    *,
+    status: EventWatcherDeliveryStatus,
+    error: str | None,
+    now: datetime,
+) -> EventWatcherState:
+    return state.model_copy(
+        update={
+            "cursor_sequence": claim.event_sequence,
+            "pending_event_id": None,
+            "pending_event_sequence": None,
+            "pending_attempt": 0,
+            "pending_claim_id": None,
+            "delivery_status": status,
+            "lease_expires_at": None,
+            "last_error": error,
+            "dead_lettered_count": state.dead_lettered_count
+            + int(status is EventWatcherDeliveryStatus.DEAD_LETTERED),
+            "updated_at": now,
+        },
+        deep=True,
+    )
+
+
 class InMemoryEventWatcherStore(EventWatcherStore):
     """In-process watcher state for tests, examples, and single-process apps."""
 
@@ -305,6 +523,7 @@ class InMemoryEventWatcherStore(EventWatcherStore):
         self._states: dict[str, EventWatcherState] = {}
         self._dead_letters: dict[str, dict[int, EventWatcherDeadLetter]] = {}
         self._clock = _clock_or_utc_now(clock)
+        self._settlements: dict[tuple[str, str], EventWatcherSettlement] = {}
 
     async def load_state(self, watcher_name: str) -> EventWatcherState:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
@@ -320,82 +539,48 @@ class InMemoryEventWatcherStore(EventWatcherStore):
         watcher_name: str,
         record: EventRecord,
         lease_seconds: float,
-    ) -> EventWatcherClaim | None:
+        max_attempts: int = 3,
+    ) -> EventWatcherClaim | EventWatcherDelivery | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
         record = copy_event_watcher_record(record)
-        now = self._clock()
-        lease_seconds = require_positive_timedelta_seconds(
-            lease_seconds,
-            "lease_seconds",
-            relative_to=now,
-        )
+        max_attempts = _validate_max_attempts(max_attempts)
         async with self._lock:
+            now = self._clock()
             state = self._states.get(watcher_name)
             if state is None:
                 state = EventWatcherState(watcher_name=watcher_name, updated_at=now)
-            if state.cursor_sequence >= record.sequence:
-                self._states[watcher_name] = state
-                return None
-            if (
-                state.delivery_status is EventWatcherDeliveryStatus.LEASED
-                and state.lease_expires_at is not None
-                and state.lease_expires_at > now
-            ):
-                return None
+            now = max(now, state.updated_at)
+            transition = claim_event_watcher_transition(
+                state,
+                record,
+                now=now,
+                lease_seconds=lease_seconds,
+                max_attempts=max_attempts,
+            )
+            self._states[watcher_name] = transition.state
+            if transition.dead_letter is not None:
+                self._dead_letters.setdefault(watcher_name, {})[record.sequence] = (
+                    transition.dead_letter
+                )
+            return transition.outcome
 
-            attempt = (
-                state.pending_attempt + 1
-                if state.pending_event_id == record.event.id
-                and state.pending_event_sequence == record.sequence
-                else 1
+    async def renew_claim(
+        self, claim: EventWatcherClaim, *, lease_seconds: float
+    ) -> EventWatcherClaim:
+        claim = copy_event_watcher_claim(claim)
+        async with self._lock:
+            state = self._states.get(claim.watcher_name)
+            if state is None:
+                raise EventWatcherLeaseLost("Watcher claim not found.")
+            transition = renew_event_watcher_transition(
+                state, claim, now=max(self._clock(), state.updated_at), lease_seconds=lease_seconds
             )
-            claim = EventWatcherClaim(
-                watcher_name=watcher_name,
-                event_id=record.event.id,
-                event_sequence=record.sequence,
-                attempt=attempt,
-                lease_expires_at=now + timedelta(seconds=lease_seconds),
-            )
-            self._states[watcher_name] = state.model_copy(
-                update={
-                    "pending_event_id": claim.event_id,
-                    "pending_event_sequence": claim.event_sequence,
-                    "pending_attempt": claim.attempt,
-                    "pending_claim_id": claim.claim_id,
-                    "delivery_status": EventWatcherDeliveryStatus.LEASED,
-                    "lease_expires_at": claim.lease_expires_at,
-                    "last_error": None,
-                    "updated_at": now,
-                },
-                deep=True,
-            )
-            return claim.model_copy(deep=True)
+            self._states[claim.watcher_name] = transition.state
+            assert isinstance(transition.outcome, EventWatcherClaim)
+            return transition.outcome
 
     async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
-        claim = copy_event_watcher_claim(claim)
-        now = self._clock()
-        async with self._lock:
-            state = _matching_claim_state(self._states.get(claim.watcher_name), claim)
-            updated = state.model_copy(
-                update={
-                    "cursor_sequence": claim.event_sequence,
-                    "pending_event_id": None,
-                    "pending_event_sequence": None,
-                    "pending_attempt": 0,
-                    "pending_claim_id": None,
-                    "delivery_status": EventWatcherDeliveryStatus.SUCCEEDED,
-                    "lease_expires_at": None,
-                    "last_error": None,
-                    "updated_at": now,
-                },
-                deep=True,
-            )
-            self._states[claim.watcher_name] = updated
-            return _delivery_from_claim(
-                claim,
-                status=EventWatcherDeliveryStatus.SUCCEEDED,
-                cursor_sequence=updated.cursor_sequence,
-            )
+        return await self._settle(claim, error=None, max_attempts=None)
 
     async def mark_failure(
         self,
@@ -404,52 +589,50 @@ class InMemoryEventWatcherStore(EventWatcherStore):
         error: str,
         max_attempts: int,
     ) -> EventWatcherDelivery:
+        return await self._settle(
+            claim, error=_clean_error(error), max_attempts=_validate_max_attempts(max_attempts)
+        )
+
+    async def _settle(
+        self,
+        claim: EventWatcherClaim,
+        *,
+        error: str | None,
+        max_attempts: int | None,
+    ) -> EventWatcherDelivery:
         claim = copy_event_watcher_claim(claim)
-        error = _clean_error(error)
-        max_attempts = _validate_max_attempts(max_attempts)
-        now = self._clock()
+        key = (claim.watcher_name, claim.claim_id)
         async with self._lock:
-            state = _matching_claim_state(self._states.get(claim.watcher_name), claim)
-            if claim.attempt >= max_attempts:
-                updated = state.model_copy(
-                    update={
-                        "cursor_sequence": claim.event_sequence,
-                        "pending_event_id": None,
-                        "pending_event_sequence": None,
-                        "pending_attempt": 0,
-                        "pending_claim_id": None,
-                        "delivery_status": EventWatcherDeliveryStatus.DEAD_LETTERED,
-                        "lease_expires_at": None,
-                        "last_error": error,
-                        "dead_lettered_count": state.dead_lettered_count + 1,
-                        "updated_at": now,
-                    },
-                    deep=True,
+            receipt = self._settlements.get(key)
+            if receipt is not None:
+                return replay_event_watcher_settlement(
+                    receipt, claim, error=error, max_attempts=max_attempts
                 )
-                status = EventWatcherDeliveryStatus.DEAD_LETTERED
-                dead_letter = _dead_letter_from_claim(claim, error=error, now=now)
-                self._dead_letters.setdefault(claim.watcher_name, {})[
-                    dead_letter.event_sequence
-                ] = dead_letter
-            else:
-                updated = state.model_copy(
-                    update={
-                        "delivery_status": EventWatcherDeliveryStatus.FAILED,
-                        "pending_claim_id": None,
-                        "lease_expires_at": None,
-                        "last_error": error,
-                        "updated_at": now,
-                    },
-                    deep=True,
-                )
-                status = EventWatcherDeliveryStatus.FAILED
-            self._states[claim.watcher_name] = updated
-            return _delivery_from_claim(
+            state = self._states.get(claim.watcher_name)
+            if state is None:
+                raise EventWatcherLeaseLost("Watcher claim not found.")
+            transition = settle_event_watcher_transition(
+                state,
                 claim,
-                status=status,
-                cursor_sequence=updated.cursor_sequence,
+                now=max(self._clock(), state.updated_at),
                 error=error,
+                max_attempts=max_attempts,
             )
+            assert isinstance(transition.outcome, EventWatcherDelivery)
+            receipt = EventWatcherSettlement(
+                claim=claim,
+                operation="success" if error is None else "failure",
+                error=error,
+                max_attempts=max_attempts,
+                delivery=transition.outcome,
+            )
+            self._states[claim.watcher_name] = transition.state
+            if transition.dead_letter is not None:
+                self._dead_letters.setdefault(claim.watcher_name, {})[claim.event_sequence] = (
+                    transition.dead_letter
+                )
+            self._settlements[key] = receipt
+            return transition.outcome.model_copy(deep=True)
 
     async def list_dead_letters(
         self,
@@ -496,7 +679,18 @@ async def run_event_watcher_handler(
     watcher: EventWatcher,
     context: EventWatcherContext,
 ) -> None:
-    result = watcher.handler(context)
+    if inspect.iscoroutinefunction(watcher.handler) or inspect.iscoroutinefunction(
+        type(watcher.handler).__call__
+    ):
+        result = watcher.handler(context)
+    else:
+        work = asyncio.create_task(asyncio.to_thread(watcher.handler, context))
+        outcome = await await_shielded_task_outcome(work)
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
+        if outcome.error is not None:
+            raise outcome.error
+        result = outcome.result
     if inspect.isawaitable(result):
         await result
 
@@ -568,17 +762,25 @@ def event_watcher_error_payload(
 def _matching_claim_state(
     state: EventWatcherState | None,
     claim: EventWatcherClaim,
+    *,
+    now: datetime,
 ) -> EventWatcherState:
     if state is None:
-        raise ValueError(f"Watcher claim not found: {claim.watcher_name}")
+        raise EventWatcherLeaseLost(f"Watcher claim not found: {claim.watcher_name}")
     if state.pending_claim_id != claim.claim_id:
-        raise ValueError("Watcher claim is no longer active.")
+        raise EventWatcherLeaseLost("Watcher claim is no longer active.")
     if state.pending_event_id != claim.event_id:
-        raise ValueError("Watcher claim event_id does not match active claim.")
+        raise EventWatcherLeaseLost("Watcher claim event_id does not match active claim.")
     if state.pending_event_sequence != claim.event_sequence:
-        raise ValueError("Watcher claim sequence does not match active claim.")
+        raise EventWatcherLeaseLost("Watcher claim sequence does not match active claim.")
     if state.pending_attempt != claim.attempt:
-        raise ValueError("Watcher claim attempt does not match active claim.")
+        raise EventWatcherLeaseLost("Watcher claim attempt does not match active claim.")
+    if (
+        state.delivery_status is not EventWatcherDeliveryStatus.LEASED
+        or state.lease_expires_at is None
+        or state.lease_expires_at <= now
+    ):
+        raise EventWatcherLeaseLost("Watcher claim lease has expired.")
     return state
 
 
@@ -645,11 +847,18 @@ def _clock_or_utc_now(clock: Callable[[], datetime] | None) -> Callable[[], date
     return wrapped
 
 
-def _validate_max_attempts(value: int) -> int:
+def _validate_max_attempts(value: int | None) -> int:
     if type(value) is not int or value < 1:
         raise ValueError("max_attempts must be an integer greater than or equal to 1.")
     return value
 
 
 def _clean_error(value: str) -> str:
-    return require_durable_nonblank(value, "error")
+    value = require_durable_nonblank(value, "error")
+    encoded = value.encode("utf-8")
+    if len(encoded) <= 4096:
+        return value
+    return (
+        encoded[:4096].decode("utf-8", errors="ignore").strip()
+        or "Event watcher diagnostic truncated."
+    )

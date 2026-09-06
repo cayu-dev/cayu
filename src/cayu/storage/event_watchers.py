@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from cayu._validation import (
@@ -12,24 +12,34 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_nonblank,
     require_nonblank,
-    require_positive_timedelta_seconds,
 )
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
     EventWatcherDeadLetter,
     EventWatcherDelivery,
     EventWatcherDeliveryStatus,
+    EventWatcherSettlement,
     EventWatcherState,
     EventWatcherStore,
+    claim_event_watcher_transition,
     copy_event_watcher_claim,
     copy_event_watcher_record,
+    renew_event_watcher_transition,
+    replay_event_watcher_settlement,
+    settle_event_watcher_transition,
+)
+from cayu.runtime.event_watchers import (
+    _clean_error as clean_watcher_error,
+)
+from cayu.runtime.event_watchers import (
+    _validate_max_attempts as validate_watcher_max_attempts,
 )
 from cayu.runtime.sessions import EventRecord
 from cayu.storage import migrations as schema
 
 from . import _sqlite_support as sqlite_support
 
-_SQLITE_MIN_REQUIRED_REVISION = 18
+_SQLITE_MIN_REQUIRED_REVISION = 81
 
 
 class SQLiteEventWatcherStore(EventWatcherStore):
@@ -59,6 +69,22 @@ class SQLiteEventWatcherStore(EventWatcherStore):
             schema_mode,
             app_min_supported=_SQLITE_MIN_REQUIRED_REVISION,
         )
+        # Retry writer contention cooperatively so Runtime deadlines and other
+        # lease heartbeats can run while this connection waits for authority.
+        self._connection.execute("PRAGMA busy_timeout = 0")
+
+    async def _begin_immediate(self) -> None:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while True:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as error:
+                code = getattr(error, "sqlite_errorcode", None)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if type(code) is not int or code & 0xFF != sqlite3.SQLITE_BUSY or remaining <= 0:
+                    raise
+                await asyncio.sleep(min(0.01, remaining))
 
     async def load_state(self, watcher_name: str) -> EventWatcherState:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
@@ -81,95 +107,56 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         watcher_name: str,
         record: EventRecord,
         lease_seconds: float,
-    ) -> EventWatcherClaim | None:
+        max_attempts: int = 3,
+    ) -> EventWatcherClaim | EventWatcherDelivery | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
         record = copy_event_watcher_record(record)
-        now = self._clock()
-        lease_seconds = require_positive_timedelta_seconds(
-            lease_seconds,
-            "lease_seconds",
-            relative_to=now,
-        )
+        max_attempts = validate_watcher_max_attempts(max_attempts)
         async with self._lock:
             try:
-                self._connection.execute("BEGIN IMMEDIATE")
+                await self._begin_immediate()
                 state = self._load_state_unlocked(watcher_name)
-                if state.cursor_sequence >= record.sequence:
-                    self._connection.commit()
-                    return None
-                if (
-                    state.delivery_status is EventWatcherDeliveryStatus.LEASED
-                    and state.lease_expires_at is not None
-                    and state.lease_expires_at > now
-                ):
-                    self._connection.commit()
-                    return None
-
-                attempt = (
-                    state.pending_attempt + 1
-                    if state.pending_event_id == record.event.id
-                    and state.pending_event_sequence == record.sequence
-                    else 1
+                now = max(self._clock(), state.updated_at)
+                transition = claim_event_watcher_transition(
+                    state,
+                    record,
+                    now=now,
+                    lease_seconds=lease_seconds,
+                    max_attempts=max_attempts,
                 )
-                claim = EventWatcherClaim(
-                    watcher_name=watcher_name,
-                    event_id=record.event.id,
-                    event_sequence=record.sequence,
-                    attempt=attempt,
-                    lease_expires_at=now + timedelta(seconds=lease_seconds),
-                )
-                self._upsert_state_unlocked(
-                    state.model_copy(
-                        update={
-                            "pending_event_id": claim.event_id,
-                            "pending_event_sequence": claim.event_sequence,
-                            "pending_attempt": claim.attempt,
-                            "pending_claim_id": claim.claim_id,
-                            "delivery_status": EventWatcherDeliveryStatus.LEASED,
-                            "lease_expires_at": claim.lease_expires_at,
-                            "last_error": None,
-                            "updated_at": now,
-                        },
-                        deep=True,
-                    )
-                )
+                self._upsert_state_unlocked(transition.state)
+                if transition.dead_letter is not None:
+                    self._insert_dead_letter_unlocked(transition.dead_letter)
                 self._connection.commit()
-                return claim
-            except Exception:
+                return transition.outcome
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def renew_claim(
+        self, claim: EventWatcherClaim, *, lease_seconds: float
+    ) -> EventWatcherClaim:
+        claim = copy_event_watcher_claim(claim)
+        async with self._lock:
+            try:
+                await self._begin_immediate()
+                state = self._load_state_unlocked(claim.watcher_name)
+                transition = renew_event_watcher_transition(
+                    state,
+                    claim,
+                    now=max(self._clock(), state.updated_at),
+                    lease_seconds=lease_seconds,
+                )
+                self._upsert_state_unlocked(transition.state)
+                self._connection.commit()
+                assert isinstance(transition.outcome, EventWatcherClaim)
+                return transition.outcome
+            except BaseException:
                 self._connection.rollback()
                 raise
 
     async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
-        claim = copy_event_watcher_claim(claim)
-        now = self._clock()
-        async with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
-                state = self._matching_state_unlocked(claim)
-                updated = state.model_copy(
-                    update={
-                        "cursor_sequence": claim.event_sequence,
-                        "pending_event_id": None,
-                        "pending_event_sequence": None,
-                        "pending_attempt": 0,
-                        "pending_claim_id": None,
-                        "delivery_status": EventWatcherDeliveryStatus.SUCCEEDED,
-                        "lease_expires_at": None,
-                        "last_error": None,
-                        "updated_at": now,
-                    },
-                    deep=True,
-                )
-                self._upsert_state_unlocked(updated)
-                self._connection.commit()
-                return _delivery_from_claim(
-                    claim,
-                    status=EventWatcherDeliveryStatus.SUCCEEDED,
-                    cursor_sequence=updated.cursor_sequence,
-                )
-            except Exception:
-                self._connection.rollback()
-                raise
+        return await self._settle(claim, error=None, max_attempts=None)
 
     async def mark_failure(
         self,
@@ -178,63 +165,62 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         error: str,
         max_attempts: int,
     ) -> EventWatcherDelivery:
+        return await self._settle(
+            claim,
+            error=clean_watcher_error(error),
+            max_attempts=validate_watcher_max_attempts(max_attempts),
+        )
+
+    async def _settle(
+        self,
+        claim: EventWatcherClaim,
+        *,
+        error: str | None,
+        max_attempts: int | None,
+    ) -> EventWatcherDelivery:
         claim = copy_event_watcher_claim(claim)
-        error = _clean_error(error)
-        if type(max_attempts) is not int or max_attempts < 1:
-            raise ValueError("max_attempts must be an integer greater than or equal to 1.")
-        now = self._clock()
         async with self._lock:
             try:
-                self._connection.execute("BEGIN IMMEDIATE")
-                state = self._matching_state_unlocked(claim)
-                if claim.attempt >= max_attempts:
-                    updated = state.model_copy(
-                        update={
-                            "cursor_sequence": claim.event_sequence,
-                            "pending_event_id": None,
-                            "pending_event_sequence": None,
-                            "pending_attempt": 0,
-                            "pending_claim_id": None,
-                            "delivery_status": EventWatcherDeliveryStatus.DEAD_LETTERED,
-                            "lease_expires_at": None,
-                            "last_error": error,
-                            "dead_lettered_count": state.dead_lettered_count + 1,
-                            "updated_at": now,
-                        },
-                        deep=True,
+                await self._begin_immediate()
+                row = self._connection.execute(
+                    "SELECT receipt_json FROM cayu_event_watcher_settlements WHERE watcher_name = ? AND claim_id = ?",
+                    (claim.watcher_name, claim.claim_id),
+                ).fetchone()
+                if row is not None:
+                    result = replay_event_watcher_settlement(
+                        EventWatcherSettlement.model_validate_json(row["receipt_json"]),
+                        claim,
+                        error=error,
+                        max_attempts=max_attempts,
                     )
-                    status = EventWatcherDeliveryStatus.DEAD_LETTERED
-                    self._insert_dead_letter_unlocked(
-                        EventWatcherDeadLetter(
-                            watcher_name=claim.watcher_name,
-                            event_id=claim.event_id,
-                            event_sequence=claim.event_sequence,
-                            attempts=claim.attempt,
-                            error=error,
-                            dead_lettered_at=now,
-                        )
-                    )
-                else:
-                    updated = state.model_copy(
-                        update={
-                            "delivery_status": EventWatcherDeliveryStatus.FAILED,
-                            "pending_claim_id": None,
-                            "lease_expires_at": None,
-                            "last_error": error,
-                            "updated_at": now,
-                        },
-                        deep=True,
-                    )
-                    status = EventWatcherDeliveryStatus.FAILED
-                self._upsert_state_unlocked(updated)
-                self._connection.commit()
-                return _delivery_from_claim(
+                    self._connection.commit()
+                    return result
+                state = self._load_state_unlocked(claim.watcher_name)
+                transition = settle_event_watcher_transition(
+                    state,
                     claim,
-                    status=status,
-                    cursor_sequence=updated.cursor_sequence,
+                    now=max(self._clock(), state.updated_at),
                     error=error,
+                    max_attempts=max_attempts,
                 )
-            except Exception:
+                assert isinstance(transition.outcome, EventWatcherDelivery)
+                receipt = EventWatcherSettlement(
+                    claim=claim,
+                    operation="success" if error is None else "failure",
+                    error=error,
+                    max_attempts=max_attempts,
+                    delivery=transition.outcome,
+                )
+                self._upsert_state_unlocked(transition.state)
+                if transition.dead_letter is not None:
+                    self._insert_dead_letter_unlocked(transition.dead_letter)
+                self._connection.execute(
+                    "INSERT INTO cayu_event_watcher_settlements (watcher_name, claim_id, receipt_json) VALUES (?, ?, ?)",
+                    (claim.watcher_name, claim.claim_id, receipt.model_dump_json()),
+                )
+                self._connection.commit()
+                return transition.outcome
+            except BaseException:
                 self._connection.rollback()
                 raise
 
@@ -279,7 +265,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         now = self._clock()
         async with self._lock:
             try:
-                self._connection.execute("BEGIN IMMEDIATE")
+                await self._begin_immediate()
                 row = self._connection.execute(
                     """
                     SELECT
@@ -318,7 +304,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
                     record = record.model_copy(update={"resolved_at": resolved_at}, deep=True)
                 self._connection.commit()
                 return record
-            except Exception:
+            except BaseException:
                 self._connection.rollback()
                 raise
 
@@ -366,18 +352,6 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         if row is None:
             return EventWatcherState(watcher_name=watcher_name, updated_at=self._clock())
         return _state_from_row(row)
-
-    def _matching_state_unlocked(self, claim: EventWatcherClaim) -> EventWatcherState:
-        state = self._load_state_unlocked(claim.watcher_name)
-        if state.pending_claim_id != claim.claim_id:
-            raise ValueError("Watcher claim is no longer active.")
-        if state.pending_event_id != claim.event_id:
-            raise ValueError("Watcher claim event_id does not match active claim.")
-        if state.pending_event_sequence != claim.event_sequence:
-            raise ValueError("Watcher claim sequence does not match active claim.")
-        if state.pending_attempt != claim.attempt:
-            raise ValueError("Watcher claim attempt does not match active claim.")
-        return state
 
     def _upsert_state_unlocked(self, state: EventWatcherState) -> None:
         self._connection.execute(

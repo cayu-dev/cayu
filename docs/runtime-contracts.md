@@ -6125,7 +6125,43 @@ must be idempotent. Use a stable idempotency key such as
 `(watcher_name, context.record.event.id)` when calling external systems; that
 ID is the stable public global-sequence alias, not the private store identity.
 
-`EventWatcher.lease_seconds` and every built-in `EventWatcherStore.claim_event(...)`
+Claim/reclaim receives `max_attempts`. Under the same store lock/transaction it
+dead-letters an exhausted pending event and advances its cursor without another
+handler invocation, including when every previous worker died before publishing
+failure. A pending nonterminal event prevents admission of later events.
+
+Runtime renews the claim before invoking a handler and throughout execution using
+the shared durable-worker heartbeat. `renew_claim` preserves claim identity and
+uses store-authoritative time sampled after locking (Postgres uses database
+`clock_timestamp()`). Renewal and terminal publication reject expired or replaced
+claims with `EventWatcherLeaseLost`. Exact success/failure publication replays
+return their original receipt, even after later events advance the cursor;
+contradictory or stale publication cannot mutate delivery state. SQL revision 81
+adds durable settlement receipts and excludes older watcher writers. Existing
+cursors and pending attempts survive migration; historical receipts are not inferred.
+
+Renewal loss returns `lease_lost`; an unconfirmed terminal publication returns
+`publication_failed`. Discovery/admission failures populate `EventWatcherRunResult.error`.
+These outcomes stop that watcher's batch while unrelated registrations continue.
+Store waits are bounded; errors exposed or persisted by Runtime are redacted and
+limited to 4096 UTF-8 bytes. Dead letters require explicit application replay;
+resolving a dead letter does not rewind a cursor.
+SQLite watcher transactions retry writer contention cooperatively for up to five
+seconds; Runtime's shorter lease deadlines and caller cancellation can interrupt
+that wait without blocking unrelated heartbeats.
+
+Handlers must cooperate with cancellation and use external idempotency keys.
+Synchronous handlers run in a thread; caller cancellation retains lease renewal
+until the callback actually finishes. A handler that ignores cancellation remains
+locally registered until cleanup finishes. Lease loss or process death can still
+leave external effects running after takeover; store fencing protects durable
+publication, not arbitrary external side effects.
+
+Custom stores must implement atomic max-attempt admission, `renew_claim`, fenced
+settlement, and exact replay receipts with the same semantics. Missing renewal
+support fails before Runtime invokes the handler.
+
+`EventWatcher.lease_seconds` and every built-in claim/renew operation
 implementation accept only finite, positive seconds that remain a positive
 `datetime.timedelta` and produce a representable expiry relative to the claim clock.
 NaN, infinities, non-positive values, sub-microsecond durations that round to zero,

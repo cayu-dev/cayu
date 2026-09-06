@@ -430,6 +430,9 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=79, kind=RevisionKind.BREAKING, compatible_from=79),
     # Optional closed eval failure diagnostics; historical failures remain valid.
     Revision(revision=80, kind=RevisionKind.ADDITIVE, compatible_from=79),
+    # Watcher acknowledgements now use immutable claim receipts and lease fences.
+    # Older writers neither enforce expiry nor preserve these settlements.
+    Revision(revision=81, kind=RevisionKind.BREAKING, compatible_from=81),
 )
 
 #: The revision an empty database is initialized to.

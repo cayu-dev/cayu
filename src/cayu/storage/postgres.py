@@ -61,7 +61,6 @@ from cayu._validation import (
     copy_label_map,
     require_durable_nonblank,
     require_nonblank,
-    require_positive_timedelta_seconds,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -163,10 +162,21 @@ from cayu.runtime.event_watchers import (
     EventWatcherDeadLetter,
     EventWatcherDelivery,
     EventWatcherDeliveryStatus,
+    EventWatcherSettlement,
     EventWatcherState,
     EventWatcherStore,
+    claim_event_watcher_transition,
     copy_event_watcher_claim,
     copy_event_watcher_record,
+    renew_event_watcher_transition,
+    replay_event_watcher_settlement,
+    settle_event_watcher_transition,
+)
+from cayu.runtime.event_watchers import (
+    _clean_error as clean_watcher_error,
+)
+from cayu.runtime.event_watchers import (
+    _validate_max_attempts as validate_watcher_max_attempts,
 )
 from cayu.runtime.evidence_spool import EvidenceSpool
 from cayu.runtime.execution_profiles import (
@@ -1306,6 +1316,16 @@ def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
 # (revision 1) is applied from pg_support.SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    81: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_event_watcher_settlements (
+            watcher_name TEXT NOT NULL,
+            claim_id TEXT NOT NULL,
+            receipt_json JSONB NOT NULL,
+            PRIMARY KEY (watcher_name, claim_id)
+        )
+        """,
+    ),
     2: (
         """
         CREATE TABLE IF NOT EXISTS cayu_session_labels (
@@ -12477,94 +12497,68 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
                 return EventWatcherState(watcher_name=watcher_name)
             return _event_watcher_state_from_row(row)
 
+    _min_required_revision = 81
+
+    @staticmethod
+    async def _watcher_database_now(cur: Any) -> datetime:
+        await cur.execute("SELECT clock_timestamp()")
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL did not return authoritative watcher time.")
+        return pg_support.to_utc(row[0])
+
     async def claim_event(
         self,
         *,
         watcher_name: str,
         record: EventRecord,
         lease_seconds: float,
-    ) -> EventWatcherClaim | None:
+        max_attempts: int = 3,
+    ) -> EventWatcherClaim | EventWatcherDelivery | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
         record = copy_event_watcher_record(record)
-        now = datetime.now(UTC)
-        lease_seconds = require_positive_timedelta_seconds(
-            lease_seconds,
-            "lease_seconds",
-            relative_to=now,
-        )
+        max_attempts = validate_watcher_max_attempts(max_attempts)
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            state = await self._load_watcher_state_for_update(cur, watcher_name, now=now)
-            if state.cursor_sequence >= record.sequence:
-                await conn.commit()
-                return None
-            if (
-                state.delivery_status is EventWatcherDeliveryStatus.LEASED
-                and state.lease_expires_at is not None
-                and state.lease_expires_at > now
-            ):
-                await conn.commit()
-                return None
-
-            attempt = (
-                state.pending_attempt + 1
-                if state.pending_event_id == record.event.id
-                and state.pending_event_sequence == record.sequence
-                else 1
+            state = await self._load_watcher_state_for_update(
+                cur, watcher_name, now=await self._watcher_database_now(cur)
             )
-            claim = EventWatcherClaim(
-                watcher_name=watcher_name,
-                event_id=record.event.id,
-                event_sequence=record.sequence,
-                attempt=attempt,
-                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            now = max(await self._watcher_database_now(cur), state.updated_at)
+            transition = claim_event_watcher_transition(
+                state,
+                record,
+                now=now,
+                lease_seconds=lease_seconds,
+                max_attempts=max_attempts,
             )
-            await self._upsert_watcher_state(
-                cur,
-                state.model_copy(
-                    update={
-                        "pending_event_id": claim.event_id,
-                        "pending_event_sequence": claim.event_sequence,
-                        "pending_attempt": claim.attempt,
-                        "pending_claim_id": claim.claim_id,
-                        "delivery_status": EventWatcherDeliveryStatus.LEASED,
-                        "lease_expires_at": claim.lease_expires_at,
-                        "last_error": None,
-                        "updated_at": now,
-                    },
-                    deep=True,
-                ),
-            )
+            await self._upsert_watcher_state(cur, transition.state)
+            if transition.dead_letter is not None:
+                await self._insert_dead_letter(cur, transition.dead_letter)
             await conn.commit()
-            return claim
+            return transition.outcome
 
-    async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
+    async def renew_claim(
+        self, claim: EventWatcherClaim, *, lease_seconds: float
+    ) -> EventWatcherClaim:
         claim = copy_event_watcher_claim(claim)
         await self._ensure_ready()
-        now = datetime.now(UTC)
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            state = await self._matching_watcher_state_for_update(cur, claim, now=now)
-            updated = state.model_copy(
-                update={
-                    "cursor_sequence": claim.event_sequence,
-                    "pending_event_id": None,
-                    "pending_event_sequence": None,
-                    "pending_attempt": 0,
-                    "pending_claim_id": None,
-                    "delivery_status": EventWatcherDeliveryStatus.SUCCEEDED,
-                    "lease_expires_at": None,
-                    "last_error": None,
-                    "updated_at": now,
-                },
-                deep=True,
+            state = await self._load_watcher_state_for_update(
+                cur, claim.watcher_name, now=await self._watcher_database_now(cur)
             )
-            await self._upsert_watcher_state(cur, updated)
-            await conn.commit()
-            return _event_watcher_delivery_from_claim(
+            transition = renew_event_watcher_transition(
+                state,
                 claim,
-                status=EventWatcherDeliveryStatus.SUCCEEDED,
-                cursor_sequence=updated.cursor_sequence,
+                now=max(await self._watcher_database_now(cur), state.updated_at),
+                lease_seconds=lease_seconds,
             )
+            await self._upsert_watcher_state(cur, transition.state)
+            await conn.commit()
+            assert isinstance(transition.outcome, EventWatcherClaim)
+            return transition.outcome
+
+    async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
+        return await self._settle_watcher(claim, error=None, max_attempts=None)
 
     async def mark_failure(
         self,
@@ -12573,62 +12567,63 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
         error: str,
         max_attempts: int,
     ) -> EventWatcherDelivery:
+        return await self._settle_watcher(
+            claim,
+            error=clean_watcher_error(error),
+            max_attempts=validate_watcher_max_attempts(max_attempts),
+        )
+
+    async def _settle_watcher(
+        self,
+        claim: EventWatcherClaim,
+        *,
+        error: str | None,
+        max_attempts: int | None,
+    ) -> EventWatcherDelivery:
         claim = copy_event_watcher_claim(claim)
-        error = _clean_error(error)
-        if type(max_attempts) is not int or max_attempts < 1:
-            raise ValueError("max_attempts must be an integer greater than or equal to 1.")
         await self._ensure_ready()
-        now = datetime.now(UTC)
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            state = await self._matching_watcher_state_for_update(cur, claim, now=now)
-            if claim.attempt >= max_attempts:
-                updated = state.model_copy(
-                    update={
-                        "cursor_sequence": claim.event_sequence,
-                        "pending_event_id": None,
-                        "pending_event_sequence": None,
-                        "pending_attempt": 0,
-                        "pending_claim_id": None,
-                        "delivery_status": EventWatcherDeliveryStatus.DEAD_LETTERED,
-                        "lease_expires_at": None,
-                        "last_error": error,
-                        "dead_lettered_count": state.dead_lettered_count + 1,
-                        "updated_at": now,
-                    },
-                    deep=True,
-                )
-                status = EventWatcherDeliveryStatus.DEAD_LETTERED
-                await self._insert_dead_letter(
-                    cur,
-                    EventWatcherDeadLetter(
-                        watcher_name=claim.watcher_name,
-                        event_id=claim.event_id,
-                        event_sequence=claim.event_sequence,
-                        attempts=claim.attempt,
-                        error=error,
-                        dead_lettered_at=now,
-                    ),
-                )
-            else:
-                updated = state.model_copy(
-                    update={
-                        "delivery_status": EventWatcherDeliveryStatus.FAILED,
-                        "pending_claim_id": None,
-                        "lease_expires_at": None,
-                        "last_error": error,
-                        "updated_at": now,
-                    },
-                    deep=True,
-                )
-                status = EventWatcherDeliveryStatus.FAILED
-            await self._upsert_watcher_state(cur, updated)
-            await conn.commit()
-            return _event_watcher_delivery_from_claim(
-                claim,
-                status=status,
-                cursor_sequence=updated.cursor_sequence,
-                error=error,
+            state = await self._load_watcher_state_for_update(
+                cur, claim.watcher_name, now=await self._watcher_database_now(cur)
             )
+            await cur.execute(
+                "SELECT receipt_json FROM cayu_event_watcher_settlements WHERE watcher_name = %s AND claim_id = %s",
+                (claim.watcher_name, claim.claim_id),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                result = replay_event_watcher_settlement(
+                    EventWatcherSettlement.model_validate(row[0]),
+                    claim,
+                    error=error,
+                    max_attempts=max_attempts,
+                )
+                await conn.commit()
+                return result
+            transition = settle_event_watcher_transition(
+                state,
+                claim,
+                now=max(await self._watcher_database_now(cur), state.updated_at),
+                error=error,
+                max_attempts=max_attempts,
+            )
+            assert isinstance(transition.outcome, EventWatcherDelivery)
+            receipt = EventWatcherSettlement(
+                claim=claim,
+                operation="success" if error is None else "failure",
+                error=error,
+                max_attempts=max_attempts,
+                delivery=transition.outcome,
+            )
+            await self._upsert_watcher_state(cur, transition.state)
+            if transition.dead_letter is not None:
+                await self._insert_dead_letter(cur, transition.dead_letter)
+            await cur.execute(
+                "INSERT INTO cayu_event_watcher_settlements (watcher_name, claim_id, receipt_json) VALUES (%s, %s, %s::jsonb)",
+                (claim.watcher_name, claim.claim_id, receipt.model_dump_json()),
+            )
+            await conn.commit()
+            return transition.outcome
 
     async def list_dead_letters(
         self,
@@ -12785,24 +12780,6 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
         if row is None:
             raise RuntimeError(f"Failed to initialize event watcher state: {watcher_name}")
         return _event_watcher_state_from_row(row)
-
-    async def _matching_watcher_state_for_update(
-        self,
-        cur: Any,
-        claim: EventWatcherClaim,
-        *,
-        now: datetime,
-    ) -> EventWatcherState:
-        state = await self._load_watcher_state_for_update(cur, claim.watcher_name, now=now)
-        if state.pending_claim_id != claim.claim_id:
-            raise ValueError("Watcher claim is no longer active.")
-        if state.pending_event_id != claim.event_id:
-            raise ValueError("Watcher claim event_id does not match active claim.")
-        if state.pending_event_sequence != claim.event_sequence:
-            raise ValueError("Watcher claim sequence does not match active claim.")
-        if state.pending_attempt != claim.attempt:
-            raise ValueError("Watcher claim attempt does not match active claim.")
-        return state
 
     async def _upsert_watcher_state(self, cur: Any, state: EventWatcherState) -> None:
         await cur.execute(

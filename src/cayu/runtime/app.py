@@ -132,6 +132,7 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_linkage_sequence,
 )
+from cayu.runtime._event_watcher_delivery import EventWatcherSupervisor
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
@@ -298,7 +299,9 @@ from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.event_watchers import (
     EVENT_WATCHER_QUERY_PAGE_LIMIT,
     EventWatcher,
+    EventWatcherClaim,
     EventWatcherContext,
+    EventWatcherDelivery,
     EventWatcherDeliveryStatus,
     EventWatcherRunResult,
     EventWatcherStore,
@@ -306,7 +309,6 @@ from cayu.runtime.event_watchers import (
     _clock_or_utc_now,
     event_query_after_cursor,
     event_watcher_error_payload,
-    run_event_watcher_handler,
 )
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
@@ -991,6 +993,7 @@ class CayuApp:
             budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
         )
         self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
+        self._event_watcher_supervisor = EventWatcherSupervisor()
         self.event_watcher_store = (
             event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
         )
@@ -6090,89 +6093,106 @@ class CayuApp:
         *,
         limit: int = 100,
     ) -> list[EventWatcherRunResult]:
-        """Process durable event watchers once.
-
-        Watchers run over already-persisted events. Delivery is ordered and
-        at-least-once: a cursor advances only after the handler succeeds or the
-        event reaches the watcher's dead-letter threshold.
-        """
+        """Deliver ordered durable events under renewable, fenced watcher leases."""
         watcher_list = _validate_event_watchers(watchers)
         for watcher in watcher_list:
             if self._secret_redactor.redact_text(watcher.name) != watcher.name:
                 raise ValueError(
-                    "Event watcher name contains a workload secret and cannot be "
-                    "used as durable watcher authority."
+                    "Event watcher name contains a workload secret and cannot be used as durable watcher authority."
                 )
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be an integer greater than or equal to 1.")
-
         remaining = limit
         results: list[EventWatcherRunResult] = []
         for watcher in watcher_list:
-            deliveries = []
+            deliveries: list[EventWatcherDelivery] = []
             blocked_by_active_lease = False
-            processed_for_watcher = 0
-            while remaining > 0 and processed_for_watcher < watcher.batch_size:
-                state = await self.event_watcher_store.load_state(watcher.name)
-                if (
-                    watcher.query.before_sequence is not None
-                    and state.cursor_sequence >= watcher.query.before_sequence
-                ):
-                    break
-                page_limit = min(
-                    remaining,
-                    watcher.batch_size - processed_for_watcher,
-                    EVENT_WATCHER_QUERY_PAGE_LIMIT,
-                )
-                records = await self.session_store.query_events(
-                    event_query_after_cursor(
-                        watcher.query,
-                        state.cursor_sequence,
-                        limit=page_limit,
-                    )
-                )
-                if not records:
-                    break
-
-                should_fetch_next_page = True
-                for record in records:
-                    claim = await self.event_watcher_store.claim_event(
-                        watcher_name=watcher.name,
-                        record=record,
-                        lease_seconds=watcher.lease_seconds,
-                    )
-                    if claim is None:
-                        refreshed_state = await self.event_watcher_store.load_state(watcher.name)
-                        if refreshed_state.cursor_sequence >= record.sequence:
-                            continue
+            watcher_error: str | None = None
+            try:
+                while remaining > 0 and len(deliveries) < watcher.batch_size:
+                    if self._event_watcher_supervisor.active(watcher.name):
                         blocked_by_active_lease = True
-                        should_fetch_next_page = False
                         break
-
-                    watcher_error: str | None = None
-                    try:
-                        await run_event_watcher_handler(
-                            watcher,
-                            EventWatcherContext(
+                    state = await self._event_watcher_supervisor.store_call(
+                        self.event_watcher_store.load_state(watcher.name)
+                    )
+                    if (
+                        watcher.query.before_sequence is not None
+                        and state.cursor_sequence >= watcher.query.before_sequence
+                    ):
+                        break
+                    page_limit = min(
+                        remaining,
+                        watcher.batch_size - len(deliveries),
+                        EVENT_WATCHER_QUERY_PAGE_LIMIT,
+                    )
+                    records = await self._event_watcher_supervisor.store_call(
+                        self.session_store.query_events(
+                            event_query_after_cursor(
+                                watcher.query,
+                                state.cursor_sequence,
+                                limit=page_limit,
+                            )
+                        ),
+                    )
+                    if not records:
+                        break
+                    stop_watcher = False
+                    for record in records:
+                        outcome = await self._event_watcher_supervisor.store_call(
+                            self.event_watcher_store.claim_event(
                                 watcher_name=watcher.name,
-                                record=self._project_persisted_event_record_for_exposure(record),
-                                attempt=claim.attempt,
+                                record=record,
+                                lease_seconds=watcher.lease_seconds,
+                                max_attempts=watcher.max_attempts,
                             ),
                         )
-                    except Exception as exc:
-                        watcher_error = self._secret_redactor.redact_text_bounded(
-                            event_watcher_error_payload(
-                                exc,
+                        if outcome is None:
+                            refreshed = await self._event_watcher_supervisor.store_call(
+                                self.event_watcher_store.load_state(watcher.name),
+                            )
+                            if refreshed.cursor_sequence >= record.sequence:
+                                state = refreshed
+                                continue
+                            blocked_by_active_lease = True
+                            stop_watcher = True
+                            break
+                        if (
+                            outcome.watcher_name != watcher.name
+                            or outcome.event_id != record.event.id
+                            or outcome.event_sequence != record.sequence
+                        ):
+                            raise ValueError("Watcher store returned authority for another event.")
+                        if isinstance(outcome, EventWatcherDelivery):
+                            if (
+                                outcome.status is not EventWatcherDeliveryStatus.DEAD_LETTERED
+                                or outcome.cursor_sequence != record.sequence
+                            ):
+                                raise ValueError(
+                                    "Watcher claim returned a non-dead-letter delivery."
+                                )
+                            delivery = outcome
+                        elif isinstance(outcome, EventWatcherClaim):
+                            if outcome.attempt > watcher.max_attempts:
+                                raise ValueError(
+                                    "Watcher claim exceeds the configured attempt limit."
+                                )
+                            delivery = await self._event_watcher_supervisor.run(
+                                watcher=watcher,
+                                store=self.event_watcher_store,
+                                claim=outcome,
+                                context=EventWatcherContext(
+                                    watcher_name=watcher.name,
+                                    record=self._project_persisted_event_record_for_exposure(
+                                        record
+                                    ),
+                                    attempt=outcome.attempt,
+                                ),
+                                cursor_sequence=state.cursor_sequence,
                                 redactor=self._secret_redactor,
-                            ),
-                            max_bytes=4096,
-                        )
-                    if watcher_error is not None:
-                        delivery = await self.event_watcher_store.mark_failure(
-                            claim,
-                            error=watcher_error,
-                            max_attempts=watcher.max_attempts,
-                        )
+                            )
+                        else:
+                            raise TypeError("Watcher store returned an invalid claim result.")
                         deliveries.append(
                             delivery.model_copy(
                                 update={"event_id": public_event_id(delivery.event_sequence)},
@@ -6180,40 +6200,37 @@ class CayuApp:
                             )
                         )
                         remaining -= 1
-                        processed_for_watcher += 1
-                        if delivery.status is not EventWatcherDeliveryStatus.DEAD_LETTERED:
-                            should_fetch_next_page = False
+                        if delivery.status in {
+                            EventWatcherDeliveryStatus.SUCCEEDED,
+                            EventWatcherDeliveryStatus.DEAD_LETTERED,
+                        }:
+                            state = state.model_copy(
+                                update={"cursor_sequence": delivery.cursor_sequence}
+                            )
+                        if delivery.status not in {
+                            EventWatcherDeliveryStatus.SUCCEEDED,
+                            EventWatcherDeliveryStatus.DEAD_LETTERED,
+                        }:
+                            stop_watcher = True
                             break
-                        continue
-
-                    delivery = await self.event_watcher_store.mark_success(claim)
-                    deliveries.append(
-                        delivery.model_copy(
-                            update={"event_id": public_event_id(delivery.event_sequence)},
-                            deep=True,
-                        )
-                    )
-                    remaining -= 1
-                    processed_for_watcher += 1
-
-                    if remaining <= 0 or processed_for_watcher >= watcher.batch_size:
-                        should_fetch_next_page = False
+                        if remaining <= 0 or len(deliveries) >= watcher.batch_size:
+                            stop_watcher = True
+                            break
+                    if stop_watcher or len(records) < page_limit:
                         break
-
-                if len(records) < page_limit:
-                    break
-                if not should_fetch_next_page:
-                    break
-
+            except Exception as error:
+                watcher_error = self._secret_redactor.redact_text_bounded(
+                    event_watcher_error_payload(error, redactor=self._secret_redactor),
+                    max_bytes=4096,
+                )
             results.append(
                 EventWatcherRunResult(
                     watcher_name=watcher.name,
                     deliveries=deliveries,
                     blocked_by_active_lease=blocked_by_active_lease,
+                    error=watcher_error,
                 )
             )
-            if remaining <= 0:
-                break
         return results
 
     async def get_session_cost(
