@@ -24,6 +24,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_execution_unit_id,
 )
+from cayu.recall_relevance import RecallCandidateDecision
 from cayu.retrieval import RetrievalCandidateIdentity
 
 RECALL_RECEIPT_VERSION = "cayu.recall_receipt.v1"
@@ -544,6 +545,7 @@ class RecallReceipt(BaseModel):
     situation_fingerprint: KeyedEvidenceFingerprint
     engine_version: str
     query_resolution: RecallQueryResolutionEvidence | None = None
+    candidate_decisions: tuple[RecallCandidateDecision, ...] = Field(default=(), max_length=100)
     source_configuration_fingerprint: KeyedEvidenceFingerprint
     admission_policy_fingerprint: KeyedEvidenceFingerprint
     access_scope_fingerprint: KeyedEvidenceFingerprint
@@ -657,6 +659,17 @@ class RecallReceipt(BaseModel):
 
     @model_validator(mode="after")
     def validate_receipt(self) -> Self:
+        if self.candidate_decisions:
+            decisions = {item.identity.sort_key(): item for item in self.candidate_decisions}
+            if len(decisions) != len(self.candidate_decisions):
+                raise ValueError("Recall receipt candidate decisions must have unique identities.")
+            if any(
+                item.identity.sort_key() not in decisions
+                or decisions[item.identity.sort_key()].outcome
+                != ("focused" if item.admission is RecallItemAdmission.ADMITTED else "offered")
+                for item in self.items
+            ):
+                raise ValueError("Recall receipt decisions conflict with selected items.")
         source_names = tuple(source.source for source in self.sources)
         if len(source_names) != len(set(source_names)):
             raise ValueError("Recall receipt source identities must be unique.")

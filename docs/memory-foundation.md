@@ -1909,3 +1909,40 @@ fingerprint binds current intent; retry/recovery retains the committed projectio
 Generated automatic-context policies inherit this resolver and its configuration
 identity. Custom callers now need `user: ` role tags for conversational antecedents;
 explicit `work_context` remains supported. Scope and admission are independent.
+
+### Shipped relevance eligibility
+
+Generated projects select `cayu.query_concepts.v1` with calibration
+`standard-local-recall-query-concepts-v2`. Rank fusion still orders candidates;
+rank, list population, ties, repeated words, and channel agreement cannot establish
+eligibility. The gate compares unique normalized current-query concepts against
+bounded authorized candidate text: one exact concept/identifier, or at least two
+concepts covering 60% of a multi-concept query. The versioned vocabulary includes
+limited release/rollback, authentication, and timeout paraphrases. This is a
+conservative text heuristic, not a general semantic-confidence estimator.
+
+Lexical-only defaults remain useful. Supported semantic/hybrid hits use the same
+text gate; raw embedding scores are never interpreted as universal confidence.
+Semantic-only paraphrases outside the vocabulary can remain unadmitted. Missing
+query evidence is explicitly insufficient. Timeout, unsupported semantic search,
+and partial index coverage remain separate source diagnostics and do not veto
+well-supported lexical evidence or promote weak matches. The gate uses the current
+query plus an explicitly resolved user antecedent for genuine follow-ups.
+Unresolved or clipped input remains insufficient evidence. Older assistant text
+cannot become relevance evidence.
+
+Existing custom policies retain `rank_only.v1` behavior and their policy fingerprint
+unless they explicitly opt into the new relevance policy with a new calibration
+name. The gate also binds its Unicode text-semantics version and rejects a captured
+configuration from another Unicode version. Captured results without a current
+query are insufficient under the new gate.
+Admission diagnostics and durable receipts retain bounded candidate identities,
+eligibility reasons, and final outcomes, separate from source coverage. Scope,
+lifecycle, expiration, currentness, and revision checks still occur in retrieval.
+
+Work remains bounded by the existing candidate and text ceilings (at most 100
+candidates, 128,000 UTF-8 bytes per candidate and an 8,192-byte current query), with
+no provider calls. Local tests exercise in-memory and SQLite stores, generated
+configuration, deterministic replay, weak hybrid agreement and semantic timeout.
+These are focused regression controls; broader held-out quality and real embedding
+provider effectiveness belong to the shipped-default evaluation gate.

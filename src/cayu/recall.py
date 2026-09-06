@@ -841,7 +841,15 @@ class RecallResult(BaseModel):
     sources: tuple[RecallSourceDiagnostic, ...]
     continuations: Mapping[str, str] = Field(default_factory=dict)
     truncated: bool
+    relevance_query: str | None = Field(default=None, max_length=RECALL_MAX_QUERY_BYTES)
     omitted_by_result_bytes: int = 0
+
+    @field_validator("relevance_query")
+    @classmethod
+    def validate_relevance_query(cls, value: str | None) -> str | None:
+        if value is not None and len(value.encode("utf-8")) > RECALL_MAX_QUERY_BYTES:
+            raise ValueError("Relevance query exceeds its UTF-8 byte bound.")
+        return value
 
     @field_validator("engine_version")
     @classmethod
@@ -1275,6 +1283,12 @@ class RecallEngine:
             for diagnostic in source_diagnostics
         )
         situation_sha256 = situation.fingerprint()
+        resolution = situation.query_resolution()
+        relevance_query = (
+            None
+            if resolution["decision"] == "insufficient_context"
+            else resolution["retrieval_text"]
+        )
         pageable_channels = {
             channel
             for registration in self._sources
@@ -1319,6 +1333,7 @@ class RecallEngine:
             return RecallResult(
                 engine_version=self._config.engine_version,
                 situation_sha256=situation_sha256,
+                relevance_query=relevance_query,
                 candidates=tuple(fused_candidates[:candidate_count]),
                 fusion=diagnostics_with_continuations(continuations),
                 sources=tuple(source_diagnostics),

@@ -172,6 +172,9 @@ def build_recall_receipt(
 
     selected_items = _receipt_items(contribution, key=key)
     selected_identities = {item.identity.sort_key() for item in selected_items}
+    decisions = {
+        item.identity.sort_key(): item for item in contribution.diagnostics.candidate_decisions
+    }
     silent_count = 0
     omitted_visible_count = 0
     for index, candidate in enumerate(result.candidates):
@@ -183,6 +186,15 @@ def build_recall_receipt(
             > admission_policy.max_candidate_text_bytes
         ):
             omitted_visible_count += 1
+            continue
+        decision = decisions.get(candidate.record.identity.sort_key())
+        if decision is not None and decision.outcome in {
+            "low_relevance",
+            "insufficient_evidence",
+            "below_score",
+            "mode",
+        }:
+            silent_count += 1
             continue
         score = candidate.fused.score
         if score < admission_policy.minimum_offer_score or (
@@ -224,6 +236,7 @@ def build_recall_receipt(
                 if name not in {"current_query", "retrieval_text"}
             }
         ),
+        candidate_decisions=contribution.diagnostics.candidate_decisions,
         source_configuration_fingerprint=_fingerprint_payload(
             source_configuration_payload,
             "recall source configuration",

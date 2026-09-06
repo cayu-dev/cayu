@@ -746,7 +746,8 @@ def build_context_policy() -> ContextPolicy | None:
         return None
     return AutomaticRecallContextPolicy(
         admission_policy=AutomaticRecallPolicy(
-            calibration_version="standard-local-recall-v1",
+            calibration_version="standard-local-recall-query-concepts-v2",
+            relevance_policy="cayu.query_concepts.v1",
             fusion_strategy_version=WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
             fusion_configuration_version=_FUSION_VERSION,
             minimum_inject_score=0.01,

@@ -30,6 +30,11 @@ from cayu.recall import (
     RecallSituation,
     RecallSourceDiagnostic,
 )
+from cayu.recall_relevance import (
+    RELEVANCE_TEXT_VERSION,
+    RecallCandidateDecision,
+    query_concept_eligibility,
+)
 from cayu.retrieval import FusedChannelMatch, RetrievalCandidateIdentity
 
 AUTOMATIC_RECALL_POLICY_VERSION = "cayu.automatic_recall_policy.v1"
@@ -86,6 +91,10 @@ class AutomaticRecallPolicy(BaseModel):
     calibration_version: str
     fusion_strategy_version: str
     fusion_configuration_version: str
+    relevance_policy: Literal["rank_only.v1", "cayu.query_concepts.v1"] = Field(
+        default="rank_only.v1", exclude_if=lambda value: value == "rank_only.v1"
+    )
+    relevance_text_version: str | None = Field(default=None, exclude_if=lambda value: value is None)
     mode: AutomaticRecallMode = AutomaticRecallMode.OFFER_AND_STRONG_MATCHES
     minimum_inject_score: float
     minimum_offer_score: float
@@ -159,6 +168,15 @@ class AutomaticRecallPolicy(BaseModel):
 
     @model_validator(mode="after")
     def validate_policy(self) -> AutomaticRecallPolicy:
+        if self.relevance_policy == "cayu.query_concepts.v1":
+            if self.relevance_text_version is None:
+                object.__setattr__(self, "relevance_text_version", RELEVANCE_TEXT_VERSION)
+            elif self.relevance_text_version != RELEVANCE_TEXT_VERSION:
+                raise ValueError(
+                    "Relevance text semantics do not match this runtime's Unicode version."
+                )
+        elif self.relevance_text_version is not None:
+            raise ValueError("Rank-only admission cannot configure relevance text semantics.")
         if self.minimum_offer_score > self.minimum_inject_score:
             raise ValueError("`minimum_offer_score` cannot exceed `minimum_inject_score`.")
         if self.max_injected_items > self.max_evaluated_candidates:
@@ -515,6 +533,7 @@ class RecallOffer(BaseModel):
 class AutomaticRecallDiagnostics(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
+    candidate_decisions: tuple[RecallCandidateDecision, ...] = Field(default=(), max_length=100)
     recall_performed: bool
     recall_candidate_count: int
     evaluated_candidate_count: int
@@ -799,9 +818,18 @@ def admit_recall(
     strong: list[tuple[int, RecallCandidate]] = []
     plausible: list[tuple[int, RecallCandidate]] = []
     oversized_count = 0
+    eligibility = {}
     for fused_rank, candidate in enumerate(evaluated, start=1):
         if len(candidate.record.text.encode("utf-8")) > policy.max_candidate_text_bytes:
             oversized_count += 1
+            continue
+        decision = (
+            query_concept_eligibility(result.relevance_query, candidate.record.text)
+            if policy.relevance_policy == "cayu.query_concepts.v1"
+            else ("legacy_rank_only", "rank_only_calibration")
+        )
+        eligibility[candidate.record.identity.sort_key()] = decision
+        if decision[0] in {"low_relevance", "insufficient_evidence"}:
             continue
         if candidate.fused.score >= policy.minimum_inject_score:
             strong.append((fused_rank, candidate))
@@ -906,7 +934,47 @@ def admit_recall(
                 eligible_item_count=len(offer_eligible),
             )
         )
+        focused = {item.candidate.record.identity.sort_key() for item in focus_items}
+        focused_content = {item.candidate.record.content_hash for item in focus_items}
+        offered = {item.identity.sort_key() for item in offer_items}
+        strong_keys = {candidate.record.identity.sort_key() for _, candidate in strong}
+        plausible_keys = {candidate.record.identity.sort_key() for _, candidate in plausible}
+        decisions = []
+        for index, candidate in enumerate(result.candidates[:100]):
+            identity = candidate.record.identity.sort_key()
+            state, reason = eligibility.get(
+                identity, ("insufficient_evidence", "missing_query_evidence")
+            )
+            if index >= policy.max_evaluated_candidates:
+                outcome = "unevaluated"
+            elif len(candidate.record.text.encode("utf-8")) > policy.max_candidate_text_bytes:
+                outcome = "oversized"
+            elif identity in focused:
+                outcome = "focused"
+            elif identity in offered:
+                outcome = "offered"
+            elif state in {"low_relevance", "insufficient_evidence"}:
+                outcome = state
+            elif identity not in strong_keys | plausible_keys:
+                outcome = "below_score"
+            elif candidate.record.content_hash in focused_content:
+                outcome = "duplicate"
+            elif identity in plausible_keys and not policy.mode.emits_offers:
+                outcome = "mode"
+            else:
+                outcome = "capacity"
+            decisions.append(
+                RecallCandidateDecision.model_validate(
+                    {
+                        "identity": candidate.record.identity,
+                        "eligibility": state,
+                        "reason": reason,
+                        "outcome": outcome,
+                    }
+                )
+            )
         diagnostics = AutomaticRecallDiagnostics(
+            candidate_decisions=tuple(decisions),
             recall_performed=True,
             recall_candidate_count=len(result.candidates),
             evaluated_candidate_count=len(evaluated),

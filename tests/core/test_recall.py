@@ -432,6 +432,7 @@ def test_recall_engine_bounds_the_complete_serialized_result_and_keeps_a_fused_p
         one_candidate = RecallResult(
             engine_version=complete.engine_version,
             situation_sha256=complete.situation_sha256,
+            relevance_query=complete.relevance_query,
             candidates=complete.candidates[:1],
             fusion=complete.fusion,
             sources=complete.sources,
