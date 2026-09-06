@@ -84,6 +84,7 @@ class RecallItemAdmission(StrEnum):
         admitted_reasons = {
             RecallItemSelectionReason.CALIBRATED_STRONG_MATCH,
             RecallItemSelectionReason.EXPLICIT_APPLICATION_SELECTION,
+            RecallItemSelectionReason.NEWLY_RELEVANT,
         }
         return isinstance(reason, RecallItemSelectionReason) and (
             (reason in admitted_reasons) is (self is RecallItemAdmission.ADMITTED)
@@ -97,6 +98,7 @@ class RecallItemSelectionReason(StrEnum):
     STRONG_MATCH_NOT_FOCUSED = "strong_match_not_focused"
     STRONG_MATCH_OFFERED_BY_MODE = "strong_match_offered_by_mode"
     EXPLICIT_APPLICATION_SELECTION = "explicit_application_selection"
+    NEWLY_RELEVANT = "newly_relevant"
 
 
 class ContextExposureState(StrEnum):

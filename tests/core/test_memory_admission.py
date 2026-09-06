@@ -11,6 +11,13 @@ from cayu.memory import (
     AutomaticRecallContributor,
     AutomaticRecallMode,
     AutomaticRecallPolicy,
+    MemoryDelta,
+    MemoryDeltaItem,
+    MemoryDeltaPolicy,
+    MemoryDeltaRefreshDisposition,
+    MemoryDeltaRefreshOutcome,
+    MemoryDeltaSelectionReason,
+    MemoryDeltaTrigger,
     RecallOffer,
     admit_recall,
 )
@@ -161,6 +168,83 @@ def test_automatic_recall_admits_strong_offers_plausible_and_silences_weak() -> 
     assert contribution.diagnostics.admission_truncated is False
     assert contribution.sources == result.sources
     assert contribution.continuations == {}
+
+
+def test_memory_delta_contract_binds_sequence_trigger_and_exact_candidate() -> None:
+    trigger = MemoryDeltaTrigger(
+        model_step_id="mstep_00000000000000000000000000000000",
+        previous_knowledge_sequence=4,
+        knowledge_sequence=5,
+        previous_index_readiness_sequence=2,
+        index_readiness_sequence=2,
+    )
+    candidate = _candidate("new-revision", score=0.04)
+    delta = MemoryDelta(
+        interaction_id="interaction-one",
+        sequence=1,
+        base_receipt_id="base-receipt-one",
+        base_situation_sha256="a" * 64,
+        situation_sha256="b" * 64,
+        policy_sha256="c" * 64,
+        trigger=trigger,
+        receipt_id="receipt-one",
+        items=(MemoryDeltaItem(candidate=candidate, fused_rank=1),),
+        eligible_item_count=1,
+        omitted_item_count=0,
+        recall_truncated=False,
+        truncated=False,
+    )
+
+    assert delta.trigger.fingerprint() == trigger.fingerprint()
+    assert delta.items[0].selection_reason is MemoryDeltaSelectionReason.NEWLY_RELEVANT
+    with pytest.raises(ValueError, match="advanced frontier"):
+        MemoryDeltaTrigger(
+            model_step_id="mstep_00000000000000000000000000000000",
+            previous_knowledge_sequence=5,
+            knowledge_sequence=5,
+            previous_index_readiness_sequence=2,
+            index_readiness_sequence=2,
+        )
+    with pytest.raises(ValueError, match="max_items_per_delta"):
+        MemoryDeltaPolicy(max_items_per_delta=4, max_cumulative_items=3)
+    with pytest.raises(ValueError, match="max_delta_bytes"):
+        MemoryDeltaPolicy().model_copy(update={"max_delta_bytes": 0})
+
+
+def test_memory_delta_refresh_outcome_binds_frontier_decision_and_counts() -> None:
+    outcome = MemoryDeltaRefreshOutcome(
+        interaction_id="interaction-one",
+        ordinal=1,
+        model_step_id="mstep_00000000000000000000000000000001",
+        disposition=MemoryDeltaRefreshDisposition.DELTA_APPENDED,
+        previous_knowledge_sequence=4,
+        observed_knowledge_sequence=5,
+        previous_index_readiness_sequence=2,
+        observed_index_readiness_sequence=3,
+        eligible_item_count=2,
+        selected_item_count=1,
+        omitted_item_count=1,
+        delta_sequence=1,
+    )
+
+    assert outcome.disposition is MemoryDeltaRefreshDisposition.DELTA_APPENDED
+    assert outcome.selected_item_count + outcome.omitted_item_count == (outcome.eligible_item_count)
+    payload = outcome.model_dump(mode="python")
+    payload["disposition"] = MemoryDeltaRefreshDisposition.FRONTIER_UNCHANGED
+    with pytest.raises(ValueError, match="disposition conflicts"):
+        MemoryDeltaRefreshOutcome.model_validate(payload)
+    payload = outcome.model_dump(mode="python")
+    payload.update(
+        {
+            "disposition": MemoryDeltaRefreshDisposition.ITEM_BUDGET_EXHAUSTED,
+            "eligible_item_count": 0,
+            "selected_item_count": 0,
+            "omitted_item_count": 0,
+            "delta_sequence": None,
+        }
+    )
+    with pytest.raises(ValueError, match="budget-exhausted refresh"):
+        MemoryDeltaRefreshOutcome.model_validate(payload)
 
 
 def test_automatic_recall_preserves_record_type_diversity_before_filling_capacity() -> None:

@@ -18,6 +18,7 @@ from cayu._validation import (
     FrozenJsonDict,
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    require_execution_unit_id,
     require_finite,
 )
 from cayu._validation import (
@@ -41,6 +42,10 @@ from cayu.retrieval import FusedChannelMatch, RetrievalCandidateIdentity
 AUTOMATIC_RECALL_POLICY_VERSION = "cayu.automatic_recall_policy.v1"
 AUTOMATIC_RECALL_CONTRIBUTION_VERSION = "cayu.automatic_recall_contribution.v1"
 MEMORY_FOCUS_VERSION = "cayu.memory_focus.v1"
+MEMORY_DELTA_POLICY_VERSION = "cayu.memory_delta_policy.v1"
+MEMORY_DELTA_REFRESH_OUTCOME_VERSION = "cayu.memory_delta_refresh_outcome.v1"
+MEMORY_DELTA_TRIGGER_VERSION = "cayu.memory_delta_trigger.v1"
+MEMORY_DELTA_VERSION = "cayu.memory_delta.v1"
 RECALL_OFFER_VERSION = "cayu.recall_offer.v1"
 
 _MAX_ADMISSION_CANDIDATES = 100
@@ -48,6 +53,9 @@ _MAX_ADMISSION_ITEMS = 50
 _MAX_ADMISSION_BYTES = 1_000_000
 _MAX_CALIBRATION_NAME_BYTES = 256
 _MAX_CANDIDATE_TEXT_BYTES = 128_000
+_MAX_MEMORY_DELTAS = 31
+_MAX_MEMORY_DELTA_REFRESHES = 128
+_MAX_MEMORY_DELTA_SEQUENCE = 2**63 - 1
 
 _RecallOfferReason: TypeAlias = Literal[
     "calibrated_plausible_match",
@@ -222,6 +230,426 @@ class AutomaticRecallPolicy(BaseModel):
                 "automatic recall policy",
             )
         ).hexdigest()
+
+
+class MemoryDeltaPolicy(BaseModel):
+    """Deterministic work and projection bounds for intra-interaction refresh."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
+
+    policy_version: Literal["cayu.memory_delta_policy.v1"] = MEMORY_DELTA_POLICY_VERSION
+    max_refreshes_per_interaction: int = 8
+    max_deltas_per_interaction: int = 4
+    max_items_per_delta: int = 3
+    max_cumulative_items: int = 64
+    max_delta_bytes: int = 32_000
+    max_cumulative_bytes: int = 128_000
+    change_page_limit: int = 32
+    readiness_page_limit: int = 32
+
+    @field_validator(
+        "max_refreshes_per_interaction",
+        "max_deltas_per_interaction",
+        "max_items_per_delta",
+        "max_cumulative_items",
+        "change_page_limit",
+        "readiness_page_limit",
+        mode="before",
+    )
+    @classmethod
+    def validate_count_bound(cls, value: Any, info: Any) -> int:
+        if type(value) is not int or value < 1:
+            raise ValueError(f"`{info.field_name}` must be a positive integer.")
+        maximum = {
+            "max_refreshes_per_interaction": _MAX_MEMORY_DELTA_REFRESHES,
+            "max_deltas_per_interaction": _MAX_MEMORY_DELTAS,
+            "max_items_per_delta": _MAX_ADMISSION_ITEMS,
+            "max_cumulative_items": 64,
+            "change_page_limit": 100,
+            "readiness_page_limit": 100,
+        }[info.field_name]
+        if value > maximum:
+            raise ValueError(f"`{info.field_name}` must be at most {maximum}.")
+        return value
+
+    @field_validator("max_delta_bytes", "max_cumulative_bytes", mode="before")
+    @classmethod
+    def validate_byte_bound(cls, value: Any, info: Any) -> int:
+        if type(value) is not int or not 1 <= value <= _MAX_ADMISSION_BYTES:
+            raise ValueError(f"`{info.field_name}` must be between 1 and {_MAX_ADMISSION_BYTES}.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> MemoryDeltaPolicy:
+        if self.max_deltas_per_interaction > self.max_refreshes_per_interaction:
+            raise ValueError(
+                "`max_deltas_per_interaction` cannot exceed `max_refreshes_per_interaction`."
+            )
+        if self.max_delta_bytes > self.max_cumulative_bytes:
+            raise ValueError("`max_delta_bytes` cannot exceed `max_cumulative_bytes`.")
+        if self.max_items_per_delta > self.max_cumulative_items:
+            raise ValueError("`max_items_per_delta` cannot exceed `max_cumulative_items`.")
+        canonical_durable_json_bytes(self.model_dump(mode="json"), "memory delta policy")
+        return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        payload = self.model_dump(mode="python", round_trip=True)
+        if update is not None:
+            payload.update(update)
+        copied = type(self).model_validate(payload)
+        fields_set = set(self.model_fields_set)
+        if update is not None:
+            fields_set.update(update)
+        object.__setattr__(copied, "__pydantic_fields_set__", fields_set)
+        return copied
+
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                self.model_dump(mode="json"),
+                "memory delta policy",
+            )
+        ).hexdigest()
+
+
+class MemoryDeltaTriggerKind(StrEnum):
+    KNOWLEDGE_FRONTIER_ADVANCED = "knowledge_frontier_advanced"
+
+
+class MemoryDeltaTrigger(BaseModel):
+    """Exact durable frontier advance observed at one safe model boundary."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
+
+    schema_version: Literal["cayu.memory_delta_trigger.v1"] = MEMORY_DELTA_TRIGGER_VERSION
+    kind: Literal[MemoryDeltaTriggerKind.KNOWLEDGE_FRONTIER_ADVANCED] = (
+        MemoryDeltaTriggerKind.KNOWLEDGE_FRONTIER_ADVANCED
+    )
+    model_step_id: str
+    previous_knowledge_sequence: int
+    knowledge_sequence: int
+    previous_index_readiness_sequence: int
+    index_readiness_sequence: int
+
+    @field_validator("model_step_id")
+    @classmethod
+    def validate_model_step_id(cls, value: str) -> str:
+        return require_execution_unit_id(value, "model_step_id")
+
+    @field_validator(
+        "previous_knowledge_sequence",
+        "knowledge_sequence",
+        "previous_index_readiness_sequence",
+        "index_readiness_sequence",
+        mode="before",
+    )
+    @classmethod
+    def validate_sequence(cls, value: Any, info: Any) -> int:
+        if type(value) is not int or not 0 <= value <= _MAX_MEMORY_DELTA_SEQUENCE:
+            raise ValueError(f"`{info.field_name}` must be a non-negative durable integer.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_advance(self) -> MemoryDeltaTrigger:
+        if (
+            self.knowledge_sequence < self.previous_knowledge_sequence
+            or self.index_readiness_sequence < self.previous_index_readiness_sequence
+        ):
+            raise ValueError("A memory-delta frontier cannot regress.")
+        if (
+            self.knowledge_sequence == self.previous_knowledge_sequence
+            and self.index_readiness_sequence == self.previous_index_readiness_sequence
+        ):
+            raise ValueError("A memory-delta trigger requires an advanced frontier.")
+        return self
+
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                self.model_dump(mode="json"),
+                "memory delta trigger",
+            )
+        ).hexdigest()
+
+
+class MemoryDeltaSelectionReason(StrEnum):
+    NEWLY_RELEVANT = "newly_relevant"
+
+
+class MemoryDeltaRefreshDisposition(StrEnum):
+    FRONTIER_UNCHANGED = "frontier_unchanged"
+    NO_CURRENT_REVISION = "no_current_revision"
+    RECALL_INCOMPLETE = "recall_incomplete"
+    NO_NEWLY_RELEVANT_ITEMS = "no_newly_relevant_items"
+    ITEM_BUDGET_EXHAUSTED = "item_budget_exhausted"
+    BYTE_BUDGET_EXHAUSTED = "byte_budget_exhausted"
+    DELTA_APPENDED = "delta_appended"
+
+
+class MemoryDeltaRefreshOutcome(BaseModel):
+    """One bounded durable result from inspecting a safe refresh boundary."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
+
+    schema_version: Literal["cayu.memory_delta_refresh_outcome.v1"] = (
+        MEMORY_DELTA_REFRESH_OUTCOME_VERSION
+    )
+    interaction_id: str
+    ordinal: int
+    model_step_id: str
+    disposition: MemoryDeltaRefreshDisposition
+    previous_knowledge_sequence: int
+    observed_knowledge_sequence: int
+    previous_index_readiness_sequence: int
+    observed_index_readiness_sequence: int
+    eligible_item_count: int = 0
+    selected_item_count: int = 0
+    omitted_item_count: int = 0
+    recall_truncated: bool = False
+    delta_sequence: int | None = None
+
+    @field_validator("interaction_id")
+    @classmethod
+    def validate_interaction_id(cls, value: str) -> str:
+        value = require_clean_nonblank(value, "interaction_id")
+        if len(value.encode("utf-8")) > 256:
+            raise ValueError("`interaction_id` must be at most 256 UTF-8 bytes.")
+        return value
+
+    @field_validator("model_step_id")
+    @classmethod
+    def validate_model_step_id(cls, value: str) -> str:
+        return require_execution_unit_id(value, "model_step_id")
+
+    @field_validator("ordinal", mode="before")
+    @classmethod
+    def validate_ordinal(cls, value: Any) -> int:
+        if type(value) is not int or not 1 <= value <= _MAX_MEMORY_DELTA_REFRESHES:
+            raise ValueError(f"`ordinal` must be between 1 and {_MAX_MEMORY_DELTA_REFRESHES}.")
+        return value
+
+    @field_validator(
+        "previous_knowledge_sequence",
+        "observed_knowledge_sequence",
+        "previous_index_readiness_sequence",
+        "observed_index_readiness_sequence",
+        mode="before",
+    )
+    @classmethod
+    def validate_frontier_sequence(cls, value: Any, info: Any) -> int:
+        if type(value) is not int or not 0 <= value <= _MAX_MEMORY_DELTA_SEQUENCE:
+            raise ValueError(f"`{info.field_name}` must be a non-negative durable integer.")
+        return value
+
+    @field_validator(
+        "eligible_item_count",
+        "selected_item_count",
+        "omitted_item_count",
+        mode="before",
+    )
+    @classmethod
+    def validate_item_count(cls, value: Any, info: Any) -> int:
+        if type(value) is not int or not 0 <= value <= _MAX_ADMISSION_CANDIDATES:
+            raise ValueError(
+                f"`{info.field_name}` must be between 0 and {_MAX_ADMISSION_CANDIDATES}."
+            )
+        return value
+
+    @field_validator("recall_truncated", mode="before")
+    @classmethod
+    def validate_recall_truncated(cls, value: Any) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`recall_truncated` must be a boolean.")
+        return value
+
+    @field_validator("delta_sequence", mode="before")
+    @classmethod
+    def validate_optional_delta_sequence(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        if type(value) is not int or not 1 <= value <= _MAX_MEMORY_DELTAS:
+            raise ValueError(
+                f"`delta_sequence` must be between 1 and {_MAX_MEMORY_DELTAS} or None."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> MemoryDeltaRefreshOutcome:
+        if (
+            self.observed_knowledge_sequence < self.previous_knowledge_sequence
+            or self.observed_index_readiness_sequence < self.previous_index_readiness_sequence
+        ):
+            raise ValueError("A memory-delta refresh frontier cannot regress.")
+        advanced = (
+            self.observed_knowledge_sequence != self.previous_knowledge_sequence
+            or self.observed_index_readiness_sequence != self.previous_index_readiness_sequence
+        )
+        if (self.disposition is MemoryDeltaRefreshDisposition.FRONTIER_UNCHANGED) != (not advanced):
+            raise ValueError("The memory-delta refresh disposition conflicts with its frontier.")
+        if self.eligible_item_count != self.selected_item_count + self.omitted_item_count:
+            raise ValueError("Memory-delta refresh item counts are inconsistent.")
+        appended = self.disposition is MemoryDeltaRefreshDisposition.DELTA_APPENDED
+        if appended != (self.delta_sequence is not None) or appended != (
+            self.selected_item_count > 0
+        ):
+            raise ValueError("Only an appended memory delta may select items or name a sequence.")
+        if self.disposition in {
+            MemoryDeltaRefreshDisposition.ITEM_BUDGET_EXHAUSTED,
+            MemoryDeltaRefreshDisposition.BYTE_BUDGET_EXHAUSTED,
+        } and (self.eligible_item_count == 0 or self.omitted_item_count == 0):
+            raise ValueError("A budget-exhausted refresh must record omitted eligible items.")
+        if self.disposition in {
+            MemoryDeltaRefreshDisposition.FRONTIER_UNCHANGED,
+            MemoryDeltaRefreshDisposition.NO_CURRENT_REVISION,
+            MemoryDeltaRefreshDisposition.RECALL_INCOMPLETE,
+            MemoryDeltaRefreshDisposition.NO_NEWLY_RELEVANT_ITEMS,
+        } and any((self.eligible_item_count, self.selected_item_count, self.omitted_item_count)):
+            raise ValueError("This memory-delta refresh disposition cannot report selected items.")
+        if (
+            self.disposition is MemoryDeltaRefreshDisposition.RECALL_INCOMPLETE
+            and not self.recall_truncated
+        ):
+            raise ValueError("An incomplete memory-delta recall must be marked truncated.")
+        return self
+
+
+class MemoryDeltaItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    candidate: RecallCandidate
+    fused_rank: int
+    selection_reason: Literal[MemoryDeltaSelectionReason.NEWLY_RELEVANT] = (
+        MemoryDeltaSelectionReason.NEWLY_RELEVANT
+    )
+
+    @field_validator("candidate", mode="before")
+    @classmethod
+    def copy_candidate(cls, value: Any) -> RecallCandidate:
+        return RecallCandidate.model_validate(
+            value.model_dump(mode="python") if type(value) is RecallCandidate else value
+        )
+
+    @field_validator("fused_rank", mode="before")
+    @classmethod
+    def validate_rank(cls, value: Any) -> int:
+        if type(value) is not int or value < 1:
+            raise ValueError("`fused_rank` must be a positive integer.")
+        return value
+
+
+class MemoryDelta(BaseModel):
+    """One immutable append-only addition to a frozen interaction memory frame."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
+
+    schema_version: Literal["cayu.memory_delta.v1"] = MEMORY_DELTA_VERSION
+    interaction_id: str
+    sequence: int
+    base_receipt_id: str
+    base_situation_sha256: str
+    situation_sha256: str
+    policy_sha256: str
+    trigger: MemoryDeltaTrigger
+    receipt_id: str
+    items: tuple[MemoryDeltaItem, ...]
+    eligible_item_count: int
+    omitted_item_count: int
+    recall_truncated: bool
+    truncated: bool
+
+    @field_validator("interaction_id", "base_receipt_id", "receipt_id")
+    @classmethod
+    def validate_identity(cls, value: str, info: Any) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > 256:
+            raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
+        return value
+
+    @field_validator("sequence", mode="before")
+    @classmethod
+    def validate_delta_sequence(cls, value: Any) -> int:
+        if type(value) is not int or not 1 <= value <= _MAX_MEMORY_DELTAS:
+            raise ValueError(f"`sequence` must be between 1 and {_MAX_MEMORY_DELTAS}.")
+        return value
+
+    @field_validator("base_situation_sha256", "situation_sha256", "policy_sha256")
+    @classmethod
+    def validate_digest(cls, value: str, info: Any) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"`{info.field_name}` must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("trigger", mode="before")
+    @classmethod
+    def copy_trigger(cls, value: Any) -> MemoryDeltaTrigger:
+        return MemoryDeltaTrigger.model_validate(
+            value.model_dump(mode="python") if type(value) is MemoryDeltaTrigger else value
+        )
+
+    @field_validator("items", mode="before")
+    @classmethod
+    def copy_items(cls, value: Any) -> tuple[MemoryDeltaItem, ...]:
+        return tuple(
+            MemoryDeltaItem.model_validate(
+                item.model_dump(mode="python") if type(item) is MemoryDeltaItem else item
+            )
+            for item in value
+        )
+
+    @field_validator("eligible_item_count", "omitted_item_count", mode="before")
+    @classmethod
+    def validate_count(cls, value: Any, info: Any) -> int:
+        if type(value) is not int or value < 0:
+            raise ValueError(f"`{info.field_name}` must be a non-negative integer.")
+        return value
+
+    @field_validator("recall_truncated", "truncated", mode="before")
+    @classmethod
+    def validate_bool(cls, value: Any, info: Any) -> bool:
+        if type(value) is not bool:
+            raise ValueError(f"`{info.field_name}` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_delta(self) -> MemoryDelta:
+        if not self.items:
+            raise ValueError("A memory delta must contain at least one item.")
+        ranks = [item.fused_rank for item in self.items]
+        identities = [item.candidate.record.identity.sort_key() for item in self.items]
+        if ranks != sorted(ranks) or len(ranks) != len(set(ranks)):
+            raise ValueError("Memory delta items must retain unique fused-rank order.")
+        if len(identities) != len(set(identities)):
+            raise ValueError("A memory delta cannot repeat a candidate identity.")
+        if self.eligible_item_count != len(self.items) + self.omitted_item_count:
+            raise ValueError("Memory delta item counts are inconsistent.")
+        if self.truncated != (self.recall_truncated or self.omitted_item_count > 0):
+            raise ValueError("Memory delta truncation is inconsistent.")
+        return self
 
 
 class MemoryFocusItem(BaseModel):
@@ -1223,6 +1651,10 @@ def _serialized_bytes(value: BaseModel, field_name: str) -> int:
 __all__ = [
     "AUTOMATIC_RECALL_CONTRIBUTION_VERSION",
     "AUTOMATIC_RECALL_POLICY_VERSION",
+    "MEMORY_DELTA_POLICY_VERSION",
+    "MEMORY_DELTA_REFRESH_OUTCOME_VERSION",
+    "MEMORY_DELTA_TRIGGER_VERSION",
+    "MEMORY_DELTA_VERSION",
     "MEMORY_FOCUS_VERSION",
     "RECALL_OFFER_VERSION",
     "AutomaticRecallContribution",
@@ -1230,6 +1662,14 @@ __all__ = [
     "AutomaticRecallDiagnostics",
     "AutomaticRecallMode",
     "AutomaticRecallPolicy",
+    "MemoryDelta",
+    "MemoryDeltaItem",
+    "MemoryDeltaPolicy",
+    "MemoryDeltaRefreshDisposition",
+    "MemoryDeltaRefreshOutcome",
+    "MemoryDeltaSelectionReason",
+    "MemoryDeltaTrigger",
+    "MemoryDeltaTriggerKind",
     "MemoryFocus",
     "MemoryFocusItem",
     "RecallOffer",
