@@ -197,8 +197,10 @@ def test_cli_check_reports_an_invalid_registration_seam_before_import(
 
     assert report["manifest_fingerprint"] == "unavailable"
     assert [(item["code"], item["path"]) for item in report["diagnostics"]] == [
-        ("SCAFFOLD_LAYOUT_PATH_MISSING", "agents/registration.py")
+        ("SCAFFOLD_IMPORT_SIDE_EFFECT", "app.py:18"),
+        ("SCAFFOLD_LAYOUT_PATH_MISSING", "agents/registration.py"),
     ]
+    assert report["diagnostics"][0]["parameters"]["expression_kind"] == "ImportFrom"
 
 
 def test_cli_check_rejects_a_symlinked_application_package_before_import(

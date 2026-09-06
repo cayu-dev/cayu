@@ -296,8 +296,10 @@ def test_descriptor_hook_is_not_executed(tmp_path: Path, monkeypatch: pytest.Mon
     )
     monkeypatch.chdir(tmp_path)
     findings = _check_import_inertness(tmp_path)
-    # The descriptor module is rejected before its base can be trusted.
-    assert any(item.path == "domain/errors.py:4" for item in findings)
+    # Report the opaque namespace value and its helper's constructor, rather
+    # than pointing only at the dependent base declaration.
+    assert any(item.path == "domain/errors.py:5" for item in findings)
+    assert any(item.path == "vendor/descriptor.py:4" for item in findings)
     assert not (tmp_path / "executed").exists()
 
 
@@ -554,7 +556,8 @@ def test_local_base_proof_prefers_package_over_same_named_module(
     assert _check_import_inertness(tmp_path)
 
 
-def test_local_base_dependency_proof_is_bounded(tmp_path: Path) -> None:
+def test_local_base_dependency_proof_is_bounded(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("cayu.cli.scaffold_check._MAX_DECLARATION_MODULES", 64)
     modules = {
         "domain/errors.py": "class Base:\n    pass\nimport vendor.helper0\n"
         "class Child(Base):\n    pass\n",

@@ -17,7 +17,9 @@ class Grant(Parent):
     def validate(cls, value):
         return value
 class FinalGrant(Grant):
-    count: int = 1
+    count: int = Field(default_factory=lambda: 1)
+    labels: list[str] = Field(default_factory=list)
+    metadata: dict[str, str] = Field(default_factory=dict)
 """,
     "domain/declarations.py": """from contextvars import ContextVar as Variable
 import typing as types
