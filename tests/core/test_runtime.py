@@ -13331,7 +13331,7 @@ def test_cayu_app_preserves_caller_cancellation_during_provider_stream_cleanup(
             self.close_started.set()
 
             def physical_cleanup() -> None:
-                self.cleanup_release.wait()
+                self.cleanup_release.wait(timeout=5)
                 self.cleanup_finished.set()
                 raise RuntimeError(f"cleanup failed near {canary}")
 
@@ -13377,7 +13377,7 @@ def test_cayu_app_preserves_caller_cancellation_during_provider_stream_cleanup(
             caught = True
             caught_cancellation = exc
             assert BaseException.__dict__["args"].__get__(exc, BaseException) == (
-                "Provider stream cleanup cancelled",
+                "Provider operation cancelled",
             )
         assert caught is True
         assert caught_cancellation is not None
@@ -13396,6 +13396,7 @@ def test_cayu_app_preserves_caller_cancellation_during_provider_stream_cleanup(
         assert task.cancelling() == 1
         assert task.cancelled() is True
         assert provider.iterator.cleanup_finished.is_set() is False
+        provider.iterator.cleanup_release.set()
         assert provider.requests == 1
         assert EventType.MODEL_ERROR not in {event.type for event in live_events}
         assert EventType.SESSION_FAILED not in {event.type for event in live_events}
@@ -13424,6 +13425,22 @@ def test_cayu_app_preserves_caller_cancellation_during_provider_stream_cleanup(
                 "phase": "provider_stream_cleanup",
                 "error": "Provider stream cleanup did not complete normally.",
                 "error_type": "ProviderStreamCleanupError",
+                "cleanup_diagnostic_version": 1,
+                "cleanup_action": "stream_close",
+                "cleanup_reason": "cleanup_cancelled",
+                "cleanup_exception_type": "CancelledError",
+                "cancellation_requested": True,
+                "stream_close_state": "not_confirmed",
+                "remote_cancellation_state": "unknown",
+                "remote_settlement_state": "unknown",
+                **{
+                    key: next(
+                        record.event.payload[key]
+                        for record in records
+                        if record.event.type is EventType.MODEL_STARTED
+                    )
+                    for key in ("model_step_id", "model_attempt_id")
+                },
             },
         ]
         retained = json.dumps(
@@ -13604,6 +13621,7 @@ def test_provider_cancellation_marker_precedes_operator_terminal_transition() ->
             self.close_started = asyncio.Event()
             self.cleanup_release = asyncio.Event()
             self.cleanup_finished = asyncio.Event()
+            self.cleanup_cancelled = asyncio.Event()
 
         def __aiter__(self) -> FailingCloseIterator:
             return self
@@ -13616,7 +13634,11 @@ def test_provider_cancellation_marker_precedes_operator_terminal_transition() ->
 
         async def aclose(self) -> None:
             self.close_started.set()
-            await self.cleanup_release.wait()
+            try:
+                await self.cleanup_release.wait()
+            except asyncio.CancelledError:
+                self.cleanup_cancelled.set()
+                raise
             self.cleanup_finished.set()
             raise RuntimeError("private provider cleanup failure") from None
 
@@ -13668,11 +13690,19 @@ def test_provider_cancellation_marker_precedes_operator_terminal_transition() ->
                 "phase": "provider_stream_cleanup",
                 "error": "Provider stream cleanup did not complete normally.",
                 "error_type": "ProviderStreamCleanupError",
+                "cleanup_diagnostic_version": 1,
+                "cleanup_action": "stream_close",
+                "cleanup_reason": "cleanup_cancelled",
+                "cleanup_exception_type": "CancelledError",
+                "cancellation_requested": True,
+                "stream_close_state": "not_confirmed",
+                "remote_cancellation_state": "unknown",
+                "remote_settlement_state": "unknown",
             },
         ]
         assert provider.iterator.cleanup_finished.is_set() is False
         provider.iterator.cleanup_release.set()
-        await asyncio.wait_for(provider.iterator.cleanup_finished.wait(), timeout=2)
+        assert provider.iterator.cleanup_cancelled.is_set()
 
     asyncio.run(run())
 
@@ -14038,6 +14068,22 @@ def test_cayu_app_preserves_caller_cancellation_across_late_explicit_close_failu
                 "phase": "provider_stream_cleanup",
                 "error": "Provider stream cleanup did not complete normally.",
                 "error_type": "ProviderStreamCleanupError",
+                "cleanup_diagnostic_version": 1,
+                "cleanup_action": "stream_close",
+                "cleanup_reason": "close_exception",
+                "cleanup_exception_type": "RuntimeError",
+                "cancellation_requested": True,
+                "stream_close_state": "not_confirmed",
+                "remote_cancellation_state": "unknown",
+                "remote_settlement_state": "unknown",
+                **{
+                    key: next(
+                        record.event.payload[key]
+                        for record in records
+                        if record.event.type is EventType.MODEL_STARTED
+                    )
+                    for key in ("model_step_id", "model_attempt_id")
+                },
             }
         ]
         assert EventType.MODEL_ERROR not in {event.type for event in events}

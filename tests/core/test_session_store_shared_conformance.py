@@ -2204,6 +2204,22 @@ def test_session_store_conformance_persists_provider_stream_cancellation_diagnos
                     "phase": "provider_stream_cleanup",
                     "error": "Provider stream cleanup did not complete normally.",
                     "error_type": "ProviderStreamCleanupError",
+                    "cleanup_diagnostic_version": 1,
+                    "cleanup_action": "stream_close",
+                    "cleanup_reason": "cleanup_cancelled",
+                    "cleanup_exception_type": "CancelledError",
+                    "cancellation_requested": True,
+                    "stream_close_state": "not_confirmed",
+                    "remote_cancellation_state": "unknown",
+                    "remote_settlement_state": "unknown",
+                    **{
+                        key: next(
+                            record.event.payload[key]
+                            for record in records
+                            if record.event.type is EventType.MODEL_STARTED
+                        )
+                        for key in ("model_step_id", "model_attempt_id")
+                    },
                 },
             ]
         finally:

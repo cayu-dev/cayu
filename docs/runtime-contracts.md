@@ -7524,10 +7524,40 @@ session terminates as `interrupted` without first publishing `model.error` or
 `session.failed`. The matching `session.interrupted` may contain at most two
 ordered `provider_cancellation_failures` entries. Their phases are limited to
 `model_stream`, `provider_stream_cleanup`, and
-`billing_identity_for_request`; each entry is a fixed, bounded classification
-and never retains provider exception attributes, traceback state, requests,
-credentials, or response bodies. Provider work is not retried merely to collect
-this secondary evidence. Live synchronous model dispatch reserves bounded
+`billing_identity_for_request`. Legacy three-field entries remain readable.
+New `provider_stream_cleanup` entries include `cleanup_diagnostic_version=1`,
+`cleanup_action` (`stream_close`, `stream_close_lookup`, or `unknown`), `cleanup_reason`
+(`close_exception`, `cleanup_timeout`, `cleanup_cancelled`, `cleanup_pending`,
+or `unknown_exception`), and an allowlisted exact `cleanup_exception_type`.
+Unknown extension classes remain `unknown`; no class-name, formatting, or
+exception-attribute hooks are invoked to classify them. Exact `ModelProviderError`
+instances may contribute a valid HTTP `cleanup_status_code` and closed,
+provider-specific `cleanup_provider` / `cleanup_error_code` values (OpenAI:
+`rate_limit_exceeded`, `server_error`, `insufficient_quota`; Anthropic:
+`rate_limit_error`, `overloaded_error`, `api_error`). Other codes are omitted.
+No arbitrary exception text, stack traces, request IDs, response bodies, URLs,
+headers, prompts, or credentials enter these diagnostics.
+
+`cancellation_requested=true` records observed caller task cancellation, not a
+remote provider cancellation request. `stream_close_state=pending` means the
+owned close is still running when evidence is captured; `not_confirmed` means
+closure was not confirmed after a cleanup exception. A timeout is classified
+only when the close actually raises a trusted timeout exception; pending cleanup
+alone is not a timeout. Successful closure adds no failure entry. The local
+iterator-close boundary cannot establish remote cancellation or settlement, so
+`remote_cancellation_state` and `remote_settlement_state` remain `unknown`.
+Provider-operation cancellation and settlement receipts retain their separate
+authority; local close diagnostics do not replace those receipts.
+
+The attempt owner adds existing `model_step_id` and `model_attempt_id` when
+available, allowing durable diagnostics to join to the model event and its
+interaction identity. The containing interruption retains its existing
+`interruption_request_id`. No provider-operation identity is invented. Public
+projection omits private model IDs from these entries while retaining the safe
+classifications; durable evidence and restart repair preserve them. Each entry
+has a closed flat schema, and merging keeps the first observation per phase
+within the existing two-entry bound. Provider work is not retried merely to
+collect this secondary evidence. Live synchronous model dispatch reserves bounded
 cleanup ownership before invoking `ModelProvider.stream`; if caller
 cancellation meets an unsettled close, the caller stops waiting while that
 exact close remains retained until settlement. This opt-in ownership is not a

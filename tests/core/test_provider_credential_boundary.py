@@ -296,6 +296,14 @@ async def test_explicit_live_model_cleanup_owner_releases_caller_during_opaque_c
             "phase": "provider_stream_cleanup",
             "error": "Provider stream cleanup did not complete normally.",
             "error_type": "ProviderStreamCleanupError",
+            "cleanup_diagnostic_version": 1,
+            "cleanup_action": "stream_close",
+            "cleanup_reason": "cleanup_cancelled",
+            "cleanup_exception_type": "CancelledError",
+            "cancellation_requested": True,
+            "stream_close_state": "pending",
+            "remote_cancellation_state": "unknown",
+            "remote_settlement_state": "unknown",
         },
     )
 
@@ -357,6 +365,14 @@ async def test_explicit_cleanup_owner_preserves_real_cancellation_after_deadline
                 "phase": "provider_stream_cleanup",
                 "error": "Provider stream cleanup did not complete normally.",
                 "error_type": "ProviderStreamCleanupError",
+                "cleanup_diagnostic_version": 1,
+                "cleanup_action": "stream_close",
+                "cleanup_reason": "cleanup_cancelled",
+                "cleanup_exception_type": "CancelledError",
+                "cancellation_requested": True,
+                "stream_close_state": "pending",
+                "remote_cancellation_state": "unknown",
+                "remote_settlement_state": "unknown",
             },
         )
     finally:

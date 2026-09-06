@@ -22,6 +22,7 @@ from cayu._exception_state import (
     set_exception_state,
 )
 from cayu._validation import require_durable_nonblank
+from cayu.providers._cleanup_diagnostics import cleanup_diagnostics, copy_cleanup_diagnostics
 from cayu.providers.base import ModelProviderError, ModelStreamDeadlineError
 from cayu.providers.deadlines import (
     DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
@@ -245,7 +246,11 @@ def copy_provider_cancellation_failures(
         if type(failure) is not dict:
             raise TypeError(f"Provider cancellation failure {index} must be a dict.")
         failure = cast("dict[object, object]", failure)
-        if set(failure) != {"phase", "error", "error_type"}:
+        if (
+            len(failure) > 16
+            or any(type(key) is not str for key in failure)
+            or not {"phase", "error", "error_type"} <= failure.keys()
+        ):
             raise ValueError("Provider cancellation failure fields are invalid.")
         phase = failure.get("phase")
         error = failure.get("error")
@@ -260,7 +265,13 @@ def copy_provider_cancellation_failures(
         if type(error_type) is not str or error_type != expected_error_type:
             raise ValueError("Provider cancellation failure error_type is invalid.")
         seen_phases.add(phase)
-        copied.append({"phase": phase, "error": error, "error_type": error_type})
+        entry = {"phase": phase, "error": error, "error_type": error_type}
+        extra = {key: value for key, value in failure.items() if key not in entry}
+        if extra:
+            if phase != "provider_stream_cleanup":
+                raise ValueError("Provider cancellation failure fields are invalid.")
+            entry.update(copy_cleanup_diagnostics(cast("dict[str, Any]", extra)))
+        copied.append(entry)
     return tuple(copied)
 
 
@@ -546,6 +557,7 @@ async def aclosing_provider_stream(
     cleanup_failure: BaseException | None = None
     cleanup_unsettled = False
     cleanup_task_tracked = False
+    cleanup_action = "stream_close_lookup"
     closing = False
     task = asyncio.current_task()
     if cancellation_baseline is None:
@@ -575,10 +587,12 @@ async def aclosing_provider_stream(
             )
             close = None
             if deadline_failure and cleanup_ownership is None:
+                cleanup_action = "unknown"
                 cleanup_unsettled = await close_provider_stream_after_deadline(source)
             else:
                 close = getattr(source, "aclose", None)
             if callable(close):
+                cleanup_action = "stream_close"
                 close_operation = cast("Callable[[], Awaitable[None]]", close)
                 if cleanup_ownership is None:
                     await close_operation()
@@ -620,6 +634,8 @@ async def aclosing_provider_stream(
                 cleanup_ownership.release()
         except BaseException as exc:
             cleanup_failure = exc
+            if cleanup_task_tracked:
+                cleanup_unsettled = not cleanup_task.done()
             if (
                 cleanup_ownership is not None
                 and cleanup_ownership.reserved
@@ -672,6 +688,9 @@ async def aclosing_provider_stream(
                     "phase": "provider_stream_cleanup",
                     "error": "Provider stream cleanup did not complete normally.",
                     "error_type": "ProviderStreamCleanupError",
+                    **cleanup_diagnostics(
+                        cleanup_failure, unsettled=cleanup_unsettled, action=cleanup_action
+                    ),
                 }
             )
         cancellation = credential_safe_provider_cancellation(

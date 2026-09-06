@@ -4171,8 +4171,15 @@ def _project_runtime_event(
         if provider_failures is None:
             redacted_payload.pop("provider_cancellation_failures", None)
         else:
+            # Fixed classifications bypass generic redaction, but the attempt
+            # owner's correlation IDs remain private durable authority.
             redacted_payload["provider_cancellation_failures"] = [
-                dict(item) for item in provider_failures
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"model_step_id", "model_attempt_id"}
+                }
+                for item in provider_failures
             ]
     _restore_publication_safe_request_fingerprints(
         event,

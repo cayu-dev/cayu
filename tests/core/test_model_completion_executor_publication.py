@@ -1265,6 +1265,18 @@ def test_model_executor_publishes_completion_before_grouped_aclose_failure() -> 
             "phase": "provider_stream_cleanup",
             "error": "Provider stream cleanup did not complete normally.",
             "error_type": "ProviderStreamCleanupError",
+            "cleanup_diagnostic_version": 1,
+            "cleanup_action": "stream_close",
+            "cleanup_reason": "unknown_exception",
+            "cleanup_exception_type": "unknown",
+            "cancellation_requested": True,
+            "stream_close_state": "not_confirmed",
+            "remote_cancellation_state": "unknown",
+            "remote_settlement_state": "unknown",
+            **{
+                key: observed[0].completion_event.payload[key]
+                for key in ("model_step_id", "model_attempt_id")
+            },
         },
     )
     assert provider.events.cleanup_failure is not raised.__cause__

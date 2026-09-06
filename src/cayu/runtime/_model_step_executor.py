@@ -8127,7 +8127,12 @@ class ModelStepExecutor:
                     stream_cleanup_cancelled_after_failure=(
                         stream_cleanup_cancelled_after_provider_failure(exc)
                     ),
-                    provider_cancellation_failures=provider_cancellation_failures(exc),
+                    provider_cancellation_failures=tuple(
+                        {**failure, **model_attempt_identity.payload()}
+                        if "cleanup_diagnostic_version" in failure
+                        else failure
+                        for failure in provider_cancellation_failures(exc)
+                    ),
                 )
             elif isinstance(exc, _ProviderStreamSelfCancellation):
                 # Only the exact provider iterator boundary can mint this
