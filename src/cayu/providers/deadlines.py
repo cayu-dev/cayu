@@ -459,7 +459,13 @@ class ProviderStreamDeadlineController:
         *,
         kinds: Iterable[ProviderDeadlineKind],
         accept_cancelled_result: Callable[[_T], bool] | None = None,
+        on_interrupted: Callable[[asyncio.Future[_T]], None] | None = None,
     ) -> _T:
+        """Wait within stream clocks, handing interrupted reads back to their owner.
+
+        ``on_interrupted`` runs only for a read this controller cancelled, so the
+        iterator owner can join finalization before closing the stream.
+        """
         selected = tuple(dict.fromkeys(kinds))
         if not selected:
             raise ValueError("At least one deadline kind is required.")
@@ -471,13 +477,14 @@ class ProviderStreamDeadlineController:
                 close()
             raise ProviderStreamDeadlineExceeded(self.evidence(selected, now=now))
         operation = asyncio.ensure_future(awaitable)
+        interrupted = False
         try:
             while True:
                 now = self._loop.time()
                 remaining = min(self._deadline_at(kind) - now for kind in selected)
                 if remaining <= 0:
                     terminal_was_observed = self._terminal_observed
-                    operation.cancel()
+                    interrupted = operation.cancel()
                     # Give cooperative reads one scheduling boundary to settle,
                     # but never await opaque cleanup indefinitely. A real caller
                     # cancellation delivered here remains authoritative.
@@ -549,21 +556,23 @@ class ProviderStreamDeadlineController:
             # Expiry already cancelled and retained the provider read. Do not
             # inject a second cancellation while it is settling cooperatively.
             self._await_ownership.retain(operation)
+            if interrupted and on_interrupted is not None:
+                on_interrupted(operation)
             raise
         except BaseException as failure:
             terminal_was_observed = self._terminal_observed
-            if not operation.done():
-                operation.cancel()
-            if isinstance(failure, asyncio.CancelledError) and accept_cancelled_result is not None:
-                # A bundled parser can turn cancellation delivered after its
-                # authoritative terminal frame into the normalized completion
-                # that runtime must publish first. Give only that cooperative
-                # transition the same single scheduling boundary used by
-                # deadline cleanup; never wait for opaque provider code.
+            if not operation.done() and not interrupted:
+                interrupted = operation.cancel()
+            if isinstance(failure, asyncio.CancelledError):
+                # Let every cooperative read settle before its owner closes the
+                # iterator. Bundled parsers may also preserve a terminal frame;
+                # opaque reads never gain permission to resume caller work.
                 try:
                     await asyncio.sleep(0)
                 except BaseException:
                     self._await_ownership.retain(operation)
+                    if interrupted and on_interrupted is not None:
+                        on_interrupted(operation)
                     raise
                 accepted, accepted_result = _accepted_cancelled_result(
                     operation,
@@ -573,6 +582,12 @@ class ProviderStreamDeadlineController:
                 if accepted:
                     return cast("_T", accepted_result)
             self._await_ownership.retain(operation)
+            if (
+                interrupted
+                and isinstance(failure, asyncio.CancelledError)
+                and on_interrupted is not None
+            ):
+                on_interrupted(operation)
             raise
 
 

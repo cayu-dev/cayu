@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
 
@@ -866,11 +867,12 @@ async def test_runtime_retains_cancellation_resistant_provider_read_until_late_s
         assert captured.value.deadline_evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
         assert captured.value.stream_cleanup_failed is True
         assert cancellation_seen.is_set()
-        assert close_called.is_set()
+        assert not close_called.is_set()
         assert not settled.is_set()
     finally:
         release.set()
         await asyncio.wait_for(settled.wait(), timeout=0.5)
+        await asyncio.wait_for(close_called.wait(), timeout=0.5)
         await asyncio.sleep(0)
 
     with pytest.raises(StopAsyncIteration):
@@ -879,6 +881,9 @@ async def test_runtime_retains_cancellation_resistant_provider_read_until_late_s
 
 @pytest.mark.anyio
 async def test_nonsettling_deadline_read_exhausts_capacity_before_provider_entry() -> None:
+    # Finalize unreachable controllers from earlier tests before fixing capacity;
+    # a later GC release must not create an unrelated admission slot mid-test.
+    gc.collect()
     existing_owners = set(provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS)
     capacity = len(existing_owners) + 1
     cancellation_seen = asyncio.Event()
@@ -948,7 +953,10 @@ async def test_nonsettling_deadline_read_exhausts_capacity_before_provider_entry
 
     release.set()
     await asyncio.wait_for(settled.wait(), timeout=0.5)
-    await asyncio.sleep(0)
+    # Read completion now precedes ordered close and both ownership callbacks.
+    async with asyncio.timeout(0.5):
+        while retained_owner in provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS:
+            await asyncio.sleep(0)
     assert retained_owner not in provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS
 
     admitted = ProbeProvider(completed_events())

@@ -109,8 +109,10 @@ class Verifiers(WorkflowBase):
 
 
 class VerifierProvider(ScriptedModelProvider):
-    def __init__(self, cleanup_failure=False):
+    def __init__(self, cleanup_failure=False, streaming=False):
         super().__init__([])
+        self.streaming = streaming
+        self.read_tasks = set()
         self.cleanup_failure = cleanup_failure
         self.calls = 0
         self.settled = 0
@@ -118,7 +120,10 @@ class VerifierProvider(ScriptedModelProvider):
     async def stream(self, request):
         self.calls += 1
         if request.model == "slow":
+            self.read_tasks.add(asyncio.current_task())
             try:
+                if self.streaming:
+                    yield ModelStreamEvent.text_delta("partial check")
                 await asyncio.Event().wait()
             finally:
                 self.settled += 1
@@ -131,18 +136,24 @@ class VerifierProvider(ScriptedModelProvider):
 @pytest.mark.parametrize(
     "both_expire,cleanup_failure", [(False, False), (True, False), (False, True)]
 )
-def test_native_deadline_and_sqlite_replay(tmp_path, both_expire, cleanup_failure):
+@pytest.mark.parametrize("bounded_parent", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_native_deadline_and_sqlite_replay(
+    tmp_path, both_expire, cleanup_failure, bounded_parent, streaming
+):
     async def run():
         path = tmp_path / "sessions.db"
         store = SQLiteSessionStore(path)
-        provider = VerifierProvider(cleanup_failure)
+        provider = VerifierProvider(cleanup_failure, streaming)
         app = CayuApp(enable_logging=False, session_store=store)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="slow", model="slow"))
         app.register_agent(AgentSpec(name="fast", model="fast"))
         ctx = Verifiers(app).context("workflow")
         await ctx.start()
-        async with execution_deadline_scope(ExecutionDeadline.after(30, scope="parent")):
+        async with execution_deadline_scope(
+            ExecutionDeadline.after(30 if bounded_parent else None, scope="parent")
+        ):
             result = await parallel(
                 [
                     step(
@@ -168,6 +179,10 @@ def test_native_deadline_and_sqlite_replay(tmp_path, both_expire, cleanup_failur
         assert len(result.failures) == (2 if both_expire else 1)
         assert len(result.successes) == (0 if both_expire else 1)
         assert provider.settled == len(result.failures)
+        assert all(task.done() for task in provider.read_tasks)
+        assert provider.calls == 2
+        if not both_expire:
+            assert result.successes[0].text == "negative verification"
         for failure in result.failures:
             assert failure.evidence.classification == "deadline"
             assert failure.evidence.deadline.scope == "verification"
@@ -177,8 +192,18 @@ def test_native_deadline_and_sqlite_replay(tmp_path, both_expire, cleanup_failur
             assert failure.evidence.terminal_event_id is not None
             assert failure.workflow_attempt_id == ctx.attempt_id
             assert failure.evidence.settlement == "unknown"
+            assert failure.evidence.secondary_failures is cleanup_failure
+            terminal = next(
+                event
+                for event in await store.load_events(failure.session_id)
+                if event.id == failure.evidence.terminal_event_id
+            )
+            diagnostics = terminal.payload.get("provider_cancellation_failures", [])
+            assert bool(diagnostics) is cleanup_failure
             if cleanup_failure:
-                assert failure.evidence.secondary_failures
+                assert diagnostics[0]["cleanup_reason"] == "close_exception"
+                assert diagnostics[0]["cleanup_exception_type"] == "RuntimeError"
+                assert diagnostics[0]["remote_settlement_state"] == "unknown"
         calls = provider.calls
         await store.close()
         store = SQLiteSessionStore(path)
@@ -196,8 +221,7 @@ def test_native_deadline_and_sqlite_replay(tmp_path, both_expire, cleanup_failur
             assert replay.run_epoch == failure.evidence.run_epoch
             assert replay.terminal_event_id == failure.evidence.terminal_event_id
             assert replay.settlement == "unknown"
-            if cleanup_failure:
-                assert replay.secondary_failures
+            assert replay.secondary_failures is cleanup_failure
         assert provider.calls == calls
         await store.close()
 
@@ -544,5 +568,181 @@ def test_parallel_accepts_future_outcomes(outcome):
             future.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await parallel([future])
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stop", ["parent_cancel", "parent_deadline", "repeat_cancel"])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_native_parent_stop_does_not_resume_children(stop, streaming):
+    async def run():
+        entered = asyncio.Event()
+        read_tasks = set()
+        finalized = []
+        parent = None
+        timer = None
+
+        class Provider(ScriptedModelProvider):
+            async def stream(self, request):
+                read_tasks.add(asyncio.current_task())
+                if len(read_tasks) == 2:
+                    entered.set()
+                try:
+                    if streaming:
+                        yield ModelStreamEvent.text_delta("partial")
+                    await asyncio.Event().wait()
+                finally:
+                    finalized.append(request.model)
+                    if stop == "repeat_cancel":
+                        asyncio.get_running_loop().call_soon(parent.cancel)
+                yield ModelStreamEvent.completed()
+
+        app = CayuApp(enable_logging=False)
+        app.register_provider(Provider([]), default=True)
+        app.register_agent(AgentSpec(name="slow", model="slow"))
+        ctx = Verifiers(app).context("parent-stop")
+        await ctx.start()
+        resumed = False
+
+        async def invoke():
+            nonlocal timer, resumed
+            async with execution_deadline_scope(ExecutionDeadline.after(60)) as timer:
+                await parallel(
+                    [step(ctx, agent="slow", step_id=name, prompt="check") for name in ("a", "b")]
+                )
+                resumed = True
+
+        parent = asyncio.create_task(invoke())
+        await asyncio.wait_for(entered.wait(), 3)
+        if stop == "parent_deadline":
+            timer.reschedule(asyncio.get_running_loop().time())
+        else:
+            parent.cancel()
+        with pytest.raises(TimeoutError if stop == "parent_deadline" else asyncio.CancelledError):
+            await asyncio.wait_for(parent, 3)
+        assert not resumed
+        assert len(finalized) == 2
+        assert all(task.done() for task in read_tasks)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cleanup", ["delayed_read", "delayed_close"])
+def test_native_retained_cleanup_is_uncertain_after_sqlite_replay(tmp_path, cleanup):
+    async def run():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        closed = asyncio.Event()
+        local_tasks = set()
+        reading = False
+
+        class Stream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                nonlocal reading
+                local_tasks.add(asyncio.current_task())
+                entered.set()
+                reading = True
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if cleanup == "delayed_read":
+                        await release.wait()
+                    raise
+                finally:
+                    reading = False
+
+            async def aclose(self):
+                local_tasks.add(asyncio.current_task())
+                assert not reading
+                if cleanup == "delayed_close":
+                    await release.wait()
+                closed.set()
+
+        class Provider(VerifierProvider):
+            def stream(self, request):
+                if request.model == "slow":
+                    self.calls += 1
+                    return Stream()
+                return super().stream(request)
+
+        provider = Provider()
+        path = tmp_path / "retained.db"
+        store = SQLiteSessionStore(path)
+        app = CayuApp(enable_logging=False, session_store=store)
+        app.register_provider(provider, default=True)
+        for name in ("fast", "slow"):
+            app.register_agent(AgentSpec(name=name, model=name))
+        ctx = Verifiers(app).context("retained")
+        await ctx.start()
+        result_task = asyncio.create_task(
+            parallel(
+                [
+                    step(ctx, agent="fast", step_id="a", prompt="check"),
+                    step(
+                        ctx,
+                        agent="slow",
+                        step_id="b",
+                        prompt="check",
+                        run_options=StepRunOptions(
+                            execution_deadline=ExecutionDeadline.after(1, scope="verification")
+                        ),
+                    ),
+                ]
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            result = await asyncio.wait_for(result_task, 5)
+            assert result.successes[0].text == "negative verification"
+            (failure,) = result.failures
+            assert failure.evidence.classification == "deadline"
+            assert failure.evidence.deadline_phase == "in_flight"
+            assert failure.evidence.secondary_failures
+            assert failure.evidence.settlement == "unknown"
+            assert not closed.is_set()
+            terminal = next(
+                event
+                for event in await store.load_events(failure.session_id)
+                if event.id == failure.evidence.terminal_event_id
+            )
+            diagnostics = terminal.payload["provider_cancellation_failures"]
+            assert any(item["cleanup_reason"] == "cleanup_pending" for item in diagnostics)
+            assert all(item["remote_settlement_state"] == "unknown" for item in diagnostics)
+            calls = provider.calls
+            await store.close()
+            store = SQLiteSessionStore(path)
+            replay_app = CayuApp(enable_logging=False, session_store=store)
+            replay_app.register_provider(provider, default=True)
+            replay_app.register_agent(AgentSpec(name="slow", model="slow"))
+            replay_ctx = Verifiers(replay_app).context("retained")
+            await replay_ctx.start()
+            with pytest.raises(StepError) as raised:
+                await step(replay_ctx, agent="slow", step_id="b", prompt="check")
+            replay = raised.value.evidence
+            assert replay.classification == "deadline"
+            assert replay.deadline_phase == "in_flight"
+            assert replay.secondary_failures
+            assert replay.settlement == "unknown"
+            assert replay.session_id == failure.session_id
+            assert replay.run_epoch == failure.evidence.run_epoch
+            assert replay.terminal_event_id == terminal.id
+            assert raised.value.workflow_attempt_id == replay_ctx.attempt_id
+            reloaded = next(
+                event
+                for event in await store.load_events(failure.session_id)
+                if event.id == terminal.id
+            )
+            assert reloaded.payload["provider_cancellation_failures"] == diagnostics
+            assert provider.calls == calls == 2
+        finally:
+            release.set()
+            await asyncio.wait_for(closed.wait(), 3)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert all(task.done() for task in local_tasks)
+            await store.close()
 
     asyncio.run(run())

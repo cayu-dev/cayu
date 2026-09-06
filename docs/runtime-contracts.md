@@ -8356,6 +8356,17 @@ evaluation capacity must set the provider capacity from measured downstream and
 cleanup capacity; the value is validated as a positive integer and is included
 in execution-profile identity.
 
+On caller cancellation or execution-deadline expiry, Runtime cancels the pending
+provider read and gives cooperative finalization a scheduling boundary before
+closing the iterator. A read that remains pending retains its dispatch ownership;
+its close runs only after that read settles. Delayed reads and closes retain
+bounded local ownership and publish pending cleanup evidence without delaying the
+caller indefinitely. Real read-finalization and close failures remain secondary
+failures; cancellation and typed deadline provenance remain authoritative. A clean
+local close does not establish remote cancellation or settlement, and workflow
+`FailureEvidence.settlement` remains `unknown`. Replay preserves this evidence
+without another provider dispatch.
+
 The bundled HTTP transports also bound one unterminated SSE event to 16 MiB,
 4,096 event lines, and four times the configured protocol-idle timeout. These are
 internal transport-safety ceilings, not provider constructor options. The byte

@@ -486,6 +486,41 @@ def _contains_fatal_signal(failure: BaseException) -> bool:
     return False
 
 
+async def _close_after_provider_read(
+    close: Callable[[], Awaitable[None]] | None,
+    read: asyncio.Future[Any] | None,
+) -> None:
+    """Join an interrupted read before closing its iterator, preserving both failures."""
+
+    read_failure: BaseException | None = None
+    if read is not None:
+        # Shield retained reads: repeated caller cancellation must not inject a
+        # second cancellation into provider finalization.
+        if not read.done():
+            await asyncio.wait((read,))
+        if read.cancelled():
+            try:
+                read.result()
+            except asyncio.CancelledError as failure:
+                if provider_cancellation_failures(failure):
+                    read_failure = failure
+        else:
+            read_failure = read.exception()
+            if read_failure is None:
+                read_failure = RuntimeError("Provider read suppressed cancellation")
+    try:
+        if close is not None:
+            await close()
+    except BaseException as close_failure:
+        if read_failure is not None:
+            raise BaseExceptionGroup(
+                "Provider read and close failed", [read_failure, close_failure]
+            ) from None
+        raise
+    if read_failure is not None:
+        raise read_failure
+
+
 async def close_provider_stream_after_deadline(source: AsyncIterator[object]) -> bool:
     """Start bounded retained cleanup without delaying an established deadline.
 
@@ -540,6 +575,8 @@ async def aclosing_provider_stream(
     *,
     cancellation_baseline: int | None = None,
     cleanup_ownership: _ProviderStreamCleanupOwnership | None = None,
+    pending_read: Callable[[], asyncio.Future[Any] | None] | None = None,
+    retain_cleanup: Callable[[asyncio.Future[Any]], None] | None = None,
 ) -> AsyncIterator[AsyncIterator[object]]:
     """Close a nested provider stream before propagating its outcome.
 
@@ -552,6 +589,9 @@ async def aclosing_provider_stream(
     without exposing provider-controlled cleanup details. Genuine task
     cancellation and process-level cleanup signals remain authoritative.
     """
+
+    if pending_read is not None and retain_cleanup is None:
+        raise ValueError("Interrupted provider reads require retained cleanup ownership.")
 
     operation_failure: BaseException | None = None
     cleanup_failure: BaseException | None = None
@@ -585,28 +625,38 @@ async def aclosing_provider_stream(
                 type(operation_failure) is ProviderStreamDeadlineExceeded
                 or type(operation_failure) is ModelStreamDeadlineError
             )
+            read = None if pending_read is None else pending_read()
             close = None
-            if deadline_failure and cleanup_ownership is None:
+            if deadline_failure and cleanup_ownership is None and read is None:
                 cleanup_action = "unknown"
                 cleanup_unsettled = await close_provider_stream_after_deadline(source)
             else:
                 close = getattr(source, "aclose", None)
-            if callable(close):
+            if callable(close) or read is not None:
                 cleanup_action = "stream_close"
-                close_operation = cast("Callable[[], Awaitable[None]]", close)
-                if cleanup_ownership is None:
-                    await close_operation()
+                close_operation = (
+                    cast("Callable[[], Awaitable[None]]", close) if callable(close) else None
+                )
+                if cleanup_ownership is None and read is None:
+                    await _close_after_provider_read(close_operation, read)
                 else:
 
                     async def capture_close() -> _ProviderStreamCleanupOutcome:
                         try:
-                            await close_operation()
+                            await _close_after_provider_read(close_operation, read)
                         except BaseException as exc:
                             return _ProviderStreamCleanupOutcome(error=exc)
                         return _ProviderStreamCleanupOutcome()
 
                     cleanup_task = asyncio.create_task(capture_close())
-                    cleanup_ownership.track(cleanup_task)
+                    if cleanup_ownership is not None:
+                        cleanup_ownership.track(cleanup_task)
+                    else:
+                        # The dispatch already reserved a read slot. Retain its
+                        # ordered close under the same owner, without introducing
+                        # a smaller cancellation-only capacity limit.
+                        assert retain_cleanup is not None
+                        retain_cleanup(cleanup_task)
                     cleanup_task_tracked = True
                     current_count = task.cancelling() if task is not None else 0
                     if deadline_failure or current_count > cancellation_baseline:
@@ -705,6 +755,9 @@ async def aclosing_provider_stream(
                 ()
                 if inherited_handoff is None
                 else inherited_handoff.provider_cancellation_failures,
+                provider_cancellation_failures(cleanup_failure)
+                if isinstance(cleanup_failure, asyncio.CancelledError)
+                else (),
                 tuple(diagnostics),
             ),
         )

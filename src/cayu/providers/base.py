@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from abc import ABC, abstractmethod
@@ -1630,7 +1631,17 @@ async def _guard_normalized_provider_stream(
         raise ValueError("Provider stream deadline policy changed after dispatch admission.")
     try:
         iterator = events.__aiter__()
-        async with aclosing_provider_stream(iterator) as raw_guarded:
+        interrupted_read: asyncio.Future[ModelStreamEvent] | None = None
+
+        def retain_interrupted_read(operation: asyncio.Future[ModelStreamEvent]) -> None:
+            nonlocal interrupted_read
+            interrupted_read = operation
+
+        async with aclosing_provider_stream(
+            iterator,
+            pending_read=lambda: interrupted_read,
+            retain_cleanup=controller.retain_dispatched_operation,
+        ) as raw_guarded:
             guarded = cast("AsyncIterator[ModelStreamEvent]", raw_guarded)
             try:
                 while True:
@@ -1638,6 +1649,7 @@ async def _guard_normalized_provider_stream(
                     try:
                         event = await controller.wait_for(
                             guarded.__anext__(),
+                            on_interrupted=retain_interrupted_read,
                             kinds=(
                                 ProviderDeadlineKind.SEMANTIC_IDLE,
                                 ProviderDeadlineKind.ABSOLUTE,
