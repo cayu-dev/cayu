@@ -68,6 +68,7 @@ class SessionTrajectoryBounds(BaseModel):
 class SessionTrajectoryErrorCode(StrEnum):
     """Stable reason a durable session tree cannot become exact eval evidence."""
 
+    DEADLINE_EXCEEDED = "deadline_exceeded"
     STORE_UNSUPPORTED = "store_unsupported"
     EVIDENCE_READ_FAILED = "evidence_read_failed"
     TERMINAL_EVIDENCE_REJECTED = "terminal_evidence_rejected"
@@ -81,13 +82,23 @@ class SessionTrajectoryErrorCode(StrEnum):
     EVIDENCE_INCONSISTENT = "evidence_inconsistent"
 
 
+WorkflowCaptureStage = Literal[
+    "execution",
+    "terminal_load",
+    "result_projection",
+    "child_capture",
+    "probe_capture",
+    "capture_revalidation",
+    "assertion",
+    "post_scoring_revalidation",
+]
+
+
 class WorkflowCaptureDiagnostic(BaseModel):
     """Payload-free bounded-read rejection; observed is a witness, never a total."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
-    stage: Literal["child_capture", "capture_revalidation", "post_scoring_revalidation"] = (
-        "child_capture"
-    )
+    stage: WorkflowCaptureStage = "child_capture"
     code: SessionTrajectoryErrorCode
     session_id: str
     terminal_code: TerminalSessionEvidenceErrorCode | None = None

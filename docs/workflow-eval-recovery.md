@@ -143,6 +143,19 @@ are unavailable and are not reconstructed by running tools. If a project needs a
 model judge, it must separately and explicitly use its model-scoring surface with
 that surface's normal usage accounting.
 
+## Incremental recovery beyond eager bounds
+
+For larger saved traces, use the optional
+[incremental workflow evidence API](incremental-workflow-evidence.md). It keeps
+payloads in bounded private backing, supports declared deterministic consumers,
+and records separate capture-policy and scoring semantics. SQLite and PostgreSQL
+support it; full-trace and model-backed consumers fail explicitly. This does not
+raise live target defaults or change an original report.
+
+Post-execution timeouts retain a `deadline_exceeded` capture diagnostic with the
+last known phase and already-retained counts, while preserving `case_timeout` and
+completed execution. Counts are not reconstructed through store reads after expiry.
+
 ## Import reports written before attempt anchors
 
 The two retained GAIA smoke reports predate the anchor field. Use

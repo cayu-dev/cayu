@@ -794,6 +794,9 @@ validation fails before provider dispatch.
 
 For configurable child capture limits, precise capture failures, and read-only
 recapture/rescoring, see [Workflow capture and saved-attempt recovery](workflow-eval-recovery.md).
+For large saved traces, [incremental workflow evidence](incremental-workflow-evidence.md)
+provides bounded disk backing, explicit aggregate admission, and declared deterministic
+consumers without repeating execution.
 
 Trial JSON and HTML expose invocation health separately from command exit, timeout,
 and cancellation observations. See [Operation outcome monitoring](operation-outcomes.md)

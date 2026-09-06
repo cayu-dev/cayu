@@ -56,6 +56,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
+    from cayu.runtime.evidence_spool import EvidenceSpool
 
 from pydantic import (
     BaseModel,
@@ -9562,6 +9563,7 @@ class SessionStore(ABC):
     child_session_notification_version: ClassVar[int | None] = None
     supports_public_authority_aliases: ClassVar[bool] = False
     supports_targeted_tool_grants: ClassVar[bool] = False
+    supports_incremental_terminal_evidence: ClassVar[bool] = False
     supports_terminal_session_evidence: ClassVar[bool] = False
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = False
     supports_execution_profile_admission: ClassVar[bool] = False
@@ -11455,6 +11457,25 @@ class SessionStore(ABC):
 
         raise NotImplementedError(
             f"{type(self).__name__} does not implement byte-bounded event queries."
+        )
+
+    async def load_bounded(self, session_id: str, *, max_bytes: int) -> Session | None:
+        """Load a full session only after bounding transport bytes in one snapshot."""
+        raise NotImplementedError("This SessionStore does not support byte-bounded session loads.")
+
+    async def export_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        spool: EvidenceSpool,
+    ) -> None:
+        """Export a stable terminal snapshot to bounded indexed backing.
+
+        Optional capability. Unsupported stores fail before reading payloads;
+        callers must explicitly choose the separate bounded eager fallback.
+        """
+        raise NotImplementedError(
+            "This SessionStore does not support incremental terminal evidence export."
         )
 
     async def load_terminal_session_evidence(

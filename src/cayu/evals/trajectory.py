@@ -3,7 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from cayu.runtime.evidence_spool import EvidenceSpool
 
 from pydantic import BaseModel
 
@@ -790,7 +793,7 @@ async def _load_strict_terminal_evidence(
     return evidence
 
 
-def _validate_terminal_origin_lineage(evidence: TerminalSessionEvidence) -> None:
+def _validate_terminal_origin_lineage(evidence: TerminalSessionEvidence | EvidenceSpool) -> None:
     """Require one origin event whose runtime-owned lineage matches the session."""
 
     session = evidence.session

@@ -178,35 +178,25 @@ async def import_workflow_eval_attempt(
     )
 
 
-async def capture_workflow_eval_attempt(
+def _prepare_workflow_attempt_capture(
     target: WorkflowEvalTarget,
     source_trial: EvalTrialResult,
-    *,
     messages: tuple[Message, ...],
     output: WorkflowEvalResult,
-    bounds: SessionTrajectoryBounds,
-    expected_evidence_sha256: str | None = None,
-) -> SavedWorkflowEvalCapture:
-    """Recapture an exact completed attempt without invoking application callbacks.
-
-    Supply the original target (including its original capture policy), exact input,
-    and original projected output. ``bounds`` controls only this new capture revision.
-    To reject changes since a prior successful capture, supply its evidence_sha256.
-    Persist the returned document separately from the original EvalRun.
-    """
-
+    *,
+    omit_retained_trajectory: bool = False,
+) -> tuple[WorkflowEvalTarget, EvalTrialResult, WorkflowEvalResult, WorkflowAttemptAnchor]:
     if type(target) is not WorkflowEvalTarget:
         raise TypeError("target must be an exact WorkflowEvalTarget")
     # Reconstruct public models: model_copy/model_construct are not validation.
     copied_target = _copy_corpus_target(target)
     assert isinstance(copied_target, WorkflowEvalTarget)
     target = copied_target
-    bounds = SessionTrajectoryBounds.model_validate(bounds.model_dump(mode="python"))
-    if bounds.memory_attribution_bounds != SessionTrajectoryBounds().memory_attribution_bounds:
-        raise ValueError(
-            "Workflow capture bounds cannot override the separate Evals memory policy."
+    source_trial = EvalTrialResult.model_validate(
+        source_trial.model_dump(
+            mode="python", exclude={"trajectory"} if omit_retained_trajectory else None
         )
-    source_trial = EvalTrialResult.model_validate(source_trial.model_dump(mode="python"))
+    )
     output = WorkflowEvalResult.model_validate(output.model_dump(mode="python"))
     anchor = source_trial.workflow_attempt
     if anchor is None or source_trial.execution_status != "completed":
@@ -231,26 +221,88 @@ async def capture_workflow_eval_attempt(
     ):
         _reject(anchor)
 
-    async def read_root():
+    return target, source_trial, output, anchor
+
+
+async def _read_workflow_attempt_root(
+    target: WorkflowEvalTarget,
+    anchor: WorkflowAttemptAnchor,
+    *,
+    root_max_bytes: int | None = None,
+    max_record_bytes: int | None = None,
+    root_max_events: int = 10_000,
+):
+    from cayu._validation import compact_json_utf8_size
+
+    if root_max_bytes is None:
         session = await target.app.session_store.load(anchor.session_id)
-        records = await _load_workflow_eval_records(
-            target.app, session_id=anchor.session_id, workflow_name=target.workflow_spec.name
+        remaining = None
+    else:
+        session = await target.app.session_store.load_bounded(
+            anchor.session_id,
+            max_bytes=min(root_max_bytes, max_record_bytes or root_max_bytes),
         )
-        attempt, completion = _current_workflow_completion(
-            records, workflow_name=target.workflow_spec.name
+        remaining = root_max_bytes - (
+            0 if session is None else compact_json_utf8_size(session.model_dump(mode="json"))
         )
-        if sum(record.event.type == WORKFLOW_ATTEMPT_EVENT_TYPE for record in records) != 1:
+        if remaining <= 0:
             _reject(anchor)
-        if (
-            session is None
-            or session.status is not SessionStatus.COMPLETED
-            or attempt != anchor.attempt_id
-            or completion.event.id != anchor.completion_event_id
-            or completion.sequence != anchor.completion_sequence
-            or _workflow_root_sha256(session, records) != anchor.root_sha256
-        ):
-            _reject(anchor)
-        return session, records
+    records = await _load_workflow_eval_records(
+        target.app,
+        session_id=anchor.session_id,
+        workflow_name=target.workflow_spec.name,
+        max_bytes=remaining,
+        max_record_bytes=max_record_bytes,
+        max_events=root_max_events,
+    )
+    attempt, completion = _current_workflow_completion(
+        records, workflow_name=target.workflow_spec.name
+    )
+    if sum(record.event.type == WORKFLOW_ATTEMPT_EVENT_TYPE for record in records) != 1:
+        _reject(anchor)
+    if (
+        session is None
+        or session.status is not SessionStatus.COMPLETED
+        or attempt != anchor.attempt_id
+        or completion.event.id != anchor.completion_event_id
+        or completion.sequence != anchor.completion_sequence
+        or _workflow_root_sha256(session, records) != anchor.root_sha256
+    ):
+        _reject(anchor)
+    return session, records
+
+
+async def capture_workflow_eval_attempt(
+    target: WorkflowEvalTarget,
+    source_trial: EvalTrialResult,
+    *,
+    messages: tuple[Message, ...],
+    output: WorkflowEvalResult,
+    bounds: SessionTrajectoryBounds,
+    expected_evidence_sha256: str | None = None,
+) -> SavedWorkflowEvalCapture:
+    """Recapture an exact completed attempt without invoking application callbacks.
+
+    Supply the original target (including its original capture policy), exact input,
+    and original projected output. ``bounds`` controls only this new capture revision.
+    To reject changes since a prior successful capture, supply its evidence_sha256.
+    Persist the returned document separately from the original EvalRun.
+    """
+
+    target, source_trial, output, anchor = _prepare_workflow_attempt_capture(
+        target,
+        source_trial,
+        messages,
+        output,
+    )
+    bounds = SessionTrajectoryBounds.model_validate(bounds.model_dump(mode="python"))
+    if bounds.memory_attribution_bounds != SessionTrajectoryBounds().memory_attribution_bounds:
+        raise ValueError(
+            "Workflow capture bounds cannot override the separate Evals memory policy."
+        )
+
+    async def read_root():
+        return await _read_workflow_attempt_root(target, anchor)
 
     session, records = await read_root()
     state = _CaptureState(bounds=bounds, strict=False, fail_closed=True)

@@ -354,3 +354,30 @@ def test_recovery_rejects_deleted_child_and_model_judge(tmp_path, monkeypatch):
             await store.close()
 
     asyncio.run(exercise())
+
+
+def test_post_execution_timeout_retains_safe_phase_and_progress(monkeypatch):
+    import cayu.evals.runner as runner
+
+    async def exercise():
+        _, target, suite = _setup()
+        entered = asyncio.Event()
+
+        async def blocked_probes(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(runner, "_capture_workflow_child_probes", blocked_probes)
+        run = await run_workflow_eval_suite(target, suite, case_timeout_seconds=10)
+        trial = run.cases[0].trials[0]
+        assert entered.is_set()
+        assert trial.execution_status == "completed"
+        assert trial.score is None
+        assert not trial.evidence_complete
+        assert trial.capture_diagnostic.stage == "probe_capture"
+        assert trial.capture_diagnostic.code == "deadline_exceeded"
+        assert trial.capture_diagnostic.consumed_events > 0
+        assert trial.capture_diagnostic.consumed_bytes > 0
+        assert "phase=probe_capture" in trial.error
+
+    asyncio.run(exercise())

@@ -1068,6 +1068,15 @@ from cayu.evals import (
     write_html_report,
     write_trajectory_json,
 )
+from cayu.evals.incremental_recovery import (
+    IncrementalCaptureProgress,
+    IncrementalSessionSeal,
+    IncrementalWorkflowCaptureError,
+    SavedIncrementalWorkflowCapture,
+    SavedIncrementalWorkflowScore,
+    capture_incremental_workflow_eval_attempt,
+    score_incremental_workflow_eval_capture,
+)
 from cayu.evals.workflow_recovery import (
     SavedWorkflowEvalCapture,
     SavedWorkflowEvalScore,
@@ -2470,6 +2479,12 @@ from cayu.runtime import (
     validate_application_tool_name,
     work_contract_fingerprint,
     work_contract_from_draft,
+)
+from cayu.runtime.evidence_spool import (
+    EvidenceSpool,
+    IncrementalEvidenceAdmission,
+    IncrementalEvidenceError,
+    IncrementalEvidenceLimits,
 )
 from cayu.storage import (
     BUILTIN_KNOWLEDGE_KINDS,
@@ -4082,6 +4097,7 @@ __all__ = [
     "EventWatcherRunResult",
     "EventWatcherState",
     "EventWatcherStore",
+    "EvidenceSpool",
     "ExaWebAdapter",
     "ExecCommand",
     "ExecCommandTool",
@@ -4179,6 +4195,12 @@ __all__ = [
     "IncompleteSessionRecoveryResult",
     "IncompleteSessionsRecoveryPage",
     "IncompleteSessionsRecoveryRequest",
+    "IncrementalCaptureProgress",
+    "IncrementalEvidenceAdmission",
+    "IncrementalEvidenceError",
+    "IncrementalEvidenceLimits",
+    "IncrementalSessionSeal",
+    "IncrementalWorkflowCaptureError",
     "InlineDispatcher",
     "InputTokenCountConfidence",
     "InputTokenCountMethod",
@@ -4936,6 +4958,8 @@ __all__ = [
     "SQLiteMemoryInterventionExecutionStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
+    "SavedIncrementalWorkflowCapture",
+    "SavedIncrementalWorkflowScore",
     "SavedWorkflowEvalCapture",
     "SavedWorkflowEvalScore",
     "SavingsPercentageState",
@@ -5471,6 +5495,7 @@ __all__ = [
     "business_approval_routing_metadata",
     "canonical_tool_id",
     "capture_eval_scenario_from_session",
+    "capture_incremental_workflow_eval_attempt",
     "capture_workflow_eval_attempt",
     "captured_evaluation_result_from_json",
     "captured_evaluation_result_to_json",
@@ -5718,6 +5743,7 @@ __all__ = [
     "scenario_from_corpus_case",
     "scenario_launch_settings_from_invocation",
     "score_captured_evaluation_candidate",
+    "score_incremental_workflow_eval_capture",
     "score_promotion_candidate",
     "score_workflow_eval_capture",
     "scripted_structured_output",

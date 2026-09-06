@@ -168,6 +168,7 @@ from cayu.runtime.event_watchers import (
     copy_event_watcher_claim,
     copy_event_watcher_record,
 )
+from cayu.runtime.evidence_spool import EvidenceSpool
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
     ExecutionProfileDecision,
@@ -24495,6 +24496,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
     child_session_notification_version: ClassVar[int | None] = 1
+    supports_incremental_terminal_evidence: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
@@ -33492,13 +33494,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
-        return await self._load_terminal_session_evidence(
+        result = await self._load_terminal_session_evidence(
             session_id,
             limits=limits,
             observed_interrupted_events=None,
             expected_interrupted_parent_session_id=None,
             require_interrupted_proof=False,
         )
+        assert isinstance(result, TerminalSessionEvidence)
+        return result
 
     async def load_runner_owned_interrupted_evidence(
         self,
@@ -33508,13 +33512,65 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         expected_parent_session_id: str | None = None,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
-        return await self._load_terminal_session_evidence(
+        result = await self._load_terminal_session_evidence(
             session_id,
             limits=limits,
             observed_interrupted_events=observed_events,
             expected_interrupted_parent_session_id=expected_parent_session_id,
             require_interrupted_proof=True,
         )
+        assert isinstance(result, TerminalSessionEvidence)
+        return result
+
+    async def load_bounded(self, session_id: str, *, max_bytes: int) -> Session | None:
+        from cayu._validation import compact_json_utf8_size
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 8_388_608:
+            raise ValueError("max_bytes must be an integer in 1..8388608.")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            await cur.execute(
+                "SELECT octet_length(to_jsonb(s)::text) + 1 + COALESCE((SELECT "
+                "SUM(octet_length(key) + octet_length(value)) FROM cayu_session_labels "
+                "WHERE session_id = s.id), 0) FROM cayu_sessions s WHERE id = %s",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            if row[0] > max_bytes + (max_bytes + 1) // 2:
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED, limit=max_bytes
+                )
+            session = await self._load(cur, session_id)
+            if (
+                session is not None
+                and compact_json_utf8_size(session.model_dump(mode="json")) > max_bytes
+            ):
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED, limit=max_bytes
+                )
+            return session
+
+    async def export_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        spool: EvidenceSpool,
+    ) -> None:
+        """Copy one stable terminal snapshot into caller-owned bounded backing."""
+        async with asyncio.timeout(spool.limits.max_seconds):
+            await self._load_terminal_session_evidence(
+                session_id,
+                limits=None,
+                observed_interrupted_events=None,
+                expected_interrupted_parent_session_id=None,
+                require_interrupted_proof=False,
+                spool=spool,
+            )
+            await spool.seal_async()
 
     async def _load_terminal_session_evidence(
         self,
@@ -33524,14 +33580,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         observed_interrupted_events: tuple[RunnerObservedEventIdentity, ...] | None,
         expected_interrupted_parent_session_id: str | None,
         require_interrupted_proof: bool,
-    ) -> TerminalSessionEvidence:
+        spool: EvidenceSpool | None = None,
+    ) -> TerminalSessionEvidence | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        limits = _copy_terminal_session_evidence_limits(limits)
+        eager_limits = _copy_terminal_session_evidence_limits(limits)
+        selected_limits = eager_limits if spool is None else spool.limits
         observed, expected_parent_session_id = _copy_runner_owned_interruption_proof(
             session_id,
             observed_events=observed_interrupted_events,
             expected_parent_session_id=expected_interrupted_parent_session_id,
-            limits=limits,
+            limits=eager_limits,
             required=require_interrupted_proof,
         )
         allow_interrupted = observed is not None or expected_parent_session_id is not None
@@ -33567,6 +33625,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             f"COALESCE(octet_length(session.{column}), 0)"
             for column in (
                 "id",
+                "instance_id",
                 "agent_name",
                 "provider_name",
                 "model",
@@ -33581,15 +33640,21 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_transport_bytes += (
             " + octet_length(session.run_epoch::text)"
             f" + {jsonb_transport_bytes('session.metadata')}"
+            f" + {jsonb_transport_bytes('session.invocation')}"
         )
-        max_record_transport_bytes = transport_limit(limits.max_record_bytes)
-        max_total_transport_bytes = transport_limit(limits.max_total_bytes)
+        max_record_transport_bytes = transport_limit(selected_limits.max_record_bytes)
+        max_total_transport_bytes = transport_limit(selected_limits.max_total_bytes)
 
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    if spool is not None:
+                        await cur.execute(
+                            "SELECT set_config('statement_timeout', %s, true)",
+                            (str(spool.limits.max_seconds * 1000),),
+                        )
                     await cur.execute(
                         f"""
                             SELECT session.status,
@@ -33659,7 +33724,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                    COALESCE(SUM(transport_bytes), 0)
                             FROM bounded_identities
                             """,
-                            (session_id, limits.max_events + 1),
+                            (session_id, selected_limits.max_events + 1),
                         )
                         identity_preflight = await cur.fetchone()
                         if identity_preflight is None:
@@ -33667,10 +33732,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                             )
                         identity_count = int(identity_preflight[0])
-                        if identity_count > limits.max_events:
+                        if identity_count > selected_limits.max_events:
                             raise TerminalSessionEvidenceError(
                                 TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
-                                limit=limits.max_events,
+                                limit=selected_limits.max_events,
                                 observed=identity_count,
                             )
                         if identity_count != len(observed):
@@ -33781,10 +33846,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 )
                             operation_id_bytes = int(checkpoint_projection[4])
                             marker_stored_bytes = operation_id_bytes + len(run_epoch_text)
-                            if marker_stored_bytes > limits.max_record_bytes:
+                            if marker_stored_bytes > selected_limits.max_record_bytes:
                                 raise TerminalSessionEvidenceError(
                                     TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
-                                    limit=limits.max_record_bytes,
+                                    limit=selected_limits.max_record_bytes,
                                 )
                             await cur.execute(
                                 """
@@ -33912,7 +33977,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             FROM bounded_events
                             """,
                         ),
-                        (session_id, terminal_record.sequence, limits.max_events + 1),
+                        (session_id, terminal_record.sequence, selected_limits.max_events + 1),
                     )
                     event_preflight = await cur.fetchone()
                     await cur.execute(
@@ -33932,7 +33997,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             FROM bounded_transcript
                             """,
                         ),
-                        (session_id, limits.max_transcript_records + 1),
+                        (session_id, selected_limits.max_transcript_records + 1),
                     )
                     transcript_preflight = await cur.fetchone()
                     if event_preflight is None or transcript_preflight is None:
@@ -33941,16 +34006,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     event_count = int(event_preflight[0])
                     transcript_count = int(transcript_preflight[0])
-                    if event_count > limits.max_events:
+                    if event_count > selected_limits.max_events:
                         raise TerminalSessionEvidenceError(
                             TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
-                            limit=limits.max_events,
+                            limit=selected_limits.max_events,
                             observed=event_count,
                         )
-                    if transcript_count > limits.max_transcript_records:
+                    if transcript_count > selected_limits.max_transcript_records:
                         raise TerminalSessionEvidenceError(
                             TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED,
-                            limit=limits.max_transcript_records,
+                            limit=selected_limits.max_transcript_records,
                             observed=transcript_count,
                         )
                     largest_transport_bytes = max(
@@ -33983,6 +34048,82 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise TerminalSessionEvidenceError(
                             TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                         )
+                    if spool is not None:
+                        after_sequence = 0
+                        while True:
+                            spool.check()
+                            await cur.execute(
+                                "SELECT sequence, event, input_contract_runtime_owned, "
+                                f"file_attachment_attestations_runtime_owned, ({event_transport_bytes}), "
+                                "((event->>'id') IS NOT DISTINCT FROM event_id AND "
+                                "(event->>'session_id') IS NOT DISTINCT FROM session_id AND "
+                                "(event->>'type') IS NOT DISTINCT FROM event_type AND "
+                                "(event->>'interaction_id') IS NOT DISTINCT FROM interaction_id AND "
+                                "(event->>'agent_name') IS NOT DISTINCT FROM agent_name AND "
+                                "(event->>'environment_name') IS NOT DISTINCT FROM environment_name AND "
+                                "(event->>'workflow_name') IS NOT DISTINCT FROM workflow_name AND "
+                                "(event->>'tool_name') IS NOT DISTINCT FROM tool_name AND "
+                                "(event->'payload') IS NOT DISTINCT FROM payload) "
+                                "FROM cayu_events "
+                                "WHERE session_id = %s AND sequence > %s AND sequence <= %s "
+                                "ORDER BY sequence ASC LIMIT %s",
+                                (
+                                    session_id,
+                                    after_sequence,
+                                    terminal_record.sequence,
+                                    spool.limits.batch_records,
+                                ),
+                            )
+                            rows = await cur.fetchall()
+                            if not rows:
+                                break
+                            spool.observe_page(
+                                records=len(rows), transport_bytes=sum(row[4] for row in rows)
+                            )
+                            for row in rows:
+                                if row[5] is not True:
+                                    raise TerminalSessionEvidenceError(
+                                        TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                                    )
+                                spool.append(
+                                    "event",
+                                    EventRecord(
+                                        sequence=row[0],
+                                        event=restore_persisted_event_authority(
+                                            Event(**_json_obj(row[1])),
+                                            input_contract_runtime_owned=row[2],
+                                            file_attachment_attestations_runtime_owned=row[3],
+                                        ),
+                                    ),
+                                )
+                            after_sequence = rows[-1][0]
+                        after_index = 0
+                        while True:
+                            spool.check()
+                            await cur.execute(
+                                f"SELECT session_order, interaction_id, message, ({transcript_transport_bytes}) "
+                                "FROM cayu_transcript_messages WHERE session_id = %s "
+                                "AND session_order > %s ORDER BY session_order ASC LIMIT %s",
+                                (session_id, after_index, spool.limits.batch_records),
+                            )
+                            rows = await cur.fetchall()
+                            if not rows:
+                                break
+                            spool.observe_page(
+                                records=len(rows), transport_bytes=sum(row[3] for row in rows)
+                            )
+                            for row in rows:
+                                spool.append(
+                                    "transcript",
+                                    TranscriptRecord(
+                                        index=row[0] - 1,
+                                        interaction_id=row[1],
+                                        message=Message(**_json_obj(row[2])),
+                                    ),
+                                )
+                            after_index = rows[-1][0]
+                        spool.stage(session, marker, terminal_record, event_count, transcript_count)
+                        return None
                     await cur.execute(
                         """
                         SELECT sequence, event, input_contract_runtime_owned,
@@ -34033,7 +34174,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         terminal_record=terminal_record,
                         events=events,
                         transcript=transcript,
-                        limits=limits,
+                        limits=eager_limits,
                         allow_interrupted=allow_interrupted,
                     )
             except TerminalSessionEvidenceError:

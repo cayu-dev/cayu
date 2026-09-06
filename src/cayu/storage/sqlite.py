@@ -94,6 +94,7 @@ from cayu.runtime.completion_verifier_profiles import (
     copy_completion_verifier_profile_record,
     require_completion_verifier_profile_transition,
 )
+from cayu.runtime.evidence_spool import EvidenceSpool, _settled_evidence_reads_required
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
     ExecutionProfileDecision,
@@ -1703,6 +1704,7 @@ class SQLiteSessionStore(SessionStore):
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
     child_session_notification_version: ClassVar[int | None] = 1
+    supports_incremental_terminal_evidence: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
@@ -2132,6 +2134,14 @@ class SQLiteSessionStore(SessionStore):
         def guarded(connection: sqlite3.Connection) -> _T:
             self._require_current_public_authority_configuration(connection)
             return query(connection)
+
+        if _settled_evidence_reads_required():
+            return await _run_off_thread_with_connection_ownership(
+                self._read_lock,
+                self._read_connection,
+                guarded,
+                interrupt_on_cancellation=True,
+            )
 
         owner = asyncio.create_task(
             _run_off_thread_with_connection_ownership(
@@ -10318,13 +10328,15 @@ class SQLiteSessionStore(SessionStore):
         *,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
-        return await self._load_terminal_session_evidence(
+        result = await self._load_terminal_session_evidence(
             session_id,
             limits=limits,
             observed_interrupted_events=None,
             expected_interrupted_parent_session_id=None,
             require_interrupted_proof=False,
         )
+        assert isinstance(result, TerminalSessionEvidence)
+        return result
 
     async def load_runner_owned_interrupted_evidence(
         self,
@@ -10334,13 +10346,71 @@ class SQLiteSessionStore(SessionStore):
         expected_parent_session_id: str | None = None,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
-        return await self._load_terminal_session_evidence(
+        result = await self._load_terminal_session_evidence(
             session_id,
             limits=limits,
             observed_interrupted_events=observed_events,
             expected_interrupted_parent_session_id=expected_parent_session_id,
             require_interrupted_proof=True,
         )
+        assert isinstance(result, TerminalSessionEvidence)
+        return result
+
+    async def load_bounded(self, session_id: str, *, max_bytes: int) -> Session | None:
+        from cayu._validation import compact_json_utf8_size
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 8_388_608:
+            raise ValueError("max_bytes must be an integer in 1..8388608.")
+
+        def read(connection: sqlite3.Connection) -> Session | None:
+            connection.execute("BEGIN")
+            try:
+                row = connection.execute(
+                    "SELECT (COALESCE(length(CAST(s.id AS BLOB)), 0) + COALESCE(length(CAST(s.instance_id AS BLOB)), 0) + COALESCE(length(CAST(s.agent_name AS BLOB)), 0) + COALESCE(length(CAST(s.provider_name AS BLOB)), 0) + COALESCE(length(CAST(s.model AS BLOB)), 0) + COALESCE(length(CAST(s.parent_session_id AS BLOB)), 0) + COALESCE(length(CAST(s.causal_budget_id AS BLOB)), 0) + COALESCE(length(CAST(s.runtime_name AS BLOB)), 0) + COALESCE(length(CAST(s.runtime_version AS BLOB)), 0) + COALESCE(length(CAST(s.environment_name AS BLOB)), 0) + COALESCE(length(CAST(s.status AS BLOB)), 0) + COALESCE(length(CAST(s.created_at AS BLOB)), 0) + COALESCE(length(CAST(s.updated_at AS BLOB)), 0) + COALESCE(length(CAST(s.last_activity_at AS BLOB)), 0) + COALESCE(length(CAST(s.run_epoch AS BLOB)), 0) + COALESCE(length(CAST(s.invocation_json AS BLOB)), 0) + COALESCE(length(CAST(s.metadata_json AS BLOB)), 0)) + COALESCE((SELECT SUM(length(CAST(key AS BLOB)) "
+                    "+ length(CAST(value AS BLOB))) FROM cayu_session_labels "
+                    "WHERE session_id = s.id), 0) FROM cayu_sessions s WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row[0] > max_bytes:
+                    raise TerminalSessionEvidenceError(
+                        TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED, limit=max_bytes
+                    )
+                session = _load_session(connection, session_id)
+                if (
+                    session is not None
+                    and compact_json_utf8_size(session.model_dump(mode="json")) > max_bytes
+                ):
+                    raise TerminalSessionEvidenceError(
+                        TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED, limit=max_bytes
+                    )
+                return session
+            finally:
+                connection.rollback()
+
+        return await self._run_read(read)
+
+    async def export_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        spool: EvidenceSpool,
+    ) -> None:
+        """Copy one stable terminal snapshot into caller-owned bounded backing."""
+        async with asyncio.timeout(spool.limits.max_seconds):
+            await spool.run_owned(
+                self._load_terminal_session_evidence(
+                    session_id,
+                    limits=None,
+                    observed_interrupted_events=None,
+                    expected_interrupted_parent_session_id=None,
+                    require_interrupted_proof=False,
+                    spool=spool,
+                )
+            )
+            await spool.seal_async()
 
     async def _load_terminal_session_evidence(
         self,
@@ -10350,14 +10420,16 @@ class SQLiteSessionStore(SessionStore):
         observed_interrupted_events: tuple[RunnerObservedEventIdentity, ...] | None,
         expected_interrupted_parent_session_id: str | None,
         require_interrupted_proof: bool,
-    ) -> TerminalSessionEvidence:
+        spool: EvidenceSpool | None = None,
+    ) -> TerminalSessionEvidence | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        resolved_limits = _copy_terminal_session_evidence_limits(limits)
+        eager_limits = _copy_terminal_session_evidence_limits(limits)
+        resolved_limits = eager_limits if spool is None else spool.limits
         observed, expected_parent_session_id = _copy_runner_owned_interruption_proof(
             session_id,
             observed_events=observed_interrupted_events,
             expected_parent_session_id=expected_interrupted_parent_session_id,
-            limits=resolved_limits,
+            limits=eager_limits,
             required=require_interrupted_proof,
         )
         allow_interrupted = observed is not None or expected_parent_session_id is not None
@@ -10376,6 +10448,8 @@ class SQLiteSessionStore(SessionStore):
             f"COALESCE(length(CAST(session.{column} AS BLOB)), 0)"
             for column in (
                 "id",
+                "instance_id",
+                "invocation_json",
                 "agent_name",
                 "provider_name",
                 "model",
@@ -10400,8 +10474,10 @@ class SQLiteSessionStore(SessionStore):
             )
         )
 
-        def run_query(connection: sqlite3.Connection) -> TerminalSessionEvidence:
+        def run_query(connection: sqlite3.Connection) -> TerminalSessionEvidence | None:
             limits = resolved_limits
+            if spool is not None:
+                connection.set_progress_handler(lambda: int(spool.should_interrupt()), 1000)
             connection.execute("BEGIN")
             try:
                 session_preflight = connection.execute(
@@ -10810,6 +10886,53 @@ class SQLiteSessionStore(SessionStore):
                     raise TerminalSessionEvidenceError(
                         TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                     )
+                if spool is not None:
+                    cursor = connection.execute(
+                        f"SELECT sequence, {event_columns}, ({event_stored_bytes}) AS transport_bytes FROM cayu_events "
+                        "WHERE session_id = ? AND sequence <= ? ORDER BY sequence ASC",
+                        (session_id, terminal_record.sequence),
+                    )
+                    while True:
+                        spool.check()
+                        rows = cursor.fetchmany(spool.limits.batch_records)
+                        if not rows:
+                            break
+                        spool.observe_page(
+                            records=len(rows),
+                            transport_bytes=sum(row["transport_bytes"] for row in rows),
+                        )
+                        for row in rows:
+                            spool.append(
+                                "event",
+                                EventRecord(sequence=row["sequence"], event=_event_from_row(row)),
+                            )
+                    cursor.close()
+                    cursor = connection.execute(
+                        f"SELECT session_order - 1 AS transcript_index, interaction_id, message_json, ({transcript_stored_bytes}) AS transport_bytes "
+                        "FROM cayu_transcript_messages WHERE session_id = ? ORDER BY session_order ASC",
+                        (session_id,),
+                    )
+                    while True:
+                        spool.check()
+                        rows = cursor.fetchmany(spool.limits.batch_records)
+                        if not rows:
+                            break
+                        spool.observe_page(
+                            records=len(rows),
+                            transport_bytes=sum(row["transport_bytes"] for row in rows),
+                        )
+                        for row in rows:
+                            spool.append(
+                                "transcript",
+                                TranscriptRecord(
+                                    index=row["transcript_index"],
+                                    interaction_id=row["interaction_id"],
+                                    message=Message(**json.loads(row["message_json"])),
+                                ),
+                            )
+                    cursor.close()
+                    spool.stage(session, marker, terminal_record, event_count, transcript_count)
+                    return None
                 event_rows = connection.execute(
                     f"""
                     SELECT sequence, {event_columns}
@@ -10852,7 +10975,7 @@ class SQLiteSessionStore(SessionStore):
                     terminal_record=terminal_record,
                     events=events,
                     transcript=transcript,
-                    limits=limits,
+                    limits=eager_limits,
                     allow_interrupted=allow_interrupted,
                 )
             except TerminalSessionEvidenceError:
@@ -10862,6 +10985,8 @@ class SQLiteSessionStore(SessionStore):
                     TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                 ) from exc
             finally:
+                if spool is not None:
+                    connection.set_progress_handler(None, 0)
                 connection.rollback()
 
         return await self._run_read(run_query)

@@ -13943,6 +13943,18 @@ See [workflow capture and saved-attempt recovery](workflow-eval-recovery.md) for
 policy identities, bounds, diagnostic semantics, immutable capture/score revisions,
 and the explicit historical limits of importing pre-anchor reports.
 
+The optional incremental evidence capability on SQLite/PostgreSQL copies bounded
+pages under one terminal snapshot into owned authenticated JSON backing. Source
+transactions end before local validation/scoring. Exact attempt and parent boundaries,
+content seals, two complete closure reads, root revalidation, finite work/disk/buffer
+budgets and shared aggregate admission remain mandatory. Cancellation settles owned
+workers before backing disposal. Reports distinguish full-scope verification from
+summary-only retention; unsupported consumers and stores fail explicitly. See the
+[incremental evidence contract](incremental-workflow-evidence.md) for backend semantics,
+resource accounting, supported assertions and source-mutation limitations. Live
+post-execution timeouts retain safe phase/capture progress under the outer deadline.
+
+
 ### Model retry decision evidence
 
 The OpenAI Responses adapter recognizes `server_is_overloaded` by error code,

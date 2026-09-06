@@ -338,6 +338,15 @@ from cayu.evals.external_private_memory_ablation import (
     run_external_private_memory_ablation,
     write_external_private_memory_ablation_artifacts,
 )
+from cayu.evals.incremental_recovery import (
+    IncrementalCaptureProgress,
+    IncrementalSessionSeal,
+    IncrementalWorkflowCaptureError,
+    SavedIncrementalWorkflowCapture,
+    SavedIncrementalWorkflowScore,
+    capture_incremental_workflow_eval_attempt,
+    score_incremental_workflow_eval_capture,
+)
 from cayu.evals.judges import LLMJudge
 from cayu.evals.knowledge_maintenance import (
     KNOWLEDGE_MAINTENANCE_EVALUATION_CORPUS_SCHEMA_VERSION,
@@ -868,6 +877,12 @@ from cayu.evals.workflow_target import (
     workflow_eval_trial_session_id,
     workflow_spec_revision,
 )
+from cayu.runtime.evidence_spool import (
+    EvidenceSpool,
+    IncrementalEvidenceAdmission,
+    IncrementalEvidenceError,
+    IncrementalEvidenceLimits,
+)
 
 __all__ = [
     "ASSERTION_EVIDENCE_MAX_BYTES",
@@ -1249,6 +1264,7 @@ __all__ = [
     "EventNotOccurred",
     "EventOccurred",
     "EventPayloadContains",
+    "EvidenceSpool",
     "ExternalBodyReleaseV1",
     "ExternalContainerLaunchRequestV1",
     "ExternalContainerOperationAdapter",
@@ -1282,6 +1298,12 @@ __all__ = [
     "FinalOutputEqualsAssertionSpec",
     "FinalOutputMatches",
     "InMemoryEvalStore",
+    "IncrementalCaptureProgress",
+    "IncrementalEvidenceAdmission",
+    "IncrementalEvidenceError",
+    "IncrementalEvidenceLimits",
+    "IncrementalSessionSeal",
+    "IncrementalWorkflowCaptureError",
     "JudgePrivacyPolicyV1",
     "JudgeProfileIdentityV1",
     "JudgeReferenceV1",
@@ -1414,6 +1436,8 @@ __all__ = [
     "RuntimeReplayReport",
     "RuntimeReplayRequest",
     "RuntimeReplayWarning",
+    "SavedIncrementalWorkflowCapture",
+    "SavedIncrementalWorkflowScore",
     "SavedWorkflowEvalCapture",
     "SavedWorkflowEvalScore",
     "ScenarioApprovalCheckpointEventV2",
@@ -1501,6 +1525,7 @@ __all__ = [
     "build_memory_experiment_report",
     "build_promotion_candidate",
     "capture_eval_scenario_from_session",
+    "capture_incremental_workflow_eval_attempt",
     "capture_workflow_eval_attempt",
     "captured_evaluation_result_from_json",
     "captured_evaluation_result_to_json",
@@ -1630,6 +1655,7 @@ __all__ = [
     "scenario_from_corpus_case",
     "scenario_launch_settings_from_invocation",
     "score_captured_evaluation_candidate",
+    "score_incremental_workflow_eval_capture",
     "score_promotion_candidate",
     "score_workflow_eval_capture",
     "scripted_structured_output",

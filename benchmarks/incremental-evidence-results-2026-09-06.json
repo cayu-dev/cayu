@@ -1,0 +1,579 @@
+{
+  "python": "3.14.2 (main, Jan 27 2026, 23:32:07) [Clang 21.1.4 ]",
+  "platform": "darwin",
+  "results": [
+    {
+      "synthetic_records": 10000,
+      "arrivals": 1,
+      "admitted": 1,
+      "rejected": 0,
+      "seconds": 6.23,
+      "baseline_peak_rss_bytes": 229359616,
+      "peak_rss_bytes": 234373120,
+      "peak_rss_growth_bytes": 5013504,
+      "per_capture_buffer_reservation_bytes": 67814400,
+      "aggregate_buffer_budget_bytes": 536870912,
+      "aggregate_spill_budget_bytes": 4294967296,
+      "limits": {
+        "max_root_bytes": 4194304,
+        "max_root_events": 10000,
+        "max_sessions": 100,
+        "max_depth": 32,
+        "max_events": 10010,
+        "max_transcript_records": 100000,
+        "max_record_bytes": 1048576,
+        "max_total_bytes": 268435456,
+        "max_spill_bytes": 536870912,
+        "batch_records": 4,
+        "max_lifecycle_bytes": 2097152,
+        "max_lifecycle_records": 10000,
+        "max_seconds": 600
+      },
+      "captures": [
+        {
+          "status": "complete",
+          "events": 10003,
+          "evidence_bytes": 4040295,
+          "peak_record_bytes": 965,
+          "peak_page_transport_bytes": 905,
+          "peak_page_records": 4,
+          "spill_records_read": 80034,
+          "spill_bytes": 7143424,
+          "digest": "714bf4a094a0299c7dd5380d21350bad9e0a6eadbfe3c65d0135a17ece0f4e40"
+        }
+      ],
+      "payload_bytes": 128
+    },
+    {
+      "synthetic_records": 100000,
+      "arrivals": 1,
+      "admitted": 1,
+      "rejected": 0,
+      "seconds": 63.488,
+      "baseline_peak_rss_bytes": 229048320,
+      "peak_rss_bytes": 233701376,
+      "peak_rss_growth_bytes": 4653056,
+      "per_capture_buffer_reservation_bytes": 67814400,
+      "aggregate_buffer_budget_bytes": 536870912,
+      "aggregate_spill_budget_bytes": 4294967296,
+      "limits": {
+        "max_root_bytes": 4194304,
+        "max_root_events": 10000,
+        "max_sessions": 100,
+        "max_depth": 32,
+        "max_events": 100010,
+        "max_transcript_records": 100000,
+        "max_record_bytes": 1048576,
+        "max_total_bytes": 268435456,
+        "max_spill_bytes": 536870912,
+        "batch_records": 4,
+        "max_lifecycle_bytes": 2097152,
+        "max_lifecycle_records": 10000,
+        "max_seconds": 600
+      },
+      "captures": [
+        {
+          "status": "complete",
+          "events": 100003,
+          "evidence_bytes": 40580304,
+          "peak_record_bytes": 965,
+          "peak_page_transport_bytes": 913,
+          "peak_page_records": 4,
+          "spill_records_read": 800034,
+          "spill_bytes": 71528448,
+          "digest": "5b5caa377a9734b57187cbd94e164d976178be96d664afc1b69ac2bc24dbc216"
+        }
+      ],
+      "payload_bytes": 128
+    },
+    {
+      "synthetic_records": 250000,
+      "arrivals": 1,
+      "admitted": 1,
+      "rejected": 0,
+      "seconds": 153.72,
+      "baseline_peak_rss_bytes": 222248960,
+      "peak_rss_bytes": 226983936,
+      "peak_rss_growth_bytes": 4734976,
+      "per_capture_buffer_reservation_bytes": 67814400,
+      "aggregate_buffer_budget_bytes": 536870912,
+      "aggregate_spill_budget_bytes": 4294967296,
+      "limits": {
+        "max_root_bytes": 4194304,
+        "max_root_events": 10000,
+        "max_sessions": 100,
+        "max_depth": 32,
+        "max_events": 250010,
+        "max_transcript_records": 100000,
+        "max_record_bytes": 1048576,
+        "max_total_bytes": 268435456,
+        "max_spill_bytes": 536870912,
+        "batch_records": 4,
+        "max_lifecycle_bytes": 2097152,
+        "max_lifecycle_records": 10000,
+        "max_seconds": 600
+      },
+      "captures": [
+        {
+          "status": "complete",
+          "events": 250003,
+          "evidence_bytes": 101780306,
+          "peak_record_bytes": 965,
+          "peak_page_transport_bytes": 920,
+          "peak_page_records": 4,
+          "spill_records_read": 2000034,
+          "spill_bytes": 179064832,
+          "digest": "1c67df9fe3c3aa9626cafd42a320a1e7c19c59bbf1b89ecffc8a97a33a639101"
+        }
+      ],
+      "payload_bytes": 128
+    },
+    {
+      "synthetic_records": 64,
+      "arrivals": 1,
+      "admitted": 1,
+      "rejected": 0,
+      "seconds": 4.822,
+      "baseline_peak_rss_bytes": 230014976,
+      "peak_rss_bytes": 285212672,
+      "peak_rss_growth_bytes": 55197696,
+      "per_capture_buffer_reservation_bytes": 67814400,
+      "aggregate_buffer_budget_bytes": 536870912,
+      "aggregate_spill_budget_bytes": 4294967296,
+      "limits": {
+        "max_root_bytes": 4194304,
+        "max_root_events": 10000,
+        "max_sessions": 100,
+        "max_depth": 32,
+        "max_events": 10000,
+        "max_transcript_records": 100000,
+        "max_record_bytes": 1048576,
+        "max_total_bytes": 268435456,
+        "max_spill_bytes": 536870912,
+        "batch_records": 4,
+        "max_lifecycle_bytes": 2097152,
+        "max_lifecycle_records": 10000,
+        "max_seconds": 600
+      },
+      "captures": [
+        {
+          "status": "complete",
+          "events": 67,
+          "evidence_bytes": 51219887,
+          "peak_record_bytes": 800271,
+          "peak_page_transport_bytes": 3200376,
+          "peak_page_records": 4,
+          "spill_records_read": 546,
+          "spill_bytes": 51429376,
+          "digest": "ac0bc8912a939da777bfe3e8cb42cae2b3d0828c356c1dc5712684555e9d112d"
+        }
+      ],
+      "payload_bytes": 800000
+    },
+    {
+      "synthetic_records": 256,
+      "arrivals": 1,
+      "admitted": 1,
+      "rejected": 0,
+      "seconds": 18.942,
+      "baseline_peak_rss_bytes": 228999168,
+      "peak_rss_bytes": 297025536,
+      "peak_rss_growth_bytes": 68026368,
+      "per_capture_buffer_reservation_bytes": 67814400,
+      "aggregate_buffer_budget_bytes": 536870912,
+      "aggregate_spill_budget_bytes": 4294967296,
+      "limits": {
+        "max_root_bytes": 4194304,
+        "max_root_events": 10000,
+        "max_sessions": 100,
+        "max_depth": 32,
+        "max_events": 10000,
+        "max_transcript_records": 100000,
+        "max_record_bytes": 1048576,
+        "max_total_bytes": 268435456,
+        "max_spill_bytes": 536870912,
+        "batch_records": 4,
+        "max_lifecycle_bytes": 2097152,
+        "max_lifecycle_records": 10000,
+        "max_seconds": 600
+      },
+      "captures": [
+        {
+          "status": "complete",
+          "events": 259,
+          "evidence_bytes": 204872432,
+          "peak_record_bytes": 800273,
+          "peak_page_transport_bytes": 3200384,
+          "peak_page_records": 4,
+          "spill_records_read": 2082,
+          "spill_bytes": 205692928,
+          "digest": "c3677d1b720ab6c1cd07b7734581afd91a7a3606a3d608846af7145779120bb4"
+        }
+      ],
+      "payload_bytes": 800000
+    },
+    {
+      "synthetic_records": 1000,
+      "arrivals": 100,
+      "admitted": 4,
+      "rejected": 96,
+      "seconds": 3.368,
+      "baseline_peak_rss_bytes": 229064704,
+      "peak_rss_bytes": 239026176,
+      "peak_rss_growth_bytes": 9961472,
+      "per_capture_buffer_reservation_bytes": 67814400,
+      "aggregate_buffer_budget_bytes": 536870912,
+      "aggregate_spill_budget_bytes": 4294967296,
+      "limits": {
+        "max_root_bytes": 4194304,
+        "max_root_events": 10000,
+        "max_sessions": 100,
+        "max_depth": 32,
+        "max_events": 10000,
+        "max_transcript_records": 100000,
+        "max_record_bytes": 1048576,
+        "max_total_bytes": 268435456,
+        "max_spill_bytes": 536870912,
+        "batch_records": 4,
+        "max_lifecycle_bytes": 2097152,
+        "max_lifecycle_records": 10000,
+        "max_seconds": 600
+      },
+      "captures": [
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "aggregate_admission_rejected"
+        },
+        {
+          "status": "complete",
+          "events": 1003,
+          "evidence_bytes": 404286,
+          "peak_record_bytes": 965,
+          "peak_page_transport_bytes": 897,
+          "peak_page_records": 4,
+          "spill_records_read": 8034,
+          "spill_bytes": 724992,
+          "digest": "35a3d442a4db2010265a92ba20369cb704c9bdf48b5e38ffd87ed0de0a153841"
+        },
+        {
+          "status": "complete",
+          "events": 1003,
+          "evidence_bytes": 404286,
+          "peak_record_bytes": 965,
+          "peak_page_transport_bytes": 897,
+          "peak_page_records": 4,
+          "spill_records_read": 8034,
+          "spill_bytes": 724992,
+          "digest": "35a3d442a4db2010265a92ba20369cb704c9bdf48b5e38ffd87ed0de0a153841"
+        },
+        {
+          "status": "complete",
+          "events": 1003,
+          "evidence_bytes": 404286,
+          "peak_record_bytes": 965,
+          "peak_page_transport_bytes": 897,
+          "peak_page_records": 4,
+          "spill_records_read": 8034,
+          "spill_bytes": 724992,
+          "digest": "35a3d442a4db2010265a92ba20369cb704c9bdf48b5e38ffd87ed0de0a153841"
+        },
+        {
+          "status": "complete",
+          "events": 1003,
+          "evidence_bytes": 404286,
+          "peak_record_bytes": 965,
+          "peak_page_transport_bytes": 897,
+          "peak_page_records": 4,
+          "spill_records_read": 8034,
+          "spill_bytes": 724992,
+          "digest": "35a3d442a4db2010265a92ba20369cb704c9bdf48b5e38ffd87ed0de0a153841"
+        }
+      ],
+      "payload_bytes": 128
+    }
+  ]
+}
