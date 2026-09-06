@@ -26218,6 +26218,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             request.metadata,
                             identity=identity,
                             tool_capability_ceiling=request.tool_capability_ceiling,
+                            execution_deadline=request.execution_deadline,
+                            parent_session=parent_session,
                         ),
                         labels=request.labels,
                     )

@@ -34,6 +34,7 @@ from cayu.core.messages import (
     ToolResultPart,
     detach_message,
 )
+from cayu.deadlines import current_execution_deadline
 from cayu.providers.cache import CachePolicy, RequestCacheProjection
 from cayu.providers.deadlines import (
     ProviderDeadlineKind,
@@ -1321,6 +1322,7 @@ class ModelProvider(ABC):
         that cannot trust terminal evidence accepted by the wrapped adapter.
         """
 
+        current_execution_deadline().require_admission("model")
         return _runtime_provider_stream(self, request)
 
     @property
@@ -1679,6 +1681,7 @@ async def _runtime_provider_stream(
     # Import lazily because the credential boundary depends on this module.
     from cayu.providers._credential_boundary import aclosing_provider_stream
 
+    current_execution_deadline().require_admission("model")
     deadlines = provider.stream_deadlines
     controller = ProviderStreamDeadlineController(deadlines)
     try:

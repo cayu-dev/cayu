@@ -83,6 +83,15 @@ from cayu.core.thinking import ThinkingConfig, thinking_config_payload
 from cayu.core.tools import (
     ToolResult,
 )
+from cayu.deadlines import (
+    EXECUTION_DEADLINE_METADATA_KEY,
+    ExecutionDeadline,
+    ExecutionDeadlineExceeded,
+    current_execution_deadline,
+    deadline_stream,
+    effective_deadline,
+    resumed_execution_deadline,
+)
 from cayu.egress.authority import EgressAuthorityChangeKind, EgressAuthorityTransitionState
 from cayu.environments import (
     EnvironmentFactoryOperation,
@@ -9558,6 +9567,19 @@ class SessionEngine:
             request,
             redactor=self._secret_redactor,
         )
+        parent = (
+            await self.session_store.load(request.parent_session_id)
+            if request.parent_session_id is not None
+            else None
+        )
+        boundary = effective_deadline(
+            current_execution_deadline(),
+            request.execution_deadline,
+            parent.execution_deadline if parent is not None else ExecutionDeadline(),
+        )
+        if admit_session or allow_work_attempt_admission:
+            boundary.require_admission("run_preparation")
+        request = request.model_copy(update={"execution_deadline": boundary})
         if request.session_id is None:
             request = request.model_copy(update={"session_id": str(uuid4())})
         if request.session_id is None:
@@ -10864,6 +10886,8 @@ class SessionEngine:
         if session_validation.failure is not None:
             raise_task_store_operation_failure(session_validation.failure)
         session = session_validation.result
+        if session is not None:
+            resumed_execution_deadline(session.execution_deadline).require_admission("work_attempt")
         del session_validation
         if session is None:
             raise RuntimeError("Work-attempt continuation session lookup returned no session.")
@@ -19396,6 +19420,10 @@ class SessionEngine:
         except ValueError:
             del source_session
             raise
+        fork_deadline = effective_deadline(
+            current_execution_deadline(), source_session.execution_deadline
+        )
+        fork_deadline.require_admission("fork")
         # Only first-time creation executes against source authority. Keep the
         # public preflight on this branch so reconciliation of an already
         # committed child does not depend on a live parent or its task store.
@@ -20045,6 +20073,8 @@ class SessionEngine:
         fork_metadata[RUNTIME_BUILD_PROVENANCE_METADATA_KEY] = (
             selected_runtime_identity.runtime_build_provenance.model_dump(mode="json")
         )
+        if fork_deadline.expires_at is not None:
+            fork_metadata[EXECUTION_DEADLINE_METADATA_KEY] = fork_deadline.model_dump(mode="json")
         fork_session = Session(
             id=destination_session_id,
             agent_name=agent_name,
@@ -20444,6 +20474,7 @@ class SessionEngine:
             BaseException | None,
         ]:
             try:
+                fork_deadline.require_admission("fork_creation")
                 raw_result = await self.session_store.create_profiled_fork(
                     source_session_id=source_session.id,
                     fork=fork_session.model_copy(deep=True),
@@ -21087,7 +21118,14 @@ class SessionEngine:
             async for item in owned_stream:
                 yield item
 
-    async def _run_session(
+    def _run_session(self, *, session: Session, **kwargs: Any) -> AsyncGenerator[Event, None]:
+        # Internal admitted-work and continuation entrances also restore the
+        # durable boundary. Preserve the unconfigured stream's existing owner.
+        boundary = effective_deadline(current_execution_deadline(), session.execution_deadline)
+        stream = self._run_session_with_deadline(session=session, **kwargs)
+        return stream if boundary.expires_at is None else deadline_stream(stream, boundary)
+
+    async def _run_session_with_deadline(
         self,
         *,
         session: Session,
@@ -21376,6 +21414,7 @@ class SessionEngine:
             )
 
         try:
+            current_execution_deadline().require_admission("session")
             if structured_output is not None and (
                 STRUCTURED_OUTPUT_TOOL_NAME in registered_agent.tools
             ):
@@ -21601,6 +21640,11 @@ class SessionEngine:
                     environment_name=environment_name,
                     payload={
                         **start_event_payload,
+                        **(
+                            {"execution_deadline": current_execution_deadline().inspection()}
+                            if current_execution_deadline().expires_at is not None
+                            else {}
+                        ),
                         **_session_trace_event_fields(session, request_trace_metadata),
                     },
                 )
@@ -24023,6 +24067,8 @@ class SessionEngine:
             if failure_terminal_decision is None:
                 for event in failure_turn_events:
                     yield event
+            if isinstance(exc, ExecutionDeadlineExceeded):
+                payload["execution_deadline"] = exc.diagnostics
             session_failed_event = Event(
                 type=EventType.SESSION_FAILED,
                 session_id=session.id,

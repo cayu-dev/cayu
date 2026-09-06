@@ -9325,6 +9325,96 @@ Coordinates deterministic or agent-assisted multi-step execution.
 
 Workflows need durable step state, retries, pause/resume, failure modes, and event emission.
 
+### Execution deadlines
+
+`ExecutionDeadline` is the Runtime finish-by contract, independent of cost budgets,
+queued-task start-by deadlines, provider stream limits, and individual tool timeouts.
+`ExecutionDeadline()` explicitly means no deadline. `ExecutionDeadline.after(seconds,
+source="application", scope="workflow")` fixes an absolute UTC `expires_at` immediately;
+`remaining_seconds()` returns `None` or a live, nonnegative number. Exact equality to
+expiry is expired. Source and scope are bounded diagnostic identifiers, not prompts,
+case content, or secrets.
+
+For an ordinary workflow, drive `workflow.execute(run_id,
+execution_deadline=boundary)`. Inside `run`, use `await ctx.execution_deadline()` or
+`await ctx.remaining_seconds()` after creating the context. A new agent execution takes
+`RunRequest(execution_deadline=boundary, ...)`. To include application setup and the
+whole consumer lifecycle, enclose them in `async with execution_deadline_scope(boundary)`.
+The evaluator uses that same scope at its existing case-lifecycle entrance, before the
+workflow factory/setup. It does not start another case allowance when the workflow or
+first child begins. `WorkflowBase.run` remains the application-authored generator;
+`execute` supplies standalone enforcement. Streaming consumers must drive or close
+owned streams; time spent between pulls still consumes the original allowance.
+
+```python
+from cayu import ExecutionDeadline
+
+boundary = ExecutionDeadline.after(300, source="application", scope="workflow")
+async for event in workflow.execute("run-123", execution_deadline=boundary):
+    consume(event)
+
+# Inside an authored WorkflowBase.run:
+ctx = self.context(session_id)
+yield await ctx.start()
+remaining = await ctx.remaining_seconds()
+if remaining is not None and remaining < 30:
+    # The application chooses its own reserve and verified finalization path.
+    yield await ctx.completed({"answer": previously_verified_answer})
+    return
+```
+
+Workflow steps, parallel tasks, child-agent Runtime calls, and session forks inherit
+the earliest effective expiry. A child's `StepRunOptions.execution_deadline` or
+`RunRequest.execution_deadline` may shorten it; a later expiry or no deadline is clamped
+to the parent. `current_execution_deadline()` exposes the active boundary to Runtime
+hooks and agent/tool implementations. `ToolContext.execution_deadline` and the process
+isolated tool context expose the same portable contract. Isolated workers restore it
+for descendant Runtime calls. Model exposure is intentional: append
+`boundary.model_context()` when constructing a model-facing message, or use the active
+boundary from a context policy. This text explicitly reports time **at context
+construction**; it is not a live model-side clock. Rebuild it when fresh context is needed.
+
+The effective expiry is immutable for a session/workflow lifetime. Model retries,
+workflow retries of a failed child, queued continuations, and resumed sessions do not
+receive a fresh duration. A shorter scope cannot be attached transiently to an existing
+session/workflow on resume: that request is rejected; create a new descendant execution
+with the shorter boundary. A longer scope cannot extend the stored expiry. Completed
+workflow step replay remains a read of durable results; unresolved child effects still
+follow the existing recovery path and are never redispatched because time ran out.
+
+The built-in memory, SQLite, and PostgreSQL stores persist the boundary in Runtime-owned
+`cayu:execution_deadline` metadata at session creation, composing the parent inside that
+creation transaction. User metadata updates cannot replace it. `Session.execution_deadline`
+restores the typed value. Store adapters must pass `execution_deadline` and the loaded
+`parent_session` to `session_metadata_for_creation`. Workflow journal adapters must retain
+the anchor's expiry for durable resume; ephemeral custom journals do not establish
+cross-process recovery authority.
+
+Only UTC expiry/source/scope cross a process boundary. No monotonic timestamp, original
+relative allowance, or remaining-time snapshot is serialized as authority. Each loaded
+boundary also anchors a local monotonic upper bound: a backward wall-clock adjustment
+cannot add time during that execution, and observed expiry stays expired. Forward wall
+adjustments can expire admission earlier; an already armed asyncio timer remains anchored
+to its monotonic schedule. After a restart, remaining time is recomputed from the original
+UTC expiry using the new host's wall clock. Cross-host recovery requires synchronized,
+trustworthy UTC clocks; no process-local timestamp can correct arbitrary host clock skew.
+
+Known expiry denies new workflow steps, child runs, model attempts, tools, compaction,
+and continuation dispatch. `ExecutionDeadlineExceeded` carries safe `diagnostics`,
+including the denied stage. In-flight expiry cancels through existing Runtime ownership
+and raises `TimeoutError`; an owned timeout adds an `execution_deadline` inspection to
+the exception without replacing its cleanup causes. Session/workflow start events record
+the effective boundary, and abandoned-session interruption evidence retains a deadline
+inspection alongside existing receipts and failures. These are observations of expiry,
+not proof that all external effects have stopped.
+
+Interruption, incomplete-session recovery, result reconciliation, and environment/process
+cleanup keep their existing bounded settlement budgets after expiry. They do not call
+application-work admission. Their receipts and secondary cleanup failures remain distinct
+from the execution timeout. A durable settled outcome can still be reconciled; an
+unfinished operation is never turned into success merely because its deadline elapsed.
+Unconfigured executions retain the existing unbounded behavior.
+
 ## Runner
 
 Executes commands/code and returns stdout, stderr, exit code, timeout/cancel flags, and artifacts.

@@ -370,7 +370,11 @@ supported observer.
   before adding autonomous effects.
 - **Durable workflows:** keep deterministic orchestration in application code
   and durable state; use Cayu tasks and workflow helpers where needed. Use
-  model steps only where judgment is required.
+  model steps only where judgment is required. Use `WorkflowBase.execute(...,
+  execution_deadline=ExecutionDeadline.after(seconds))` for a Runtime finish-by boundary.
+  Inspect `await ctx.remaining_seconds()` to reserve application-selected finalization
+  time; children and resumed executions retain the original effective expiry. See the
+  [execution deadline contract](../../../docs/runtime-contracts.md#execution-deadlines).
 - **Multi-agent:** justify each role, bound delegation, persist lineage, and eval
   both child behavior and parent synthesis.
 

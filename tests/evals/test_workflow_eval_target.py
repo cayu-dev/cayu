@@ -1037,7 +1037,8 @@ def test_workflow_eval_timeout_closes_owned_execution_before_returning() -> None
         result = await run_workflow_eval_suite(
             target,
             _suite(FinalOutputContains("unreachable")),
-            case_timeout_seconds=0.01,
+            # Allow construction/journaling to finish; the workflow then blocks forever.
+            case_timeout_seconds=0.1,
         )
 
         trial = result.cases[0].trials[0]
@@ -1414,3 +1415,55 @@ def test_workflow_command_outcomes_reach_portable_reports() -> None:
     assert counts.http_error == 2
     assert len({row.session_id for row in trial.operation_outcomes.evidence}) == 2
     assert "2 nonzero exit" in render_corpus_execution_html(loaded)
+
+
+def test_evaluator_factory_and_workflow_share_expiry_including_setup(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    import cayu.deadlines as deadlines
+
+    state = SimpleNamespace(wall=datetime(2026, 9, 5, tzinfo=UTC), mono=100.0)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return state.wall
+
+    monkeypatch.setattr(deadlines, "datetime", Clock)
+    monkeypatch.setattr(deadlines, "time", SimpleNamespace(monotonic=lambda: state.mono))
+    observations = []
+
+    class DeadlineWorkflow(WorkflowBase):
+        spec = WorkflowSpec(name="deadline-eval")
+
+        async def run(self, session_id):
+            ctx = self.context(session_id)
+            yield await ctx.start()
+            boundary = await ctx.execution_deadline()
+            observations.append((boundary.expires_at, await ctx.remaining_seconds()))
+            # Reserve finalization using the shared Runtime boundary.
+            assert await ctx.remaining_seconds() < 30
+            yield await ctx.completed({"answer": "verified cached answer"})
+
+    async def run():
+        app = _register_app()
+
+        def factory(invocation):
+            boundary = deadlines.current_execution_deadline()
+            observations.append((boundary.expires_at, boundary.remaining_seconds()))
+            state.wall += timedelta(seconds=40)
+            state.mono += 40
+            return WorkflowEvalExecution(app=app, workflow=DeadlineWorkflow(app))
+
+        result = await run_workflow_eval_suite(
+            _target(app, DeadlineWorkflow, factory=factory),
+            _suite(FinalOutputContains("verified cached answer")),
+            case_timeout_seconds=60,
+        )
+        assert result.cases[0].trials[0].status is EvalStatus.PASSED
+        assert observations[0][0] == observations[1][0]
+        assert observations[0][1] == 60
+        assert observations[1][1] == 20
+
+    asyncio.run(run())

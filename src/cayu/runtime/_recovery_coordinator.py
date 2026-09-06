@@ -65,6 +65,7 @@ from cayu.core.tools import (
     DurableToolRecoveryAuthority,
     ToolResult,
 )
+from cayu.deadlines import current_execution_deadline, effective_deadline
 from cayu.environments import EnvironmentFactoryOperation
 from cayu.environments.bindings import _runtime_owned_workspace_observer_name
 from cayu.memory_evidence import ContextExposureEvidenceKind, ContextExposureState
@@ -14694,6 +14695,11 @@ class RecoveryCoordinator:
             "reason": _ABANDONED_RUN_REASON,
             "abandoned": True,
         }
+        deadline = effective_deadline(
+            current_execution_deadline(), request.session.execution_deadline
+        )
+        if deadline.expires_at is not None:
+            payload["execution_deadline"] = deadline.inspection()
         if request.interaction_transition_failures:
             copied_failures = copy_durable_json_value(
                 list(request.interaction_transition_failures),

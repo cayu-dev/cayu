@@ -39,6 +39,7 @@ from cayu.core.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
+from cayu.deadlines import ExecutionDeadline, current_execution_deadline
 
 if TYPE_CHECKING:
     from cayu.runners.base import ExecCommand, ExecResult
@@ -726,6 +727,11 @@ def _runtime_tool_invocation_authority(
 
 
 class ToolContext(BaseModel):
+    execution_deadline: ExecutionDeadline = Field(
+        default_factory=current_execution_deadline,
+        exclude_if=lambda boundary: boundary.expires_at is None,
+    )
+
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,

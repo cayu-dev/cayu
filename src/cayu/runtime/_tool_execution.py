@@ -16,6 +16,7 @@ from cayu._validation import (
 )
 from cayu.core.isolated_tools import ProcessIsolatedTool
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
+from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
 from cayu.runners import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._durable_subagents import (
@@ -434,6 +435,7 @@ async def _run_tool(
     try:
 
         async def invoke_registered_tool() -> ToolResult:
+            current_execution_deadline().require_admission("tool")
             if type(tool) is not ProcessIsolatedTool:
                 return await tool.run(ctx, arguments)
             if registered_schema is None:
@@ -593,6 +595,8 @@ async def _run_tool(
             failure_code=exc.code,
             redactor=_active_redactor(redactor),
         )
+    except ExecutionDeadlineExceeded:
+        raise
     except TimeoutError as exc:
         ctx._discard_policy_denials_for(tool)
         if timer is not None and timer.expired():

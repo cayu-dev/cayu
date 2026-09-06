@@ -18,6 +18,7 @@ from cayu.core.execution_identity import (
 )
 from cayu.core.isolated_tools import MAX_ISOLATED_TOOL_MESSAGE_BYTES
 from cayu.core.tools import ToolResult
+from cayu.deadlines import bind_execution_deadline
 from cayu.runtime._isolated_tool_protocol import (
     IsolatedToolChildErrorCode,
     IsolatedToolInvocationEnvelope,
@@ -125,9 +126,11 @@ def _execute(
     if not callable(run):
         return None, IsolatedToolChildErrorCode.FACTORY_INVALID.value
     try:
-        result = run(envelope.context, envelope.arguments)
-        if inspect.isawaitable(result):
-            result = asyncio.run(_await_result(result))
+        envelope.context.execution_deadline.require_admission("isolated_tool")
+        with bind_execution_deadline(envelope.context.execution_deadline):
+            result = run(envelope.context, envelope.arguments)
+            if inspect.isawaitable(result):
+                result = asyncio.run(_await_result(result))
     except BaseException:
         return None, IsolatedToolChildErrorCode.CHILD_EXCEPTION.value
     if type(result) is not ToolResult:

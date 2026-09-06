@@ -296,6 +296,12 @@ from cayu.core.tools import (
     WorkspaceHandle,
 )
 from cayu.core.workflows import Workflow, WorkflowSpec
+from cayu.deadlines import (
+    ExecutionDeadline,
+    ExecutionDeadlineExceeded,
+    current_execution_deadline,
+    execution_deadline_scope,
+)
 from cayu.egress import (
     ApprovedEgressDestination,
     BrowserEgressPolicy,
@@ -5793,4 +5799,12 @@ __all__ += [
     "pin_workspace_checkpoint",
     "release_workspace_checkpoint",
     "restore_workspace_checkpoint",
+]
+
+
+__all__ += [
+    "ExecutionDeadline",
+    "ExecutionDeadlineExceeded",
+    "current_execution_deadline",
+    "execution_deadline_scope",
 ]

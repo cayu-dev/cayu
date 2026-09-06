@@ -37,6 +37,13 @@ from cayu.core.events import (
 from cayu.core.messages import Message, MessageRole, TextPart, ToolCallPart
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.workflows import Workflow, WorkflowSpec, copy_workflow_spec
+from cayu.deadlines import (
+    ExecutionDeadline,
+    current_execution_deadline,
+    deadline_stream,
+    effective_deadline,
+    resumed_execution_deadline,
+)
 from cayu.runtime import (
     BudgetLimit,
     CayuApp,
@@ -131,6 +138,9 @@ class StepRunOptions(BaseModel):
         extra="forbid", arbitrary_types_allowed=True, hide_input_in_errors=True
     )
 
+    execution_deadline: ExecutionDeadline = Field(
+        default_factory=ExecutionDeadline, exclude_if=lambda boundary: boundary.expires_at is None
+    )
     target: ModelTarget | None = None
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -299,8 +309,22 @@ class WorkflowContext:
         self._claimed_step_ids_lock = asyncio.Lock()
         self._fence_established = False
         self._fence_lock = asyncio.Lock()
+        self._execution_deadline = current_execution_deadline()
         self._anchor_loaded = False
         self._anchor = None
+
+    async def execution_deadline(self) -> ExecutionDeadline:
+        """Live boundary, including the durable anchor on recovery."""
+        anchor = await self.app.session_store.load(self.session_id)
+        self._execution_deadline = effective_deadline(
+            self._execution_deadline,
+            anchor.execution_deadline if anchor is not None else ExecutionDeadline(),
+            current_execution_deadline(),
+        )
+        return self._execution_deadline
+
+    async def remaining_seconds(self) -> float | None:
+        return (await self.execution_deadline()).remaining_seconds()
 
     @property
     def workflow_name(self) -> str:
@@ -438,9 +462,19 @@ class WorkflowContext:
     async def start(self, payload: dict[str, Any] | None = None) -> Event:
         """Journal + return the ``workflow.started`` event. Use ``yield await``."""
         await self._check_fence()
+        boundary = await self.execution_deadline()
+        boundary.require_admission("workflow_start")
         event = self.event(
             EventType.WORKFLOW_STARTED,
-            payload={"workflow": self.workflow_name, **(payload or {})},
+            payload={
+                "workflow": self.workflow_name,
+                **(payload or {}),
+                **(
+                    {"execution_deadline": boundary.inspection()}
+                    if boundary.expires_at is not None
+                    else {}
+                ),
+            },
         )
         await self._append_current_attempt_event(event)
         return event
@@ -448,6 +482,7 @@ class WorkflowContext:
     async def completed(self, payload: dict[str, Any] | None = None) -> Event:
         """Journal + return the ``workflow.completed`` event. Use ``yield await``."""
         await self._check_fence(establish=False)
+        (await self.execution_deadline()).require_admission("workflow_completion")
         event = self.event(
             EventType.WORKFLOW_COMPLETED,
             payload={"workflow": self.workflow_name, **(payload or {})},
@@ -477,6 +512,32 @@ class WorkflowBase(Workflow):
         self.app = app
         self.spec = copy_workflow_spec(resolved_spec)
         self._journal_factory = journal_factory or _default_journal_factory
+
+    async def execute(
+        self, session_id: str, *, execution_deadline: ExecutionDeadline | None = None
+    ):
+        """Execute with Runtime cancellation and the original durable expiry on resume."""
+        anchor = await self.app.session_store.load(session_id)
+        boundary = effective_deadline(
+            execution_deadline or ExecutionDeadline(),
+            current_execution_deadline(),
+            anchor.execution_deadline if anchor is not None else ExecutionDeadline(),
+        )
+        if anchor is not None:
+            if (
+                execution_deadline is not None
+                and execution_deadline.expires_at is not None
+                and (
+                    anchor.execution_deadline.expires_at is None
+                    or execution_deadline.expires_at < anchor.execution_deadline.expires_at
+                )
+            ):
+                raise ValueError("Cannot tighten an existing workflow on resume; create a child.")
+            boundary = resumed_execution_deadline(anchor.execution_deadline)
+        boundary.require_admission("workflow")
+        async with contextlib.aclosing(deadline_stream(self.run(session_id), boundary)) as stream:
+            async for event in stream:
+                yield event
 
     def context(self, session_id: str) -> WorkflowContext:
         """Build the per-run context (and its journal) for one workflow run."""
@@ -695,15 +756,18 @@ async def _run_step(
                 structured_output=spec,
             )
 
+    (await ctx.execution_deadline()).require_admission("workflow_step")
     child_session_id = session_id
     child_session_has_runtime_authority = False
     generated_child_ownership = _GeneratedChildOwnership.NOT_GENERATED
     generated_child_claim_id: str | None = None
+    retry_deadline = ExecutionDeadline()
     failed_started_child_session_id: str | None = None
     if child_session_id is None and started_child_session_id is not None:
         started_child = await ctx.app.session_store.load(started_child_session_id)
         if started_child is not None and started_child.status == SessionStatus.FAILED:
             failed_started_child_session_id = started_child_session_id
+            retry_deadline = started_child.execution_deadline
         if started_child is None or started_child.status != SessionStatus.FAILED:
             if started_child is not None and started_child.status in _LIVE_CHILD_STATUSES:
                 await ctx.app.recover_incomplete_session(
@@ -773,6 +837,9 @@ async def _run_step(
     anchor = await ctx._workflow_anchor()
     parent_session_id, causal_budget_id = _workflow_lineage_from_anchor(ctx, anchor)
     request = RunRequest(
+        execution_deadline=effective_deadline(
+            await ctx.execution_deadline(), retry_deadline, opts.execution_deadline
+        ),
         agent_name=agent,
         session_id=child_session_id,
         messages=run_messages,
@@ -789,6 +856,7 @@ async def _run_step(
         parent_session_id=parent_session_id,
         causal_budget_id=causal_budget_id,
     )
+    request.execution_deadline.require_admission("workflow_step")
     run_default_overrides: dict[str, object] = {}
     if "max_steps" in opts.model_fields_set:
         run_default_overrides["max_steps"] = opts.max_steps

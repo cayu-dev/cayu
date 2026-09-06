@@ -32,6 +32,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast, overload
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from cayu.deadlines import (
+    EXECUTION_DEADLINE_METADATA_KEY,
+    ExecutionDeadline,
+    current_execution_deadline,
+    deadline_from_metadata,
+    effective_deadline,
+)
+
 if TYPE_CHECKING:
     from cayu.runtime._invocation_lifecycle import (
         AdmitInvocationCommand,
@@ -1628,6 +1636,10 @@ class RunRequest(BaseModel):
 
     agent_name: str
     messages: list[Message]
+    execution_deadline: ExecutionDeadline = Field(
+        default_factory=current_execution_deadline,
+        exclude_if=lambda boundary: boundary.expires_at is None,
+    )
     # Optional caller-provided id for a new session. It must be unique.
     session_id: str | None = None
     parent_session_id: str | None = None
@@ -1685,6 +1697,7 @@ class RunRequest(BaseModel):
             (
                 key
                 for key in (
+                    EXECUTION_DEADLINE_METADATA_KEY,
                     MODEL_TARGET_PROJECTION_METADATA_KEY,
                     EXECUTION_PROFILE_METADATA_KEY,
                     TOOL_CAPABILITY_CEILING_METADATA_KEY,
@@ -1697,7 +1710,9 @@ class RunRequest(BaseModel):
         )
         if reserved_key is not None:
             copied.clear()
-            if reserved_key == MODEL_TARGET_PROJECTION_METADATA_KEY:
+            if reserved_key == EXECUTION_DEADLINE_METADATA_KEY:
+                authority_name = "execution-deadline authority"
+            elif reserved_key == MODEL_TARGET_PROJECTION_METADATA_KEY:
                 authority_name = "model-target authority"
             elif reserved_key == EXECUTION_PROFILE_METADATA_KEY:
                 authority_name = "execution-profile authority"
@@ -1944,7 +1959,10 @@ class ResumeRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        copied = copy_durable_json_object(value, "metadata")
+        if EXECUTION_DEADLINE_METADATA_KEY in copied:
+            raise ValueError("Session metadata contains runtime-owned deadline authority.")
+        return copied
 
     @field_validator("structured_output")
     @classmethod
@@ -3162,6 +3180,7 @@ class ForkSessionRequest(BaseModel):
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         copied = copy_durable_json_object(value, "metadata")
         reserved_authority_kinds = {
+            EXECUTION_DEADLINE_METADATA_KEY: "execution-deadline authority",
             MODEL_TARGET_PROJECTION_METADATA_KEY: "model-target authority",
             EXECUTION_PROFILE_METADATA_KEY: "execution-profile authority",
             TOOL_CAPABILITY_CEILING_METADATA_KEY: "tool-capability-ceiling authority",
@@ -3972,6 +3991,10 @@ class Session(BaseModel):
     invocation: SessionInvocation = Field(frozen=True)
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def execution_deadline(self) -> ExecutionDeadline:
+        return deadline_from_metadata(self.metadata)
 
     @model_validator(mode="before")
     @classmethod
@@ -13757,6 +13780,8 @@ class InMemorySessionStore(SessionStore):
                     request.metadata,
                     identity=identity,
                     tool_capability_ceiling=request.tool_capability_ceiling,
+                    execution_deadline=request.execution_deadline,
+                    parent_session=parent_session,
                 ),
                 run_epoch=1 if admission is not None else 0,
             )
@@ -20309,6 +20334,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         agent_name=request.agent_name,
         messages=[detach_message(message) for message in messages],
         session_id=request.session_id,
+        execution_deadline=request.execution_deadline,
         parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
@@ -22031,10 +22057,22 @@ def session_metadata_for_creation(
     *,
     identity: SessionIdentity,
     tool_capability_ceiling: ToolCapabilityCeiling | None = None,
+    execution_deadline: ExecutionDeadline | None = None,
+    parent_session: Session | None = None,
 ) -> dict[str, Any]:
     """Combine caller metadata with runtime-owned creation authority."""
 
     copied = copy_durable_json_object(metadata, "metadata")
+    if EXECUTION_DEADLINE_METADATA_KEY in copied:
+        raise ValueError("Session metadata contains runtime-owned deadline authority.")
+    boundary = effective_deadline(
+        execution_deadline or ExecutionDeadline(),
+        current_execution_deadline(),
+        parent_session.execution_deadline if parent_session is not None else ExecutionDeadline(),
+    )
+    boundary.require_admission("session_creation")
+    if boundary.expires_at is not None:
+        copied[EXECUTION_DEADLINE_METADATA_KEY] = boundary.model_dump(mode="json")
     if EXECUTION_PROFILE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned execution-profile authority.")
     if RUNTIME_BUILD_PROVENANCE_METADATA_KEY in copied:

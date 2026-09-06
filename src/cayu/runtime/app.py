@@ -60,6 +60,13 @@ from cayu.core.tools import (
     ToolResult,
     ToolSpec,
 )
+from cayu.deadlines import (
+    ExecutionDeadline,
+    current_execution_deadline,
+    deadline_stream,
+    effective_deadline,
+    resumed_execution_deadline,
+)
 from cayu.environments import (
     Environment,
     EnvironmentFactory,
@@ -4447,6 +4454,18 @@ class CayuApp:
             raise TypeError("Runtime run requires a RunRequest.")
         request = self._with_application_run_defaults(request)
         request = _validate_run_request(request)
+        parent = (
+            await self.session_store.load(request.parent_session_id)
+            if request.parent_session_id is not None
+            else None
+        )
+        boundary = effective_deadline(
+            request.execution_deadline,
+            current_execution_deadline(),
+            parent.execution_deadline if parent is not None else ExecutionDeadline(),
+        )
+        boundary.require_admission("child_run" if parent is not None else "run")
+        request = request.model_copy(update={"execution_deadline": boundary})
         stream = self._session_engine.run(
             request=request,
             expected_execution_profile=expected_execution_profile,
@@ -4454,6 +4473,8 @@ class CayuApp:
             expected_context_policy=expected_context_policy,
         )
         del request
+        if boundary.expires_at is not None:
+            stream = deadline_stream(stream, boundary)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -4485,11 +4506,18 @@ class CayuApp:
             raise TypeError("Runtime resume requires a ResumeRequest.")
         request = self._with_application_run_defaults(request)
         request = _validate_resume_request(request)
+        stored = await self.session_store.load(request.session_id)
+        boundary = resumed_execution_deadline(
+            stored.execution_deadline if stored is not None else ExecutionDeadline()
+        )
+        boundary.require_admission("resume")
         stream = self._session_engine.resume(
             request=request,
             store_resolved_session_id=store_resolved_session_id,
         )
         del request
+        if boundary.expires_at is not None:
+            stream = deadline_stream(stream, boundary)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -4520,10 +4548,17 @@ class CayuApp:
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not CompactSessionRequest:
             raise TypeError("Runtime compaction requires a CompactSessionRequest.")
+        stored = await self.session_store.load(request.session_id)
+        boundary = resumed_execution_deadline(
+            stored.execution_deadline if stored is not None else ExecutionDeadline()
+        )
+        boundary.require_admission("compaction")
         stream = self._session_engine.compact_session(
             request=request,
             store_resolved_session_id=store_resolved_session_id,
         )
+        if boundary.expires_at is not None:
+            stream = deadline_stream(stream, boundary)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -4741,6 +4776,9 @@ class CayuApp:
         # not persist private session authority; dispatch_inline resolves it again in
         # the worker that owns execution.
         private_session_id, _ = await self._resolve_public_session_authority(request.session_id)
+        stored = await self.session_store.load(private_session_id)
+        if stored is not None:
+            resumed_execution_deadline(stored.execution_deadline).require_admission("dispatch")
         (
             contract_rejected,
             admission_failure,

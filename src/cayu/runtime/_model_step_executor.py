@@ -93,6 +93,7 @@ from cayu.core.messages import (
     detach_message,
 )
 from cayu.core.thinking import ThinkingConfig, thinking_config_payload
+from cayu.deadlines import current_execution_deadline
 from cayu.memory_evidence import (
     ContextExposure,
     ContextExposureEvidenceKind,
@@ -2433,6 +2434,7 @@ async def _admitted_model_provider_events(
 ) -> AsyncGenerator[ModelStreamEvent, None]:
     """Transfer one pre-dispatch deadline admission into the provider stream."""
 
+    current_execution_deadline().require_admission("model")
     events = provider.runtime_stream(request)
     iterator = aiter(events)
     try:
@@ -9866,6 +9868,7 @@ class ModelStepRun:
         async def before_provider_dispatch(
             model_attempt_identity: ModelAttemptIdentity,
         ) -> None:
+            current_execution_deadline().require_admission("model_dispatch")
             await controller.before_provider_dispatch(
                 budget_reservations,
                 lifecycle=lifecycle,

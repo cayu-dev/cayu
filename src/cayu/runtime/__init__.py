@@ -7,6 +7,12 @@ from cayu.core.billing import (
     ResolvedBillingIdentity,
     UnresolvedBillingIdentity,
 )
+from cayu.deadlines import (
+    ExecutionDeadline,
+    ExecutionDeadlineExceeded,
+    current_execution_deadline,
+    execution_deadline_scope,
+)
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerMetrics,
     DurableWorkerMetricsSnapshot,
@@ -2065,4 +2071,12 @@ __all__ = [
     "validate_application_tool_name",
     "work_contract_fingerprint",
     "work_contract_from_draft",
+]
+
+
+__all__ += [
+    "ExecutionDeadline",
+    "ExecutionDeadlineExceeded",
+    "current_execution_deadline",
+    "execution_deadline_scope",
 ]

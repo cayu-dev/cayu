@@ -158,6 +158,7 @@ def _tool(
     factory_config: dict[str, Any] | None = None,
     max_request_bytes: int = 1 << 20,
     max_response_bytes: int = 1 << 20,
+    max_terminal_payload_bytes: int | None = None,
     max_stdout_bytes: int = 64 << 10,
     max_stderr_bytes: int = 64 << 10,
     term_grace_seconds: float = 0.1,
@@ -171,6 +172,7 @@ def _tool(
             description="Exercise the real isolated process boundary.",
             input_schema=_SCHEMA,
             effect=effect,
+            max_terminal_payload_bytes=max_terminal_payload_bytes,
             execution_profile_identity=ExecutionProfileBehaviorIdentity(
                 name="cayu:testing:isolated-fixture",
                 behavior_version="1",
@@ -277,6 +279,7 @@ def test_isolated_tool_contract_is_explicit_callable_free_and_not_a_sandbox() ->
         "hard_deadline_seconds": 5.0,
         "protocol": "cayu.isolated-tool",
         "protocol_version": 1,
+        "max_terminal_payload_bytes": None,
     }
     assert contract["adapter_configuration_sha256"].startswith("sha256:")
     assert "factory_config" not in contract
@@ -3718,15 +3721,19 @@ def test_predispatch_validation_fails_without_starting_a_child() -> None:
     assert aggregate_limit.value.code == "request_invalid_or_too_large"
 
 
-def test_runtime_rejects_post_registration_adapter_configuration_drift() -> None:
+@pytest.mark.parametrize("drift", ["factory_config", "terminal_payload_limit"])
+def test_runtime_rejects_post_registration_adapter_configuration_drift(drift: str) -> None:
     arguments = {"text": "hello"}
     tool = _tool()
     registered_contract = isolated_tool_execution_contract(tool)
-    object.__setattr__(
-        tool,
-        "_factory_config",
-        {"mode": "success", "post_registration_drift": True},
-    )
+    if drift == "factory_config":
+        object.__setattr__(
+            tool,
+            "_factory_config",
+            {"mode": "success", "post_registration_drift": True},
+        )
+    else:
+        tool.spec = tool.spec.model_copy(update={"max_terminal_payload_bytes": 64 * 1024})
 
     outcome = asyncio.run(
         tool_execution.run_tool(
@@ -4059,8 +4066,13 @@ def test_public_cancellation_during_dispatch_publication_restores_task_state(
 
 
 @pytest.mark.process
-def test_public_runtime_executes_registered_isolated_tool_and_exposes_truthful_evidence() -> None:
-    app = _public_app(_tool(deadline_seconds=3))
+@pytest.mark.parametrize("max_terminal_payload_bytes", [None, 64 * 1024])
+def test_public_runtime_executes_registered_isolated_tool_and_exposes_truthful_evidence(
+    max_terminal_payload_bytes: int | None,
+) -> None:
+    app = _public_app(
+        _tool(deadline_seconds=3, max_terminal_payload_bytes=max_terminal_payload_bytes)
+    )
 
     manifest_tool = app.describe().agents[0].tools[0]
     assert manifest_tool.execution_boundary == "posix_process"
@@ -4910,6 +4922,10 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
         assert not worker_task.done()
         async with asyncio.timeout(5):
             while True:
+                # A worker can renew its task lease before creating the session.
+                if await session_store.load(f"worker-session-{blocking_task.id}") is None:
+                    await asyncio.sleep(0.01)
+                    continue
                 active_events = await session_store.load_events(
                     f"worker-session-{blocking_task.id}"
                 )
@@ -5102,3 +5118,41 @@ def test_parallel_isolated_process_groups_settle_independently(tmp_path: Path) -
     assert len(failed) == 1
     assert failed[0].payload["terminal_outcome"] == "tool_execution_timeout"
     assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.process
+def test_isolated_worker_receives_runtime_execution_deadline() -> None:
+    from cayu import ExecutionDeadline, execution_deadline_scope
+
+    async def run():
+        boundary = ExecutionDeadline.after(30, source="test", scope="workflow")
+        async with execution_deadline_scope(boundary):
+            result = await _execute(_tool(mode="execution_deadline"))
+        expected = boundary.model_dump(mode="json")
+        assert result.structured["context"] == expected
+        assert result.structured["active"] == expected
+        assert result.structured["child_request"] == expected
+        assert 0 < result.structured["remaining_seconds"] <= 30
+
+    asyncio.run(run())
+
+
+@pytest.mark.process
+def test_public_runtime_propagates_execution_deadline_to_isolated_worker() -> None:
+    from cayu import ExecutionDeadline, execution_deadline_scope
+
+    async def run():
+        boundary = ExecutionDeadline.after(30, source="test", scope="workflow")
+        app = _public_app(_tool(mode="execution_deadline"))
+        async with execution_deadline_scope(boundary):
+            events = await _run_public(app, session_id="public-isolated-deadline")
+        completed = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+        structured = completed.payload["result"]["structured"]
+        expected = boundary.model_dump(mode="json")
+        assert structured["context"] == expected
+        assert structured["active"] == expected
+        assert structured["child_request"] == expected
+        assert 0 < structured["remaining_seconds"] <= 30
+        assert events[-1].type is EventType.SESSION_COMPLETED
+
+    asyncio.run(run())

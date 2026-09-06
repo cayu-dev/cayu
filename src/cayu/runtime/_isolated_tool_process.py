@@ -854,6 +854,7 @@ def isolated_tool_execution_contract(
         ),
         "protocol": "cayu.isolated-tool",
         "protocol_version": 1,
+        "max_terminal_payload_bytes": tool.spec.max_terminal_payload_bytes,
     }
     return copy_durable_json_object(material, "isolated_tool_execution_contract")
 
@@ -1206,6 +1207,7 @@ def _project_context(
         if key in context.metadata
     }
     projected["metadata"] = metadata
+    projected["execution_deadline"] = context.execution_deadline.model_dump(mode="json")
     try:
         bounded = copy_bounded_durable_json_value(
             projected,

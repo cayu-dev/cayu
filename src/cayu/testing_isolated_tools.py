@@ -14,6 +14,8 @@ from typing import Any
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.isolated_tools import ProcessIsolatedToolContext
 from cayu.core.tools import ToolResult
+from cayu.deadlines import current_execution_deadline
+from cayu.runtime.sessions import RunRequest
 
 
 class _DeterministicIsolatedToolHandler:
@@ -32,6 +34,18 @@ class _DeterministicIsolatedToolHandler:
                 structured={
                     "session_id": context.session_id,
                     "environment_marker": os.environ.get("CAYU_TEST_MARKER"),
+                },
+            )
+        if mode == "execution_deadline":
+            return ToolResult(
+                content="execution deadline observed",
+                structured={
+                    "context": context.execution_deadline.model_dump(mode="json"),
+                    "active": current_execution_deadline().model_dump(mode="json"),
+                    "child_request": RunRequest(
+                        agent_name="child", messages=[]
+                    ).execution_deadline.model_dump(mode="json"),
+                    "remaining_seconds": context.execution_deadline.remaining_seconds(),
                 },
             )
         if mode == "counted_success":

@@ -33,6 +33,7 @@ from cayu.artifacts import (
 )
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
+from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
@@ -1724,7 +1725,9 @@ async def _run_workflow_case_once_with_public_projection(
         effective_max_bytes=selected_memory_max_bytes,
     )
     try:
-        async with asyncio.timeout(timeout_seconds):
+        async with execution_deadline_scope(
+            ExecutionDeadline.after(timeout_seconds, source="evaluator", scope="case")
+        ):
             invocation = WorkflowEvalInvocation(
                 run_id=run_id,
                 suite_id=suite_id,
@@ -2360,7 +2363,9 @@ async def _run_case_once_with_public_projection(
     # Keep the deadline around the full case lifecycle: runtime execution, state/probe
     # capture, child traversal, and assertion evaluation all belong to one trial.
     try:
-        async with asyncio.timeout(timeout_seconds) as deadline:
+        async with execution_deadline_scope(
+            ExecutionDeadline.after(timeout_seconds, source="evaluator", scope="case")
+        ) as deadline:
             try:
                 stream = app.run(trial_request) if run_stream is None else run_stream(trial_request)
                 async for event in stream:

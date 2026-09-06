@@ -22,6 +22,7 @@ from cayu.core.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.deadlines import ExecutionDeadline
 
 ISOLATED_TOOL_PROTOCOL_NAME: Final = "cayu.isolated-tool"
 ISOLATED_TOOL_PROTOCOL_VERSION: Final = 1
@@ -207,6 +208,9 @@ class ProcessIsolatedToolContext(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
+    execution_deadline: ExecutionDeadline = Field(
+        default_factory=ExecutionDeadline, exclude_if=lambda boundary: boundary.expires_at is None
+    )
     session_id: str | None = None
     agent_name: str | None = None
     environment_name: str | None = None
