@@ -7829,6 +7829,14 @@ instances expose `reason_code`; only the allowlisted event projection is safe to
 persist. Exception messages, provider values, URLs, queries, prompts, credentials,
 and encrypted reasoning never populate these diagnostic fields.
 
+Unsupported hosted-search source discriminators additionally retain a bounded
+source index, JSON kind, supported variants, and an optional canonical label from
+a small diagnostic vocabulary. Unknown strings and credential matches are
+omitted. These diagnostics also survive background exception wrapping and
+`provider.operation.recovery_required` readback, without authorizing redispatch.
+See [hosted-search source diagnostics](hosted-search-source-diagnostics.md) for
+the field contract, omission policy, schema audit, and historical evidence limits.
+
 These fields identify Cayu's rejected validation check, not whether the provider
 or adapter caused the incompatibility. They do not affect
 `provider_error_type="protocol_error"`, bounded `unknown_provider` retries, or

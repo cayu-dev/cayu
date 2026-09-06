@@ -142,6 +142,7 @@ from cayu.providers._credential_boundary import (
     reserve_provider_stream_cleanup,
     stream_cleanup_cancelled_after_provider_failure,
 )
+from cayu.providers._openai_protocol import protocol_exception_fields
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -4457,6 +4458,7 @@ class ModelStepExecutor:
             status: str,
             recovery_reason: ProviderOperationUnavailableReason | None = None,
             cleanup_failure: Exception | None = None,
+            protocol_failure: Exception | None = None,
         ) -> Event:
             payload: dict[str, Any] = {
                 "provider": registered_provider.name,
@@ -4471,6 +4473,7 @@ class ModelStepExecutor:
                 "stream_protocol": operation.state.stream_protocol,
                 "status": status,
             }
+            payload.update(protocol_exception_fields(protocol_failure))
             if recovery_reason is not None:
                 payload["recovery_reason"] = recovery_reason.value
             if cleanup_failure is not None:
@@ -4559,6 +4562,7 @@ class ModelStepExecutor:
             *,
             cleanup_failure: Exception | None = None,
             deadline_failure: ModelStreamDeadlineError | None = None,
+            protocol_failure: Exception | None = None,
         ) -> ProviderOperationRecoveryResult:
             authoritative_deadline: ModelStreamDeadlineError | None = None
             if deadline_failure is not None:
@@ -4624,6 +4628,7 @@ class ModelStepExecutor:
                         status=status_value,
                         recovery_reason=reason,
                         cleanup_failure=cleanup_failure,
+                        protocol_failure=protocol_failure,
                     ),
                     recovery_reason=reason,
                     cleanup_failure=cleanup_failure,
@@ -4912,6 +4917,7 @@ class ModelStepExecutor:
                         else ProviderOperationUnavailableReason.UNAVAILABLE
                     ),
                     "malformed" if malformed else ProviderOperationStatus.UNAVAILABLE,
+                    protocol_failure=recovery_failure,
                     deadline_failure=(
                         recovery_failure
                         if isinstance(recovery_failure, ModelStreamDeadlineError)
@@ -4967,6 +4973,7 @@ class ModelStepExecutor:
             ) = None
             reconnect_pending_status: ProviderOperationStatus | None = None
             reconnect_cleanup_failure: Exception | None = None
+            reconnect_protocol_failure: Exception | None = None
             reconnect_deadline_failure: ModelStreamDeadlineError | None = None
             try:
                 async with aclosing_provider_stream(connection.events) as reconnect_events:
@@ -5022,6 +5029,7 @@ class ModelStepExecutor:
                         if reconnect_unavailable is None:
                             if isinstance(stream_failure, ModelStreamDeadlineError):
                                 reconnect_deadline_failure = stream_failure
+                            reconnect_protocol_failure = stream_failure
                             malformed = isinstance(stream_failure, ProviderOperationMalformedError)
                             reconnect_unavailable = (
                                 (
@@ -5042,6 +5050,7 @@ class ModelStepExecutor:
                     *reconnect_unavailable,
                     cleanup_failure=reconnect_cleanup_failure,
                     deadline_failure=reconnect_deadline_failure,
+                    protocol_failure=reconnect_protocol_failure,
                 )
             if reconnect_pending_status is not None and completed_event is None:
                 return await pending_recovery_result(reconnect_pending_status)
@@ -5069,6 +5078,7 @@ class ModelStepExecutor:
                         else ProviderOperationUnavailableReason.UNAVAILABLE
                     ),
                     "malformed" if malformed else ProviderOperationStatus.UNAVAILABLE,
+                    protocol_failure=recovery_failure,
                 )
             try:
                 snapshot = copy_provider_operation_snapshot(raw_snapshot)

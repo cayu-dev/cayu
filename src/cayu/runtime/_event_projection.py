@@ -2189,6 +2189,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "provider_protocol_reason",
         "provider_protocol_stage",
         "provider_protocol_field",
+        "provider_protocol_source_index",
+        "provider_protocol_source_type_kind",
+        "provider_protocol_source_supported_types",
+        "provider_protocol_source_type_value_status",
+        "provider_protocol_source_type_value",
         "provider_deadline_kind",
         "provider_deadline_timeout_s",
         "provider_effect_outcome",
@@ -2386,6 +2391,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     }
     policies[EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED] = _policy(
         *provider_operation_recovery_keys,
+        *(key for key in model_failure_keys if key.startswith("provider_protocol_")),
         "idempotent_start_recovery",
         "provider_cleanup_failure",
         "recovery_reason",

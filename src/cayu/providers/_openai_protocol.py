@@ -4,6 +4,96 @@ Keep existing reason codes stable when editing parser messages. Add new checks
 here explicitly. No response value, exception text, or dynamic path is copied.
 """
 
+from dataclasses import dataclass
+
+from cayu.providers.operations import ProviderOperationMalformedError
+
+
+class OpenAIProtocolDiagnosticError(ProviderOperationMalformedError):
+    """Typed marker for allowlisted diagnostics, including operation recovery."""
+
+
+# Diagnostic vocabulary, NOT supported source variants. Unknown strings are
+# omitted: syntax checks alone cannot distinguish enum labels from secrets.
+_SOURCE_TYPE_LABELS = {
+    value: value for value in ("url", "api", "file", "image", "document", "text")
+}
+_JSON_KINDS: dict[type, str] = {
+    type(None): "null",
+    bool: "boolean",
+    int: "number",
+    float: "number",
+    str: "string",
+    list: "array",
+    dict: "object",
+}
+
+
+@dataclass(frozen=True)
+class SearchSourceDiagnostic:
+    """Bounded evidence only; never retain the raw source or discriminator."""
+
+    index: int
+    kind: str
+    type_value: str | None
+
+    @classmethod
+    def from_value(cls, index: int, value: object) -> "SearchSourceDiagnostic":
+        label = None
+        if type(value) is str and len(value) <= 32:
+            label = _SOURCE_TYPE_LABELS.get(value)
+        return cls(index, _JSON_KINDS.get(type(value), "non_json"), label)
+
+
+def source_diagnostic_fields(
+    diagnostic: object, *, credential_values: tuple[str, ...] = ()
+) -> dict[str, str | int]:
+    # Revalidate exception attributes at the public projection boundary.
+    if type(diagnostic) is not SearchSourceDiagnostic:
+        return {}
+    if type(diagnostic.index) is not int or not 0 <= diagnostic.index < 100:
+        return {}
+    if type(diagnostic.kind) is not str or diagnostic.kind not in (
+        *_JSON_KINDS.values(),
+        "non_json",
+    ):
+        return {}
+    label = diagnostic.type_value
+    if type(label) is not str or len(label) > 32 or label not in _SOURCE_TYPE_LABELS:
+        label = None
+    if label is not None and any(value and value in label for value in credential_values):
+        label = None
+    fields: dict[str, str | int] = {
+        "provider_protocol_source_index": diagnostic.index,
+        "provider_protocol_source_type_kind": diagnostic.kind,
+        "provider_protocol_source_supported_types": "url",
+        "provider_protocol_source_type_value_status": "retained"
+        if label is not None
+        else "omitted",
+    }
+    if label is not None:
+        fields["provider_protocol_source_type_value"] = _SOURCE_TYPE_LABELS[label]
+    return fields
+
+
+def protocol_exception_fields(
+    error: object, *, credential_values: tuple[str, ...] = ()
+) -> dict[str, str | int]:
+    if not isinstance(error, OpenAIProtocolDiagnosticError):
+        return {}
+    fields: dict[str, str | int] = dict(
+        protocol_diagnostic_fields(getattr(error, "reason_code", None))
+    )
+    if fields["provider_protocol_reason"] == "web_search_action_sources_type_is_unsupported":
+        fields.update(
+            source_diagnostic_fields(
+                getattr(error, "source_diagnostic", None),
+                credential_values=credential_values,
+            )
+        )
+    return fields
+
+
 # reason -> (stage, optional schema path); [] denotes an unspecified array index.
 _PROTOCOL_DIAGNOSTICS: dict[str, tuple[str, str | None]] = {
     "unspecified": ("unknown", None),

@@ -72,7 +72,11 @@ from cayu.providers._http import (
     validate_base_url,
     validate_url,
 )
-from cayu.providers._openai_protocol import protocol_diagnostic_fields
+from cayu.providers._openai_protocol import (
+    OpenAIProtocolDiagnosticError,
+    SearchSourceDiagnostic,
+    protocol_exception_fields,
+)
 from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -313,16 +317,23 @@ class OpenAIContextOverflowError(OpenAIAPIError, ModelContextOverflowError):
         )
 
 
-class OpenAIProtocolError(OpenAIError):
+class OpenAIProtocolError(OpenAIError, OpenAIProtocolDiagnosticError):
     """Responses validation failure with an allowlisted diagnostic identity.
 
     ``reason_code`` is independent of the exception message. Unknown values are
     projected as ``unspecified``; raw messages never supply diagnostic fields.
     """
 
-    def __init__(self, message: str, *, reason_code: str = "unspecified") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "unspecified",
+        source_diagnostic: SearchSourceDiagnostic | None = None,
+    ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
+        self.source_diagnostic = source_diagnostic
 
 
 class OpenAITransport(Protocol):
@@ -667,11 +678,14 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
             raise self._safe_cancellation(exc) from None
         except Exception as exc:
             raise self._safe_failure(exc) from None
-        return _openai_background_snapshot(
-            state,
-            response,
-            reasoning_state=self._provider.reasoning_state,
-        )
+        try:
+            return _openai_background_snapshot(
+                state,
+                response,
+                reasoning_state=self._provider.reasoning_state,
+            )
+        except OpenAIProtocolError as exc:
+            raise self._safe_failure(exc) from None
 
     async def reconnect(self, state: ProviderOperationState) -> ProviderOperationConnection:
         state = _require_openai_background_state(state)
@@ -788,11 +802,14 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
             raise self._safe_cancellation(exc) from None
         except Exception as exc:
             raise self._safe_failure(exc) from None
-        return _openai_background_snapshot(
-            state,
-            response,
-            reasoning_state=self._provider.reasoning_state,
-        )
+        try:
+            return _openai_background_snapshot(
+                state,
+                response,
+                reasoning_state=self._provider.reasoning_state,
+            )
+        except OpenAIProtocolError as exc:
+            raise self._safe_failure(exc) from None
 
     async def _next_raw_event(
         self,
@@ -915,7 +932,27 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
         )
         if type(safe) is ModelStreamDeadlineError:
             return safe
-        if isinstance(exc, (OpenAIProtocolError, ProviderOperationMalformedError)):
+        if isinstance(exc, OpenAIProtocolError):
+            fields = protocol_exception_fields(
+                exc,
+                credential_values=credential_sanitization_values(
+                    self._provider.api_key,
+                    extra_headers=self._provider.extra_headers,
+                ),
+            )
+            diagnostic = None
+            if "provider_protocol_source_index" in fields:
+                diagnostic = SearchSourceDiagnostic(
+                    cast("int", fields["provider_protocol_source_index"]),
+                    cast("str", fields["provider_protocol_source_type_kind"]),
+                    cast("str | None", fields.get("provider_protocol_source_type_value")),
+                )
+            return OpenAIProtocolError(
+                str(safe),
+                reason_code=cast("str", fields["provider_protocol_reason"]),
+                source_diagnostic=diagnostic,
+            )
+        if isinstance(exc, ProviderOperationMalformedError):
             return ProviderOperationMalformedError(str(safe))
         return OpenAIAPIError(
             str(safe),
@@ -1327,7 +1364,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 # The runtime can then apply its bounded unknown retry policy.
                 protocol_payload["provider_error_type"] = "protocol_error"
                 protocol_payload.update(
-                    protocol_diagnostic_fields(getattr(exc, "reason_code", None))
+                    protocol_exception_fields(
+                        exc,
+                        credential_values=credential_values,
+                    )
                 )
                 error_event = ModelStreamEvent(
                     type=protocol_event.type,
@@ -2085,7 +2125,9 @@ def _openai_background_snapshot(
         return ProviderOperationSnapshot(state=state, status=status)
     try:
         parsed = openai_response_events(response, reasoning_state=reasoning_state)
-    except (OpenAIAPIError, OpenAIProtocolError, TypeError, ValueError):
+    except OpenAIProtocolError:
+        raise
+    except (OpenAIAPIError, TypeError, ValueError):
         return ProviderOperationSnapshot(state=state, status=status)
     cursor = state.recovery_metadata.cursor
     cursor = 0 if cursor is None else cursor
@@ -3619,6 +3661,7 @@ def _normalized_web_search_action(action: object, *, path: str) -> dict[str, Any
                 raise OpenAIProtocolError(
                     f"OpenAI {path}.sources[{index}].type is unsupported.",
                     reason_code="web_search_action_sources_type_is_unsupported",
+                    source_diagnostic=SearchSourceDiagnostic.from_value(index, source_type),
                 )
             url = _normalized_external_web_url(
                 url,
