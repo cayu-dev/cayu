@@ -3722,6 +3722,77 @@ def test_artifact_tools_return_error_without_artifact_store():
     assert list_result.content == "No artifact store configured for this tool call."
 
 
+@pytest.mark.parametrize("kind", ["process", "shell"])
+@pytest.mark.parametrize("explicit_kind", [False, True])
+def test_exec_command_output_limit_guidance_is_field_specific(kind, explicit_kind):
+    secret = "sensitive-command-content-" + "x" * 10_000
+    args = {"argv": ["echo", secret]} if kind == "process" else {"shell": f"echo {secret}"}
+    if explicit_kind:
+        args["kind"] = kind
+    runner = RecordingRunner()
+    ctx = ToolContext(session_id="sess_1", runner=runner)
+
+    result = asyncio.run(ExecCommandTool().run(ctx, {**args, "max_output_bytes": 300_000}))
+
+    assert result.is_error
+    assert result.structured == {"error": "invalid_arguments"}
+    assert result.content == "Tool argument `max_output_bytes` must be at most 200000."
+    assert "sensitive-command-content" not in json.dumps(result.model_dump(mode="json"))
+    assert runner.command is None
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({}, "must include `argv` or `shell`"),
+        ({"kind": "process"}, "`argv` is required when kind is `process`"),
+        ({"kind": "shell"}, "`shell` is required when kind is `shell`"),
+        (
+            {"argv": ["echo", "private-command"], "shell": "echo private-command"},
+            "`argv` and `shell` cannot both be provided",
+        ),
+        (
+            {"kind": "process", "shell": "echo private-command"},
+            "`shell` cannot be provided when kind is `process`",
+        ),
+        (
+            {"kind": "shell", "argv": ["echo", "private-command"]},
+            "`argv` cannot be provided when kind is `shell`",
+        ),
+    ],
+)
+def test_exec_command_form_guidance_is_safe_before_dispatch(args, message):
+    runner = RecordingRunner()
+    ctx = ToolContext(session_id="sess_1", runner=runner)
+
+    result = asyncio.run(ExecCommandTool().run(ctx, args))
+
+    assert result.is_error
+    assert result.structured == {"error": "invalid_arguments"}
+    assert message in result.content
+    assert len(result.content) < 200
+    assert "max_output_bytes" not in result.content
+    assert "private-command" not in json.dumps(result.model_dump(mode="json"))
+    assert runner.command is None
+
+
+@pytest.mark.parametrize("kind", ["process", "shell"])
+def test_exec_command_output_limit_boundary_runs_valid_command(tmp_path, kind):
+    args = (
+        {"kind": kind, "argv": [sys.executable, "-c", "print('ok')"]}
+        if kind == "process"
+        else {"kind": kind, "shell": "printf 'ok\\n'"}
+    )
+    ctx = ToolContext(session_id="sess_1", runner=LocalRunner(tmp_path))
+
+    result = asyncio.run(ExecCommandTool().run(ctx, {**args, "max_output_bytes": 200_000}))
+
+    assert not result.is_error
+    assert result.content == "ok"
+    assert result.structured["exit_code"] == 0
+    assert not result.structured["stdout_truncated"]
+
+
 def test_exec_command_tool_runs_process_and_reports_failures(tmp_path):
     ctx = ToolContext(session_id="sess_1", runner=LocalRunner(tmp_path))
 
