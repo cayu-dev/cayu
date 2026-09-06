@@ -38,7 +38,19 @@ from cayu.core.messages import (
     copy_message,
     copy_message_part,
 )
-from cayu.memory import AutomaticRecallPolicy
+from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+)
+from cayu.memory import (
+    AutomaticRecallPolicy,
+    MemoryDeltaPolicy,
+    MemoryDeltaRefreshDisposition,
+    MemoryDeltaRefreshOutcome,
+)
 from cayu.memory_evidence import (
     ContextExposureEvidenceKind,
     ContextExposureState,
@@ -74,8 +86,9 @@ from cayu.retrieval import (
 )
 from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
 from cayu.runtime._memory_evidence import (
+    MemoryEvidenceItemReference,
     MemoryEvidenceKey,
-    _request_includes_exact_frozen_manifest,
+    _request_includes_exact_memory_manifests,
     memory_evidence_key,
     memory_evidence_key_scope,
     recall_receipt_document_sha256,
@@ -111,7 +124,17 @@ from cayu.runtime.request_footprints import RequestFootprintConfig
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
+from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
+from cayu.storage.memory import (
+    InMemoryEmbeddingKnowledgeStore,
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeChunk,
+    KnowledgeEntry,
+    KnowledgeSearchMode,
+    KnowledgeStatus,
+    KnowledgeStore,
+)
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -119,10 +142,70 @@ class _CountingKnowledgeStore(InMemoryKnowledgeStore):
     def __init__(self, *, access_scope: KnowledgeAccessScope) -> None:
         super().__init__(access_scope=access_scope)
         self.search_count = 0
+        self.frontier_search_count = 0
+        self.revision_search_count = 0
+        self.change_read_count = 0
+        self.readiness_read_count = 0
 
     async def search(self, query, *, access_scope=None):
         self.search_count += 1
         return await super().search(query, access_scope=access_scope)
+
+    async def search_at_frontier(self, query, **kwargs):
+        self.frontier_search_count += 1
+        return await super().search_at_frontier(query, **kwargs)
+
+    async def search_revisions(self, query, revision_refs, **kwargs):
+        self.revision_search_count += 1
+        return await super().search_revisions(query, revision_refs, **kwargs)
+
+    async def read_changes(self, **kwargs):
+        self.change_read_count += 1
+        return await super().read_changes(**kwargs)
+
+    async def read_index_readiness(self, **kwargs):
+        self.readiness_read_count += 1
+        return await super().read_index_readiness(**kwargs)
+
+
+class _SemanticTestEmbeddingProvider(TextEmbeddingProvider):
+    name = "automatic-recall-semantic-test"
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        return TextEmbeddingResult(
+            model=request.model,
+            embeddings=[
+                TextEmbedding(
+                    index=index,
+                    vector=[
+                        1.0
+                        if "auth" in text.casefold() or "credential" in text.casefold()
+                        else 0.0,
+                        1.0 if "release" in text.casefold() else 0.0,
+                        0.0,
+                    ],
+                )
+                for index, text in enumerate(request.texts)
+            ],
+        )
+
+
+class _RetryableSemanticKnowledgeStore(InMemoryEmbeddingKnowledgeStore):
+    def __init__(self, *, access_scope: KnowledgeAccessScope) -> None:
+        super().__init__(
+            embedding_provider=_SemanticTestEmbeddingProvider(),
+            embedding_model="automatic-recall-semantic-test",
+            embedding_dimensions=3,
+            access_scope=access_scope,
+        )
+        self.fail_revision_semantic = False
+        self.revision_search_count = 0
+
+    async def search_revisions(self, query, revision_refs, **kwargs):
+        self.revision_search_count += 1
+        if self.fail_revision_semantic and query.mode is KnowledgeSearchMode.SEMANTIC:
+            raise RuntimeError("temporary semantic search failure")
+        return await super().search_revisions(query, revision_refs, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -481,6 +564,29 @@ class _ContinueOnceBeforeStop(LoopPolicy):
         return BeforeStopDecision.complete("second step is final")
 
 
+class _PublishAtlasEvidenceTool(Tool):
+    spec = ToolSpec(
+        name="publish_atlas_evidence",
+        description="Publish new Atlas evidence.",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+    )
+
+    def __init__(self, knowledge: InMemoryKnowledgeStore) -> None:
+        super().__init__()
+        self._knowledge = knowledge
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        await self._knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-runtime-delta",
+                namespace="project:cayu",
+                text="New Atlas release evidence says Saturday after the final review.",
+            )
+        )
+        return ToolResult(content="Published the new Atlas evidence.")
+
+
 def _fusion(*channels: str) -> WeightedReciprocalRankFusionConfig:
     return WeightedReciprocalRankFusionConfig(
         configuration_version="automatic-recall-context-tests-v1",
@@ -538,18 +644,20 @@ async def _fixture() -> tuple[
 def _request(
     *,
     sessions: _CountingSessionStore,
-    knowledge: _CountingKnowledgeStore,
+    knowledge: KnowledgeStore,
     session: Any,
     messages: list[Message],
     step: int = 1,
+    interaction_id: str = "interaction-one",
+    model_step_id: str | None = None,
 ) -> ContextRequest:
     return ContextRequest(
         session=session,
         agent=AgentSpec(name="assistant", model="fake-model"),
         messages=messages,
         step=step,
-        interaction_id=f"interaction-{step}",
-        model_step_id="mstep_00000000000000000000000000000000",
+        interaction_id=interaction_id,
+        model_step_id=model_step_id or f"mstep_{step:032x}",
         session_store=sessions,
         knowledge_store=knowledge,
         knowledge_access_scope=knowledge.bound_access_scope(),
@@ -614,6 +722,8 @@ def test_automatic_recall_freezes_projection_across_tool_and_runtime_user_rounds
         assert first.checkpoint["automatic_recall"]["anchor_transcript_index"] == 1
         assert knowledge.search_count == 1
         assert sessions.transcript_search_count == 1
+        assert knowledge.change_read_count == 0
+        assert knowledge.readiness_read_count == 0
 
         tool_round = [*messages, Message.text("assistant", "tool round continuation")]
         second = await policy.build_with_checkpoint(
@@ -673,6 +783,7 @@ def test_automatic_recall_freezes_projection_across_tool_and_runtime_user_rounds
                 session=session,
                 messages=next_round,
                 step=4,
+                interaction_id="interaction-two",
             ),
             checkpoint=third.checkpoint,
         )
@@ -683,6 +794,961 @@ def test_automatic_recall_freezes_projection_across_tool_and_runtime_user_rounds
         assert fourth.checkpoint["automatic_recall"]["runtime_authored_anchors"] == []
         assert knowledge.search_count == 2
         assert sessions.transcript_search_count == 2
+
+    asyncio.run(run())
+
+
+def test_memory_delta_appends_new_revision_once_without_changing_base_focus() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        base_manifest = _manifest(first)
+        assert '<cayu_memory_delta version="1"' not in base_manifest
+
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-new-evidence",
+                namespace="project:cayu",
+                text="New Atlas release evidence says Saturday after the final review.",
+            )
+        )
+        boundary_messages = [*messages, Message.text("assistant", "Tool round completed.")]
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=boundary_messages,
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert second.checkpoint is not None
+        user = next(message for message in second.messages if message.role is MessageRole.USER)
+        text_parts = [part.text for part in user.content if type(part) is TextPart]
+        assert text_parts[0] == base_manifest
+        assert text_parts[1].startswith('<cayu_memory_delta version="1" sequence="1">')
+        assert "Saturday" in text_parts[1]
+        delta_state = second.checkpoint["automatic_recall"]["delta_state"]
+        assert [item["sequence"] for item in delta_state["deltas"]] == [1]
+        assert [item["disposition"] for item in delta_state["refresh_outcomes"]] == [
+            MemoryDeltaRefreshDisposition.DELTA_APPENDED.value
+        ]
+        assert knowledge.frontier_search_count == 1
+        assert knowledge.revision_search_count == 1
+
+        third = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=boundary_messages,
+                step=3,
+            ),
+            checkpoint=second.checkpoint,
+        )
+        assert third.checkpoint is not None
+        assert third.messages == second.messages
+        assert [
+            item["disposition"]
+            for item in third.checkpoint["automatic_recall"]["delta_state"]["refresh_outcomes"]
+        ] == [
+            MemoryDeltaRefreshDisposition.DELTA_APPENDED.value,
+            MemoryDeltaRefreshDisposition.FRONTIER_UNCHANGED.value,
+        ]
+        assert knowledge.revision_search_count == 1
+        receipts = (
+            await sessions.list_recall_receipts(RecallEvidenceQuery(session_id=session.id))
+        ).items
+        assert len(receipts) == 2
+
+    asyncio.run(run())
+
+
+def test_memory_delta_rejects_a_non_injecting_admission_mode() -> None:
+    with pytest.raises(ValueError, match="mode that injects strong matches"):
+        AutomaticRecallContextPolicy(
+            admission_policy=_admission().model_copy(update={"mode": "offer"}),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            delta_policy=MemoryDeltaPolicy(),
+        )
+
+
+def test_memory_delta_reuses_one_boundary_plan_and_bounds_frontier_checks() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(
+                max_refreshes_per_interaction=2,
+                max_deltas_per_interaction=2,
+            ),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-first-boundary",
+                namespace="project:cayu",
+                text="New Atlas boundary evidence says Saturday.",
+            )
+        )
+        boundary_messages = [*messages, Message.text("assistant", "Boundary.")]
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=boundary_messages,
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert second.checkpoint is not None
+        reads_after_second = (knowledge.change_read_count, knowledge.readiness_read_count)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-after-boundary",
+                namespace="project:cayu",
+                text="Later Atlas boundary evidence says Sunday.",
+            )
+        )
+
+        exact_retry = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=boundary_messages,
+                step=2,
+            ),
+            checkpoint=second.checkpoint,
+        )
+        assert exact_retry.checkpoint is None
+        assert exact_retry.messages == second.messages
+        assert (knowledge.change_read_count, knowledge.readiness_read_count) == reads_after_second
+        with pytest.raises(ContextBuildError, match="another interaction"):
+            await policy.build_with_checkpoint(
+                _request(
+                    sessions=sessions,
+                    knowledge=knowledge,
+                    session=session,
+                    messages=boundary_messages,
+                    step=2,
+                    interaction_id="interaction-other",
+                ),
+                checkpoint=second.checkpoint,
+            )
+        assert (knowledge.change_read_count, knowledge.readiness_read_count) == reads_after_second
+
+        third = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=[*boundary_messages, Message.text("assistant", "Next boundary.")],
+                step=3,
+            ),
+            checkpoint=second.checkpoint,
+        )
+        assert third.checkpoint is not None
+        assert len(third.checkpoint["automatic_recall"]["delta_state"]["deltas"]) == 2
+        reads_after_third = (knowledge.change_read_count, knowledge.readiness_read_count)
+
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-after-refresh-budget",
+                namespace="project:cayu",
+                text="Atlas evidence beyond the refresh budget says Monday.",
+            )
+        )
+        fourth = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=[*boundary_messages, Message.text("assistant", "Final boundary.")],
+                step=4,
+            ),
+            checkpoint=third.checkpoint,
+        )
+        assert fourth.checkpoint is None
+        assert (knowledge.change_read_count, knowledge.readiness_read_count) == reads_after_third
+
+    asyncio.run(run())
+
+
+def test_memory_delta_ranking_isolated_from_transcript_candidates() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        fusion = WeightedReciprocalRankFusionConfig(
+            configuration_version="memory-delta-source-isolation-v1",
+            channel_weights={
+                KNOWLEDGE_LEXICAL_CHANNEL: 1.0,
+                KNOWLEDGE_SEMANTIC_CHANNEL: 1.0,
+                TRANSCRIPT_LEXICAL_CHANNEL: 100.0,
+            },
+            max_candidates_per_channel=20,
+            fused_head_limit=20,
+        )
+        admission = AutomaticRecallPolicy(
+            calibration_version="memory-delta-source-isolation-v1",
+            fusion_strategy_version=fusion.strategy_version,
+            fusion_configuration_version=fusion.configuration_version,
+            minimum_inject_score=0.0001,
+            minimum_offer_score=0.0001,
+            max_evaluated_candidates=1,
+            max_injected_items=1,
+            max_offered_items=1,
+        )
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=admission,
+            fusion_config=fusion,
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        assert sessions.transcript_search_count == 1
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-source-isolated-delta",
+                namespace="project:cayu",
+                text="Atlas release evidence says Saturday.",
+            )
+        )
+
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=[*messages, Message.text("assistant", "Tool completed.")],
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+
+        assert second.checkpoint is not None
+        delta_state = second.checkpoint["automatic_recall"]["delta_state"]
+        assert len(delta_state["deltas"]) == 1
+        assert delta_state["refresh_outcomes"][0]["disposition"] == (
+            MemoryDeltaRefreshDisposition.DELTA_APPENDED.value
+        )
+        assert sessions.transcript_search_count == 1
+        assert knowledge.revision_search_count == 1
+
+    asyncio.run(run())
+
+
+def test_memory_delta_retries_transient_partial_semantic_recall() -> None:
+    async def run() -> None:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _RetryableSemanticKnowledgeStore(access_scope=scope)
+        sessions = _CountingSessionStore()
+        session = await sessions.create(
+            RunRequest(agent_name="assistant", session_id="semantic-delta-retry", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        messages = [Message.text("user", "How should auth work?")]
+        await sessions.append_transcript_messages(
+            session.id,
+            messages,
+            interaction_id="interaction-one",
+        )
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL),
+            sources=AutomaticRecallSourceConfig(
+                include_transcript=False,
+                transcript_required=False,
+                knowledge_namespace="project:cayu",
+            ),
+            delta_policy=MemoryDeltaPolicy(),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        entry = KnowledgeEntry(
+            id="credential-design",
+            namespace="project:cayu",
+            text="Credential broker design.",
+        )
+        await knowledge.create_entry(
+            entry,
+            [
+                KnowledgeChunk(
+                    id="credential-design-chunk",
+                    entry_id=entry.id,
+                    entry_revision=entry.revision,
+                    chunk_index=0,
+                    text=entry.text,
+                )
+            ],
+        )
+        worker = await knowledge.process_embedding_changes(
+            "semantic-delta-retry-consumer",
+            "semantic-delta-retry-worker",
+            access_scope=scope,
+        )
+        assert worker.acknowledged_changes == 1
+        knowledge.fail_revision_semantic = True
+
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert second.checkpoint is not None
+        partial_state = second.checkpoint["automatic_recall"]["delta_state"]
+        assert partial_state["deltas"] == []
+        assert partial_state["refresh_outcomes"][0]["disposition"] == (
+            MemoryDeltaRefreshDisposition.RECALL_INCOMPLETE.value
+        )
+        assert partial_state["knowledge_sequence"] == partial_state["initial_knowledge_sequence"]
+        assert (
+            partial_state["index_readiness_sequence"]
+            == partial_state["initial_index_readiness_sequence"]
+        )
+
+        knowledge.fail_revision_semantic = False
+        third = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+                step=3,
+            ),
+            checkpoint=second.checkpoint,
+        )
+
+        assert third.checkpoint is not None
+        recovered_state = third.checkpoint["automatic_recall"]["delta_state"]
+        assert len(recovered_state["deltas"]) == 1
+        assert [item["disposition"] for item in recovered_state["refresh_outcomes"]] == [
+            MemoryDeltaRefreshDisposition.RECALL_INCOMPLETE.value,
+            MemoryDeltaRefreshDisposition.DELTA_APPENDED.value,
+        ]
+        assert knowledge.revision_search_count == 4
+
+    asyncio.run(run())
+
+
+def test_memory_delta_records_item_budget_exhaustion() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL),
+            sources=AutomaticRecallSourceConfig(
+                include_transcript=False,
+                transcript_required=False,
+                knowledge_namespace="project:cayu",
+            ),
+            delta_policy=MemoryDeltaPolicy(max_items_per_delta=1, max_cumulative_items=1),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-over-item-budget",
+                namespace="project:cayu",
+                text="Atlas release evidence says Saturday.",
+            )
+        )
+
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+
+        assert second.checkpoint is not None
+        state = second.checkpoint["automatic_recall"]["delta_state"]
+        assert state["deltas"] == []
+        outcome = MemoryDeltaRefreshOutcome.model_validate(state["refresh_outcomes"][0])
+        assert outcome.disposition is MemoryDeltaRefreshDisposition.ITEM_BUDGET_EXHAUSTED
+        assert outcome.eligible_item_count == outcome.omitted_item_count == 1
+
+    asyncio.run(run())
+
+
+def test_memory_delta_records_byte_budget_exhaustion() -> None:
+    async def run() -> None:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        sessions = _CountingSessionStore()
+        session = await sessions.create(
+            RunRequest(agent_name="assistant", session_id="delta-byte-budget", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        messages = [Message.text("user", "When is the Atlas release?")]
+        await sessions.append_transcript_messages(
+            session.id,
+            messages,
+            interaction_id="interaction-one",
+        )
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL),
+            sources=AutomaticRecallSourceConfig(
+                include_transcript=False,
+                transcript_required=False,
+                knowledge_namespace="project:cayu",
+            ),
+            delta_policy=MemoryDeltaPolicy(max_delta_bytes=1, max_cumulative_bytes=1),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-over-byte-budget",
+                namespace="project:cayu",
+                text="Atlas release evidence says Saturday.",
+            )
+        )
+
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+
+        assert second.checkpoint is not None
+        state = second.checkpoint["automatic_recall"]["delta_state"]
+        assert state["deltas"] == []
+        outcome = MemoryDeltaRefreshOutcome.model_validate(state["refresh_outcomes"][0])
+        assert outcome.disposition is MemoryDeltaRefreshDisposition.BYTE_BUDGET_EXHAUSTED
+        assert outcome.eligible_item_count == outcome.omitted_item_count == 1
+
+    asyncio.run(run())
+
+
+def test_memory_delta_rejects_base_projection_over_cumulative_budget() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(max_delta_bytes=1, max_cumulative_bytes=1),
+        )
+
+        with pytest.raises(ContextBuildError) as captured:
+            await policy.build_with_checkpoint(
+                _request(
+                    sessions=sessions,
+                    knowledge=knowledge,
+                    session=session,
+                    messages=messages,
+                ),
+                checkpoint=None,
+            )
+
+        assert isinstance(captured.value.__cause__, ValueError)
+        assert "base automatic-memory projection" in str(captured.value.__cause__)
+
+    asyncio.run(run())
+
+
+def test_memory_delta_checkpoint_rejects_active_policy_limit_violation() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(
+                max_refreshes_per_interaction=1,
+                max_deltas_per_interaction=1,
+            ),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert second.checkpoint is not None
+        corrupted = json.loads(json.dumps(second.checkpoint))
+        state = corrupted["automatic_recall"]["delta_state"]
+        model_step_id = f"mstep_{999:032x}"
+        state["refresh_outcomes"].append(
+            MemoryDeltaRefreshOutcome(
+                interaction_id="interaction-one",
+                ordinal=2,
+                model_step_id=model_step_id,
+                disposition=MemoryDeltaRefreshDisposition.FRONTIER_UNCHANGED,
+                previous_knowledge_sequence=state["knowledge_sequence"],
+                observed_knowledge_sequence=state["knowledge_sequence"],
+                previous_index_readiness_sequence=state["index_readiness_sequence"],
+                observed_index_readiness_sequence=state["index_readiness_sequence"],
+            ).model_dump(mode="json")
+        )
+        state["last_evaluated_model_step_id"] = model_step_id
+
+        with pytest.raises(ContextBuildError, match="delta checkpoint is invalid"):
+            await policy.build_with_checkpoint(
+                _request(
+                    sessions=sessions,
+                    knowledge=knowledge,
+                    session=session,
+                    messages=messages,
+                    step=3,
+                ),
+                checkpoint=corrupted,
+            )
+
+    asyncio.run(run())
+
+
+def test_memory_delta_uses_the_sqlite_frontier_and_exact_revision_path(tmp_path) -> None:
+    async def run() -> None:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = SQLiteKnowledgeStore(tmp_path / "memory-delta.sqlite", access_scope=scope)
+        sessions = _CountingSessionStore()
+        session = await sessions.create(
+            RunRequest(agent_name="assistant", session_id="sqlite-memory-delta", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        messages = [Message.text("user", "When is the Atlas release?")]
+        await sessions.append_transcript_messages(
+            session.id,
+            messages,
+            interaction_id="interaction-sqlite",
+        )
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(),
+        )
+
+        first = await policy.build_with_checkpoint(
+            ContextRequest(
+                session=session,
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=1,
+                interaction_id="interaction-sqlite",
+                model_step_id="mstep_00000000000000000000000000000001",
+                session_store=sessions,
+                knowledge_store=knowledge,
+                knowledge_access_scope=scope,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        assert first.checkpoint["automatic_recall"]["projection"] is None
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-sqlite-delta",
+                namespace="project:cayu",
+                text="New Atlas release evidence says Saturday.",
+            )
+        )
+        second = await policy.build_with_checkpoint(
+            ContextRequest(
+                session=session,
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[*messages, Message.text("assistant", "Tool boundary.")],
+                step=2,
+                interaction_id="interaction-sqlite",
+                model_step_id="mstep_00000000000000000000000000000002",
+                session_store=sessions,
+                knowledge_store=knowledge,
+                knowledge_access_scope=scope,
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert second.checkpoint is not None
+        delta = second.checkpoint["automatic_recall"]["delta_state"]["deltas"][0]
+        assert (
+            delta["projection"]["base_receipt_id"]
+            == first.checkpoint["automatic_recall"]["receipt_id"]
+        )
+        locator = json.loads(delta["projection"]["items"][0]["locator_json"])
+        assert locator["entry_id"] == "atlas-sqlite-delta"
+        await knowledge.close()
+
+    asyncio.run(run())
+
+
+def test_runtime_exposes_base_and_delta_receipts_for_the_exact_tool_round() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-runtime-base",
+                namespace="project:cayu",
+                text="Initial Atlas release evidence says Friday.",
+            )
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_publish_atlas_evidence",
+                        name="publish_atlas_evidence",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("Saturday"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(),
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=policy,
+            tools=[_PublishAtlasEvidenceTool(knowledge)],
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-memory-delta",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 2
+        first_parts = [
+            part.text
+            for message in provider.requests[0].messages
+            for part in message.content
+            if type(part) is TextPart
+        ]
+        second_parts = [
+            part.text
+            for message in provider.requests[1].messages
+            for part in message.content
+            if type(part) is TextPart
+        ]
+        base = next(text for text in first_parts if text.startswith("<cayu_automatic_memory"))
+        assert base in second_parts
+        assert any(text.startswith("<cayu_memory_delta") for text in second_parts)
+
+        receipts = (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-memory-delta")
+            )
+        ).items
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-memory-delta")
+            )
+        ).items
+        assert len(receipts) == 2
+        assert len(exposures) == 2
+        assert len(exposures[0].receipt_ids) == 1
+        assert exposures[1].receipt_ids == tuple(receipt.receipt_id for receipt in receipts)
+        links = await sessions.load_recall_item_exposures(
+            "automatic-recall-memory-delta",
+            exposures[1].exposure_id,
+        )
+        assert {link.receipt_id for link in links} == set(exposures[1].receipt_ids)
+        delta_receipt_id = receipts[1].receipt_id
+        assert {
+            link.selection_reason.value for link in links if link.receipt_id == delta_receipt_id
+        } == {"newly_relevant"}
+
+    asyncio.run(run())
+
+
+def test_memory_delta_admits_a_new_revision_but_not_a_superseded_archived_revision() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        current = await knowledge.get_entry("atlas-release")
+        assert current is not None
+        revised = await knowledge.append_entry_revision(
+            current.model_copy(
+                update={
+                    "revision": 2,
+                    "text": "Revised Atlas release evidence says Saturday.",
+                }
+            ),
+            expected_revision=1,
+        )
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=[*messages, Message.text("assistant", "First boundary.")],
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert second.checkpoint is not None
+        delta = second.checkpoint["automatic_recall"]["delta_state"]["deltas"][0]
+        assert delta["projection"]["items"][0]["identity"]["revision"] == "2"
+
+        revision_three = await knowledge.append_entry_revision(
+            revised.model_copy(
+                update={
+                    "revision": 3,
+                    "text": "Transient Atlas release evidence says Sunday.",
+                }
+            ),
+            expected_revision=2,
+        )
+        await knowledge.transition_entry_status(
+            revision_three.id,
+            expected_revision=3,
+            from_status=KnowledgeStatus.ACTIVE,
+            to_status=KnowledgeStatus.ARCHIVED,
+        )
+        third = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=[*messages, Message.text("assistant", "Second boundary.")],
+                step=3,
+            ),
+            checkpoint=second.checkpoint,
+        )
+        assert third.checkpoint is not None
+        assert len(third.checkpoint["automatic_recall"]["delta_state"]["deltas"]) == 1
+        rendered = "\n".join(
+            part.text
+            for message in third.messages
+            for part in message.content
+            if type(part) is TextPart
+        )
+        assert "Transient Atlas" not in rendered
+
+    asyncio.run(run())
+
+
+def test_memory_delta_checkpoint_rejects_reordered_or_detached_delta_state() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+            delta_policy=MemoryDeltaPolicy(),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+        assert first.checkpoint is not None
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-checkpoint-delta",
+                namespace="project:cayu",
+                text="New Atlas checkpoint evidence says Saturday.",
+            )
+        )
+        second = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=[*messages, Message.text("assistant", "Boundary.")],
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert second.checkpoint is not None
+        reordered = json.loads(json.dumps(second.checkpoint))
+        reordered["automatic_recall"]["delta_state"]["deltas"][0]["sequence"] = 2
+        detached_policy = json.loads(json.dumps(second.checkpoint))
+        detached_policy["automatic_recall"]["delta_state"]["policy_sha256"] = "0" * 64
+        missing_identity = json.loads(json.dumps(second.checkpoint))
+        missing_identity["automatic_recall"]["delta_state"]["emitted_identity_hmac_sha256s"].pop()
+        false_suppression = json.loads(json.dumps(second.checkpoint))
+        false_suppression["automatic_recall"]["delta_state"]["projection_suppressed"] = True
+
+        for corrupted in (
+            reordered,
+            detached_policy,
+            missing_identity,
+            false_suppression,
+        ):
+            with pytest.raises(ContextBuildError, match="checkpoint is invalid"):
+                await policy.build_with_checkpoint(
+                    _request(
+                        sessions=sessions,
+                        knowledge=knowledge,
+                        session=session,
+                        messages=[*messages, Message.text("assistant", "Boundary.")],
+                        step=3,
+                    ),
+                    checkpoint=corrupted,
+                )
 
     asyncio.run(run())
 
@@ -1291,6 +2357,12 @@ def test_final_request_rejects_duplicate_or_altered_automatic_memory_envelopes()
         "</cayu_automatic_memory>"
     )
     manifest_sha256 = sha256(manifest.encode("utf-8")).hexdigest()
+    delta_manifest = (
+        '<cayu_memory_delta version="1" sequence="1">\n'
+        '{"notice":"trusted runtime delta"}\n'
+        "</cayu_memory_delta>"
+    )
+    delta_manifest_sha256 = sha256(delta_manifest.encode("utf-8")).hexdigest()
     exact = ModelRequest(
         model="fake-model",
         messages=[Message(role="user", content=(TextPart(text=manifest),))],
@@ -1327,15 +2399,68 @@ def test_final_request_rejects_duplicate_or_altered_automatic_memory_envelopes()
         ],
     )
 
-    assert _request_includes_exact_frozen_manifest(exact, manifest_sha256) is True
-    assert _request_includes_exact_frozen_manifest(removed, manifest_sha256) is False
-    assert _request_includes_exact_frozen_manifest(removed, None) is False
-    with pytest.raises(RuntimeError, match="manifest changed"):
-        _request_includes_exact_frozen_manifest(duplicate, manifest_sha256)
-    with pytest.raises(RuntimeError, match="manifest changed"):
-        _request_includes_exact_frozen_manifest(altered, manifest_sha256)
-    with pytest.raises(RuntimeError, match="manifest changed"):
-        _request_includes_exact_frozen_manifest(altered, None)
+    def reference(digest: str | None) -> MemoryEvidenceItemReference:
+        return MemoryEvidenceItemReference(
+            receipt_id="receipt-one",
+            receipt_document_sha256="a" * 64,
+            receipt_manifest_binding_hmac_sha256="b" * 64,
+            manifest_sha256=digest,
+        )
+
+    assert _request_includes_exact_memory_manifests(exact, (reference(manifest_sha256),)) == (True,)
+    with pytest.raises(RuntimeError, match="memory changed"):
+        _request_includes_exact_memory_manifests(removed, (reference(manifest_sha256),))
+    assert _request_includes_exact_memory_manifests(removed, (reference(None),)) == (False,)
+    with pytest.raises(RuntimeError, match="memory changed"):
+        _request_includes_exact_memory_manifests(duplicate, (reference(manifest_sha256),))
+    with pytest.raises(RuntimeError, match="memory changed"):
+        _request_includes_exact_memory_manifests(altered, (reference(manifest_sha256),))
+    with pytest.raises(RuntimeError, match="memory changed"):
+        _request_includes_exact_memory_manifests(altered, (reference(None),))
+
+    exact_sequence = ModelRequest(
+        model="fake-model",
+        messages=[
+            Message(
+                role="user",
+                content=(
+                    TextPart(text=manifest),
+                    TextPart(text=delta_manifest),
+                    TextPart(text="Original question."),
+                ),
+            )
+        ],
+    )
+    references = (reference(manifest_sha256), reference(delta_manifest_sha256))
+    assert _request_includes_exact_memory_manifests(exact_sequence, references) == (True, True)
+    reversed_sequence = exact_sequence.model_copy(
+        update={
+            "messages": [
+                Message(
+                    role="user",
+                    content=(TextPart(text=delta_manifest), TextPart(text=manifest)),
+                )
+            ]
+        }
+    )
+    with pytest.raises(RuntimeError, match="memory changed"):
+        _request_includes_exact_memory_manifests(reversed_sequence, references)
+    moved_sequence = exact_sequence.model_copy(
+        update={
+            "messages": [
+                Message(
+                    role="user",
+                    content=(
+                        TextPart(text="Original question."),
+                        TextPart(text=manifest),
+                        TextPart(text=delta_manifest),
+                    ),
+                )
+            ]
+        }
+    )
+    with pytest.raises(RuntimeError, match="memory moved"):
+        _request_includes_exact_memory_manifests(moved_sequence, references)
 
 
 def test_transcript_automatic_recall_excludes_the_anchoring_user_message() -> None:
@@ -3054,8 +4179,8 @@ def test_presentation_transition_rejects_previous_frozen_checkpoint_version():
         )
         first = await policy.build_with_checkpoint(request, checkpoint=None)
         checkpoint = json.loads(json.dumps(first.checkpoint))
-        assert checkpoint["automatic_recall"]["version"] == 3
-        checkpoint["automatic_recall"]["version"] = 2
+        assert checkpoint["automatic_recall"]["version"] == 4
+        checkpoint["automatic_recall"]["version"] = 3
         with pytest.raises(ContextBuildError, match="checkpoint is invalid"):
             await policy.build_with_checkpoint(request, checkpoint=checkpoint)
         assert knowledge.search_count == 1

@@ -12919,6 +12919,7 @@ from cayu import (
     AutomaticRecallSourceConfig,
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
+    MemoryDeltaPolicy,
     TRANSCRIPT_LEXICAL_CHANNEL,
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     WeightedReciprocalRankFusionConfig,
@@ -12948,6 +12949,8 @@ policy = AutomaticRecallContextPolicy(
         knowledge_required=True,
         transcript_required=False,
     ),
+    # Opt in only for a frontier-aware KnowledgeStore.
+    delta_policy=MemoryDeltaPolicy(),
 )
 ```
 
@@ -13027,9 +13030,10 @@ durable user transcript.
 The frozen redacted provider-neutral contribution projection and its session id,
 anchor digest/index, admission-policy and complete automatic-recall configuration
 fingerprints, situation and contribution/projection/manifest digests, receipt
-ID, exact receipt-document digest, purpose-separated receipt-to-manifest HMAC,
-byte count, and runtime-authored anchors are stored under the versioned
-`automatic_recall` checkpoint root (version 3; older frames are rejected).
+ID, interaction ID, exact receipt-document digest, purpose-separated receipt-to-manifest HMAC,
+byte count, runtime-authored anchors, initial and committed delta frontiers, and bounded typed
+refresh outcomes are stored under the versioned
+`automatic_recall` checkpoint root (version 4; older frames are rejected).
 Presentation version 2 participates in the complete configuration fingerprint.
 Each exposed item's `provider_representation_sha256` binds the exact escaped JSON
 item in the actual manifest, including redacted previews and read arguments.
@@ -13046,6 +13050,42 @@ malformed or internally inconsistent frame still fails closed without recalling.
 The next real user message creates a new frame and can observe new knowledge. The
 complete redacted projection must fit `max_projection_bytes`; otherwise context
 construction fails before dispatch.
+
+`MemoryDeltaPolicy` optionally admits newly changed knowledge during the same
+interaction and therefore requires an automatic-recall mode that injects strong matches.
+The initial recall captures the accessible knowledge and semantic-index
+readiness frontier. At each later model-request composition boundary, the policy reads
+bounded pages after that frontier. It performs no recall when the accessible frontier is
+unchanged. Each model-step identity is checked at most once, including after recovery, and
+the refresh bound limits all frontier checks rather than only checks that lead to recall.
+An advance is represented by an immutable `MemoryDeltaTrigger`. Delta recall uses a derived
+knowledge-only fusion configuration and is restricted to the exact revisions in that bounded
+page, the current request's access scope, and the captured search frontier; transcript
+candidates cannot compete for its fused or evaluated head. A current strong match not already present in
+the base focus, base offer, or an earlier delta becomes a `MemoryDeltaItem` with the
+`newly_relevant` reason.
+
+Each non-empty `MemoryDelta` has a contiguous interaction-local sequence and renders as
+a separate `<cayu_memory_delta version="1" sequence="N">` text part after the unchanged
+base manifest. It binds the exact interaction and base recall receipt as well as its own
+trigger, receipt, and selected revisions. The runtime never edits an earlier manifest or appends the projection to
+the transcript. Count and byte limits bound frontier pages and checks, recall operations, deltas,
+items per delta, cumulative exposed items, each rendered delta, and total automatic-memory
+bytes. Every attempted boundary retains an immutable `MemoryDeltaRefreshOutcome` that
+distinguishes unchanged frontiers, no current or newly relevant revision, retryable incomplete
+recall, item/byte exhaustion, and an appended delta. Transient semantic timeout or failure
+does not consume the observed frontier: a later distinct model step may retry the same exact
+page until the overall refresh bound is exhausted. Complete empty, omitted, and appended
+outcomes commit the observed frontier, so retries and process recovery do not repeat completed
+work. The final
+provider composition links the base receipt and every rendered delta receipt through one
+`ContextExposure`; each item keeps its own receipt ordinal and exact provider
+representation hash.
+
+This slice deliberately does not re-anchor an unchanged previously exposed revision.
+Re-anchoring needs separate evaluation evidence and policy for cooldown, repeat count,
+and useful-repeat precision; prior exposure alone remains neither proof of attention nor
+a reason to repeat material.
 
 Forks inherit authoritative transcript history but never the source interaction's
 `automatic_recall` checkpoint root. The child derives a new frame from its next

@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
+from cayu.core.messages import MessageRole
 from cayu.memory import AutomaticRecallContribution, AutomaticRecallPolicy
 from cayu.memory_evidence import (
     ContextExposure,
@@ -55,6 +56,8 @@ _MEMORY_EVIDENCE_KEY_DERIVATION_CONTEXT = b"cayu.memory-evidence.request-footpri
 _AUTOMATIC_RECALL_CHECKPOINT_BINDING_CONTEXT = b"cayu.automatic-recall-checkpoint-binding.v1"
 _AUTOMATIC_RECALL_OPEN_TAG = '<cayu_automatic_memory version="2">'
 _AUTOMATIC_RECALL_CLOSE_TAG = "</cayu_automatic_memory>"
+_MEMORY_DELTA_OPEN_TAG_PREFIX = '<cayu_memory_delta version="1" sequence="'
+_MEMORY_DELTA_CLOSE_TAG = "</cayu_memory_delta>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +78,7 @@ class MemoryEvidenceKey:
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryEvidenceReference:
+class MemoryEvidenceItemReference:
     receipt_id: str
     receipt_document_sha256: str
     receipt_manifest_binding_hmac_sha256: str
@@ -112,6 +115,22 @@ class MemoryEvidenceReference:
             or any(character not in "0123456789abcdef" for character in self.manifest_sha256)
         ):
             raise ValueError("manifest_sha256 must be a lowercase SHA-256 digest.")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryEvidenceReference:
+    items: tuple[MemoryEvidenceItemReference, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.items) is not tuple or not self.items:
+            raise ValueError("Memory evidence must contain at least one receipt reference.")
+        if len(self.items) > 32:
+            raise ValueError("Memory evidence exceeds its receipt-reference bound.")
+        if any(type(item) is not MemoryEvidenceItemReference for item in self.items):
+            raise TypeError("Memory evidence items must be MemoryEvidenceItemReference values.")
+        receipt_ids = [item.receipt_id for item in self.items]
+        if len(receipt_ids) != len(set(receipt_ids)):
+            raise ValueError("Memory evidence cannot repeat a receipt reference.")
 
 
 _ACTIVE_MEMORY_EVIDENCE_KEY: ContextVar[MemoryEvidenceKey | None] = ContextVar(
@@ -160,6 +179,7 @@ def build_recall_receipt(
     admission_policy: AutomaticRecallPolicy,
     source_configuration: Mapping[str, Any],
     key: MemoryEvidenceKey,
+    admitted_selection_reason: RecallItemSelectionReason | None = None,
     created_at: datetime | None = None,
 ) -> RecallReceipt:
     """Build one receipt from the exact result already used for admission."""
@@ -171,7 +191,16 @@ def build_recall_receipt(
     if contribution.policy_sha256 != admission_policy.fingerprint():
         raise ValueError("Automatic recall contribution belongs to a different policy.")
 
-    selected_items = _receipt_items(contribution, key=key)
+    if admitted_selection_reason is not None and (
+        type(admitted_selection_reason) is not RecallItemSelectionReason
+        or not RecallItemAdmission.ADMITTED.matches_selection_reason(admitted_selection_reason)
+    ):
+        raise ValueError("admitted_selection_reason must describe admitted recall items.")
+    selected_items = _receipt_items(
+        contribution,
+        key=key,
+        admitted_selection_reason=admitted_selection_reason,
+    )
     selected_identities = {item.identity.sort_key() for item in selected_items}
     decisions = {
         item.identity.sort_key(): item for item in contribution.diagnostics.candidate_decisions
@@ -383,41 +412,46 @@ async def prepare_context_exposure(
         character not in "0123456789abcdef" for character in request_fingerprint_sha256
     ):
         raise ValueError("request_fingerprint_sha256 must be a lowercase SHA-256 digest.")
-    receipt = await store.load_recall_receipt(session_id, reference.receipt_id)
-    if receipt is None:
-        raise RuntimeError("The automatic recall receipt is not durable.")
-    if receipt.interaction_id != interaction_id:
-        raise RuntimeError("The automatic recall receipt belongs to another interaction.")
-    if receipt.situation_fingerprint.key_id != key.key_id:
-        raise RuntimeError("The automatic recall receipt uses another evidence-key identity.")
-    if not hmac.compare_digest(
-        recall_receipt_document_sha256(receipt),
-        reference.receipt_document_sha256,
-    ):
-        raise RuntimeError("The automatic recall checkpoint does not match its durable receipt.")
-    if not hmac.compare_digest(
-        recall_receipt_manifest_binding_hmac_sha256(
-            receipt_document_sha256=reference.receipt_document_sha256,
-            manifest_sha256=reference.manifest_sha256,
-            key=key,
-        ),
-        reference.receipt_manifest_binding_hmac_sha256,
-    ):
-        raise RuntimeError(
-            "The automatic recall checkpoint receipt-to-manifest binding is invalid."
+    receipts: list[RecallReceipt] = []
+    representations: list[dict[int, str]] = []
+    included = _request_includes_exact_memory_manifests(model_request, reference.items)
+    for item_reference, include_items in zip(reference.items, included, strict=True):
+        receipt = await store.load_recall_receipt(session_id, item_reference.receipt_id)
+        if receipt is None:
+            raise RuntimeError("An automatic memory recall receipt is not durable.")
+        if receipt.interaction_id != interaction_id:
+            raise RuntimeError("An automatic memory receipt belongs to another interaction.")
+        if receipt.situation_fingerprint.key_id != key.key_id:
+            raise RuntimeError("An automatic memory receipt uses another evidence-key identity.")
+        if not hmac.compare_digest(
+            recall_receipt_document_sha256(receipt),
+            item_reference.receipt_document_sha256,
+        ):
+            raise RuntimeError(
+                "The automatic memory checkpoint does not match its durable receipt."
+            )
+        if not hmac.compare_digest(
+            recall_receipt_manifest_binding_hmac_sha256(
+                receipt_document_sha256=item_reference.receipt_document_sha256,
+                manifest_sha256=item_reference.manifest_sha256,
+                key=key,
+            ),
+            item_reference.receipt_manifest_binding_hmac_sha256,
+        ):
+            raise RuntimeError(
+                "The automatic memory checkpoint receipt-to-manifest binding is invalid."
+            )
+        representation_hashes = (
+            _provider_representation_hashes(model_request, item_reference.manifest_sha256)
+            if include_items
+            else {}
         )
-    include_items = _request_includes_exact_frozen_manifest(
-        model_request,
-        reference.manifest_sha256,
-    )
-
-    representation_hashes = (
-        _provider_representation_hashes(model_request, reference.manifest_sha256)
-        if include_items
-        else {}
-    )
-    if include_items and set(representation_hashes) != {item.fused_rank for item in receipt.items}:
-        raise RuntimeError("The rendered recall items do not match the durable receipt.")
+        if include_items and set(representation_hashes) != {
+            receipt_item.fused_rank for receipt_item in receipt.items
+        }:
+            raise RuntimeError("Rendered automatic memory items do not match their receipt.")
+        receipts.append(receipt)
+        representations.append(representation_hashes)
     provider_attempt_id = new_provider_attempt_id()
     exposure_id = new_context_exposure_id()
     composition_sha256 = _payload_sha256(
@@ -442,7 +476,7 @@ async def prepare_context_exposure(
         },
         "context policy availability",
     )
-    now = max(datetime.now(UTC), receipt.created_at)
+    now = max(datetime.now(UTC), *(receipt.created_at for receipt in receipts))
     planned = ContextExposureTransition(
         transition_id=new_context_exposure_transition_id(),
         revision=0,
@@ -485,7 +519,7 @@ async def prepare_context_exposure(
             KeyedEvidenceFingerprintDomain.REQUEST_CONTRACT,
             key,
         ),
-        receipt_ids=(receipt.receipt_id,),
+        receipt_ids=tuple(receipt.receipt_id for receipt in receipts),
         contributor_ids=("automatic_recall",),
         created_at=now,
         updated_at=now,
@@ -493,25 +527,28 @@ async def prepare_context_exposure(
         state_revision=0,
         transitions=(planned,),
     )
-    item_exposures = (
-        tuple(
-            RecallItemExposure(
-                exposure_id=exposure_id,
-                receipt_id=receipt.receipt_id,
-                ordinal=ordinal,
-                receipt_item_ordinal=item.ordinal,
-                provider_representation_sha256=representation_hashes[item.fused_rank],
-                identity=item.identity,
-                representation_id=item.representation_id,
-                content_sha256=item.content_sha256,
-                locator=item.locator,
-                admission=item.admission,
-                selection_reason=item.selection_reason,
-            )
-            for ordinal, item in enumerate(receipt.items)
+    item_exposures = tuple(
+        RecallItemExposure(
+            exposure_id=exposure_id,
+            receipt_id=receipt.receipt_id,
+            ordinal=ordinal,
+            receipt_item_ordinal=item.ordinal,
+            provider_representation_sha256=representations[receipt_index][item.fused_rank],
+            identity=item.identity,
+            representation_id=item.representation_id,
+            content_sha256=item.content_sha256,
+            locator=item.locator,
+            admission=item.admission,
+            selection_reason=item.selection_reason,
         )
-        if include_items
-        else ()
+        for ordinal, (receipt_index, receipt, item) in enumerate(
+            (receipt_index, receipt, item)
+            for receipt_index, (receipt, include_items) in enumerate(
+                zip(receipts, included, strict=True)
+            )
+            if include_items
+            for item in receipt.items
+        )
     )
     try:
         exposure = await _create_context_exposure(
@@ -816,24 +853,35 @@ def memory_evidence_reference_from_checkpoint(
     state = checkpoint["automatic_recall"]
     if type(state) is not dict:
         raise ValueError("Automatic-recall memory-evidence checkpoint is malformed.")
-    receipt_id = state.get("receipt_id")
-    receipt_document_sha256 = state.get("receipt_document_sha256")
-    receipt_manifest_binding_hmac_sha256 = state.get("receipt_manifest_binding_hmac_sha256")
-    manifest_sha256 = state.get("manifest_sha256")
-    if (
-        type(receipt_id) is not str
-        or type(receipt_document_sha256) is not str
-        or type(receipt_manifest_binding_hmac_sha256) is not str
-    ):
-        raise ValueError("Automatic-recall memory-evidence checkpoint is malformed.")
-    if manifest_sha256 is not None and type(manifest_sha256) is not str:
-        raise ValueError("Automatic-recall memory-evidence checkpoint is malformed.")
-    return MemoryEvidenceReference(
-        receipt_id=receipt_id,
-        receipt_document_sha256=receipt_document_sha256,
-        receipt_manifest_binding_hmac_sha256=receipt_manifest_binding_hmac_sha256,
-        manifest_sha256=manifest_sha256,
-    )
+    raw_items = [state]
+    delta_state = state.get("delta_state")
+    if delta_state is not None:
+        if type(delta_state) is not dict or type(delta_state.get("deltas")) is not list:
+            raise ValueError("Automatic-memory delta evidence checkpoint is malformed.")
+        raw_items.extend(delta_state["deltas"])
+    items: list[MemoryEvidenceItemReference] = []
+    for raw_item in raw_items:
+        receipt_id = raw_item.get("receipt_id")
+        receipt_document_sha256 = raw_item.get("receipt_document_sha256")
+        receipt_manifest_binding_hmac_sha256 = raw_item.get("receipt_manifest_binding_hmac_sha256")
+        manifest_sha256 = raw_item.get("manifest_sha256")
+        if (
+            type(receipt_id) is not str
+            or type(receipt_document_sha256) is not str
+            or type(receipt_manifest_binding_hmac_sha256) is not str
+        ):
+            raise ValueError("Automatic-recall memory-evidence checkpoint is malformed.")
+        if manifest_sha256 is not None and type(manifest_sha256) is not str:
+            raise ValueError("Automatic-recall memory-evidence checkpoint is malformed.")
+        items.append(
+            MemoryEvidenceItemReference(
+                receipt_id=receipt_id,
+                receipt_document_sha256=receipt_document_sha256,
+                receipt_manifest_binding_hmac_sha256=(receipt_manifest_binding_hmac_sha256),
+                manifest_sha256=manifest_sha256,
+            )
+        )
+    return MemoryEvidenceReference(items=tuple(items))
 
 
 def context_exposure_identity_payload(exposure: ContextExposure) -> dict[str, str]:
@@ -899,6 +947,7 @@ def _receipt_items(
     contribution: AutomaticRecallContribution,
     *,
     key: MemoryEvidenceKey,
+    admitted_selection_reason: RecallItemSelectionReason | None,
 ) -> tuple[RecallReceiptItem, ...]:
     material: list[tuple[int, Any, RecallItemAdmission, str]] = []
     if contribution.focus is not None:
@@ -945,7 +994,11 @@ def _receipt_items(
                     key=key,
                 ),
                 admission=admission,
-                selection_reason=RecallItemSelectionReason(reason),
+                selection_reason=(
+                    RecallItemSelectionReason(reason)
+                    if admission is RecallItemAdmission.OFFERED or admitted_selection_reason is None
+                    else admitted_selection_reason
+                ),
                 fused_rank=fused_rank,
                 match_channels=tuple(match.channel for match in matches),
             )
@@ -1002,11 +1055,15 @@ def _provider_representation_hashes(
                 and hashlib.sha256(part.text.encode("utf-8")).hexdigest() == manifest_sha256
             ):
                 payload = json.loads(part.text.split("\n", 1)[1].rsplit("\n", 1)[0])
-                items = [
-                    item
-                    for section in ("focus", "offer")
-                    for item in payload.get(section, {}).get("items", [])
-                ]
+                items = (
+                    payload.get("items", [])
+                    if _MEMORY_DELTA_OPEN_TAG_PREFIX in part.text
+                    else [
+                        item
+                        for section in ("focus", "offer")
+                        for item in payload.get(section, {}).get("items", [])
+                    ]
+                )
                 if len({item["ref"] for item in items}) != len(items):
                     raise RuntimeError("The rendered recall repeats an item reference.")
                 return {
@@ -1018,40 +1075,48 @@ def _provider_representation_hashes(
     return {}
 
 
-def _request_manifest_count(request: ModelRequest, manifest_sha256: str) -> int:
+def _request_memory_manifest_locations(
+    request: ModelRequest,
+) -> tuple[tuple[int, int, str], ...]:
     from cayu.core.messages import TextPart
 
-    return sum(
-        hashlib.sha256(part.text.encode("utf-8")).hexdigest() == manifest_sha256
-        for message in request.messages
-        for part in message.content
-        if type(part) is TextPart
+    return tuple(
+        (message_index, part_index, hashlib.sha256(part.text.encode("utf-8")).hexdigest())
+        for message_index, message in enumerate(request.messages)
+        for part_index, part in enumerate(message.content)
+        if type(part) is TextPart and _is_automatic_memory_envelope(part.text)
     )
 
 
-def _request_includes_exact_frozen_manifest(
+def _request_includes_exact_memory_manifests(
     request: ModelRequest,
-    manifest_sha256: str | None,
-) -> bool:
-    reserved_envelope_count = _request_automatic_recall_envelope_count(request)
-    if manifest_sha256 is None:
-        if reserved_envelope_count:
-            raise RuntimeError("The frozen recall manifest changed before provider dispatch.")
-        return False
-    exact_manifest_count = _request_manifest_count(request, manifest_sha256)
-    if exact_manifest_count > 1 or reserved_envelope_count != exact_manifest_count:
-        raise RuntimeError("The frozen recall manifest changed before provider dispatch.")
-    return exact_manifest_count == 1
+    references: tuple[MemoryEvidenceItemReference, ...],
+) -> tuple[bool, ...]:
+    expected = tuple(
+        item.manifest_sha256 for item in references if item.manifest_sha256 is not None
+    )
+    if len(expected) != len(set(expected)):
+        raise RuntimeError("Automatic memory repeats a frozen manifest identity.")
+    locations = _request_memory_manifest_locations(request)
+    if tuple(digest for _, _, digest in locations) != expected:
+        raise RuntimeError("Frozen automatic memory changed before provider dispatch.")
+    if locations:
+        message_index = locations[0][0]
+        if (
+            request.messages[message_index].role is not MessageRole.USER
+            or any(location[0] != message_index for location in locations)
+            or tuple(location[1] for location in locations) != tuple(range(len(locations)))
+        ):
+            raise RuntimeError("Frozen automatic memory moved before provider dispatch.")
+    return tuple(item.manifest_sha256 is not None for item in references)
 
 
-def _request_automatic_recall_envelope_count(request: ModelRequest) -> int:
-    from cayu.core.messages import TextPart
-
-    return sum(
-        _AUTOMATIC_RECALL_OPEN_TAG in part.text or _AUTOMATIC_RECALL_CLOSE_TAG in part.text
-        for message in request.messages
-        for part in message.content
-        if type(part) is TextPart
+def _is_automatic_memory_envelope(value: str) -> bool:
+    return (
+        _AUTOMATIC_RECALL_OPEN_TAG in value
+        or _AUTOMATIC_RECALL_CLOSE_TAG in value
+        or _MEMORY_DELTA_OPEN_TAG_PREFIX in value
+        or _MEMORY_DELTA_CLOSE_TAG in value
     )
 
 

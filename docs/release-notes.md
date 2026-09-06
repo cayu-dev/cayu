@@ -93,6 +93,27 @@ guard.
 
 ## Unreleased
 
+### Automatic memory can append bounded frontier-driven deltas
+
+`AutomaticRecallContextPolicy` accepts an opt-in `MemoryDeltaPolicy` for knowledge stores
+that implement Cayu's bounded change, index-readiness, exact-revision, and frontier-search
+contracts. The frozen base memory manifest remains byte-identical throughout the real-user
+interaction. A later safe model boundary with an accessible frontier advance can append a
+separate, monotonic `MemoryDelta` containing exact newly relevant revisions. Unchanged
+frontiers do not run recall; exact retries and recovery reuse the committed sequence. Delta
+ranking is knowledge-only even when base recall also uses transcript search, preventing an
+unrelated transcript candidate from displacing a changed knowledge revision. A transient
+semantic timeout or failure retains the prior committed frontier for a bounded later retry.
+
+The final provider composition links the base and delta recall receipts through the same
+crash-safe `ContextExposure` lifecycle, with exact per-item representation hashes. Explicit
+limits bound page work, once-per-model-step frontier checks, delta count, per-delta and
+cumulative items, and bytes. Typed `MemoryDeltaRefreshOutcome` records distinguish complete
+empty results, retryable incomplete recall, item or byte exhaustion, and appended deltas.
+This does not re-anchor unchanged revisions or infer provider attention. Enabling deltas is
+a deliberate prerelease checkpoint compatibility boundary: `automatic_recall` advances to
+version 4, and version-3 frames are rejected rather than translated or backfilled.
+
 ### Application fingerprints survive durable numeric normalization
 
 Application manifests and generator plans advance from schema 16 to 17.

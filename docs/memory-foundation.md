@@ -410,10 +410,22 @@ interaction, freezes the redacted provider-neutral contribution through retries,
 tool rounds, repair, compaction, and recovery, and expires it at the next real
 user message. It never mutates the durable transcript.
 
+Applications whose knowledge store supports bounded change/readiness streams and
+frontier-restricted revision search can opt into `MemoryDeltaPolicy`. The base
+`MemoryFocus` remains byte-stable. At a later safe model boundary, an accessible
+knowledge-frontier advance may append a bounded, separately rendered `MemoryDelta` for an
+exact newly relevant revision. Delta ranking uses a derived knowledge-only fusion
+configuration, so transcript candidates cannot consume the changed-revision head. An
+unchanged frontier performs no recall. Every attempted boundary records a typed
+`MemoryDeltaRefreshOutcome`; transiently incomplete semantic recall retains the prior
+committed frontier for one bounded later retry, while complete empty, omitted, and appended
+outcomes advance it. One provider composition and exposure record binds the base receipt
+plus every delta receipt; nothing is written into user or assistant transcript history.
+
 This first context manager does not claim semantic awareness of everything
 already stated in the provider-visible context and does not reposition material
-around a guessed lost-in-the-middle region. Those remain future composition and
-exposure-evidence decisions. The credential-free
+around a guessed lost-in-the-middle region. It also does not re-anchor an unchanged
+revision: that remains a future evidence-backed composition decision. The credential-free
 [cross-source example](../examples/cross_source_recall.py) shows retrieval and
 admission as explicit separate steps.
 
