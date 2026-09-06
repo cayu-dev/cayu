@@ -1666,6 +1666,9 @@ def test_e2b_runner_detaches_opaque_sdk_failure_text(
     assert exc_info.value.__context__ is None
     assert exc_info.value.diagnostic == {
         "type": "cayu.runner_execution_error.v1",
+        "errno": None,
+        "errno_code": None,
+        "execution_phase": "unknown",
         "adapter": "e2b",
         "status": "failed",
         "error_type": "RuntimeError",

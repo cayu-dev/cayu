@@ -47,6 +47,8 @@ from cayu._validation import (
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runners._cleanup import RunnerCleanupResult
 from cayu.runners._diagnostics import (
+    runner_failure_fields,
+    safe_runner_failure_fields,
     trusted_runner_error_type_name,
     trusted_runner_exception_type_name,
 )
@@ -514,9 +516,16 @@ def runner_execution_error(
     }:
         adapter = "unknown"
     error_type = trusted_runner_exception_type_name(error)
+    failure_fields = runner_failure_fields(error)
     source_diagnostic = _base_exception_namespace_value(error, "diagnostic")
     if type(source_diagnostic) is dict:
-        source_diagnostic = cast("dict[str, Any]", source_diagnostic)
+        source_diagnostic = {
+            key: value for key, value in dict.items(source_diagnostic) if type(key) is str
+        }
+        if type(error) is RunnerExecutionError:
+            failure_fields = safe_runner_failure_fields(
+                source_diagnostic.get("errno"), source_diagnostic.get("execution_phase")
+            )
         source_type = trusted_runner_error_type_name(source_diagnostic.get("error_type"))
         if source_type is not None:
             error_type = source_type
@@ -533,6 +542,7 @@ def runner_execution_error(
         "adapter": adapter,
         "status": "failed",
         "error_type": error_type,
+        **failure_fields,
         "timed_out": False,
         "cancelled": False,
     }
@@ -546,6 +556,7 @@ def runner_execution_error(
 def _safe_runner_execution_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
     if type(diagnostic) is not dict:
         raise TypeError("Runner execution diagnostic must be a dict.")
+    diagnostic = {key: value for key, value in dict.items(diagnostic) if type(key) is str}
     adapter = diagnostic.get("adapter")
     if type(adapter) is not str or adapter not in {
         "docker",
@@ -561,6 +572,7 @@ def _safe_runner_execution_diagnostic(diagnostic: dict[str, Any]) -> dict[str, A
         "adapter": adapter,
         "status": "failed",
         "error_type": error_type,
+        **safe_runner_failure_fields(diagnostic.get("errno"), diagnostic.get("execution_phase")),
         "timed_out": diagnostic.get("timed_out") is True,
         "cancelled": diagnostic.get("cancelled") is True,
     }
@@ -576,7 +588,11 @@ def _base_exception_namespace_value(error: BaseException, name: str) -> object:
         namespace = BaseException.__dict__["__dict__"].__get__(error, BaseException)
     except BaseException:
         return None
-    return dict.get(namespace, name) if type(namespace) is dict else None
+    if type(namespace) is dict:
+        for key, value in dict.items(namespace):
+            if type(key) is str and key == name:
+                return value
+    return None
 
 
 def attach_cancellation_artifacts(

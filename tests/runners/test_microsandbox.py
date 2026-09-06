@@ -958,6 +958,9 @@ def test_microsandbox_runner_sanitizes_no_exit_event_when_agent_ping_succeeds() 
 
     assert exc_info.value.diagnostic == {
         "type": "cayu.runner_execution_error.v1",
+        "errno": None,
+        "errno_code": None,
+        "execution_phase": "unknown",
         "adapter": "microsandbox",
         "status": "failed",
         "error_type": "Exception",

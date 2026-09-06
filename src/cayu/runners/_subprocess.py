@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import BinaryIO, TypeVar
 
 from cayu._validation import require_durable_clean_nonblank, require_durable_text
+from cayu.runners._diagnostics import tag_runner_failure_phase
 from cayu.runners._redacted_output import RedactedOutputCapture
 from cayu.runners.base import ExecResult
 from cayu.vaults import SecretRedactor
@@ -265,6 +266,10 @@ async def run_subprocess(
             output_limit=output_limit,
         )
 
+    except Exception as error:
+        tag_runner_failure_phase(error, "launch")
+        raise
+
     stdout = RedactedOutputCapture(redactor=redactor, limit=output_limit)
     binary_stdout = (
         None
@@ -291,6 +296,14 @@ async def run_subprocess(
             completed=completed,
         )
         if io_failure is not None:
+            tag_runner_failure_phase(
+                io_failure,
+                "process_wait"
+                if wait_task.done()
+                and not wait_task.cancelled()
+                and wait_task.exception() is io_failure
+                else "stream_handling",
+            )
             await _cleanup_failed_subprocess_io(
                 process,
                 process_group=use_new_session,

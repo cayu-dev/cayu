@@ -1661,6 +1661,9 @@ def test_runner_cleanup_failure_cannot_replace_real_task_cancellation() -> None:
     assert type(cancellation.__cause__) is RunnerExecutionError
     assert cancellation.__cause__.diagnostic == {
         "type": "cayu.runner_execution_error.v1",
+        "errno": None,
+        "errno_code": None,
+        "execution_phase": "unknown",
         "adapter": "microsandbox",
         "status": "failed",
         "error_type": "RuntimeError",
@@ -4868,6 +4871,9 @@ def test_invocation_runner_handle_preserves_supported_sdk_error_classification(
 
     assert exc_info.value.diagnostic == {
         "type": "cayu.runner_execution_error.v1",
+        "errno": None,
+        "errno_code": None,
+        "execution_phase": "unknown",
         "adapter": adapter,
         "status": "failed",
         "error_type": error_type,
@@ -5011,6 +5017,9 @@ def test_invocation_runner_handle_rejects_hostile_instance_adapter_safely() -> N
     assert error.__context__ is None
     assert error.diagnostic == {
         "type": "cayu.runner_execution_error.v1",
+        "errno": None,
+        "errno_code": None,
+        "execution_phase": "unknown",
         "adapter": "unknown",
         "status": "failed",
         "error_type": "RuntimeError",

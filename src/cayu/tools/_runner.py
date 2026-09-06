@@ -1131,9 +1131,9 @@ async def _capture_runner_dispatch_outcome(
     if isinstance(error, asyncio.CancelledError):
         completed_payload["cancelled"] = True
     if error is not None:
-        completed_payload["error_type"] = (
-            trusted_runner_exception_type_name(error) or "runner_execution_error"
-        )
+        failure_diagnostic = _safe_runner_execution_error(runner, error).diagnostic
+        for field in ("error_type", "errno", "errno_code", "execution_phase"):
+            completed_payload[field] = failure_diagnostic[field]
     try:
         await execution_observer(
             "completed",

@@ -1310,6 +1310,9 @@ def test_egress_wrapped_runner_failure_preserves_backend_identity() -> None:
 
     assert diagnostic == {
         "type": "cayu.runner_execution_error.v1",
+        "errno": None,
+        "errno_code": None,
+        "execution_phase": "unknown",
         "adapter": "docker",
         "status": "failed",
         "error_type": "NotImplementedError",

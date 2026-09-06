@@ -534,6 +534,9 @@ def test_run_check_distinguishes_unavailable_failed_and_malformed_runners() -> N
     execution_failure = RunnerExecutionError(
         diagnostic={
             "type": "cayu.runner_execution_error.v1",
+            "errno": None,
+            "errno_code": None,
+            "execution_phase": "unknown",
             "adapter": "docker",
             "status": "failed",
             "error_type": "RuntimeError",

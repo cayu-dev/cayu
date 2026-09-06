@@ -23,6 +23,7 @@ from cayu.credentials import (
     is_agent_readable,
     normalize_credential_mode,
 )
+from cayu.runners._diagnostics import tag_runner_failure_phase
 from cayu.runners._subprocess import runner_env_name_identity, validate_runner_env_name
 from cayu.runners.base import ExecResult
 from cayu.vaults import (
@@ -171,18 +172,30 @@ def runner_env_file(environment: Mapping[str, str]) -> Iterator[str | None]:
     if not environment:
         yield None
         return
-    fd, path = tempfile.mkstemp(prefix="cayu-runner-env-")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            for key, value in environment.items():
-                handle.write(f"{key}={value}\n")
+        fd, path = tempfile.mkstemp(prefix="cayu-runner-env-")
+    except OSError as error:
+        tag_runner_failure_phase(error, "filesystem")
+        raise
+    try:
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                for key, value in environment.items():
+                    handle.write(f"{key}={value}\n")
+        except OSError as error:
+            tag_runner_failure_phase(error, "filesystem")
+            raise
         # The file now owns the transport representation. Do not keep the raw
         # mapping alive in this generator while the subprocess is awaited.
         environment = {}
         yield path
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+        except OSError as error:
+            tag_runner_failure_phase(error, "cleanup")
+            raise
 
 
 def validate_runner_env_file_environment(environment: Mapping[str, str]) -> None:

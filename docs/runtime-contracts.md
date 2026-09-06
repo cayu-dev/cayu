@@ -9431,6 +9431,35 @@ Unconfigured executions retain the existing unbounded behavior.
 
 ## Runner
 
+Runner execution failures publish fixed-message `cayu.runner_execution_error.v1`
+diagnostics. The additive v1 fields `errno`, `errno_code`, and `execution_phase`
+are also present on failed `runner.exec.completed` events. Existing v1 records
+without these fields remain valid; readers must treat absent fields as unavailable.
+New diagnostics explicitly use `null` for unavailable errno/code and `"unknown"`
+for an unavailable phase. Numeric errno is an exact positive integer bounded to
+signed 32 bits, read only from an exact built-in `OSError` family instance. Custom
+exception subclasses do not supply trusted errno. Symbolic codes come from the
+host Python errno table, never from exception messages or custom attributes;
+an unrecognized numeric errno retains its number with a null symbolic code.
+These are host OS codes, not an inferred guest exit status or historical cause.
+
+Execution phases are the fixed values `launch`, `transport`, `stream_handling`,
+`process_wait`, `filesystem`, `cleanup`, and `unknown`. Only a boundary that
+knows the operation tags it: the shared subprocess path identifies host process
+launch, stream-task failures, and process-wait failures; runner environment-file
+operations identify filesystem preparation and cleanup. Other boundaries remain
+unknown unless explicitly tagged. Docker CLI launch does not imply guest launch,
+and a stream failure does not establish whether its cause was transport or disk.
+Safe fields survive exact `RunnerExecutionError` wrapping, tool diagnostics,
+durable event replay, and JSON export. Arbitrary messages, paths, commands,
+environment values, and traceback contents are never diagnostic inputs.
+
+These fields are observations only. They do not grant retry or redispatch
+permission, prove absence of side effects, or change timeout, cancellation,
+cleanup, or workspace mutation-settlement decisions. A failure after dispatch
+continues to require unknown-outcome reconciliation under the existing contract.
+
+
 Executes commands/code and returns stdout, stderr, exit code, timeout/cancel flags, and artifacts.
 
 Runner commands use `ExecCommand`:

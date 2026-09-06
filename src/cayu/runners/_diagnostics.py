@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import errno as errno_module
+
+from cayu._exception_state import set_exception_state
+
 _TRUSTED_RUNNER_ERROR_TYPE_NAMES = frozenset(
     {
         "ArithmeticError",
@@ -142,3 +146,62 @@ def trusted_runner_error_type_name(value: object) -> str | None:
     if type(value) is not str or value not in _TRUSTED_RUNNER_ERROR_TYPE_NAMES:
         return None
     return value
+
+
+_RUNNER_FAILURE_PHASES = frozenset(
+    {"launch", "transport", "stream_handling", "process_wait", "filesystem", "cleanup"}
+)
+_TRUSTED_OS_ERRORS = (
+    OSError,
+    BlockingIOError,
+    ChildProcessError,
+    ConnectionError,
+    BrokenPipeError,
+    ConnectionAbortedError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    FileExistsError,
+    FileNotFoundError,
+    InterruptedError,
+    IsADirectoryError,
+    NotADirectoryError,
+    PermissionError,
+    ProcessLookupError,
+    TimeoutError,
+)
+_ERRNO_CODES = dict(errno_module.errorcode)
+
+
+def safe_runner_failure_fields(errno: object, phase: object) -> dict[str, object]:
+    """Normalize additive v1 fields without coercion or extension hooks."""
+
+    number = errno if type(errno) is int and 0 < errno <= 2**31 - 1 else None
+    return {
+        "errno": number,
+        "errno_code": _ERRNO_CODES.get(number) if number is not None else None,
+        "execution_phase": (
+            phase if type(phase) is str and phase in _RUNNER_FAILURE_PHASES else "unknown"
+        ),
+    }
+
+
+def runner_failure_fields(error: BaseException) -> dict[str, object]:
+    """Read errno only from exact builtin OS errors, never custom descriptors."""
+
+    number = None
+    if any(type(error) is candidate for candidate in _TRUSTED_OS_ERRORS):
+        number = OSError.__dict__["errno"].__get__(error, OSError)
+    namespace = BaseException.__dict__["__dict__"].__get__(error, BaseException)
+    phase = None
+    for key, value in dict.items(namespace):
+        if type(key) is str and key == "_cayu_runner_execution_phase":
+            phase = value
+            break
+    return safe_runner_failure_fields(number, phase)
+
+
+def tag_runner_failure_phase(error: BaseException, phase: str) -> None:
+    """Attach boundary knowledge without changing exception or settlement semantics."""
+
+    safe = safe_runner_failure_fields(None, phase)
+    set_exception_state(error, "_cayu_runner_execution_phase", safe["execution_phase"])

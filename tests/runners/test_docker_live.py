@@ -364,3 +364,54 @@ def test_search_text_tool_bounds_a_minified_line_in_real_docker_runner() -> None
             assert result.structured["truncation_reasons"] == ["line"]
 
     asyncio.run(run())
+
+
+def test_real_docker_failure_diagnostics_survive_durable_tool_evidence(tmp_path, monkeypatch):
+    import errno
+
+    from tests.core.test_runner_failure_diagnostics import verify_durable_failure
+
+    import cayu.runners._subprocess as subprocess_module
+
+    docker_path = _docker_path_or_skip()
+    name = f"cayu-diagnostics-{uuid4().hex[:12]}"
+    runner = asyncio.run(
+        DockerRunner.create(
+            name,
+            image=os.environ.get("CAYU_DOCKER_LIVE_IMAGE", "alpine:3.20"),
+            docker_path=docker_path,
+            close_action="remove",
+        )
+    )
+    original_read = subprocess_module._read_limited
+    observed_output = []
+
+    async def fail_after_output(stream, capture):
+        # Reading guest output proves command execution began before this failure.
+        chunk = await stream.read(4096)
+        if b"diagnostics-started" in chunk:
+            observed_output.append(chunk)
+            raise OSError(errno.ENOSPC, "secret-failure-canary /private/output")
+        if chunk:
+            capture.append(chunk)
+        await original_read(stream, capture)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(subprocess_module, "_read_limited", fail_after_output)
+            verify_durable_failure(
+                tmp_path,
+                runner,
+                ExecCommand.process("sh", "-c", "printf diagnostics-started; sleep 2"),
+                errno.ENOSPC,
+                "stream_handling",
+            )
+        assert len(observed_output) == 1
+    finally:
+        asyncio.run(runner.close())
+    inspected = subprocess.run(
+        [docker_path, "container", "inspect", name],
+        capture_output=True,
+        timeout=10,
+    )
+    assert inspected.returncode != 0
