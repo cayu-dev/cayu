@@ -41,6 +41,25 @@ composition work, and agent registration that no longer originates from the
 explicit registration module. Removing the contract is an intentional custom
 layout migration, not a supported way to silence a finding.
 
+The import check accepts inert application class hierarchies, including exception
+classes and subclasses of a shared `Tool` base. Define bases before their uses
+and use explicit named imports, such as `from tools.base import ProductTool`;
+relative imports, import aliases, and explicit package re-exports are supported.
+The checker reads local source without executing it to establish inheritance
+safety, including explicit local import dependencies and their package
+initializers. These dependencies must also be declarative: a helper import can
+install subclass hooks after a class is defined. The proof is bounded to 64 local
+source modules and fails closed beyond that limit. Rebindings, import cycles,
+opaque descriptors, custom metaclasses,
+class decorators on a base, and application `__init_subclass__` hooks remain
+unproven and fail closed. Dynamic base expressions and class namespaces also
+require a stronger proof than this static check supports. Keep lifecycle and
+external work in methods or explicit builders. External roots of a local class
+hierarchy must also have reviewed subclass-creation behavior: builtin exceptions,
+`object`, `abc.ABC`, and Cayu's `Tool` are supported. Enum-derived application
+bases remain unproven because enum metaclasses can execute inherited member
+initializers; mixing a local base with an enum has the same restriction.
+
 ## Planning
 
 Discover the package-shipped catalog before choosing a plan:

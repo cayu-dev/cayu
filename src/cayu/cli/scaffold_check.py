@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
@@ -548,6 +549,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
             rebound_names=rebound_names,
         )
         declarative_subscriptions = _declarative_subscription_names(root, tree)
+        declarative_bases = _declarative_class_base_names(root, path, tree)
         for node in tree.body:
             unsafe_import = next(
                 (
@@ -561,7 +563,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                 ),
                 None,
             )
-            unsafe_node: ast.AST | None = unsafe_import
+            unsafe_node: ast.expr | ast.stmt | None = unsafe_import
             if unsafe_node is None:
                 unsafe_node = _unsafe_import_time_expression(
                     node,
@@ -570,6 +572,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                     declarative_identities=declarative_identities,
                     declarative_subscriptions=declarative_subscriptions,
                     project_root=root,
+                    declarative_bases=declarative_bases,
                 )
             if unsafe_node is None:
                 continue
@@ -578,8 +581,8 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                     code="SCAFFOLD_IMPORT_SIDE_EFFECT",
                     path=f"{relative}:{unsafe_node.lineno}",
                     message=(
-                        "A declared application module performs non-declarative "
-                        "execution during import."
+                        "Import-time execution in a declared application module "
+                        "cannot be proven declarative."
                     ),
                     hint=(
                         "Move external or lifecycle work behind an explicit builder or "
@@ -608,13 +611,19 @@ def _application_module_paths(root: Path) -> tuple[Path, ...]:
 
 
 def _import_time_import_from_nodes(node: ast.stmt) -> tuple[ast.ImportFrom, ...]:
-    imports: list[ast.ImportFrom] = []
+    return tuple(
+        item for item in _import_time_import_nodes(node) if isinstance(item, ast.ImportFrom)
+    )
+
+
+def _import_time_import_nodes(node: ast.stmt) -> tuple[ast.Import | ast.ImportFrom, ...]:
+    imports: list[ast.Import | ast.ImportFrom] = []
 
     def add_suite(statements: list[ast.stmt]) -> None:
         for statement in statements:
-            imports.extend(_import_time_import_from_nodes(statement))
+            imports.extend(_import_time_import_nodes(statement))
 
-    if isinstance(node, ast.ImportFrom):
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
         imports.append(node)
     elif isinstance(node, ast.ClassDef):
         add_suite(node.body)
@@ -682,12 +691,13 @@ def _project_local_import_module_path(
         is_project_local = False
 
     candidate = root.joinpath(*parts)
-    module_file = candidate.with_suffix(".py")
-    if module_file.is_file() or module_file.is_symlink():
-        return True, module_file
+    # Python prefers a regular package over a same-named module file.
     package_init = candidate / "__init__.py"
     if package_init.is_file() or package_init.is_symlink():
         return True, package_init
+    module_file = candidate.with_suffix(".py")
+    if module_file.is_file() or module_file.is_symlink():
+        return True, module_file
     return is_project_local, None
 
 
@@ -806,7 +816,8 @@ def _unsafe_import_time_expression(
     declarative_identities: frozenset[str],
     declarative_subscriptions: frozenset[str],
     project_root: Path,
-) -> ast.expr | None:
+    declarative_bases: Mapping[str, int],
+) -> ast.expr | ast.stmt | None:
     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
         return (
             None
@@ -837,16 +848,38 @@ def _unsafe_import_time_expression(
     for metaclass in _import_time_metaclasses(node):
         return metaclass
     for base, class_rebound_names in _import_time_class_base_uses(node):
-        root_name = _expression_root_name(base)
-        binding = import_bindings.get(root_name) if root_name is not None else None
-        if root_name is not None and (
-            root_name in rebound_names | class_rebound_names
-            or (
-                binding is not None
-                and not _imported_class_base_is_declarative(project_root, binding)
-            )
+        if not _class_base_is_declarative(
+            base,
+            project_root=project_root,
+            import_bindings=import_bindings,
+            rebound_names=rebound_names | class_rebound_names,
+            declarative_bases=declarative_bases,
+            class_rebound_names=class_rebound_names,
         ):
             return base
+    # A newly admitted local base must not allow an opaque descriptor into the
+    # subclass namespace: type.__new__ would execute its __set_name__ hook.
+    for definition in _import_time_class_nodes(node):
+        if any(
+            isinstance(base, ast.Name) and base.id in declarative_bases for base in definition.bases
+        ):
+            # Multiple inheritance can introduce an effectful metaclass even
+            # when the application mixin itself has an ordinary, inert type.
+            for base in definition.bases:
+                if not _class_base_is_declarative(
+                    base,
+                    project_root=project_root,
+                    import_bindings=import_bindings,
+                    rebound_names=rebound_names,
+                    declarative_bases=declarative_bases,
+                    require_inert_metaclass=True,
+                ):
+                    return base
+            if definition.keywords:
+                return definition.keywords[0].value
+            unsafe_namespace = _unsafe_class_namespace(definition, import_bindings)
+            if unsafe_namespace is not None:
+                return unsafe_namespace
     for expression, class_rebound_names in _import_time_expression_uses(node):
         expression_rebound_names = rebound_names | class_rebound_names
         for mutation_target in ast.walk(expression):
@@ -904,13 +937,340 @@ def _bare_decorator_is_declarative(
         "overload": ("typing", "overload"),
         "runtime_checkable": ("typing", "runtime_checkable"),
     }
-    return import_bindings.get(name) == expected_imports.get(name)
+    return name in expected_imports and import_bindings.get(name) == expected_imports[name]
 
 
 def _expression_root_name(expression: ast.expr) -> str | None:
     while isinstance(expression, (ast.Attribute, ast.Subscript)):
         expression = expression.value
     return expression.id if isinstance(expression, ast.Name) else None
+
+
+# These builtins have no application-owned metaclass or subclass hook. Unknown
+# unbound names are not evidence of safety (nor are calls or local subscriptions).
+_INERT_BUILTIN_BASES = frozenset(
+    {"object"}
+    | {
+        name
+        for name, value in vars(builtins).items()
+        if isinstance(value, type) and issubclass(value, BaseException)
+    }
+)
+
+
+# Permission to declare a class using an external base does not establish that
+# its metaclass can safely create further application subclasses. EnumType, for
+# example, calls inherited __init__/__new__ methods while creating members.
+# Only these reviewed external roots propagate a local inheritance proof.
+_INERT_METACLASS_BASE_IMPORTS = frozenset(
+    {("abc", "ABC"), ("cayu", "Tool"), ("cayu.core.tools", "Tool")}
+)
+
+
+def _class_base_is_declarative(
+    base: ast.expr,
+    *,
+    project_root: Path,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+    declarative_bases: Mapping[str, int],
+    class_rebound_names: frozenset[str] = frozenset(),
+    require_inert_metaclass: bool = False,
+) -> bool:
+    if isinstance(base, ast.Name) and base.id not in class_rebound_names:
+        line = declarative_bases.get(base.id)
+        if line is not None and line < base.lineno:
+            return True
+    name = _expression_root_name(base)
+    if name is None or name in rebound_names:
+        return False
+    binding = import_bindings.get(name)
+    if binding is not None:
+        if require_inert_metaclass and (
+            not isinstance(base, ast.Name) or binding not in _INERT_METACLASS_BASE_IMPORTS
+        ):
+            return False
+        return _imported_class_base_is_declarative(project_root, binding)
+    return isinstance(base, ast.Name) and name in _INERT_BUILTIN_BASES
+
+
+def _unsafe_class_namespace(
+    node: ast.ClassDef,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+) -> ast.expr | ast.stmt | None:
+    for statement in node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Pass)):
+            continue
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+            continue
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            value = statement.value
+            if value is None or _literal_collection_is_data_only(value):
+                continue
+            # Tool declarations contain reviewed immutable Runtime data, not
+            # application descriptor instances. The normal expression scan still
+            # checks arguments, shadowing, and nested calls.
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and import_bindings.get(value.func.id) == ("cayu", "ToolSpec")
+            ):
+                continue
+            return value
+        # Conditional/dynamic namespaces need a richer proof than this bounded
+        # local inheritance analysis.
+        return statement
+    return None
+
+
+def _declarative_class_base_names(
+    root: Path,
+    path: Path,
+    tree: ast.Module,
+    *,
+    visiting: frozenset[Path] = frozenset(),
+    requested: frozenset[str] = frozenset(),
+    check_dependencies: bool = True,
+) -> dict[str, int]:
+    """Prove unique, ordered class bindings using only explicit source imports.
+
+    Cycles, rebindings, dynamic namespaces and hooks are intentionally unresolved.
+    No imports are executed, and no package discovery is used to find bases.
+    """
+    if path in visiting or len(visiting) >= 64:
+        return {}
+    visiting = visiting | {path}
+    imports = _import_bindings(tree)
+    rebound = _module_rebound_names(tree)
+    proven: dict[str, int] = {}
+    needed = requested | {
+        base.id
+        for statement in tree.body
+        for base, _scope in _import_time_class_base_uses(statement)
+        if isinstance(base, ast.Name)
+    }
+
+    def unique(name: str, definition: ast.stmt) -> bool:
+        return not any(
+            statement is not definition
+            and (
+                name in _scope_rebound_names([statement], include_imports=True)
+                or any(
+                    _expression_may_bind_name(expression, name)
+                    for expression, _scope in _import_time_expression_uses(statement)
+                )
+                or any(
+                    isinstance(item, ast.Name) and isinstance(item.ctx, ast.Del) and item.id == name
+                    for item in ast.walk(statement)
+                )
+            )
+            for statement in tree.body
+        ) and not any(
+            any(alias.name == "*" for alias in item.names)
+            for statement in tree.body
+            for item in _import_time_import_from_nodes(statement)
+        )
+
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            symbols = frozenset(
+                alias.name for alias in node.names if (alias.asname or alias.name) in needed
+            )
+            if not symbols:
+                continue
+            local, target = _project_local_import_module_path(
+                root,
+                importing_path=path,
+                module=node.module,
+                level=node.level,
+            )
+            if not local or target is None or target in visiting:
+                continue
+            # Reject symlinked ancestors as well as symlinked source files.
+            if any(part.is_symlink() for part in (target, *target.parents) if part != root):
+                continue
+            imported_tree = _parsed_module(target)
+            if imported_tree is None or _module_may_bind_name(target, "__getattr__"):
+                continue
+            imported_bases = _declarative_class_base_names(
+                root,
+                target,
+                imported_tree,
+                visiting=visiting,
+                requested=symbols,
+                check_dependencies=check_dependencies,
+            )
+            if not _local_base_module_is_declarative(root, target, imported_tree, imported_bases):
+                continue
+            package_is_safe = True
+            for parent in target.parents:
+                if parent == root:
+                    break
+                initializer = parent / "__init__.py"
+                if initializer == target or not initializer.exists():
+                    continue
+                initializer_tree = _parsed_module(initializer)
+                if initializer.is_symlink() or initializer_tree is None:
+                    package_is_safe = False
+                    break
+                initializer_bases = _declarative_class_base_names(
+                    root,
+                    initializer,
+                    initializer_tree,
+                    visiting=visiting | {target},
+                    check_dependencies=check_dependencies,
+                )
+                if not _local_base_module_is_declarative(
+                    root,
+                    initializer,
+                    initializer_tree,
+                    initializer_bases,
+                ):
+                    package_is_safe = False
+                    break
+            if not package_is_safe:
+                continue
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if (
+                    alias.name in imported_bases
+                    and unique(name, node)
+                    and sum((item.asname or item.name) == name for item in node.names) == 1
+                ):
+                    proven[name] = node.lineno
+        elif isinstance(node, ast.ClassDef) and unique(node.name, node):
+            if node.decorator_list or node.keywords:
+                continue
+            if any(
+                _import_time_statement_may_bind_name(item, "__init_subclass__")
+                for item in node.body
+            ):
+                continue
+            if _unsafe_class_namespace(node, imports) is not None:
+                continue
+            if (
+                all(
+                    _class_base_is_declarative(
+                        base,
+                        project_root=root,
+                        import_bindings=imports,
+                        rebound_names=rebound,
+                        declarative_bases=proven,
+                        require_inert_metaclass=True,
+                    )
+                    for base in node.bases
+                )
+                and _unsafe_import_time_expression(
+                    node,
+                    import_bindings=imports,
+                    rebound_names=rebound,
+                    declarative_identities=frozenset(),
+                    declarative_subscriptions=frozenset(),
+                    project_root=root,
+                    declarative_bases=proven,
+                )
+                is None
+            ):
+                proven[node.name] = node.lineno
+    if proven and check_dependencies and not _local_base_dependencies_are_declarative(root, path):
+        return {}
+    return proven
+
+
+def _local_base_dependencies_are_declarative(root: Path, path: Path) -> bool:
+    """Check the explicit local import closure before trusting a class binding.
+
+    Imports can install hooks on an otherwise inert class. Follow source imports
+    and package initializers, never execute modules or discover unrelated files.
+    The separate visited set handles package re-exports; inheritance cycles are
+    still rejected by the class-binding proof.
+    """
+    pending = [path]
+    checked: set[Path] = set()
+    while pending:
+        dependency = pending.pop()
+        if dependency in checked:
+            continue
+        if len(checked) >= 64 or any(
+            part.is_symlink() for part in (dependency, *dependency.parents) if part != root
+        ):
+            return False
+        checked.add(dependency)
+        tree = _parsed_module(dependency)
+        if tree is None:
+            return False
+        bases = _declarative_class_base_names(root, dependency, tree, check_dependencies=False)
+        if not _local_base_module_is_declarative(root, dependency, tree, bases):
+            return False
+        for parent in dependency.parents:
+            if parent == root:
+                break
+            initializer = parent / "__init__.py"
+            if initializer.exists() or initializer.is_symlink():
+                pending.append(initializer)
+        for statement in tree.body:
+            for imported in _import_time_import_nodes(statement):
+                modules = (
+                    [(alias.name, 0) for alias in imported.names]
+                    if isinstance(imported, ast.Import)
+                    else [(imported.module, imported.level)]
+                )
+                for module, level in modules:
+                    local, target = _project_local_import_module_path(
+                        root, importing_path=dependency, module=module, level=level
+                    )
+                    if target is not None:
+                        pending.append(target)
+                    elif local:
+                        return False
+                    if isinstance(imported, ast.ImportFrom):
+                        # `from package import helper` may load a submodule rather
+                        # than a name defined by __init__.py. Inspect either file
+                        # when present, including namespace-package children.
+                        for alias in imported.names:
+                            child_module = f"{module}.{alias.name}" if module else alias.name
+                            _child_local, child = _project_local_import_module_path(
+                                root,
+                                importing_path=dependency,
+                                module=child_module,
+                                level=level,
+                            )
+                            if child is not None:
+                                pending.append(child)
+    return True
+
+
+def _local_base_module_is_declarative(
+    root: Path,
+    path: Path,
+    tree: ast.Module,
+    bases: Mapping[str, int],
+) -> bool:
+    bindings = _import_bindings(tree)
+    rebound = _module_rebound_names(tree)
+    identities = _declarative_identity_names(
+        tree,
+        import_bindings=bindings,
+        rebound_names=rebound,
+    )
+    subscriptions = _declarative_subscription_names(root, tree)
+    return not _module_may_bind_name(path, "__getattr__") and all(
+        all(
+            _project_local_import_from_is_declarative(root, importing_path=path, node=import_node)
+            for import_node in _import_time_import_from_nodes(statement)
+        )
+        and _unsafe_import_time_expression(
+            statement,
+            import_bindings=bindings,
+            rebound_names=rebound,
+            declarative_identities=identities,
+            declarative_subscriptions=subscriptions,
+            project_root=root,
+            declarative_bases=bases,
+        )
+        is None
+        for statement in tree.body
+    )
 
 
 def _imported_class_base_is_declarative(
