@@ -60,22 +60,34 @@ hierarchy must also have reviewed subclass-creation behavior: builtin exceptions
 bases remain unproven because enum metaclasses can execute inherited member
 initializers; mixing a local base with an enum has the same restriction.
 
-Direct Pydantic `BaseModel` declarations (including named import aliases) may register `@field_validator` and
+Pydantic `BaseModel` declarations (including named import aliases) may register `@field_validator` and
 `@model_validator` methods. Import these helpers explicitly from `pydantic`
 (named aliases and `import pydantic as pd` are supported). Field names must be
 literal strings; `mode` must be a supported literal string and `check_fields`
 a literal boolean or `None`. Model validators require an explicit `mode` of
 `before`, `after`, or `wrap`; field validators also accept `plain` and default
-to `after`. Validator bodies run during validation, not registration. Direct model
+to `after`. Validator bodies run during validation, not registration. Model
 assignments may also use explicitly imported `ConfigDict` and `Field` with
 literal data arguments; callbacks and computed defaults remain unproven.
 Unknown options, computed arguments, unpacking, shadowed/rebound imports,
 project-local substitutes for Pydantic, opaque/quoted model field annotations,
 explicit `__annotations__`, `__annotate__`, or `__annotate_func__` bindings,
 and model construction/schema hooks
-remain unproven. This does not permit arbitrary decorator factories or prove
-inheritance from application-owned Pydantic models. Attribute and subscription
-base expressions such as `BaseModel.__mro__[0]` remain unproven.
+remain unproven. Inherited models retain these checks through explicit named
+imports, aliases and package re-exports; literal `ConfigDict` configuration does
+not prevent subclassing. Mixing models with ordinary application mixins remains
+unproven because the model metaclass could activate inherited hooks. Attribute
+and subscription base expressions such as `BaseModel.__mro__[0]` remain unproven.
+
+Standard-library `TypeVar`, `ParamSpec`, and `TypeVarTuple` declarations accept a
+single literal string name. `TypeVar` and `ParamSpec` also accept literal boolean
+variance options. Bounds, constraints, computed arguments and unpacking remain
+unproven. `ContextVar` construction accepts a literal string name and an optional
+literal-data `default`. These process-wide identities can remain at module scope.
+Standard `contextlib.contextmanager` and `asynccontextmanager` decorators on
+functions and methods are declarations; their bodies are not executed by the
+scanner. Named import aliases and module aliases are supported for these standard
+library forms, while shadowed imports and project-local substitutes fail closed.
 
 ## Planning
 

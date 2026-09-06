@@ -6,6 +6,7 @@ import ast
 import builtins
 import tomllib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -808,6 +809,78 @@ def _assignment_target_binds_name(target: ast.expr, name: str) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _DeclarativeBase:
+    line: int
+    pydantic: bool = False
+
+
+def _is_pydantic_base(
+    base: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    bases: Mapping[str, _DeclarativeBase],
+) -> bool:
+    return isinstance(base, ast.Name) and (
+        imports.get(base.id) == ("pydantic", "BaseModel")
+        or (base.id in bases and bases[base.id].pydantic)
+    )
+
+
+def _trusted_symbol(
+    expression: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+) -> tuple[str, str | None] | None:
+    if isinstance(expression, ast.Name):
+        name = expression.id
+        binding = imports.get(name)
+    elif isinstance(expression, ast.Attribute) and isinstance(expression.value, ast.Name):
+        name = expression.value.id
+        module, symbol = imports.get(name, ("", None))
+        binding = (module, expression.attr) if symbol is None else None
+    else:
+        return None
+    if name in rebound or binding is None or _import_binding_is_project_local(root, binding):
+        return None
+    return binding
+
+
+def _stdlib_declaration_is_inert(
+    call: ast.Call,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+) -> bool:
+    """Admit identity declarations with literal data, never arbitrary factories."""
+    binding = _trusted_symbol(call.func, imports, rebound, root)
+    if binding not in {
+        ("typing", "TypeVar"),
+        ("typing", "ParamSpec"),
+        ("typing", "TypeVarTuple"),
+        ("contextvars", "ContextVar"),
+    }:
+        return False
+    if (
+        len(call.args) != 1
+        or not isinstance(call.args[0], ast.Constant)
+        or not isinstance(call.args[0].value, str)
+    ):
+        return False
+    options = {keyword.arg: keyword.value for keyword in call.keywords}
+    if len(options) != len(call.keywords):
+        return False
+    if binding == ("contextvars", "ContextVar"):
+        return set(options) <= {"default"} and all(
+            _literal_collection_is_data_only(value) for value in options.values()
+        )
+    return set(options) <= (
+        {"covariant", "contravariant", "infer_variance"} if binding[1] != "TypeVarTuple" else set()
+    ) and all(
+        isinstance(value, ast.Constant) and type(value.value) is bool for value in options.values()
+    )
+
+
 def _unsafe_import_time_expression(
     node: ast.stmt,
     *,
@@ -816,7 +889,7 @@ def _unsafe_import_time_expression(
     declarative_identities: frozenset[str],
     declarative_subscriptions: frozenset[str],
     project_root: Path,
-    declarative_bases: Mapping[str, int],
+    declarative_bases: Mapping[str, _DeclarativeBase],
 ) -> ast.expr | ast.stmt | None:
     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
         return (
@@ -830,6 +903,15 @@ def _unsafe_import_time_expression(
     declarative_pydantic_calls: set[ast.Call] = set()
     for decorator, class_rebound_names in _import_time_decorator_uses(node):
         decorator_rebound_names = rebound_names | class_rebound_names
+        if _trusted_symbol(decorator, import_bindings, decorator_rebound_names, project_root) in {
+            ("contextlib", "contextmanager"),
+            ("contextlib", "asynccontextmanager"),
+        } and any(
+            isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and decorator in definition.decorator_list
+            for definition in _import_time_definition_nodes(node)
+        ):
+            continue
         if isinstance(decorator, ast.Call) and _pydantic_validator_is_declarative(
             decorator,
             import_bindings=import_bindings,
@@ -870,9 +952,13 @@ def _unsafe_import_time_expression(
     # subclass namespace: type.__new__ would execute its __set_name__ hook.
     for definition in _import_time_class_nodes(node):
         if any(
-            isinstance(base, ast.Name) and import_bindings.get(base.id) == ("pydantic", "BaseModel")
-            for base in definition.bases
+            _is_pydantic_base(base, import_bindings, declarative_bases) for base in definition.bases
         ):
+            # An ordinary mixin may carry schema hooks that Pydantic activates.
+            # Only model-proven parents can participate in this bounded proof.
+            for base in definition.bases:
+                if not _is_pydantic_base(base, import_bindings, declarative_bases):
+                    return base
             class_scope = rebound_names | _scope_rebound_names(
                 definition.body, include_imports=True
             )
@@ -936,7 +1022,9 @@ def _unsafe_import_time_expression(
                     return base
             if definition.keywords:
                 return definition.keywords[0].value
-            unsafe_namespace = _unsafe_class_namespace(definition, import_bindings)
+            unsafe_namespace = _unsafe_class_namespace(
+                definition, import_bindings, declarative_calls=declarative_pydantic_calls
+            )
             if unsafe_namespace is not None:
                 return unsafe_namespace
     for expression, class_rebound_names in _import_time_expression_uses(node):
@@ -952,6 +1040,15 @@ def _unsafe_import_time_expression(
             if binding is not None and _import_binding_is_project_local(project_root, binding):
                 return attribute
         for subscript in _evaluated_subscripts(expression):
+            if _trusted_symbol(
+                subscript.value, import_bindings, expression_rebound_names, project_root
+            ) == ("contextvars", "ContextVar") and _pydantic_annotation_is_declarative(
+                subscript.slice,
+                import_bindings=import_bindings,
+                rebound_names=expression_rebound_names,
+                project_root=project_root,
+            ):
+                continue
             root_name = _expression_root_name(subscript.value)
             binding = import_bindings.get(root_name) if root_name is not None else None
             if root_name is not None and (
@@ -966,7 +1063,9 @@ def _unsafe_import_time_expression(
             ):
                 return subscript
         for call in _evaluated_calls(expression):
-            if call in declarative_pydantic_calls:
+            if call in declarative_pydantic_calls or _stdlib_declaration_is_inert(
+                call, import_bindings, expression_rebound_names, project_root
+            ):
                 continue
             if not _import_call_is_declarative(
                 call,
@@ -1103,7 +1202,6 @@ def _bare_decorator_is_declarative(
     expected_imports = {
         "abstractmethod": ("abc", "abstractmethod"),
         "cached_property": ("functools", "cached_property"),
-        "contextmanager": ("contextlib", "contextmanager"),
         "dataclass": ("dataclasses", "dataclass"),
         "final": ("typing", "final"),
         "overload": ("typing", "overload"),
@@ -1134,8 +1232,10 @@ _INERT_BUILTIN_BASES = frozenset(
 # its metaclass can safely create further application subclasses. EnumType, for
 # example, calls inherited __init__/__new__ methods while creating members.
 # Only these reviewed external roots propagate a local inheritance proof.
+# BaseModel additionally requires the model annotation/namespace/hook checks at
+# every generation; _DeclarativeBase carries that obligation through imports.
 _INERT_METACLASS_BASE_IMPORTS = frozenset(
-    {("abc", "ABC"), ("cayu", "Tool"), ("cayu.core.tools", "Tool")}
+    {("abc", "ABC"), ("cayu", "Tool"), ("cayu.core.tools", "Tool"), ("pydantic", "BaseModel")}
 )
 
 
@@ -1145,13 +1245,13 @@ def _class_base_is_declarative(
     project_root: Path,
     import_bindings: Mapping[str, tuple[str, str | None]],
     rebound_names: frozenset[str],
-    declarative_bases: Mapping[str, int],
+    declarative_bases: Mapping[str, _DeclarativeBase],
     class_rebound_names: frozenset[str] = frozenset(),
     require_inert_metaclass: bool = False,
 ) -> bool:
     if isinstance(base, ast.Name) and base.id not in class_rebound_names:
-        line = declarative_bases.get(base.id)
-        if line is not None and line < base.lineno:
+        proof = declarative_bases.get(base.id)
+        if proof is not None and proof.line < base.lineno:
             return True
     name = _expression_root_name(base)
     if name is None or name in rebound_names:
@@ -1213,7 +1313,7 @@ def _declarative_class_base_names(
     visiting: frozenset[Path] = frozenset(),
     requested: frozenset[str] = frozenset(),
     check_dependencies: bool = True,
-) -> dict[str, int]:
+) -> dict[str, _DeclarativeBase]:
     """Prove unique, ordered class bindings using only explicit source imports.
 
     Cycles, rebindings, dynamic namespaces and hooks are intentionally unresolved.
@@ -1224,7 +1324,7 @@ def _declarative_class_base_names(
     visiting = visiting | {path}
     imports = _import_bindings(tree)
     rebound = _module_rebound_names(tree)
-    proven: dict[str, int] = {}
+    proven: dict[str, _DeclarativeBase] = {}
     needed = requested | {
         base.id
         for statement in tree.body
@@ -1319,7 +1419,9 @@ def _declarative_class_base_names(
                     and unique(name, node)
                     and sum((item.asname or item.name) == name for item in node.names) == 1
                 ):
-                    proven[name] = node.lineno
+                    proven[name] = _DeclarativeBase(
+                        node.lineno, imported_bases[alias.name].pydantic
+                    )
         elif isinstance(node, ast.ClassDef) and unique(node.name, node):
             if node.decorator_list or node.keywords:
                 continue
@@ -1328,7 +1430,10 @@ def _declarative_class_base_names(
                 for item in node.body
             ):
                 continue
-            if _unsafe_class_namespace(node, imports) is not None:
+            if (
+                not any(_is_pydantic_base(base, imports, proven) for base in node.bases)
+                and _unsafe_class_namespace(node, imports) is not None
+            ):
                 continue
             if (
                 all(
@@ -1353,7 +1458,10 @@ def _declarative_class_base_names(
                 )
                 is None
             ):
-                proven[node.name] = node.lineno
+                proven[node.name] = _DeclarativeBase(
+                    node.lineno,
+                    any(_is_pydantic_base(base, imports, proven) for base in node.bases),
+                )
     if proven and check_dependencies and not _local_base_dependencies_are_declarative(root, path):
         return {}
     return proven
@@ -1426,7 +1534,7 @@ def _local_base_module_is_declarative(
     root: Path,
     path: Path,
     tree: ast.Module,
-    bases: Mapping[str, int],
+    bases: Mapping[str, _DeclarativeBase],
 ) -> bool:
     bindings = _import_bindings(tree)
     rebound = _module_rebound_names(tree)
