@@ -364,10 +364,10 @@ class ApplyPatchTool(Tool):
 
     @property
     def _publish_arguments(self) -> bool:
-        # Patch bodies contain source text. Runtime policy still evaluates and
-        # commits to the private effective envelope, but terminal/public event
-        # surfaces receive the quarantined argument state rather than content.
-        return False
+        # Retain submitted operations through the runtime's sealed, redacted
+        # terminal/transcript projection, including preflight refusals. Starts
+        # remain quarantined and incomplete secret scopes remain unavailable.
+        return True
 
     def _execution_profile_material(self) -> dict[str, object]:
         return {

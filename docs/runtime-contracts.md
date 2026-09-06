@@ -9129,8 +9129,8 @@ The first built-in tools are:
   mutations. It never claims a cross-file transaction. Its result records each
   operation as `applied`, `not_started`, `conflict`, `failed`, or `unknown`; a
   `partial`, `ambiguous`, or `cancelled` outcome requires fresh reads before repair.
-  Patch bodies are quarantined from terminal argument publication, diffs are
-  redacted and independently bounded per file and in aggregate, and a larger safe
+  Submitted patch operations use the sealed argument publication contract below;
+  diffs are redacted and independently bounded per file and in aggregate, and a larger safe
   manifest is retained as a session artifact when configured storage can accept it.
   A dynamic invocation secret scope is sealed before that durable write; direct
   static-redactor callers recheck after the write and remove a revision-stale artifact.
@@ -9141,6 +9141,47 @@ The first built-in tools are:
   runtime recovery authority uses the original authenticated patch paths to observe
   current before/projected-after identities, advances the journal by compare-and-set,
   and reports `unknown` only when fresh state cannot prove a safe classification.
+  **Submitted input evidence:** native `apply_patch` accepts a structured JSON
+  `operations` object, not a freeform/custom-tool patch string. The OpenAI adapter
+  decodes function-call JSON into that object; original wire JSON whitespace and
+  key order are not retained as exact source text. A supplied `input` string is
+  unsupported and is diagnosed as invalid arguments, without mutation.
+
+  Starts remain `arguments_state="quarantined"`. After the invocation secret scope
+  seals, successful calls, preflight refusals (including stale revisions and
+  replacement-count mismatches), and argument-validation failures retain the
+  submitted object in terminal `arguments`, with `arguments_state="finalized"`.
+  This includes supplied revision tokens, source/replacement text, explicit match
+  counts, and operation order; defaults and normalized execution plans are not
+  substituted for submitted values. `arguments_exact=true` means equality with
+  the provider-neutral submitted object, not equality with provider wire bytes.
+  Redaction of keys or values makes `arguments_exact=false`; the remaining safe
+  diagnostic content is retained. Hook-modified execution arguments, when present,
+  use the separate `effective_arguments` field. Malformed patch objects can still
+  have exact retained input: validity is described by the failed result, not by
+  the argument-retention marker. Calls rejected before invocation and recovery or
+  cancellation without a complete secret scope remain explicitly `unavailable`.
+
+  Inspect terminal events through `SessionStore.load_events(session_id)` and join
+  the durable assistant `ToolCallPart` from `load_transcript(session_id)` using
+  `tool_call_id` and `tool_round_id`. Both carry the same finalized submitted
+  object after restart. Private pending-round checkpoints remain execution and
+  recovery authority; they are not a public diagnostic API. The content-free patch
+  journal and bounded diff artifact describe execution, not submitted input.
+  No additional artifact or durable sink is needed for input retention.
+
+  Full `Trajectory` JSON exports retain these events and transcript associations.
+  The portable eval argument view selects `effective_arguments` when present and
+  otherwise `arguments`; its 4 KiB JSON bound reports `truncated` rather than
+  silently dropping content. Read the full retained event/transcript for that
+  invocation when this bounded view is insufficient. Native patch admission limits
+  accepted input to 2 MiB (configurable downward); normal message/durable JSON
+  limits still apply to rejected objects. Existing transcript/context budgeting
+  and independently bounded diff previews remain in force. Session-scoped reads
+  use the existing SDK trust and server authorization boundaries; this contract
+  grants no cross-session artifact access. Evidence readback never dispatches a
+  mutation, and journal reconciliation never replays a patch to recover inputs.
+
 - `list_files`: list files in the active workspace with deterministic `offset`
   continuation, capped by `limit` and `max_result_bytes`; applications may configure
   directory-name exclusions and a bounded scan window on the registered tool instance

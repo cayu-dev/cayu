@@ -61,7 +61,7 @@ def test_apply_patch_schema_and_effect_contract() -> None:
     assert tool.spec.effect is ToolEffect.EXTERNAL
     assert tool.spec.workspace_mutation is True
     assert tool.spec.parallel_safe is False
-    assert tool._publish_arguments is False
+    assert tool._publish_arguments is True
     assert tool.schema["additionalProperties"] is False
     operations = tool.schema["properties"]["operations"]
     assert operations["minItems"] == 1
@@ -142,8 +142,9 @@ def test_cayu_app_native_apply_patch_publishes_applied_result(tmp_path: Path) ->
     completed = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
     assert completed.payload.get("outcome_unknown", False) is False
     assert completed.payload.get("manual_reconciliation_required", False) is False
-    assert completed.payload["arguments_state"] == "unavailable"
-    assert "arguments" not in completed.payload
+    assert completed.payload["arguments_state"] == "finalized"
+    assert completed.payload["arguments_exact"] is True
+    assert completed.payload["arguments"] == arguments
     assert completed.payload["result"]["structured"]["outcome"] == "applied"
     assert journal is not None
     assert journal["state"] == "terminal"
@@ -152,7 +153,7 @@ def test_cayu_app_native_apply_patch_publishes_applied_result(tmp_path: Path) ->
     assistant_call = next(
         part for message in transcript for part in message.content if part.type == "tool_call"
     )
-    assert assistant_call.arguments == {}
+    assert assistant_call.arguments == arguments
 
 
 def test_apply_patch_applies_create_two_updates_move_and_delete(tmp_path: Path) -> None:

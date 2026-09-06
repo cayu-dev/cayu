@@ -5021,12 +5021,39 @@ class ToolRoundExecutor:
                 tool_round_identity=tool_round_identity,
             )
             try:
+                snapshot = invocation_secret_scope.seal_for_publication()
+                projection = (
+                    tool_argument_publication.unavailable_argument_projection()
+                    if publish_arguments_as_unavailable
+                    else tool_argument_publication.finalized_argument_projection(
+                        model_arguments,
+                        redactor=snapshot.redactor,
+                        scope_finalized=not snapshot.unsafe_output,
+                    )
+                )
+                interrupted_payload = {
+                    **interrupted_event.payload,
+                    **projection.payload_fields(),
+                    tool_argument_publication.ARGUMENTS_EXACT_FIELD: (
+                        tool_argument_publication.argument_projection_is_exact(
+                            projection,
+                            private_arguments=model_arguments,
+                        )
+                    ),
+                }
+                if projection.state == "finalized" and effective_arguments_payload:
+                    interrupted_payload["effective_arguments"] = snapshot.redactor.redact_json(
+                        effective_tool_call.arguments
+                    )
+                interrupted_event = interrupted_event.model_copy(
+                    update={"payload": interrupted_payload}
+                )
                 await effective_terminal_stager(
                     interrupted_event,
                     interrupted_outcome,
                     False,
                     False,
-                    invocation_secret_scope.seal_for_publication(),
+                    snapshot,
                 )
             except BaseException as closure_error:
                 if _contains_process_signal(closure_error):
