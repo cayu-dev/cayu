@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -9,7 +10,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from itertools import islice
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -96,7 +97,17 @@ RECALL_MAX_KNOWLEDGE_GROUPED_ASPECT_BYTES = 128_000
 _RECALL_MAX_SOURCES = 32
 _RECALL_MAX_CHANNELS = 100
 _RECALL_MAX_NAME_BYTES = 256
-_SHORT_FOLLOWUP_MAX_TERMS = 4
+QUERY_RESOLUTION_VERSION = "cayu.query_resolution.v2"
+# Deliberately narrow discourse cues, not a language detector or word-count proxy.
+_DEPENDENT_QUERY = re.compile(
+    r"^(?:and (?:in|on|for|that|this)\b|let['\u2019]s do (?:that|this|it)\b|what about (?:that|this|it|those|them)\b|"
+    r"how about (?:that|this|it|those|them)\b|why[?\uff1f.! ]*$|"
+    r"y (?:en|eso|esto)\b|¿?por qué[?\uff1f.! ]*$|"
+    r"et (?:en|ça|cela)\b|pourquoi[?\uff1f.! ]*$|"
+    r"а (?:в|это)\b|почему[?\uff1f.! ]*$|那(?:在|这个|个)|为什么[?\uff1f。\uff01 ]*$)",  # noqa: RUF001 - intentional Cyrillic discourse cue
+    re.IGNORECASE,
+)
+_QUERY_CONTEXT_BYTES = 2048
 
 
 class RecallSourceStatus(StrEnum):
@@ -124,8 +135,11 @@ class RecallSituation(BaseModel):
         validate_default=True,
     )
 
+    query_resolution_version: Literal["cayu.query_resolution.v2"] = QUERY_RESOLUTION_VERSION
     query: str
     recent_conversation: tuple[str, ...] = ()
+    recent_user_context_clipped: bool = False
+    current_query_clipped: bool = False
     work_context: str | None = None
     knowledge_access_scope: KnowledgeAccessScope | None = None
     knowledge_namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE
@@ -135,6 +149,13 @@ class RecallSituation(BaseModel):
     knowledge_aspect_groups: tuple[tuple[str, ...], ...] = ()
     knowledge_filter_only: bool = False
     current_time: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("recent_user_context_clipped", "current_query_clipped", mode="before")
+    @classmethod
+    def validate_resolution_clipping(cls, value, info) -> bool:
+        if type(value) is not bool:
+            raise ValueError(f"`{info.field_name}` must be a boolean.")
+        return value
 
     @field_validator("query")
     @classmethod
@@ -413,22 +434,54 @@ class RecallSituation(BaseModel):
             )
         return self
 
-    def retrieval_text(self) -> str:
-        """Resolve short follow-ups from bounded caller-supplied current context."""
+    def query_resolution(self) -> dict[str, Any]:
+        """Bounded evidence of whether a current question needs an antecedent.
 
-        terms = self.query.split()
-        if len(terms) > _SHORT_FOLLOWUP_MAX_TERMS:
-            return self.query
-        context: list[str] = []
-        if self.work_context is not None:
-            context.append(self.work_context)
-        context.extend(self.recent_conversation[-2:])
-        context.append(self.query)
-        text = "\n".join(context)
-        encoded = text.encode("utf-8")
-        if len(encoded) <= RECALL_MAX_QUERY_BYTES:
-            return text
-        return encoded[-RECALL_MAX_QUERY_BYTES:].decode("utf-8", errors="ignore")
+        Only the most recent caller-supplied user turn (or explicit work context)
+        may resolve a follow-up. Assistant prose never supplies search terms.
+        Unknown discourse forms conservatively remain current-query-only.
+        """
+        dependent = _DEPENDENT_QUERY.search(self.query.strip()) is not None
+        antecedent = None
+        source = None
+        if dependent:
+            for item in reversed(self.recent_conversation):
+                if item.startswith("user: "):
+                    antecedent = item[len("user: ") :]
+                    source = "recent_user"
+                    break
+            if antecedent is None and self.work_context is not None:
+                antecedent = self.work_context
+                source = "explicit_work_context"
+        budget = min(
+            _QUERY_CONTEXT_BYTES, RECALL_MAX_QUERY_BYTES - len(self.query.encode("utf-8")) - 1
+        )
+        raw = b"" if antecedent is None else antecedent.encode("utf-8")
+        clipped = raw[: max(0, budget)].decode("utf-8", errors="ignore")
+        # A clipped antecedent may omit the subject: preserve that uncertainty.
+        context_clipped = len(raw) > max(0, budget) or (
+            dependent and source != "explicit_work_context" and self.recent_user_context_clipped
+        )
+        usable = bool(clipped) and not context_clipped and not self.current_query_clipped
+        return {
+            "version": self.query_resolution_version,
+            "current_query": self.query,
+            "decision": "resolved_followup"
+            if usable
+            else (
+                "insufficient_context"
+                if dependent or self.current_query_clipped
+                else "independent_query"
+            ),
+            "context_source": source,
+            "context_clipped": context_clipped,
+            "query_clipped": self.current_query_clipped,
+            "context_bytes": len(raw) if usable else 0,
+            "retrieval_text": self.query + ("\n" + clipped if usable else ""),
+        }
+
+    def retrieval_text(self) -> str:
+        return self.query_resolution()["retrieval_text"]
 
     def fingerprint(self) -> str:
         return sha256(

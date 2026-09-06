@@ -521,7 +521,7 @@
       "language": "en",
       "query": "Why?",
       "recent_conversation": [
-        "We need orionport8443."
+        "user: We need orionport8443."
       ],
       "namespace": "org-a",
       "access": {
@@ -552,7 +552,7 @@
       "language": "en",
       "query": "Let's do that.",
       "recent_conversation": [
-        "ceruleancodeword"
+        "user: ceruleancodeword"
       ],
       "namespace": "org-a",
       "access": {

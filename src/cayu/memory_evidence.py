@@ -518,6 +518,18 @@ class RecallReceiptItem(BaseModel):
         return self
 
 
+class RecallQueryResolutionEvidence(BaseModel):
+    """Non-content diagnostics; the situation fingerprint binds the current intent."""
+
+    model_config = _MODEL_CONFIG
+    version: Literal["cayu.query_resolution.v2"] = "cayu.query_resolution.v2"
+    decision: Literal["independent_query", "resolved_followup", "insufficient_context"]
+    context_source: Literal["recent_user", "explicit_work_context"] | None
+    context_clipped: StrictBool
+    query_clipped: StrictBool
+    context_bytes: StrictInt = Field(ge=0, le=2048)
+
+
 class RecallReceipt(BaseModel):
     """Immutable bounded proof of one already-computed recall/admission operation."""
 
@@ -531,6 +543,7 @@ class RecallReceipt(BaseModel):
     created_at: datetime
     situation_fingerprint: KeyedEvidenceFingerprint
     engine_version: str
+    query_resolution: RecallQueryResolutionEvidence | None = None
     source_configuration_fingerprint: KeyedEvidenceFingerprint
     admission_policy_fingerprint: KeyedEvidenceFingerprint
     access_scope_fingerprint: KeyedEvidenceFingerprint

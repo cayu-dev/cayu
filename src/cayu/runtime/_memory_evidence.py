@@ -26,6 +26,7 @@ from cayu.memory_evidence import (
     RecallItemAdmission,
     RecallItemExposure,
     RecallItemSelectionReason,
+    RecallQueryResolutionEvidence,
     RecallReceipt,
     RecallReceiptItem,
     RecallSourceCoverage,
@@ -216,6 +217,13 @@ def build_recall_receipt(
             key,
         ),
         engine_version=result.engine_version,
+        query_resolution=RecallQueryResolutionEvidence.model_validate(
+            {
+                name: value
+                for name, value in situation.query_resolution().items()
+                if name not in {"current_query", "retrieval_text"}
+            }
+        ),
         source_configuration_fingerprint=_fingerprint_payload(
             source_configuration_payload,
             "recall source configuration",

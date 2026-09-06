@@ -176,7 +176,7 @@ def test_recall_situation_is_bounded_defensive_and_resolves_short_followups() ->
     assert situation.knowledge_access_scope is not None
     assert situation.knowledge_access_scope.allowed_namespaces == ("project:cayu",)
     assert situation.knowledge_access_scope.required_labels == {"project": "cayu"}
-    assert situation.retrieval_text() == ("Release investigation\nWe selected project Atlas.\nWhy?")
+    assert situation.retrieval_text() == ("Why?\nRelease investigation")
     with pytest.raises(TypeError):
         situation.continuations["new"] = "cursor"  # type: ignore[index]
     with pytest.raises(TypeError):

@@ -2987,3 +2987,58 @@ def test_runtime_reuses_frozen_recall_for_runtime_authored_user_continuations(
         assert len(checkpoint["automatic_recall"]["runtime_authored_anchors"]) == 1
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "query,expected", [("Weather tomorrow?", "weather"), ("And in production?", "atlas-release")]
+)
+def test_real_context_resolves_query_without_assistant_contamination(query, expected):
+    async def run():
+        sessions, knowledge, session, previous = await _fixture()
+        await knowledge.create_entry(
+            KnowledgeEntry(id="weather", namespace="project:cayu", text="Weather tomorrow sunny.")
+        )
+        messages = [
+            *previous,
+            Message.text("user", "Atlas release"),
+            Message.text("assistant", "irrelevant picnic tables " * 100),
+            Message.text("user", query),
+        ]
+        await sessions.append_transcript_messages(
+            session.id, messages[len(previous) :], interaction_id="query-test"
+        )
+        policy = AutomaticRecallContextPolicy(
+            admission_policy=_admission(),
+            fusion_config=_fusion(KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL),
+            sources=AutomaticRecallSourceConfig(
+                knowledge_namespace="project:cayu", include_transcript=False
+            ),
+        )
+        first = await policy.build_with_checkpoint(
+            _request(sessions=sessions, knowledge=knowledge, session=session, messages=messages),
+            checkpoint=None,
+        )
+        projection = first.checkpoint["automatic_recall"]["projection"]
+        receipt = await sessions.load_recall_receipt(
+            session.id, first.checkpoint["automatic_recall"]["receipt_id"]
+        )
+        assert receipt.query_resolution.decision == (
+            "independent_query" if expected == "weather" else "resolved_followup"
+        )
+        assert not receipt.query_resolution.context_clipped
+        assert not receipt.query_resolution.query_clipped
+
+        assert {
+            json.loads(item["locator_json"])["entry_id"] for item in projection["focus"]["items"]
+        } == {expected}
+        replay = await policy.build_with_checkpoint(
+            _request(
+                sessions=sessions, knowledge=knowledge, session=session, messages=messages, step=2
+            ),
+            checkpoint=first.checkpoint,
+        )
+        assert replay.checkpoint is None  # Unchanged checkpoints are omitted.
+        assert _provider_manifest(replay.messages) == _provider_manifest(first.messages)
+        assert knowledge.search_count == 1
+
+    asyncio.run(run())

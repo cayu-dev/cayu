@@ -5,7 +5,7 @@
       "backend": "memory",
       "cases": [
         {
-          "admission_latency_ms": 1.166959,
+          "admission_latency_ms": 1.493375,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -13,7 +13,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2626,
@@ -29,7 +29,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.560792,
+          "latency_ms": 3.811125,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -54,7 +54,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.157292,
+          "admission_latency_ms": 1.656666,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -62,7 +62,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2849,
@@ -78,7 +78,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.739334,
+          "latency_ms": 3.523791,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -103,7 +103,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.848416,
+          "admission_latency_ms": 3.399333,
           "admission_truncated": true,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -111,7 +111,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 3886,
@@ -127,7 +127,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.240166,
+          "latency_ms": 4.969125,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [
@@ -155,7 +155,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.813292,
+          "admission_latency_ms": 3.191208,
           "admission_truncated": true,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -163,7 +163,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 3879,
@@ -179,7 +179,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.195417,
+          "latency_ms": 4.86525,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [
@@ -207,7 +207,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 2.137834,
+          "admission_latency_ms": 2.597542,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -215,7 +215,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 3894,
@@ -232,7 +232,7 @@
           ],
           "injected_source_diversity": 2,
           "language": "en",
-          "latency_ms": 3.258916,
+          "latency_ms": 4.680375,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [],
@@ -258,7 +258,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.080958,
+          "admission_latency_ms": 1.596833,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -266,7 +266,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2644,
@@ -282,7 +282,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "es",
-          "latency_ms": 2.284708,
+          "latency_ms": 3.341083,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -307,7 +307,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.133541,
+          "admission_latency_ms": 1.6585,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -315,7 +315,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2897,
@@ -331,7 +331,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "ru",
-          "latency_ms": 2.44075,
+          "latency_ms": 3.584833,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -356,7 +356,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.069875,
+          "admission_latency_ms": 1.459375,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -364,7 +364,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2626,
@@ -380,7 +380,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.251833,
+          "latency_ms": 3.606167,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -405,7 +405,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.161042,
+          "admission_latency_ms": 1.464209,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -413,7 +413,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2845,
@@ -429,7 +429,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.688083,
+          "latency_ms": 3.689375,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -454,7 +454,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.136042,
+          "admission_latency_ms": 1.667041,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -462,7 +462,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2861,
@@ -478,7 +478,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.422375,
+          "latency_ms": 3.756792,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -503,7 +503,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.134458,
+          "admission_latency_ms": 1.684208,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -511,7 +511,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2859,
@@ -527,7 +527,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "de",
-          "latency_ms": 2.451625,
+          "latency_ms": 3.487042,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -552,7 +552,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.453041,
+          "admission_latency_ms": 1.716375,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -560,7 +560,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [
             "transcript.lexical"
@@ -578,7 +578,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.024375,
+          "latency_ms": 3.921208,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -603,7 +603,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.077917,
+          "admission_latency_ms": 1.554709,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -611,7 +611,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2641,
@@ -627,7 +627,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.096083,
+          "latency_ms": 3.524291,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -652,7 +652,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.121792,
+          "admission_latency_ms": 1.481291,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -660,7 +660,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2834,
@@ -676,7 +676,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.465542,
+          "latency_ms": 3.444958,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -701,7 +701,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 2.1155,
+          "admission_latency_ms": 3.29125,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 3,
@@ -709,7 +709,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 4194,
@@ -725,7 +725,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.661709,
+          "latency_ms": 6.058875,
           "locator_correct_count": 3,
           "locator_evaluated_count": 3,
           "offered_identities": [
@@ -756,7 +756,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.077666,
+          "admission_latency_ms": 1.529416,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -764,7 +764,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2704,
@@ -780,7 +780,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.271084,
+          "latency_ms": 3.313167,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1165,8 +1165,8 @@
       "corpus_origin": "hermetic_public",
       "corpus_revision": "public-cross-source-admission-v2",
       "metrics": {
-        "admission_latency_p50_ms": 1.136042,
-        "admission_latency_p95_ms": 2.137834,
+        "admission_latency_p50_ms": 1.656666,
+        "admission_latency_p95_ms": 3.399333,
         "admission_truncated_case_count": 2,
         "authorization_leak_rate": 0.0,
         "case_count": 16,
@@ -1177,8 +1177,8 @@
         "false_injection_rate": 0.0,
         "false_result_rate": 0.0,
         "injected_precision": 1.0,
-        "latency_p50_ms": 2.560792,
-        "latency_p95_ms": 4.661709,
+        "latency_p50_ms": 3.606167,
+        "latency_p95_ms": 6.058875,
         "locator_correctness": 1.0,
         "mean_candidate_count": 1.3125,
         "mean_injected_source_diversity": 1.0625,
@@ -1200,7 +1200,7 @@
       "backend": "sqlite",
       "cases": [
         {
-          "admission_latency_ms": 1.123834,
+          "admission_latency_ms": 1.84725,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1208,7 +1208,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2645,
@@ -1224,7 +1224,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.12975,
+          "latency_ms": 4.714416,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1249,7 +1249,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.152583,
+          "admission_latency_ms": 1.658625,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1257,7 +1257,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2849,
@@ -1273,7 +1273,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.084333,
+          "latency_ms": 4.483042,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1298,7 +1298,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.858958,
+          "admission_latency_ms": 3.369584,
           "admission_truncated": true,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -1306,7 +1306,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 3906,
@@ -1322,7 +1322,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.717084,
+          "latency_ms": 5.255584,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [
@@ -1350,7 +1350,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.908292,
+          "admission_latency_ms": 3.575125,
           "admission_truncated": true,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -1358,7 +1358,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 3899,
@@ -1374,7 +1374,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.73225,
+          "latency_ms": 5.315375,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [
@@ -1402,7 +1402,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 2.133458,
+          "admission_latency_ms": 2.833708,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 2,
@@ -1410,7 +1410,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 3913,
@@ -1427,7 +1427,7 @@
           ],
           "injected_source_diversity": 2,
           "language": "en",
-          "latency_ms": 4.427459,
+          "latency_ms": 5.949292,
           "locator_correct_count": 2,
           "locator_evaluated_count": 2,
           "offered_identities": [],
@@ -1453,7 +1453,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.115584,
+          "admission_latency_ms": 1.632084,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1461,7 +1461,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2664,
@@ -1477,7 +1477,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "es",
-          "latency_ms": 2.678292,
+          "latency_ms": 3.92625,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1502,7 +1502,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.171333,
+          "admission_latency_ms": 1.716167,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1510,7 +1510,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2897,
@@ -1526,7 +1526,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "ru",
-          "latency_ms": 3.104042,
+          "latency_ms": 4.37175,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1551,7 +1551,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.074083,
+          "admission_latency_ms": 1.617375,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1559,7 +1559,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2645,
@@ -1575,7 +1575,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.777667,
+          "latency_ms": 4.01025,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1600,7 +1600,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.134709,
+          "admission_latency_ms": 1.59675,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1608,7 +1608,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2845,
@@ -1624,7 +1624,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.095667,
+          "latency_ms": 4.683583,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1649,7 +1649,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.157959,
+          "admission_latency_ms": 1.698,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1657,7 +1657,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2861,
@@ -1673,7 +1673,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.901334,
+          "latency_ms": 4.647292,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1698,7 +1698,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.16925,
+          "admission_latency_ms": 1.610125,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1706,7 +1706,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2859,
@@ -1722,7 +1722,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "de",
-          "latency_ms": 2.966542,
+          "latency_ms": 4.603583,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1747,7 +1747,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.252875,
+          "admission_latency_ms": 1.730417,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1755,7 +1755,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [
             "transcript.lexical"
@@ -1773,7 +1773,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 3.928667,
+          "latency_ms": 4.962334,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1798,7 +1798,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.311334,
+          "admission_latency_ms": 1.51875,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1806,7 +1806,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2661,
@@ -1822,7 +1822,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.887708,
+          "latency_ms": 4.574834,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1847,7 +1847,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.133208,
+          "admission_latency_ms": 1.752417,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1855,7 +1855,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2834,
@@ -1871,7 +1871,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.921375,
+          "latency_ms": 4.666667,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -1896,7 +1896,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.944292,
+          "admission_latency_ms": 3.49275,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 3,
@@ -1904,7 +1904,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 4194,
@@ -1920,7 +1920,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 4.675292,
+          "latency_ms": 7.088375,
           "locator_correct_count": 3,
           "locator_evaluated_count": 3,
           "offered_identities": [
@@ -1951,7 +1951,7 @@
           "unauthorized_injection_count": 0
         },
         {
-          "admission_latency_ms": 1.116833,
+          "admission_latency_ms": 1.564291,
           "admission_truncated": false,
           "authorization_leak_count": 0,
           "candidate_count": 1,
@@ -1959,7 +1959,7 @@
           "channel_index_versions": {
             "knowledge.lexical": "cayu.knowledge.lexical.v1",
             "knowledge.semantic": "unsupported",
-            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
           },
           "continuation_channels": [],
           "contribution_bytes": 2724,
@@ -1975,7 +1975,7 @@
           ],
           "injected_source_diversity": 1,
           "language": "en",
-          "latency_ms": 2.672042,
+          "latency_ms": 3.892125,
           "locator_correct_count": 1,
           "locator_evaluated_count": 1,
           "offered_identities": [],
@@ -2360,8 +2360,8 @@
       "corpus_origin": "hermetic_public",
       "corpus_revision": "public-cross-source-admission-v2",
       "metrics": {
-        "admission_latency_p50_ms": 1.157959,
-        "admission_latency_p95_ms": 2.133458,
+        "admission_latency_p50_ms": 1.698,
+        "admission_latency_p95_ms": 3.575125,
         "admission_truncated_case_count": 2,
         "authorization_leak_rate": 0.0,
         "case_count": 16,
@@ -2372,8 +2372,8 @@
         "false_injection_rate": 0.0,
         "false_result_rate": 0.0,
         "injected_precision": 1.0,
-        "latency_p50_ms": 3.084333,
-        "latency_p95_ms": 4.675292,
+        "latency_p50_ms": 4.647292,
+        "latency_p95_ms": 7.088375,
         "locator_correctness": 1.0,
         "mean_candidate_count": 1.3125,
         "mean_injected_source_diversity": 1.0625,

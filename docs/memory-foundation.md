@@ -1889,3 +1889,23 @@ The same bounded corpus schema accepts `origin="external_private"`, trajectory
 identity, and turn index. Production-shaped long trajectories stay outside the
 public repository and use the same runner locally; reports identify the corpus
 revision, backend, search mode, embedding/reranker identity, and configuration.
+
+### Current question resolution (v2)
+
+Automatic recall no longer expands queries based on whitespace length. The fixed
+`cayu.query_resolution.v2` resolver recognizes a bounded set of explicit follow-up
+cues (English, Spanish, French, Russian, and Chinese regression examples). It
+appends at most 2,048 UTF-8 bytes from the latest `user: ` context item, or explicit
+caller work context when no user antecedent exists. Assistant text and untagged
+conversation never supply terms. The complete current query comes first within
+the existing 8,192-byte query ceiling. A missing or oversized antecedent remains
+`insufficient_context`; unknown cues conservatively use the current query alone.
+This is a deterministic heuristic, not a general multilingual intent classifier.
+
+The resolver version participates in situation and automatic-context configuration
+fingerprints. Durable receipts record the context-use decision, source, byte count,
+and query/context clipping flags without copying private query text. The existing keyed situation
+fingerprint binds current intent; retry/recovery retains the committed projection.
+Generated automatic-context policies inherit this resolver and its configuration
+identity. Custom callers now need `user: ` role tags for conversational antecedents;
+explicit `work_context` remains supported. Scope and admission are independent.

@@ -33,6 +33,7 @@ from cayu.memory import (
 from cayu.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
+    QUERY_RESOLUTION_VERSION,
     RECALL_MAX_QUERY_BYTES,
     RECALL_MAX_RECENT_CONVERSATION_BYTES,
     RECALL_MAX_RECENT_CONVERSATION_ITEMS,
@@ -304,6 +305,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
 
         return {
             "kind": "automatic_recall",
+            "query_resolution_version": QUERY_RESOLUTION_VERSION,
             "version": 1,
             "admission_policy": self.admission_policy.model_dump(mode="json"),
             "fusion_config": self.fusion_config.model_dump(mode="json"),
@@ -547,15 +549,18 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         recorded_telemetry: list[ContextRecallTelemetry],
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         runtime_anchors = _runtime_anchor_pairs(previous_state)
+        recent, recent_user_context_clipped = _recent_conversation(
+            request.messages,
+            before_index=anchor_index,
+            excluded_user_anchors=runtime_anchors,
+            max_items=self.sources.recent_conversation_items,
+            max_bytes=self.sources.recent_conversation_bytes,
+        )
         situation = RecallSituation(
             query=_bounded_tail(query, RECALL_MAX_QUERY_BYTES),
-            recent_conversation=_recent_conversation(
-                request.messages,
-                before_index=anchor_index,
-                excluded_user_anchors=runtime_anchors,
-                max_items=self.sources.recent_conversation_items,
-                max_bytes=self.sources.recent_conversation_bytes,
-            ),
+            current_query_clipped=len(query.encode("utf-8")) > RECALL_MAX_QUERY_BYTES,
+            recent_conversation=recent,
+            recent_user_context_clipped=recent_user_context_clipped,
             knowledge_access_scope=_knowledge_access_scope(request),
             knowledge_namespace=self.sources.knowledge_namespace,
             transcript_session_ids=(request.session.id,) if self.sources.include_transcript else (),
@@ -599,6 +604,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                 admission_policy=self.admission_policy,
                 source_configuration={
                     "sources": self.sources.model_dump(mode="json"),
+                    "query_resolution": situation.query_resolution(),
                     "engine_config": self.engine_config.model_dump(mode="json"),
                     "fusion_config": self.fusion_config.model_dump(mode="json"),
                 },
@@ -897,38 +903,37 @@ def _recent_conversation(
     excluded_user_anchors: set[tuple[int, str]],
     max_items: int,
     max_bytes: int,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], bool]:
     selected: list[str] = []
     used_bytes = 0
+    latest_clipped = False
     for index in range(before_index - 1, -1, -1):
         message = messages[index]
-        if message.role not in {MessageRole.USER, MessageRole.ASSISTANT}:
+        # Only user-authored antecedents can resolve a current follow-up.
+        # Assistant verbosity must not consume the antecedent budget either.
+        if message.role is not MessageRole.USER:
             continue
-        if (
-            message.role is MessageRole.USER
-            and (
-                index,
-                _message_digest(message),
-            )
-            in excluded_user_anchors
-        ):
+        if (index, _message_digest(message)) in excluded_user_anchors:
             continue
         text = _message_text(message)
         if not text:
             continue
-        label = "user" if message.role is MessageRole.USER else "assistant"
-        item = f"{label}: {_bounded_tail(text, max_bytes)}"
+        prefix = "user: "
+        available = max_bytes - len(prefix.encode("utf-8"))
+        if available <= 0:
+            return (), True
+        bounded = _bounded_tail(text, available)
+        if not selected:
+            latest_clipped = len(text.encode("utf-8")) > available
+        item = prefix + bounded
         item_bytes = len(item.encode("utf-8"))
-        if item_bytes > max_bytes:
-            item = _bounded_tail(item, max_bytes)
-            item_bytes = len(item.encode("utf-8"))
         if used_bytes + item_bytes > max_bytes:
             break
         selected.append(item)
         used_bytes += item_bytes
         if len(selected) >= max_items:
             break
-    return tuple(reversed(selected))
+    return tuple(reversed(selected)), latest_clipped
 
 
 def _load_runtime_authored_user_message(
