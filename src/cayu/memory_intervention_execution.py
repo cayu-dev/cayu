@@ -68,7 +68,7 @@ from cayu.agent_snapshots import (
     AgentSnapshotTrialBinding,
     execution_profile_snapshot_ref,
 )
-from cayu.core.events import event_durable_sequence
+from cayu.core.events import EventType, event_durable_sequence
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_runtime_source,
 )
@@ -120,7 +120,9 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
 )
 from cayu.runtime.sessions import (
+    CompactSessionRequest,
     IncompleteSessionRecoveryRequest,
+    ResumeRequest,
     RunnerObservedEventIdentity,
     RunRequest,
     RuntimeSessionCreateClaimAuthenticationDisposition,
@@ -312,6 +314,10 @@ class MemoryInterventionTrialRequest(_ExecutionModel):
     trial_id: StrictStr = Field(max_length=_MAX_ID_CHARS)
     case: EvalCaseContractV1
     run_request: RunRequest
+    context_preparation: Literal["none", "compact_then_resume"] = Field(
+        default="none",
+        exclude_if=lambda value: value == "none",
+    )
     timeout_seconds: StrictInt = Field(
         default=300,
         ge=1,
@@ -372,6 +378,11 @@ class MemoryInterventionTrialRequest(_ExecutionModel):
     @model_validator(mode="after")
     def validate_isolated_request(self) -> Self:
         request = self.run_request
+        if self.context_preparation == "compact_then_resume":
+            if len(request.messages) < 2 or request.messages[-1].role.value != "user":
+                raise ValueError("Compaction preparation requires history and a final user input.")
+            if request.limits.scope != "session":
+                raise ValueError("Compaction preparation requires session-scoped run limits.")
         owned_values = {
             "session_id": request.session_id,
             "parent_session_id": request.parent_session_id,
@@ -404,6 +415,11 @@ class MemoryInterventionTrialRequest(_ExecutionModel):
             "case": self.case.model_dump(mode="json"),
             "run_request": self.run_request.model_dump(mode="json"),
             "timeout_seconds": self.timeout_seconds,
+            **(
+                {"context_preparation": self.context_preparation}
+                if self.context_preparation != "none"
+                else {}
+            ),
         }
 
     @property
@@ -1801,6 +1817,11 @@ def _memory_intervention_runtime_request(
             "session_id": execution.session_id,
             "causal_budget_id": execution.causal_budget_id,
             "metadata": metadata,
+            "messages": (
+                request.run_request.messages[:-1]
+                if request.context_preparation == "compact_then_resume"
+                else request.run_request.messages
+            ),
         }
     )
     return run_request_with_runtime_generated_authority(
@@ -2086,6 +2107,27 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                     operation_id=execution.execution_id,
                     reference_key=reference_key,
                 )
+            if (
+                request.context_preparation == "compact_then_resume"
+                and not execution.runtime_timeout_observed
+                and not execution.runtime_cancellation_observed
+            ):
+                try:
+                    session = await self._continue_compacted_trial(
+                        app=app,
+                        request=request,
+                        execution=execution,
+                        session=session,
+                    )
+                except TimeoutError:
+                    return await self._collect_timeout_result(
+                        app=app,
+                        execution=execution,
+                        runtime_request=runtime_request,
+                        session_create_claim=session_create_claim,
+                        observed_events=(),
+                        reference_key=reference_key,
+                    )
             return await self._collect_result(
                 app=app,
                 expected_session=session,
@@ -2314,6 +2356,19 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             raise MemoryInterventionExecutionConflict(
                 "Memory intervention runtime did not install the exact canonical recall policy."
             )
+        if request.context_preparation == "compact_then_resume":
+            from cayu.runtime.context import (
+                CheckpointCompactionContextPolicy,
+                TranscriptDigestCompactor,
+            )
+
+            if (
+                type(policy.base_policy) is not CheckpointCompactionContextPolicy
+                or type(policy.base_policy.compactor) is not TranscriptDigestCompactor
+            ):
+                raise MemoryInterventionExecutionConflict(
+                    "Compaction preparation requires the native provider-free digest compactor."
+                )
         expected_profile = _sha256(
             self.factory.expected_execution_profile_fingerprint(request.spec),
             "factory expected execution profile",
@@ -2389,6 +2444,9 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                     expected_execution_profile=expected_profile,
                     expected_registered_environment=expected_registered_environment,
                     expected_context_policy=expected_context_policy,
+                    pause_after_initial_transcript=(
+                        request.context_preparation == "compact_then_resume"
+                    ),
                 ):
                     observed.append(
                         RunnerObservedEventIdentity(
@@ -2419,6 +2477,26 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             operation_id=execution.execution_id,
             reference_key=reference_key,
         )
+        if request.context_preparation == "compact_then_resume":
+            try:
+                session = await self._continue_compacted_trial(
+                    app=app,
+                    request=request,
+                    execution=execution,
+                    session=session,
+                )
+            except TimeoutError:
+                observed_events = tuple(observed)
+                raise _MemoryInterventionRuntimeTimeoutObserved(
+                    lambda: self._collect_timeout_result(
+                        app=app,
+                        execution=execution,
+                        runtime_request=runtime_request,
+                        session_create_claim=session_create_claim,
+                        observed_events=observed_events,
+                        reference_key=reference_key,
+                    )
+                ) from None
         return await self._collect_result(
             app=app,
             expected_session=session,
@@ -2426,6 +2504,123 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             timeout_expired=False,
             cancellation_observed=False,
         )
+
+    @staticmethod
+    async def _continue_compacted_trial(*, app, request, execution, session):
+        """Use native idempotent compaction and resume under the trial's scope."""
+        events = await app.session_store.load_events(session.id)
+        interactions = [event for event in events if event.type is EventType.INTERACTION_STARTED]
+        if len(interactions) == 2:
+            second = interactions[1]
+            prefix = events[: events.index(second)]
+            await CayuMemoryInterventionRuntimeRunner._require_preparation_compaction(
+                app=app, execution=execution, session=session, events=prefix
+            )
+            if any(event.type is EventType.MODEL_STARTED for event in prefix):
+                raise MemoryInterventionExecutionConflict(
+                    "Prepared history contains provider work."
+                )
+            transcript = await app.session_store.load_transcript_snapshot(session.id)
+            inputs = [
+                record.message
+                for record in transcript.records
+                if record.interaction_id == second.interaction_id and record.message.role == "user"
+            ]
+            if inputs != [request.run_request.messages[-1]]:
+                raise MemoryInterventionExecutionConflict(
+                    "Prepared trial has an undeclared continuation."
+                )
+            return session
+        if len(interactions) != 1:
+            raise MemoryInterventionExecutionConflict("Prepared trial has unexpected interactions.")
+        if session.status is not SessionStatus.INTERRUPTED:
+            return session
+        if any(event.type is EventType.MODEL_STARTED for event in events):
+            raise MemoryInterventionExecutionConflict("Prepared history contains provider work.")
+        remaining = _remaining_runtime_timeout(request, execution)
+        if remaining <= 0:
+            raise TimeoutError("Trial deadline expired before compaction/resume.")
+        async with asyncio.timeout(remaining):
+            cursor = await app.session_store.load_transcript_cursor(session.id)
+            async for _event in app._compact_session_private(
+                CompactSessionRequest(
+                    session_id=session.id,
+                    idempotency_key="memory-trial-compact:" + execution.execution_id,
+                    expected_run_epoch=session.run_epoch,
+                    expected_transcript_cursor=cursor,
+                    limits=request.run_request.limits,
+                    budget_limits=request.run_request.budget_limits,
+                ),
+                store_resolved_session_id=session.id,
+            ):
+                pass
+            compacted_events = await app.session_store.load_events(session.id)
+            await CayuMemoryInterventionRuntimeRunner._require_preparation_compaction(
+                app=app, execution=execution, session=session, events=compacted_events
+            )
+            base = request.run_request
+            async for _event in app._resume_private(
+                ResumeRequest(
+                    session_id=session.id,
+                    messages=[base.messages[-1]],
+                    target=base.target,
+                    tool_capability_ceiling=base.tool_capability_ceiling,
+                    tool_grants=base.tool_grants,
+                    metadata=base.metadata,
+                    max_steps=base.max_steps,
+                    limits=base.limits,
+                    budget_limits=base.budget_limits,
+                    retry_policy=base.retry_policy,
+                    structured_output=base.structured_output,
+                    thinking=base.thinking,
+                ),
+                store_resolved_session_id=session.id,
+            ):
+                pass
+        result = await app.session_store.load(session.id)
+        if result is None:
+            raise MemoryInterventionExecutionConflict("Prepared trial session disappeared.")
+        return result
+
+    @staticmethod
+    async def _require_preparation_compaction(*, app, execution, session, events):
+        request_id = "memory-trial-compact:" + execution.execution_id
+        completed = [
+            event
+            for event in events
+            if event.type is EventType.CONTEXT_COMPACTION_COMPLETED
+            and event.payload.get("request_id") == request_id
+        ]
+        if not completed:
+            raise MemoryInterventionExecutionConflict(
+                "Native history compaction did not complete for this trial."
+            )
+        payload = completed[-1].payload
+        start = payload.get("previous_compacted_transcript_cursor")
+        end = payload.get("compacted_transcript_cursor")
+        count = payload.get("newly_compacted_message_count")
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or type(count) is not int
+            or start < 0
+            or end <= start
+            or count != end - start
+        ):
+            raise MemoryInterventionExecutionConflict(
+                "Native history compaction made no verified progress."
+            )
+        checkpoint = await app.session_store.load_checkpoint(session.id)
+        compaction = None if checkpoint is None else checkpoint.get("context_compaction")
+        persisted_cursor = (
+            compaction.get("compacted_transcript_cursor") if type(compaction) is dict else None
+        )
+        # Later model work may advance the checkpoint, but cannot erase the
+        # preparation's acknowledged source prefix.
+        if type(persisted_cursor) is not int or persisted_cursor < end:
+            raise MemoryInterventionExecutionConflict(
+                "Native history compaction progress is not persisted."
+            )
 
     async def _collect_timeout_result(
         self,
@@ -4394,6 +4589,7 @@ def _copy_trial_request(
         trial_id=request.trial_id,
         case=request.case,
         run_request=request.run_request,
+        context_preparation=request.context_preparation,
         timeout_seconds=request.timeout_seconds,
     )
 

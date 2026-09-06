@@ -11383,7 +11383,10 @@ class SessionEngine:
         expected_execution_profile: ExecutionProfileIdentity | None = None,
         expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
         expected_context_policy: object | None = None,
+        pause_after_initial_transcript: bool = False,
     ) -> AsyncGenerator[Event, None]:
+        if type(pause_after_initial_transcript) is not bool:
+            raise TypeError("pause_after_initial_transcript must be a bool.")
         preparation = self._prepare_initial_run(
             request,
             expected_execution_profile=expected_execution_profile,
@@ -11810,6 +11813,73 @@ class SessionEngine:
                     messages,
                     runtime_suffix_count=1,
                 )
+            if pause_after_initial_transcript:
+                # Native fixture preparation admits the exact transcript and
+                # closes its interaction before any model-loop/provider work.
+                # Keep setup ownership until normal terminal/fence cleanup.
+                # This entrance returns before _run_session emits the origin;
+                # retain that runtime-owned evidence before closing setup so a
+                # later resume remains capturable as a complete trajectory.
+                start_event = Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    payload={
+                        "agent_name": registered_agent.spec.name,
+                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
+                            request,
+                            message_start_index=(len(messages) - len(initial_source_messages)),
+                        ),
+                        **(
+                            {}
+                            if prompt_contribution_manifest is None
+                            else {
+                                "prompt_contribution_manifest": (
+                                    prompt_contribution_manifest.model_dump(mode="json")
+                                )
+                            }
+                        ),
+                        **(
+                            {}
+                            if prepared_session_authority is None
+                            else {
+                                "dispatch_operation_id": (
+                                    prepared_session_authority.dispatch_operation_id
+                                ),
+                                "queue_task_id": prepared_session_authority.queue_task_id,
+                                "durable_subagent_submission_sha256": (
+                                    prepared_session_authority.submission_sha256
+                                ),
+                            }
+                        ),
+                        **_session_trace_event_fields(session, request.metadata),
+                    },
+                )
+                lineage_fields = (
+                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+                    *(
+                        field_name
+                        for field_name, expected in (
+                            ("parent_session_id", session.parent_session_id),
+                            ("causal_budget_id", session.causal_budget_id),
+                        )
+                        if expected is not None and start_event.payload.get(field_name) == expected
+                    ),
+                )
+                yield await self._event_writer.emit(
+                    event_with_runtime_payload_authority(start_event, *lineage_fields)
+                )
+                async for event in self._handle_session_interrupted(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                ):
+                    yield event
+                return
             release_before_run = False
         except asyncio.CancelledError as cancellation:
             if await self._session_control.interrupt_requested(session.id):
@@ -12690,6 +12760,10 @@ class SessionEngine:
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         context_policy = registered_agent.context_policy
+        from cayu.runtime.memory_context import AutomaticRecallContextPolicy
+
+        if type(context_policy) is AutomaticRecallContextPolicy:
+            context_policy = context_policy.base_policy
         if not isinstance(context_policy, CheckpointCompactionContextPolicy):
             raise ValueError(
                 "Explicit session compaction requires a configured "

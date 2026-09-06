@@ -775,7 +775,9 @@ def build_eval() -> EvalPlan:
 evidence-policy, limit, optional pricing, and model-judge target inputs. Its request base must have
 no messages, session/parent/causal/task identity, structured-output request,
 prior redaction state, or runtime authority. Bootstrap messages are bounded
-single-text-part system or user messages. Compilation produces exactly that
+single-text-part system, user, or assistant messages. Trusted assistant text can
+represent authored conversation history; tool calls, tool results, and provider
+state remain disallowed. Portable corpus input remains user-only. Compilation produces exactly that
 trusted bootstrap followed by the corpus's user messages; every trial then gets
 a fresh runtime session and causal identity from the existing evaluator. The
 trusted request base is capped at 64 KiB and the published AppManifest at 1 MiB.
@@ -1664,6 +1666,35 @@ the validated causal budget policy independently of the allocated scope key,
 while ledger identities and request fingerprints retain the exact trial key.
 Read-only profile preparation uses the target's single causal key without
 admitting a session or modifying the target.
+
+For structured answers, `FinalOutputEqualsAssertionSpec(comparison="json", ...)`
+compares parsed JSON values: object-key order and whitespace are insignificant,
+array order and scalar types are significant, and equivalent JSON numbers compare
+equally. Invalid JSON, duplicate object keys, nonfinite numbers, markdown fences,
+and extra fields fail. The expected value must itself be valid JSON. The mode is
+bound to the assertion revision and retained in published evidence; omitting it
+preserves exact text comparison and existing serialized assertions.
+
+For an authored compaction-and-resume experiment, set
+`context_preparation="compact_then_resume"` on both the trial request and its
+external-private authorization. The compiled messages must contain trusted
+history followed by the final user query, and run limits must be session-scoped.
+The runner starts a native interaction containing only the history, interrupts
+it before provider work, invokes native idempotent compaction, and resumes with
+the final query. The complete input and preparation choice remain bound to the
+trial identity. Both phases share its causal budget and original deadline.
+This preparation requires `AutomaticRecallContextPolicy` wrapping the exact
+native `CheckpointCompactionContextPolicy` and provider-free
+`TranscriptDigestCompactor`; preparation requires a completed compaction for the
+trial with positive source-prefix progress retained in the checkpoint. A digest
+capacity limit that leaves zero messages compacted fails preparation before
+provider work. Recovery verifies that progress and the declared continuation,
+and never starts a third interaction.
+The default `"none"` preserves ordinary single-interaction execution.
+Trusted bootstrap defaults to 16 messages. A target can explicitly increase
+`CorpusExecutionLimits.max_bootstrap_messages` up to 128 for a longer fixture;
+the total input-text and expanded-suite bounds still apply. Portable case input
+retains its existing 16-message ceiling.
 
 Preflight reloads and hashes the bounded corpus, revalidates the approved paths,
 compiles every case through the selected target, and requires the complete

@@ -98,7 +98,7 @@ from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.manifest import AppManifest, _app_manifest_fingerprint
 from cayu.runtime.sessions import RunRequest, copy_run_request
 
-CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES = EVAL_CORPUS_MAX_MESSAGES_PER_CASE
+CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES = 128
 CORPUS_EXECUTION_MAX_TOTAL_INPUT_CHARS = EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS * 2
 CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS = 8 << 20
 CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY = DEFAULT_EVAL_MAX_ACTIVE_TRIALS
@@ -154,7 +154,7 @@ class CorpusExecutionLimits(BaseModel):
         le=EVAL_MAX_CONCURRENCY,
     )
     max_bootstrap_messages: StrictInt = Field(
-        default=CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES,
+        default=EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
         ge=0,
         le=CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES,
     )
@@ -732,9 +732,9 @@ class CorpusTarget(BaseModel):
                 raise TypeError("CorpusTarget bootstrap_messages must contain exact Messages.")
             role = getattr(message, "role", None)
             content = getattr(message, "content", None)
-            if role not in {MessageRole.SYSTEM, MessageRole.USER}:
+            if role not in {MessageRole.SYSTEM, MessageRole.USER, MessageRole.ASSISTANT}:
                 raise ValueError(
-                    "CorpusTarget bootstrap_messages support only system and user roles."
+                    "CorpusTarget bootstrap_messages support only system, user, and assistant roles."
                 )
             if (
                 not isinstance(content, tuple)

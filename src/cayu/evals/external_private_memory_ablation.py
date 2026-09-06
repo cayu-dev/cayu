@@ -421,6 +421,7 @@ class ExternalPrivateMemoryAblationAuthorization(BaseModel):
     report_destination_id: StrictStr = Field(max_length=256)
     report_destination_fingerprint: StrictStr = Field(min_length=64, max_length=64)
     execution_mode: ExternalPrivateMemoryAblationExecutionMode
+    context_preparation: Literal["none", "compact_then_resume"] = "none"
     live_execution_authorization_id: StrictStr | None = Field(default=None, max_length=256)
     allowed_variant_ids: tuple[StrictStr, ...] = Field(min_length=2, max_length=128)
     allowed_variant_kinds: tuple[MemoryInterventionKind, ...] = Field(
@@ -2440,6 +2441,8 @@ def _prepare_external_private_memory_ablation_validated(
             or request.candidate_id != variant.candidate_id
         ):
             raise ValueError("Trial request conflicts with its experiment matrix coordinate.")
+        if request.context_preparation != copied_authorization.context_preparation:
+            raise ValueError("Trial context preparation differs from the campaign authorization.")
         trial = _bind_compiled_trial_budget(trial, compiled_case.request)
         request = trial.request
         if request.timeout_seconds != compiled.timeout_seconds:

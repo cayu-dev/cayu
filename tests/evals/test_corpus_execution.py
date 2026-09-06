@@ -2432,3 +2432,62 @@ def test_legacy_corpus_policy_does_not_inherit_new_application_concurrency():
     )
     assert result.run.status == "passed"
     assert result.run.trial_policy.max_concurrency == 1
+
+
+def test_trusted_assistant_history_reaches_each_trial_without_role_flattening():
+    provider = _provider(trials=2)
+    history = (
+        Message.text("user", "Use the standard refund procedure."),
+        Message.text("assistant", "Which order should I check?"),
+    )
+    target = _target(provider).model_copy(update={"bootstrap_messages": history})
+    corpus = _corpus(trials=2)
+    compiled = compile_corpus_suite(corpus, target, corpus.suites[0].id)
+    assert tuple(compiled.suite.cases[0].request.messages[:2]) == history
+    result = asyncio.run(run_corpus_suite(target, corpus, corpus.suites[0].id))
+    assert result.run.status == "passed"
+    assert len(provider.requests) == 2
+    for request in provider.requests:
+        assert tuple(request.messages[:2]) == history
+        assert request.messages[2].role.value == "user"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        Message.tool_call(tool_call_id="fixture-call", tool_name="fixture-tool", arguments={}),
+        Message.tool_result(
+            tool_call_id="fixture-call", tool_name="fixture-tool", content="untrusted"
+        ),
+    ],
+)
+def test_trusted_history_still_rejects_tool_authority(message):
+    target = _target(_provider()).model_copy(update={"bootstrap_messages": (message,)})
+    corpus = _corpus()
+    with pytest.raises(ValidationError, match="bootstrap_messages"):
+        compile_corpus_suite(corpus, target, corpus.suites[0].id)
+
+
+def test_portable_corpus_cannot_supply_assistant_history():
+    with pytest.raises(ValidationError):
+        RunInputSpec.model_validate(
+            {"messages": [{"role": "assistant", "text": "Authored answer"}]}
+        )
+
+
+def test_long_trusted_history_requires_explicit_target_limit():
+    from cayu.evals.execution import CorpusExecutionLimits
+
+    history = tuple(
+        Message.text("user" if index % 2 == 0 else "assistant", f"History {index}")
+        for index in range(82)
+    )
+    target = _target(_provider()).model_copy(update={"bootstrap_messages": history})
+    corpus = _corpus()
+    with pytest.raises(ValueError, match="configured limit"):
+        compile_corpus_suite(corpus, target, corpus.suites[0].id)
+    target = target.model_copy(update={"limits": CorpusExecutionLimits(max_bootstrap_messages=82)})
+    compiled = compile_corpus_suite(corpus, target, corpus.suites[0].id)
+    assert tuple(compiled.suite.cases[0].request.messages[:82]) == history
+    with pytest.raises(ValueError):
+        CorpusExecutionLimits(max_bootstrap_messages=129)

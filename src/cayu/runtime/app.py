@@ -4449,6 +4449,7 @@ class CayuApp:
         expected_execution_profile: ExecutionProfileIdentity | None = None,
         expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
         expected_context_policy: object | None = None,
+        pause_after_initial_transcript: bool = False,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
@@ -4471,6 +4472,7 @@ class CayuApp:
             expected_execution_profile=expected_execution_profile,
             expected_registered_environment=expected_registered_environment,
             expected_context_policy=expected_context_policy,
+            pause_after_initial_transcript=pause_after_initial_transcript,
         )
         del request
         if boundary.expires_at is not None:

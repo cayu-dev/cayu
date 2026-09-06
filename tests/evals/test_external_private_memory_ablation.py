@@ -273,6 +273,7 @@ async def _campaign_fixture(
         ExternalPrivateMemoryAblationScheduleStrategy.FIXED
     ),
     budgeted_live: bool = False,
+    prepare_context: bool = False,
     memory_attribution: bool = False,
 ) -> _CampaignFixture:
     variant_ids = reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS
@@ -294,6 +295,17 @@ async def _campaign_fixture(
     off_policy = reference_campaign._recall_policy(reference_campaign.AutomaticRecallMode.OFF)
     target = reference_campaign._target(factory, policy=starting_policy)
     off_target = reference_campaign._target(factory, policy=off_policy)
+    if prepare_context:
+        if not budgeted_live:
+            raise ValueError("Preparation fixture requires budgeted live admission.")
+        history = (
+            Message.text("user", "Retain this authored background."),
+            Message.text("assistant", "Background retained."),
+            Message.text("user", "Now change to another subject."),
+            Message.text("assistant", "Subject changed."),
+        )
+        target = target.model_copy(update={"bootstrap_messages": history})
+        off_target = off_target.model_copy(update={"bootstrap_messages": history})
     private_document = reference_campaign.build_causal_memory_reference_corpus(
         app_manifest=target.app.describe()
     )
@@ -378,6 +390,22 @@ async def _campaign_fixture(
             suites=private_document.suites,
             cases=private_document.cases,
             pricing_profile=pricing_profile_identity(pricing),
+        )
+    if prepare_context:
+        private_document = type(private_document).create(
+            target_key=private_document.target_key,
+            evidence_policy=private_document.evidence_policy,
+            cases=private_document.cases,
+            pricing_profile=private_document.pricing_profile,
+            suites=tuple(
+                type(suite).create(
+                    id=suite.id,
+                    name=suite.name,
+                    description=suite.description,
+                    trial_request=suite.trial_request.model_copy(update={"timeout_seconds": 120}),
+                )
+                for suite in private_document.suites
+            ),
         )
     if not corpus_path.exists():
         corpus_path.write_text(eval_corpus_to_json(private_document), encoding="utf-8")
@@ -529,6 +557,10 @@ async def _campaign_fixture(
                 request=trial.request.model_copy(
                     update={
                         "run_request": requests[trial.case_id],
+                        "context_preparation": "compact_then_resume" if prepare_context else "none",
+                        "timeout_seconds": 120
+                        if prepare_context
+                        else trial.request.timeout_seconds,
                     }
                 ),
             )
@@ -552,6 +584,7 @@ async def _campaign_fixture(
     manifest = target.app.describe()
     authorization = ExternalPrivateMemoryAblationAuthorization(
         authorization_id="approved-private-campaign",
+        context_preparation="compact_then_resume" if prepare_context else "none",
         valid_from=datetime(2026, 9, 1, tzinfo=UTC),
         valid_through=datetime(2026, 9, 10, tzinfo=UTC),
         corpus_revision=corpus.document.revision,
@@ -594,7 +627,7 @@ async def _campaign_fixture(
         maximum_repetitions=reference_campaign.CAUSAL_MEMORY_CAMPAIGN_REPETITIONS,
         maximum_total_trials=len(trials),
         maximum_concurrency=1,
-        maximum_timeout_seconds=30,
+        maximum_timeout_seconds=120 if prepare_context else 30,
         maximum_model_steps=1,
         maximum_report_evidence_bytes_per_trial=(
             EXTERNAL_PRIVATE_MEMORY_ABLATION_MIN_REPORT_EVIDENCE_BYTES_PER_TRIAL
@@ -3362,6 +3395,280 @@ def test_trial_budget_binding_rejects_unapproved_request_changes(
             assert fixture.provider.requests == []
         finally:
             await fixture.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("crash_before_resume", [False, True])
+def test_native_compaction_then_resume_precedes_provider_work_and_recovers(
+    tmp_path: Path, crash_before_resume: bool
+):
+    import subprocess
+    import sys
+
+    from cayu.core.events import EventType
+
+    if crash_before_resume:
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import asyncio, os, sys
+from pathlib import Path
+import importlib
+sys.path.insert(0, str(Path("tests/evals").resolve()))
+fixture_module = importlib.import_module(sys.argv[2])
+_campaign_fixture = fixture_module._campaign_fixture
+_AccountingEvidenceCollector = fixture_module._AccountingEvidenceCollector
+_NOW = fixture_module._NOW
+from cayu.evals.external_private_memory_ablation import run_external_private_memory_ablation
+from cayu.runtime.app import CayuApp
+async def crash(self, *args, **kwargs):
+    os._exit(75)
+    yield
+CayuApp._resume_private = crash
+async def main():
+    fixture = await _campaign_fixture(
+        Path(sys.argv[1]), artifact_name="report", budgeted_live=True, prepare_context=True,
+    )
+    await run_external_private_memory_ablation(
+        fixture.prepared, fixture.executor,
+        evidence_collector=_AccountingEvidenceCollector(experiment=fixture.prepared.experiment),
+        clock=lambda: _NOW,
+    )
+asyncio.run(main())
+""",
+                str(tmp_path / "private"),
+                __name__,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert child.returncode == 75, child.stderr
+
+    async def run():
+        fixture = await _campaign_fixture(
+            tmp_path / "private",
+            artifact_name="report",
+            budgeted_live=True,
+            prepare_context=True,
+        )
+        try:
+            result = await run_external_private_memory_ablation(
+                fixture.prepared,
+                fixture.executor,
+                evidence_collector=_AccountingEvidenceCollector(
+                    experiment=fixture.prepared.experiment
+                ),
+                clock=lambda: _NOW,
+            )
+            assert result.methodology.status is ExternalPrivateMemoryAblationRunStatus.COMPLETE, (
+                result.methodology.model_dump(mode="json")
+            )
+            assert len(fixture.provider.requests) == len(fixture.prepared.scheduled_trials)
+            for trial in fixture.prepared.scheduled_trials:
+                events = await fixture.sessions.load_events(trial.request.session_id)
+                kinds = [e.type for e in events]
+                assert kinds.count(EventType.INTERACTION_STARTED) == 2
+                assert kinds.count(EventType.SESSION_STARTED) == 1
+                assert kinds.index(EventType.SESSION_STARTED) < kinds.index(
+                    EventType.SESSION_INTERRUPTED
+                )
+                assert kinds.index(EventType.CONTEXT_COMPACTION_COMPLETED) < kinds.index(
+                    EventType.MODEL_STARTED
+                )
+                from cayu.evals.trajectory import trajectory_from_session
+
+                trajectory = await trajectory_from_session(
+                    fixture.prepared.target.app, trial.request.session_id
+                )
+                assert trajectory.final_output
+        finally:
+            await fixture.close()
+        restarted = await _campaign_fixture(
+            tmp_path / "private",
+            artifact_name="report",
+            budgeted_live=True,
+            prepare_context=True,
+        )
+        try:
+            replay = await run_external_private_memory_ablation(
+                restarted.prepared,
+                restarted.executor,
+                evidence_collector=_AccountingEvidenceCollector(
+                    experiment=restarted.prepared.experiment
+                ),
+                clock=lambda: _NOW,
+            )
+            assert replay.report == result.report
+            assert restarted.provider.requests == []
+        finally:
+            await restarted.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing_compaction",
+        "early_provider",
+        "foreign_query",
+        "extra_interaction",
+        "foreign_compaction",
+        "missing_checkpoint",
+        "zero_checkpoint",
+    ],
+)
+def test_prepared_trial_recovery_rejects_undeclared_continuation(tamper: str):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from cayu.core.events import Event, EventType
+    from cayu.memory_intervention_execution import (
+        CayuMemoryInterventionRuntimeRunner,
+        MemoryInterventionExecutionConflict,
+    )
+
+    async def run():
+        first = Event(
+            type=EventType.INTERACTION_STARTED, session_id="trial", interaction_id="history"
+        )
+        compacted = Event(
+            type=EventType.CONTEXT_COMPACTION_COMPLETED,
+            session_id="trial",
+            interaction_id="history",
+            payload={
+                "request_id": "memory-trial-compact:execution",
+                "previous_compacted_transcript_cursor": 0,
+                "compacted_transcript_cursor": 1,
+                "newly_compacted_message_count": 1,
+            },
+        )
+        second = Event(
+            type=EventType.INTERACTION_STARTED, session_id="trial", interaction_id="query"
+        )
+        events = [first, compacted, second]
+        query = Message.text("user", "Declared query")
+        messages = [query]
+        checkpoint = {"context_compaction": {"compacted_transcript_cursor": 1}}
+        if tamper == "foreign_compaction":
+            compacted.payload["request_id"] = "foreign"
+        elif tamper == "missing_checkpoint":
+            checkpoint = None
+        elif tamper == "zero_checkpoint":
+            checkpoint["context_compaction"]["compacted_transcript_cursor"] = 0
+        elif tamper == "missing_compaction":
+            events.remove(compacted)
+        elif tamper == "early_provider":
+            events.insert(
+                1, Event(type=EventType.MODEL_STARTED, session_id="trial", interaction_id="history")
+            )
+        elif tamper == "foreign_query":
+            messages = [Message.text("user", "Unrelated continuation")]
+        else:
+            events.append(
+                Event(
+                    type=EventType.INTERACTION_STARTED, session_id="trial", interaction_id="third"
+                )
+            )
+        store = SimpleNamespace(
+            load_events=AsyncMock(return_value=events),
+            load_checkpoint=AsyncMock(return_value=checkpoint),
+            load_transcript_snapshot=AsyncMock(
+                return_value=SimpleNamespace(
+                    records=[
+                        SimpleNamespace(interaction_id="query", message=message)
+                        for message in messages
+                    ]
+                )
+            ),
+        )
+        with pytest.raises(MemoryInterventionExecutionConflict):
+            await CayuMemoryInterventionRuntimeRunner._continue_compacted_trial(
+                app=SimpleNamespace(session_store=store),
+                request=SimpleNamespace(run_request=SimpleNamespace(messages=[query])),
+                execution=SimpleNamespace(execution_id="execution"),
+                session=SimpleNamespace(id="trial"),
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("already_resumed", [False, True])
+def test_native_preparation_rejects_zero_progress_compaction(already_resumed: bool):
+    from types import SimpleNamespace
+
+    from cayu.core.events import EventType
+    from cayu.memory_intervention_execution import MemoryInterventionExecutionConflict
+    from cayu.runtime import InMemorySessionStore, ResumeRequest, RunRequest
+
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([ModelStreamEvent.completed({})]), default=True)
+        policy = reference_campaign._context_policy(
+            reference_campaign._recall_policy(reference_campaign.AutomaticRecallMode.OFF)
+        )
+        policy.base_policy.compactor.max_summary_chars = 200
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), context_policy=policy)
+        base = RunRequest(
+            agent_name="assistant",
+            messages=[
+                Message.text("user", "x" * 1000),
+                Message.text("assistant", "Acknowledged"),
+                Message.text("user", "Another subject"),
+                Message.text("assistant", "OK"),
+                Message.text("user", "Final query"),
+            ],
+            limits=RunLimits(scope="session"),
+        )
+        initial = base.model_copy(update={"messages": base.messages[:-1]})
+        events = [
+            event async for event in app._run_private(initial, pause_after_initial_transcript=True)
+        ]
+        session = await store.load(events[0].session_id)
+        request = SimpleNamespace(run_request=base, timeout_seconds=120)
+        execution = SimpleNamespace(
+            execution_id="zero-progress",
+            runtime_deadline_at=datetime.now(UTC) + timedelta(seconds=120),
+        )
+        with pytest.raises(MemoryInterventionExecutionConflict, match="no verified progress"):
+            await CayuMemoryInterventionRuntimeRunner._continue_compacted_trial(
+                app=app, request=request, execution=execution, session=session
+            )
+        events = await store.load_events(session.id)
+        completed = next(
+            event for event in events if event.type is EventType.CONTEXT_COMPACTION_COMPLETED
+        )
+        assert completed.payload["coverage_mode"] == "no_progress"
+        assert completed.payload["newly_compacted_message_count"] == 0
+        assert not any(event.type is EventType.MODEL_STARTED for event in events)
+        assert (await store.load_checkpoint(session.id))["context_compaction"][
+            "compacted_transcript_cursor"
+        ] == 0
+
+        if already_resumed:
+            # Recreate a continuation admitted by the pre-fix runner so recovery
+            # must reject its zero-progress preparation as well.
+            async for _event in app._resume_private(
+                ResumeRequest(
+                    session_id=session.id,
+                    messages=[base.messages[-1]],
+                    limits=base.limits,
+                ),
+                store_resolved_session_id=session.id,
+            ):
+                pass
+        session = await store.load(session.id)
+        before = await store.load_events(session.id)
+        with pytest.raises(MemoryInterventionExecutionConflict, match="no verified progress"):
+            await CayuMemoryInterventionRuntimeRunner._continue_compacted_trial(
+                app=app, request=request, execution=execution, session=session
+            )
+        assert await store.load_events(session.id) == before
 
     asyncio.run(run())
 

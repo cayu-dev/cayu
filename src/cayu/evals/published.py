@@ -282,6 +282,9 @@ class PublishedChildStatusDetail(_PublishedAssertionDetail):
 
 class PublishedFinalOutputEqualsDetail(_PublishedAssertionDetail):
     kind: Literal["final_output_equals"] = "final_output_equals"
+    comparison: Literal["text", "json"] = Field(
+        default="text", exclude_if=lambda value: value == "text"
+    )
     matched: StrictBool | None = None
 
 
@@ -1866,7 +1869,9 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
         static_detail: tuple[object, ...] = (detail.kind, detail.expected)
     elif isinstance(detail, PublishedChildStatusDetail):
         static_detail = (detail.kind, detail.expected, detail.min_count, detail.max_count)
-    elif isinstance(detail, (PublishedFinalOutputEqualsDetail, PublishedFinalOutputContainsDetail)):
+    elif isinstance(detail, PublishedFinalOutputEqualsDetail):
+        static_detail = (detail.kind, detail.comparison)
+    elif isinstance(detail, PublishedFinalOutputContainsDetail):
         static_detail = (detail.kind,)
     elif isinstance(detail, PublishedToolCalledDetail):
         static_detail = (detail.kind, detail.tool_name, detail.min_count, detail.max_count)
@@ -1964,7 +1969,9 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
         return (*base, spec.expected)
     if type(spec) is ChildStatusAssertionSpec:
         return (*base, spec.expected, spec.min_count, spec.max_count)
-    if type(spec) in {FinalOutputEqualsAssertionSpec, FinalOutputContainsAssertionSpec}:
+    if type(spec) is FinalOutputEqualsAssertionSpec:
+        return (*base, spec.comparison)
+    if type(spec) is FinalOutputContainsAssertionSpec:
         return base
     if type(spec) is ToolCalledAssertionSpec:
         return (*base, spec.tool_name, spec.min_count, spec.max_count)
@@ -2385,7 +2392,9 @@ def _published_detail(
             matching_count=_safe_metadata_int(result, "count"),
         )
     if type(spec) is FinalOutputEqualsAssertionSpec:
-        return PublishedFinalOutputEqualsDetail(matched=_safe_metadata_bool(result, "matched"))
+        return PublishedFinalOutputEqualsDetail(
+            matched=_safe_metadata_bool(result, "matched"), comparison=spec.comparison
+        )
     if type(spec) is FinalOutputContainsAssertionSpec:
         return PublishedFinalOutputContainsDetail(matched=_safe_metadata_bool(result, "matched"))
     if type(spec) is ToolCalledAssertionSpec:

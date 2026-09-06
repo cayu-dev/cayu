@@ -41,6 +41,7 @@ from cayu._validation import (
 )
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
 from cayu.evals.external import OpaqueExternalCaseRefV1
+from cayu.evals.json_output import parse_json_output
 from cayu.evals.json_subset import copy_eval_tool_json_object
 from cayu.evals.models import (
     ARTIFACT_PUBLIC_TEXT_MAX_BYTES,
@@ -488,6 +489,15 @@ class ChildStatusAssertionSpec(_AssertionSpecBase):
 class FinalOutputEqualsAssertionSpec(_AssertionSpecBase):
     kind: Literal["final_output_equals"] = "final_output_equals"
     expected: StrictStr
+    comparison: Literal["text", "json"] = Field(
+        default="text", exclude_if=lambda value: value == "text"
+    )
+
+    @model_validator(mode="after")
+    def validate_comparison(self) -> FinalOutputEqualsAssertionSpec:
+        if self.comparison == "json":
+            parse_json_output(self.expected)
+        return self
 
     @field_validator("expected")
     @classmethod

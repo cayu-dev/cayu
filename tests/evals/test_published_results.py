@@ -1642,3 +1642,32 @@ def test_projection_handles_non_scalar_allowlisted_metadata_without_copying_it()
                 run_contract=run.run_contract,
             ),
         )
+
+
+def test_published_json_output_comparison_retains_and_binds_mode(monkeypatch):
+    original_specs = _specs
+    original_trial = _trial
+
+    def json_specs():
+        return tuple(
+            FinalOutputEqualsAssertionSpec(id=spec.id, expected='"Approved"', comparison="json")
+            if type(spec) is FinalOutputEqualsAssertionSpec
+            else spec
+            for spec in original_specs()
+        )
+
+    def json_trial(*args, **kwargs):
+        return original_trial(*args, **kwargs).model_copy(update={"final_output": '"Approved"'})
+
+    monkeypatch.setitem(globals(), "_specs", json_specs)
+    monkeypatch.setitem(globals(), "_trial", json_trial)
+    corpus = _corpus()
+    published = publish_eval_run(corpus, _run(corpus=corpus))
+    detail = published.cases[0].trials[0].assertions[2].detail
+    assert detail.comparison == "json"
+    assert detail.model_dump(mode="json")["comparison"] == "json"
+    assert PublishedEvalRun.model_validate(published.model_dump(mode="python")) == published
+    forged = published.model_dump(mode="python")
+    forged["cases"][0]["trials"][0]["assertions"][2]["detail"]["comparison"] = "text"
+    with pytest.raises(ValueError):
+        PublishedEvalRun.model_validate(forged)

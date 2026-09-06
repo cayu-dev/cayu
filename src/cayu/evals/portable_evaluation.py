@@ -142,9 +142,25 @@ def _evaluate_final_output(
     actual: str,
     state: EvidenceState,
     contains: bool,
+    json_comparison: bool = False,
 ) -> EvalAssertionResult:
     if state != "complete":
         return _unavailable(name, "final output", state)
+    if json_comparison:
+        from cayu.evals.json_output import json_outputs_equal
+
+        try:
+            matched = json_outputs_equal(expected, actual)
+        except ValueError:
+            matched = False
+        return _result(
+            name,
+            EvalOutcome.PASSED if matched else EvalOutcome.FAILED,
+            "Final output matched the expected JSON value."
+            if matched
+            else "Final output did not match the expected JSON value.",
+            metadata={"matched": matched},
+        )
     matched = expected in actual if contains else expected == actual
     comparison = "contained" if contains else "equaled"
     return _result(
@@ -682,6 +698,7 @@ def _evaluate_validated_assertion_outcome(
             actual=evidence.final_output,
             state=evidence.final_output_state,
             contains=False,
+            json_comparison=validated_spec.comparison == "json",
         )
     if type(validated_spec) is FinalOutputContainsAssertionSpec:
         return _evaluate_final_output(

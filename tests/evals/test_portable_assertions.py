@@ -1205,3 +1205,56 @@ def test_compile_rejects_assertion_and_pricing_subclasses():
             evidence_policy=policy,
             trusted_pricing=CustomPriceBook.model_validate(_pricing().model_dump(mode="python")),
         )
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected_outcome"),
+    [
+        (' { "sources": ["entry-1"], "answer": "Friday" } ', EvalOutcome.PASSED),
+        ('{"answer":"Friday","sources":[]}', EvalOutcome.FAILED),
+        ('{"answer":"Friday","sources":["entry-1"],"extra":true}', EvalOutcome.FAILED),
+        ('{"answer":"Friday","answer":"Saturday","sources":["entry-1"]}', EvalOutcome.FAILED),
+        ('```json\n{"answer":"Friday","sources":["entry-1"]}\n```', EvalOutcome.FAILED),
+        ('{"answer":NaN,"sources":["entry-1"]}', EvalOutcome.FAILED),
+    ],
+)
+def test_json_output_comparison_requires_exact_unambiguous_values(actual, expected_outcome):
+    spec = FinalOutputEqualsAssertionSpec(
+        id="json-answer",
+        comparison="json",
+        expected='{"answer":"Friday","sources":["entry-1"]}',
+    )
+    evidence = project_assertion_evidence_view(
+        CayuApp(enable_logging=False),
+        _trajectory().model_copy(
+            update={
+                "final_output": actual,
+                "transcript": (
+                    _trajectory().transcript[0],
+                    Message.text("assistant", actual),
+                ),
+            }
+        ),
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    result = evaluate_assertion_spec(spec, evidence)
+    assert result.outcome is expected_outcome
+    assert result.assertion_revision == assertion_spec_revision(spec)
+
+
+@pytest.mark.parametrize("expected", ['{"x":1,"x":2}', "NaN", '"unfinished', "1 2"])
+def test_json_output_comparison_rejects_invalid_expected_value(expected):
+    with pytest.raises(ValueError, match="unambiguous JSON"):
+        FinalOutputEqualsAssertionSpec(id="json-answer", comparison="json", expected=expected)
+
+
+def test_json_output_comparison_binds_mode_and_preserves_json_types():
+    from cayu.evals.json_output import json_outputs_equal
+
+    text = FinalOutputEqualsAssertionSpec(id="answer", expected='{"n":1}')
+    structural = FinalOutputEqualsAssertionSpec(id="answer", expected='{"n":1}', comparison="json")
+    assert "comparison" not in text.model_dump(mode="json")
+    assert assertion_spec_revision(text) != assertion_spec_revision(structural)
+    assert json_outputs_equal('{"n":1}', '{"n":1.0}')
+    assert not json_outputs_equal('{"n":1}', '{"n":true}')
+    assert not json_outputs_equal("[1,2]", "[2,1]")
