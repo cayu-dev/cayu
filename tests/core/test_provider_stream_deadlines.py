@@ -1683,3 +1683,190 @@ def test_wrong_type_provider_error_code_cannot_bypass_deadline_claim(
     assert reconstructed.provider == "fallback"
     assert reconstructed.error_code == "invalid_provider_stream_deadline_evidence"
     assert reconstructed.retryable is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("whitespace", [" ", "\n", " \t\r\n\u00a0\u2003\u2028"])
+@pytest.mark.parametrize("chunks", [1, 16, 256])
+@pytest.mark.parametrize("adapter", ["normalized", "openai", "chat"])
+@pytest.mark.parametrize("initial_text", ["", "substantive"])
+async def test_whitespace_stream_has_chunk_independent_semantic_bound(
+    monkeypatch: pytest.MonkeyPatch, whitespace: str, chunks: int, adapter: str, initial_text: str
+) -> None:
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    started = now
+    monkeypatch.setattr(loop, "time", lambda: now)
+    accepted: list[str] = []
+    expected: list[str] = []
+
+    async def deltas() -> AsyncIterator[str]:
+        nonlocal now
+        if initial_text:
+            yield initial_text
+        for _ in range(5):
+            now += 1
+            text = whitespace * 256
+            size = len(text) // chunks
+            for offset in range(0, len(text), size):
+                delta = text[offset : offset + size]
+                if now - started < 4:
+                    expected.append(delta)
+                yield delta
+
+    async def events() -> AsyncIterator[ModelStreamEvent]:
+        async for delta in deltas():
+            yield ModelStreamEvent.text_delta(delta)
+
+    async def raw_events() -> AsyncIterator[dict[str, object]]:
+        async for delta in deltas():
+            if adapter == "openai":
+                yield {"type": "response.output_text.delta", "delta": delta}
+            else:
+                yield {"choices": [{"index": 0, "delta": {"content": delta}}]}
+
+    source = events()
+    if adapter == "openai":
+        source = openai_stream_events(raw_events())
+    elif adapter == "chat":
+        source = chat_completions_stream_events(raw_events())
+    provider = _DeadlineProvider(
+        source,
+        ProviderStreamDeadlines(semantic_progress_timeout_s=4, absolute_stream_timeout_s=20),
+    )
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        async for event in provider.runtime_stream(_request()):
+            if event.type is ModelStreamEventType.TEXT_DELTA:
+                accepted.append(event.delta or "")
+
+    assert accepted == ([initial_text] if initial_text else []) + expected
+    evidence = captured.value.deadline_evidence
+    assert evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
+    assert evidence.elapsed_s == 4
+    assert evidence.last_progress_kind is (ProviderProgressKind.CONTENT if initial_text else None)
+    assert evidence.last_progress_elapsed_s == (0 if initial_text else None)
+    assert evidence.whitespace_since_progress is True
+    payload = captured.value.error_payload_fields()
+    assert payload["provider_effect_outcome"] == "unknown"
+    assert payload["provider_recovery_disposition"] == "manual_settlement_required"
+    assert captured.value.retryable is False
+    copied = copy_provider_exception_control(captured.value).cause
+    assert isinstance(copied, ModelStreamDeadlineError)
+    assert copied.error_payload_fields() == payload
+    restored = model_provider_error_from_payload(
+        ModelStreamEvent.error(str(captured.value), cause=captured.value).payload,
+        fallback_provider=provider.name,
+    )
+    assert isinstance(restored, ModelStreamDeadlineError)
+    assert restored.error_payload_fields() == payload
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "text", ["Normal prose.\nMore text.", "def f():\n    return 1\n", '{\n  "x": [1, 2]\n}']
+)
+async def test_split_whitespace_preserves_text_with_continuing_progress(
+    monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    monkeypatch.setattr(loop, "time", lambda: now)
+
+    async def events() -> AsyncIterator[ModelStreamEvent]:
+        nonlocal now
+        for character in text:
+            now += 0.125
+            yield ModelStreamEvent.text_delta(character)
+        yield ModelStreamEvent.completed({})
+
+    provider = _DeadlineProvider(
+        events(),
+        ProviderStreamDeadlines(semantic_progress_timeout_s=1, absolute_stream_timeout_s=20),
+    )
+    result = [event async for event in provider.runtime_stream(_request())]
+    assert "".join(event.delta or "" for event in result) == text
+    assert result[-1].type is ModelStreamEventType.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (ModelStreamEvent.text_delta(""), None),
+        (ModelStreamEvent.text_delta(" \n\u00a0"), None),
+        (ModelStreamEvent.text_delta("\u200b"), ProviderProgressKind.CONTENT),
+        (ModelStreamEvent.text_delta(" x "), ProviderProgressKind.CONTENT),
+        (ModelStreamEvent.thinking(" \n"), ProviderProgressKind.REASONING),
+        (
+            ModelStreamEvent.tool_call(name="f", arguments={"x": " \n"}, id="c"),
+            ProviderProgressKind.TOOL_CALL,
+        ),
+    ],
+)
+def test_text_whitespace_policy_does_not_apply_to_structured_progress(
+    event: ModelStreamEvent, expected: ProviderProgressKind | None
+) -> None:
+    from cayu.providers.base import _normalized_provider_progress_kind
+
+    assert _normalized_provider_progress_kind(event) is expected
+
+
+@pytest.mark.anyio
+async def test_meaningful_stream_still_reaches_absolute_fake_clock_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    monkeypatch.setattr(loop, "time", lambda: now)
+
+    async def events() -> AsyncIterator[ModelStreamEvent]:
+        nonlocal now
+        for _ in range(6):
+            now += 1
+            yield ModelStreamEvent.text_delta("x")
+
+    provider = _DeadlineProvider(
+        events(),
+        ProviderStreamDeadlines(semantic_progress_timeout_s=2, absolute_stream_timeout_s=5),
+    )
+    with pytest.raises(ModelStreamDeadlineError) as captured:
+        async for _ in provider.runtime_stream(_request()):
+            pass
+    evidence = captured.value.deadline_evidence
+    assert evidence.deadline_kind is ProviderDeadlineKind.ABSOLUTE
+    assert evidence.elapsed_s == 5
+    assert evidence.last_progress_elapsed_s == 4
+    assert evidence.whitespace_since_progress is False
+
+
+@pytest.mark.anyio
+async def test_whitespace_diagnostic_clears_on_accepted_progress() -> None:
+    controller = ProviderStreamDeadlineController(ProviderStreamDeadlines())
+    try:
+        controller.observe_text(" \n")
+        controller.observe_protocol()
+        controller.observe_transport()
+        assert controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,)).whitespace_since_progress
+        controller.observe_semantic(ProviderProgressKind.REASONING)
+        assert not controller.evidence(
+            (ProviderDeadlineKind.SEMANTIC_IDLE,)
+        ).whitespace_since_progress
+    finally:
+        controller.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("invalid", [None, 1, "true", [], {}])
+async def test_whitespace_evidence_rejects_non_boolean_payload(invalid: object) -> None:
+    controller = ProviderStreamDeadlineController(ProviderStreamDeadlines())
+    try:
+        error = ModelStreamDeadlineError(
+            provider="test", evidence=controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
+        )
+        payload = ModelStreamEvent.error(str(error), cause=error).payload
+        payload["provider_whitespace_since_progress"] = invalid
+        restored = model_provider_error_from_payload(payload, fallback_provider="test")
+        assert type(restored) is ModelProviderError
+        assert restored.error_code == "invalid_provider_stream_deadline_evidence"
+        assert restored.retryable is False
+    finally:
+        controller.close()

@@ -112,8 +112,11 @@ class ProviderStreamDeadlineEvidence:
     last_progress_kind: ProviderProgressKind | None
     last_progress_elapsed_s: float | None
     last_progress_at: datetime | None
+    whitespace_since_progress: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.whitespace_since_progress) is not bool:
+            raise TypeError("whitespace_since_progress must be a bool.")
         if type(self.deadline_kind) is not ProviderDeadlineKind:
             raise TypeError("deadline_kind must be ProviderDeadlineKind.")
         _positive_finite_seconds(self.configured_timeout_s, "configured_timeout_s")
@@ -147,6 +150,8 @@ class ProviderStreamDeadlineEvidence:
             "provider_deadline_timeout_s": self.configured_timeout_s,
             "provider_stream_elapsed_s": self.elapsed_s,
         }
+        if self.whitespace_since_progress:
+            payload["provider_whitespace_since_progress"] = True
         if self.last_progress_kind is not None:
             payload["provider_last_progress_kind"] = self.last_progress_kind.value
         if self.last_progress_elapsed_s is not None:
@@ -350,6 +355,7 @@ class ProviderStreamDeadlineController:
         self._last_progress_observed_at: float | None = None
         self._last_progress_kind: ProviderProgressKind | None = None
         self._terminal_observed = False
+        self._whitespace_since_progress = False
 
     def close(self) -> None:
         """Release admission only after every retained provider read settles."""
@@ -371,10 +377,20 @@ class ProviderStreamDeadlineController:
     def observe_protocol(self) -> None:
         self._last_protocol_at = self._loop.time()
 
+    def observe_text(self, delta: str | None) -> None:
+        """Record content-free whitespace evidence without extending any clock.
+
+        Python str.isspace defines Unicode whitespace. The existing semantic
+        idle budget is the grace period; text bytes and chunk counts are irrelevant.
+        """
+        if delta and delta.isspace():
+            self._whitespace_since_progress = True
+
     def observe_semantic(self, kind: ProviderProgressKind) -> None:
         if type(kind) is not ProviderProgressKind:
             raise TypeError("kind must be ProviderProgressKind.")
         observed_at = self._loop.time()
+        self._whitespace_since_progress = False
         self._last_semantic_at = observed_at
         self._last_progress_observed_at = observed_at
         self._last_progress_kind = kind
@@ -441,6 +457,7 @@ class ProviderStreamDeadlineController:
             else max(0.0, self._last_progress_observed_at - self._started_at)
         )
         return ProviderStreamDeadlineEvidence(
+            whitespace_since_progress=self._whitespace_since_progress,
             deadline_kind=selected,
             configured_timeout_s=self._configured_timeout(selected),
             elapsed_s=elapsed,
@@ -695,6 +712,7 @@ def _provider_deadline_material(deadlines: object) -> dict[str, float | int]:
     if type(deadlines) is not ProviderStreamDeadlines:
         raise TypeError("Model provider stream_deadlines must be ProviderStreamDeadlines.")
     return {
+        "text_progress_policy_version": 2,
         "transport_idle_timeout_s": deadlines.transport_idle_timeout_s,
         "protocol_idle_timeout_s": deadlines.protocol_idle_timeout_s,
         "semantic_progress_timeout_s": deadlines.semantic_progress_timeout_s,

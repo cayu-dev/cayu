@@ -8307,6 +8307,24 @@ OpenAIProvider(
 )
 ```
 
+Text deltas refresh semantic progress only when they contain a character that
+Python `str.isspace()` does not classify as Unicode whitespace. Spaces, tabs,
+newlines, nonbreaking spaces, and other Unicode whitespace pass through exactly,
+but do not refresh the clock. The existing semantic timeout is their grace
+period, measured from dispatch or the last accepted semantic progress (excluding
+downstream consumer pauses). Thus continuous whitespace expires independently of
+chunk count or size, while ordinary split spacing, code indentation, and JSON
+whitespace remain valid when substantive progress continues. Zero-width space
+is not whitespace under this policy. Reasoning, structured tool arguments,
+response lifecycle, and permitted usage-tail progress retain their explicit
+semantics; this text rule does not inspect those payloads. The fixed
+`text_progress_policy_version=2` participates in execution-profile identity.
+Deadline evidence includes `provider_whitespace_since_progress=true` when
+whitespace text was observed since the last accepted progress, without retaining
+text, counts, or raw content. It describes an observation, not the origin of the
+output or a new deadline kind; the actual expired clock and unknown-effect
+settlement authority remain unchanged.
+
 `stream_deadlines` is the sole bundled-provider deadline configuration input.
 Custom transport protocols receive the four explicit clocks independently,
 preserving transport and decoded-protocol ownership.

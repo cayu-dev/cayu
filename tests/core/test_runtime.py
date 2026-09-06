@@ -27239,8 +27239,9 @@ class ProcessLossSemanticDeadlineProvider(ModelProvider):
         del request
         prior = int(self._marker.read_text(encoding="utf-8")) if self._marker.exists() else 0
         self._marker.write_text(str(prior + 1), encoding="utf-8")
-        await asyncio.Event().wait()
-        yield ModelStreamEvent.completed({})  # pragma: no cover
+        while True:
+            yield ModelStreamEvent.text_delta(" \n")
+            await asyncio.sleep(0.001)
 
 
 def _run_until_semantic_deadline_process_exit(database: str, marker: str) -> None:
@@ -27331,6 +27332,7 @@ def test_semantic_deadline_process_loss_cannot_redispatch_before_settlement(
     assert len(deadline_events) == 1
     deadline = deadline_events[0]
     assert deadline.payload["provider_deadline_kind"] == "semantic_idle"
+    assert deadline.payload["provider_whitespace_since_progress"] is True
     assert deadline.payload["provider_recovery_disposition"] == "manual_settlement_required"
     assert deadline.payload["model_step_id"] == active.stage.logical_step_id
     assert deadline.payload["model_attempt_id"] == active.stage.intent["model_attempt_id"]

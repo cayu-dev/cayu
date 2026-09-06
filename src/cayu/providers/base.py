@@ -1588,7 +1588,7 @@ def _normalized_provider_progress_kind(
     event: ModelStreamEvent,
 ) -> ProviderProgressKind | None:
     if event.type is ModelStreamEventType.TEXT_DELTA:
-        return ProviderProgressKind.CONTENT if event.delta else None
+        return ProviderProgressKind.CONTENT if event.delta and not event.delta.isspace() else None
     if event.type is ModelStreamEventType.THINKING:
         return (
             ProviderProgressKind.REASONING
@@ -1664,6 +1664,8 @@ async def _guard_normalized_provider_stream(
                         return
                     finally:
                         reset_provider_deadline_controller(token)
+                    if event.type is ModelStreamEventType.TEXT_DELTA:
+                        controller.observe_text(event.delta)
                     progress = _normalized_provider_progress_kind(event)
                     if progress is not None:
                         controller.observe_semantic(progress)

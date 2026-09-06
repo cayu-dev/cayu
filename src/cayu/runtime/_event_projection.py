@@ -2202,6 +2202,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "provider_deadline_timeout_s",
         "provider_effect_outcome",
         "provider_last_progress_at",
+        "provider_whitespace_since_progress",
         "provider_last_progress_elapsed_s",
         "provider_last_progress_kind",
         "provider_recovery_disposition",
