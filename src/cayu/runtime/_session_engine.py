@@ -362,6 +362,7 @@ from cayu.runtime.budgets import (
     budget_reservation_payload,
     copy_budget_policy,
     has_deferred_contextual_price,
+    request_budget_execution_profile_ids,
     request_budget_limits_for_session,
 )
 from cayu.runtime.build_provenance import current_runtime_build_provenance
@@ -3370,13 +3371,10 @@ def _execution_profile_identity(
                 causal_budget_id=causal_budget_id,
             )
         )
-        request_limit_ids = tuple(
-            limit.budget_limit_id
-            for limit in request_budget_limits_for_session(
-                limits=request_budget_limits,
-                agent_name=registered_agent.spec.name,
-                causal_budget_id=causal_budget_id,
-            )
+        request_limit_ids = request_budget_execution_profile_ids(
+            limits=request_budget_limits,
+            agent_name=registered_agent.spec.name,
+            causal_budget_id=causal_budget_id,
         )
     return execution_profile_admission.resolve_execution_profile_identity(
         registered_agent=registered_agent,
@@ -5412,13 +5410,10 @@ class SessionEngine:
         )
         request_limit_ids: tuple[str, ...] = ()
         if invocation_semantics_available:
-            request_limit_ids = tuple(
-                limit.budget_limit_id
-                for limit in request_budget_limits_for_session(
-                    limits=request_budget_limits,
-                    agent_name=registered_agent.spec.name,
-                    causal_budget_id=session.causal_budget_id,
-                )
+            request_limit_ids = request_budget_execution_profile_ids(
+                limits=request_budget_limits,
+                agent_name=registered_agent.spec.name,
+                causal_budget_id=session.causal_budget_id,
             )
         plan = execution_profile_admission.prepare_execution_profile_continuation(
             session=session,

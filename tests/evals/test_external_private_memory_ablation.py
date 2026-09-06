@@ -6,7 +6,7 @@ import os
 import stat
 from collections.abc import Iterator
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -36,6 +36,7 @@ from cayu.evals.corpus import (
     eval_corpus_to_json,
     pricing_profile_identity,
 )
+from cayu.evals.execution import compile_corpus_suite
 from cayu.evals.execution_profiles import (
     EvalExecutionProfilePolicyV1,
     prepare_eval_execution_profile,
@@ -45,6 +46,7 @@ from cayu.evals.external_private_memory_ablation import (
     EXTERNAL_PRIVATE_MEMORY_ABLATION_METHODOLOGY_FILENAME,
     EXTERNAL_PRIVATE_MEMORY_ABLATION_MIN_REPORT_EVIDENCE_BYTES_PER_TRIAL,
     EXTERNAL_PRIVATE_MEMORY_ABLATION_REPORT_FILENAME,
+    EXTERNAL_PRIVATE_MEMORY_ABLATION_TRIAL_BUDGET_KEY,
     ExternalPrivateMemoryAblationAuthorization,
     ExternalPrivateMemoryAblationCacheEvidencePolicy,
     ExternalPrivateMemoryAblationCacheEvidenceState,
@@ -99,7 +101,15 @@ from cayu.memory_interventions import MemoryInterventionTrialBinding
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runtime.app import CayuApp
 from cayu.runtime.budgets import BudgetLimit, BudgetReservation, BudgetWindow
-from cayu.runtime.costs import default_price_book
+from cayu.runtime.costs import (
+    ModelPrice,
+    PriceBook,
+    PriceSchedule,
+    PriceTier,
+    Provenance,
+    TieredPricing,
+    default_price_book,
+)
 from cayu.runtime.stop_policy import RunLimits
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore
@@ -260,6 +270,7 @@ async def _campaign_fixture(
     strategy: ExternalPrivateMemoryAblationScheduleStrategy = (
         ExternalPrivateMemoryAblationScheduleStrategy.FIXED
     ),
+    budgeted_live: bool = False,
 ) -> _CampaignFixture:
     private_root.mkdir(parents=True, exist_ok=True)
     corpus_path = private_root / "private-corpus.json"
@@ -280,6 +291,64 @@ async def _campaign_fixture(
     private_document = reference_campaign.build_causal_memory_reference_corpus(
         app_manifest=target.app.describe()
     )
+    pricing = None
+    if budgeted_live:
+        # Live-classified authority with a credential-free scripted transport.
+        factory.provider_execution_mode = MemoryInterventionProviderExecutionMode.LIVE
+        pricing = PriceBook(
+            price_book_version="private-live-fixture-v1",
+            generated_at="2026-09-03",
+            prices=(
+                ModelPrice(
+                    provider_name=provider.name,
+                    model=reference_campaign._MODEL,
+                    schedules=(
+                        PriceSchedule(
+                            pricing=TieredPricing(
+                                standard=(
+                                    PriceTier(
+                                        input_per_million=Decimal("1"),
+                                        output_per_million=Decimal("1"),
+                                    ),
+                                )
+                            ),
+                            provenance=Provenance(
+                                source="fixture",
+                                url="https://example.invalid/pricing",
+                                as_of="2026-09-03",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        request_base = target.request_base.model_copy(
+            update={
+                "limits": RunLimits(scope="session", max_total_tokens=30_000),
+                "budget_limits": (
+                    BudgetLimit(
+                        scope="causal",
+                        key=EXTERNAL_PRIVATE_MEMORY_ABLATION_TRIAL_BUDGET_KEY,
+                        max_estimated_cost=Decimal("0.08"),
+                        pricing=pricing,
+                        reservation=BudgetReservation(
+                            max_input_tokens=20_000, max_output_tokens=1_000
+                        ),
+                    ),
+                ),
+            }
+        )
+        target = target.model_copy(update={"request_base": request_base, "price_book": pricing})
+        off_target = off_target.model_copy(
+            update={"request_base": request_base, "price_book": pricing}
+        )
+        private_document = type(private_document).create(
+            target_key=private_document.target_key,
+            evidence_policy=private_document.evidence_policy,
+            suites=private_document.suites,
+            cases=private_document.cases,
+            pricing_profile=pricing_profile_identity(pricing),
+        )
     if not corpus_path.exists():
         corpus_path.write_text(eval_corpus_to_json(private_document), encoding="utf-8")
     corpus = load_external_private_memory_ablation_corpus(
@@ -398,6 +467,9 @@ async def _campaign_fixture(
                 ),
             ),
             minimum_comparable_pairs=1,
+            require_priced_cost=budgeted_live,
+            maximum_candidate_cost=Decimal("20") if budgeted_live else None,
+            cost_currency="USD" if budgeted_live else None,
         ),
     )
     trials = tuple(
@@ -416,6 +488,22 @@ async def _campaign_fixture(
         for repetition in range(1, reference_campaign.CAUSAL_MEMORY_CAMPAIGN_REPETITIONS + 1)
         for variant_id in reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS
     )
+    if budgeted_live:
+        compiled = compile_corpus_suite(
+            corpus.document, target, reference_campaign.CAUSAL_MEMORY_CAMPAIGN_SUITE_ID
+        )
+        requests = {case.id: case.request for case in compiled.suite.cases}
+        trials = tuple(
+            replace(
+                trial,
+                request=trial.request.model_copy(
+                    update={
+                        "run_request": requests[trial.case_id],
+                    }
+                ),
+            )
+            for trial in trials
+        )
     schedule_policy = ExternalPrivateMemoryAblationSchedulePolicy(
         strategy=strategy,
         seed_fingerprint=(
@@ -449,14 +537,25 @@ async def _campaign_fixture(
         model=reference_campaign._MODEL,
         provider_configuration_fingerprint=factory.provider_configuration_fingerprint,
         evidence_policy_revision=target.evidence_policy.revision,
-        pricing_profile_fingerprint=None,
+        pricing_profile_fingerprint=None
+        if pricing is None
+        else pricing_profile_identity(pricing).fingerprint,
+        evidence_collector_fingerprint=(
+            _AccountingEvidenceCollector(experiment=experiment).collector_fingerprint
+            if budgeted_live
+            else None
+        ),
         redaction_policy_revision="sha256:" + _digest("private-redaction-policy"),
         retention_policy_revision="sha256:" + _digest("private-retention-policy"),
         state_storage_id="approved-private-state",
         report_destination_id="approved-private-report",
         report_destination_fingerprint=destination.fingerprint,
-        execution_mode=ExternalPrivateMemoryAblationExecutionMode.HERMETIC,
-        live_execution_authorization_id=None,
+        execution_mode=(
+            ExternalPrivateMemoryAblationExecutionMode.LIVE
+            if budgeted_live
+            else ExternalPrivateMemoryAblationExecutionMode.HERMETIC
+        ),
+        live_execution_authorization_id="approved-fixture-live" if budgeted_live else None,
         allowed_variant_ids=tuple(sorted(reference_campaign.CAUSAL_MEMORY_CAMPAIGN_VARIANTS)),
         allowed_variant_kinds=tuple(sorted({variant.spec.kind for variant in variants}, key=str)),
         minimum_cases=len(corpus.document.cases),
@@ -470,10 +569,15 @@ async def _campaign_fixture(
         maximum_report_evidence_bytes_per_trial=(
             EXTERNAL_PRIVATE_MEMORY_ABLATION_MIN_REPORT_EVIDENCE_BYTES_PER_TRIAL
         ),
-        maximum_total_tokens_per_trial=None,
-        maximum_estimated_cost_total=None,
-        cost_currency=None,
-        cache_evidence_policy=ExternalPrivateMemoryAblationCacheEvidencePolicy.UNAVAILABLE,
+        maximum_supplemental_evidence_bytes_per_trial=(4 << 10) if budgeted_live else None,
+        maximum_total_tokens_per_trial=30_000 if budgeted_live else None,
+        maximum_estimated_cost_total=Decimal("20") if budgeted_live else None,
+        cost_currency="USD" if budgeted_live else None,
+        cache_evidence_policy=(
+            ExternalPrivateMemoryAblationCacheEvidencePolicy.BEST_EFFORT
+            if budgeted_live
+            else ExternalPrivateMemoryAblationCacheEvidencePolicy.UNAVAILABLE
+        ),
     )
     evaluator = reference_campaign._CampaignEvaluator(
         corpus=corpus.document,
@@ -3085,3 +3189,148 @@ def test_private_cost_ceiling_aggregation_is_exact() -> None:
             (Decimal("1e-1000000"),),
             Decimal("1"),
         )
+
+
+def test_live_campaign_binds_distinct_trial_budgets_and_recovers_exactly(tmp_path: Path) -> None:
+    async def run() -> None:
+        fixture = await _campaign_fixture(
+            tmp_path / "private",
+            artifact_name="report",
+            budgeted_live=True,
+        )
+        try:
+            prepared = fixture.prepared
+            trials = prepared.scheduled_trials
+            assert len({trial.variant_id for trial in trials}) > 1
+            assert len({trial.repetition for trial in trials}) > 1
+            assert len({trial.request.causal_budget_id for trial in trials}) == len(trials)
+            for trial in trials:
+                limits = trial.request.run_request.budget_limits
+                assert len(limits) == 1
+                assert limits[0].key == trial.request.causal_budget_id
+                assert limits[0].max_estimated_cost == Decimal("0.08")
+                assert private_ablation._matching_cost_ceiling(
+                    trial.request,
+                    prepared.authorization,
+                ) == Decimal("0.08")
+            assert prepared.target.request_base.budget_limits[0].key == (
+                EXTERNAL_PRIVATE_MEMORY_ABLATION_TRIAL_BUDGET_KEY
+            )
+            # Re-preparing resolved requests is exact, and never requires a caller
+            # to replace the trusted target template or weaken input comparison.
+            again = prepare_external_private_memory_ablation(
+                corpus=prepared.corpus,
+                target=prepared.target,
+                snapshot=prepared.snapshot,
+                experiment=prepared.experiment,
+                trials=trials,
+                executor=fixture.executor,
+                authorization=prepared.authorization,
+                schedule_policy=prepared.schedule_policy,
+                destination=prepared.destination,
+                now=_NOW,
+            )
+            assert again.preflight_revision == prepared.preflight_revision
+            assert again._trial_request_revisions == prepared._trial_request_revisions
+            collector = _AccountingEvidenceCollector(experiment=prepared.experiment)
+            result = await run_external_private_memory_ablation(
+                prepared,
+                fixture.executor,
+                evidence_collector=collector,
+                clock=lambda: _NOW,
+            )
+            assert result.methodology.status is ExternalPrivateMemoryAblationRunStatus.COMPLETE
+            assert len(fixture.provider.requests) == len(trials)
+            for trial in trials:
+                session = await fixture.sessions.load(trial.request.session_id)
+                assert session is not None
+                assert session.causal_budget_id == trial.request.causal_budget_id
+            recovered = await run_external_private_memory_ablation(
+                again,
+                fixture.executor,
+                evidence_collector=collector,
+                clock=lambda: _NOW,
+            )
+            assert recovered.report == result.report
+            assert len(fixture.provider.requests) == len(trials)
+        finally:
+            await fixture.close()
+        restarted = await _campaign_fixture(
+            tmp_path / "private",
+            artifact_name="report",
+            budgeted_live=True,
+        )
+        try:
+            recovered_after_restart = await run_external_private_memory_ablation(
+                restarted.prepared,
+                restarted.executor,
+                evidence_collector=_AccountingEvidenceCollector(
+                    experiment=restarted.prepared.experiment,
+                ),
+                clock=lambda: _NOW,
+            )
+            assert recovered_after_restart.report == result.report
+            assert restarted.provider.requests == []
+        finally:
+            await restarted.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mutation", ["prompt", "foreign_key", "ceiling", "reservation", "pricing"])
+def test_trial_budget_binding_rejects_unapproved_request_changes(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    async def run() -> None:
+        fixture = await _campaign_fixture(
+            tmp_path / "private",
+            artifact_name="report",
+            budgeted_live=True,
+        )
+        try:
+            prepared = fixture.prepared
+            trial = prepared.scheduled_trials[0]
+            request = trial.request.run_request
+            limit = request.budget_limits[0]
+            if mutation == "prompt":
+                request = request.model_copy(
+                    update={
+                        "messages": [*request.messages, Message.text("user", "unapproved")],
+                    }
+                )
+            else:
+                updates = {
+                    "foreign_key": {"key": prepared.scheduled_trials[1].request.causal_budget_id},
+                    "ceiling": {"max_estimated_cost": Decimal("0.09")},
+                    "reservation": {
+                        "reservation": BudgetReservation(max_input_tokens=1, max_output_tokens=1)
+                    },
+                    "pricing": {"pricing": default_price_book()},
+                }
+                request = request.model_copy(
+                    update={
+                        "budget_limits": (limit.model_copy(update=updates[mutation]),),
+                    }
+                )
+            changed = replace(
+                trial, request=trial.request.model_copy(update={"run_request": request})
+            )
+            with pytest.raises(ValueError, match="Trial request differs from the compiled"):
+                prepare_external_private_memory_ablation(
+                    corpus=prepared.corpus,
+                    target=prepared.target,
+                    snapshot=prepared.snapshot,
+                    experiment=prepared.experiment,
+                    trials=(changed, *prepared.scheduled_trials[1:]),
+                    executor=fixture.executor,
+                    authorization=prepared.authorization,
+                    schedule_policy=prepared.schedule_policy,
+                    destination=prepared.destination,
+                    now=_NOW,
+                )
+            assert fixture.provider.requests == []
+        finally:
+            await fixture.close()
+
+    asyncio.run(run())

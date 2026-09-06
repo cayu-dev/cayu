@@ -250,3 +250,39 @@ def test_sqlite_ledger_reconstructs_exact_limit_and_separates_semantic_change(
         assert independently_accepted.accepted is True
 
     asyncio.run(scenario())
+
+
+def test_causal_profile_policy_is_stable_while_ledger_scopes_are_distinct() -> None:
+    from cayu.runtime.budgets import request_budget_execution_profile_ids
+
+    first = _limit().model_copy(update={"scope": "causal", "key": "trial-one"})
+    second = first.model_copy(update={"key": "trial-two"})
+
+    def profile(limit: BudgetLimit, key: str) -> tuple[str, ...]:
+        return request_budget_execution_profile_ids(
+            limits=(limit,),
+            agent_name="assistant",
+            causal_budget_id=key,
+        )
+
+    assert profile(first, "trial-one") == profile(second, "trial-two")
+    resolved = [
+        request_budget_limits_for_session(
+            limits=(limit,),
+            agent_name="assistant",
+            causal_budget_id=key,
+        )[0]
+        for limit, key in ((first, "trial-one"), (second, "trial-two"))
+    ]
+    assert resolved[0].budget_limit_id != resolved[1].budget_limit_id
+    assert resolved[0].key == "trial-one"
+    assert resolved[1].key == "trial-two"
+    with pytest.raises(ValueError, match="does not match session causal_budget_id"):
+        profile(first, "trial-two")
+    for update in (
+        {"max_estimated_cost": Decimal("2")},
+        {"pricing": _price_book(rate="2000000")},
+        {"reservation": BudgetReservation(max_input_tokens=2, max_output_tokens=0)},
+        {"scope": "agent", "key": "assistant"},
+    ):
+        assert profile(first.model_copy(update=update), "trial-one") != profile(first, "trial-one")

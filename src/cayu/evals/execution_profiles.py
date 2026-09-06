@@ -496,6 +496,12 @@ async def prepare_eval_execution_profile(
     request = target.app._with_application_run_defaults(
         copy_run_request(target.request_base),
     )
+    # Resolve a keyed causal policy without allocating a conflicting random
+    # scope for this read-only preparation. The target itself remains unchanged;
+    # real execution must still supply a matching runtime-owned scope.
+    causal_keys = {limit.key for limit in request.budget_limits if limit.scope == "causal"}
+    if request.causal_budget_id is None and len(causal_keys) == 1:
+        request = request.model_copy(update={"causal_budget_id": next(iter(causal_keys))})
     prepared = await target.app._session_engine._prepare_initial_run(
         request,
         admit_session=False,

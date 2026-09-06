@@ -2774,6 +2774,39 @@ def request_budget_limits_for_session(
     return effective_limits
 
 
+def request_budget_execution_profile_ids(
+    *,
+    limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
+    agent_name: str,
+    causal_budget_id: str,
+) -> tuple[str, ...]:
+    """Bind policy semantics after validating runtime-owned causal membership.
+
+    Ledger identities retain the exact causal key. Only profile material uses
+    a structural current-scope key: a different session allocation must not
+    change otherwise identical execution behavior. Foreign keys still fail
+    before normalization, including during continuation and recovery.
+    """
+
+    effective = request_budget_limits_for_session(
+        limits=limits,
+        agent_name=agent_name,
+        causal_budget_id=causal_budget_id,
+    )
+    normalized = tuple(
+        _copy_budget_limit_definition(limit).model_copy(
+            update={"key": "cayu:execution-profile:current-causal-scope"}
+        )
+        if limit.scope == "causal"
+        else _copy_budget_limit_definition(limit)
+        for limit in effective
+    )
+    return tuple(
+        limit.budget_limit_id
+        for limit in _effective_budget_limits(normalized, identity_namespace="request")
+    )
+
+
 def _operation_budget_limits_for_session(
     *,
     limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,

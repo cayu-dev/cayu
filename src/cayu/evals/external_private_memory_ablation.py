@@ -130,8 +130,13 @@ from cayu.runtime.cost_quality import (
     PairedCostQualitySide,
     compare_paired_cost_quality,
 )
+from cayu.runtime.sessions import RunRequest
 
 EXTERNAL_PRIVATE_MEMORY_ABLATION_SCHEMA_VERSION = 1
+# Used only in a trusted CorpusTarget's request budget template. Preflight
+# replaces this key with the exact trial causal-budget identity before freezing
+# the complete request. Ordinary runtime requests never receive the marker.
+EXTERNAL_PRIVATE_MEMORY_ABLATION_TRIAL_BUDGET_KEY = "cayu:private-memory:trial-budget"
 EXTERNAL_PRIVATE_MEMORY_ABLATION_MAX_ARTIFACT_BYTES = 64 << 20
 EXTERNAL_PRIVATE_MEMORY_ABLATION_MAX_LIMITATIONS = 32
 # Even when the full intervention binding must be omitted, the complete terminal
@@ -1850,6 +1855,36 @@ def _external_private_executor_binding(
     return authority, binding_revision, state_files_revision
 
 
+def _bind_compiled_trial_budget(
+    trial: ExternalPrivateMemoryAblationTrial,
+    compiled_request: RunRequest,
+) -> ExternalPrivateMemoryAblationTrial:
+    """Derive only an explicitly templated causal key, retaining exact inputs."""
+
+    limits = []
+    for limit in compiled_request.budget_limits:
+        if limit.key == EXTERNAL_PRIVATE_MEMORY_ABLATION_TRIAL_BUDGET_KEY:
+            if limit.scope != "causal":
+                raise ValueError("The private trial budget template requires causal scope.")
+            limit = limit.model_copy(update={"key": trial.request.causal_budget_id})
+        limits.append(limit)
+    expected = compiled_request.model_copy(update={"budget_limits": tuple(limits)})
+    actual_material = trial.request.run_request.model_dump(mode="json")
+    if actual_material not in (
+        compiled_request.model_dump(mode="json"),
+        expected.model_dump(mode="json"),
+    ):
+        raise ValueError("Trial request differs from the compiled private corpus input.")
+    # Accept the original template or an exact previously resolved request.
+    # Preflight, the journal, and recovery all retain the resolved form.
+    return ExternalPrivateMemoryAblationTrial(
+        case_id=trial.case_id,
+        repetition=trial.repetition,
+        variant_id=trial.variant_id,
+        request=trial.request.model_copy(update={"run_request": expected}),
+    )
+
+
 def _matching_cost_ceiling(
     request: MemoryInterventionTrialRequest,
     authorization: ExternalPrivateMemoryAblationAuthorization,
@@ -2390,6 +2425,7 @@ def _prepare_external_private_memory_ablation_validated(
             "Live external private campaigns cannot expose child-session tools until "
             "total-token authority is causal across the complete trial tree."
         )
+    bound_trials: list[ExternalPrivateMemoryAblationTrial] = []
     for trial in copied_trials:
         case_spec = case_specs[trial.case_id]
         compiled_case = compiled_cases[trial.case_id]
@@ -2402,10 +2438,8 @@ def _prepare_external_private_memory_ablation_validated(
             or request.candidate_id != variant.candidate_id
         ):
             raise ValueError("Trial request conflicts with its experiment matrix coordinate.")
-        if request.run_request.model_dump(mode="json") != compiled_case.request.model_dump(
-            mode="json"
-        ):
-            raise ValueError("Trial request differs from the compiled private corpus input.")
+        trial = _bind_compiled_trial_budget(trial, compiled_case.request)
+        request = trial.request
         if request.timeout_seconds != compiled.timeout_seconds:
             raise ValueError("Trial timeout differs from the immutable suite timeout.")
         if request.timeout_seconds > copied_authorization.maximum_timeout_seconds:
@@ -2432,6 +2466,7 @@ def _prepare_external_private_memory_ablation_validated(
             raise ValueError("Trial execution and trial ids must be unique across the matrix.")
         execution_ids.add(request.execution_id)
         trial_ids.add(request.trial_id)
+        bound_trials.append(trial)
     authorized_cost = copied_authorization.maximum_estimated_cost_total
     if authorized_cost is not None and not _cost_ceilings_within_authorization(
         cost_ceilings,
@@ -2476,7 +2511,7 @@ def _prepare_external_private_memory_ablation_validated(
     if reserved_report_bytes > MEMORY_EXPERIMENT_REPORT_MAX_BYTES:
         raise ValueError("The authorized campaign evidence cannot fit the bounded memory report.")
 
-    scheduled_trials = _realize_schedule(copied_trials, copied_policy, variant_ids)
+    scheduled_trials = _realize_schedule(tuple(bound_trials), copied_policy, variant_ids)
     case_revisions = {case.case_id: case.case_revision for case in copied_experiment.cases}
     schedule = tuple(
         ExternalPrivateMemoryAblationScheduleEntry(

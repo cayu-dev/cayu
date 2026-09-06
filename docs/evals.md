@@ -1645,6 +1645,19 @@ The application performs four explicit steps:
    therefore cannot observe published completion without both matching payload
    files.
 
+For live trials, put a causal `BudgetLimit` in `CorpusTarget.request_base`
+with `key=EXTERNAL_PRIVATE_MEMORY_ABLATION_TRIAL_BUDGET_KEY` (exported from
+`cayu.evals`). This explicit template keeps the shared corpus request stable.
+Preflight replaces only that key with each trial's runtime-owned causal budget
+identity and freezes the resolved request for execution and recovery. Pricing,
+reservation, ceiling, and every other request field must still match the
+compiled corpus exactly. Supplying the exact previously resolved request is
+also supported; a foreign causal key is rejected. Execution profiles compare
+the validated causal budget policy independently of the allocated scope key,
+while ledger identities and request fingerprints retain the exact trial key.
+Read-only profile preparation uses the target's single causal key without
+admitting a session or modifying the target.
+
 Preflight reloads and hashes the bounded corpus, revalidates the approved paths,
 compiles every case through the selected target, and requires the complete
 case/repetition/variant matrix exactly once. Fixed, deterministic-randomized,
