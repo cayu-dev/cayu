@@ -36,15 +36,85 @@ def invalid_tool_arguments_result(exc: Exception) -> ToolResult:
     """Build the shared structured result for model-supplied bad arguments."""
     return ToolResult(
         content=str(exc),
-        structured={"error": "invalid_arguments"},
+        structured={
+            "error": "invalid_arguments",
+            **(exc.details if isinstance(exc, ToolArgumentShapeError) else {}),
+        },
         is_error=True,
     )
 
 
-def reject_unknown_tool_arguments(args: dict[str, Any], *, allowed: frozenset[str]) -> None:
-    """Reject unsupported keys without reflecting caller-controlled names or values."""
-    if set(args) - allowed:
-        raise ValueError("Tool arguments contain unknown fields.")
+# Only source-owned schema names may be reflected; syntactically valid keys can
+# still be credentials or other sensitive caller content.
+_SAFE_FIELD_NAMES = frozenset(
+    {
+        "operations",
+        "type",
+        "path",
+        "from_path",
+        "to_path",
+        "expected_revision",
+        "content",
+        "edits",
+        "old_text",
+        "new_text",
+        "expected_replacements",
+        "pattern",
+        "limit",
+        "offset",
+        "max_result_bytes",
+    }
+)
+
+
+class ToolArgumentShapeError(ValueError):
+    """Bounded, content-free diagnostics for an object schema mismatch."""
+
+    def __init__(
+        self,
+        args: object,
+        *,
+        allowed: frozenset[str],
+        required: frozenset[str] = frozenset(),
+        hint: str = "",
+    ) -> None:
+        self.details: dict[str, Any] = {}
+        if not isinstance(args, dict):
+            super().__init__("Tool arguments must be an object.")
+            return
+        missing = sorted(required - args.keys())
+        safe_names = allowed | required | _SAFE_FIELD_NAMES
+        unknown = sorted(name for name in safe_names if name in args and name not in allowed)
+        omitted = sum(1 for name in args if name not in allowed and name not in safe_names)
+        self.details = {"missing_fields": missing, "unknown_fields": unknown}
+        if omitted:
+            self.details["unknown_fields_omitted"] = omitted
+        notes = []
+        if missing:
+            notes.append("Missing fields: " + ", ".join(missing) + ".")
+        if unknown or omitted:
+            notes.append(
+                "Tool arguments contain unknown fields"
+                + (": " + ", ".join(unknown) if unknown else "")
+                + "."
+            )
+        if omitted:
+            notes.append("Additional unrecognized field names were withheld.")
+        if hint:
+            notes.append(hint)
+        super().__init__(" ".join(notes))
+
+
+def reject_unknown_tool_arguments(
+    args: object,
+    *,
+    allowed: frozenset[str],
+    required: frozenset[str] = frozenset(),
+    hint: str = "",
+) -> None:
+    """Reject invalid object shapes with bounded, trusted field names only."""
+    if not isinstance(args, dict) or args.keys() - allowed or required - args.keys():
+        raise ToolArgumentShapeError(args, allowed=allowed, required=required, hint=hint)
 
 
 @contextmanager

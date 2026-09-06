@@ -1040,3 +1040,116 @@ def test_apply_patch_durable_recovery_reconstructs_without_replay_and_refuses_dr
     assert drifted is not None
     assert drifted.structured["outcome"] == "unsupported"
     assert drifted.structured["failure_category"] == "execution_profile_drift"
+
+
+@pytest.mark.parametrize(
+    ("operation", "missing", "unknown", "edit_index"),
+    [
+        ({"type": "update", "path": "a", "edits": []}, ["expected_revision"], [], None),
+        (
+            {"type": "create", "path": "a", "expected_revision": "secret"},
+            ["content"],
+            ["expected_revision"],
+            None,
+        ),
+        (
+            {
+                "type": "update",
+                "path": "a",
+                "expected_revision": "secret",
+                "edits": [{"old_text": "secret", "path": "secret"}],
+            },
+            ["new_text"],
+            ["path"],
+            0,
+        ),
+        ({"path": "a"}, ["type"], [], None),
+    ],
+)
+def test_patch_shape_diagnostics_write_nothing(tmp_path, operation, missing, unknown, edit_index):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a").write_text("original")
+    result = asyncio.run(ApplyPatchTool().run(_context(tmp_path), {"operations": [operation]}))
+    assert result.is_error
+    assert result.structured["missing_fields"] == missing
+    assert result.structured["unknown_fields"] == unknown
+    assert result.structured["operation_index"] == 0
+    assert result.structured.get("edit_index") == edit_index
+    assert result.structured["mutated"] is False
+    assert "secret" not in str(result.structured) + result.content
+    assert (root / "a").read_text() == "original"
+    assert list(root.iterdir()) == [root / "a"]
+    if "expected_revision" in missing:
+        assert "read_file" in result.content
+        assert "returned revision" in result.content
+
+
+@pytest.mark.parametrize("item", [None, 1, "sensitive", [], {"old_text": "private"}])
+def test_patch_malformed_nested_edits(tmp_path, item):
+    (tmp_path / "workspace").mkdir()
+    result = asyncio.run(
+        ApplyPatchTool().run(
+            _context(tmp_path),
+            {
+                "operations": [
+                    {
+                        "type": "update",
+                        "path": "a",
+                        "expected_revision": "revision",
+                        "edits": [item],
+                    }
+                ]
+            },
+        )
+    )
+    assert result.is_error
+    assert result.structured["category"] == "invalid_edit_shape"
+    assert result.structured["edit_index"] == 0
+    assert result.structured["mutated"] is False
+
+
+def test_patch_shape_diagnostics_bound_untrusted_keys(tmp_path):
+    (tmp_path / "workspace").mkdir()
+    operation = {"type": "update", "path": "sensitive path", "edits": []}
+    operation.update({f"secret_{index}": "private value" for index in range(10000)})
+    result = asyncio.run(ApplyPatchTool().run(_context(tmp_path), {"operations": [operation]}))
+    assert result.structured["missing_fields"] == ["expected_revision"]
+    assert result.structured["unknown_fields"] == []
+    assert result.structured["unknown_fields_omitted"] == 10000
+    rendered = result.content + str(result.structured)
+    assert len(rendered) < 2000
+    assert "secret_" not in rendered
+    assert "sensitive path" not in rendered
+    assert "private value" not in rendered
+
+
+def test_patch_missing_revision_can_be_repaired_from_read(tmp_path):
+    from cayu.tools import ReadFileTool
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a").write_text("before")
+    ctx = _context(tmp_path)
+    operation = {
+        "type": "update",
+        "path": "a",
+        "edits": [{"old_text": "before", "new_text": "after"}],
+    }
+    refused = asyncio.run(ApplyPatchTool().run(ctx, {"operations": [operation]}))
+    assert refused.structured["missing_fields"] == ["expected_revision"]
+    read = asyncio.run(ReadFileTool().run(ctx, {"path": "a"}))
+    operation["expected_revision"] = read.structured["revision"]
+    applied = asyncio.run(ApplyPatchTool().run(ctx, {"operations": [operation]}))
+    assert not applied.is_error
+    assert (root / "a").read_text() == "after"
+
+
+@pytest.mark.parametrize("item", [None, 1, "private", []])
+def test_patch_non_object_operation_is_bounded(tmp_path, item):
+    (tmp_path / "workspace").mkdir()
+    result = asyncio.run(ApplyPatchTool().run(_context(tmp_path), {"operations": [item]}))
+    assert result.structured["category"] == "operation_not_object"
+    assert result.structured["operation_index"] == 0
+    assert result.structured["mutated"] is False
+    assert "private" not in result.content

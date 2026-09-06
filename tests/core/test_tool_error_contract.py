@@ -18,6 +18,7 @@ from cayu.core.tools import ToolContext, ToolResult
 from cayu.runners import LocalRunner
 from cayu.runtime.sessions import InMemorySessionStore
 from cayu.tools import (
+    ApplyPatchTool,
     DeleteFileTool,
     EditFileTool,
     ExecCommandTool,
@@ -239,7 +240,14 @@ def test_read_file_invalid_arguments_return_structured_error(tmp_path):
 def test_workspace_file_tools_reject_unknown_arguments_before_resource_lookup(tool, args):
     result = asyncio.run(tool.run(ToolContext(session_id="sess_1"), args))
 
-    _assert_invalid_arguments(result, match="unknown fields")
+    assert result.is_error
+    assert result.structured == {
+        "error": "invalid_arguments",
+        "missing_fields": [],
+        "unknown_fields": [],
+        "unknown_fields_omitted": 2,
+    }
+    assert "unknown fields" in result.content
     assert "alpha" not in result.content
     assert "zeta" not in result.content
 
@@ -464,3 +472,38 @@ def test_host_misconfiguration_rejected_at_context_construction(tmp_path):
     # of deferring to a TypeError inside the first tool call.
     with pytest.raises(ValidationError, match="WorkspaceHandle"):
         ToolContext(session_id="sess_1", workspace=_NotAWorkspace())
+
+
+@pytest.mark.parametrize("args", [None, 1, "private value", [], ["pattern"], {1: "secret"}])
+@pytest.mark.parametrize("tool", [ListFilesTool(), ApplyPatchTool()])
+def test_malformed_shape_is_structured(tool, args):
+    result = asyncio.run(tool.run(ToolContext(session_id="session"), args))
+    assert result.is_error
+    assert result.structured["error"] == "invalid_arguments"
+    assert "private value" not in result.content
+    assert "secret" not in result.content
+
+
+def test_list_files_repair_guidance(tmp_path):
+    ctx = _workspace_ctx(tmp_path)
+    result = asyncio.run(ListFilesTool().run(ctx, {"path": "private", "limit": 1}))
+    assert result.structured == {
+        "error": "invalid_arguments",
+        "missing_fields": [],
+        "unknown_fields": ["path"],
+    }
+    assert "workspace-relative glob" in result.content
+    assert "private" not in result.content
+    repaired = asyncio.run(ListFilesTool().run(ctx, {"pattern": "**/*", "limit": 1}))
+    assert not repaired.is_error
+
+
+def test_patch_missing_operations_is_actionable_before_resource_lookup():
+    result = asyncio.run(ApplyPatchTool().run(ToolContext(session_id="session"), {}))
+    assert result.is_error
+    assert result.structured == {
+        "error": "invalid_arguments",
+        "missing_fields": ["operations"],
+        "unknown_fields": [],
+    }
+    assert "operations" in result.content

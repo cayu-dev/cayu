@@ -29,6 +29,7 @@ from cayu.core.tools import (
     _runtime_tool_invocation_authority,
 )
 from cayu.tools._errors import (
+    ToolArgumentShapeError,
     reject_unknown_tool_arguments,
     structured_invalid_arguments,
     tool_argument_validation,
@@ -141,7 +142,11 @@ class _PatchPreflightError(Exception):
         *,
         operation_index: int | None = None,
         path: str | None = None,
+        shape_error: ToolArgumentShapeError | None = None,
+        edit_index: int | None = None,
     ) -> None:
+        self.shape_error = shape_error
+        self.edit_index = edit_index
         self.category = category
         self.operation_index = operation_index
         self.path = path
@@ -396,7 +401,9 @@ class ApplyPatchTool(Tool):
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         initial_snapshot = active_secret_redactor_snapshot(ctx)
         with tool_argument_validation():
-            reject_unknown_tool_arguments(args, allowed=_APPLY_PATCH_ARGUMENTS)
+            reject_unknown_tool_arguments(
+                args, allowed=_APPLY_PATCH_ARGUMENTS, required=_APPLY_PATCH_ARGUMENTS
+            )
             raw_operations = args.get("operations")
             if not isinstance(raw_operations, list):
                 raise ValueError("Tool argument `operations` must be an array.")
@@ -1748,11 +1755,21 @@ def _validate_patch_intents(
         if type(item) is not dict:
             raise _PatchPreflightError("operation_not_object", operation_index=index)
         operation = cast("dict[str, object]", item)
-        if set(operation) - _OPERATION_FIELDS:
-            raise _PatchPreflightError("unknown_operation_fields", operation_index=index)
         operation_type = operation.get("type")
         if type(operation_type) is not str or operation_type not in _PATCH_TYPES:
-            raise _PatchPreflightError("unknown_operation_type", operation_index=index)
+            shape = ToolArgumentShapeError(
+                operation,
+                allowed=_OPERATION_FIELDS,
+                required=frozenset({"type"}),
+                hint="Provide `type`: create, update, delete, or move.",
+            )
+            raise _PatchPreflightError(
+                "unknown_operation_fields"
+                if operation.keys() - _OPERATION_FIELDS
+                else "unknown_operation_type",
+                operation_index=index,
+                shape_error=shape,
+            )
         operation_type = cast("PatchOperationType", operation_type)
 
         expected_fields: set[str]
@@ -1765,7 +1782,24 @@ def _validate_patch_intents(
         else:
             expected_fields = {"type", "from_path", "to_path", "expected_revision"}
         if set(operation) != expected_fields:
-            raise _PatchPreflightError("invalid_operation_shape", operation_index=index)
+            shape = ToolArgumentShapeError(
+                operation,
+                allowed=frozenset(expected_fields),
+                required=frozenset(expected_fields),
+                hint=(
+                    "Read the target with `read_file` and use its returned revision as "
+                    "`expected_revision`; the precondition cannot be inferred or bypassed."
+                )
+                if "expected_revision" in expected_fields and "expected_revision" not in operation
+                else "Use only the fields required for this operation type.",
+            )
+            raise _PatchPreflightError(
+                "unknown_operation_fields"
+                if operation.keys() - _OPERATION_FIELDS
+                else "invalid_operation_shape",
+                operation_index=index,
+                shape_error=shape,
+            )
 
         if operation_type == "move":
             source_path = _validate_patch_path(
@@ -1924,14 +1958,21 @@ def _validate_patch_edits(value: object, *, index: int) -> tuple[_PatchEdit, ...
     if not isinstance(value, list) or not value or len(value) > MAX_PATCH_EDITS:
         raise _PatchPreflightError("invalid_edits", operation_index=index)
     edits: list[_PatchEdit] = []
-    for item in value:
-        if type(item) is not dict:
-            raise _PatchPreflightError("invalid_edit_shape", operation_index=index)
+    for edit_index, item in enumerate(value):
+        try:
+            reject_unknown_tool_arguments(
+                item,
+                allowed=_EDIT_FIELDS,
+                required=frozenset({"old_text", "new_text"}),
+            )
+        except ToolArgumentShapeError as exc:
+            raise _PatchPreflightError(
+                "invalid_edit_shape",
+                operation_index=index,
+                edit_index=edit_index,
+                shape_error=exc,
+            ) from exc
         edit = cast("dict[str, object]", item)
-        if set(edit) - _EDIT_FIELDS:
-            raise _PatchPreflightError("invalid_edit_shape", operation_index=index)
-        if not {"old_text", "new_text"}.issubset(edit):
-            raise _PatchPreflightError("invalid_edit_shape", operation_index=index)
         old_text = _validate_patch_text(
             edit.get("old_text"),
             category="invalid_edit_text",
@@ -2340,6 +2381,11 @@ def _preflight_failure_result(
         "category": error.category,
         "mutated": False,
     }
+    if error.shape_error is not None:
+        raw.update(error.shape_error.details)
+        raw["explanation"] = str(error.shape_error)
+    if error.edit_index is not None:
+        raw["edit_index"] = error.edit_index
     redacted = _redact_projection_stably(ctx, raw, initial_snapshot)
     if redacted is None:
         return _unstable_projection_result(outcome="precondition_failed", mutated=False)
@@ -2352,7 +2398,7 @@ def _preflight_failure_result(
     return ToolResult(
         content=(
             f"Patch preflight refused{index_note}{path_note}: {safe['category']}. "
-            "No changes were written."
+            f"No changes were written. {safe.get('explanation', '')}".rstrip()
         ),
         structured=safe,
         is_error=True,

@@ -495,7 +495,7 @@ def test_search_text_returns_a_bounded_invalid_pattern_result() -> None:
 
     assert result.is_error is True
     assert len(result.content.encode("utf-8")) <= 200
-    assert result.content == "Search pattern is invalid."
+    assert result.content.startswith("Search pattern is invalid. Parser detail unavailable.")
     assert "regex parse error" not in json.dumps(result.model_dump())
     assert result.artifacts == []
     assert result.structured is not None
@@ -505,6 +505,7 @@ def test_search_text_returns_a_bounded_invalid_pattern_result() -> None:
         "error": "invalid_pattern",
         "exit_code": 2,
         "stderr_bytes": len(stderr.encode("utf-8")),
+        "pattern_diagnostic": {"reason": "unavailable", "offset": None, "offset_unit": "utf8_byte"},
     }
 
 
@@ -1514,3 +1515,165 @@ def test_search_text_reports_when_one_entry_cannot_fit_registration_budget() -> 
     assert result.structured is not None
     assert result.structured["error"] == "search_entry_too_large"
     assert len(result.content.encode("utf-8")) <= 200
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(
+    ("pattern", "parser_reason", "reason", "hint"),
+    [
+        (
+            "{{",
+            "repetition operator missing expression",
+            "missing_repetition_expression",
+            "Escape literal braces",
+        ),
+        ("(", "unclosed group", "unclosed_group", "Close the group"),
+        (r"\q", "unrecognized escape sequence", "unrecognized_escape", "literal backslash"),
+        ("[", "unclosed character class", "unclosed_character_class", "Close the character class"),
+    ],
+)
+def test_search_regex_diagnostic_trusted_reasons_and_offsets(
+    wrapped, pattern, parser_reason, reason, hint
+):
+    display = "(?:" + pattern + ")" if wrapped else pattern
+    marker = " " * (7 if wrapped else 4) + "^"
+    stderr = f"regex parse error:\n    {display}\n{marker}\nerror: {parser_reason}\n"
+    runner = _ResultRunner(ExecResult(exit_code=2, stderr=stderr))
+    result = asyncio.run(
+        SearchTextTool().run(ToolContext(session_id="s", runner=runner), {"pattern": pattern})
+    )
+    assert result.structured["error"] == "invalid_pattern"
+    assert result.structured["pattern_diagnostic"] == {
+        "reason": reason,
+        "offset": 0,
+        "offset_unit": "utf8_byte",
+    }
+    assert hint in result.content
+    assert runner.command.argv[-2] == pattern
+
+
+@pytest.mark.parametrize(
+    ("pattern", "display", "marker"),
+    [
+        ("SECRET(", "(?:SECRET()", "    ^"),  # caret in rg's wrapper
+        ("SECRET(", "different(", "             ^"),
+        ("é(", "é(", "     ^"),
+        ("a\t(", "a\t(", "      ^"),
+        ("SECRET(", "SECRET(", "    ^ arbitrary text"),
+        ("SECRET(", "SECRET(", "           ^"),  # beyond pattern
+    ],
+)
+def test_search_regex_ambiguous_locations_are_not_inferred(pattern, display, marker):
+    stderr = f"rg: regex parse error:\n    {display}\n{marker}\nerror: unclosed group\n"
+    result = asyncio.run(
+        SearchTextTool().run(
+            ToolContext(
+                session_id="s", runner=_ResultRunner(ExecResult(exit_code=2, stderr=stderr))
+            ),
+            {"pattern": pattern},
+        )
+    )
+    assert result.structured["pattern_diagnostic"]["reason"] == "unclosed_group"
+    assert result.structured["pattern_diagnostic"]["offset"] is None
+    assert "Pattern location unavailable" in result.content
+    assert "SECRET" not in json.dumps(result.model_dump())
+
+
+@pytest.mark.parametrize("variant", ["unknown", "large", "truncated", "injected"])
+def test_search_regex_diagnostic_fallback_never_echoes_secrets(variant):
+    pattern = "SECRET" * 600 + "("
+    stderr = f"regex parse error:\n    {pattern}\n    ^\nerror: SECRET parser text\n"
+    if variant == "large":
+        stderr += "SECRET" * 10000 + "\nerror: unclosed group\n"
+    if variant == "truncated":
+        stderr = stderr.replace("SECRET parser text", "unclosed group")
+    if variant == "injected":
+        stderr = stderr.replace("SECRET parser text", "unclosed group SECRET")
+    result = asyncio.run(
+        SearchTextTool(max_preview_bytes=80, max_result_bytes=200).run(
+            ToolContext(
+                session_id="s",
+                runner=_ResultRunner(
+                    ExecResult(exit_code=2, stderr=stderr, stderr_truncated=variant == "truncated")
+                ),
+            ),
+            {"pattern": pattern},
+        )
+    )
+    assert result.structured["pattern_diagnostic"]["reason"] == "unavailable"
+    assert result.structured["pattern_diagnostic"]["offset"] is None
+    assert "SECRET" not in json.dumps(result.model_dump())
+    assert len(result.content.encode()) <= 200
+    assert len(json.dumps(result.model_dump())) < 1500
+
+
+@pytest.mark.parametrize(
+    "stderr", ["SECRET permission denied", "rg: SECRET regex parse error: Permission denied"]
+)
+def test_search_backend_errors_do_not_become_regex_diagnostics(stderr):
+    result = asyncio.run(
+        SearchTextTool().run(
+            ToolContext(
+                session_id="s", runner=_ResultRunner(ExecResult(exit_code=2, stderr=stderr))
+            ),
+            {"pattern": "valid"},
+        )
+    )
+    assert result.structured["error"] == "search_failed"
+    assert "pattern_diagnostic" not in result.structured
+    assert "SECRET" not in json.dumps(result.model_dump())
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
+@pytest.mark.parametrize("pattern", ["{{", "(", r"\q"])
+def test_search_regex_diagnostic_live_ripgrep(tmp_path, pattern):
+    (tmp_path / "sample.txt").write_text("{{ literal text")
+    ctx = ToolContext(session_id="s", runner=LocalRunner(tmp_path))
+    result = asyncio.run(SearchTextTool().run(ctx, {"pattern": pattern}))
+    assert result.structured["error"] == "invalid_pattern"
+    assert result.structured["pattern_diagnostic"]["reason"] != "unavailable"
+    repaired = asyncio.run(SearchTextTool().run(ctx, {"pattern": r"\{\{.*text"}))
+    assert not repaired.is_error
+    assert repaired.structured["matches"]
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_search_regex_offset_accounts_for_prefix_without_leaking_pattern(wrapped):
+    pattern = "SECRET" * 500 + r"\q"
+    display = "(?:" + pattern + ")" if wrapped else pattern
+    marker = " " * ((7 if wrapped else 4) + 3000) + "^^"
+    stderr = f"regex parse error:\n    {display}\n{marker}\nerror: unrecognized escape sequence\n"
+    result = asyncio.run(
+        SearchTextTool().run(
+            ToolContext(
+                session_id="s", runner=_ResultRunner(ExecResult(exit_code=2, stderr=stderr))
+            ),
+            {"pattern": pattern},
+        )
+    )
+    assert result.structured["pattern_diagnostic"] == {
+        "reason": "unrecognized_escape",
+        "offset": 3000,
+        "offset_unit": "utf8_byte",
+    }
+    assert "SECRET" not in json.dumps(result.model_dump())
+    assert len(json.dumps(result.model_dump())) < 1500
+
+
+def test_search_regex_multiline_location_is_explicitly_unavailable():
+    stderr = "regex parse error:\n1: SECRET\n2: (\n   ^\nerror: unclosed group\n"
+    result = asyncio.run(
+        SearchTextTool().run(
+            ToolContext(
+                session_id="s", runner=_ResultRunner(ExecResult(exit_code=2, stderr=stderr))
+            ),
+            {"pattern": "SECRET\n("},
+        )
+    )
+    assert result.structured["pattern_diagnostic"] == {
+        "reason": "unclosed_group",
+        "offset": None,
+        "offset_unit": "utf8_byte",
+    }
+    assert "Pattern location unavailable" in result.content
+    assert "SECRET" not in json.dumps(result.model_dump())

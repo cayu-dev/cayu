@@ -395,6 +395,7 @@ class SearchTextTool(Tool):
                 duration_ms=duration_ms,
                 artifacts=artifacts,
                 artifacts_truncated=artifacts_truncated,
+                pattern=pattern,
             )
 
         parsed_page = _parse_search_page(
@@ -1058,6 +1059,93 @@ def _validate_no_nul(value: str, field_name: str) -> str:
     return value
 
 
+# Match complete parser reasons, never project stderr fragments. Even the
+# pattern display and parser-suggested snippets can contain caller secrets.
+_REGEX_REASONS = {
+    "repetition operator missing expression": (
+        "missing_repetition_expression",
+        "A repetition operator has no preceding expression. Escape literal braces "
+        "or other regex metacharacters with a backslash.",
+    ),
+    "unclosed group": (
+        "unclosed_group",
+        "Close the group with `)` or escape a literal `(` with a backslash.",
+    ),
+    "unopened group": (
+        "unopened_group",
+        "Balance the parentheses or escape a literal `)` with a backslash.",
+    ),
+    "unclosed character class": (
+        "unclosed_character_class",
+        "Close the character class with `]` or escape a literal `[` with a backslash.",
+    ),
+    "unrecognized escape sequence": (
+        "unrecognized_escape",
+        "Use an escape supported by the regex syntax. To match a literal backslash, "
+        "escape it with another backslash.",
+    ),
+    "invalid repetition count range, the start must be <= the end": (
+        "invalid_repetition_range",
+        "The repetition minimum must not exceed the maximum. Escape braces for literal text.",
+    ),
+}
+_REGEX_DIAGNOSTIC_LIMIT = 16 * 1024
+_REGEX_HEADERS = ("regex parse error:", "rg: regex parse error:")
+
+
+def _regex_diagnostic(result: ExecResult, pattern: str) -> tuple[dict[str, Any], str]:
+    """Recognize bounded rg diagnostics without echoing any backend text.
+
+    Locations are zero-based UTF-8 byte offsets. Only printable ASCII, a
+    verified display, and a caret span wholly inside the supplied pattern
+    establish a location. Multiline/Unicode displays and wrapper locations
+    deliberately return null rather than guessing display-column semantics.
+    """
+    diagnostic: dict[str, Any] = {
+        "reason": "unavailable",
+        "offset": None,
+        "offset_unit": "utf8_byte",
+    }
+    fallback = "Parser detail unavailable. Escape regex metacharacters to search for literal text."
+    if result.stderr_truncated or len(result.stderr) > _REGEX_DIAGNOSTIC_LIMIT:
+        return diagnostic, fallback
+    lines = result.stderr.splitlines()
+    if not lines or lines[0] not in _REGEX_HEADERS:
+        return diagnostic, fallback
+    # Only an exact terminal reason is trusted. Future formats fall back safely.
+    reason = (
+        _REGEX_REASONS.get(lines[-1].removeprefix("error: "))
+        if lines[-1].startswith("error: ")
+        else None
+    )
+    if reason is None:
+        return diagnostic, fallback
+    diagnostic["reason"], explanation = reason
+    if len(lines) == 4 and pattern and all(" " <= char <= "~" for char in pattern):
+        display, marker = lines[1:3]
+        prefix = None
+        if display == "    " + pattern:
+            prefix = 4
+        elif display == "    (?:" + pattern + ")":
+            prefix = 7
+        if prefix is not None:
+            caret_start = len(marker) - len(marker.lstrip(" "))
+            carets = marker[caret_start:]
+            start = caret_start - prefix
+            if (
+                carets
+                and set(carets) == {"^"}
+                and 0 <= start < len(pattern)
+                and start + len(carets) <= len(pattern)
+            ):
+                diagnostic["offset"] = start
+    if diagnostic["offset"] is None:
+        explanation += " Pattern location unavailable."
+    else:
+        explanation += f" At pattern byte offset {diagnostic['offset']} (zero-based)."
+    return diagnostic, explanation
+
+
 def _search_failure_result(
     result: ExecResult,
     *,
@@ -1066,7 +1154,9 @@ def _search_failure_result(
     duration_ms: int,
     artifacts: list[dict[str, Any]],
     artifacts_truncated: bool,
+    pattern: str | None = None,
 ) -> ToolResult:
+    diagnostic = None
     if result.timed_out:
         error = "search_timed_out"
         message = f"Search timed out after {timeout_s} seconds."
@@ -1079,12 +1169,17 @@ def _search_failure_result(
     else:
         error = (
             "invalid_pattern"
-            if result.exit_code == 2 and "regex parse error" in result.stderr.lower()
+            if result.exit_code == 2
+            and pattern is not None
+            and result.stderr.startswith(_REGEX_HEADERS)
             else "search_failed"
         )
         message = (
             "Search pattern is invalid." if error == "invalid_pattern" else "Text search failed."
         )
+    if error == "invalid_pattern" and pattern is not None:
+        diagnostic, explanation = _regex_diagnostic(result, pattern)
+        message += " " + explanation
     content = _bounded_message(message, max_result_bytes)
     return ToolResult(
         content=content,
@@ -1097,6 +1192,7 @@ def _search_failure_result(
                 else len(result.stderr.encode("utf-8"))
             ),
             "duration_ms": duration_ms,
+            **({"pattern_diagnostic": diagnostic} if diagnostic is not None else {}),
             **({"artifacts_truncated": True} if artifacts_truncated else {}),
         },
         artifacts=artifacts,

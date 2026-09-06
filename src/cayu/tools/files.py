@@ -2265,7 +2265,12 @@ class ListFilesTool(Tool):
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
-            reject_unknown_tool_arguments(args, allowed=_LIST_FILES_ARGUMENTS)
+            reject_unknown_tool_arguments(
+                args,
+                allowed=_LIST_FILES_ARGUMENTS,
+                hint="Use `pattern`, a workspace-relative glob (for example `src/**`). "
+                "`path` is not accepted; choose a glob explicitly.",
+            )
         workspace = _require_workspace(ctx)
         if workspace is None:
             return _missing_workspace_result()
