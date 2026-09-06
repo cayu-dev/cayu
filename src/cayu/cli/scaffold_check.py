@@ -942,6 +942,7 @@ class _DeclarativeBinding:
     line: int
     kind: Literal["class", "model", "enum", "literal", "annotation", "function"] = "class"
     enum_members: frozenset[str] | None = None
+    metadata_shape: Literal["str", "tuple"] | None = None
 
 
 def _is_pydantic_base(
@@ -1439,7 +1440,11 @@ def _unsafe_import_time_expression(
             and (
                 _declaration_value_is_inert(statement.value, class_proofs)
                 or _runtime_namespace_value_is_inert(
-                    statement.value, import_bindings, rebound_names | class_bindings, project_root
+                    statement.value,
+                    import_bindings,
+                    rebound_names | class_bindings,
+                    project_root,
+                    class_proofs,
                 )
             )
         }
@@ -1509,6 +1514,14 @@ def _unsafe_import_time_expression(
             ):
                 return subscript
         for call in _evaluated_calls(expression):
+            if _trusted_symbol(
+                call.func, import_bindings, expression_rebound_names, project_root
+            ) == ("cayu", "ToolSpec"):
+                if not _runtime_namespace_value_is_inert(
+                    call, import_bindings, expression_rebound_names, project_root, expression_proofs
+                ):
+                    return call
+                continue
             if call in declarative_values or _stdlib_declaration_is_inert(
                 call, import_bindings, expression_rebound_names, project_root, expression_proofs
             ):
@@ -1770,11 +1783,83 @@ def _class_base_is_declarative(
     return isinstance(base, ast.Name) and name in _INERT_BUILTIN_BASES
 
 
+def _metadata_shape(
+    value: ast.expr, proofs: Mapping[str, _DeclarativeBinding]
+) -> Literal["str", "tuple"] | None:
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return "str"
+    if isinstance(value, ast.Tuple) and _literal_collection_is_data_only(value):
+        return "tuple"
+    if isinstance(value, ast.Name):
+        proof = proofs.get(value.id)
+        if proof is not None and proof.kind == "literal" and proof.line < value.lineno:
+            return proof.metadata_shape
+    if (
+        isinstance(value, ast.BinOp)
+        and isinstance(value.op, ast.Add)
+        and _metadata_shape(value.left, proofs) == _metadata_shape(value.right, proofs) == "str"
+    ):
+        return "str"
+    return None
+
+
+def _toolspec_metadata_is_inert(
+    value: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+    proofs: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """Prove metadata without evaluating application objects or their hooks."""
+
+    def safe(item: ast.expr) -> bool:
+        return _toolspec_metadata_is_inert(item, imports, rebound, root, proofs)
+
+    if isinstance(value, ast.Constant):
+        return True
+    if isinstance(value, ast.Name):
+        proof = proofs.get(value.id)
+        return proof is not None and proof.kind == "literal" and proof.line < value.lineno
+    if isinstance(value, ast.Attribute):
+        return _trusted_symbol(value.value, imports, rebound, root) == (
+            "cayu",
+            "ToolEffect",
+        ) and value.attr in {"NONE", "IDEMPOTENT", "EXTERNAL"}
+    if isinstance(value, ast.UnaryOp) or (
+        isinstance(value, ast.BinOp) and isinstance(value.op, ast.Mult)
+    ):
+        # Reuse the numeric literal/product bounds without admitting operators
+        # on application objects or the other declaration metadata forms.
+        return _declaration_value_is_inert(value, proofs)
+    if isinstance(value, ast.BinOp):
+        return _metadata_shape(value, proofs) == "str"
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        return all(safe(item) for item in value.elts)
+    if isinstance(value, ast.Dict):
+        return all(
+            key is not None and safe(key) and safe(item)
+            for key, item in zip(value.keys, value.values, strict=True)
+        )
+    if isinstance(value, ast.Call):
+        return (
+            isinstance(value.func, ast.Name)
+            and value.func.id == "list"
+            and "list" not in imports
+            and "list" not in rebound
+            and len(value.args) == 1
+            and not value.keywords
+            and _metadata_shape(value.args[0], proofs) == "tuple"
+            and safe(value.args[0])
+        )
+    return False
+
+
 def _runtime_namespace_value_is_inert(
     value: ast.expr,
     imports: Mapping[str, tuple[str, str | None]],
     rebound: frozenset[str],
     root: Path,
+    proofs: Mapping[str, _DeclarativeBinding],
 ) -> bool:
     """Reviewed immutable Runtime metadata cannot supply descriptor hooks."""
     if isinstance(value, ast.Attribute):
@@ -1782,13 +1867,21 @@ def _runtime_namespace_value_is_inert(
             "cayu.server",
             "ServiceIdentityStoreKind",
         ) and value.attr in {"DEVELOPMENT", "DURABLE"}
+    if isinstance(value, ast.Call) and _trusted_symbol(value.func, imports, rebound, root) == (
+        "cayu",
+        "ToolSpec",
+    ):
+        return all(
+            _toolspec_metadata_is_inert(arg, imports, rebound, root, proofs) for arg in value.args
+        ) and all(
+            keyword.arg is not None
+            and _toolspec_metadata_is_inert(keyword.value, imports, rebound, root, proofs)
+            for keyword in value.keywords
+        )
     return (
         isinstance(value, ast.Call)
         and _trusted_symbol(value.func, imports, rebound, root)
-        in {
-            ("cayu", "ToolSpec"),
-            ("cayu", "ExecutionProfileBehaviorIdentity"),
-        }
+        == ("cayu", "ExecutionProfileBehaviorIdentity")
         and all(_literal_collection_is_data_only(arg) for arg in value.args)
         and all(
             keyword.arg is not None and _literal_collection_is_data_only(keyword.value)
@@ -1968,7 +2061,11 @@ def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
                                 isinstance(item, (ast.List, ast.Dict, ast.Set))
                                 for item in ast.walk(value)
                             ):
-                                proven[target.id] = _DeclarativeBinding(node.lineno, kind="literal")
+                                proven[target.id] = _DeclarativeBinding(
+                                    node.lineno,
+                                    kind="literal",
+                                    metadata_shape=_metadata_shape(value, proven),
+                                )
                         elif isinstance(
                             value, (ast.Subscript, ast.BinOp)
                         ) and _pydantic_annotation_is_declarative(
@@ -2895,7 +2992,6 @@ def _import_call_is_declarative(
                 "ExecutionProfileBehaviorIdentity",
             ),
             "Path": ("pathlib", "Path"),
-            "ToolSpec": ("cayu", "ToolSpec"),
             "dataclass": ("dataclasses", "dataclass"),
         }
         if name in expected_imports:
