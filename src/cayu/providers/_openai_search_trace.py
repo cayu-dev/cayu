@@ -13,6 +13,8 @@ _EVENT_TYPES = frozenset(
         "response.created",
         "response.output_item.added",
         "response.output_item.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
         "response.web_search_call.in_progress",
         "response.web_search_call.searching",
         "response.web_search_call.completed",
@@ -106,6 +108,18 @@ class SearchStreamTrace:
             state, expected = "pending", registered[0]
         elif finished is not None and finished.get("type") == "web_search_call":
             state, expected = "completed", finished.get("id")
+        self._record(event, state, expected, response_id, kind, index, valid_index)
+
+    def _record(
+        self,
+        event: Mapping[str, Any],
+        state: str,
+        expected: object,
+        response_id: str | None,
+        kind: str,
+        index: Any,
+        valid_index: bool,
+    ) -> None:
         item = event.get("item")
         item_id = item.get("id") if isinstance(item, Mapping) else event.get("item_id")
         response = event.get("response")
@@ -125,3 +139,38 @@ class SearchStreamTrace:
 
     def snapshot(self) -> SearchStreamDiagnostic:
         return SearchStreamDiagnostic(tuple(self._entries), self._truncated)
+
+
+class FunctionStreamTrace(SearchStreamTrace):
+    """Same bounded structural format, using function registration state."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.has_function = False
+
+    def record(
+        self,
+        event: Mapping[str, Any],
+        pending: Mapping[int, Any],
+        completed: Mapping[int, dict[str, Any]],
+        response_id: str | None,
+    ) -> None:
+        self._truncated |= len(self._entries) == _TRACE_LIMIT
+        self._ordinal = min(self._ordinal + 1, _COUNTER_LIMIT)
+        kind = event.get("type")
+        kind = kind if type(kind) is str and len(kind) <= 64 and kind in _EVENT_TYPES else "other"
+        index = event.get("output_index")
+        valid_index = type(index) is int and index >= 0
+        registered = pending.get(index) if valid_index else None
+        finished = completed.get(index) if valid_index else None
+        state, expected = "absent", None
+        if registered is not None:
+            state, expected = "pending", registered.item_id
+        elif finished is not None and finished.get("type") == "function_call":
+            state, expected = "completed", finished.get("id")
+        item = event.get("item")
+        self.has_function |= kind in {
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        } or (isinstance(item, Mapping) and item.get("type") == "function_call")
+        self._record(event, state, expected, response_id, kind, index, valid_index)

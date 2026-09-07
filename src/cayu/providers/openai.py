@@ -77,7 +77,11 @@ from cayu.providers._openai_protocol import (
     SearchSourceDiagnostic,
     protocol_exception_fields,
 )
-from cayu.providers._openai_search_trace import SearchStreamDiagnostic, SearchStreamTrace
+from cayu.providers._openai_search_trace import (
+    FunctionStreamTrace,
+    SearchStreamDiagnostic,
+    SearchStreamTrace,
+)
 from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -3040,6 +3044,26 @@ async def openai_stream_events(
 async def _openai_stream_events(
     events: AsyncIterator[Mapping[str, Any]], *, reasoning_state: str = "inline"
 ) -> AsyncIterator[ModelStreamEvent]:
+    trace = FunctionStreamTrace()
+    parsed_events = _openai_stream_events_impl(
+        events, reasoning_state=reasoning_state, function_trace=trace
+    )
+    try:
+        async with aclosing_provider_stream(parsed_events):
+            async for event in parsed_events:
+                yield event
+    except OpenAIProtocolError as exc:
+        if trace.has_function and exc.stream_diagnostic is None:
+            exc.stream_diagnostic = trace.snapshot()
+        raise
+
+
+async def _openai_stream_events_impl(
+    events: AsyncIterator[Mapping[str, Any]],
+    *,
+    reasoning_state: str,
+    function_trace: FunctionStreamTrace,
+) -> AsyncIterator[ModelStreamEvent]:
     pending_function_calls: dict[int, _PendingFunctionCall] = {}
     pending_reasoning_items: set[int] = set()
     pending_web_search_calls: dict[int, tuple[str, str]] = {}
@@ -3063,7 +3087,16 @@ async def _openai_stream_events(
                 reason_code="stream_event_must_be_a_json_object",
             )
         search_trace.record(event, pending_web_search_calls, fallback_output_items, response_id)
+        function_trace.record(event, pending_function_calls, fallback_output_items, response_id)
         event_type = event.get("type")
+        if completed:
+            raise OpenAIProtocolError(
+                "OpenAI stream mutated after terminal response.",
+                reason_code="stream_event_arrived_after_terminal_response",
+            )
+        _validate_function_stream_boundary(
+            event, pending_function_calls, fallback_output_items, response_id
+        )
         if event_type == "cayu.internal.transport_cancelled":
             for call_id, _status in pending_web_search_calls.values():
                 yield _web_search_outcome_unknown_event(call_id)
@@ -3151,6 +3184,18 @@ async def _openai_stream_events(
             continue
         if event_type == "response.output_item.added":
             item = event.get("item")
+            if isinstance(item, Mapping) and item.get("type") == "function_call":
+                output_index = _stream_output_index(event)
+                if (
+                    output_index in pending_replay_items
+                    or output_index in pending_reasoning_items
+                    or output_index in pending_web_search_calls
+                    or output_index in pending_tool_search_calls
+                ):
+                    raise OpenAIProtocolError(
+                        "OpenAI function call output index changed item type.",
+                        reason_code="function_call_output_index_type_mismatch",
+                    )
             reasoning_added = False
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
                 output_index = _stream_output_index(event)
@@ -4463,12 +4508,23 @@ def _stream_terminal_events(
                 reason_code="terminal_web_search_evidence_conflicts_with_lifecycle_evidence",
             )
 
+    for output_index, item in fallback_output_items.items():
+        if (
+            item.get("type") == "function_call"
+            and output_index not in excluded_output_indexes
+            and output_index not in terminal_function_calls
+        ):
+            raise OpenAIProtocolError(
+                "OpenAI terminal response omitted completed function call evidence.",
+                reason_code="terminal_response_omitted_completed_function_call_evidence",
+            )
+
     terminal_events: list[ModelStreamEvent] = []
     for output_index, terminal_item in terminal_function_calls.items():
         fallback_item = fallback_output_items.get(output_index)
         if fallback_item is not None and any(
             fallback_item.get(key) != terminal_item.get(key)
-            for key in ("type", "id", "call_id", "name", "arguments", "status")
+            for key in ("type", "id", "call_id", "name", "arguments")
         ):
             raise OpenAIProtocolError(
                 "OpenAI terminal function-call evidence conflicts with lifecycle evidence.",
@@ -4748,9 +4804,11 @@ def _record_stream_output_item_done(
                 "OpenAI function_call output_item.done arrived before arguments completion.",
                 reason_code="function_call_output_item_done_arrived_before_arguments_completion",
             )
+        # Both items already passed completion validation. An omitted optional
+        # status is equivalent to completed, not an identity contradiction.
         if existing is not None and any(
             existing.get(key) != item.get(key)
-            for key in ("type", "id", "call_id", "name", "arguments", "status")
+            for key in ("type", "id", "call_id", "name", "arguments")
         ):
             raise OpenAIProtocolError(
                 "OpenAI function_call output_item.done conflicts with streamed arguments.",
@@ -4874,6 +4932,87 @@ def _reconcile_fallback_visible_text(
         )
 
 
+def _validate_function_stream_boundary(
+    event: Mapping[str, Any],
+    pending: Mapping[int, _PendingFunctionCall],
+    finished: Mapping[int, Mapping[str, Any]],
+    response_id: str | None,
+) -> None:
+    """Validate supplied identities and distinguish missing from consumed registration."""
+    kind = event.get("type")
+    item = event.get("item")
+    is_function = kind in {
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+    } or (isinstance(item, Mapping) and item.get("type") == "function_call")
+    response = event.get("response")
+    incoming_response_id = (
+        response.get("id") if isinstance(response, Mapping) else event.get("response_id")
+    )
+    if (
+        response_id is not None
+        and incoming_response_id is not None
+        and (is_function or kind in {"response.completed", "response.incomplete"})
+        and incoming_response_id != response_id
+    ):
+        raise OpenAIProtocolError(
+            "OpenAI stream emitted conflicting response identities.",
+            reason_code="stream_emitted_conflicting_response_identities",
+        )
+    if not is_function:
+        if kind in {"response.output_item.added", "response.output_item.done"}:
+            index = _stream_output_index(event)
+            existing = finished.get(index)
+            if index in pending or (
+                existing is not None and existing.get("type") == "function_call"
+            ):
+                raise OpenAIProtocolError(
+                    "OpenAI function call output index changed item type.",
+                    reason_code="function_call_output_index_type_mismatch",
+                )
+        return
+    index = _stream_output_index(event)
+    existing = finished.get(index)
+    if existing is not None:
+        if existing.get("type") != "function_call":
+            raise OpenAIProtocolError(
+                "OpenAI function call output index changed item type.",
+                reason_code="function_call_output_index_type_mismatch",
+            )
+        reason = {
+            "response.output_item.added": "function_call_output_item_added_was_repeated",
+            "response.function_call_arguments.delta": "function_call_arguments_delta_arrived_after_arguments_done",
+            "response.function_call_arguments.done": "function_call_arguments_done_was_repeated",
+        }.get(kind if isinstance(kind, str) else "")
+        if reason is not None:
+            raise OpenAIProtocolError(
+                "OpenAI function registration was already completed.", reason_code=reason
+            )
+    if kind == "response.output_item.added":
+        item_id = _mapping_optional_string(item, "id")
+        call_id = _mapping_optional_string(item, "call_id")
+        if any(
+            other_index != index
+            and (
+                (item_id is not None and other.item_id == item_id)
+                or (call_id is not None and other.call_id == call_id)
+            )
+            for other_index, other in pending.items()
+        ) or any(
+            other_index != index
+            and other.get("type") == "function_call"
+            and (
+                (item_id is not None and other.get("id") == item_id)
+                or (call_id is not None and other.get("call_id") == call_id)
+            )
+            for other_index, other in finished.items()
+        ):
+            raise OpenAIProtocolError(
+                "OpenAI function call identity was reused.",
+                reason_code="function_call_identity_was_reused",
+            )
+
+
 def _record_stream_function_call_delta(
     event: Mapping[str, Any],
     pending_function_calls: dict[int, _PendingFunctionCall],
@@ -4886,7 +5025,7 @@ def _record_stream_function_call_delta(
             reason_code="function_call_arguments_delta_arrived_before_output_item_added",
         )
     item_id = _mapping_optional_string(event, "item_id")
-    if pending.item_id is not None and item_id is not None and pending.item_id != item_id:
+    if pending.item_id is not None and "item_id" in event and pending.item_id != item_id:
         raise OpenAIProtocolError(
             "OpenAI function_call_arguments.delta item_id mismatch.",
             reason_code="function_call_arguments_delta_item_id_mismatch",
@@ -4912,10 +5051,27 @@ def _stream_function_call_event(
             reason_code="function_call_arguments_done_arrived_before_output_item_added",
         )
     item_id = _mapping_optional_string(event, "item_id")
-    if pending.item_id is not None and item_id is not None and pending.item_id != item_id:
+    if pending.item_id is not None and "item_id" in event and pending.item_id != item_id:
         raise OpenAIProtocolError(
             "OpenAI function_call_arguments.done item_id mismatch.",
             reason_code="function_call_arguments_done_item_id_mismatch",
+        )
+    for field, expected in (("name", pending.name), ("call_id", pending.call_id)):
+        if field in event and _mapping_optional_string(event, field) != expected:
+            raise OpenAIProtocolError(
+                "OpenAI function argument completion identity mismatch.",
+                reason_code=f"function_call_arguments_done_{field}_mismatch",
+            )
+    completed_arguments = event.get("arguments")
+    streamed_arguments = pending.arguments
+    if (
+        isinstance(completed_arguments, str)
+        and streamed_arguments
+        and completed_arguments != streamed_arguments
+    ):
+        raise OpenAIProtocolError(
+            "OpenAI function argument completion conflicts with streamed arguments.",
+            reason_code="function_call_arguments_done_conflicts_with_streamed_arguments",
         )
     call_id = _first_nonblank_string(pending.call_id)
     name = _first_nonblank_string(

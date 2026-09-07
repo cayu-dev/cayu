@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import httpx
 import pytest
+from tests.providers._responses_sse import ChunkedSSE
 
 from cayu import (
     AgentSpec,
@@ -90,15 +91,6 @@ def normal():
         done(),
         terminal(),
     ]
-
-
-class ChunkedSSE(httpx.AsyncByteStream):
-    def __init__(self, events):
-        self.body = b"".join(f"data: {json.dumps(event)}\n\n".encode() for event in events)
-
-    async def __aiter__(self):
-        for offset in range(0, len(self.body), 23):
-            yield self.body[offset : offset + 23]
 
 
 async def run_sse(tmp_path, attempts):
