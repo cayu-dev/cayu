@@ -5,14 +5,15 @@ import contextlib
 import os
 import signal
 import subprocess
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
 from cayu._validation import require_durable_clean_nonblank, require_durable_text
+from cayu.runners._cleanup import _cleanup_artifact
 from cayu.runners._diagnostics import tag_runner_failure_phase
 from cayu.runners._redacted_output import RedactedOutputCapture
-from cayu.runners.base import ExecResult
+from cayu.runners.base import ExecResult, attach_cancellation_artifacts
 from cayu.vaults import SecretRedactor
 from cayu.vaults.redaction import _bounded_redacted_head
 
@@ -34,6 +35,20 @@ _TASKKILL_ENV_KEYS = (
 )
 
 _BinaryIOResultT = TypeVar("_BinaryIOResultT")
+
+
+class _SubprocessIO:
+    """Retain stream failures even when a task propagates cancellation."""
+
+    failed = False
+
+    async def observe(self, operation: Awaitable[None]) -> None:
+        try:
+            await operation
+        except BaseException as error:
+            if not isinstance(error, asyncio.CancelledError) or error.__cause__ is not None:
+                self.failed = True
+            raise
 
 
 class _BinaryOutputCapture:
@@ -162,8 +177,13 @@ async def run_subprocess(
     output_limit_bytes: int | None = None,
     output_redactor: SecretRedactor | None = None,
     start_new_session: bool | None = None,
+    report_cleanup: bool = False,
 ) -> ExecResult:
-    """Run a subprocess with bounded output, timeout, and cancellation cleanup."""
+    """Run a subprocess with bounded output, timeout, and cancellation cleanup.
+
+    Only LocalRunner opts into report_cleanup: killing a local adapter helper
+    does not establish quiescence of the remote command that helper launched.
+    """
 
     if type(command) is not SubprocessCommand:
         raise TypeError("run_subprocess command must be a SubprocessCommand.")
@@ -277,14 +297,20 @@ async def run_subprocess(
         else _BinaryOutputCapture(binary_output, limit=binary_output_limit)
     )
     stderr = RedactedOutputCapture(redactor=redactor, limit=output_limit)
-    stdin_task = asyncio.create_task(_write_stdin(process, input_bytes, input_stream=binary_input))
-    stdout_task = asyncio.create_task(
-        _read_limited(process.stdout, stdout)
-        if binary_stdout is None
-        else _read_binary_limited(process.stdout, binary_stdout)
+    io_state = _SubprocessIO()
+    stdin_task = asyncio.create_task(
+        io_state.observe(_write_stdin(process, input_bytes, input_stream=binary_input))
     )
-    stderr_task = asyncio.create_task(_read_limited(process.stderr, stderr))
+    stdout_task = asyncio.create_task(
+        io_state.observe(
+            _read_limited(process.stdout, stdout)
+            if binary_stdout is None
+            else _read_binary_limited(process.stdout, binary_stdout)
+        )
+    )
+    stderr_task = asyncio.create_task(io_state.observe(_read_limited(process.stderr, stderr)))
     wait_task = asyncio.create_task(process.wait())
+    cleanup_complete = False
     try:
         completed, _ = await asyncio.wait(
             (stdin_task, stdout_task, stderr_task, wait_task),
@@ -314,9 +340,9 @@ async def run_subprocess(
                 io_failure=io_failure,
             )
             raise io_failure
-        timed_out = wait_task not in completed
+        timed_out = len(completed) != 4
         if timed_out:
-            await _kill_timed_out_process(
+            cleanup_complete = await _kill_timed_out_process(
                 process,
                 process_group=use_new_session,
                 stdin_task=stdin_task,
@@ -324,8 +350,19 @@ async def run_subprocess(
                 stderr_task=stderr_task,
                 wait_task=wait_task,
             )
-    except asyncio.CancelledError:
-        await _cleanup_cancelled_process(
+        await _cleanup_io_tasks(stdin_task)
+        if timed_out:
+            await _bounded_drain(
+                process,
+                stdout_task,
+                stderr_task,
+                wait_task,
+                captures=(stdout if binary_stdout is None else binary_stdout, stderr),
+            )
+        else:
+            await asyncio.gather(stdout_task, stderr_task)
+    except asyncio.CancelledError as cancellation:
+        cleanup_complete = await _cleanup_cancelled_process(
             process,
             process_group=use_new_session,
             stdin_task=stdin_task,
@@ -333,23 +370,29 @@ async def run_subprocess(
             stderr_task=stderr_task,
             wait_task=wait_task,
         )
+        if report_cleanup:
+            attach_cancellation_artifacts(
+                cancellation,
+                [
+                    _local_cleanup_artifact(
+                        cleanup_complete and not io_state.failed and cancellation.__cause__ is None
+                    )
+                ],
+            )
         raise
-    finally:
-        await _cleanup_io_tasks(stdin_task)
-
-    if timed_out:
-        # The child was killed and its exit already awaited (bounded); bound the
-        # output drain too so a daemonizing grandchild that inherited the pipes
-        # cannot hold the read tasks open past the wall-clock limit.
-        await _bounded_drain(
-            process,
-            stdout_task,
-            stderr_task,
-            wait_task,
-            captures=(stdout if binary_stdout is None else binary_stdout, stderr),
+    except BaseException as error:
+        cancellation = await _cleanup_io_tasks_resisting_cancellation(
+            stdin_task, stdout_task, stderr_task, wait_task
         )
-    else:
-        await asyncio.gather(stdout_task, stderr_task)
+        if cancellation is not None:
+            raise cancellation from error
+        raise
+
+    cleanup_complete = (
+        cleanup_complete
+        and not io_state.failed
+        and _subprocess_io_settled(process, stdin_task, stdout_task, stderr_task, wait_task)
+    )
     return ExecResult(
         stdout="" if binary_stdout is not None else stdout.text(),
         stderr=stderr.text(),
@@ -357,6 +400,9 @@ async def run_subprocess(
         if process.returncode is not None
         else (-1 if timed_out else 0),
         timed_out=timed_out,
+        artifacts=[_local_cleanup_artifact(cleanup_complete)]
+        if timed_out and report_cleanup
+        else [],
         stdout_truncated=(
             binary_stdout.truncated if binary_stdout is not None else stdout.truncated
         ),
@@ -577,16 +623,17 @@ async def _kill_process(
     process: asyncio.subprocess.Process,
     *,
     process_group: bool,
-) -> None:
+) -> bool:
     if os.name == "posix" and process_group:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-            return
+            return True
         except ProcessLookupError:
-            return
+            return True
     if os.name == "nt" and await _taskkill_tree(process.pid):
-        return
+        return False
     process.kill()
+    return False
 
 
 async def _kill_timed_out_process(
@@ -597,7 +644,7 @@ async def _kill_timed_out_process(
     stdout_task: asyncio.Task[None],
     stderr_task: asyncio.Task[None],
     wait_task: asyncio.Task[int],
-) -> None:
+) -> bool:
     """Kill a timed-out process without letting cancellation strand its I/O tasks."""
     termination_task = asyncio.create_task(
         _kill_process_and_wait(process, process_group=process_group, wait_task=wait_task)
@@ -620,6 +667,7 @@ async def _kill_timed_out_process(
             stdin_task, stdout_task, stderr_task, wait_task
         )
         raise cancellation
+    return termination_task.result()
 
 
 async def _cleanup_cancelled_process(
@@ -630,13 +678,15 @@ async def _cleanup_cancelled_process(
     stdout_task: asyncio.Task[None],
     stderr_task: asyncio.Task[None],
     wait_task: asyncio.Task[int],
-) -> None:
+) -> bool:
     """Finish bounded process teardown while preserving the caller's cancellation."""
     termination_task = asyncio.create_task(
         _kill_process_and_wait(process, process_group=process_group, wait_task=wait_task)
     )
+    complete = False
     try:
         await _await_task_resisting_cancellation(termination_task)
+        complete = termination_task.result()
     except Exception:
         # Cancellation stays authoritative even if the preferred tree cleanup
         # fails unexpectedly. Make one final best-effort direct-child kill.
@@ -644,14 +694,31 @@ async def _cleanup_cancelled_process(
             process.kill()
     finally:
         try:
-            await _cleanup_io_tasks_resisting_cancellation(
+            io_cancellation = await _cleanup_io_tasks_resisting_cancellation(
                 stdin_task, stdout_task, stderr_task, wait_task
             )
+            if io_cancellation is not None and io_cancellation.__cause__ is not None:
+                complete = False
+        except Exception:
+            complete = False
         finally:
             # A cancelled reader may stop after its last data chunk but before
-            # consuming EOF. The child is already terminal here, so close the
-            # remaining pipe transports while their event loop is still alive.
-            _detach_process(process)
+            # consuming EOF. Close remaining pipe transports while the event
+            # loop is alive; closure alone does not prove child termination.
+            detached = _detach_process(process)
+    return (
+        complete
+        and detached
+        and _subprocess_io_settled(process, stdin_task, stdout_task, stderr_task, wait_task)
+    )
+
+
+def _subprocess_io_settled(process: asyncio.subprocess.Process, *tasks: asyncio.Task) -> bool:
+    # A wait created after the leader exits can finish before inherited pipes
+    # close. Require consumed EOF too; cancelling readers is not proof of EOF.
+    return all(
+        stream is None or stream.at_eof() for stream in (process.stdout, process.stderr)
+    ) and all(task.done() and (task.cancelled() or task.exception() is None) for task in tasks)
 
 
 async def _cleanup_failed_subprocess_io(
@@ -686,11 +753,34 @@ async def _kill_process_and_wait(
     *,
     process_group: bool,
     wait_task: asyncio.Task[int],
-) -> None:
-    await _kill_process(process, process_group=process_group)
-    # Bounded (see _await_process_exit): process.wait() only resolves once the
-    # captured pipes reach EOF, so a pipe-holding descendant cannot hang this.
+) -> bool:
+    tree_killed = await _kill_process(process, process_group=process_group)
+    # Bounded (see _await_process_exit): a pending process.wait() can wait for
+    # captured pipe EOF, so a pipe-holding descendant must not hang this.
     await _await_process_exit(wait_task)
+    if not tree_killed or not wait_task.done() or wait_task.cancelled():
+        return False
+    wait_task.result()
+    if process.returncode is None:
+        return False
+    # Killing the leader alone is insufficient. Require the owned POSIX group
+    # to be gone and the wait to have completed. I/O EOF is checked separately.
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _local_cleanup_artifact(complete: bool) -> dict:
+    return _cleanup_artifact(
+        adapter="local",
+        action="kill_command",
+        status="completed" if complete else "failed",
+        timeout_s=_DRAIN_AFTER_KILL_S,
+    )
 
 
 async def _await_task_resisting_cancellation(
@@ -818,7 +908,7 @@ async def _bounded_drain(
         raise
 
 
-def _detach_process(process: asyncio.subprocess.Process) -> None:
+def _detach_process(process: asyncio.subprocess.Process) -> bool:
     """Close the subprocess transport after abandoning a pipe-holding child.
 
     The direct child is already killed; closing the transport releases our pipe
@@ -827,9 +917,12 @@ def _detach_process(process: asyncio.subprocess.Process) -> None:
     """
     transport = getattr(process, "_transport", None)
     if transport is None:
-        return
-    with contextlib.suppress(Exception):
+        return False
+    try:
         transport.close()
+    except Exception:
+        return False
+    return True
 
 
 async def _await_process_exit(wait_task: asyncio.Task[int]) -> None:

@@ -37,6 +37,7 @@ from cayu.runners.base import (
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
     copy_exec_command,
+    runner_workspace_mutation_settlement,
 )
 from cayu.vaults import (
     SecretEnv,
@@ -454,11 +455,19 @@ class LocalRunner(Runner, RunnerBinaryStreamCapability):
             stdout_limit_bytes=stdout_limit_bytes,
             output_limit_bytes=output_limit,
             output_redactor=invocation_redactor,
+            report_cleanup=True,
         )
         # Transfer the raw environment into the subprocess coroutine before
         # crossing an await; this frame must not retain it on cancellation.
         environment = {}
-        result = await subprocess_run
+        try:
+            result = await subprocess_run
+        except BaseException as error:
+            if runner_workspace_mutation_settlement(result=None, error=error) == "uncertain":
+                self._close_exec("local command cleanup could not be confirmed")
+            raise
+        if runner_workspace_mutation_settlement(result=result, error=None) == "uncertain":
+            self._close_exec("local command cleanup could not be confirmed")
         return redact_exec_result(result, resolved_secrets)
 
     def resolve_cwd(self, cwd: str | None = None) -> str:

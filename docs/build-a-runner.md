@@ -130,6 +130,29 @@ cleanup is still owned asynchronously, report `status="deferred"`, implement
 only when cancelling that waiter stops observation without cancelling or
 releasing the underlying cleanup owner.
 
+### LocalRunner interruption evidence
+
+On POSIX, `LocalRunner` reports completed command cleanup only after killing its
+owned process group, observing that the group is gone, reaping the direct child,
+and settling stdin/stdout/stderr with consumed output EOF and no observed I/O
+failure. Timeout results carry the receipt in `ExecResult.artifacts`;
+cancellation carries it on the original `CancelledError`. A registered native
+`workspace_mutation=True` tool can then use supported workspace operations in
+`finally` to remove its exact invocation-owned temporary files. A completed
+cleanup receipt proves quiescence within this process-group boundary, not command
+success or rollback of filesystem effects. Timeout and cancellation retain their
+original outcome.
+
+Local execution is not process containment: commands must keep descendants in
+the owned group. Processes deliberately escaping that group and closing inherited
+pipes cannot be tracked by this boundary; use a containing runner for such work.
+An escaped descendant retaining a pipe, an unconfirmed kill, or failed I/O
+shutdown cannot receive a completed receipt. LocalRunner keeps cleanup owned
+through repeated cancellation and blocking stream I/O; it does not publish a
+successful receipt while cleanup is pending. Unproven interruption closes its
+exec lane and native mutation access remains fail-closed. Windows tree cleanup
+still runs, but does not supply the POSIX proof required for a completed receipt.
+
 ## Build a ModalRunner, step by step
 
 Follow [`examples/modal_runner.py`](../examples/modal_runner.py).

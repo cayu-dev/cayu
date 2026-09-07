@@ -18,7 +18,7 @@ RUNNER_CLEANUP_ARTIFACT_TYPE = "cayu.runner_cleanup.v1"
 RunnerCleanupPolicy = Literal["command", "sandbox", "none"]
 DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY: RunnerCleanupPolicy = "command"
 DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY: RunnerCleanupPolicy = "command"
-_KNOWN_CLEANUP_ADAPTERS = frozenset({"docker", "e2b", "lambda-microvm", "microsandbox"})
+_KNOWN_CLEANUP_ADAPTERS = frozenset({"docker", "e2b", "lambda-microvm", "local", "microsandbox"})
 _KNOWN_CLEANUP_ACTIONS = frozenset({"kill_command", "kill_sandbox", "none"})
 _KNOWN_CLEANUP_STATUSES = frozenset(
     {"completed", "deferred", "failed", "skipped", "timeout", "unsupported"}
