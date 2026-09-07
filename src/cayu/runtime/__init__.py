@@ -439,6 +439,12 @@ from cayu.runtime.execution_units import (
     copy_tool_round_identity,
     new_model_step_identity,
 )
+from cayu.runtime.exports import (
+    SessionExportBoundary,
+    SessionExportLimits,
+    SessionExportSnapshot,
+    SessionExportTooLarge,
+)
 from cayu.runtime.hooks import (
     AfterToolCallDecision,
     BeforeToolCallDecision,
@@ -1720,6 +1726,10 @@ __all__ = [
     "SessionCostSummary",
     "SessionDebugState",
     "SessionExecutionSource",
+    "SessionExportBoundary",
+    "SessionExportLimits",
+    "SessionExportSnapshot",
+    "SessionExportTooLarge",
     "SessionForkProfileRelationship",
     "SessionIdentity",
     "SessionInspectionIdentity",

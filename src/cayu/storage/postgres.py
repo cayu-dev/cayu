@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
+    from cayu.runtime.exports import SessionExportLimits, SessionExportSnapshot
 
 try:
     from psycopg import AsyncConnection, sql
@@ -33239,6 +33240,109 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 raise
             return loaded.model_copy(
                 update={"updated_at": updated_at, "last_activity_at": activity_at}
+            )
+
+    async def load_session_export_snapshot(
+        self,
+        session_id: str,
+        *,
+        limits: SessionExportLimits | None = None,
+    ) -> SessionExportSnapshot | None:
+        from cayu.runtime.exports import SESSION_EXPORT_PAGE_SIZE, SessionExportBuilder
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        from cayu.storage._session_export_sql import export_size_statement
+
+        builder = SessionExportBuilder(limits)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            statement, parameter_count = export_size_statement(postgres=True)
+            await cur.execute(statement, (session_id,) * parameter_count)
+            sizes = await cur.fetchone()
+            builder.preflight_bytes(int(sizes[0]), int(sizes[1]))
+            session = await self._load(cur, session_id)
+            if session is None:
+                return None
+            cursor = await _transcript_cursor(cur, session_id)
+            checkpoint = await self._load_checkpoint(cur, session_id)
+            async with conn.cursor(name=f"session_export_events_{uuid4().hex}") as rows:
+                await rows.execute(
+                    "SELECT sequence, event FROM cayu_events WHERE session_id = %s ORDER BY sequence",
+                    (session_id,),
+                )
+                while page := await rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    for row in page:
+                        builder.event(
+                            EventRecord(sequence=row[0], event=Event(**_json_obj(row[1])))
+                        )
+            async with conn.cursor(name=f"session_export_transcript_{uuid4().hex}") as rows:
+                await rows.execute(
+                    "SELECT session_order, interaction_id, message FROM cayu_transcript_messages "
+                    "WHERE session_id = %s ORDER BY session_order",
+                    (session_id,),
+                )
+                while page := await rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    for row in page:
+                        builder.message(
+                            TranscriptRecord(
+                                index=row[0] - 1,
+                                interaction_id=row[1],
+                                message=Message(**_json_obj(row[2])),
+                            )
+                        )
+            await cur.execute(
+                "SELECT interaction_id, source_messages FROM cayu_deferred_interaction_inputs "
+                "WHERE session_id = %s",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            deferred = (
+                None
+                if row is None
+                else deferred_interaction_input_from_storage_payload(row[0], _json_obj(row[1]))
+            )
+            codec = self.public_authority_alias_codec
+            grants = []
+            uses = []
+            async with conn.cursor(name=f"session_export_grants_{uuid4().hex}") as rows:
+                await rows.execute(
+                    "SELECT grant_id, session_id, interaction_id, request_id, tool_ref, "
+                    "generation_id, tool_id, tool_name, catalogue_revision, descriptor_version, "
+                    "issued_at, expires_at, max_calls, used_calls, revoked_at, record "
+                    "FROM cayu_targeted_tool_grants WHERE session_id = %s ORDER BY issued_at, grant_id",
+                    (session_id,),
+                )
+                while page := await rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    for row in page:
+                        if codec is None:
+                            raise RuntimeError(
+                                "Exporting targeted grants requires an authority alias codec."
+                            )
+                        grant = targeted_tool_grant_with_active_reference(
+                            _targeted_tool_grant_from_postgres_row(row), codec
+                        )
+                        builder.charge(grant.model_dump(mode="json"))
+                        grants.append(grant)
+            async with conn.cursor(name=f"session_export_uses_{uuid4().hex}") as rows:
+                await rows.execute(
+                    "SELECT use_id, grant_id, session_id, interaction_id, model_step_id, "
+                    "outer_tool_call_id, arguments_sha256, invocation_id, bound_at, record "
+                    "FROM cayu_targeted_tool_grant_uses WHERE session_id = %s ORDER BY bound_at, use_id",
+                    (session_id,),
+                )
+                while page := await rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    for row in page:
+                        use = _targeted_tool_use_from_postgres_row(row)
+                        builder.charge(use.model_dump(mode="json"))
+                        uses.append(use)
+            return builder.finish(
+                session=session,
+                transcript_cursor=cursor,
+                checkpoint=checkpoint,
+                deferred=deferred,
+                grants_charged=True,
+                grants=TargetedToolGrantStateSnapshot(records=tuple(grants), uses=tuple(uses)),
             )
 
     async def load_events(self, session_id: str) -> list[Event]:

@@ -40,13 +40,19 @@ from cayu._validation import (
 )
 from cayu.core import Event, EventType, Message
 from cayu.runtime.checkpoints import decode_runtime_checkpoint
+from cayu.runtime.exports import (
+    SessionExportBoundary,
+    SessionExportLimits,
+    SessionExportSnapshot,
+    validate_export_boundary,
+    validate_export_ownership,
+)
 from cayu.runtime.sessions import (
     DeferredInteractionInput,
     Session,
     SessionOrder,
     SessionQuery,
     SessionStore,
-    TranscriptQuery,
     TranscriptRecord,
     restore_persisted_event_authority,
 )
@@ -81,14 +87,20 @@ def _write_line(stream: _TextStream, obj: dict[str, Any]) -> None:
     stream.write(json.dumps(portable, ensure_ascii=False, allow_nan=False) + "\n")
 
 
-async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
+async def export_sessions(
+    store: SessionStore,
+    *,
+    stream: _TextStream,
+    limits: SessionExportLimits | None = None,
+) -> int:
     """Export every session in ``store`` as JSONL, one session per line.
 
-    Each line is a ``{"type": "session", ...}`` object bundling the session
+    Each line is a version-2 ``{"type": "session", ...}`` snapshot bundling the session
     record with its events, attributed transcript records, and latest
     checkpoint::
 
-        {"type": "session", "session": {...}, "events": [...],
+        {"type": "session", "format_version": 2, "snapshot": {...},
+         "session": {...}, "events": [...],
          "transcript_records": [...],
          "checkpoint": {...} | null,
          "deferred_interaction_input": {...} | null}
@@ -96,7 +108,9 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
     Sessions are emitted oldest-first by creation time. Paging uses a keyset
     cursor (see the module docstring), so concurrent inserts and deletes cannot
     make the walk skip or duplicate a session. Returns the number of sessions
-    written.
+    written. Each session has its own bounded read transaction or store lock;
+    no transaction remains open while the line is written. Limits reject an
+    oversized session before any part of its line is emitted.
     """
     count = 0
     cursor: str | None = None
@@ -109,62 +123,16 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
             )
         )
         for session in result.sessions:
-            events = await store.load_events(session.id)
-            transcript_records = await _load_transcript_records(store, session.id)
-            checkpoint = decode_runtime_checkpoint(
-                await store.load_checkpoint(session.id),
-                session_id=session.id,
-            )
-            deferred_interaction_input = await store.load_deferred_interaction_input(session.id)
-            targeted_tool_grant_state = (
-                await store.load_targeted_tool_grant_state(session.id)
-                if store.supports_targeted_tool_grants
-                else TargetedToolGrantStateSnapshot()
-            )
-            _write_line(
-                stream,
-                {
-                    "type": "session",
-                    "session": session.model_dump(mode="json"),
-                    "events": [event.model_dump(mode="json") for event in events],
-                    "transcript_records": [
-                        record.model_dump(mode="json") for record in transcript_records
-                    ],
-                    "checkpoint": checkpoint,
-                    "deferred_interaction_input": (
-                        None
-                        if deferred_interaction_input is None
-                        else deferred_interaction_input.model_dump(mode="json")
-                    ),
-                    "targeted_tool_grant_state": targeted_tool_grant_state.model_dump(mode="json"),
-                },
-            )
+            snapshot = await store.load_session_export_snapshot(session.id, limits=limits)
+            if snapshot is None:
+                continue  # Deleted after enumeration, before its snapshot.
+            if type(snapshot) is not SessionExportSnapshot or snapshot.session.id != session.id:
+                raise ValueError("Session store returned another export snapshot identity.")
+            _write_line(stream, snapshot.document())
             count += 1
         cursor = result.next_cursor
         if cursor is None:
             return count
-
-
-async def _load_transcript_records(
-    store: SessionStore,
-    session_id: str,
-) -> list[TranscriptRecord]:
-    records: list[TranscriptRecord] = []
-    offset = 0
-    while True:
-        page = await store.query_transcript(
-            TranscriptQuery(
-                session_id=session_id,
-                offset=offset,
-                limit=_EXPORT_PAGE_SIZE,
-            )
-        )
-        if not page.records:
-            return records
-        records.extend(page.records)
-        offset += len(page.records)
-        if offset >= page.total_records:
-            return records
 
 
 async def export_tasks(store: TaskStore, *, stream: _TextStream) -> int:
@@ -225,6 +193,7 @@ class ImportedSession:
     checkpoint: dict[str, Any] | None
     deferred_interaction_input: DeferredInteractionInput | None
     targeted_tool_grant_state: TargetedToolGrantStateSnapshot
+    boundary: SessionExportBoundary | None = None
 
 
 def _iter_json_lines(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
@@ -282,8 +251,15 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
         for required_field in _SESSION_RECORD_FIELDS:
             if required_field not in obj:
                 raise ValueError(f"Session record is missing {required_field}.")
-        if obj.keys() != _SESSION_RECORD_FIELDS:
-            raise ValueError("Session record contains unsupported fields.")
+        version = obj.get("format_version", 1)
+        if type(version) is not int or version not in {1, 2}:
+            raise ValueError("Unsupported session export format_version.")
+        expected_fields = _SESSION_RECORD_FIELDS
+        if version == 2:
+            expected_fields = expected_fields | {"format_version", "snapshot"}
+        if obj.keys() != expected_fields:
+            raise ValueError("Session record contains missing or unsupported fields.")
+        boundary = None if version == 1 else SessionExportBoundary.model_validate(obj["snapshot"])
         session = Session.model_validate(obj["session"])
         checkpoint = decode_runtime_checkpoint(
             obj["checkpoint"],
@@ -312,6 +288,24 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
             )
             for event in obj["events"]
         ]
+        if any(event.session_id != session.id for event in events) or len(
+            {event.id for event in events}
+        ) != len(events):
+            raise ValueError("Session export has conflicting event identities.")
+        deferred = (
+            None
+            if obj["deferred_interaction_input"] is None
+            else DeferredInteractionInput.model_validate(obj["deferred_interaction_input"])
+        )
+        validate_export_ownership(session, events, deferred, targeted_tool_grant_state)
+        if boundary is not None:
+            validate_export_boundary(
+                session=session,
+                events=events,
+                transcript_records=transcript_records,
+                checkpoint=checkpoint,
+                boundary=boundary,
+            )
         records_by_interaction: dict[str, list] = {}
         for record in targeted_tool_grant_state.records:
             records_by_interaction.setdefault(record.interaction_id, []).append(record)
@@ -339,12 +333,9 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
             transcript=transcript,
             transcript_records=transcript_records,
             checkpoint=checkpoint,
-            deferred_interaction_input=(
-                None
-                if obj["deferred_interaction_input"] is None
-                else DeferredInteractionInput.model_validate(obj["deferred_interaction_input"])
-            ),
+            deferred_interaction_input=deferred,
             targeted_tool_grant_state=targeted_tool_grant_state,
+            boundary=boundary,
         )
 
 

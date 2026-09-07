@@ -57,6 +57,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionRequest,
     )
     from cayu.runtime.evidence_spool import EvidenceSpool
+    from cayu.runtime.exports import SessionExportLimits, SessionExportSnapshot
 
 from pydantic import (
     BaseModel,
@@ -11301,6 +11302,19 @@ class SessionStore(ABC):
             f"{type(self).__name__} does not support durable model-completion stages."
         )
 
+    async def load_session_export_snapshot(
+        self,
+        session_id: str,
+        *,
+        limits: SessionExportLimits | None = None,
+    ) -> SessionExportSnapshot | None:
+        """Read all export-owned components at one bounded per-session snapshot.
+
+        Return None if the session has been deleted. No sequential-read fallback
+        is safe for custom stores: implement one lock or database snapshot.
+        """
+        raise NotImplementedError("This SessionStore does not support consistent exports.")
+
     @abstractmethod
     async def load_events(self, session_id: str) -> list[Event]:
         """Load all events for a session."""
@@ -18096,6 +18110,62 @@ class InMemorySessionStore(SessionStore):
             receipt=receipt,
             replayed=False,
         )
+
+    async def load_session_export_snapshot(
+        self,
+        session_id: str,
+        *,
+        limits: SessionExportLimits | None = None,
+    ) -> SessionExportSnapshot | None:
+        from cayu.runtime.exports import SessionExportBuilder
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        builder = SessionExportBuilder(limits)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            for record in self._session_event_records.get(session_id, ()):
+                builder.event(record)
+            for index, message in enumerate(self._transcripts.get(session_id, ())):
+                builder.message(
+                    TranscriptRecord(
+                        index=index,
+                        message=message,
+                        interaction_id=self._transcript_interaction_ids[session_id][index],
+                    )
+                )
+            codec = self.public_authority_alias_codec
+            records = []
+            uses = []
+            for grant_id in self._targeted_tool_grant_ids_by_session.get(session_id, ()):
+                if codec is None:
+                    raise RuntimeError(
+                        "Exporting targeted grants requires an authority alias codec."
+                    )
+                record = targeted_tool_grant_with_active_reference(
+                    self._targeted_tool_grants[grant_id],
+                    codec,
+                )
+                builder.charge(record.model_dump(mode="json"))
+                records.append(record)
+                for binding in self._targeted_tool_uses.get(grant_id, {}).values():
+                    builder.charge(binding.model_dump(mode="json"))
+                    uses.append(binding.model_copy(deep=True))
+            records.sort(key=lambda record: (record.issued_at, record.grant_id))
+            uses.sort(key=lambda binding: (binding.bound_at, binding.use_id))
+            deferred = self._deferred_interaction_inputs.get(session_id)
+            checkpoint = self._checkpoints.get(session_id)
+            return builder.finish(
+                session=session,
+                transcript_cursor=len(self._transcripts.get(session_id, ())),
+                checkpoint=None
+                if checkpoint is None
+                else copy_durable_json_object(checkpoint, "checkpoint"),
+                deferred=None if deferred is None else deferred.model_copy(deep=True),
+                grants_charged=True,
+                grants=TargetedToolGrantStateSnapshot(records=tuple(records), uses=tuple(uses)),
+            )
 
     async def load_events(self, session_id: str) -> list[Event]:
         session_id = require_clean_nonblank(session_id, "session_id")

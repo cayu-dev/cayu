@@ -3775,7 +3775,53 @@ Hook helper side effects are persisted and sent to event sinks; the parent run s
 
 `SQLiteSessionStore` is the durable local implementation. New projects conventionally place session, task, and knowledge tables in one `data/cayu.db`; applications may select a different path explicitly. It stores sessions, append-only events, provider-neutral transcript messages, and the latest checkpoint in SQLite, while keeping session identity and event identity fields queryable as columns. Session identity includes agent, provider, active model, runtime, environment, and parent session. Event identity includes event type, agent, environment, workflow, and tool. `InMemorySessionStore` remains for tests and small examples. Hosted use can later provide a different `SessionStore`, such as Postgres, without changing runtime behavior.
 
-JSONL is available from bounded CLI inspection and complete storage exports. A session export uses `transcript_records` as its canonical transcript representation; every record carries a stable absolute index and nullable `interaction_id`. The export also includes any private deferred interaction input in addition to visible transcript records, events, and checkpoint. Imports require both fields and reject the pre-release unversioned shape instead of silently discarding interaction attribution or deferred input. Session import is an explicit trusted-backup boundary: it restores Cayu's fixed allowlist of runtime-owned durable event fields so the events retain their resume semantics when appended to another store. Do not restore JSONL obtained from an untrusted source. JSONL should not be the primary Cayu session store because dashboards, replay, task orchestration, retries, and hosted runtimes need indexed structured queries and transactional state updates.
+JSONL is available from bounded CLI inspection and portable storage exports.
+`export_sessions(store, stream=..., limits=SessionExportLimits(...))` emits
+`format_version: 2`. Each line contains one `SessionExportSnapshot`: session
+metadata, events, retained attributed transcript records, checkpoint, private
+deferred interaction input, and targeted grant/use state from the same store
+snapshot. Session enumeration uses keyset pages; the session is read again inside
+its own snapshot, and a session deleted after enumeration is skipped. There is
+no export-wide transaction or shared watermark across different sessions.
+
+`SessionStore.load_session_export_snapshot(session_id, limits=...)` returns that
+snapshot, or `None` for an absent session. Memory captures it under its store
+lock; SQLite uses one read transaction; PostgreSQL uses one repeatable-read
+transaction and named server cursors. Readers fetch at most 256 rows at a time.
+`SessionExportLimits` defaults to 64 MiB for one session's serialized components
+and output, and 8 MiB for one component/row. SQL checks source byte counts before
+hydrating payloads; all backends charge components before retaining them and
+check the complete encoded output. Codec temporaries and typed-object overhead
+are additional to these serialized-byte ceilings. Exceeding a ceiling raises
+`SessionExportTooLarge` before writing any part of that session's line. Earlier
+complete lines remain valid. Custom stores must implement the snapshot contract;
+independent component reads are not a safe fallback.
+
+The line's `snapshot` field records source event sequences, the included event
+watermark, and the permanent transcript append cursor. `transcript_records`
+retain their absolute indices and nullable `interaction_id`, including gaps
+left by retention. Runtime checkpoint compaction/tool-round cursors cannot exceed
+that cursor; model completion and embedded operation event references must occur
+in the included event prefix. Export and import validate these relationships.
+Application-owned opaque checkpoint payloads are preserved without interpreting
+their private reference conventions. Source event sequences are export evidence,
+not destination-store sequence assignments.
+
+`import_sessions` validates each line before yielding an `ImportedSession` to a
+caller that may restore it. Version 2 requires its explicit snapshot boundary and
+rejects mismatched identities, non-increasing event positions, missing referenced
+events, and checkpoint cursors beyond the transcript boundary. The preceding
+attributed JSONL shape remains readable with `ImportedSession.boundary=None`;
+import does not invent historical snapshot proof for those older exports. The
+older pre-release shape without attributed transcript or deferred-input fields
+remains unsupported. Pending-message queue rows and independent store closure
+are separate from this per-session snapshot contract.
+
+Session import is an explicit trusted-backup boundary: it restores Cayu's fixed
+allowlist of runtime-owned durable event fields so the events retain their
+resume semantics when appended to another store. Do not restore JSONL obtained
+from an untrusted source. JSONL should not be the primary Cayu session store;
+live execution requires indexed queries and transactional state updates.
 
 Session stores expose two read surfaces:
 

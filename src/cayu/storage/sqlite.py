@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
+    from cayu.runtime.exports import SessionExportLimits, SessionExportSnapshot
 
 from pydantic import ValidationError
 
@@ -10082,6 +10083,104 @@ class SQLiteSessionStore(SessionStore):
             )
 
         return await self._run_write(statement)
+
+    async def load_session_export_snapshot(
+        self,
+        session_id: str,
+        *,
+        limits: SessionExportLimits | None = None,
+    ) -> SessionExportSnapshot | None:
+        from cayu.runtime.exports import SESSION_EXPORT_PAGE_SIZE, SessionExportBuilder
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        from cayu.storage._session_export_sql import export_size_statement
+
+        builder = SessionExportBuilder(limits)
+
+        def query(connection: sqlite3.Connection) -> SessionExportSnapshot | None:
+            with connection:
+                connection.execute("BEGIN")
+                statement, parameter_count = export_size_statement(postgres=False)
+                sizes = connection.execute(statement, (session_id,) * parameter_count).fetchone()
+                builder.preflight_bytes(int(sizes[0]), int(sizes[1]))
+                session = _load_session(connection, session_id)
+                if session is None:
+                    return None
+                cursor = _transcript_cursor(connection, session_id)
+                checkpoint = _load_checkpoint_state(connection, session_id)
+                rows = connection.execute(
+                    "SELECT * FROM cayu_events WHERE session_id = ? ORDER BY sequence",
+                    (session_id,),
+                )
+                while page := rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    for row in page:
+                        builder.event(
+                            EventRecord(sequence=row["sequence"], event=_event_from_row(row))
+                        )
+                rows = connection.execute(
+                    "SELECT session_order, interaction_id, message_json FROM cayu_transcript_messages "
+                    "WHERE session_id = ? ORDER BY session_order",
+                    (session_id,),
+                )
+                while page := rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    for row in page:
+                        builder.message(
+                            TranscriptRecord(
+                                index=row["session_order"] - 1,
+                                interaction_id=row["interaction_id"],
+                                message=Message(**json.loads(row["message_json"])),
+                            )
+                        )
+                row = connection.execute(
+                    "SELECT interaction_id, source_messages_json FROM cayu_deferred_interaction_inputs "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                deferred = (
+                    None
+                    if row is None
+                    else deferred_interaction_input_from_storage_payload(
+                        row["interaction_id"],
+                        json.loads(row["source_messages_json"]),
+                    )
+                )
+                codec = self.public_authority_alias_codec
+                grants = []
+                uses = []
+                rows = connection.execute(
+                    "SELECT * FROM cayu_targeted_tool_grants WHERE session_id = ? ORDER BY issued_at, grant_id",
+                    (session_id,),
+                )
+                while page := rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    for row in page:
+                        if codec is None:
+                            raise RuntimeError(
+                                "Exporting targeted grants requires an authority alias codec."
+                            )
+                        grant = targeted_tool_grant_with_active_reference(
+                            _targeted_tool_grant_from_row(row), codec
+                        )
+                        builder.charge(grant.model_dump(mode="json"))
+                        grants.append(grant)
+                rows = connection.execute(
+                    "SELECT * FROM cayu_targeted_tool_grant_uses WHERE session_id = ? ORDER BY bound_at, use_id",
+                    (session_id,),
+                )
+                while page := rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    for row in page:
+                        use = _targeted_tool_use_from_row(row)
+                        builder.charge(use.model_dump(mode="json"))
+                        uses.append(use)
+                return builder.finish(
+                    session=session,
+                    transcript_cursor=cursor,
+                    checkpoint=checkpoint,
+                    deferred=deferred,
+                    grants_charged=True,
+                    grants=TargetedToolGrantStateSnapshot(records=tuple(grants), uses=tuple(uses)),
+                )
+
+        return await self._run_read(query)
 
     async def load_events(self, session_id: str) -> list[Event]:
         session_id = require_clean_nonblank(session_id, "session_id")
