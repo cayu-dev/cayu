@@ -13288,8 +13288,7 @@ class SessionEngine:
                     "Session compaction initial publication claim expired before commit."
                 )
 
-        initial_claim_started_monotonic = time.monotonic()
-        try:
+        async def publish_initial_claim() -> None:
             await self.session_store.publish_session_operation_guarded_with_store_time(
                 loaded_session.id,
                 idempotency_key=request.idempotency_key,
@@ -13301,6 +13300,26 @@ class SessionEngine:
                 expected_run_epoch=request.expected_run_epoch,
                 expected_transcript_cursor=request.expected_transcript_cursor,
             )
+
+        initial_claim_started_monotonic = time.monotonic()
+        initial_claim_reconciled = False
+        try:
+            initial_task = asyncio.create_task(publish_initial_claim())
+            initial_outcome = await self._await_session_operation_store_task(initial_task)
+            initial_error = initial_outcome.error
+            if initial_outcome.timed_out:
+                initial_error = TimeoutError(
+                    "Session compaction initial claim exceeded its bounded store wait."
+                )
+            if initial_outcome.cancellation is not None:
+                raise initial_outcome.cancellation from initial_error
+            if isinstance(initial_error, asyncio.CancelledError):
+                initial_error = unexpected_child_cancellation_error(
+                    initial_error,
+                    operation="Session compaction initial claim publication",
+                )
+            if initial_error is not None:
+                raise initial_error
         except _ExpiredIncompleteRecoveryClaim as expired_claim:
             current = await self._require_session(loaded_session.id)
             fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
@@ -13319,6 +13338,40 @@ class SessionEngine:
             ) from None
         except _SessionCompactionReplay as replay:
             replay_event_ids = replay.event_ids
+        except BaseException as publication_failure:
+            reconciliation = asyncio.create_task(
+                self._reconcile_initial_compaction_claim(
+                    session=loaded_session,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    model_step_id=model_step_identity.model_step_id,
+                    request_digest=request_digest,
+                    started_event=started_event,
+                )
+            )
+            outcome = await self._await_session_operation_store_task(
+                reconciliation,
+                cancellation=(
+                    publication_failure
+                    if isinstance(publication_failure, asyncio.CancelledError)
+                    else None
+                ),
+            )
+            if outcome.cancellation is not None:
+                raise outcome.cancellation from (
+                    publication_failure if outcome.cancellation is not publication_failure else None
+                )
+            if outcome.timed_out or outcome.error is not None or outcome.result is None:
+                publication_failure.add_note(
+                    "Initial compaction claim acknowledgement could not be reconciled; "
+                    "ownership remains unproven and no provider work was started."
+                )
+                raise publication_failure
+            if not isinstance(publication_failure, Exception):
+                raise publication_failure
+            claimed_checkpoint, claimed_operation_expires_at = outcome.result
+            initial_claim_reconciled = True
         if replay_event_ids is not None:
             for event in await self._load_session_compaction_replay_events(
                 session_id=loaded_session.id,
@@ -13330,12 +13383,13 @@ class SessionEngine:
             raise AssertionError("New session compaction did not persist its operation claim.")
         if claimed_operation_expires_at is None:
             raise AssertionError("New session compaction did not persist its claim expiry.")
-        claimed_operation_expires_at = await self._reconcile_compaction_operation_claim_expiry(
-            session_id=loaded_session.id,
-            idempotency_key=request.idempotency_key,
-            operation_id=operation_id,
-            attempt_id=attempt_id,
-        )
+        if not initial_claim_reconciled:
+            claimed_operation_expires_at = await self._reconcile_compaction_operation_claim_expiry(
+                session_id=loaded_session.id,
+                idempotency_key=request.idempotency_key,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+            )
         compaction_invocation_checkpoint = project_compaction_invocation_checkpoint(
             claimed_checkpoint,
             redactor=self._secret_redactor,
@@ -14796,36 +14850,16 @@ class SessionEngine:
                         terminal_cancellation.add_note(str(atomicity_error))
                         raise terminal_cancellation from publication_failure
                     raise atomicity_error from publication_failure
-                if fully_committed:
-                    operation_published = True
-                    (
-                        fan_out_error,
-                        terminal_cancellation,
-                    ) = await self._fan_out_reconciled_session_operation_events(
-                        published_events,
-                        cancellation=terminal_cancellation,
+                if not fully_committed:
+                    _attach_context_build_termination_diagnostics(
+                        publication_failure,
+                        compaction_telemetry=result.compaction_telemetry,
                     )
-                    if fan_out_error is not None:
-                        publication_failure.add_note(
-                            "Committed terminal event side-effect delivery also failed: "
-                            f"{type(fan_out_error).__name__}: {fan_out_error}"
-                        )
-                    publication_failure.add_note(
-                        "Session compaction completed durably before its publication "
-                        "acknowledgement failed; retry will replay the committed result."
-                    )
+                    if terminal_publication_unknown:
+                        operation_published = True
                     if terminal_cancellation is not None:
                         raise terminal_cancellation from publication_failure
                     raise publication_failure
-                _attach_context_build_termination_diagnostics(
-                    publication_failure,
-                    compaction_telemetry=result.compaction_telemetry,
-                )
-                if terminal_publication_unknown:
-                    operation_published = True
-                if terminal_cancellation is not None:
-                    raise terminal_cancellation from publication_failure
-                raise publication_failure
             operation_published = True
             (
                 fan_out_error,
@@ -14841,6 +14875,8 @@ class SessionEngine:
                         f"{type(fan_out_error).__name__}: {fan_out_error}"
                     )
                 raise terminal_cancellation
+            if publication_failure is not None and not isinstance(publication_failure, Exception):
+                raise publication_failure
             if fan_out_error is not None:
                 raise fan_out_error
             for event in prepublished_dispatch_events:
@@ -15612,6 +15648,59 @@ class SessionEngine:
         if renewed_until is None:
             raise AssertionError("Session compaction claim renewal did not update its lease.")
         return renewed_until
+
+    async def _reconcile_initial_compaction_claim(
+        self,
+        *,
+        session: Session,
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        model_step_id: str,
+        request_digest: str,
+        started_event: Event,
+    ) -> tuple[dict[str, Any], datetime]:
+        observed: tuple[dict[str, Any], datetime] | None = None
+
+        def inspect(
+            current: Session, checkpoint: dict[str, Any] | None, store_now: datetime
+        ) -> None:
+            nonlocal observed
+            if checkpoint is None:
+                raise SessionCompactionAttemptSuperseded("Initial compaction claim is absent.")
+            operations = _session_operation_state(checkpoint)
+            record = operations["records"].get(request.idempotency_key)
+            if (
+                current.instance_id != session.instance_id
+                or current.run_epoch != request.expected_run_epoch
+                or current.status not in _RESUMABLE_SESSION_STATUSES
+                or type(record) is not dict
+                or record.get("kind") != _CONTEXT_COMPACTION_OPERATION_KIND
+                or record.get("status") != "running"
+                or record.get("operation_id") != operation_id
+                or record.get("current_attempt_id") != attempt_id
+                or record.get("model_step_id") != model_step_id
+                or record.get("request_digest") != request_digest
+                or record.get("source_run_epoch") != request.expected_run_epoch
+                or record.get("source_transcript_cursor") != request.expected_transcript_cursor
+                or operations.get("active_operation_id") != operation_id
+                or started_event.id not in record.get("event_ids", ())
+            ):
+                raise SessionCompactionAttemptSuperseded(
+                    "Initial compaction claim does not prove this request's exact ownership."
+                )
+            expiry = _operation_claim_expiry(record)
+            if expiry is None or expiry <= store_now:
+                raise SessionCompactionAttemptSuperseded(
+                    "Initial compaction claim expired before acknowledgement reconciliation."
+                )
+            observed = (copy_json_value(checkpoint, "checkpoint"), expiry)
+            return None
+
+        await self.session_store.transform_checkpoint_with_store_time(session.id, inspect)
+        if observed is None or not await self._event_writer.is_persisted(started_event):
+            raise RuntimeError("Initial compaction claim is missing its durable start event.")
+        return observed
 
     async def _reconcile_compaction_operation_claim_expiry(
         self,

@@ -1115,12 +1115,11 @@ def test_explicit_compaction_replay_does_not_repeat_sanitized_work_after_lost_ac
             expected_transcript_cursor=len(transcript),
         )
 
-        with pytest.raises(ConnectionError, match="terminal acknowledgement lost"):
-            async for _event in app.compact_session(request):
-                pass
+        first = [event async for event in app.compact_session(request)]
         replay = [event async for event in app.compact_session(request)]
 
-        assert replay
+        assert first[-1].type == EventType.SESSION_CHECKPOINTED
+        assert [event.id for event in first] == [event.id for event in replay]
         assert len(compactor.requests) == 1
         assert secret not in _serialized(compactor.requests)
         assert REDACTED_SECRET in _serialized(compactor.requests)

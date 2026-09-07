@@ -650,6 +650,17 @@ the store's per-session replay index and remove it from checkpoint state. This
 keeps exact idempotent replay durable without making every later checkpoint write
 copy the session's full operation history.
 
+If initial publication loses its acknowledgement, Cayu performs bounded durable
+reconciliation before dispatch. The original caller can continue only when the
+record proves its exact operation, attempt, request, source fences, start event,
+and unexpired store-time lease. An independent caller cannot adopt that live
+attempt merely by supplying the same key. Missing or uncertain evidence preserves
+the original publication error and existing lease-based recovery. When terminal
+reconciliation proves that the entire completion batch and checkpoint committed,
+the original call returns the committed success immediately. Caller cancellation
+remains authoritative during both reconciliation paths; durable completion can
+still be replayed by a later same-key call, including after process restart.
+
 An equivalent retry with the same idempotency key replays the original durable
 events without calling the compactor again, even after a later resume advances
 the session epoch or transcript; changing any request field under the same key

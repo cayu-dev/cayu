@@ -440,9 +440,8 @@ def test_compact_session_lost_terminal_ack_keeps_completed_state_unambiguous() -
             expected_transcript_cursor=len(transcript),
         )
 
-        with pytest.raises(ConnectionError, match="terminal acknowledgement lost"):
-            async for _event in app.compact_session(request):
-                pass
+        first = [event async for event in app.compact_session(request)]
+        assert first[-1].type == EventType.SESSION_CHECKPOINTED
 
         durable = [
             record.event
@@ -461,6 +460,7 @@ def test_compact_session_lost_terminal_ack_keeps_completed_state_unambiguous() -
             created.id,
             operation["event_ids"],
         )
+        assert [event.id for event in first] == [event.id for event in replay]
         assert len(compactor.requests) == 1
 
     asyncio.run(run())
