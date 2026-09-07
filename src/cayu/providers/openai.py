@@ -33,6 +33,7 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
     WebSearchAction,
+    WebSearchAPISource,
     WebSearchSource,
 )
 from cayu.embeddings import (
@@ -3746,6 +3747,18 @@ def _normalized_web_search_action(action: object, *, path: str) -> dict[str, Any
             source_type = source.get("type", "url")
             url = source.get("url")
             title = source.get("title")
+            if source_type == "api":
+                try:
+                    api_source = WebSearchAPISource.model_validate(
+                        {"type": "api", "name": source.get("name")}
+                    )
+                except ValueError:
+                    raise OpenAIProtocolError(
+                        "OpenAI hosted-search API source name must be a bounded clean string.",
+                        reason_code="web_search_action_sources_name_is_invalid",
+                    ) from None
+                sources.append({"type": "api", "name": api_source.name})
+                continue
             if source_type != "url":
                 raise OpenAIUnsupportedSearchSourceError(
                     source_diagnostic=SearchSourceDiagnostic.from_value(index, source_type),

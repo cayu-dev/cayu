@@ -1,42 +1,50 @@
 # Hosted-search source discriminator diagnostics
 
-Issue #1448 adds evidence for unsupported Responses hosted-search source types.
-It does not establish the historical offending type or expand supported variants.
+## Supported evidence
 
-## Contract and retained evidence audit
+Hosted search accepts URL sources (`WebSearchSource`) and named API sources
+(`WebSearchAPISource`). `WebSearchAction.sources` preserves both as distinct
+variants. API sources have a bounded nonblank `name` (up to 1,024 characters,
+portable durable text without surrounding whitespace), not a URL. The name is
+retained exactly; it is not an enum, a URL, or a citation target.
 
-The official [Responses Python schema](https://developers.openai.com/api/reference/python/resources/responses.md)
-was retrieved during this change. `ActionSearchSource.type` is `Literal["url"]`
-and `url` is a string. The generated Python SDK agrees:
-[`response_function_web_search.py`](https://github.com/openai/openai-python/blob/be928151372e4b62adb4a1571cda52ad759b38be/src/openai/types/responses/response_function_web_search.py).
-No additional supported source variant was confirmed. Cayu keeps its existing
-compatibility behavior for an omitted discriminator, normalizing it to `url`.
-Explicit null and other values remain unsupported. Sources are never silently
-dropped or coerced into invented URLs.
+A bounded direct Responses API comparison on September 7, 2026 returned this
+structure for weather and finance searches. A compatible HTTP path also received
+and forwarded these source fields unchanged:
 
-Issue #1486 records the exact discriminator `api`, but no complete observed
-source object or emitting upstream boundary. Its URL-bearing example is a
-synthetic rejection fixture, not evidence that an API source has a URL.
-The [web-search guide](https://developers.openai.com/api/docs/guides/tools-web-search#sources)
-mentions third-party feeds in sources, but does not establish their wire schema
-or tie them to the observed discriminator. The remaining fields and the origin
-of this variant are unresolved; no live provider probe was run.
+```json
+{"type": "api", "name": "redacted"}
+```
 
-Runtime exposes `OpenAIUnsupportedSearchSourceError` (a subclass of
-`OpenAIProtocolError`) for unsupported discriminators, including explicit null
-and non-string values. Streaming translates this into
-`provider_error_type=unsupported_capability`, `retryable=false`, while preserving
-the existing bounded protocol diagnostic. The attempt stops with
-`retry_disposition=explicit_nonretryable`; a second hosted search cannot repair
-an unsupported decoding contract. URL and omitted-type behavior is unchanged.
+`redacted` is an explicit replacement, not an observed source-name value. The
+comparison did not retain exact names. This support follows observed wire fields;
+it does not claim that every published provider schema declares this variant.
 
-Supporting a non-URL variant still requires a bounded sanitized **observed**
-fixture from the emitting boundary: field names/types and safe enum values,
-with credentials, text, prompts, service identity, and full responses removed.
-Qualify any upstream normalization and Runtime decoding with that same fixture.
-Until then, do not coerce sources into URLs, discard them, or claim complete
-evidence. This change supplies the terminal capability outcome; it does not
-resolve the upstream schema investigation or declare `api` supported.
+URL sources retain their existing constructor and validation. An omitted source
+discriminator still means `url`; explicit null is not omission. API sources are
+never converted to URL sources, assigned fabricated URLs, or discarded.
+
+Both item-completion and completed-response parsing use the same normalizer.
+The normalized action enters hosted-tool events and typed `HostedToolCallPart`
+transcript evidence through `WebSearchAction`. Session serialization preserves
+the variant and name; provider continuation state retains the normalized source
+object for replay. The server schema and generated client expose both variants.
+Consumers that need a link must check `source.type == "url"` before reading `url`.
+
+Unsupported discriminators raise `OpenAIUnsupportedSearchSourceError`, a subclass
+of `OpenAIProtocolError`. Streaming exposes
+`provider_error_type=unsupported_capability`, `retryable=false`, and stops with
+`retry_disposition=explicit_nonretryable`. Repeating a hosted search cannot repair
+an unsupported decoding contract. Malformed API names use the static diagnostic
+`web_search_action_sources_name_is_invalid`, stage `hosted_tool`, field
+`output[].action.sources[].name`, and the existing bounded protocol retry policy.
+No source name or body is included in these diagnostics.
+
+The observed-shape fixture covers completed parsing, streaming item completion,
+terminal-only streams, mixed URL/API sources, durable readback, and provider-state
+replay. Synthetic malformed and unknown variants cover safe diagnostics and
+bounded retries. HTTP source compatibility does not qualify WebSocket ordering,
+concurrency, or idle behavior.
 
 ## Diagnostic contract
 
@@ -47,7 +55,7 @@ The stable reason remains `web_search_action_sources_type_is_unsupported`, stage
 | --- | --- |
 | `source_index` | Zero-based index, 0 through 99, within the failing source list |
 | `source_type_kind` | `null`, `boolean`, `number`, `string`, `array`, `object`, or `non_json` |
-| `source_supported_types` | `url` |
+| `source_supported_types` | `url,api` |
 | `source_type_value_status` | `retained` or `omitted` |
 | `source_type_value` | Optional canonical diagnostic label |
 
@@ -60,7 +68,7 @@ Objects/arrays provide only their JSON kind. Syntax-only validation cannot prove
 that an arbitrary enum-shaped string is not a secret, so unknown labels fail
 closed. Labels matching configured API/header credential values are also omitted
 at the provider boundary. Runtime's existing workload-secret redaction still
-applies. Source bodies, titles, URLs, and complete payloads never enter these
+applies. Source names, bodies, titles, URLs, and complete payloads never enter these
 additional diagnostics or exception messages.
 
 The typed exception retains bounded evidence during completed-response parsing.

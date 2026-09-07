@@ -75,6 +75,7 @@ import {
   numericValue,
   sumCounts,
 } from "../lib/format"
+import { hostedSearchSourceRows } from "../lib/hosted-search-sources"
 import { dashboardPath } from "../lib/links"
 import type { MutationExecutionOptions } from "../lib/mutation-browser"
 import type {
@@ -826,22 +827,22 @@ function TranscriptPart({ part }: { part: Record<string, unknown> }) {
         </div>
         {sources.length > 0 && (
           <ul className="mt-2 space-y-1 text-sm">
-            {sources.map((source) => {
-              const url = typeof source.url === "string" ? source.url : ""
-              const title = typeof source.title === "string" ? source.title : url
-              return (
-                <li key={`${url}:${String(source.title ?? "")}`}>
+            {hostedSearchSourceRows(sources).map((source) => (
+              <li key={source.key}>
+                {source.url ? (
                   <a
-                    href={url}
+                    href={source.url}
                     target="_blank"
                     rel="noopener noreferrer nofollow"
                     className="break-all text-primary underline underline-offset-2"
                   >
-                    {title || url}
+                    {source.label}
                   </a>
-                </li>
-              )
-            })}
+                ) : (
+                  <span className="break-all">{source.label}</span>
+                )}
+              </li>
+            ))}
           </ul>
         )}
       </div>

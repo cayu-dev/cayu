@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -220,7 +220,7 @@ def _is_valid_url_hostname(hostname: str) -> bool:
 
 
 class WebSearchSource(BaseModel):
-    """Bounded external source returned by a provider-hosted web search."""
+    """Bounded URL source returned by a provider-hosted web search."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
@@ -257,6 +257,20 @@ class WebSearchSource(BaseModel):
         return _require_nonblank("title", value)
 
 
+class WebSearchAPISource(BaseModel):
+    """Named API evidence returned by hosted search, without a fabricated URL."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    type: Literal["api"] = "api"
+    name: str = Field(max_length=1024, strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _require_clean_nonblank("name", value)
+
+
 class WebSearchAction(BaseModel):
     """Bounded terminal evidence; optional provider details may be absent."""
 
@@ -267,7 +281,7 @@ class WebSearchAction(BaseModel):
     queries: tuple[str, ...] = Field(default=(), max_length=100)
     url: str | None = Field(default=None, max_length=4096)
     pattern: str | None = Field(default=None, max_length=4096)
-    sources: tuple[WebSearchSource, ...] = Field(default=(), max_length=100)
+    sources: tuple[WebSearchSource | WebSearchAPISource, ...] = Field(default=(), max_length=100)
 
     @field_validator("query", "pattern")
     @classmethod
@@ -299,10 +313,19 @@ class WebSearchAction(BaseModel):
 
     @field_validator("sources", mode="before")
     @classmethod
-    def copy_sources(cls, value: object) -> tuple[WebSearchSource, ...]:
+    def copy_sources(cls, value: object) -> tuple[WebSearchSource | WebSearchAPISource, ...]:
         if not isinstance(value, (list, tuple)):
             raise ValueError("sources must be a list or tuple.")
-        return tuple(WebSearchSource.model_validate(source) for source in value)
+        return tuple(
+            WebSearchAPISource.model_validate(source)
+            if isinstance(source, WebSearchAPISource)
+            or (
+                isinstance(source, Mapping)
+                and cast("Mapping[str, Any]", source).get("type") == "api"
+            )
+            else WebSearchSource.model_validate(source)
+            for source in value
+        )
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> WebSearchAction:

@@ -67,7 +67,7 @@ def source_diagnostic_fields(
     fields: dict[str, str | int] = {
         "provider_protocol_source_index": diagnostic.index,
         "provider_protocol_source_type_kind": diagnostic.kind,
-        "provider_protocol_source_supported_types": "url",
+        "provider_protocol_source_supported_types": "url,api",
         "provider_protocol_source_type_value_status": "retained"
         if label is not None
         else "omitted",
@@ -356,6 +356,7 @@ _PROTOCOL_DIAGNOSTICS: dict[str, tuple[str, str | None]] = {
         "hosted_tool",
         "output[].action.sources[].title",
     ),
+    "web_search_action_sources_name_is_invalid": ("hosted_tool", "output[].action.sources[].name"),
     "web_search_action_sources_type_is_unsupported": (
         "hosted_tool",
         "output[].action.sources[].type",

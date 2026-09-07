@@ -19,6 +19,7 @@ from cayu import (
     RunRequest,
     SQLiteSessionStore,
     WebSearchAction,
+    WebSearchAPISource,
 )
 from cayu.providers import (
     ModelStreamEventType,
@@ -27,7 +28,18 @@ from cayu.providers import (
     openai_response_events,
 )
 
+# Observed wire fields from bounded direct API and compatible HTTP probes.
+# The name is explicitly redacted; no observed source-name value was retained.
+API_SOURCE = {"type": "api", "name": "redacted"}
 ACTIONS = [
+    {"type": "search", "sources": [API_SOURCE]},
+    {
+        "type": "search",
+        "sources": [
+            {"type": "url", "url": "https://example.com/"},
+            API_SOURCE,
+        ],
+    },
     {"type": "open_page"},
     {"type": "open_page", "url": None},
     {"type": "open_page", "url": "https://example.com/"},
@@ -172,6 +184,10 @@ async def test_optional_action_durable_runtime_readback(tmp_path, action):
     assert len(parts) == 1
     assert parts[0].status == "completed"
     assert parts[0].action == WebSearchAction.model_validate(action)
+    if API_SOURCE in action.get("sources", []):
+        api_source = next(s for s in parts[0].action.sources if s.type == "api")
+        assert isinstance(api_source, WebSearchAPISource)
+        assert api_source.model_dump() == API_SOURCE
     persisted = await reopened.load_events("optional")
     hosted = [event for event in persisted if event.type == EventType.MODEL_HOSTED_TOOL_CALL]
     assert [event.payload["status"] for event in hosted] == ["in_progress", "completed"]

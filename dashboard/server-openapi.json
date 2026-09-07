@@ -32830,9 +32830,31 @@
         "title": "VersioningContract",
         "type": "object"
       },
+      "WebSearchAPISource": {
+        "additionalProperties": false,
+        "description": "Named API evidence returned by hosted search, without a fabricated URL.",
+        "properties": {
+          "name": {
+            "maxLength": 1024,
+            "title": "Name",
+            "type": "string"
+          },
+          "type": {
+            "const": "api",
+            "default": "api",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "WebSearchAPISource",
+        "type": "object"
+      },
       "WebSearchAction": {
         "additionalProperties": false,
-        "description": "Bounded provider-neutral terminal web-search action evidence.",
+        "description": "Bounded terminal evidence; optional provider details may be absent.",
         "properties": {
           "pattern": {
             "anyOf": [
@@ -32870,7 +32892,14 @@
           "sources": {
             "default": [],
             "items": {
-              "$ref": "#/components/schemas/WebSearchSource"
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/WebSearchSource"
+                },
+                {
+                  "$ref": "#/components/schemas/WebSearchAPISource"
+                }
+              ]
             },
             "maxItems": 100,
             "title": "Sources",
@@ -32906,7 +32935,7 @@
       },
       "WebSearchSource": {
         "additionalProperties": false,
-        "description": "Bounded external source returned by a provider-hosted web search.",
+        "description": "Bounded URL source returned by a provider-hosted web search.",
         "properties": {
           "title": {
             "anyOf": [

@@ -107,6 +107,7 @@ from cayu.core import (
     ToolCallPart,
     ToolResultPart,
     WebSearchAction,
+    WebSearchAPISource,
     WebSearchSource,
 )
 from cayu.core.billing import BillingIdentity
@@ -13605,6 +13606,7 @@ def test_session_store_conformance_preserves_hosted_search_evidence(
                             type="search",
                             query="Cayu",
                             sources=(
+                                WebSearchAPISource(name="redacted"),
                                 WebSearchSource(
                                     url="https://github.com/example/cayu",
                                     title="Cayu",
@@ -13633,6 +13635,11 @@ def test_session_store_conformance_preserves_hosted_search_evidence(
             store = await _reopen_store(session_store_case, store)
 
             assert await store.load_transcript(session_id) == [message]
+            stream = io.StringIO()
+            assert await export_sessions(store, stream=stream) == 1
+            imported = list(import_sessions(io.StringIO(stream.getvalue())))
+            assert len(imported) == 1
+            assert imported[0].transcript == [message]
         finally:
             await _close_store(store)
 

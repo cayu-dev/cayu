@@ -16710,6 +16710,22 @@ export type VersioningContract = {
 };
 
 /**
+ * WebSearchAPISource
+ *
+ * Named API evidence returned by hosted search, without a fabricated URL.
+ */
+export type WebSearchApiSource = {
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Type
+     */
+    type?: 'api';
+};
+
+/**
  * WebSearchAction
  *
  * Bounded provider-neutral terminal web-search action evidence.
@@ -16730,7 +16746,7 @@ export type WebSearchAction = {
     /**
      * Sources
      */
-    sources?: Array<WebSearchSource>;
+    sources?: Array<WebSearchSource | WebSearchApiSource>;
     /**
      * Type
      */
@@ -16744,7 +16760,7 @@ export type WebSearchAction = {
 /**
  * WebSearchSource
  *
- * Bounded external source returned by a provider-hosted web search.
+ * Bounded URL source returned by a provider-hosted web search.
  */
 export type WebSearchSource = {
     /**

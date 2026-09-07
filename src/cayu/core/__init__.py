@@ -25,6 +25,7 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
     WebSearchAction,
+    WebSearchAPISource,
     WebSearchSource,
 )
 from cayu.core.thinking import ThinkingConfig
@@ -63,6 +64,7 @@ __all__ = [
     "ToolResultPart",
     "ToolSpec",
     "ToolTimeoutStrength",
+    "WebSearchAPISource",
     "WebSearchAction",
     "WebSearchSource",
     "Workflow",

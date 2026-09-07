@@ -1,4 +1,4 @@
-"""Synthetic discriminator fixtures; observed non-URL source shape is unresolved."""
+"""Synthetic unsupported discriminator fixtures and payload-safe diagnostics."""
 
 import json
 
@@ -28,7 +28,7 @@ from cayu.providers._openai_protocol import SearchSourceDiagnostic, source_diagn
 
 REASON = "web_search_action_sources_type_is_unsupported"
 VALUES = [
-    ("api", "string", "api"),
+    ("file", "string", "file"),
     ("future_extension", "string", None),
     (None, "null", None),
     (True, "boolean", None),
@@ -60,7 +60,7 @@ def expected_fields(kind, label):
     return {
         "provider_protocol_source_index": 1,
         "provider_protocol_source_type_kind": kind,
-        "provider_protocol_source_supported_types": "url",
+        "provider_protocol_source_supported_types": "url,api",
         "provider_protocol_source_type_value_status": "retained" if label else "omitted",
         **({"provider_protocol_source_type_value": label} if label else {}),
     }
@@ -115,7 +115,7 @@ async def test_stream_source_diagnostics(value, kind, label, terminal_only, capl
 @pytest.mark.anyio
 @pytest.mark.parametrize("succeed", [False, True])
 async def test_durable_source_capability_failure_prevents_redispatch(tmp_path, succeed):
-    raw = stream_fixture(bad_response("api"))
+    raw = stream_fixture(bad_response("file"))
     success = {
         "id": "resp_ok",
         "model": "gpt-5.6",
@@ -172,7 +172,7 @@ async def test_durable_source_capability_failure_prevents_redispatch(tmp_path, s
         assert error.payload["retry_disposition"] == "explicit_nonretryable"
         assert {
             k: v for k, v in error.payload.items() if k.startswith("provider_protocol_source_")
-        } == expected_fields("string", "api")
+        } == expected_fields("string", "file")
     hosted = [e for e in persisted if e.type == EventType.MODEL_HOSTED_TOOL_CALL]
     assert any(e.payload["status"] == "outcome_unknown" for e in hosted)
     await reopened.close()
@@ -207,8 +207,8 @@ def test_malformed_source_lists(sources, reason):
 async def test_allowlisted_label_matching_header_credential_is_omitted():
     provider = OpenAIProvider(
         api_key="offline",
-        extra_headers={"X-Private": "api"},
-        transport=RecordingTransport(stream_events=[stream_fixture(bad_response("api"))]),
+        extra_headers={"X-Private": "file"},
+        transport=RecordingTransport(stream_events=[stream_fixture(bad_response("file"))]),
     )
     events = [
         e
@@ -227,9 +227,9 @@ async def test_allowlisted_label_matching_header_credential_is_omitted():
     [
         None,
         {"index": 0},
-        SearchSourceDiagnostic(True, "string", "api"),
-        SearchSourceDiagnostic(100, "string", "api"),
-        SearchSourceDiagnostic(0, "secret", "api"),
+        SearchSourceDiagnostic(True, "string", "file"),
+        SearchSourceDiagnostic(100, "string", "file"),
+        SearchSourceDiagnostic(0, "secret", "file"),
     ],
 )
 def test_reject_untrusted_diagnostic_attributes(diagnostic):
@@ -238,7 +238,7 @@ def test_reject_untrusted_diagnostic_attributes(diagnostic):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("reconnect", [False, True])
-@pytest.mark.parametrize("credential", ["offline", "api"])
+@pytest.mark.parametrize("credential", ["offline", "file"])
 async def test_background_recovery_retains_diagnostics_without_redispatch(
     tmp_path, reconnect, credential
 ):
@@ -261,7 +261,7 @@ async def test_background_recovery_retains_diagnostics_without_redispatch(
             {"type": "response.output_text.delta", "sequence_number": 1, "delta": "accepted"}
         )
     transport.start_batches.append([*start, SimulatedWorkerLoss("worker lost")])
-    response = bad_response("api")
+    response = bad_response("file")
     response["id"] = "resp_background_123"
     if reconnect:
         transport.reconnect_batches.append(
@@ -305,7 +305,7 @@ async def test_background_recovery_retains_diagnostics_without_redispatch(
     assert required.payload["provider_protocol_reason"] == REASON
     assert {
         k: v for k, v in required.payload.items() if k.startswith("provider_protocol_source_")
-    } == expected_fields("string", None if credential == "api" else "api")
+    } == expected_fields("string", None if credential == "file" else "file")
     assert "source-body" not in json.dumps(required.payload)
     assert "private.example" not in json.dumps(required.payload)
     assert not any(e.type == EventType.MODEL_RETRY for e in events)
