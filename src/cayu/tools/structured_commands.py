@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from time import perf_counter_ns
 from typing import Any, Protocol, runtime_checkable
 
 from cayu._validation import canonical_durable_json_bytes, copy_json_value
@@ -51,6 +50,7 @@ from cayu.tools.commands import (
     _portable_command_output,
 )
 from cayu.workspaces import WorkspaceGitEntry, WorkspaceGitEntryListResult, WorkspaceReadResult
+from cayu.workspaces.base import WorkspaceContentManifest
 
 RUN_COMMAND_RESULT_SCHEMA = "cayu.run_command_result.v1"
 STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA = "cayu.structured_command_tool_policy.v1"
@@ -596,6 +596,7 @@ class RunCommandTool(Tool):
                         "dependency_paths_fingerprint": exc.paths_fingerprint,
                     },
                 )
+        pre_capture_started_at = datetime.now(UTC)
         try:
             before_manifest = await _capture_workspace_command_manifest(ctx.workspace)
         except _WorkspaceManifestError:
@@ -608,6 +609,7 @@ class RunCommandTool(Tool):
                     "observation before dispatch."
                 ),
             )
+        pre_capture_timing = _timing_evidence(pre_capture_started_at, datetime.now(UTC))
         runner_failure = docker_coding_toolchain_runner_admission_failure(
             ctx.runner,
             profile=self._profile,
@@ -658,7 +660,6 @@ class RunCommandTool(Tool):
             )
             return await self._finish_durable_result(journal, result)
         started_at = datetime.now(UTC)
-        started_ns = perf_counter_ns()
         try:
             raw_result = await self._executors[authority.selector]._execute_resolved_command(
                 ctx,
@@ -672,16 +673,13 @@ class RunCommandTool(Tool):
                 policy_source=self,
                 include_runner_evidence=True,
             )
+            process_timing = _timing_evidence(started_at, datetime.now(UTC))
+            process_timing["pre_capture"] = pre_capture_timing
             if journal is not None:
-                runner_finished_at = datetime.now(UTC)
                 try:
                     await journal.checkpoint_runner_terminal(
                         raw_result,
-                        timing=_timing_evidence(
-                            started_at,
-                            runner_finished_at,
-                            started_ns,
-                        ),
+                        timing=process_timing,
                     )
                 except _CommandJournalError:
                     result = self._error_result(
@@ -696,12 +694,18 @@ class RunCommandTool(Tool):
                     )
                     return await self._finish_durable_result(journal, result)
         except RunnerExecutionError as exc:
+            process_timing = _timing_evidence(started_at, datetime.now(UTC))
+            process_timing["pre_capture"] = pre_capture_timing
+            post_capture_started_at = datetime.now(UTC)
             mutation_settlement = runner_workspace_mutation_settlement(result=None, error=exc)
             try:
                 failed_after_manifest = await _capture_workspace_command_manifest(ctx.workspace)
             except _WorkspaceManifestError:
                 failed_after_manifest = None
-            finished_at = datetime.now(UTC)
+            process_timing["post_capture"] = _timing_evidence(
+                post_capture_started_at,
+                datetime.now(UTC),
+            )
             result = self._error_result(
                 authority,
                 status="failed",
@@ -716,7 +720,7 @@ class RunCommandTool(Tool):
                         before=before_manifest,
                         after=failed_after_manifest,
                     ),
-                    **_timing_evidence(started_at, finished_at, started_ns),
+                    **process_timing,
                 },
                 artifacts=exc.artifacts,
             )
@@ -732,11 +736,15 @@ class RunCommandTool(Tool):
             )
             return await self._finish_durable_result(journal, result)
         try:
-            finished_at = datetime.now(UTC)
+            post_capture_started_at = datetime.now(UTC)
             try:
                 after_manifest = await _capture_workspace_command_manifest(ctx.workspace)
             except _WorkspaceManifestError:
                 after_manifest = None
+            process_timing["post_capture"] = _timing_evidence(
+                post_capture_started_at,
+                datetime.now(UTC),
+            )
             result = await self._project_result(
                 ctx,
                 authority=authority,
@@ -746,7 +754,7 @@ class RunCommandTool(Tool):
                 output_mode=output_mode,
                 command_argv=command_argv,
                 raw_result=raw_result,
-                timing=_timing_evidence(started_at, finished_at, started_ns),
+                timing=process_timing,
                 before_manifest=before_manifest,
                 after_manifest=after_manifest,
             )
@@ -1232,6 +1240,24 @@ async def _capture_workspace_command_manifest(
     """Capture one complete content manifest within the coding copy bounds."""
 
     try:
+        capture = getattr(workspace, "capture_content_manifest", None)
+        if callable(capture):
+            manifest = await capture(
+                max_paths=_COMMAND_MANIFEST_MAX_PATHS,
+                max_file_bytes=_COMMAND_MANIFEST_MAX_FILE_BYTES,
+                max_total_bytes=_COMMAND_MANIFEST_MAX_TOTAL_BYTES,
+            )
+            if manifest is not None:
+                if type(manifest) is not WorkspaceContentManifest:
+                    raise _WorkspaceManifestError
+                manifest = WorkspaceContentManifest(manifest.entries, manifest.total_bytes)
+                if (
+                    len(manifest.entries) > _COMMAND_MANIFEST_MAX_PATHS
+                    or manifest.total_bytes > _COMMAND_MANIFEST_MAX_TOTAL_BYTES
+                    or any(row[2] > _COMMAND_MANIFEST_MAX_FILE_BYTES for row in manifest.entries)
+                ):
+                    raise _WorkspaceManifestError
+                return _WorkspaceCommandManifest(manifest.entries, manifest.total_bytes)
         list_git_entries = getattr(workspace, "list_git_entries", None)
         if not callable(list_git_entries):
             raise _WorkspaceManifestError
@@ -1822,11 +1848,12 @@ async def _recover_runner_terminal_command_result(
         getattr(workspace, "id", None)
     ) != record.get("workspace_id_sha256"):
         return _command_recovery_refusal("durable_command_workspace_identity_mismatch")
+    post_capture_started_at = datetime.now(UTC)
     try:
         after_manifest = await _capture_workspace_command_manifest(workspace)
     except _WorkspaceManifestError:
         after_manifest = None
-    recovered_timing = (
+    recovered_timing: dict[str, Any] = (
         copy_json_value(timing, "runner_terminal_timing") if type(timing) is dict else {}
     )
     if not {
@@ -1840,6 +1867,10 @@ async def _recover_runner_terminal_command_result(
             "finished_at": observed_at,
             "duration_ms": 0,
         }
+    recovered_timing["post_capture"] = _timing_evidence(
+        post_capture_started_at,
+        datetime.now(UTC),
+    )
     context = ToolContext(
         session_id=parent_session_id,
         agent_name=recovery_authority.agent_name,
@@ -2056,12 +2087,11 @@ def _context_receipt_evidence(ctx: ToolContext) -> dict[str, object]:
 def _timing_evidence(
     started_at: datetime,
     finished_at: datetime,
-    started_ns: int,
 ) -> dict[str, object]:
     return {
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
-        "duration_ms": max(0, (perf_counter_ns() - started_ns) // 1_000_000),
+        "duration_ms": max(0, (finished_at - started_at) // timedelta(milliseconds=1)),
     }
 
 

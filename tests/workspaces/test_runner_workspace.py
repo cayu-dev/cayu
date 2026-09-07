@@ -1664,3 +1664,123 @@ def test_builtin_file_tools_use_runner_workspace(tmp_path) -> None:
         "projected_response_bytes": list_result.structured["projected_response_bytes"],
         "max_result_bytes": 50_000,
     }
+
+
+@pytest.mark.parametrize("file_count", [10, 100, 1000])
+def test_command_manifest_bulk_operation_count_and_identities(tmp_path, file_count):
+    from tests.core.test_structured_commands import _AdmittedRunner, _profile, _run
+
+    from cayu import RunCommandTool, SecretRedactor
+    from cayu.tools._redaction import InvocationRedactorSnapshot
+    from cayu.tools._resources import InvocationWorkspaceHandle
+    from cayu.tools.structured_commands import _capture_workspace_command_manifest
+
+    class CountingRunner(LocalRunner):
+        calls = 0
+
+        async def exec(self, *args, **kwargs):
+            self.calls += 1
+            return await super().exec(*args, **kwargs)
+
+    (tmp_path / "uv.lock").write_bytes(b"locked\n")
+    for index in range(file_count):
+        (tmp_path / f"file-{index}.txt").write_bytes(b"content\n")
+    (tmp_path / "file-0.txt").chmod(0o755)
+    (tmp_path / "link").symlink_to("../outside-secret")
+    runner = CountingRunner(tmp_path, inherit_env=False)
+    raw = RunnerWorkspace(runner, workspace_id="workspace", python_executable=sys.executable)
+    snapshot = InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+    workspace = InvocationWorkspaceHandle(
+        raw, redactor_snapshot_provider=lambda: snapshot, capture_observer=lambda _: None
+    )
+    manifest = asyncio.run(_capture_workspace_command_manifest(workspace))
+    assert runner.calls == 1
+    reference = asyncio.run(_capture_workspace_command_manifest(LocalWorkspace(tmp_path)))
+    assert manifest == reference
+    runner.calls = 0
+    profile = _profile()
+    result = _run(
+        RunCommandTool(toolchain_profile=profile),
+        _AdmittedRunner(profile),
+        workspace,
+        {"selector": "focused-test", "args": ["tests/test_unit.py"]},
+    )
+    assert not result.is_error, result
+    # Two complete captures plus one dependency-lock validation, at every size.
+    assert runner.calls == 3
+
+
+@pytest.mark.parametrize(
+    ("limit", "value"), [("max_paths", 1), ("max_file_bytes", 1), ("max_total_bytes", 3)]
+)
+def test_content_manifest_limits_fail_closed(tmp_path, limit, value):
+    (tmp_path / "a").write_bytes(b"ab")
+    (tmp_path / "b").write_bytes(b"cd")
+    limits = dict(max_paths=10, max_file_bytes=10, max_total_bytes=10)
+    limits[limit] = value
+    with pytest.raises(RuntimeError):
+        asyncio.run(_workspace(tmp_path).capture_content_manifest(**limits))
+
+
+def test_content_manifest_detects_same_size_mutation_after_hash(tmp_path, monkeypatch):
+    (tmp_path / "file").write_bytes(b"before")
+    program = runner_workspace_module._RUNNER_WORKSPACE_PROGRAM.replace(
+        "    if listing() != before:",
+        '    with open("file", "wb") as changed:\n        changed.write(b"after!")\n    if listing() != before:',
+    )
+    monkeypatch.setattr(runner_workspace_module, "_RUNNER_WORKSPACE_PROGRAM", program)
+    with pytest.raises(RuntimeError, match="changed during content observation"):
+        asyncio.run(
+            _workspace(tmp_path).capture_content_manifest(
+                max_paths=10, max_file_bytes=10, max_total_bytes=10
+            )
+        )
+
+
+def test_content_manifest_refuses_symlink_swap_before_read(tmp_path, monkeypatch):
+    (tmp_path / "file").write_bytes(b"before")
+    outside = tmp_path.parent / "outside-secret"
+    outside.write_bytes(b"private")
+    program = runner_workspace_module._RUNNER_WORKSPACE_PROGRAM.replace(
+        "    before = listing()",
+        '    before = listing()\n    os.unlink("file")\n    os.symlink("../outside-secret", "file")',
+    )
+    monkeypatch.setattr(runner_workspace_module, "_RUNNER_WORKSPACE_PROGRAM", program)
+    with pytest.raises((RuntimeError, ValueError)):
+        asyncio.run(
+            _workspace(tmp_path).capture_content_manifest(
+                max_paths=10, max_file_bytes=10, max_total_bytes=10
+            )
+        )
+
+
+def test_content_manifest_rejects_duplicate_response_paths():
+    runner = _ListResultRunner(
+        {"ok": True, "entries": [["a", "a" * 64, 1, "100644"]] * 2, "total_bytes": 2}
+    )
+    with pytest.raises(ValueError, match="sorted and unique"):
+        asyncio.run(
+            RunnerWorkspace(runner).capture_content_manifest(
+                max_paths=10, max_file_bytes=10, max_total_bytes=10
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [["../escape", "a" * 64, 1, "100644"]],
+        [[".git/config", "a" * 64, 1, "100644"]],
+        [["a", "a" * 64, 11, "100644"]],
+        [["a", "not-a-digest", 1, "100644"]],
+        [["a", "a" * 64, 1, "040000"]],
+    ],
+)
+def test_content_manifest_rejects_invalid_or_out_of_scope_guest_evidence(entries):
+    runner = _ListResultRunner({"ok": True, "entries": entries, "total_bytes": entries[0][2]})
+    with pytest.raises((ValueError, RuntimeError)):
+        asyncio.run(
+            RunnerWorkspace(runner, excluded_directory_names=(".git",)).capture_content_manifest(
+                max_paths=10, max_file_bytes=10, max_total_bytes=10
+            )
+        )

@@ -25,6 +25,40 @@ WorkspaceGitEntryMode = Literal["100644", "100755", "120000"]
 
 
 @dataclass(frozen=True)
+class WorkspaceContentManifest:
+    """Complete content identities, with no file contents or symlink targets."""
+
+    entries: tuple[tuple[str, str, int, WorkspaceGitEntryMode], ...]
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.entries) is not tuple:
+            raise TypeError("Manifest entries must be a tuple.")
+        paths = []
+        total = 0
+        for entry in self.entries:
+            if type(entry) is not tuple or len(entry) != 4:
+                raise ValueError("Invalid manifest entry.")
+            path, digest, size, mode = entry
+            if _validate_workspace_relative_path(path) != path:
+                raise ValueError("Manifest path must be canonical.")
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+            ):
+                raise ValueError("Manifest requires complete SHA-256 identities.")
+            if type(size) is not int or size < 0 or mode not in {"100644", "100755", "120000"}:
+                raise ValueError("Invalid manifest size or Git mode.")
+            paths.append(path)
+            total += size
+        if paths != sorted(set(paths)):
+            raise ValueError("Manifest paths must be sorted and unique.")
+        if type(self.total_bytes) is not int or self.total_bytes != total:
+            raise ValueError("Manifest byte total is inconsistent.")
+
+
+@dataclass(frozen=True)
 class WorkspaceReadResult:
     content: bytes
     total_bytes: int

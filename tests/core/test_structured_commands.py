@@ -1281,3 +1281,31 @@ def test_structured_command_quarantines_exact_working_directory(tmp_path: Path) 
     assert result.is_error is False
     assert "working_directory" not in result.structured
     assert result.structured["working_directory_sha256"].startswith("sha256:")
+
+
+def test_command_timing_separates_slow_captures_from_process(tmp_path):
+    class SlowWorkspace(LocalWorkspace):
+        async def list_git_entries(self, **kwargs):
+            await asyncio.sleep(0.025)
+            return await super().list_git_entries(**kwargs)
+
+    (tmp_path / "uv.lock").write_bytes(b"locked\n")
+    profile = _profile()
+    result = _run(
+        RunCommandTool(toolchain_profile=profile),
+        _AdmittedRunner(profile),
+        SlowWorkspace(tmp_path),
+        {"selector": "focused-test", "args": ["tests/test_unit.py"]},
+    )
+    assert not result.is_error
+    value = result.structured
+    for interval in (value, value["pre_capture"], value["post_capture"]):
+        duration = (
+            datetime.fromisoformat(interval["finished_at"])
+            - datetime.fromisoformat(interval["started_at"])
+        ) // timedelta(milliseconds=1)
+        assert interval["duration_ms"] == duration
+    assert value["pre_capture"]["duration_ms"] >= 25
+    assert value["post_capture"]["duration_ms"] >= 25
+    assert value["pre_capture"]["finished_at"] <= value["started_at"]
+    assert value["finished_at"] <= value["post_capture"]["started_at"]

@@ -103,6 +103,20 @@ repository paths, including for working directories and stale dependency inputs.
 An out-of-scope mutation is a failed result, while an incomplete post-command
 observation or deferred cleanup is explicitly partial/ambiguous.
 
+`RunnerWorkspace` captures each manifest in one bounded guest operation, hashing
+complete file contents under descriptor containment and rechecking observed
+entries before returning identities. It preserves exclusions, symlinks, executable
+bits, and path/per-file/aggregate limits. Other workspace implementations retain
+the complete per-file fallback. An incomplete bulk observation fails closed.
+
+Receipt `started_at`, `finished_at`, and `duration_ms` describe the runner execution
+boundary; duration is the nonnegative whole-millisecond timestamp difference.
+`pre_capture` and `post_capture` each contain their own timestamps and duration.
+Capture time is excluded from process duration. Terminal recovery retains recorded
+process/pre-capture timing when available and measures its new post-capture scan;
+it does not rerun the command.
+
+
 The opt-in live contract test exercises both the built-in-language shape and a
 non-Python Node profile against exact final containers:
 

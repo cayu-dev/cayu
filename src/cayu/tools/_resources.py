@@ -588,6 +588,14 @@ class InvocationWorkspaceHandle(Workspace):
     async def list(self, pattern: str = "**/*", *, limit: int | None = None):
         return await self.__workspace.list(pattern, limit=limit)
 
+    async def capture_content_manifest(self, **limits):
+        # Identity-only evidence contains no file content to redact. The delegate
+        # still owns path exclusions and descriptor containment.
+        capture = getattr(self.__workspace, "capture_content_manifest", None)
+        if not callable(capture):
+            return None
+        return await capture(**limits)
+
     async def list_git_entries(self, *, limit: int) -> WorkspaceGitEntryListResult:
         result = await self.__workspace.list_git_entries(limit=limit)
         if type(result) is not WorkspaceGitEntryListResult:
