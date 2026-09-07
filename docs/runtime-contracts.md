@@ -9711,9 +9711,17 @@ the observing workflow attempt; `evidence.run_epoch` identifies the child run
 that produced the failure. `evidence.terminal_event_id` references a stored
 terminal event, never the public stream's presentation alias. These fields may
 be absent, for example before admission, for plain awaitables, or on older events.
+The session identity bound accommodates native IDs up to 2048 UTF-8 bytes without
+truncating their correlation identity.
 Replaying an interrupted child or explicitly attaching a failed child preserves
-stored evidence without model dispatch. Existing automatic new-child behavior
-for failed generated steps remains unchanged: use the recorded child session ID
+stored evidence without model dispatch. Ordinary hard run-limit interruptions
+publish the executing child epoch, including token, tool-call, model-step, elapsed-time,
+and budget stops. The post-interruption session/recovery epoch is not the failed run
+epoch. If a concurrent newer run or unavailable durable record prevents correlation,
+the observing step leaves the terminal event reference unset. Limit identity does not
+admit another model/tool call or turn an interrupted child into a completed result.
+Existing automatic new-child behavior for failed generated steps remains unchanged:
+use the recorded child session ID
 when inspecting that exact failure instead of requesting another attempt.
 
 `settlement` is always `unknown`: these diagnostics introduce no cleanup authority.

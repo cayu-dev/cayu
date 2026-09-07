@@ -27,7 +27,8 @@ class FailureEvidence(BaseModel):
     ] = Field(default=(), max_length=16)
     truncated: bool = False
     secondary_failures: bool = False
-    session_id: str | None = Field(default=None, max_length=512)
+    # Native session IDs allow up to 2048 UTF-8 bytes; never truncate identity.
+    session_id: str | None = Field(default=None, max_length=2048)
     run_epoch: int | None = Field(default=None, ge=0)
     terminal_event_id: str | None = Field(default=None, max_length=512)
     settlement: Literal["unknown"] = "unknown"

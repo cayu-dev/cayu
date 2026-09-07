@@ -98,7 +98,7 @@ from cayu.environments import (
     EnvironmentFactoryResult,
     WorkspaceInstructions,
 )
-from cayu.failure_evidence import exception_evidence
+from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.providers import (
     CacheBreakpoint,
     CachePolicy,
@@ -26135,6 +26135,13 @@ class SessionEngine:
         terminal_payload = {
             "interruption_type": _INTERRUPTION_TYPE_LIMIT_REACHED,
             **limit_payload,
+            # The transition can advance the stored epoch. Correlate the stop
+            # with the executing session, never the post-transition snapshot.
+            "failure_evidence": FailureEvidence(
+                classification="interruption",
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            ).model_dump(mode="json"),
         }
         if tool_round_identity is not None:
             terminal_payload.update(tool_round_identity.payload())
