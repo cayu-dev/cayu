@@ -13977,6 +13977,87 @@ text is never copied into those diagnostics. The transcript source searches only
 the configured session ids and applies an exact exclusive transcript-index
 cutoff, so the anchoring user message cannot recall itself.
 
+Applications can augment that built-in set with `custom_sources`, a bounded
+sequence of `AutomaticRecallSourceRegistration` values. Each registration pairs
+an immutable `AutomaticRecallSourceDescriptor` with an asynchronous factory.
+The descriptor declares the source name, owned channels, continuation channels,
+required/optional status, candidate limit and an application-controlled
+`configuration_version`. For example, an enterprise search adapter can register
+its existing `RecallSource` without taking over the runtime memory lifecycle:
+
+```python
+from cayu import (
+    AutomaticRecallSourceContext,
+    AutomaticRecallSourceDescriptor,
+    AutomaticRecallSourceRegistration,
+)
+
+async def enterprise_source(context: AutomaticRecallSourceContext):
+    # Application implementation; construction is read-only and request-scoped.
+    # The source must honor context.knowledge_access_scope and the RecallSituation
+    # supplied to retrieve(). Its metadata must exactly match the descriptor.
+    return EnterpriseRecallSource(
+        store=context.knowledge_store,
+        required=True,
+        candidate_limit=20,
+    )
+
+enterprise_registration = AutomaticRecallSourceRegistration(
+    descriptor=AutomaticRecallSourceDescriptor(
+        name="enterprise",
+        channel_names=("enterprise_lexical",),
+        configuration_version="enterprise-index-and-query-policy-v1",
+        required=True,
+        candidate_limit=20,
+    ),
+    factory=enterprise_source,
+)
+# Pass custom_sources=(enterprise_registration,) to AutomaticRecallContextPolicy
+# and include enterprise_lexical in its explicitly calibrated fusion configuration.
+```
+
+Construction rejects duplicate source/channel ownership, missing or extra fusion
+channels, and limits exceeding the engine's total source/channel or fusion
+candidate ceilings, without invoking factories. Registrations are ordered by
+source name. Built-in source names and channel names remain reserved even when
+that built-in source is disabled. Descriptor material joins the automatic-recall configuration and
+keyed receipt-source fingerprints; changing the version invalidates a frozen
+frame and changes execution-profile identity. The application must version every
+behavior-affecting configuration change, including access mapping. Factory
+callable identity is deliberately not serialized or guessed. Do not put secrets
+in descriptors. Built-in-only configuration material and fingerprints remain
+unchanged when `custom_sources` is empty.
+
+Factories receive an immutable `AutomaticRecallSourceContext` with session and
+interaction identity, environment name, knowledge namespace/access scope and
+store handles, not the mutable transcript or provider-dispatch callbacks. The
+returned source must match all declared metadata before retrieval. Factory work
+and retrieval share the existing engine source deadline, concurrency admission,
+overall deadline and required/optional failure handling. Candidate/result byte
+bounds are still engine-owned. Cancellation propagates rather than becoming an
+optional-source success. Like other `RecallSource` extensions, factories are
+trusted read-only application code: they must honor access constraints,
+cooperate with cancellation, avoid event-loop blocking, and own their resources.
+There is no new process sandbox or automatic lifetime management for external
+clients; allocate those at the application boundary and clean up transient work
+inside the factory/retrieval operation.
+
+Custom results participate in the same admission, redaction, frozen projection,
+receipt persistence and attempt-specific exposure lifecycle as built-in results.
+Custom record types retain their exact typed identities and source-supplied
+locators; the runtime does not invent an inspection tool for an opaque locator.
+Checkpoint loading supports those identities while retaining structural/channel
+validation and receipt/manifest binding. A custom source never decides whether
+the provider actually received its content. Losing the user anchor still
+suppresses delivery; runtime corrections still reuse the existing frame.
+
+This extension augments at least one built-in source; it does not replace the
+built-in knowledge/transcript implementations. Custom sources combined with
+`MemoryDeltaPolicy` are rejected for now: generic factories have no declared
+knowledge-frontier snapshot/change-feed contract, so the runtime must not claim
+delta coverage for them. Source inspection tools and backend-specific retrieval
+remain application code, not runtime special cases.
+
 The four admission modes are `off`, `offer`, `strong_matches`, and
 `offer_and_strong_matches`. Strong matches must meet `minimum_inject_score` and
 may enter `MemoryFocus`; plausible lower-scoring matches may enter a

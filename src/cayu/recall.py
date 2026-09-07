@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from itertools import islice
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -701,9 +701,11 @@ class RecallSourceResult(BaseModel):
 class RecallSource(ABC):
     """Trusted read-only extension that returns bounded independently ranked lanes."""
 
-    name: ClassVar[str]
-    channel_names: ClassVar[tuple[str, ...]]
-    continuation_channels: ClassVar[tuple[str, ...]] = ()
+    # Implementations may declare static class defaults or request-scoped
+    # instance metadata. RecallEngine validates and snapshots it at registration.
+    name: str
+    channel_names: tuple[str, ...]
+    continuation_channels: tuple[str, ...] = ()
 
     def __init__(self, *, required: bool, candidate_limit: int) -> None:
         if type(required) is not bool:

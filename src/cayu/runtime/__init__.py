@@ -587,6 +587,11 @@ from cayu.runtime.public_authority import (
     public_authority_alias_codec_from_environment,
     public_authority_alias_is_reserved,
 )
+from cayu.runtime.recall_sources import (
+    AutomaticRecallSourceContext,
+    AutomaticRecallSourceDescriptor,
+    AutomaticRecallSourceRegistration,
+)
 from cayu.runtime.recovery_cleanup import (
     DEFAULT_RECOVERY_CLEANUP_MAX_SUPERVISED_TASKS,
     DEFAULT_RECOVERY_CLEANUP_OVERALL_TIMEOUT_SECONDS,
@@ -1305,6 +1310,9 @@ __all__ = [
     "ArtifactExternalizingToolResultPolicy",
     "AutomaticRecallContextPolicy",
     "AutomaticRecallSourceConfig",
+    "AutomaticRecallSourceContext",
+    "AutomaticRecallSourceDescriptor",
+    "AutomaticRecallSourceRegistration",
     "BeforeStopAction",
     "BeforeStopContext",
     "BeforeStopDecision",

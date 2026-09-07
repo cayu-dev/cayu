@@ -4,9 +4,10 @@ import asyncio
 import hmac
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from hashlib import sha256
+from itertools import islice
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -105,6 +106,10 @@ from cayu.runtime.context import (
     _active_context_secret_redactor,
     _build_policy_context,
     _publish_or_record_recall_telemetry,
+)
+from cayu.runtime.recall_sources import (
+    AutomaticRecallSourceRegistration,
+    _FactoryRecallSource,
 )
 from cayu.runtime.sessions import (
     TRANSCRIPT_SEARCH_MAX_BYTES,
@@ -286,6 +291,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         admission_policy: AutomaticRecallPolicy,
         fusion_config: WeightedReciprocalRankFusionConfig,
         sources: AutomaticRecallSourceConfig | None = None,
+        custom_sources: Sequence[AutomaticRecallSourceRegistration] = (),
         engine_config: RecallEngineConfig | None = None,
         delta_policy: MemoryDeltaPolicy | None = None,
         max_projection_bytes: int = 128_000,
@@ -324,7 +330,34 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
             raise ValueError("Admission calibration does not match the fusion strategy.")
         if copied_policy.fusion_configuration_version != copied_fusion.configuration_version:
             raise ValueError("Admission calibration does not match the fusion configuration.")
+        try:
+            copied_custom = tuple(islice(custom_sources, 33))
+        except TypeError as exc:
+            raise TypeError("custom_sources must contain source registrations.") from exc
+        if len(copied_custom) > 32:
+            raise ValueError("Automatic recall cannot register more than 32 custom sources.")
+        if any(type(item) is not AutomaticRecallSourceRegistration for item in copied_custom):
+            raise TypeError("custom_sources must contain source registrations.")
+        copied_custom = tuple(sorted(copied_custom, key=lambda item: item.descriptor.name))
+        reserved_channels = {
+            KNOWLEDGE_LEXICAL_CHANNEL,
+            KNOWLEDGE_SEMANTIC_CHANNEL,
+            TRANSCRIPT_LEXICAL_CHANNEL,
+        }
+        if any(
+            item.descriptor.name in {"knowledge", "transcript"}
+            or reserved_channels.intersection(item.descriptor.channel_names)
+            for item in copied_custom
+        ):
+            raise ValueError(
+                "Custom recall sources cannot use reserved built-in names or channels."
+            )
+        if copied_custom and delta_policy is not None:
+            raise ValueError("Custom automatic recall sources do not support memory deltas.")
         expected_channels = _configured_channels(copied_sources)
+        expected_channels.update(
+            channel for item in copied_custom for channel in item.descriptor.channel_names
+        )
         if set(copied_fusion.channel_weights) != expected_channels:
             raise ValueError(
                 "Fusion channels must exactly match the configured automatic recall sources."
@@ -346,6 +379,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         self.admission_policy = copied_policy
         self.fusion_config = copied_fusion
         self.sources = copied_sources
+        self.custom_sources = copied_custom
         self.engine_config = RecallEngineConfig.model_validate(
             (engine_config or RecallEngineConfig()).model_dump(mode="python")
         )
@@ -355,6 +389,36 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
             else MemoryDeltaPolicy.model_validate(delta_policy.model_dump(mode="python"))
         )
         self.max_projection_bytes = max_projection_bytes
+        if copied_custom:
+            # Validate global names, channel ownership and engine ceilings before
+            # any factory runs. Missing-store declarations have identical lanes.
+            declarations: list[RecallSource] = []
+            if copied_sources.include_knowledge:
+                declarations.append(
+                    _UnavailableKnowledgeRecallSource(
+                        required=copied_sources.knowledge_required,
+                        candidate_limit=copied_sources.knowledge_candidate_limit,
+                    )
+                )
+            if copied_sources.include_transcript:
+                declarations.append(
+                    _UnavailableTranscriptRecallSource(
+                        required=copied_sources.transcript_required,
+                        candidate_limit=copied_sources.transcript_candidate_limit,
+                    )
+                )
+            declarations.extend(_FactoryRecallSource(item, None) for item in copied_custom)
+            RecallEngine(declarations, fusion_config=copied_fusion, config=self.engine_config)
+
+    def _custom_source_configuration(self) -> dict[str, Any]:
+        # Preserve built-in-only policy fingerprints and stored receipts exactly.
+        if not self.custom_sources:
+            return {}
+        return {
+            "custom_sources": [
+                item.descriptor.model_dump(mode="json") for item in self.custom_sources
+            ]
+        }
 
     def configuration_material(self) -> dict[str, Any]:
         """Return the complete behavior identity for automatic recall."""
@@ -367,6 +431,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
             "admission_policy": self.admission_policy.model_dump(mode="json"),
             "fusion_config": self.fusion_config.model_dump(mode="json"),
             "sources": self.sources.model_dump(mode="json"),
+            **self._custom_source_configuration(),
             "engine_config": self.engine_config.model_dump(mode="json"),
             "delta_policy": (
                 None if self.delta_policy is None else self.delta_policy.model_dump(mode="json")
@@ -850,6 +915,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                 admission_policy=self.admission_policy,
                 source_configuration={
                     "sources": self.sources.model_dump(mode="json"),
+                    **self._custom_source_configuration(),
                     "query_resolution": situation.query_resolution(),
                     "engine_config": self.engine_config.model_dump(mode="json"),
                     "fusion_config": self.fusion_config.model_dump(mode="json"),
@@ -2243,6 +2309,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                         candidate_limit=self.sources.transcript_candidate_limit,
                     )
                 )
+        sources.extend(_FactoryRecallSource(item, request) for item in self.custom_sources)
         return tuple(sources)
 
 
@@ -4212,6 +4279,10 @@ def _is_valid_projection(projection: dict[str, Any], state: dict[str, Any]) -> b
     ):
         return False
     source_channels = {channel for source in sources for channel in source["channels"]}
+    if len(source_channels) > 100 or len(source_channels) != sum(
+        len(source["channels"]) for source in sources
+    ):
+        return False
     coverage_truncated = projection["coverage_truncated"]
     focus = projection.get("focus")
     offer = projection.get("offer")
@@ -4252,7 +4323,8 @@ def _is_valid_projected_source(value: Any) -> bool:
         "transcript": {TRANSCRIPT_LEXICAL_CHANNEL},
     }
     return bool(
-        source in expected_channels
+        _is_nonblank_string(source)
+        and len(source.encode("utf-8")) <= 256
         and type(value.get("required")) is bool
         and status in {"complete", "partial", "unavailable"}
         and type(channels) is list
@@ -4260,7 +4332,7 @@ def _is_valid_projected_source(value: Any) -> bool:
         and len(channels) <= 100
         and all(_is_nonblank_string(channel) for channel in channels)
         and len(set(channels)) == len(channels)
-        and set(channels) == expected_channels[source]
+        and (source not in expected_channels or set(channels) == expected_channels[source])
         and ((status == "complete") == (failure_code is None))
         and (failure_code is None or _is_nonblank_string(failure_code))
     )
@@ -4424,7 +4496,7 @@ def _is_valid_projected_identity(value: Any) -> bool:
     return bool(
         type(value) is dict
         and set(value) == {"record_type", "record_id", "revision"}
-        and value.get("record_type") in {"knowledge_chunk", "knowledge_entry", "transcript_message"}
+        and _is_nonblank_string(value.get("record_type"))
         and _is_nonblank_string(value.get("record_id"))
         and _is_nonblank_string(value.get("revision"))
     )
