@@ -14,20 +14,29 @@ compatibility behavior for an omitted discriminator, normalizing it to `url`.
 Explicit null and other values remain unsupported. Sources are never silently
 dropped or coerced into invented URLs.
 
-The issue and retained [GAIA #114](https://github.com/cayu-tech/cayu-gaia/issues/114)
-comments identify Runtime `f2247e91c6095e5e95f81682caaf67c5a5ce40f5`, GAIA
-`0bed305ba390b1fe499d0b1fc067dbe9d8cff2c4`, and `https://codex-lb.cayu.ai`.
-They record event 6918's stable protocol reason, event 6919's retry and the
-successful completion at event 6925, but omit the actual discriminator and index.
-The referenced remote SQLite database is not available in this local workspace;
-local smoke notes contain no recovered discriminator. The historical value is
-**unknown**. No raw remote response or proxy implementation was available for
-this change. No paid probe was run. Hermetic transport tests verify the configured
-proxy URL is `/v1/responses`; they do not verify live proxy behavior.
-The evidence establishes an unresolved incompatibility, not a confirmed adapter
-gap or provider defect. Synthetic fixtures (including `api`) are boundary tests,
-not reproductions or assertions about the historical value. Any later support
-change requires a confirmed schema and exact pinned proxy-path evidence.
+Issue #1486 records the exact discriminator `api`, but no complete observed
+source object or emitting upstream boundary. Its URL-bearing example is a
+synthetic rejection fixture, not evidence that an API source has a URL.
+The [web-search guide](https://developers.openai.com/api/docs/guides/tools-web-search#sources)
+mentions third-party feeds in sources, but does not establish their wire schema
+or tie them to the observed discriminator. The remaining fields and the origin
+of this variant are unresolved; no live provider probe was run.
+
+Runtime exposes `OpenAIUnsupportedSearchSourceError` (a subclass of
+`OpenAIProtocolError`) for unsupported discriminators, including explicit null
+and non-string values. Streaming translates this into
+`provider_error_type=unsupported_capability`, `retryable=false`, while preserving
+the existing bounded protocol diagnostic. The attempt stops with
+`retry_disposition=explicit_nonretryable`; a second hosted search cannot repair
+an unsupported decoding contract. URL and omitted-type behavior is unchanged.
+
+Supporting a non-URL variant still requires a bounded sanitized **observed**
+fixture from the emitting boundary: field names/types and safe enum values,
+with credentials, text, prompts, service identity, and full responses removed.
+Qualify any upstream normalization and Runtime decoding with that same fixture.
+Until then, do not coerce sources into URLs, discard them, or claim complete
+evidence. This change supplies the terminal capability outcome; it does not
+resolve the upstream schema investigation or declare `api` supported.
 
 ## Diagnostic contract
 
@@ -59,7 +68,8 @@ Streaming item completion and terminal-response parsing share the same validator
 Safe background exception wrapping preserves diagnostics; retrieval and reconnect
 failures retain them on `provider.operation.recovery_required` events. Normal
 stream failures retain them on `model.error`, including durable SQLite readback.
-A successful retry does not erase the original failure. Unknown-outcome retry
-limits and hosted-tool effect accounting remain in force. Background recovery
+Unsupported source discriminators are terminal; other protocol failures retain
+the existing bounded unknown-outcome policy. Hosted-tool effect accounting
+remains in force. Background recovery
 of an already identified operation remains malformed/manual recovery and never
 starts another provider request merely because decoding failed.

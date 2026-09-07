@@ -336,6 +336,22 @@ class OpenAIProtocolError(OpenAIError, OpenAIProtocolDiagnosticError):
         self.source_diagnostic = source_diagnostic
 
 
+class OpenAIUnsupportedSearchSourceError(OpenAIProtocolError):
+    """Hosted search returned a source discriminator this adapter cannot decode.
+
+    This is a terminal capability mismatch, not permission to repeat a hosted
+    search. No source fields are coerced or omitted to manufacture success.
+    """
+
+    def __init__(self, *, source_diagnostic: SearchSourceDiagnostic) -> None:
+        super().__init__(
+            "OpenAI hosted-search source type is unsupported by this adapter.",
+            reason_code="web_search_action_sources_type_is_unsupported",
+            source_diagnostic=source_diagnostic,
+        )
+        self.retryable = False
+
+
 class OpenAITransport(Protocol):
     async def create_response(
         self,
@@ -1363,6 +1379,9 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 # fixed, credential-free provider classification explicitly.
                 # The runtime can then apply its bounded unknown retry policy.
                 protocol_payload["provider_error_type"] = "protocol_error"
+                if isinstance(exc, OpenAIUnsupportedSearchSourceError):
+                    protocol_payload["provider_error_type"] = "unsupported_capability"
+                    protocol_payload["retryable"] = False
                 protocol_payload.update(
                     protocol_exception_fields(
                         exc,
@@ -3658,9 +3677,7 @@ def _normalized_web_search_action(action: object, *, path: str) -> dict[str, Any
             url = source.get("url")
             title = source.get("title")
             if source_type != "url":
-                raise OpenAIProtocolError(
-                    f"OpenAI {path}.sources[{index}].type is unsupported.",
-                    reason_code="web_search_action_sources_type_is_unsupported",
+                raise OpenAIUnsupportedSearchSourceError(
                     source_diagnostic=SearchSourceDiagnostic.from_value(index, source_type),
                 )
             url = _normalized_external_web_url(

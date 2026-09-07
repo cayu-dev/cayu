@@ -1,4 +1,4 @@
-"""Synthetic discriminator boundary fixtures, not reproductions of GAIA #114."""
+"""Synthetic discriminator fixtures; observed non-URL source shape is unresolved."""
 
 import json
 
@@ -18,7 +18,12 @@ from cayu import (
     RunRequest,
     SQLiteSessionStore,
 )
-from cayu.providers import ModelStreamEventType, OpenAIProtocolError, openai_response_events
+from cayu.providers import (
+    ModelStreamEventType,
+    OpenAIProtocolError,
+    OpenAIUnsupportedSearchSourceError,
+    openai_response_events,
+)
 from cayu.providers._openai_protocol import SearchSourceDiagnostic, source_diagnostic_fields
 
 REASON = "web_search_action_sources_type_is_unsupported"
@@ -66,7 +71,9 @@ def test_completed_response_source_diagnostics(value, kind, label):
     with pytest.raises(OpenAIProtocolError) as caught:
         openai_response_events(bad_response(value))
     error = caught.value
+    assert isinstance(error, OpenAIUnsupportedSearchSourceError)
     assert error.reason_code == REASON
+    assert error.retryable is False
     assert source_diagnostic_fields(error.source_diagnostic) == expected_fields(kind, label)
     assert "source-body" not in repr(vars(error)) + str(error)
     assert "private.example" not in repr(vars(error)) + str(error)
@@ -82,7 +89,7 @@ async def test_stream_source_diagnostics(value, kind, label, terminal_only, capl
         stream_events=[stream_fixture(bad_response(value), terminal_only)]
     )
     provider = OpenAIProvider(
-        api_key="privatecredential", transport=transport, base_url="https://codex-lb.cayu.ai"
+        api_key="privatecredential", transport=transport, base_url="https://compatible.invalid"
     )
     events = [
         event
@@ -92,6 +99,8 @@ async def test_stream_source_diagnostics(value, kind, label, terminal_only, capl
     ]
     error = next(event for event in events if event.type == ModelStreamEventType.ERROR)
     assert error.payload["provider_protocol_reason"] == REASON
+    assert error.payload["provider_error_type"] == "unsupported_capability"
+    assert error.payload["retryable"] is False
     assert {
         k: v for k, v in error.payload.items() if k.startswith("provider_protocol_source_")
     } == expected_fields(kind, label)
@@ -99,13 +108,13 @@ async def test_stream_source_diagnostics(value, kind, label, terminal_only, capl
     for secret in ("source-body", "private.example", "privatecredential", "sk-secret"):
         assert secret not in rendered
     assert not any(event.type == ModelStreamEventType.COMPLETED for event in events)
-    assert transport.calls[0]["url"] == "https://codex-lb.cayu.ai/v1/responses"
+    assert transport.calls[0]["url"] == "https://compatible.invalid/v1/responses"
     await provider.aclose()
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("succeed", [False, True])
-async def test_durable_source_diagnostics_survive_bounded_retry(tmp_path, succeed):
+async def test_durable_source_capability_failure_prevents_redispatch(tmp_path, succeed):
     raw = stream_fixture(bad_response("api"))
     success = {
         "id": "resp_ok",
@@ -147,17 +156,20 @@ async def test_durable_source_diagnostics_survive_bounded_retry(tmp_path, succee
             )
         )
     ]
-    assert len(transport.calls) == 2
-    assert len([e for e in events if e.type == EventType.MODEL_RETRY]) == 1
-    assert events[-1].type == (EventType.SESSION_COMPLETED if succeed else EventType.SESSION_FAILED)
+    assert len(transport.calls) == 1
+    assert not any(e.type == EventType.MODEL_RETRY for e in events)
+    assert events[-1].type == EventType.SESSION_FAILED
     await store.close()
     reopened = SQLiteSessionStore(database)
     persisted = await reopened.load_events("source")
     errors = [e for e in persisted if e.type == EventType.MODEL_ERROR]
-    assert len(errors) == (1 if succeed else 2)
+    assert len(errors) == 1
     for error in errors:
         assert error.payload["provider_protocol_reason"] == REASON
-        assert error.payload["effective_max_attempts"] == 2
+        assert error.payload["provider_error_type"] == "unsupported_capability"
+        assert error.payload["retryable"] is False
+        assert error.payload["effective_max_attempts"] == 1
+        assert error.payload["retry_disposition"] == "explicit_nonretryable"
         assert {
             k: v for k, v in error.payload.items() if k.startswith("provider_protocol_source_")
         } == expected_fields("string", "api")
