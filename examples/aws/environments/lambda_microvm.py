@@ -66,10 +66,7 @@ class LambdaMicroVMLifecycleBinding(WorkspaceBinding):
         async with self._finalize_lock:
             if self._finalized:
                 return None
-            if outcome == "interrupted":
-                await self.runner.suspend()
-            else:
-                await self.runner.terminate()
+            self.runner.close_action = "suspend" if outcome == "interrupted" else "terminate"
             await self.runner.close()
             self._finalized = True
         return None

@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import importlib
+import json
+import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any, Literal, Protocol
 
 import httpx
 
+from cayu._task_wait import (
+    CapturedAwaitableOutcome,
+    await_shielded_task_outcome,
+    capture_awaitable_outcome,
+    restore_task_cancellation_requests,
+)
 from cayu._validation import (
     copy_json_value,
     require_clean_nonblank,
@@ -22,6 +31,8 @@ from cayu.runners._cleanup import (
     DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
     RunnerCleanupPolicy,
     RunnerCleanupResult,
+    RunnerFailureProgress,
+    attach_runner_cancellation_failure,
     cleanup_runner_command_with_diagnostic,
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
@@ -42,6 +53,7 @@ from cayu.runners.base import (
     RunnerSystemExecutionMode,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
+    _contains_runner_fatal_signal,
     attach_cancellation_artifacts,
     copy_exec_command,
 )
@@ -57,6 +69,108 @@ DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
 LAMBDA_MICROVM_PROTOCOL_VERSION = "2"
+LAMBDA_MICROVM_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES = 4 * ((LAMBDA_MICROVM_MAX_OUTPUT_BYTES + 2) // 3)
+LAMBDA_MICROVM_MAX_RESPONSE_BYTES = 2 * LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES + 64 * 1024
+_LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+_LAMBDA_POLL_ATTEMPTS = 3
+_CommandPollTask = asyncio.Task[CapturedAwaitableOutcome[Mapping[str, Any]]]
+_PENDING_LAMBDA_POLLS: set[_CommandPollTask] = set()
+_PENDING_LAMBDA_LIFECYCLES: set[asyncio.Task[CapturedAwaitableOutcome[None]]] = set()
+_PENDING_LAMBDA_ALLOCATIONS: set[asyncio.Task[CapturedAwaitableOutcome[LambdaMicroVMRunner]]] = (
+    set()
+)
+_LOGGER = logging.getLogger(__name__)
+_ABANDONED_LAMBDA_ALLOCATIONS: set[_LambdaAllocationReclamation] = set()
+_LAMBDA_ATTACHMENT_OWNERS: dict[str, _LambdaAllocationReclamation] = {}
+
+
+@dataclass(eq=False)
+class _LambdaAllocationReclamation:
+    runner_type: type[LambdaMicroVMRunner]
+    client: Any = None
+    owns_client: bool = False
+    client_closed: bool = False
+    allocation: asyncio.Task[CapturedAwaitableOutcome[LambdaMicroVMRunner]] | None = None
+    runner: LambdaMicroVMRunner | None = None
+    task: asyncio.Task[CapturedAwaitableOutcome[None]] | None = None
+    termination_confirmed: bool = False
+    observed: bool = False
+    progress: RunnerFailureProgress = field(default_factory=RunnerFailureProgress)
+    attachment: bool = False
+    restore_suspended: bool = False
+    abandoned: bool = False
+    attachment_identifier: str | None = None
+
+    def release_attachment(self) -> None:
+        identifier = self.attachment_identifier
+        if identifier is not None and _LAMBDA_ATTACHMENT_OWNERS.get(identifier) is self:
+            del _LAMBDA_ATTACHMENT_OWNERS[identifier]
+
+    async def reclaim(self) -> None:
+        assert self.allocation is not None
+        allocation = await self.allocation
+        if self.runner is None and allocation.error is not None:
+            await self.close_unbound_client()
+            return
+        await self.reclaim_runner()
+
+    async def close_unbound_client(self) -> None:
+        if self.owns_client and not self.client_closed:
+            close = getattr(self.client, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
+        self.client_closed = True
+
+    async def reclaim_runner(self) -> None:
+        runner = self.runner
+        assert runner is not None
+        if runner.is_closed:
+            return
+        # This is an outstanding allocation owner, not a terminal close(). Keep
+        # the control client usable until deletion is positively reconciled.
+        if not self.termination_confirmed:
+            if not self.attachment or self.restore_suspended:
+                if self.attachment:
+                    await runner._suspend()
+                else:
+                    await runner._terminate()
+                await runner._wait_for_lifecycle_state(
+                    terminal_state="SUSPENDED" if self.attachment else "TERMINATED",
+                    transitional_states={"RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING"},
+                    timeout_s=runner.cancel_timeout_s,
+                )
+            self.termination_confirmed = True
+        await runner._close_transports(progress=self.progress)
+        runner._closed = True
+
+    def start(self) -> asyncio.Task[CapturedAwaitableOutcome[None]]:
+        if (
+            self.task is not None
+            and self.task.done()
+            and not self.task.cancelled()
+            and self.task.result().error is None
+        ):
+            self.settled(self.task)
+            return self.task
+        if self.task is None or self.task.done():
+            self.observed = False
+            self.task = asyncio.create_task(capture_awaitable_outcome(self.reclaim))
+            self.task.add_done_callback(self.settled)
+        return self.task
+
+    def settled(self, task: asyncio.Task[CapturedAwaitableOutcome[None]]) -> None:
+        if task is not self.task or self.observed:
+            return
+        self.observed = True
+        if task.cancelled() or task.result().error is not None:
+            _LOGGER.error(
+                "Lambda MicroVM late allocation cleanup failed; drain_abandoned_allocations is required."
+            )
+            return
+        _ABANDONED_LAMBDA_ALLOCATIONS.discard(self)
+        self.release_attachment()
+
 
 LambdaMicroVMCloseAction = Literal["terminate", "suspend", "none"]
 
@@ -75,6 +189,10 @@ class _LambdaMicroVMProtocolVersionMismatch(LambdaMicroVMProtocolError):
 
 class LambdaMicroVMEndpointUnauthorized(LambdaMicroVMError):
     """The endpoint JWE token was rejected and should be refreshed."""
+
+
+class LambdaMicroVMEndpointTransientError(LambdaMicroVMError):
+    """A transport failure eligible for bounded command-state read retry only."""
 
 
 class LambdaMicroVMEndpointTransport(Protocol):
@@ -187,29 +305,57 @@ class HttpxLambdaMicroVMEndpointTransport:
         headers = {
             "X-aws-proxy-auth": require_clean_nonblank(token, "endpoint token"),
             "X-aws-proxy-port": str(DEFAULT_LAMBDA_MICROVM_PORT),
+            "Accept-Encoding": "identity",
         }
         try:
             request_options: dict[str, Any] = {"headers": headers, "timeout": timeout_s}
             if payload is not None:
                 request_options["json"] = payload
-            response = await self._client.get().request(
-                method, f"{_endpoint_base_url(endpoint)}{path}", **request_options
-            )
-        except httpx.RequestError as exc:
-            raise LambdaMicroVMError(f"Lambda MicroVM endpoint request failed: {exc}") from exc
-        if response.status_code in {401, 403}:
-            raise LambdaMicroVMEndpointUnauthorized("Lambda MicroVM endpoint token was rejected.")
-        if response.status_code >= 400:
-            raise LambdaMicroVMError(
-                f"Lambda MicroVM endpoint returned HTTP {response.status_code}; "
-                "response body omitted"
-            )
-        try:
-            decoded = response.json()
-        except ValueError as exc:
-            raise LambdaMicroVMProtocolError(
-                "Lambda MicroVM endpoint returned invalid JSON."
+            async with asyncio.timeout(timeout_s):
+                async with self._client.get().stream(
+                    method, f"{_endpoint_base_url(endpoint)}{path}", **request_options
+                ) as response:
+                    if response.status_code in {401, 403}:
+                        raise LambdaMicroVMEndpointUnauthorized(
+                            "Lambda MicroVM endpoint token was rejected."
+                        )
+                    if response.status_code >= 400:
+                        error_type = (
+                            LambdaMicroVMEndpointTransientError
+                            if response.status_code in _LAMBDA_TRANSIENT_HTTP_STATUSES
+                            else LambdaMicroVMError
+                        )
+                        raise error_type(
+                            f"Lambda MicroVM endpoint returned HTTP {response.status_code}; "
+                            "response body omitted"
+                        )
+                    if response.headers.get("content-encoding", "identity").lower() != "identity":
+                        raise LambdaMicroVMProtocolError(
+                            "Lambda MicroVM endpoint returned unsupported content encoding."
+                        )
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes(
+                        chunk_size=min(64 * 1024, LAMBDA_MICROVM_MAX_RESPONSE_BYTES + 1)
+                    ):
+                        if len(chunk) > LAMBDA_MICROVM_MAX_RESPONSE_BYTES - len(body):
+                            raise LambdaMicroVMProtocolError(
+                                "Lambda MicroVM endpoint response exceeds its byte ceiling."
+                            )
+                        body.extend(chunk)
+        except (httpx.TimeoutException, httpx.NetworkError, TimeoutError) as exc:
+            raise LambdaMicroVMEndpointTransientError(
+                "Lambda MicroVM endpoint request temporarily failed."
             ) from exc
+        except httpx.RequestError as exc:
+            raise LambdaMicroVMError("Lambda MicroVM endpoint request failed.") from exc
+        try:
+            decoded = json.loads(body)
+        except ValueError:
+            decoded = None
+        finally:
+            body.clear()
+        if decoded is None:
+            raise LambdaMicroVMProtocolError("Lambda MicroVM endpoint returned invalid JSON.")
         if not isinstance(decoded, Mapping):
             raise LambdaMicroVMProtocolError("Lambda MicroVM endpoint response must be an object.")
         return decoded
@@ -280,6 +426,9 @@ class LambdaMicroVMRunner(Runner):
         self._auth_token_expires_at = 0.0
         self._auth_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._public_lifecycle_task: asyncio.Task[CapturedAwaitableOutcome[None]] | None = None
+        self._public_lifecycle_action: str | None = None
+        self._command_poll_tasks: dict[str, tuple[float, _CommandPollTask]] = {}
         self._closed = False
         self._exec_closed = False
         self._exec_closed_reason = None
@@ -316,11 +465,17 @@ class LambdaMicroVMRunner(Runner):
     ) -> LambdaMicroVMRunner:
         image = require_clean_nonblank(image_identifier, "image_identifier")
         guest_root = _validate_guest_root(default_cwd)
-        control_client, owns_client = _control_client(
-            client=client,
+        environment_overlay = _preflight_runner_creation(
             region_name=region_name,
-            profile_name=profile_name,
-            endpoint_url=endpoint_url,
+            close_action=close_action,
+            ready_timeout_s=ready_timeout_s,
+            poll_interval_s=poll_interval_s,
+            request_timeout_s=request_timeout_s,
+            auth_token_expiration_minutes=auth_token_expiration_minutes,
+            cancel_timeout_s=cancel_timeout_s,
+            cancellation_cleanup=cancellation_cleanup,
+            timeout_cleanup=timeout_cleanup,
+            env_overlay=env_overlay,
         )
         run_options: dict[str, Any] = {"imageIdentifier": image}
         _put_optional(run_options, "imageVersion", image_version)
@@ -341,35 +496,136 @@ class LambdaMicroVMRunner(Runner):
             run_options["maximumDurationInSeconds"] = maximum_duration_in_seconds
         _put_optional(run_options, "runHookPayload", run_hook_payload)
 
-        response = await asyncio.to_thread(control_client.run_microvm, **run_options)
-        microvm_id, endpoint = _microvm_identity(response)
-        runner = cls(
-            control_client,
-            microvm_id=microvm_id,
-            endpoint=endpoint,
-            image_identifier=_response_string(response, "imageArn") or image,
-            image_version=_response_string(response, "imageVersion") or image_version,
+        control_client, owns_client = _control_client(
+            client=client,
             region_name=region_name,
-            default_cwd=guest_root,
-            close_action=close_action,
-            endpoint_transport=endpoint_transport,
-            owns_client=owns_client,
-            poll_interval_s=poll_interval_s,
-            request_timeout_s=request_timeout_s,
-            auth_token_expiration_minutes=auth_token_expiration_minutes,
-            cancel_timeout_s=cancel_timeout_s,
-            cancellation_cleanup=cancellation_cleanup,
-            timeout_cleanup=timeout_cleanup,
-            env_overlay=env_overlay,
+            profile_name=profile_name,
+            endpoint_url=endpoint_url,
         )
+        reclamation = _LambdaAllocationReclamation(cls, control_client, owns_client)
+
+        async def allocate() -> LambdaMicroVMRunner:
+            runner: LambdaMicroVMRunner | None = None
+            try:
+                response = await asyncio.to_thread(control_client.run_microvm, **run_options)
+                microvm_id, endpoint = _microvm_identity(response)
+                runner = cls(
+                    control_client,
+                    microvm_id=microvm_id,
+                    endpoint=endpoint,
+                    image_identifier=_response_string(response, "imageArn") or image,
+                    image_version=_response_string(response, "imageVersion") or image_version,
+                    region_name=region_name,
+                    default_cwd=guest_root,
+                    close_action=close_action,
+                    endpoint_transport=endpoint_transport,
+                    owns_client=owns_client,
+                    poll_interval_s=poll_interval_s,
+                    request_timeout_s=request_timeout_s,
+                    auth_token_expiration_minutes=auth_token_expiration_minutes,
+                    cancel_timeout_s=cancel_timeout_s,
+                    cancellation_cleanup=cancellation_cleanup,
+                    timeout_cleanup=timeout_cleanup,
+                    env_overlay=environment_overlay,
+                )
+                reclamation.runner = runner
+                if not reclamation.abandoned:
+                    await runner._wait_until_ready(ready_timeout_s)
+                return runner
+            except BaseException as primary:
+                reclamation.progress.failures = (primary,)
+                try:
+                    if runner is not None:
+                        await reclamation.reclaim_runner()
+                    else:
+                        await reclamation.close_unbound_client()
+                except BaseException as cleanup:
+                    raise BaseExceptionGroup(
+                        "Lambda MicroVM allocation failed.", [primary, cleanup]
+                    ) from None
+                raise
+
+        return await cls._observe_binding(
+            reclamation, allocate, ready_timeout_s + request_timeout_s, cancel_timeout_s
+        )
+
+    @staticmethod
+    async def _observe_binding(
+        reclamation: _LambdaAllocationReclamation,
+        operation: Callable[[], Awaitable[LambdaMicroVMRunner]],
+        timeout_s: float,
+        cancel_timeout_s: float | None,
+    ) -> LambdaMicroVMRunner:
         try:
-            await runner._wait_until_ready(ready_timeout_s)
+            task = asyncio.create_task(capture_awaitable_outcome(operation))
         except BaseException:
-            with contextlib.suppress(Exception, asyncio.CancelledError):
-                await asyncio.wait_for(runner._terminate(), timeout=runner.cancel_timeout_s)
-            await runner._close_transports()
+            reclamation.release_attachment()
             raise
-        return runner
+        reclamation.allocation = task
+        _PENDING_LAMBDA_ALLOCATIONS.add(task)
+        task.add_done_callback(_PENDING_LAMBDA_ALLOCATIONS.discard)
+        outcome = await await_shielded_task_outcome(
+            task,
+            timeout_s=timeout_s,
+            timeout_after_cancellation_s=validate_cancel_timeout(cancel_timeout_s),
+        )
+        failure = outcome.error if outcome.result is None else outcome.result.error
+        if (
+            outcome.cancellation is not None
+            or outcome.timed_out
+            or (
+                failure is not None
+                and (
+                    (reclamation.runner is not None and not reclamation.runner.is_closed)
+                    or (reclamation.runner is None and not reclamation.client_closed)
+                )
+            )
+        ):
+            reclamation.abandoned = True
+            _ABANDONED_LAMBDA_ALLOCATIONS.add(reclamation)
+            reclamation.start()
+            if outcome.timed_out:
+                failure = reclamation.progress.with_timeout(
+                    "Lambda MicroVM allocation has not settled."
+                )
+        else:
+            reclamation.release_attachment()
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+        )
+        if failure is not None and _contains_runner_fatal_signal(failure):
+            raise failure
+        if outcome.cancellation is not None:
+            if failure is not None:
+                attach_runner_cancellation_failure(outcome.cancellation, failure)
+            raise outcome.cancellation
+        if failure is not None:
+            raise failure
+        assert outcome.result is not None and outcome.result.result is not None
+        return outcome.result.result
+
+    @classmethod
+    async def drain_abandoned_allocations(
+        cls, *, timeout_s: float = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS
+    ) -> int:
+        """Retry process-local abandoned allocations; return the unsettled count.
+
+        Each call retries settled failures once and joins still-running cleanup.
+        Timeout or caller cancellation never cancels provider work. Applications
+        should drain again when a provider failure has been repaired.
+        """
+        timeout = validate_cancel_timeout(timeout_s)
+        owners = [
+            owner for owner in _ABANDONED_LAMBDA_ALLOCATIONS if issubclass(owner.runner_type, cls)
+        ]
+        if owners:
+            tasks = {owner.start() for owner in owners}
+            done, _ = await asyncio.wait(tasks, timeout=timeout)
+            for owner in owners:
+                if owner.task in done:
+                    assert owner.task is not None
+                    owner.settled(owner.task)
+        return sum(issubclass(owner.runner_type, cls) for owner in _ABANDONED_LAMBDA_ALLOCATIONS)
 
     @classmethod
     async def from_existing(
@@ -394,30 +650,10 @@ class LambdaMicroVMRunner(Runner):
     ) -> LambdaMicroVMRunner:
         identifier = require_clean_nonblank(microvm_id, "microvm_id")
         guest_root = _validate_guest_root(default_cwd)
-        control_client, owns_client = _control_client(
-            client=client,
+        environment_overlay = _preflight_runner_creation(
             region_name=region_name,
-            profile_name=profile_name,
-            endpoint_url=endpoint_url,
-        )
-        response = await asyncio.to_thread(control_client.get_microvm, microvmIdentifier=identifier)
-        response_id, endpoint = _microvm_identity(response)
-        if response_id != identifier:
-            raise LambdaMicroVMProtocolError("get_microvm returned the wrong MicroVM id.")
-        state = _required_response_string(response, "state")
-        if state in {"TERMINATING", "TERMINATED"}:
-            raise LambdaMicroVMError(f"Cannot attach to Lambda MicroVM in state {state}.")
-        runner = cls(
-            control_client,
-            microvm_id=identifier,
-            endpoint=endpoint,
-            image_identifier=_response_string(response, "imageArn"),
-            image_version=_response_string(response, "imageVersion"),
-            region_name=region_name,
-            default_cwd=guest_root,
             close_action=close_action,
-            endpoint_transport=endpoint_transport,
-            owns_client=owns_client,
+            ready_timeout_s=ready_timeout_s,
             poll_interval_s=poll_interval_s,
             request_timeout_s=request_timeout_s,
             auth_token_expiration_minutes=auth_token_expiration_minutes,
@@ -426,12 +662,81 @@ class LambdaMicroVMRunner(Runner):
             timeout_cleanup=timeout_cleanup,
             env_overlay=env_overlay,
         )
+        if identifier in _LAMBDA_ATTACHMENT_OWNERS:
+            raise LambdaMicroVMError("A Lambda MicroVM attachment or its cleanup is still pending.")
+        reclamation = _LambdaAllocationReclamation(
+            cls, attachment=True, attachment_identifier=identifier
+        )
+        _LAMBDA_ATTACHMENT_OWNERS[identifier] = reclamation
         try:
-            await runner._prepare_existing_for_attach(state, ready_timeout_s)
+            control_client, owns_client = _control_client(
+                client=client,
+                region_name=region_name,
+                profile_name=profile_name,
+                endpoint_url=endpoint_url,
+            )
         except BaseException:
-            await runner._close_transports()
+            reclamation.release_attachment()
             raise
-        return runner
+        reclamation.client = control_client
+        reclamation.owns_client = owns_client
+
+        async def attach() -> LambdaMicroVMRunner:
+            try:
+                response = await asyncio.to_thread(
+                    control_client.get_microvm, microvmIdentifier=identifier
+                )
+                response_id, endpoint = _microvm_identity(response)
+                if response_id != identifier:
+                    raise LambdaMicroVMProtocolError("get_microvm returned the wrong MicroVM id.")
+                state = _required_response_string(response, "state")
+                if state in {"TERMINATING", "TERMINATED"}:
+                    raise LambdaMicroVMError(f"Cannot attach to Lambda MicroVM in state {state}.")
+                runner = cls(
+                    control_client,
+                    microvm_id=identifier,
+                    endpoint=endpoint,
+                    image_identifier=_response_string(response, "imageArn"),
+                    image_version=_response_string(response, "imageVersion"),
+                    region_name=region_name,
+                    default_cwd=guest_root,
+                    close_action=close_action,
+                    endpoint_transport=endpoint_transport,
+                    owns_client=owns_client,
+                    poll_interval_s=poll_interval_s,
+                    request_timeout_s=request_timeout_s,
+                    auth_token_expiration_minutes=auth_token_expiration_minutes,
+                    cancel_timeout_s=cancel_timeout_s,
+                    cancellation_cleanup=cancellation_cleanup,
+                    timeout_cleanup=timeout_cleanup,
+                    env_overlay=environment_overlay,
+                )
+                reclamation.runner = runner
+
+                def mark_resume_dispatched() -> None:
+                    reclamation.restore_suspended = True
+
+                if not reclamation.abandoned:
+                    await runner._prepare_existing_for_attach(
+                        state, ready_timeout_s, before_resume=mark_resume_dispatched
+                    )
+                return runner
+            except BaseException as primary:
+                reclamation.progress.failures = (primary,)
+                try:
+                    if reclamation.runner is not None:
+                        await reclamation.reclaim_runner()
+                    else:
+                        await reclamation.close_unbound_client()
+                except BaseException as cleanup:
+                    raise BaseExceptionGroup(
+                        "Lambda MicroVM attachment failed.", [primary, cleanup]
+                    ) from None
+                raise
+
+        return await cls._observe_binding(
+            reclamation, attach, ready_timeout_s + request_timeout_s, cancel_timeout_s
+        )
 
     async def exec(
         self,
@@ -564,6 +869,10 @@ class LambdaMicroVMRunner(Runner):
         timeout = validate_timeout(timeout_s)
         standard_input = validate_stdin(stdin)
         output_limit = validate_output_limit(output_limit_bytes)
+        output_limit = min(
+            LAMBDA_MICROVM_MAX_OUTPUT_BYTES,
+            LAMBDA_MICROVM_MAX_OUTPUT_BYTES if output_limit is None else output_limit,
+        )
         return owned_command, working_dir, environment, timeout, standard_input, output_limit
 
     async def _exec(
@@ -682,6 +991,7 @@ class LambdaMicroVMRunner(Runner):
                 handle=handle,
                 policy=self.cancellation_cleanup,
                 start_acknowledged=start_acknowledged,
+                cancellation=exc,
             )
             attach_cancellation_artifacts(exc, [cleanup.artifact])
             raise
@@ -713,13 +1023,22 @@ class LambdaMicroVMRunner(Runner):
         handle: _LambdaMicroVMCommandHandle,
         policy: RunnerCleanupPolicy,
         start_acknowledged: bool,
+        cancellation: asyncio.CancelledError | None = None,
     ) -> RunnerCleanupResult:
-        cleanup = await cleanup_runner_command_with_diagnostic(
-            self,
-            handle=handle,
+        if not start_acknowledged and policy == "none":
+            self._poison_exec()
+        cleanup = await self._settle_command_cleanup(
+            lambda: cleanup_runner_command_with_diagnostic(
+                self,
+                handle=handle,
+                adapter="lambda-microvm",
+                timeout_s=self.cancel_timeout_s,
+                policy=policy,
+            ),
             adapter="lambda-microvm",
             timeout_s=self.cancel_timeout_s,
             policy=policy,
+            cancellation=cancellation,
         )
         self._apply_cleanup_result(cleanup)
         if not start_acknowledged and policy == "none":
@@ -770,8 +1089,7 @@ class LambdaMicroVMRunner(Runner):
         )
 
     async def suspend(self) -> None:
-        async with self._lifecycle_lock:
-            await self._suspend()
+        await self._settle_public_lifecycle(self._suspend, action="suspend")
 
     async def wait_until_suspended(
         self,
@@ -791,50 +1109,127 @@ class LambdaMicroVMRunner(Runner):
     async def _suspend(self) -> None:
         if self._suspended or self._termination_requested:
             return
-        self._ensure_lifecycle_open()
         await asyncio.to_thread(self._client.suspend_microvm, microvmIdentifier=self.microvm_id)
         self._suspended = True
         self._close_exec("Lambda MicroVM is suspended")
 
     async def resume(self) -> None:
-        async with self._lifecycle_lock:
-            self._ensure_lifecycle_open()
-            if self._termination_requested:
-                raise RuntimeError("Cannot resume a terminated Lambda MicroVM.")
-            if not self._suspended:
-                response = await asyncio.to_thread(
-                    self._client.get_microvm, microvmIdentifier=self.microvm_id
+        await self._settle_public_lifecycle(self._resume, action="resume")
+
+    async def _resume(self) -> None:
+        # The public lifecycle owner holds the lock across all provider calls.
+        if self._termination_requested:
+            raise RuntimeError("Cannot resume a terminated Lambda MicroVM.")
+        if not self._suspended:
+            response = await asyncio.to_thread(
+                self._client.get_microvm, microvmIdentifier=self.microvm_id
+            )
+            response_id, endpoint = _microvm_identity(response)
+            if response_id != self.microvm_id or endpoint != self.endpoint:
+                raise LambdaMicroVMProtocolError(
+                    "get_microvm returned different identity on resume."
                 )
-                response_id, endpoint = _microvm_identity(response)
-                if response_id != self.microvm_id or endpoint != self.endpoint:
-                    raise LambdaMicroVMProtocolError(
-                        "get_microvm returned different identity on resume."
-                    )
-                state = _required_response_string(response, "state")
-                if state in {"PENDING", "RUNNING"}:
-                    return
-                if state == "SUSPENDING":
-                    await self._prepare_existing_for_attach(
-                        state, DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS
-                    )
-                    self._suspended = False
-                    self._open_exec()
-                    return
-                if state != "SUSPENDED":
-                    raise LambdaMicroVMError(f"Cannot resume Lambda MicroVM in state {state}.")
-            await asyncio.to_thread(self._client.resume_microvm, microvmIdentifier=self.microvm_id)
-            self._auth_token = None
-            self._auth_token_expires_at = 0.0
-            await self._wait_until_ready(DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS)
-            self._suspended = False
-            self._open_exec()
+            state = _required_response_string(response, "state")
+            if state in {"PENDING", "RUNNING"}:
+                return
+            if state == "SUSPENDING":
+                await self._prepare_existing_for_attach(
+                    state, DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS
+                )
+                self._suspended = False
+                return
+            if state != "SUSPENDED":
+                raise LambdaMicroVMError(f"Cannot resume Lambda MicroVM in state {state}.")
+        await asyncio.to_thread(self._client.resume_microvm, microvmIdentifier=self.microvm_id)
+        self._auth_token = None
+        self._auth_token_expires_at = 0.0
+        await self._wait_until_ready(DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS)
+        self._suspended = False
 
     async def terminate(self) -> None:
-        async with self._lifecycle_lock:
-            if self._termination_requested:
-                return
+        await self._settle_public_lifecycle(self._terminate, action="terminate")
+
+    async def _settle_public_lifecycle(
+        self, operation: Callable[[], Awaitable[None]], *, action: str
+    ) -> None:
+        task = self._public_lifecycle_task
+        if task is None:
             self._ensure_lifecycle_open()
-            await self._terminate()
+        elif self._public_lifecycle_action != action or self._exec_poisoned or self._closing:
+            raise RuntimeError("Lambda MicroVM has a conflicting lifecycle mutation.")
+
+        async def owned() -> None:
+            async with self._lifecycle_lock:
+                if self._closed or self._closing:
+                    raise RuntimeError("LambdaMicroVMRunner is closed.")
+                await operation()
+                if action in {"suspend", "terminate"}:
+                    await self._wait_for_lifecycle_state(
+                        terminal_state="SUSPENDED" if action == "suspend" else "TERMINATED",
+                        transitional_states=(
+                            {"RUNNING", "SUSPENDING"}
+                            if action == "suspend"
+                            else {"RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING"}
+                        ),
+                        timeout_s=self.request_timeout_s,
+                    )
+
+        def settled(task: asyncio.Task[CapturedAwaitableOutcome[None]]) -> None:
+            _PENDING_LAMBDA_LIFECYCLES.discard(task)
+            if task is not self._public_lifecycle_task:
+                return
+            self._public_lifecycle_task = None
+            self._public_lifecycle_action = None
+            self._command_cleanups_pending -= 1
+            if task.cancelled() or task.result().error is not None:
+                self._poison_exec("Lambda MicroVM lifecycle mutation failed")
+            elif action == "resume" and not self._exec_poisoned and not self._closing:
+                self._open_exec()
+            elif not self._exec_poisoned and not self._closing:
+                self._close_exec(
+                    "Lambda MicroVM is suspended"
+                    if self._suspended
+                    else "Lambda MicroVM termination was requested"
+                )
+
+        if task is None:
+            self._command_cleanups_pending += 1
+            self._close_exec("Lambda MicroVM lifecycle mutation is pending")
+            try:
+                task = asyncio.create_task(capture_awaitable_outcome(owned))
+            except BaseException:
+                self._command_cleanups_pending -= 1
+                self._poison_exec()
+                raise
+            self._public_lifecycle_task = task
+            self._public_lifecycle_action = action
+            _PENDING_LAMBDA_LIFECYCLES.add(task)
+            task.add_done_callback(settled)
+        outcome = await await_shielded_task_outcome(
+            task,
+            timeout_s=self.request_timeout_s
+            + (DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS if action == "resume" else 0),
+            timeout_after_cancellation_s=self.cancel_timeout_s,
+        )
+        failure = outcome.error if outcome.result is None else outcome.result.error
+        if outcome.timed_out:
+            self._poison_exec("Lambda MicroVM lifecycle mutation has not settled")
+            failure = TimeoutError("Lambda MicroVM lifecycle mutation has not settled.")
+        elif task.done():
+            settled(task)
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+        )
+        if failure is not None and _contains_runner_fatal_signal(failure):
+            raise failure
+        if outcome.cancellation is not None:
+            if failure is not None:
+                attach_runner_cancellation_failure(outcome.cancellation, failure)
+            raise outcome.cancellation
+        if failure is not None:
+            if isinstance(failure, asyncio.CancelledError):
+                raise RuntimeError("Lambda MicroVM lifecycle dependency was cancelled.") from None
+            raise failure
 
     async def wait_until_terminated(
         self,
@@ -852,27 +1247,58 @@ class LambdaMicroVMRunner(Runner):
             )
 
     async def close(self) -> None:
-        async with self._lifecycle_lock:
-            if self._closed:
-                return
-            if self.close_action == "terminate":
-                await self._terminate()
-            elif self.close_action == "suspend":
-                await self._suspend()
-            elif self.close_action != "none":
-                raise AssertionError(
-                    f"Unsupported Lambda MicroVM close action: {self.close_action}"
-                )
-            self._closed = True
-            await self._close_transports()
+        action = self.close_action
+        progress = RunnerFailureProgress()
+        await self._settle_terminal_lifecycle(
+            lambda: self._close_owned(action, progress=progress),
+            action=action,
+            timeout_s=self.cancel_timeout_s,
+            progress=progress,
+        )
 
     async def kill(self) -> None:
+        progress = RunnerFailureProgress()
+        await self._settle_terminal_lifecycle(
+            lambda: self._close_owned("terminate", progress=progress),
+            action="terminate",
+            timeout_s=self.cancel_timeout_s,
+            progress=progress,
+        )
+
+    async def _close_owned(
+        self, action: LambdaMicroVMCloseAction, *, progress: RunnerFailureProgress | None = None
+    ) -> None:
         async with self._lifecycle_lock:
-            if self._closed:
-                return
-            await self._terminate()
-            self._closed = True
-            await self._close_transports()
+            failures: list[BaseException] = []
+            try:
+                if action == "terminate":
+                    await self._terminate()
+                    await self._wait_for_lifecycle_state(
+                        terminal_state="TERMINATED",
+                        transitional_states={"RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING"},
+                        timeout_s=self.cancel_timeout_s,
+                    )
+                elif action == "suspend":
+                    await self._suspend()
+                    await self._wait_for_lifecycle_state(
+                        terminal_state="SUSPENDED",
+                        transitional_states={"RUNNING", "SUSPENDING"},
+                        timeout_s=self.cancel_timeout_s,
+                    )
+                elif action != "none":
+                    raise AssertionError(f"Unsupported Lambda MicroVM close action: {action}")
+            except BaseException as error:
+                failures.append(error)
+                if progress is not None:
+                    progress.failures = tuple(failures)
+            try:
+                await self._close_transports(progress=progress)
+            except BaseException as error:
+                failures.append(error)
+            if len(failures) == 1:
+                raise failures[0]
+            if failures:
+                raise BaseExceptionGroup("Lambda MicroVM finalization failed.", failures)
 
     async def _terminate(self) -> None:
         if self._termination_requested:
@@ -917,17 +1343,33 @@ class LambdaMicroVMRunner(Runner):
                 )
             await asyncio.sleep(min(max(self.poll_interval_s, 0.05), remaining))
 
-    async def _close_transports(self) -> None:
+    async def _close_transports(self, *, progress: RunnerFailureProgress | None = None) -> None:
         self._auth_token = None
         self._auth_token_expires_at = 0.0
+        failures: list[BaseException] = []
+        prior_failures = () if progress is None else progress.failures
         if self._owns_endpoint_transport:
             close = getattr(self._endpoint_transport, "aclose", None)
             if callable(close):
-                await close()
+                try:
+                    await close()
+                except BaseException as error:
+                    failures.append(error)
+                    if progress is not None:
+                        progress.failures = (*prior_failures, *failures)
         if self._owns_client:
             close = getattr(self._client, "close", None)
             if callable(close):
-                await asyncio.to_thread(close)
+                try:
+                    await asyncio.to_thread(close)
+                except BaseException as error:
+                    failures.append(error)
+                    if progress is not None:
+                        progress.failures = (*prior_failures, *failures)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Lambda MicroVM transport cleanup failed.", failures)
 
     async def _wait_until_ready(self, ready_timeout_s: float) -> None:
         timeout = _positive_float(ready_timeout_s, "ready_timeout_s")
@@ -948,7 +1390,11 @@ class LambdaMicroVMRunner(Runner):
             await asyncio.sleep(max(self.poll_interval_s, 0.05))
 
     async def _prepare_existing_for_attach(
-        self, initial_state: str, ready_timeout_s: float
+        self,
+        initial_state: str,
+        ready_timeout_s: float,
+        *,
+        before_resume: Callable[[], None] | None = None,
     ) -> None:
         timeout = _positive_float(ready_timeout_s, "ready_timeout_s")
         loop = asyncio.get_running_loop()
@@ -971,6 +1417,8 @@ class LambdaMicroVMRunner(Runner):
                 )
             state = _required_response_string(response, "state")
         if state == "SUSPENDED":
+            if before_resume is not None:
+                before_resume()
             await asyncio.to_thread(self._client.resume_microvm, microvmIdentifier=self.microvm_id)
         elif state not in {"PENDING", "RUNNING"}:
             raise LambdaMicroVMError(f"Cannot attach to Lambda MicroVM in state {state}.")
@@ -1004,24 +1452,98 @@ class LambdaMicroVMRunner(Runner):
         return response
 
     async def _endpoint_get(self, command_id: str) -> Mapping[str, Any]:
-        return await self._endpoint_call("get_command", command_id=command_id)
+        loop = asyncio.get_running_loop()
+        pending = self._command_poll_tasks.get(command_id)
+        if pending is None:
+            deadline = loop.time() + self.request_timeout_s
+            task = asyncio.create_task(
+                capture_awaitable_outcome(
+                    lambda: self._poll_command_until_deadline(command_id, deadline)
+                )
+            )
+            self._command_poll_tasks[command_id] = (deadline, task)
+            _PENDING_LAMBDA_POLLS.add(task)
+
+            def retire(completed: _CommandPollTask) -> None:
+                _PENDING_LAMBDA_POLLS.discard(completed)
+                if self._command_poll_tasks.get(command_id) == (deadline, completed):
+                    del self._command_poll_tasks[command_id]
+
+            task.add_done_callback(retire)
+        else:
+            deadline, task = pending
+        outcome = await await_shielded_task_outcome(
+            task,
+            timeout_s=max(0, deadline - loop.time()),
+            timeout_after_cancellation_s=0,
+        )
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+        )
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
+        if outcome.timed_out:
+            raise TimeoutError("Lambda MicroVM command-state poll exceeded its deadline.")
+        captured = outcome.result
+        failure = outcome.error if captured is None else captured.error
+        if isinstance(failure, asyncio.CancelledError):
+            raise LambdaMicroVMError(
+                "Lambda MicroVM command-state read was cancelled by its dependency."
+            )
+        if failure is not None:
+            raise failure
+        if captured is None or captured.result is None:
+            raise LambdaMicroVMProtocolError(
+                "Lambda MicroVM command-state read returned no result."
+            )
+        return captured.result
+
+    async def _poll_command_until_deadline(
+        self, command_id: str, deadline: float
+    ) -> Mapping[str, Any]:
+        loop = asyncio.get_running_loop()
+        for attempt in range(_LAMBDA_POLL_ATTEMPTS):
+            if loop.time() >= deadline:
+                raise TimeoutError("Lambda MicroVM command-state poll exceeded its deadline.")
+            try:
+                result = await self._endpoint_call(
+                    "get_command", deadline=deadline, command_id=command_id
+                )
+            except LambdaMicroVMEndpointTransientError:
+                if attempt == _LAMBDA_POLL_ATTEMPTS - 1:
+                    raise
+            else:
+                if loop.time() >= deadline:
+                    raise TimeoutError("Lambda MicroVM command-state poll exceeded its deadline.")
+                return result
+            await asyncio.sleep(min(0.05 * (2**attempt), max(0, deadline - loop.time())))
+        raise AssertionError("unreachable command-state retry loop")
 
     async def _endpoint_cancel(self, command_id: str) -> Mapping[str, Any]:
         return await self._endpoint_call("cancel_command", command_id=command_id)
 
-    async def _endpoint_call(self, method_name: str, **kwargs: Any) -> Mapping[str, Any]:
+    async def _endpoint_call(
+        self, method_name: str, *, deadline: float | None = None, **kwargs: Any
+    ) -> Mapping[str, Any]:
         method = getattr(self._endpoint_transport, method_name)
-        for attempt in range(2):
+        attempts = 1 if method_name == "get_command" else 2
+        for attempt in range(attempts):
             token = await self._endpoint_token(force_refresh=attempt == 1)
+            timeout_s = self.request_timeout_s
+            if deadline is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("Lambda MicroVM command-state poll exceeded its deadline.")
+                timeout_s = min(timeout_s, remaining)
             try:
                 result = await method(
                     endpoint=self.endpoint,
                     token=token,
-                    timeout_s=self.request_timeout_s,
+                    timeout_s=timeout_s,
                     **kwargs,
                 )
             except LambdaMicroVMEndpointUnauthorized:
-                if attempt == 0:
+                if attempt + 1 < attempts:
                     continue
                 raise
             if not isinstance(result, Mapping):
@@ -1061,7 +1583,7 @@ class LambdaMicroVMRunner(Runner):
             return token
 
     def _ensure_lifecycle_open(self) -> None:
-        if self._closed:
+        if self._closed or self._closing or self._command_cleanups_pending or self._exec_poisoned:
             raise RuntimeError("LambdaMicroVMRunner is closed.")
 
 
@@ -1111,6 +1633,11 @@ def _decode_output(response: Mapping[str, Any], key: str, byte_count: int) -> st
     raw = response.get(key, "")
     if type(raw) is not str:
         raise LambdaMicroVMProtocolError(f"Lambda MicroVM result {key} must be a string.")
+    if len(raw) > LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES:
+        raise LambdaMicroVMProtocolError("Lambda MicroVM encoded output exceeds its byte ceiling.")
+    padding = 2 if raw.endswith("==") else 1 if raw.endswith("=") else 0
+    if (len(raw) // 4) * 3 - padding > LAMBDA_MICROVM_MAX_OUTPUT_BYTES:
+        raise LambdaMicroVMProtocolError("Lambda MicroVM decoded output exceeds its byte ceiling.")
     try:
         decoded = base64.b64decode(raw, validate=True)
     except ValueError as exc:
@@ -1231,6 +1758,34 @@ def _optional_bool(response: Mapping[str, Any], key: str, default: bool) -> bool
     return value
 
 
+def _preflight_runner_creation(
+    *,
+    region_name: str | None,
+    close_action: LambdaMicroVMCloseAction,
+    ready_timeout_s: float,
+    poll_interval_s: float,
+    request_timeout_s: float,
+    auth_token_expiration_minutes: int,
+    cancel_timeout_s: float | None,
+    cancellation_cleanup: RunnerCleanupPolicy,
+    timeout_cleanup: RunnerCleanupPolicy,
+    env_overlay: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Reject local configuration before allocating or attaching provider resources."""
+
+    _optional_clean_string(region_name, "region_name")
+    _validate_close_action(close_action)
+    _positive_float(ready_timeout_s, "ready_timeout_s")
+    _nonnegative_float(poll_interval_s, "poll_interval_s")
+    _positive_float(request_timeout_s, "request_timeout_s")
+    if type(auth_token_expiration_minutes) is not int or auth_token_expiration_minutes <= 0:
+        raise ValueError("auth_token_expiration_minutes must be a positive integer.")
+    validate_cancel_timeout(cancel_timeout_s)
+    validate_runner_cleanup_policy(cancellation_cleanup, "cancellation_cleanup")
+    validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+    return dict(env_overlay) if env_overlay else {}
+
+
 def _put_optional(target: dict[str, Any], key: str, value: str | None) -> None:
     if value is not None:
         target[key] = require_clean_nonblank(value, key)
@@ -1251,14 +1806,14 @@ def _optional_clean_string(value: str | None, field_name: str) -> str | None:
 def _positive_float(value: float, field_name: str) -> float:
     if type(value) not in {int, float}:
         raise TypeError(f"{field_name} must be a number.")
-    if value <= 0:
-        raise ValueError(f"{field_name} must be greater than zero.")
+    if not isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be finite and greater than zero.")
     return float(value)
 
 
 def _nonnegative_float(value: float, field_name: str) -> float:
     if type(value) not in {int, float}:
         raise TypeError(f"{field_name} must be a number.")
-    if value < 0:
-        raise ValueError(f"{field_name} must be non-negative.")
+    if not isfinite(value) or value < 0:
+        raise ValueError(f"{field_name} must be finite and non-negative.")
     return float(value)

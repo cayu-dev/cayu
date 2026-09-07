@@ -61,6 +61,7 @@ from cayu.environments.factory import (
     environment_factory_cleanup_settlement_task,
     register_environment_factory_cleanup_retry,
 )
+from cayu.runners._creation_cleanup import retry_acquisition_settlement
 from cayu.runners.base import ExecCommand, Runner
 from cayu.runners.microsandbox import (
     DEFAULT_MICROSANDBOX_RECONNECT_TIMEOUT_SECONDS,
@@ -970,10 +971,16 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                         # quiescence for the exact attested incarnation.
                         return
                     raise
-                await restoration_runner.close()
+                await restoration_runner._close_for_reconnect_restoration()
 
-            retry_task = asyncio.create_task(
-                restore(),
+            previous = claim.settlement_task
+            if previous is None:
+                raise EgressReconnectConflictError(
+                    "Microsandbox restoration has no retained owner."
+                )
+            retry_task = retry_acquisition_settlement(
+                previous,
+                restore,
                 name=f"cayu-microsandbox-reconnect-recovery-{sandbox_name}",
             )
             self._observe_claim_settlement(

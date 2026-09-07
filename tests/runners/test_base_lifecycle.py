@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu.runners._cleanup import RunnerCleanupResult
+from cayu.runners._cleanup import RunnerCleanupResult, runner_cancellation_failure
 from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
@@ -63,6 +63,75 @@ def _artifact(action: str, status: str) -> dict:
         "status": status,
         "timeout_s": 5.0,
     }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("policy", "action"),
+    [("command", "kill_command"), ("sandbox", "kill_sandbox"), ("none", "none")],
+)
+async def test_cleanup_deadline_reports_the_selected_boundary(policy, action):
+    runner = StubRunner()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def cleanup():
+        await release.wait()
+        finished.set()
+        return RunnerCleanupResult(artifact=_artifact(action, "completed"), close_runner=False)
+
+    try:
+        result = await runner._settle_command_cleanup(
+            cleanup, adapter="stub", timeout_s=0.01, policy=policy
+        )
+        assert result.artifact["action"] == action
+        assert result.artifact["status"] == "timeout"
+        assert runner.lifecycle_state == "poisoned"
+        assert not finished.is_set()
+    finally:
+        release.set()
+        await asyncio.wait_for(finished.wait(), 1)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("fatal", [False, True])
+async def test_cleanup_group_preserves_current_cancellation_and_fatal_leaves(terminal, fatal):
+    runner = StubRunner()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    signal = SystemExit(7) if fatal else RuntimeError("cleanup failed")
+    failure = BaseExceptionGroup("cleanup group", [asyncio.CancelledError("child"), signal])
+
+    async def cleanup():
+        entered.set()
+        await release.wait()
+        raise failure
+
+    async def run():
+        if terminal:
+            await runner._settle_terminal_lifecycle(cleanup, action="close", timeout_s=1)
+        else:
+            await runner._settle_command_cleanup(cleanup, adapter="stub", timeout_s=1)
+
+    task = asyncio.create_task(run())
+    await entered.wait()
+    task.cancel("owner")
+    await asyncio.sleep(0)
+    release.set()
+    if fatal:
+        with pytest.raises(BaseExceptionGroup) as captured:
+            await task
+        assert captured.value is failure
+        assert not task.cancelled()
+    else:
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await task
+        assert captured.value.args == ("owner",)
+        assert runner_cancellation_failure(captured.value) is failure
+        assert task.cancelled()
+    assert task.cancelling() == 1
+    assert runner.lifecycle_state == "poisoned"
 
 
 def test_is_same_or_child_edges():
@@ -145,9 +214,9 @@ def test_apply_cleanup_result_latches_failed_command_kill():
         RunnerCleanupResult(artifact=_artifact("kill_command", "failed"), close_runner=False)
     )
     assert runner._exec_closed is True
-    assert runner._exec_closed_reason == (
-        "stub command cleanup did not complete; command state is unknown"
-    )
+    assert runner.lifecycle_state == "poisoned"
+    with pytest.raises(RuntimeError, match="permanently poisoned"):
+        runner.reopen_exec()
     assert runner._closed is False
 
 

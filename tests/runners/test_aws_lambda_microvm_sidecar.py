@@ -14,7 +14,10 @@ from typing import Any
 import pytest
 
 from cayu.cli.lambda_microvm import _export_sidecar
-from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
+from cayu.runners.aws_lambda_microvm import (
+    LAMBDA_MICROVM_MAX_OUTPUT_BYTES,
+    LAMBDA_MICROVM_PROTOCOL_VERSION,
+)
 
 SUPERVISOR_PATH = (
     Path(__file__).resolve().parents[2]
@@ -35,6 +38,10 @@ READ_CHUNK_BYTES = SUPERVISOR_MODULE.READ_CHUNK_BYTES
 _LimitedBuffer = SUPERVISOR_MODULE._LimitedBuffer
 _drain = SUPERVISOR_MODULE._drain
 _result = SUPERVISOR_MODULE._result
+
+
+def test_sidecar_output_ceiling_matches_runner() -> None:
+    assert SUPERVISOR_MODULE.MAX_OUTPUT_LIMIT_BYTES == LAMBDA_MICROVM_MAX_OUTPUT_BYTES
 
 
 def test_sidecar_dockerfile_pins_supported_python() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import importlib
 import posixpath
@@ -14,6 +15,11 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 from cayu._exception_groups import add_exception_note_safely, exception_tree_contains
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    capture_awaitable_outcome,
+    restore_task_cancellation_requests,
+)
 from cayu._validation import (
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -29,6 +35,13 @@ from cayu.runners._cleanup import (
     cleanup_runner_command_with_diagnostic,
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
+)
+from cayu.runners._creation_cleanup import (
+    CreationCleanupProgress,
+    drain_creation_cleanups,
+    require_creation_cleanup_settled,
+    retain_creation_cleanup,
+    settle_creation_cleanup,
 )
 from cayu.runners._redacted_output import RedactedOutputCapture
 from cayu.runners._subprocess import (
@@ -49,6 +62,7 @@ from cayu.runners.base import (
     RunnerWorkspaceCapabilityT,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
+    _contains_runner_fatal_signal,
     attach_cancellation_artifacts,
     copy_exec_command,
     runner_execution_error,
@@ -723,6 +737,9 @@ class E2BRunner(Runner):
         module = _e2b_module(e2b_module)
         guest_root = _validate_guest_root(default_cwd)
         _validate_close_action(close_action)
+        cancel_timeout = validate_cancel_timeout(cancel_timeout_s)
+        execution_user = _validate_exec_user(exec_user)
+        environment_overlay = dict(env_overlay) if env_overlay else {}
         cancellation_policy = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
         )
@@ -761,24 +778,26 @@ class E2BRunner(Runner):
                 sandbox,
                 exc,
                 "E2B setup was cancelled and cleanup failed.",
+                timeout_s=cancel_timeout,
             )
             raise
-        except Exception as exc:
+        except BaseException as exc:
             await _cleanup_created_sandbox_after_failure(
                 sandbox,
                 exc,
                 "E2B setup failed and cleanup failed.",
+                timeout_s=cancel_timeout,
             )
             raise
         return cls(
             sandbox,
             default_cwd=guest_root,
             close_action=close_action,
-            cancel_timeout_s=cancel_timeout_s,
+            cancel_timeout_s=cancel_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
-            env_overlay=env_overlay,
-            exec_user=exec_user,
+            env_overlay=environment_overlay,
+            exec_user=execution_user,
             e2b_module=module,
         )
 
@@ -1142,8 +1161,12 @@ class E2BRunner(Runner):
 
         module = _e2b_module(e2b_module)
         resolved_id = _validate_sandbox_id(sandbox_id)
+        require_creation_cleanup_settled("e2b", resolved_id)
         guest_root = _validate_guest_root(default_cwd)
         _validate_close_action(close_action)
+        cancel_timeout = validate_cancel_timeout(cancel_timeout_s)
+        execution_user = _validate_exec_user(exec_user)
+        environment_overlay = dict(env_overlay) if env_overlay else {}
         cancellation_policy = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
         )
@@ -1154,28 +1177,34 @@ class E2BRunner(Runner):
         connect_options = dict(api_options)
         _set_option(connect_options, "timeout", timeout)
         sandbox = await module.AsyncSandbox.connect(resolved_id, **connect_options)
+        require_creation_cleanup_settled("e2b", resolved_id)
         if ensure_default_cwd:
             await sandbox.commands.run(
                 f"mkdir -p {shlex.quote(guest_root)}",
                 cwd="/",
                 timeout=60,
             )
+        require_creation_cleanup_settled("e2b", resolved_id)
         return cls(
             sandbox,
             sandbox_id=resolved_id,
             default_cwd=guest_root,
             close_action=close_action,
-            cancel_timeout_s=cancel_timeout_s,
+            cancel_timeout_s=cancel_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
-            env_overlay=env_overlay,
-            exec_user=exec_user,
+            env_overlay=environment_overlay,
+            exec_user=execution_user,
             e2b_module=module,
         )
 
     @property
     def resource_key(self) -> tuple[object, ...]:
         return ("e2b", self.sandbox_id)
+
+    def _ensure_exec_open(self) -> None:
+        super()._ensure_exec_open()
+        require_creation_cleanup_settled("e2b", self.sandbox_id)
 
     def workspace_capability(
         self,
@@ -1189,29 +1218,42 @@ class E2BRunner(Runner):
             return cast("RunnerWorkspaceCapabilityT", capability)
         return super().workspace_capability(capability_type)
 
+    @classmethod
+    async def drain_failed_creations(
+        cls, *, timeout_s: float = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS
+    ) -> int:
+        """Retry retained process-local constructor rollback; return unsettled count."""
+        return await drain_creation_cleanups("e2b", timeout_s=timeout_s)
+
     async def close(self) -> None:
         """Apply the configured lifecycle action once."""
 
-        if self._closed:
-            return
+        action = self.close_action
+        await self._settle_terminal_lifecycle(
+            lambda: self._close_owned(action), action=action, timeout_s=2 * self.cancel_timeout_s
+        )
+
+    async def _close_owned(self, action: E2BCloseAction) -> None:
         await self._wait_for_late_start_cleanup_tasks()
-        if self.close_action in {"none", "detach"}:
-            self._closed = True
+        if action in {"none", "detach"}:
             return
-        if self.close_action == "kill":
-            await self._sandbox.kill()
-            self._closed = True
+        if action == "kill":
+            await _kill_sandbox_confirmed(self._sandbox)
             return
-        raise AssertionError(f"Unsupported E2B close action: {self.close_action}")
+        raise AssertionError(f"Unsupported E2B close action: {action}")
 
     async def detach_preserving_allocation(self) -> None:
         """Close this local capability without deleting the provider sandbox."""
 
-        if self._closed:
-            return
+        await self._settle_terminal_lifecycle(
+            self._detach_preserving_allocation_owned,
+            action="detach",
+            timeout_s=self.cancel_timeout_s,
+        )
+
+    async def _detach_preserving_allocation_owned(self) -> None:
         if not await self.await_pending_command_settlement():
             raise RuntimeError("E2B command settlement is uncertain at allocation detach.")
-        self._closed = True
 
     async def await_pending_command_settlement(self) -> bool:
         """Wait for every deferred late-start cleanup known to this runner."""
@@ -1469,6 +1511,7 @@ class E2BRunner(Runner):
             if execution_user is not None:
                 run_options["user"] = execution_user
             start_task = asyncio.create_task(self._sandbox.commands.run(script, **run_options))
+            start_task.add_done_callback(_consume_task_outcome)
             handle = await self._await_started_handle(start_task, deadline=deadline)
             if standard_input is not None:
                 await handle.send_stdin(standard_input)
@@ -1486,6 +1529,7 @@ class E2BRunner(Runner):
                 current_handle=handle,
                 cleanup_policy=self.cancellation_cleanup,
                 wait_for_handle_before_cancelling=True,
+                cancellation=exc,
             )
             attach_cancellation_artifacts(exc, [cleanup.artifact])
             raise
@@ -1522,6 +1566,17 @@ class E2BRunner(Runner):
             )
 
         if execution_failure is not None:
+            if self.cancellation_cleanup == "none":
+                self._poison_exec("E2B transport failed without command settlement")
+            await self._cleanup_failed_execution(
+                execution_failure,
+                lambda: self._cleanup_interrupted_command(
+                    start_task,
+                    current_handle=handle,
+                    cleanup_policy=self.cancellation_cleanup,
+                    wait_for_handle_before_cancelling=False,
+                ),
+            )
             raise execution_failure
         return _exec_result_from_e2b_result(result, stdout, stderr)
 
@@ -1531,12 +1586,40 @@ class E2BRunner(Runner):
         *,
         deadline: float | None,
     ) -> Any:
-        if deadline is None:
-            return await asyncio.shield(start_task)
-        remaining = max(deadline - asyncio.get_running_loop().time(), 0.0)
-        return await asyncio.wait_for(asyncio.shield(start_task), timeout=remaining)
+        remaining = (
+            None if deadline is None else max(deadline - asyncio.get_running_loop().time(), 0.0)
+        )
+        # Observe without cancelling the provider task or installing shield's
+        # late-exception logger. Cleanup owns and consumes this task's outcome;
+        # Python 3.14 shield logging would expose it before that reconciliation.
+        done, _ = await asyncio.wait({start_task}, timeout=remaining)
+        if not done:
+            raise TimeoutError
+        return await start_task
 
     async def _cleanup_interrupted_command(
+        self,
+        start_task: asyncio.Task[Any] | None,
+        *,
+        current_handle: Any | None,
+        cleanup_policy: RunnerCleanupPolicy,
+        wait_for_handle_before_cancelling: bool,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> RunnerCleanupResult:
+        return await self._settle_command_cleanup(
+            lambda: self._cleanup_interrupted_command_owned(
+                start_task,
+                current_handle=current_handle,
+                cleanup_policy=cleanup_policy,
+                wait_for_handle_before_cancelling=wait_for_handle_before_cancelling,
+            ),
+            adapter="e2b",
+            timeout_s=3 * self.cancel_timeout_s,
+            policy=cleanup_policy,
+            cancellation=cancellation,
+        )
+
+    async def _cleanup_interrupted_command_owned(
         self,
         start_task: asyncio.Task[Any] | None,
         *,
@@ -1558,6 +1641,9 @@ class E2BRunner(Runner):
                 ),
                 close_runner=False,
             )
+        if handle is None and start_task is not None and cleanup_policy == "none":
+            # Cancelling an SDK waiter does not abort an accepted remote start.
+            self._poison_exec("E2B command start is unacknowledged; command state is unknown")
         cleanup = await cleanup_runner_command_with_diagnostic(
             self._sandbox,
             handle=handle,
@@ -1569,12 +1655,12 @@ class E2BRunner(Runner):
         return cleanup
 
     def _apply_cleanup_result(self, cleanup: Any) -> None:
+        super()._apply_cleanup_result(cleanup)
         if cleanup.close_runner:
             self._close_exec("runner cleanup closed the exec path")
-        if (
-            cleanup.artifact.get("action") == "kill_command"
-            and cleanup.artifact.get("status") != "completed"
-        ):
+        if cleanup.artifact.get("action") == "kill_command" and cleanup.artifact.get(
+            "status"
+        ) not in {"completed", "deferred"}:
             self._command_settlement_uncertain = True
             self._close_exec("E2B command cleanup did not prove remote command mutation quiescence")
         if (
@@ -1609,9 +1695,9 @@ class E2BRunner(Runner):
                 cleanup_policy=cleanup_policy,
             )
         try:
-            handle = await asyncio.wait_for(
-                asyncio.shield(start_task),
-                timeout=self.cancel_timeout_s,
+            handle = await self._await_started_handle(
+                start_task,
+                deadline=asyncio.get_running_loop().time() + self.cancel_timeout_s,
             )
             return handle, False
         except TimeoutError:
@@ -1635,16 +1721,16 @@ class E2BRunner(Runner):
     ) -> tuple[Any | None, bool]:
         start_task.cancel()
         try:
-            handle = await asyncio.wait_for(
-                asyncio.shield(start_task),
-                timeout=self.cancel_timeout_s,
+            handle = await self._await_started_handle(
+                start_task,
+                deadline=asyncio.get_running_loop().time() + self.cancel_timeout_s,
             )
             return handle, False
         except TimeoutError:
             if cleanup_policy == "sandbox":
                 return None, False
             if cleanup_policy == "none":
-                self._close_exec("E2B command start did not stop; command state is unknown")
+                self._poison_exec("E2B command start did not stop; command state is unknown")
                 return None, False
             self._track_late_start_cleanup(start_task, cleanup_policy=cleanup_policy)
             return None, True
@@ -1674,16 +1760,27 @@ class E2BRunner(Runner):
             settled = False
         if not settled:
             self._command_settlement_uncertain = True
+            self._poison_exec(self._exec_closed_reason)
         if self._command_settlement_uncertain:
             if not self._exec_closed:
                 self._close_exec(
                     "E2B command cleanup did not prove remote command mutation quiescence"
                 )
             return
-        if not self._late_start_cleanup_tasks and not self._closed:
-            # A deferred cleanup may reopen execution only after the complete
-            # process-local cleanup set has settled positively. One successful
-            # sibling must never clear another sibling's uncertainty latch.
+        self._command_cleanup_settled()
+
+    def _command_cleanup_settled(self) -> None:
+        if (
+            not self._late_start_cleanup_tasks
+            and not self._command_cleanups_pending
+            and not self._closed
+            and not self._closing
+            and not self._exec_poisoned
+            and not self._command_settlement_uncertain
+            and self._exec_closed_reason == "E2B command start cleanup is pending"
+        ):
+            # Clear only our deferred fence, never a later external fence or
+            # a sibling operation's still-pending cleanup ownership.
             self._open_exec()
 
     async def _cleanup_late_started_command(
@@ -1693,9 +1790,9 @@ class E2BRunner(Runner):
         cleanup_policy: RunnerCleanupPolicy,
     ) -> bool:
         try:
-            handle = await asyncio.wait_for(
-                asyncio.shield(start_task),
-                timeout=self._late_start_cleanup_timeout_s,
+            handle = await self._await_started_handle(
+                start_task,
+                deadline=asyncio.get_running_loop().time() + self._late_start_cleanup_timeout_s,
             )
         except asyncio.CancelledError:
             self._close_exec("E2B command start ended without positive remote abort evidence")
@@ -1709,9 +1806,14 @@ class E2BRunner(Runner):
         except Exception:
             self._close_exec("E2B command start failed without positive remote abort evidence")
             return False
-        cleanup = await cleanup_runner_command_with_diagnostic(
-            self._sandbox,
-            handle=handle,
+        cleanup = await self._settle_command_cleanup(
+            lambda: cleanup_runner_command_with_diagnostic(
+                self._sandbox,
+                handle=handle,
+                adapter="e2b",
+                timeout_s=self.cancel_timeout_s,
+                policy=cleanup_policy,
+            ),
             adapter="e2b",
             timeout_s=self.cancel_timeout_s,
             policy=cleanup_policy,
@@ -2053,77 +2155,55 @@ async def _cleanup_handoff_failure(
     original_error: BaseException,
     timeout_s: float,
 ) -> None:
+    if runner is not None:
+        await _cleanup_owned_handoff_runner(
+            runner, original_error=original_error, timeout_s=timeout_s
+        )
+        return
     cleanup_task = asyncio.create_task(
-        _rollback_handoff_sandbox(
-            module=module,
-            runner=runner,
-            handoff_id=handoff_id,
-            connection_options=connection_options,
-            timeout_s=timeout_s,
+        capture_awaitable_outcome(
+            lambda: _kill_handoff_sandboxes_by_metadata(
+                module=module,
+                handoff_id=handoff_id,
+                connection_options=connection_options,
+                timeout_s=timeout_s,
+            )
         )
     )
     primary_cancellation = (
         original_error if isinstance(original_error, asyncio.CancelledError) else None
     )
-    cleanup_cancellation: asyncio.CancelledError | None = None
-    cleanup_error: BaseException | None = None
-    if primary_cancellation is not None:
-        # Consume only the request whose CancelledError entered this rollback.
-        # Later cancellation requests must remain pending so the task keeps its
-        # native cancelled() / cancelling() semantics after cleanup.
-        _uncancel_current_task_once()
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    while not cleanup_task.done():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            cleanup_error = TimeoutError("E2B guest handoff rollback timed out.")
-            cleanup_task.cancel()
-            cleanup_task.add_done_callback(_consume_task_outcome)
-            break
-        try:
-            await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=remaining)
-        except asyncio.CancelledError as cancellation:
-            current_task = asyncio.current_task()
-            if current_task is None or current_task.cancelling() == 0:
-                # shield() also raises CancelledError when the cleanup task
-                # cancels itself. That is a rollback failure, not evidence
-                # that the caller cancelled the supervising handoff.
-                cleanup_error = _E2BHandoffRollbackCancelledError(
-                    "E2B guest handoff rollback cancelled without caller cancellation."
-                )
-                break
-            if cleanup_cancellation is None:
-                cleanup_cancellation = cancellation
-            # Do not uncancel this newer request. Once its exception has been
-            # delivered, shielded cleanup can continue while Task.cancelling()
-            # truthfully retains the caller-owned cancellation count.
-        except TimeoutError:
-            if cleanup_task.done():
-                break
-            cleanup_error = TimeoutError("E2B guest handoff rollback timed out.")
-            cleanup_task.cancel()
-            cleanup_task.add_done_callback(_consume_task_outcome)
-            break
-        except BaseException:
-            if cleanup_task.done():
-                break
-            raise
-    if cleanup_task.cancelled():
-        if cleanup_error is None:
-            cleanup_error = _E2BHandoffRollbackCancelledError(
-                "E2B guest handoff rollback cancelled without caller cancellation."
-            )
-    elif cleanup_error is None and cleanup_task.done():
-        try:
-            killed = cleanup_task.result()
-            if killed:
-                if runner is not None:
-                    runner._closed = True
-            elif runner is not None:
-                # False is the provider's idempotent "already gone" result.
-                runner._closed = True
-        except BaseException as exc:
-            cleanup_error = exc
+    outcome = await await_shielded_task_outcome(
+        cleanup_task, cancellation=primary_cancellation, timeout_s=timeout_s
+    )
+    cleanup_cancellation = (
+        outcome.cancellation if primary_cancellation is None else outcome.subsequent_cancellation
+    )
+    cleanup_error = outcome.error if outcome.result is None else outcome.result.error
+    if outcome.timed_out:
+        cleanup_error = TimeoutError("E2B guest handoff rollback timed out.")
+        # Stop discovery, not deletion: every observed allocation already has
+        # an independent retained deletion owner.
+        cleanup_task.cancel()
+        cleanup_task.add_done_callback(_consume_task_outcome)
+    elif isinstance(cleanup_error, asyncio.CancelledError):
+        cleanup_error = _E2BHandoffRollbackCancelledError(
+            "E2B guest handoff rollback cancelled without caller cancellation."
+        )
+    restore_task_cancellation_requests(
+        outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+    )
+    if _contains_runner_fatal_signal(original_error) or (
+        cleanup_error is not None and _contains_runner_fatal_signal(cleanup_error)
+    ):
+        failures = [original_error]
+        if cleanup_error is not None and cleanup_error is not original_error:
+            failures.append(cleanup_error)
+        if cleanup_cancellation is not None:
+            failures.append(cleanup_cancellation)
+        if len(failures) == 1:
+            raise original_error
+        raise BaseExceptionGroup("E2B guest handoff and rollback failed.", failures) from None
     if primary_cancellation is not None:
         if cleanup_error is not None:
             add_exception_note_safely(
@@ -2161,29 +2241,56 @@ async def _kill_late_handoff_runner(
 ) -> None:
     """Bound cleanup for an allocation acknowledged after supervision ended."""
 
-    kill_task = asyncio.create_task(runner._sandbox.kill())
-    done, _ = await asyncio.wait({kill_task}, timeout=timeout_s)
-    if kill_task in done:
-        kill_task.result()
-        return
-    kill_task.cancel()
-    kill_task.add_done_callback(_consume_task_outcome)
+    await _cleanup_owned_handoff_runner(
+        runner,
+        original_error=RuntimeError("E2B allocation arrived after handoff revocation."),
+        timeout_s=timeout_s,
+    )
 
 
-async def _rollback_handoff_sandbox(
+async def _cleanup_owned_handoff_runner(
+    runner: E2BRunner, *, original_error: BaseException, timeout_s: float
+) -> None:
+    # The guest-facing runner is already revoked. Cleanup owns the exact SDK
+    # sandbox directly, so retry never depends on reopening runner.close().
+    sandbox = runner._sandbox
+    await _settle_handoff_deletion(
+        lambda: sandbox.kill(),
+        sandbox_id=runner.sandbox_id,
+        original_error=original_error,
+        timeout_s=timeout_s,
+    )
+
+
+def _handoff_deletion_operation(
+    operation: Callable[[], Awaitable[bool]],
+) -> Callable[[CreationCleanupProgress], Awaitable[None]]:
+    async def delete(progress: CreationCleanupProgress) -> None:
+        try:
+            if type(await operation()) is not bool:
+                raise RuntimeError("E2B sandbox termination was not confirmed.")
+        except asyncio.CancelledError:
+            raise _E2BHandoffRollbackCancelledError(
+                "E2B guest handoff rollback cancelled without caller cancellation."
+            ) from None
+
+    return delete
+
+
+async def _settle_handoff_deletion(
+    operation: Callable[[], Awaitable[bool]],
     *,
-    module: ModuleType | Any,
-    runner: E2BRunner | None,
-    handoff_id: str,
-    connection_options: Mapping[str, Any],
+    sandbox_id: str,
+    original_error: BaseException,
     timeout_s: float,
-) -> bool:
-    if runner is not None:
-        return bool(await runner._sandbox.kill())
-    return await _kill_handoff_sandboxes_by_metadata(
-        module,
-        handoff_id=handoff_id,
-        connection_options=connection_options,
+) -> None:
+    await settle_creation_cleanup(
+        _handoff_deletion_operation(operation),
+        adapter="e2b",
+        identity=sandbox_id,
+        join_existing=True,
+        original=original_error,
+        message="E2B guest handoff and rollback failed.",
         timeout_s=timeout_s,
     )
 
@@ -2197,6 +2304,10 @@ async def _kill_handoff_sandboxes_by_metadata(
 ) -> bool:
     """Reconcile a create call whose remote allocation result is ambiguous."""
 
+    # Discovery's shrinking deadline must not become the permanent SDK timeout
+    # of a retained deletion. Each retry gets the configured request allowance
+    # (or SDK default); bounded observers still join, never cancel, deletion.
+    deletion_options = dict(connection_options)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     stable_empty_since: float | None = None
@@ -2230,19 +2341,32 @@ async def _kill_handoff_sandboxes_by_metadata(
             limit=100,
             **request_options,
         )
-        matching_ids: list[str] = []
+        matching_ids: dict[str, None] = {}
         while paginator.has_next:
             for sandbox in await paginator.next_items():
                 sandbox_id = getattr(sandbox, "sandbox_id", None)
                 if type(sandbox_id) is not str:
                     raise RuntimeError("E2B sandbox list returned an invalid sandbox id.")
-                matching_ids.append(_validate_sandbox_id(sandbox_id))
+                sandbox_id = _validate_sandbox_id(sandbox_id)
+                # Retain every observed allocation before another page, item,
+                # or deletion can fail. A drain can reclaim even unstarted work.
+                retain_creation_cleanup(
+                    _handoff_deletion_operation(
+                        functools.partial(module.AsyncSandbox.kill, sandbox_id, **deletion_options)
+                    ),
+                    adapter="e2b",
+                    identity=sandbox_id,
+                    join_existing=True,
+                )
+                matching_ids[sandbox_id] = None
         if matching_ids:
             stable_empty_since = None
             for sandbox_id in matching_ids:
-                await module.AsyncSandbox.kill(
-                    sandbox_id,
-                    **request_options,
+                await _settle_handoff_deletion(
+                    functools.partial(module.AsyncSandbox.kill, sandbox_id, **deletion_options),
+                    sandbox_id=sandbox_id,
+                    original_error=RuntimeError("E2B handoff allocation requires rollback."),
+                    timeout_s=operation_remaining,
                 )
                 killed_any = True
             continue
@@ -2297,12 +2421,6 @@ def _contains_cancellation(error: BaseException) -> bool:
     return exception_tree_contains(error, asyncio.CancelledError)
 
 
-def _uncancel_current_task_once() -> None:
-    current_task = asyncio.current_task()
-    if current_task is not None and current_task.cancelling() > 0:
-        current_task.uncancel()
-
-
 def _handoff_rollback_diagnostic(error: BaseException) -> str:
     return f"E2B guest handoff rollback incomplete: {type(error).__name__}."
 
@@ -2312,16 +2430,26 @@ def _consume_task_outcome(task: asyncio.Task[Any]) -> None:
         task.result()
 
 
-async def _cleanup_created_sandbox(sandbox: Any) -> None:
-    await sandbox.kill()
+async def _kill_sandbox_confirmed(sandbox: Any) -> None:
+    # E2B returns True for deletion and False for provider-confirmed absence.
+    # Both settle this exact sandbox ID; an unknown result is not authority.
+    if type(await sandbox.kill()) is not bool:
+        raise RuntimeError("E2B sandbox termination was not confirmed.")
 
 
 async def _cleanup_created_sandbox_after_failure(
     sandbox: Any,
     original_error: BaseException,
     message: str,
+    *,
+    timeout_s: float,
 ) -> None:
-    try:
-        await _cleanup_created_sandbox(sandbox)
-    except Exception as cleanup_error:
-        raise BaseExceptionGroup(message, [original_error, cleanup_error]) from cleanup_error
+    await settle_creation_cleanup(
+        lambda progress: _kill_sandbox_confirmed(sandbox),
+        adapter="e2b",
+        identity=_validate_sandbox_id(sandbox.sandbox_id),
+        join_existing=True,
+        original=original_error,
+        message=message,
+        timeout_s=timeout_s,
+    )

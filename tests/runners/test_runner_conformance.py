@@ -29,6 +29,8 @@ from cayu.runners import (
     DockerRunner,
     E2BRunner,
     ExecCommand,
+    ExecResult,
+    LambdaMicroVMEndpointTransientError,
     LambdaMicroVMProtocolError,
     LambdaMicroVMRunner,
     LocalRunner,
@@ -458,6 +460,48 @@ class _DelayedE2BCommands(_LocalE2BCommands):
         return await super().run(script, **options)
 
 
+async def _probe_docker_ambiguous_start(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    accepted = asyncio.Event()
+    release = asyncio.Event()
+
+    async def remote() -> None:
+        await release.wait()
+        (root / "late-effect").write_text("original")
+
+    remote_task = asyncio.create_task(remote())
+
+    async def dispatch(*args: Any, **kwargs: Any) -> ExecResult:
+        accepted.set()
+        await asyncio.shield(remote_task)
+        return ExecResult()
+
+    async def probe(*args: Any, **kwargs: Any) -> ExecResult:
+        return ExecResult(exit_code=1)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", dispatch)
+    monkeypatch.setattr("cayu.runners.docker._run_docker", probe)
+    runner = DockerRunner("owned", docker_path="docker", cancellation_cleanup="none")
+    task = asyncio.create_task(runner.exec(ExecCommand.process("true")))
+    try:
+        await accepted.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled() and task.cancelling() == 1
+        assert runner.lifecycle_state == "poisoned"
+        with pytest.raises(RuntimeError):
+            runner.reopen_exec()
+        with pytest.raises(RuntimeError):
+            await runner.exec(ExecCommand.process("true"))
+        release.set()
+        await remote_task
+        assert (root / "late-effect").read_text() == "original"
+        assert runner.lifecycle_state == "poisoned"
+    finally:
+        release.set()
+        await asyncio.gather(task, remote_task, return_exceptions=True)
+
+
 async def _probe_e2b_ambiguous_start(
     root: Path,
     _monkeypatch: pytest.MonkeyPatch,
@@ -619,7 +663,7 @@ class _ProtocolTransport:
 
 async def _probe_lambda_microvm_protocol(
     root: Path,
-    _monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, bool]:
     observed: dict[str, bool] = {}
     mismatch_client = ConformanceLambdaClient()
@@ -663,6 +707,54 @@ async def _probe_lambda_microvm_protocol(
         else:
             observed[key] = False
         await runner.close()
+    for scenario in ("transient_poll", "oversized_output"):
+
+        class BoundaryTransport(_ProtocolTransport):
+            polls = 0
+            case = scenario
+
+            async def get_command(self, *, command_id: str, **kwargs: Any) -> dict[str, Any]:
+                self.polls += 1
+                if self.case == "transient_poll" and self.polls < 3:
+                    raise LambdaMicroVMEndpointTransientError("retryable read")
+                return {
+                    "command_id": command_id,
+                    "state": "completed",
+                    "exit_code": 0,
+                    "stdout_base64": "" if self.case == "transient_poll" else "A" * 16,
+                    "timed_out": False,
+                    "cancelled": False,
+                    "stderr_base64": "",
+                    "stdout_bytes": 0 if self.case == "transient_poll" else 12,
+                    "stderr_bytes": 0,
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+
+        transport = BoundaryTransport()
+        runner = LambdaMicroVMRunner(
+            ConformanceLambdaClient(),
+            microvm_id="mvm-conformance-bounds",
+            endpoint="conformance.lambda-microvm.invalid",
+            default_cwd=str(root),
+            endpoint_transport=transport,
+            request_timeout_s=1,
+        )
+        try:
+            if scenario == "transient_poll":
+                result = await runner.exec(ExecCommand.process("true"))
+                observed[scenario] = result.exit_code == 0 and transport.polls == 3
+            else:
+                with monkeypatch.context() as scoped:
+                    scoped.setattr(
+                        "cayu.runners.aws_lambda_microvm.LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES",
+                        12,
+                    )
+                    with pytest.raises(LambdaMicroVMProtocolError, match="byte ceiling"):
+                        await runner.exec(ExecCommand.process("true"))
+                observed[scenario] = transport.polls == 1
+        finally:
+            await runner.close()
     return observed
 
 
@@ -676,6 +768,7 @@ class _FailFirstSuspendClient(ConformanceLambdaClient):
         if self._fail_suspend:
             self._fail_suspend = False
             raise RuntimeError("transient suspend failure")
+        self.state = "SUSPENDED"
         return {}
 
 
@@ -695,8 +788,26 @@ async def _probe_lambda_microvm_lifecycle(
     )
     with pytest.raises(RuntimeError, match="transient suspend failure"):
         await runner.suspend()
+    assert runner.lifecycle_state == "poisoned"
+    with pytest.raises(RuntimeError):
+        await runner.suspend()
+    with pytest.raises(RuntimeError, match="poisoned"):
+        runner.reopen_exec()
+    await runner.close()
+    assert client.terminate_calls == 1
+
+    client = ConformanceLambdaClient()
+    runner = LambdaMicroVMRunner(
+        client,
+        microvm_id="mvm-conformance-lifecycle",
+        endpoint="conformance.lambda-microvm.invalid",
+        default_cwd=str(root),
+        close_action="terminate",
+        endpoint_transport=_ProtocolTransport(),
+        poll_interval_s=0,
+    )
     await asyncio.gather(runner.suspend(), runner.suspend())
-    assert client.suspend_calls == 2
+    assert client.suspend_calls == 1
     await asyncio.gather(runner.resume(), runner.resume())
     assert client.resume_calls == 1
     await runner.close()
@@ -734,9 +845,7 @@ CLI_CAPABILITIES = RunnerCapabilities(
     command_cleanup=CapabilityClaim.supported(),
     sandbox_cleanup=CapabilityClaim.supported(),
     no_cleanup=CapabilityClaim.supported(),
-    ambiguous_start=CapabilityClaim.not_applicable(
-        "The supervised CLI call has no separately acknowledged remote start phase."
-    ),
+    ambiguous_start=CapabilityClaim.supported(),
     remote_protocol=CapabilityClaim.not_applicable(
         "The runner uses an installed CLI rather than a Cayu-owned remote protocol."
     ),
@@ -752,6 +861,7 @@ DOCKER = RunnerConformanceRegistration(
     system_execution_mode="shared",
     capabilities=CLI_CAPABILITIES,
     cleanup_factory=_docker_cleanup_factory,
+    ambiguous_start_probe=_probe_docker_ambiguous_start,
 )
 
 REMOTE_SANDBOX_CAPABILITIES = RunnerCapabilities(
@@ -1000,6 +1110,8 @@ def test_runner_conformance_remote_protocol_failures_are_explicit(
             "unknown_command",
             "malformed_state",
             "incomplete_terminal_snapshot",
+            "transient_poll",
+            "oversized_output",
         }
         assert all(observed.values())
 
@@ -1472,6 +1584,205 @@ def test_runner_conformance_close_is_bounded_idempotent_and_terminal(
 
     with evidence.reporting():
         asyncio.run(run())
+
+
+@pytest.mark.parametrize("registration", OVERLAY_REGISTRATIONS, ids=lambda item: item.name)
+@pytest.mark.anyio
+async def test_remote_runner_conformance_close_binds_action_before_scheduling(
+    registration, tmp_path, monkeypatch
+):
+    harness = await registration.factory(tmp_path, monkeypatch)
+    runner = harness.runner
+    observed = []
+
+    async def close_owned(action, **kwargs):
+        observed.append(action)
+
+    monkeypatch.setattr(runner, "_close_owned", close_owned)
+    task = asyncio.create_task(runner.close())
+    await asyncio.sleep(0)
+    runner.close_action = {
+        "docker": "remove",
+        "e2b": "kill",
+        "microsandbox": "remove",
+        "lambda-microvm": "terminate",
+    }[registration.name]
+    try:
+        await task
+        assert observed == ["none"]
+        assert runner.lifecycle_state == "closed"
+    finally:
+        await harness.aclose()
+
+
+@pytest.mark.parametrize("registration", OVERLAY_REGISTRATIONS, ids=lambda item: item.name)
+@pytest.mark.parametrize("invalid_timeout", [0, float("nan"), float("inf")])
+@pytest.mark.anyio
+async def test_remote_runner_conformance_rejects_configuration_before_allocation(
+    registration, invalid_timeout, monkeypatch
+):
+    calls = 0
+
+    async def allocate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid construction must not allocate")
+
+    with pytest.raises(ValueError):
+        if registration is DOCKER:
+            monkeypatch.setattr("cayu.runners.docker.run_subprocess", allocate)
+            await DockerRunner.create("conformance-invalid", cancel_timeout_s=invalid_timeout)
+        elif registration is E2B:
+            await E2BRunner.create(
+                e2b_module=SimpleNamespace(AsyncSandbox=SimpleNamespace(create=allocate)),
+                cancel_timeout_s=invalid_timeout,
+            )
+        elif registration is MICROSANDBOX:
+            await MicrosandboxRunner.create(
+                "conformance-invalid",
+                sandbox_module=SimpleNamespace(Sandbox=SimpleNamespace(create=allocate)),
+                cancel_timeout_s=invalid_timeout,
+            )
+        else:
+            assert registration is LAMBDA_MICROVM
+
+            def allocate_sync(**kwargs):
+                nonlocal calls
+                calls += 1
+                raise AssertionError("invalid construction must not allocate")
+
+            await LambdaMicroVMRunner.create(
+                "conformance-image",
+                client=SimpleNamespace(run_microvm=allocate_sync),
+                cancel_timeout_s=invalid_timeout,
+            )
+    assert calls == 0
+
+
+@pytest.mark.parametrize("registration", OVERLAY_REGISTRATIONS, ids=lambda item: item.name)
+@pytest.mark.anyio
+async def test_remote_runner_conformance_teardown_failure_never_grants_reuse(
+    registration, tmp_path, monkeypatch
+):
+    harness = await registration.factory(tmp_path, monkeypatch)
+    runner = harness.runner
+    calls = 0
+
+    def mutate_sync(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("terminal mutation rejected")
+        if registration is E2B:
+            return True
+        if registration is LAMBDA_MICROVM:
+            runner._client.state = "TERMINATED"
+        return SimpleNamespace(exit_code=0, timed_out=False)
+
+    async def mutate(*args, **kwargs):
+        return mutate_sync()
+
+    if registration is DOCKER:
+        runner.close_action = "remove"
+        monkeypatch.setattr("cayu.runners.docker._run_docker", mutate)
+    elif registration is E2B:
+        runner.close_action = "kill"
+        monkeypatch.setattr(runner._sandbox, "kill", mutate)
+    elif registration is MICROSANDBOX:
+        runner.close_action = "detach"
+        monkeypatch.setattr(runner._sandbox, "detach", mutate, raising=False)
+    else:
+        assert registration is LAMBDA_MICROVM
+        runner.close_action = "terminate"
+        monkeypatch.setattr(runner._client, "terminate_microvm", mutate_sync)
+    try:
+        with pytest.raises(RuntimeError, match="terminal mutation rejected"):
+            await runner.close()
+        assert runner.lifecycle_state == "poisoned"
+        with pytest.raises(RuntimeError):
+            await runner.exec(ExecCommand.process("true"))
+        with pytest.raises(RuntimeError):
+            runner.reopen_exec()
+        await runner.close()
+        assert runner.lifecycle_state == "closed"
+        await runner.close()
+        assert calls == 2
+    finally:
+        await harness.aclose()
+
+
+@pytest.mark.parametrize("registration", OVERLAY_REGISTRATIONS, ids=lambda item: item.name)
+@pytest.mark.parametrize("lost_acknowledgement", [False, True])
+@pytest.mark.anyio
+async def test_remote_runner_conformance_second_cancel_retains_cleanup_owner(
+    registration: RunnerConformanceRegistration,
+    lost_acknowledgement: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert registration.cleanup_factory is not None
+    harness = await registration.cleanup_factory(tmp_path, monkeypatch, "command")
+    adapter_module = sys.modules[registration.runner_type.__module__]
+    original_cleanup = adapter_module.cleanup_runner_command_with_diagnostic
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_cleanup(*args: Any, **kwargs: Any):
+        cleaning.set()
+        await release.wait()
+        result = await original_cleanup(*args, **kwargs)
+        if lost_acknowledgement:
+            raise RuntimeError("cleanup acknowledgement unavailable")
+        return result
+
+    monkeypatch.setattr(adapter_module, "cleanup_runner_command_with_diagnostic", delayed_cleanup)
+    started = tmp_path / "second-cancel-started"
+    task = asyncio.create_task(
+        harness.runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                f"import pathlib,time; pathlib.Path({str(started)!r}).touch(); time.sleep(2)",
+            )
+        )
+    )
+    try:
+        async with asyncio.timeout(2):
+            while not started.exists():
+                await asyncio.sleep(0.01)
+        task.cancel("original cancellation")
+        await asyncio.wait_for(cleaning.wait(), 2)
+        task.cancel("second cancellation")
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert harness.runner.lifecycle_state == "closing"
+        with pytest.raises(RuntimeError):
+            await harness.runner.exec(ExecCommand.process(sys.executable, "-c", "pass"))
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await asyncio.wait_for(task, 2)
+        assert task.cancelled()
+        assert task.cancelling() == 2
+        assert captured.value.args == ("original cancellation",)
+        artifacts = getattr(captured.value, "artifacts", [])
+        assert len(artifacts) == 1
+        assert artifacts[0]["status"] == ("failed" if lost_acknowledgement else "completed")
+        if lost_acknowledgement:
+            assert harness.runner.lifecycle_state == "poisoned"
+            with pytest.raises(RuntimeError):
+                harness.runner.reopen_exec()
+        else:
+            assert harness.runner.lifecycle_state == "reusable"
+            result = await harness.runner.exec(
+                ExecCommand.process(sys.executable, "-c", "print('reused')")
+            )
+            assert result.stdout == "reused\n"
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await harness.aclose()
 
 
 @pytest.mark.parametrize(

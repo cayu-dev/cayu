@@ -129,6 +129,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerLifecycleState,
     RunnerWorkspaceCapabilityT,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
@@ -1864,6 +1865,19 @@ class _EgressManagedRunner(Runner):
     """
 
     pending_command_settlement_cancellation_safe = True
+
+    @property
+    def lifecycle_state(self) -> RunnerLifecycleState:
+        """Include the underlying allocation's execution eligibility."""
+
+        outer = super().lifecycle_state
+        inner = self._runner.lifecycle_state
+        for state in ("closed", "poisoned", "closing", "fenced"):
+            if state == outer:
+                return outer
+            if state == inner:
+                return inner
+        return "reusable"
 
     def __init__(
         self,

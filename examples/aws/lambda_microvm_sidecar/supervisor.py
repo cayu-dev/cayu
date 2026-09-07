@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 1024 * 1024
+MAX_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024
 DEFAULT_CANCEL_TIMEOUT_SECONDS = 5.0
 MAX_STDIN_BYTES = 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
@@ -503,6 +504,10 @@ def _validated_payload(
     output_limit = request.get("output_limit_bytes", DEFAULT_OUTPUT_LIMIT_BYTES)
     if output_limit is not None and (type(output_limit) is not int or output_limit <= 0):
         raise CommandRequestError("output_limit_bytes must be null or a positive integer")
+    output_limit = min(
+        MAX_OUTPUT_LIMIT_BYTES,
+        MAX_OUTPUT_LIMIT_BYTES if output_limit is None else output_limit,
+    )
     return {
         "kind": kind,
         "argv": argv,

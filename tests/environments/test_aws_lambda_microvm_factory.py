@@ -30,6 +30,7 @@ class FakeControlClient:
         self.get_calls = 0
         self.suspend_calls = 0
         self.terminate_calls = 0
+        self.states: dict[str, str] = {}
 
     def run_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.run_calls += 1
@@ -45,7 +46,7 @@ class FakeControlClient:
         return {
             "microvmId": kwargs["microvmIdentifier"],
             "endpoint": f"{kwargs['microvmIdentifier']}.example.test",
-            "state": "RUNNING",
+            "state": self.states.get(kwargs["microvmIdentifier"], "RUNNING"),
             "imageArn": "arn:aws:lambda:us-west-2:123:microvm-image:cayu",
             "imageVersion": "3",
         }
@@ -55,10 +56,16 @@ class FakeControlClient:
 
     def suspend_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.suspend_calls += 1
+        self.states[kwargs["microvmIdentifier"]] = "SUSPENDED"
+        return {}
+
+    def resume_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        self.states[kwargs["microvmIdentifier"]] = "RUNNING"
         return {}
 
     def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.terminate_calls += 1
+        self.states[kwargs["microvmIdentifier"]] = "TERMINATED"
         return {}
 
 
@@ -67,6 +74,7 @@ class FailOnceTerminateControlClient(FakeControlClient):
         self.terminate_calls += 1
         if self.terminate_calls == 1:
             raise RuntimeError("temporary termination failure")
+        self.states[kwargs["microvmIdentifier"]] = "TERMINATED"
         return {}
 
 
@@ -155,7 +163,9 @@ async def test_lambda_microvm_factory_reconnects_and_applies_terminal_lifecycle(
     )
     await resumed_binding.finalize(resumed_bound, outcome="completed")
 
-    assert client.get_calls == 1
+    # Reconnect plus positive suspension and termination readback.
+    assert client.get_calls == 3
+    assert client.states["mvm-1"] == "TERMINATED"
     assert client.terminate_calls == 1
 
     await factory.create(

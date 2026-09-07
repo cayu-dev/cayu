@@ -5,6 +5,7 @@ import base64
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ import cayu.runners.aws_lambda_microvm as lambda_microvm_module
 from cayu import ExecCommand, LambdaMicroVMRunner, RunnerWorkspace
 from cayu.runners import (
     HttpxLambdaMicroVMEndpointTransport,
+    LambdaMicroVMEndpointTransientError,
     LambdaMicroVMEndpointUnauthorized,
     LambdaMicroVMError,
     LambdaMicroVMProtocolError,
@@ -33,6 +35,302 @@ SUPERVISOR_SPEC = importlib.util.spec_from_file_location(
     "cayu_lambda_microvm_runner_supervisor", SUPERVISOR_PATH
 )
 assert SUPERVISOR_SPEC is not None and SUPERVISOR_SPEC.loader is not None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("action", ["suspend", "terminate"])
+@pytest.mark.parametrize("late", [False, True])
+async def test_public_lifecycle_retains_dispatched_thread(action, late):
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    client = FakeLambdaMicroVMClient()
+    original = getattr(client, action + "_microvm")
+
+    def blocked(**kwargs):
+        started.set()
+        assert release.wait(5)
+        try:
+            return original(**kwargs)
+        finally:
+            finished.set()
+
+    setattr(client, action + "_microvm", blocked)
+    runner = LambdaMicroVMRunner(
+        client,
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=FakeEndpointTransport(),
+        cancel_timeout_s=0.05 if late else 1,
+    )
+    task = asyncio.create_task(getattr(runner, action)())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel("owner")
+        await asyncio.sleep(0)
+        task.cancel("second")
+        with pytest.raises(RuntimeError):
+            await runner.exec(ExecCommand.process("true"))
+        with pytest.raises(RuntimeError):
+            await runner.resume()
+        with pytest.raises(RuntimeError):
+            runner.reopen_exec()
+        if not late:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled() and task.cancelling() == 2
+        if late:
+            assert runner.lifecycle_state == "poisoned"
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        while runner._public_lifecycle_task is not None:
+            await asyncio.sleep(0)
+        if late:
+            with pytest.raises(RuntimeError, match="poisoned"):
+                runner.reopen_exec()
+        elif action == "suspend":
+            await runner.resume()
+            assert runner.lifecycle_state == "reusable"
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cleanup_failure", ["none", "terminate", "transport"])
+async def test_cancelled_allocation_reclaims_late_vm_and_owned_client(
+    monkeypatch, caplog, cleanup_failure
+):
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    client = FakeLambdaMicroVMClient()
+    original = client.run_microvm
+
+    def blocked(**kwargs):
+        started.set()
+        assert release.wait(5)
+        return original(**kwargs)
+
+    client.run_microvm = blocked
+    client.close = closed.set
+    terminate = client.terminate_microvm
+    previous_cleanups = set(lambda_microvm_module._ABANDONED_LAMBDA_ALLOCATIONS)
+    if cleanup_failure == "terminate":
+
+        def fail_termination(**kwargs):
+            client.terminate_calls.append(kwargs)
+            raise RuntimeError("private-provider-cleanup-canary")
+
+        client.terminate_microvm = fail_termination
+    elif cleanup_failure == "transport":
+
+        def fail_close():
+            raise RuntimeError("private-provider-cleanup-canary")
+
+        client.close = fail_close
+    monkeypatch.setattr(lambda_microvm_module, "_control_client", lambda **kwargs: (client, True))
+    task = asyncio.create_task(
+        LambdaMicroVMRunner.create(
+            "image",
+            endpoint_transport=FakeEndpointTransport(),
+            cancel_timeout_s=0.02,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel("allocation owner")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled() and task.cancelling() == 1
+        assert not client.terminate_calls
+        release.set()
+        owners = lambda_microvm_module._ABANDONED_LAMBDA_ALLOCATIONS - previous_cleanups
+        assert len(owners) == 1
+        owner = next(iter(owners))
+        assert owner.task is not None
+        await asyncio.wait_for(asyncio.shield(owner.task), 2)
+        assert client.terminate_calls == [{"microvmIdentifier": "mvm-123"}]
+        assert not client.token_calls
+        if cleanup_failure != "none":
+            assert not closed.is_set()
+            assert "drain_abandoned_allocations is required" in caplog.text
+            assert "private-provider-cleanup-canary" not in caplog.text
+            client.terminate_microvm = terminate
+            client.close = closed.set
+            reads = len(client.get_calls)
+            assert await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2) == 0
+            assert len(client.terminate_calls) == (2 if cleanup_failure == "terminate" else 1)
+            if cleanup_failure == "transport":
+                assert len(client.get_calls) == reads
+        assert closed.is_set()
+        assert len(client.run_calls) == 1
+        assert owner not in lambda_microvm_module._ABANDONED_LAMBDA_ALLOCATIONS
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        client.terminate_microvm = terminate
+        client.close = closed.set
+        await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cancel_drain", [False, True])
+async def test_abandoned_allocation_drains_join_in_flight_termination(cancel_drain):
+    allocating = threading.Event()
+    allocate_release = threading.Event()
+    terminating = threading.Event()
+    terminate_release = threading.Event()
+    client = FakeLambdaMicroVMClient()
+    create = client.run_microvm
+    terminate = client.terminate_microvm
+    calls = []
+
+    def allocate(**kwargs):
+        allocating.set()
+        assert allocate_release.wait(5)
+        return create(**kwargs)
+
+    def blocked_terminate(**kwargs):
+        calls.append(kwargs)
+        terminating.set()
+        assert terminate_release.wait(5)
+        return terminate(**kwargs)
+
+    client.run_microvm = allocate
+    client.terminate_microvm = blocked_terminate
+    task = asyncio.create_task(
+        LambdaMicroVMRunner.create(
+            "image",
+            client=client,
+            endpoint_transport=FakeEndpointTransport(),
+            cancel_timeout_s=0.02,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(allocating.wait, 2)
+        task.cancel("allocation")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        allocate_release.set()
+        assert await asyncio.to_thread(terminating.wait, 2)
+        drain = asyncio.create_task(
+            LambdaMicroVMRunner.drain_abandoned_allocations(
+                timeout_s=2 if cancel_drain else 0.02,
+            )
+        )
+        if cancel_drain:
+            await asyncio.sleep(0)
+            drain.cancel("drain")
+            with pytest.raises(asyncio.CancelledError):
+                await drain
+            assert drain.cancelled() and drain.cancelling() == 1
+        else:
+            assert await drain == 1
+        assert await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=0.02) == 1
+        assert len(calls) == 1
+        terminate_release.set()
+        assert await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2) == 0
+        assert len(calls) == len(client.run_calls) == 1
+    finally:
+        allocate_release.set()
+        terminate_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cancel_owner", [False, True])
+async def test_failed_allocation_retries_unbound_client_close(monkeypatch, cancel_owner):
+    started = threading.Event()
+    release = threading.Event()
+    client = FakeLambdaMicroVMClient()
+    close_calls = []
+    allocation_calls = []
+    repaired = False
+
+    def allocate(**kwargs):
+        allocation_calls.append(kwargs)
+        started.set()
+        assert release.wait(5)
+        raise RuntimeError("allocation rejected")
+
+    def close():
+        close_calls.append(True)
+        if not repaired:
+            raise RuntimeError("client close failed")
+
+    client.run_microvm = allocate
+    client.close = close
+    monkeypatch.setattr(lambda_microvm_module, "_control_client", lambda **kwargs: (client, True))
+    previous = set(lambda_microvm_module._ABANDONED_LAMBDA_ALLOCATIONS)
+    task = asyncio.create_task(LambdaMicroVMRunner.create("image", cancel_timeout_s=0.02))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if cancel_owner:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled() and task.cancelling() == 1
+        else:
+            release.set()
+            with pytest.raises(ExceptionGroup, match="allocation failed"):
+                await task
+        release.set()
+        (owner,) = lambda_microvm_module._ABANDONED_LAMBDA_ALLOCATIONS - previous
+        assert owner.task is not None
+        await asyncio.wait_for(asyncio.shield(owner.task), 2)
+        assert owner.runner is None
+        assert owner in lambda_microvm_module._ABANDONED_LAMBDA_ALLOCATIONS
+        calls_before_retry = len(close_calls)
+        repaired = True
+        assert await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2) == 0
+        assert len(close_calls) == calls_before_retry + 1
+        assert len(allocation_calls) == 1
+        assert not client.terminate_calls
+    finally:
+        repaired = True
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("factory", ["create", "from_existing"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"cancel_timeout_s": 0},
+        {"cancel_timeout_s": True},
+        {"close_action": "invalid"},
+        {"ready_timeout_s": 0},
+        {"ready_timeout_s": float("nan")},
+        {"poll_interval_s": float("inf")},
+        {"poll_interval_s": float("nan")},
+        {"request_timeout_s": float("inf")},
+        {"request_timeout_s": -1},
+        {"auth_token_expiration_minutes": True},
+        {"auth_token_expiration_minutes": 0},
+        {"cancellation_cleanup": "invalid"},
+        {"timeout_cleanup": "invalid"},
+        {"region_name": ""},
+        {"env_overlay": object()},
+    ],
+)
+async def test_lambda_constructor_validation_precedes_provider_access(
+    factory: str,
+    options: dict[str, Any],
+) -> None:
+    client = FakeLambdaMicroVMClient()
+    with pytest.raises((TypeError, ValueError)):
+        if factory == "create":
+            await LambdaMicroVMRunner.create("image", client=client, **options)
+        else:
+            await LambdaMicroVMRunner.from_existing("mvm-123", client=client, **options)
+    assert client.run_calls == []
+    assert client.get_calls == []
+    assert client.token_calls == []
 
 
 @pytest.mark.parametrize("invalid_text", ("/workspace\x00bad", "/workspace\ud800bad"))
@@ -67,6 +365,165 @@ HEALTH_RESPONSE = {
 }
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("before_resume", [False, True])
+async def test_cancelled_attachment_retains_resume_and_restores_suspension(
+    monkeypatch, before_resume
+):
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    client = FakeLambdaMicroVMClient()
+    client.state = "SUSPENDED"
+    resume = client.get_microvm if before_resume else client.resume_microvm
+    suspend = client.suspend_microvm
+
+    def blocked(**kwargs):
+        started.set()
+        assert release.wait(5)
+        return resume(**kwargs)
+
+    if before_resume:
+        client.get_microvm = blocked
+    else:
+        client.resume_microvm = blocked
+    client.close = closed.set
+    monkeypatch.setattr(lambda_microvm_module, "_control_client", lambda **kwargs: (client, True))
+    task = asyncio.create_task(
+        LambdaMicroVMRunner.from_existing(
+            "mvm-123",
+            endpoint_transport=FakeEndpointTransport(),
+            cancel_timeout_s=0.02,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel("attach")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled() and task.cancelling() == 1
+        assert not closed.is_set() and not client.terminate_calls
+        reads = len(client.get_calls)
+        with pytest.raises(LambdaMicroVMError, match="still pending"):
+            await LambdaMicroVMRunner.from_existing("mvm-123", client=FakeLambdaMicroVMClient())
+        assert len(client.get_calls) == reads
+        assert await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=0.02) == 1
+        if not before_resume:
+
+            def fail_suspend(**kwargs):
+                raise RuntimeError("suspension unavailable")
+
+            client.suspend_microvm = fail_suspend
+        release.set()
+        if not before_resume:
+            assert await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2) == 1
+            with pytest.raises(LambdaMicroVMError, match="still pending"):
+                await LambdaMicroVMRunner.from_existing("mvm-123", client=FakeLambdaMicroVMClient())
+            client.suspend_microvm = suspend
+        assert await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2) == 0
+        assert client.state == "SUSPENDED"
+        assert len(client.resume_calls) == len(client.suspend_calls) == (0 if before_resume else 1)
+        assert closed.is_set() and not client.terminate_calls and not client.run_calls
+        fresh_client = FakeLambdaMicroVMClient()
+        fresh_client.state = "SUSPENDED"
+        monkeypatch.setattr(
+            lambda_microvm_module, "_control_client", lambda **kwargs: (fresh_client, False)
+        )
+        replacement = await LambdaMicroVMRunner.from_existing(
+            "mvm-123", endpoint_transport=FakeEndpointTransport(), close_action="none"
+        )
+        assert replacement.lifecycle_state == "reusable"
+        assert fresh_client.state == "RUNNING" and len(fresh_client.resume_calls) == 1
+        assert await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2) == 0
+        assert fresh_client.state == "RUNNING"
+        await replacement.close()
+    finally:
+        client.suspend_microvm = suspend
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("allocation", [False, True])
+@pytest.mark.parametrize("cancel_owner", [False, True])
+async def test_known_failure_survives_later_cleanup_timeout(monkeypatch, allocation, cancel_owner):
+    from cayu.runners._cleanup import runner_cancellation_failure
+
+    started = threading.Event()
+    release = threading.Event()
+    primary = RuntimeError("known failure")
+    client = FakeLambdaMicroVMClient()
+    terminate = client.terminate_microvm
+    runner = None
+    if allocation:
+
+        async def fail_ready(self, timeout):
+            raise primary
+
+        monkeypatch.setattr(LambdaMicroVMRunner, "_wait_until_ready", fail_ready)
+
+        def blocked(**kwargs):
+            started.set()
+            assert release.wait(5)
+            return terminate(**kwargs)
+
+        client.terminate_microvm = blocked
+        operation = LambdaMicroVMRunner.create(
+            "image",
+            client=client,
+            endpoint_transport=FakeEndpointTransport(),
+            ready_timeout_s=0.05,
+            request_timeout_s=0.05,
+            cancel_timeout_s=0.05,
+        )
+    else:
+
+        def failed(**kwargs):
+            raise primary
+
+        client.terminate_microvm = failed
+
+        class Transport(FakeEndpointTransport):
+            async def aclose(self):
+                started.set()
+                await asyncio.to_thread(release.wait, 5)
+
+        runner = LambdaMicroVMRunner(
+            client,
+            microvm_id="mvm-123",
+            endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+            endpoint_transport=Transport(),
+            cancel_timeout_s=0.05,
+        )
+        runner._owns_endpoint_transport = True
+        operation = runner.kill()
+    task = asyncio.create_task(operation)
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if cancel_owner:
+            task.cancel("owner")
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert task.cancelled() and task.cancelling() == 1
+            failure = runner_cancellation_failure(caught.value)
+        else:
+            with pytest.raises(BaseExceptionGroup) as caught:
+                await task
+            failure = caught.value
+        assert isinstance(failure, BaseExceptionGroup)
+        assert failure.exceptions[0] is primary
+        assert len(failure.exceptions) == 2
+        assert isinstance(failure.exceptions[1], TimeoutError)
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if allocation:
+            await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=2)
+        elif runner is not None and runner._terminal_lifecycle_task is not None:
+            await asyncio.wait_for(asyncio.shield(runner._terminal_lifecycle_task), 2)
+
+
 class FakeLambdaMicroVMClient:
     def __init__(self) -> None:
         self.run_calls: list[dict[str, Any]] = []
@@ -75,6 +532,7 @@ class FakeLambdaMicroVMClient:
         self.suspend_calls: list[dict[str, Any]] = []
         self.resume_calls: list[dict[str, Any]] = []
         self.terminate_calls: list[dict[str, Any]] = []
+        self.state = "RUNNING"
 
     def run_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.run_calls.append(kwargs)
@@ -91,7 +549,7 @@ class FakeLambdaMicroVMClient:
         return {
             "microvmId": "mvm-123",
             "endpoint": "mvm-123.lambda-microvm.us-west-2.on.aws",
-            "state": "RUNNING",
+            "state": self.state,
             "imageArn": "arn:aws:lambda:us-west-2:123:microvm-image:cayu",
             "imageVersion": "7",
         }
@@ -103,14 +561,17 @@ class FakeLambdaMicroVMClient:
 
     def suspend_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.suspend_calls.append(kwargs)
+        self.state = "SUSPENDED"
         return {}
 
     def resume_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.resume_calls.append(kwargs)
+        self.state = "RUNNING"
         return {}
 
     def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.terminate_calls.append(kwargs)
+        self.state = "TERMINATED"
         return {}
 
 
@@ -337,6 +798,333 @@ async def test_lambda_runner_redacts_complete_output_and_omits_pretruncated_outp
     assert truncated_result.stdout == ""
     assert truncated_result.stdout_bytes == len(secret)
     assert truncated_result.stdout_truncated is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure_count", [1, 2, 3])
+async def test_command_state_transient_retry_is_bounded_without_redispatch(failure_count: int):
+    class Transport(FakeEndpointTransport):
+        polls = 0
+
+        async def get_command(self, **kwargs: Any) -> dict[str, Any]:
+            self.polls += 1
+            if self.polls <= failure_count:
+                raise LambdaMicroVMEndpointTransientError("temporary transport failure")
+            return await super().get_command(**kwargs)
+
+    transport = Transport()
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=transport,
+    )
+    if failure_count == 3:
+        with pytest.raises(LambdaMicroVMEndpointTransientError):
+            await runner.exec(ExecCommand.process("true"))
+        assert len(transport.cancel_calls) == 1
+    else:
+        result = await runner.exec(ExecCommand.process("true"))
+        assert result.exit_code == 7
+        assert not transport.cancel_calls
+    assert transport.polls == min(failure_count + 1, 3)
+    assert len(transport.start_calls) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("entrance", ["start_command", "cancel_command"])
+async def test_mutating_endpoint_operations_do_not_retry_transient_failure(entrance: str):
+    transport = FakeEndpointTransport()
+    calls = 0
+
+    async def reject(**kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        raise LambdaMicroVMEndpointTransientError("temporary transport failure")
+
+    setattr(transport, entrance, reject)
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=transport,
+    )
+    if entrance == "start_command":
+        with pytest.raises(LambdaMicroVMEndpointTransientError):
+            await runner.exec(ExecCommand.process("true"))
+    else:
+        # A public timeout reaches cancellation after a successfully acknowledged start.
+        async def timeout_poll(**kwargs: Any) -> dict[str, Any]:
+            raise TimeoutError
+
+        transport.get_command = timeout_poll
+        result = await runner.exec(ExecCommand.process("true"))
+        assert result.timed_out
+        assert runner.lifecycle_state == "poisoned"
+    assert calls == 1
+
+
+@pytest.mark.anyio
+async def test_opaque_poll_is_bounded_and_cannot_start_a_late_retry():
+    release = threading.Event()
+    started = asyncio.Event()
+    completed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    class Transport(FakeEndpointTransport):
+        polls = 0
+
+        async def get_command(self, **kwargs: Any) -> dict[str, Any]:
+            self.polls += 1
+
+            def read():
+                loop.call_soon_threadsafe(started.set)
+                release.wait(timeout=2)
+                loop.call_soon_threadsafe(completed.set)
+                raise LambdaMicroVMEndpointTransientError("late unavailable result")
+
+            return await asyncio.to_thread(read)
+
+    transport = Transport()
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=transport,
+        request_timeout_s=0.02,
+    )
+    task = asyncio.create_task(runner.exec(ExecCommand.process("true")))
+    try:
+        await started.wait()
+        result = await asyncio.wait_for(task, timeout=1)
+        assert result.timed_out
+        assert not completed.is_set()
+        assert transport.polls == 1
+        assert len(transport.cancel_calls) == 1
+        assert len(runner._command_poll_tasks) == 1
+        pending_task = next(iter(runner._command_poll_tasks.values()))[1]
+        release.set()
+        await asyncio.wait_for(asyncio.shield(pending_task), 1)
+        assert transport.polls == 1
+        assert not runner._command_poll_tasks
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+async def test_poll_does_not_dispatch_after_token_refresh_consumes_deadline(monkeypatch):
+    release = asyncio.Event()
+    refreshing = asyncio.Event()
+    transport = FakeEndpointTransport()
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=transport,
+        request_timeout_s=0.02,
+    )
+    original = runner._endpoint_token
+    calls = 0
+    polls = 0
+
+    async def token(*, force_refresh=False):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            refreshing.set()
+            await release.wait()
+        return await original(force_refresh=force_refresh)
+
+    async def read(**kwargs):
+        nonlocal polls
+        polls += 1
+        raise AssertionError("expired poll must not dispatch")
+
+    monkeypatch.setattr(runner, "_endpoint_token", token)
+    monkeypatch.setattr(transport, "get_command", read)
+    task = asyncio.create_task(runner.exec(ExecCommand.process("true")))
+    try:
+        await asyncio.wait_for(refreshing.wait(), 1)
+        result = await asyncio.wait_for(task, 1)
+        assert result.timed_out
+        pending = next(iter(runner._command_poll_tasks.values()))[1]
+        release.set()
+        await asyncio.wait_for(asyncio.shield(pending), 1)
+        assert polls == 0
+        assert not runner._command_poll_tasks
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error_type",
+    [LambdaMicroVMProtocolError, LambdaMicroVMError, LambdaMicroVMEndpointUnauthorized],
+)
+async def test_command_state_permanent_failure_is_not_retried(error_type):
+    transport = FakeEndpointTransport()
+    calls = 0
+
+    async def reject(**kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        raise error_type("permanent failure")
+
+    transport.get_command = reject
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=transport,
+    )
+    with pytest.raises(error_type):
+        await runner.exec(ExecCommand.process("true"))
+    assert calls == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+async def test_endpoint_stream_enforces_exact_body_ceiling(monkeypatch, extra_bytes):
+    wire = b'{"status":"ok"}'
+    ceiling = len(wire)
+    monkeypatch.setattr(lambda_microvm_module, "LAMBDA_MICROVM_MAX_RESPONSE_BYTES", ceiling)
+    closed = asyncio.Event()
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield wire
+            if extra_bytes:
+                yield b" "
+
+        async def aclose(self):
+            closed.set()
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=Stream()))
+    )
+
+    class Owner:
+        def get(self):
+            return client
+
+        async def aclose(self):
+            await client.aclose()
+
+    transport = HttpxLambdaMicroVMEndpointTransport()
+    transport._client = Owner()
+    try:
+        if extra_bytes:
+            with pytest.raises(LambdaMicroVMProtocolError, match="byte ceiling"):
+                await transport.health(endpoint="example.on.aws", token="token", timeout_s=1)
+        else:
+            assert await transport.health(
+                endpoint="example.on.aws", token="token", timeout_s=1
+            ) == {"status": "ok"}
+        assert closed.is_set()
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [400, 401, 429, 501, 503])
+async def test_endpoint_http_transient_classification_is_allowlisted(status):
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(status, text="untrusted failure body")
+        )
+    )
+
+    class Owner:
+        def get(self):
+            return client
+
+        async def aclose(self):
+            await client.aclose()
+
+    transport = HttpxLambdaMicroVMEndpointTransport()
+    transport._client = Owner()
+    try:
+        with pytest.raises(LambdaMicroVMError) as raised:
+            await transport.health(endpoint="example.on.aws", token="token", timeout_s=1)
+        assert isinstance(raised.value, LambdaMicroVMEndpointTransientError) == (
+            status in {429, 503}
+        )
+        assert "untrusted failure body" not in str(raised.value)
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.anyio
+async def test_kill_waits_for_terminal_state_not_only_termination_acknowledgement():
+    probing = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    class Client(FakeLambdaMicroVMClient):
+        def get_microvm(self, **kwargs: Any) -> dict[str, Any]:
+            loop.call_soon_threadsafe(probing.set)
+            release.wait(timeout=2)
+            return super().get_microvm(**kwargs)
+
+    client = Client()
+    runner = LambdaMicroVMRunner(
+        client,
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=FakeEndpointTransport(),
+    )
+    task = asyncio.create_task(runner.kill())
+    try:
+        await probing.wait()
+        assert len(client.terminate_calls) == 1
+        assert not task.done()
+        assert not runner.is_closed
+        assert runner.lifecycle_state == "closing"
+        release.set()
+        await task
+        assert runner.is_closed
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("output_size", [4, 5, 7])
+async def test_runner_rejects_oversized_output_before_base64_decode(monkeypatch, output_size):
+    raw = base64.b64encode(b"x" * output_size).decode("ascii")
+    monkeypatch.setattr(lambda_microvm_module, "LAMBDA_MICROVM_MAX_OUTPUT_BYTES", 4)
+    monkeypatch.setattr(lambda_microvm_module, "LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES", 8)
+    decode = base64.b64decode
+    decoded_calls = []
+
+    def bounded_decode(value, **kwargs):
+        decoded_calls.append(value)
+        return decode(value, **kwargs)
+
+    monkeypatch.setattr(base64, "b64decode", bounded_decode)
+    transport = FakeEndpointTransport(
+        result_overrides={
+            "stdout_base64": raw,
+            "stdout_bytes": output_size,
+            "stderr_base64": "",
+            "stderr_bytes": 0,
+        }
+    )
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=transport,
+    )
+    if output_size > 4:
+        with pytest.raises(LambdaMicroVMProtocolError, match="byte ceiling"):
+            await runner.exec(ExecCommand.process("true"), output_limit_bytes=None)
+        assert not decoded_calls
+    else:
+        result = await runner.exec(ExecCommand.process("true"), output_limit_bytes=None)
+        assert result.stdout == "xxxx"
+        assert result.stdout_bytes == 4
+        assert result.stdout_truncated
+    assert transport.start_calls[0]["payload"]["output_limit_bytes"] == 4
 
 
 class BlockingEndpointTransport(FakeEndpointTransport):
@@ -925,8 +1713,9 @@ async def test_lambda_microvm_runner_waits_for_positive_lifecycle_quiescence() -
         poll_interval_s=0,
     )
     await suspended_runner.suspend()
-    await suspended_runner.wait_until_suspended(timeout_s=1)
     assert len(suspended_client.get_calls) == 2
+    await suspended_runner.wait_until_suspended(timeout_s=1)
+    assert len(suspended_client.get_calls) == 3
 
     terminated_client = TerminatingLambdaMicroVMClient()
     terminated_runner = LambdaMicroVMRunner(
@@ -937,8 +1726,9 @@ async def test_lambda_microvm_runner_waits_for_positive_lifecycle_quiescence() -
         poll_interval_s=0,
     )
     await terminated_runner.terminate()
-    await terminated_runner.wait_until_terminated(timeout_s=1)
     assert len(terminated_client.get_calls) == 2
+    await terminated_runner.wait_until_terminated(timeout_s=1)
+    assert len(terminated_client.get_calls) == 3
 
 
 @pytest.mark.anyio
@@ -973,6 +1763,131 @@ async def test_lambda_microvm_runner_discards_cached_token_on_close() -> None:
 
     assert runner._auth_token is None
     assert runner._auth_token_expires_at == 0.0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("action", ["close", "kill"])
+@pytest.mark.parametrize("cancel_owner", [False, True])
+async def test_lambda_finalization_preserves_failures_and_closes_every_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    cancel_owner: bool,
+) -> None:
+    primary = RuntimeError("termination failed")
+    http_failure = RuntimeError("endpoint close failed")
+    client_failure = RuntimeError("client close failed")
+    started = asyncio.Event()
+    release = threading.Event()
+    calls: list[str] = []
+    loop = asyncio.get_running_loop()
+
+    class Client(FakeLambdaMicroVMClient):
+        def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
+            calls.append("terminate")
+            loop.call_soon_threadsafe(started.set)
+            release.wait(timeout=2)
+            raise primary
+
+        def close(self) -> None:
+            calls.append("client_close")
+            raise client_failure
+
+    class Transport(FakeEndpointTransport):
+        async def aclose(self) -> None:
+            calls.append("http_close")
+            raise http_failure
+
+    monkeypatch.setattr(lambda_microvm_module, "HttpxLambdaMicroVMEndpointTransport", Transport)
+    runner = LambdaMicroVMRunner(
+        Client(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        owns_client=True,
+        close_action="terminate",
+    )
+    task = asyncio.create_task(getattr(runner, action)())
+    try:
+        await started.wait()
+        assert runner.lifecycle_state == "closing"
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec(ExecCommand.process("true"))
+        if cancel_owner:
+            task.cancel("original cancellation")
+            await asyncio.sleep(0)
+            task.cancel("another cancellation")
+        release.set()
+        if cancel_owner:
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await task
+            assert task.cancelled()
+            assert task.cancelling() == 2
+            assert raised.value.args == ("original cancellation",)
+            failure = raised.value.__cause__
+        else:
+            with pytest.raises(BaseExceptionGroup) as raised_group:
+                await task
+            failure = raised_group.value
+        assert isinstance(failure, BaseExceptionGroup)
+        assert failure.exceptions[0] is primary
+        nested = failure.exceptions[1]
+        assert isinstance(nested, BaseExceptionGroup)
+        assert nested.exceptions == (http_failure, client_failure)
+        assert calls == ["terminate", "http_close", "client_close"]
+        assert runner.lifecycle_state == "poisoned"
+        with pytest.raises(RuntimeError, match="permanently poisoned"):
+            runner.reopen_exec()
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+async def test_lambda_close_timeout_retains_single_owner_until_thread_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    calls: list[str] = []
+
+    class Client(FakeLambdaMicroVMClient):
+        def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
+            calls.append("terminate")
+            loop.call_soon_threadsafe(started.set)
+            release.wait(timeout=2)
+            return super().terminate_microvm(**kwargs)
+
+        def close(self) -> None:
+            calls.append("client_close")
+
+    transport = FakeEndpointTransport()
+    monkeypatch.setattr(
+        lambda_microvm_module, "HttpxLambdaMicroVMEndpointTransport", lambda: transport
+    )
+    runner = LambdaMicroVMRunner(
+        Client(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        owns_client=True,
+        close_action="terminate",
+        cancel_timeout_s=0.02,
+    )
+    task = asyncio.create_task(runner.close())
+    try:
+        await started.wait()
+        with pytest.raises(TimeoutError):
+            await task
+        with pytest.raises(TimeoutError):
+            await runner.close()
+        assert calls == ["terminate"]
+        assert runner.lifecycle_state == "poisoned"
+        assert not transport.closed
+        release.set()
+        await runner.close()
+        assert runner.is_closed
+        assert transport.closed
+        assert calls == ["terminate", "client_close"]
+    finally:
+        release.set()
 
 
 @pytest.mark.anyio

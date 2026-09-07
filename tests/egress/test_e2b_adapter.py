@@ -253,9 +253,13 @@ class _SelfCancellingKillE2BModule:
 
 
 class _HangingKillSandbox(_FakeSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_kill = asyncio.Event()
+
     async def kill(self) -> bool:
-        await asyncio.Event().wait()
-        return True
+        await self.release_kill.wait()
+        return await super().kill()
 
 
 class _HangingKillAsyncSandbox(_FakeAsyncSandbox):
@@ -856,6 +860,11 @@ def test_e2b_adapter_preserves_public_error_when_hardening_and_rollback_fail(
                     egress_destinations=("api.stripe.com",),
                 )
             )
+        sandbox = _FailingKillAsyncSandbox.sandbox
+        assert sandbox is not None
+        sandbox.kill = _FakeSandbox.kill.__get__(sandbox)
+        assert await E2BRunner.drain_failed_creations(timeout_s=1) == 0
+        assert sandbox.killed
         return exc_info.value
 
     error = asyncio.run(run())
@@ -901,6 +910,11 @@ def test_e2b_adapter_preserves_public_error_when_rollback_self_cancels(
                     egress_destinations=("api.stripe.com",),
                 )
             )
+        sandbox = _SelfCancellingKillAsyncSandbox.sandbox
+        assert sandbox is not None
+        sandbox.kill = _FakeSandbox.kill.__get__(sandbox)
+        assert await E2BRunner.drain_failed_creations(timeout_s=1) == 0
+        assert sandbox.killed
         return exc_info.value
 
     error = asyncio.run(run())
@@ -1005,6 +1019,12 @@ def test_e2b_adapter_preserves_capability_error_when_rollback_times_out(
                     egress_destinations=("api.stripe.com",),
                 )
             )
+        sandbox = _HangingKillAsyncSandbox.sandbox
+        assert isinstance(sandbox, _HangingKillSandbox)
+        assert await E2BRunner.drain_failed_creations(timeout_s=0.01) == 1
+        sandbox.release_kill.set()
+        assert await E2BRunner.drain_failed_creations(timeout_s=1) == 0
+        assert sandbox.killed
         return exc_info.value
 
     error = asyncio.run(run())

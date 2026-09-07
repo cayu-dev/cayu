@@ -354,12 +354,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     ) -> RunnerFinalizationResult:
         if not isinstance(runner, LambdaMicroVMRunner):
             raise TypeError("Lambda MicroVM adapter received a different runner type.")
-        if outcome == "interrupted":
-            await runner.suspend()
-            await runner.wait_until_suspended()
-        else:
-            await runner.terminate()
-            await runner.wait_until_terminated()
+        runner.close_action = "suspend" if outcome == "interrupted" else "terminate"
         await runner.close()
         return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 

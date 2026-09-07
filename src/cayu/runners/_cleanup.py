@@ -19,7 +19,7 @@ RunnerCleanupPolicy = Literal["command", "sandbox", "none"]
 DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY: RunnerCleanupPolicy = "command"
 DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY: RunnerCleanupPolicy = "command"
 _KNOWN_CLEANUP_ADAPTERS = frozenset({"docker", "e2b", "lambda-microvm", "local", "microsandbox"})
-_KNOWN_CLEANUP_ACTIONS = frozenset({"kill_command", "kill_sandbox", "none"})
+_KNOWN_CLEANUP_ACTIONS = frozenset({"kill_command", "kill_sandbox", "close_transports", "none"})
 _KNOWN_CLEANUP_STATUSES = frozenset(
     {"completed", "deferred", "failed", "skipped", "timeout", "unsupported"}
 )
@@ -34,12 +34,36 @@ _RUNNER_CANCELLATION_FAILURE_TOKEN = object()
 class RunnerCleanupResult:
     artifact: dict[str, Any]
     close_runner: bool
+    preceding_artifacts: tuple[dict[str, Any], ...] = ()
+    failure: BaseException | None = None
+
+    @property
+    def artifacts(self) -> list[dict[str, Any]]:
+        return [*self.preceding_artifacts, self.artifact]
 
 
 @dataclass(frozen=True, slots=True)
 class _RunnerCancellationFailure:
     token: object
     failure: BaseException
+
+
+@dataclass
+class RunnerCleanupProgress:
+    """Completed phase evidence plus the phase currently awaiting settlement."""
+
+    pending: RunnerCleanupResult | None = None
+
+
+@dataclass
+class RunnerFailureProgress:
+    failures: tuple[BaseException, ...] = ()
+
+    def with_timeout(self, message: str) -> BaseException:
+        timeout = TimeoutError(message)
+        if not self.failures:
+            return timeout
+        return BaseExceptionGroup(message, [*self.failures, timeout])
 
 
 def attach_runner_cancellation_failure(
@@ -266,7 +290,7 @@ def _cleanup_artifact(
     action: str,
     status: str,
     timeout_s: float,
-    error: Exception | None = None,
+    error: BaseException | None = None,
     error_message: str | None = None,
 ) -> dict[str, Any]:
     artifact: dict[str, Any] = {

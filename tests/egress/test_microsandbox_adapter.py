@@ -924,8 +924,11 @@ def test_microsandbox_failed_reconnect_restops_allocation_started_for_resume(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("blocked_retry", [False, True])
 def test_microsandbox_timed_out_restart_has_explicit_restoration_recovery(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_retry: bool,
 ) -> None:
     start_accepted = asyncio.Event()
     allow_start_return = asyncio.Event()
@@ -1023,14 +1026,81 @@ def test_microsandbox_timed_out_restart_has_explicit_restoration_recovery(
         assert claim.settlement_task is failed_task
         assert claim.settlement_error is not None
 
+        # A failed explicit retry must retain the same acquisition fence and
+        # remain repairable through the replacement task's authority.
+        retry_task = retry_environment_factory_cleanup_settlement_task(failed_task)
+        with pytest.raises(PermissionError, match="permission denied"):
+            await retry_task
+        with pytest.raises(RuntimeError, match="acquisition or rollback is still pending"):
+            await MicrosandboxRunner.from_existing(
+                identity["sandbox_name"], sandbox_module=BlockingStartModule
+            )
+        failed_task = retry_task
         sandbox.fail_stop = False
+        stop_started = asyncio.Event()
+        allow_stop = asyncio.Event()
+        stop_calls = 0
+        original_stop = sandbox.stop_and_wait
+        if blocked_retry:
+            original_attach = MicrosandboxRunner._from_existing_for_lifecycle
+
+            async def attach_with_short_close(cls, *args, **kwargs):
+                runner = await original_attach(*args, **kwargs)
+                runner.cancel_timeout_s = 0.01
+                runner.remove_timeout_s = 0.01
+                return runner
+
+            monkeypatch.setattr(
+                MicrosandboxRunner,
+                "_from_existing_for_lifecycle",
+                classmethod(attach_with_short_close),
+            )
+
+            async def stop_with_delayed_ack():
+                nonlocal stop_calls
+                stop_calls += 1
+                if stop_calls == 1:
+                    stop_started.set()
+                    await allow_stop.wait()
+                return await original_stop()
+
+            monkeypatch.setattr(sandbox, "stop_and_wait", stop_with_delayed_ack)
         recovery_task = retry_environment_factory_cleanup_settlement_task(failed_task)
         assert recovery_task is not failed_task
         assert claim.settlement_task is recovery_task
+        if blocked_retry:
+            try:
+                async with asyncio.timeout(1):
+                    await stop_started.wait()
+                # Exceed the runner's public close deadline while the exact
+                # factory retry still owns its pending provider mutation.
+                assert await MicrosandboxRunner.drain_failed_attachments(timeout_s=0.05) == 1
+                assert not recovery_task.done()
+                assert claim.settlement_task is recovery_task
+                assert stop_calls == 1
+                drain = asyncio.create_task(
+                    MicrosandboxRunner.drain_failed_attachments(timeout_s=1)
+                )
+                await asyncio.sleep(0)
+                drain.cancel("stop observing cleanup")
+                with pytest.raises(asyncio.CancelledError):
+                    await drain
+                assert drain.cancelled() and drain.cancelling() == 1
+                with pytest.raises(RuntimeError, match="acquisition or rollback"):
+                    await MicrosandboxRunner.from_existing(
+                        identity["sandbox_name"], sandbox_module=BlockingStartModule
+                    )
+                assert stop_calls == 1
+            finally:
+                allow_stop.set()
+                await asyncio.shield(recovery_task)
         await recovery_task
         await asyncio.sleep(0)
         assert sandbox.stopped
         assert claim.closed
+        if blocked_retry:
+            assert await MicrosandboxRunner.drain_failed_attachments(timeout_s=0.1) == 0
+            assert stop_calls == 1
 
         recovered_binding = await contender.prepare_reconnect(
             session_id="session-1",

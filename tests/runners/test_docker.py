@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import threading
 from typing import Any
 
 import pytest
@@ -23,6 +24,19 @@ from cayu.runners.docker import (
 )
 from cayu.testing import verify_provider_credential_isolation
 from cayu.vaults import REDACTED_SECRET, SecretEnv, SecretRedactor, SecretRef, StaticVault
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"env_overlay": object()}, {"_env_overlay_secret_values_present": 1}],
+)
+def test_create_prevalidates_overlay_before_docker_calls(monkeypatch, options):
+    async def unexpected_dispatch(*args, **kwargs):
+        pytest.fail("Invalid local configuration reached Docker dispatch.")
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", unexpected_dispatch)
+    with pytest.raises(TypeError):
+        asyncio.run(DockerRunner.create("invalid", docker_path="/usr/bin/docker", **options))
 
 
 def test_require_docker_uses_explicit_path():
@@ -577,7 +591,7 @@ def test_exec_stream_failure_latches_runner_when_remote_settlement_is_unproven(
     assert runner._exec_closed_reason == (
         "docker command cleanup did not complete; command state is unknown"
     )
-    assert len(issued) == 4
+    assert len(issued) == 3
     assert getattr(stream_error, "artifacts", None) == [
         {
             "type": "cayu.runner_cleanup.v1",
@@ -1180,9 +1194,7 @@ def test_exec_marks_exec_closed_when_command_cleanup_fails(monkeypatch):
     assert result.timed_out is True
     assert r._closed is False
     assert r._exec_closed is True
-    assert (
-        r._exec_closed_reason == "docker command cleanup did not complete; command state is unknown"
-    )
+    assert r.lifecycle_state == "poisoned"
     assert result.artifacts == [
         {
             "type": "cayu.runner_cleanup.v1",
@@ -1218,7 +1230,49 @@ def test_command_kill_retries_before_reporting_failure(monkeypatch):
     assert result.artifacts[0]["status"] == "completed"
 
 
-def test_command_kill_verifies_missing_pid_file_as_stopped(monkeypatch):
+@pytest.mark.anyio
+async def test_cancelled_remote_acceptance_before_pid_publication_fences_reuse(monkeypatch):
+    accepted = asyncio.Event()
+    release = asyncio.Event()
+    effects = []
+
+    async def remote():
+        await release.wait()
+        effects.append("late command")
+
+    remote_task = asyncio.create_task(remote())
+
+    async def fake_run(command, **kwargs):
+        if "kill -TERM" in command.argv[-1] or command.argv[-1].startswith("test -f"):
+            return ExecResult(exit_code=1)
+        accepted.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run)
+    runner = DockerRunner("a1", docker_path="/usr/bin/docker")
+    task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "999")))
+    try:
+        await asyncio.wait_for(accepted.wait(), 1)
+        task.cancel("owner")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled() and task.cancelling() == 1
+        assert runner.lifecycle_state == "poisoned"
+        with pytest.raises(RuntimeError):
+            await runner.exec(ExecCommand.process("true"))
+        with pytest.raises(RuntimeError, match="poisoned"):
+            runner.reopen_exec()
+        release.set()
+        await remote_task
+        assert effects == ["late command"]
+        with pytest.raises(RuntimeError, match="poisoned"):
+            runner.reopen_exec()
+    finally:
+        release.set()
+        await asyncio.gather(task, remote_task, return_exceptions=True)
+
+
+def test_command_kill_missing_pid_file_does_not_prove_stopped(monkeypatch):
     issued = []
 
     async def fake_run_subprocess(command, **kwargs):
@@ -1226,7 +1280,7 @@ def test_command_kill_verifies_missing_pid_file_as_stopped(monkeypatch):
         if "kill -TERM" in command.argv[-1]:
             return ExecResult(exit_code=1)
         if command.argv[-1].startswith("test -f"):
-            # pid file absent: the supervised command is not running.
+            # Absence is also possible before a remotely accepted start.
             return ExecResult(exit_code=1)
         return ExecResult(timed_out=True, exit_code=-9)
 
@@ -1236,12 +1290,13 @@ def test_command_kill_verifies_missing_pid_file_as_stopped(monkeypatch):
     result = asyncio.run(r.exec(ExecCommand.process("sleep", "999"), timeout_s=1))
 
     assert result.timed_out is True
-    assert r._exec_closed is False
-    assert r._exec_closed_reason is None
-    assert result.artifacts[0]["status"] == "completed"
+    assert r.lifecycle_state == "poisoned"
+    with pytest.raises(RuntimeError, match="permanently poisoned"):
+        r.reopen_exec()
+    assert result.artifacts[0]["status"] == "failed"
 
 
-def test_reopen_exec_recovers_latched_runner(monkeypatch):
+def test_reopen_exec_cannot_recover_poisoned_runner(monkeypatch):
     async def fake_run_subprocess(command, **kwargs):
         if "kill -TERM" in command.argv[-1]:
             return ExecResult(exit_code=1)
@@ -1257,13 +1312,93 @@ def test_reopen_exec_recovers_latched_runner(monkeypatch):
     assert result.timed_out is True
     assert r._exec_closed is True
 
-    with pytest.raises(RuntimeError, match="DockerRunner is closed: docker command cleanup"):
+    with pytest.raises(RuntimeError, match="DockerRunner is closed"):
         asyncio.run(r.exec(ExecCommand.process("true")))
 
-    r.reopen_exec()
+    with pytest.raises(RuntimeError, match="permanently poisoned"):
+        r.reopen_exec()
 
-    after = asyncio.run(r.exec(ExecCommand.process("true"), timeout_s=None))
-    assert after.timed_out is True  # fake still reports timeouts; exec path is open again
+
+@pytest.mark.parametrize("cleanup_succeeds", [True, False])
+def test_real_repeated_cancellation_keeps_cleanup_owned(monkeypatch, cleanup_succeeds):
+    async def run():
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def fake_run_subprocess(command, **kwargs):
+            if "kill -TERM" in command.argv[-1]:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                return ExecResult(exit_code=0 if cleanup_succeeds else 1)
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+        runner = DockerRunner("a1", docker_path="/usr/bin/docker")
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await started.wait()
+        task.cancel("first cancellation")
+        await cleanup_started.wait()
+        assert runner.lifecycle_state == "closing"
+        task.cancel("second cancellation")
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec(ExecCommand.process("true"))
+        assert not task.done()
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        assert task.cancelled()
+        assert task.cancelling() == 2
+        assert raised.value.args == ("first cancellation",)
+        assert len(raised.value.artifacts) == 1
+        assert runner.lifecycle_state == ("reusable" if cleanup_succeeds else "poisoned")
+
+    asyncio.run(run())
+
+
+def test_late_thread_cleanup_never_reopens_poisoned_runner(monkeypatch):
+    release = threading.Event()
+
+    async def run():
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def opaque_cleanup():
+            loop.call_soon_threadsafe(cleanup_started.set)
+            release.wait(timeout=2)
+            loop.call_soon_threadsafe(cleanup_finished.set)
+            return ExecResult()
+
+        async def fake_run_subprocess(command, **kwargs):
+            if "kill -TERM" in command.argv[-1]:
+                return await asyncio.to_thread(opaque_cleanup)
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+        runner = DockerRunner("a1", docker_path="/usr/bin/docker", cancel_timeout_s=0.02)
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await started.wait()
+        task.cancel()
+        await cleanup_started.wait()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert not cleanup_finished.is_set()
+        assert runner.lifecycle_state == "poisoned"
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec(ExecCommand.process("true"))
+        release.set()
+        await cleanup_finished.wait()
+        with pytest.raises(RuntimeError, match="permanently poisoned"):
+            runner.reopen_exec()
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
 
 
 def test_reopen_exec_rejects_closed_runner(monkeypatch):
@@ -1276,6 +1411,21 @@ def test_reopen_exec_rejects_closed_runner(monkeypatch):
 
     with pytest.raises(RuntimeError, match="DockerRunner is closed."):
         r.reopen_exec()
+
+
+@pytest.mark.parametrize("action", ["remove", "stop"])
+def test_close_does_not_accept_timed_out_docker_acknowledgement(monkeypatch, action):
+    async def fake_run_subprocess(command, **kwargs):
+        return ExecResult(exit_code=0, timed_out=True)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner("a1", docker_path="/usr/bin/docker", close_action=action)
+    with pytest.raises(RuntimeError):
+        asyncio.run(runner.close())
+    assert not runner.is_closed
+    assert runner.lifecycle_state == "poisoned"
+    with pytest.raises(RuntimeError, match="closed"):
+        asyncio.run(runner.exec(ExecCommand.process("true")))
 
 
 def test_exec_validates_env_before_building_docker_env(monkeypatch):
@@ -1409,6 +1559,7 @@ def test_create_owns_validated_secret_env_across_docker_awaits(monkeypatch):
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     secret_env = {"API_TOKEN": SecretRef(name="api_token")}
     resolver = StaticVault({"api_token": "sk-super-secret-token"})
+    overlay = {"HTTPS_PROXY": "http://proxy.example"}
 
     async def run() -> DockerRunner:
         create_task = asyncio.create_task(
@@ -1419,11 +1570,13 @@ def test_create_owns_validated_secret_env_across_docker_awaits(monkeypatch):
                 close_action="none",
                 secret_env=secret_env,
                 secret_resolver=resolver,
+                env_overlay=overlay,
             )
         )
         await first_call_started.wait()
         secret_env.clear()
         secret_env["INVALID\nNAME"] = SecretRef(name="api_token")
+        overlay.clear()
         release_first_call.set()
         return await create_task
 
@@ -1431,6 +1584,7 @@ def test_create_owns_validated_secret_env_across_docker_awaits(monkeypatch):
 
     assert tuple(runner.secret_env) == ("API_TOKEN",)
     assert runner.secret_resolver is resolver
+    assert runner.env_overlay == {"HTTPS_PROXY": "http://proxy.example"}
     assert calls == 2
 
 

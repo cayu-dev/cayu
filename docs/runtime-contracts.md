@@ -10417,10 +10417,101 @@ Remote runner command cleanup is bounded. `DockerRunner`, `E2BRunner`, and `Micr
 Both cleanup fields accept the same three modes:
 
 - `"sandbox"`: call the sandbox provider's kill/terminate operation and close the runner. This is the strongest generic cleanup boundary for shells, child processes, and background work.
-- `"command"`: call the provider command handle's `kill()` method. Successful cleanup leaves the runner reusable. When cleanup fails or times out, the base runner contract latches the exec path closed until the caller verifies out-of-band that no stale command remains and calls `reopen_exec()`; `DockerRunner` uses that behavior. `E2BRunner` and `MicrosandboxRunner` deliberately remain reusable after an ordinary handle-level cleanup failure because their supervisors retain ownership of the command. If E2B never returns a delayed command handle after interruption or timeout, Cayu preserves the sandbox but closes that runner's exec path because later commands would overlap with unknown command state. Cayu records cleanup diagnostics so the app can surface the uncertainty without destroying workspace state.
+- `"command"`: call the provider command handle's `kill()` method. Positively completed cleanup leaves the runner reusable. Failed, timed-out, or unsupported cleanup permanently poisons execution on that runner instance, including Docker, E2B, Microsandbox, and Lambda MicroVM. `reopen_exec()` cannot override that uncertainty. E2B may retain a delayed-start cleanup while its execution fence stays closed; only positive completion of its owned cleanup permits reuse. Cayu records cleanup diagnostics without treating cancellation of a local SDK await as proof that a remote command stopped.
 - `"none"`: do not try to stop the command or sandbox. Cayu records a skipped cleanup diagnostic and leaves the runner reusable for ordinary cancellations where command state is already known. If command submission may have succeeded but start acknowledgement never arrived, the runner exec path remains closed because Cayu cannot prove that no late command is still running. This is for callers that own cleanup outside Cayu.
 
 If cleanup fails or times out, Cayu includes a structured `cayu.runner_cleanup.v1` artifact with adapter, action, status, timeout, and error details when available.
+
+Microsandbox sandbox cleanup preserves its remote kill artifact when owned transport
+finalization also fails. A following `close_transports` failure artifact reports
+that separate phase; it is not proof of command termination. Caller cancellation
+also retains the ordered transport exceptions.
+If transport finalization exceeds the observation deadline, the completed kill
+artifact is retained and the timeout is attributed to `close_transports`.
+Workspace settlement treats transport closure separately: an acknowledged sandbox
+kill still proves guest quiescence when transport closure fails, but transport
+closure alone never proves that a command stopped.
+
+E2B and Microsandbox ordinary post-dispatch transport failures use the same owned
+cleanup boundary as interruption. Without positive command settlement, execution
+is poisoned, including when cleanup is configured as `none`. The sanitized
+execution failure remains available alongside cleanup evidence.
+
+Docker permits the `none` cleanup opt-out only after positive command-start
+evidence. An ambiguous delayed start permanently poisons execution, including
+`reopen_exec()`, even when cleanup is disabled.
+
+After Docker, E2B or Microsandbox allocation is acknowledged, failed or cancelled initial
+workspace setup rolls back under a retained owner. Docker and E2B bound observation by
+`cancel_timeout_s`; Microsandbox uses `cancel_timeout_s + remove_timeout_s` for
+stop and removal together. A second caller cancellation does not cancel rollback.
+The caller's cancellation remains authoritative, with rollback failures or timeout
+attached. Ordinary setup and rollback failures retain their ordered exceptions.
+E2B terminal cleanup accepts both deletion (`True`) and provider-confirmed absence
+(`False`) from `kill()`. Thus a lost deletion acknowledgement can settle on retry
+without retaining an owner for an already-deleted sandbox. Unexpected result
+types and provider exceptions do not establish successful cleanup.
+Docker rollback targets only the acknowledged immutable container ID, never a
+reusable container name. Strict reconnect and execution through an exact-ID handle
+reject that allocation while rollback remains pending or failed; a late deletion
+cannot race a successful coding-factory recovery of the same allocation.
+Applications can call `await DockerRunner.drain_failed_creations(timeout_s=5)`,
+`await E2BRunner.drain_failed_creations(timeout_s=5)` or
+`await MicrosandboxRunner.drain_failed_creations(timeout_s=5)` after interruption
+and again after repairing a provider failure. Each method joins pending cleanup,
+retries each settled failure once, and returns the number still unsettled for that
+adapter in this process. Concurrent drains do not dispatch duplicate cleanup.
+Cancellation or timeout of a drain does not abandon its cleanup owner. These
+methods neither allocate replacements nor provide recovery across process loss;
+they cover acknowledged allocations, not lost allocation acknowledgements.
+E2B hardened handoff failures use the same drain for deletion of an acknowledged
+sandbox, including allocations returned after handoff revocation and exact sandbox
+IDs discovered by metadata reconciliation. An expired observation does not cancel
+deletion. Retrying cleanup uses the owned sandbox independently of the revoked
+runner; it does not restore provisioning or guest execution capabilities. An
+allocation that never becomes observable remains ambiguous, not proven deleted.
+Retained E2B rollback fences the exact sandbox ID against attachment, hardened
+recovery, and execution through sibling handles until deletion settles. Metadata
+reconciliation and a late allocation acknowledgement join the same deletion owner
+when they identify the same sandbox; unrelated sandbox IDs remain independent.
+Each validated metadata match is retained before awaiting later pages or deletion,
+so partial discovery or deletion failure cannot drop already-observed allocations
+from the cleanup drain.
+Retained E2B deletions use the configured SDK request timeout (or SDK default),
+not discovery's diminishing time allowance. A drain bounds observation without
+restarting pending deletion; a settled failure retries with a fresh SDK request.
+Microsandbox reserves a same-name acquisition lease before provider dispatch and
+holds it through setup or attachment. Competing creation or attachment in this
+process is rejected, including `replace=True`; distinct names remain independent.
+Failed setup transfers that lease to rollback without an admission gap. Deferred
+attachment restoration retains it until successful settlement. Confirmed removal
+retires rollback ownership even when an earlier stop failure must still be
+reported. The existing authenticated environment-cleanup retry can reclaim a
+failed restoration's lease; ordinary create/attach calls cannot bypass it.
+Direct runner callers can use
+`await MicrosandboxRunner.drain_failed_attachments(timeout_s=5)` to join pending
+attachment restoration or retry each settled failure once after repairing the
+provider. It returns the number of attachment restorations still unsettled in
+this process. This retries the retained stop operation, not allocation or resume;
+it joins any pending original mutation before retrying. Concurrent drains share
+the same owner, and cancelling a drain does not release the same-name fence.
+Creation rollback and attachment restoration have separate drain methods.
+Adapter restoration retries retain the runner's terminal settlement until its
+provider stop finishes; an internal close observation deadline cannot release
+the acquisition fence or permit another restoration stop. Public `close()` and
+factory drain observations remain bounded.
+Microsandbox removal deadlines bound retry admission, not an already-dispatched
+provider removal. Constructor rollback and terminal close retain that removal
+until its await settles; observation timeout does not cancel it or authorize
+another removal. Constructor drains keep the same-name acquisition fence until
+successful reclamation.
+A later drain must not remove a replacement allocation. This fence does
+not coordinate external SDK clients or different processes.
+
+Microsandbox public `close()` retains already-observed transport failures if a
+subsequent transport or provider teardown stalls. Its bounded observer reports
+those original failures alongside timeout, including when caller cancellation is
+the authoritative outcome.
 
 ### Ambiguous command execution
 
@@ -10429,7 +10520,17 @@ Command submission, guest execution, and host acknowledgement are separate event
 - prove the command terminal or unable to start, using a backend guarantee such as an idempotent command id and cancellation tombstone, a late-arriving handle followed by confirmed cleanup, or successful sandbox termination; or
 - latch its exec path closed and report that command state is unknown.
 
-A cleanup artifact with `status="completed"` is a claim that the selected cleanup boundary completed, not merely that Cayu sent a request. `failed`, `timeout`, `unsupported`, and `skipped` do not prove command termination. An adapter may remain reusable after a handle-level cleanup failure only when it has already identified the command and its backend supervisor retains an explicit ownership boundary; it must not generalize that exception to an unacknowledged start. `reopen_exec()` is an operator assertion: callers may use it only after verifying out-of-band that no stale or late command can overlap future work.
+A cleanup artifact with `status="completed"` is a claim that the selected cleanup boundary completed, not merely that Cayu sent a request. `failed`, `timeout`, `unsupported`, and `skipped` do not prove command termination. `reopen_exec()` clears an intentional execution fence, not a poison state caused by inconclusive cleanup.
+
+`Runner.lifecycle_state` reports `reusable`, `fenced`, `poisoned`, `closing`, or
+`closed`. Cleanup fences new execution before waiting. A bounded observer may
+return while an opaque external operation remains in flight, but the cleanup
+owner is retained and late completion never reopens a poisoned instance.
+Concurrent equal terminal cleanup requests share one operation; a different
+terminal action is rejected while that operation is pending. Repeated caller
+cancellation is carried through cleanup and returned as `CancelledError`, not
+as successful completion. A failed but positively settled finalization can be
+retried for resource cleanup; execution remains poisoned.
 
 Cancellation re-raises the original `asyncio.CancelledError` with cleanup diagnostics attached. Timeout returns an honest partial `ExecResult`: captured output and total byte counts reflect what the runner actually observed, and a synthetic exit code must not replace a backend final snapshot when that snapshot can be fetched within the cleanup deadline. `close()` is bounded, idempotent, and terminal for execution.
 
@@ -10796,7 +10897,7 @@ extra. `create(...)` calls the distinct `lambda-microvms` control API, waits for
 sidecar health interface, and terminates a newly created MicroVM if setup fails or is cancelled.
 `from_existing(...)` restores identity from `get_microvm` and generates a fresh endpoint token;
 JWE tokens are memory-only and never belong in reconnect metadata. Both process and shell forms
-cross sidecar protocol version `1` without host-environment inheritance; readiness rejects an
+cross sidecar protocol version `2` without host-environment inheritance; readiness rejects an
 image that reports another version. Endpoint authentication and the first-party sidecar are
 fixed to port 8080. The guest supervisor
 owns process groups, drains bounded stdout/stderr, enforces timeouts, and confirms command or
@@ -10805,6 +10906,59 @@ The host independently caps a timed command at its requested timeout plus a boun
 grace period, so a responsive but wedged supervisor cannot poll forever.
 `close_action` is `terminate`, `suspend`, or `none`, and explicit `suspend()` / `resume()` /
 `terminate()` methods support app-owned lifecycle policy.
+
+Cancellation or timeout of `LambdaMicroVMRunner.create()` retains ownership of a
+late allocation. Applications should call
+`await LambdaMicroVMRunner.drain_abandoned_allocations(timeout_s=5)` during cleanup
+and again after repairing a provider failure. It returns the number of unsettled
+allocations for that runner class in the current process. Concurrent drains join
+in-flight reclamation; each drain retries an already-settled failure once without
+creating another VM. Timing out or cancelling a drain leaves its owner retained.
+The reclamation owner keeps its control client until deletion is positively
+confirmed and then closes owned transports; a transport retry does not repeat
+confirmed deletion. This is process-local reclamation, not restart recovery.
+If allocation fails before constructing a runner, the drain still retries owned
+client closure. Settling that local cleanup does not prove that an unacknowledged
+provider allocation never occurred, and the original allocation failure is not
+converted into a successful creation result.
+The same retained owner covers `from_existing()` attachment. An abandoned attach
+fences further attachments with the same MicroVM identifier in this process,
+including attachments using a fresh client. The fence remains through failed
+restoration until reclamation succeeds. This conservative identifier fence does
+not coordinate different processes.
+An abandoned attach
+waits for dispatched resume work to settle before closing owned transports. If it
+resumed a suspended allocation, reclamation restores suspension; it does not
+terminate that application-owned VM. The same drain method includes these pending
+attachments.
+
+Bounded allocation and terminal-cleanup observers preserve failures already
+observed before a later phase stalls. A timeout is reported alongside those
+failures, or attached with them when caller cancellation is authoritative.
+
+Terminal close/kill waits for control-plane `TERMINATED` or `SUSPENDED` evidence,
+as appropriate, rather than treating the mutation acknowledgement as quiescence.
+Owned HTTP and control transports are both closed even when the lifecycle action
+fails; multiple failures retain their ordered original exception structure.
+An observation timeout retains the in-flight owner instead of issuing another
+termination request.
+
+Command-state reads retry at most three times for explicit transient transport
+failures or HTTP 408, 429, 500, 502, 503, and 504, with bounded backoff. The policy
+does not retry command start/cancel operations or protocol failures. A poll batch
+is bounded by `request_timeout_s`, including its backoff. Authentication failure
+during a command-state read fails immediately; one-time token refresh on other
+endpoint operations is separate from transient polling. Custom
+endpoint transports use `LambdaMicroVMEndpointTransientError` only for this
+transient category, not authorization or malformed-response failures.
+
+Each output channel has a 16 MiB retained-byte ceiling, also enforced by the
+first-party sidecar. A larger or unlimited requested output limit is capped;
+total byte counts and truncation flags remain available. The host validates
+encoded and predicted decoded sizes before base64 decoding. HTTP response
+bodies are streamed with a ceiling of twice the maximum base64 channel size
+plus 64 KiB for metadata, before JSON parsing. Compressed response bodies are
+rejected so decompression cannot bypass the bound.
 
 The installed distribution provides the matching guest build context through
 `cayu lambda-microvm sidecar export DESTINATION`. Export is local and credential-free; it does

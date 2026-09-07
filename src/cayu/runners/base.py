@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import posixpath
 import secrets
 import threading
 import traceback
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import wraps
 from typing import (
@@ -34,7 +35,14 @@ from pydantic import (
 )
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
+from cayu._exception_groups import iter_exception_tree
 from cayu._exception_state import exception_state
+from cayu._task_wait import (
+    CapturedAwaitableOutcome,
+    await_shielded_task_outcome,
+    capture_awaitable_outcome,
+    restore_task_cancellation_requests,
+)
 from cayu._validation import (
     DurableValueError,
     copy_json_value,
@@ -45,7 +53,14 @@ from cayu._validation import (
     require_nonblank,
 )
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runners._cleanup import RunnerCleanupResult
+from cayu.runners._cleanup import (
+    RunnerCleanupPolicy,
+    RunnerCleanupProgress,
+    RunnerCleanupResult,
+    RunnerFailureProgress,
+    attach_runner_cancellation_failure,
+    runner_cancellation_failure,
+)
 from cayu.runners._diagnostics import (
     runner_failure_fields,
     safe_runner_failure_fields,
@@ -62,6 +77,17 @@ if TYPE_CHECKING:
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
 RunnerSystemExecutionMode = Literal["shared", "separate"]
+RunnerLifecycleState = Literal["reusable", "fenced", "poisoned", "closing", "closed"]
+# Keep cancellation-opaque cleanup alive after its bounded observer returns.
+# A late result never grants reuse to an instance already poisoned by timeout.
+_PENDING_RUNNER_CLEANUPS: set[asyncio.Task[Any]] = set()
+
+
+def _contains_runner_fatal_signal(error: BaseException) -> bool:
+    return any(
+        not isinstance(leaf, (Exception, asyncio.CancelledError, BaseExceptionGroup))
+        for leaf in iter_exception_tree(error)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -776,6 +802,18 @@ def runner_workspace_mutation_settlement(
             return "uncertain"
         if artifact_type != "cayu.runner_cleanup.v1":
             continue
+        if type(action) is str and action == "close_transports":
+            if type(status) is not str or status not in {
+                "completed",
+                "deferred",
+                "failed",
+                "timeout",
+                "unsupported",
+                "skipped",
+            }:
+                return "uncertain"
+            # Transport closure is neither proof nor disproof of guest quiescence.
+            continue
         if (
             type(action) is not str
             or action not in {"kill_command", "kill_sandbox"}
@@ -810,8 +848,9 @@ class Runner(ABC):
       cleanup cannot confirm the command stopped, the exec path latches shut
       (``_close_exec``) so an unknown still-running command cannot race new
       work.
-    - ``reopen_exec()`` explicitly clears that latch after the caller verified
-      out-of-band that no stale command is running.
+    - Inconclusive remote command cleanup permanently poisons execution on
+      that runner instance. ``reopen_exec()`` clears only an intentional fence,
+      not uncertainty from failed cleanup.
     - ``close()`` is terminal for command execution, even for adapters whose
       configured close action intentionally leaves a remote sandbox alive.
     """
@@ -868,6 +907,12 @@ class Runner(ABC):
     _closed: bool = False
     _exec_closed: bool = False
     _exec_closed_reason: str | None = None
+    _exec_poisoned: bool = False
+    _command_cleanups_pending: int = 0
+    _closing: bool = False
+    _terminal_lifecycle_task: asyncio.Task[CapturedAwaitableOutcome[None]] | None = None
+    _terminal_failure_progress: RunnerFailureProgress | None = None
+    _terminal_lifecycle_action: str | None = None
 
     @_clean_runner_preflight
     def preflight_exec(
@@ -1045,6 +1090,18 @@ class Runner(ABC):
 
         return self._closed
 
+    @property
+    def lifecycle_state(self) -> RunnerLifecycleState:
+        """Observe execution eligibility without exposing provider internals."""
+
+        if self._closed:
+            return "closed"
+        if self._exec_poisoned:
+            return "poisoned"
+        if self._closing or self._command_cleanups_pending:
+            return "closing"
+        return "fenced" if self._exec_closed else "reusable"
+
     def workspace_capability(
         self,
         capability_type: type[RunnerWorkspaceCapabilityT],
@@ -1066,12 +1123,11 @@ class Runner(ABC):
         return None
 
     def reopen_exec(self) -> None:
-        """Clear a latched exec-closed state on an otherwise-open runner.
+        """Clear an intentional execution fence on an otherwise-open runner.
 
-        Cleanup after an interrupted command latches the exec path shut when it
-        cannot confirm the command stopped (for example a flaky pid-file wait).
-        After verifying out-of-band that no stale command is running, callers
-        use this to resume executing instead of discarding the runner.
+        This is not recovery authority for inconclusive command cleanup.
+        Poisoned instances cannot be reopened, including after a late cleanup
+        acknowledgement; a new independently verified allocation owner is needed.
         """
 
         if self._closed:
@@ -1105,6 +1161,8 @@ class Runner(ABC):
     def _ensure_exec_open(self) -> None:
         if self._closed:
             raise RuntimeError(f"{type(self).__name__} is closed.")
+        if self._closing or self._command_cleanups_pending:
+            raise RuntimeError(f"{type(self).__name__} is closed for cleanup.")
         if self._exec_closed:
             reason = self._exec_closed_reason or "runner exec path is closed"
             raise RuntimeError(f"{type(self).__name__} is closed: {reason}")
@@ -1114,8 +1172,206 @@ class Runner(ABC):
         self._exec_closed_reason = reason
 
     def _open_exec(self) -> None:
+        if self._exec_poisoned:
+            raise RuntimeError(f"{type(self).__name__} is permanently poisoned.")
+        if self._closing or self._command_cleanups_pending:
+            raise RuntimeError(f"{type(self).__name__} is closed for cleanup.")
         self._exec_closed = False
         self._exec_closed_reason = None
+
+    def _poison_exec(self, reason: str | None = None) -> None:
+        self._exec_poisoned = True
+        self._close_exec(
+            reason or f"{self.isolation} command cleanup did not complete; command state is unknown"
+        )
+
+    async def _cleanup_failed_execution(
+        self, failure: RunnerExecutionError, cleanup: Callable[[], Awaitable[RunnerCleanupResult]]
+    ) -> RunnerCleanupResult:
+        """Keep the sanitized execution failure authoritative through owned cleanup."""
+        try:
+            result = await cleanup()
+        except asyncio.CancelledError as cancellation:
+            cleanup_failure = runner_cancellation_failure(cancellation)
+            attach_runner_cancellation_failure(
+                cancellation,
+                failure
+                if cleanup_failure is None
+                else BaseExceptionGroup(
+                    "Runner execution and cleanup failed.", [failure, cleanup_failure]
+                ),
+            )
+            raise
+        except BaseException as cleanup_failure:
+            raise BaseExceptionGroup(
+                "Runner execution and cleanup failed.", [failure, cleanup_failure]
+            ) from None
+        failure.artifacts.extend(result.artifacts)
+        if result.failure is not None:
+            raise failure from result.failure
+        return result
+
+    async def _settle_command_cleanup(
+        self,
+        operation: Callable[[], Awaitable[RunnerCleanupResult]],
+        *,
+        adapter: str,
+        timeout_s: float,
+        policy: RunnerCleanupPolicy = "command",
+        cancellation: asyncio.CancelledError | None = None,
+        progress: RunnerCleanupProgress | None = None,
+    ) -> RunnerCleanupResult:
+        """Fence command reuse until owned cleanup has a positive outcome.
+
+        The timeout bounds observation, not external mutation. A timed-out child
+        remains retained and the runner stays poisoned even if it settles later.
+        """
+
+        self._command_cleanups_pending += 1
+        try:
+            task = asyncio.create_task(capture_awaitable_outcome(operation))
+            _PENDING_RUNNER_CLEANUPS.add(task)
+            task.add_done_callback(_PENDING_RUNNER_CLEANUPS.discard)
+            outcome = await await_shielded_task_outcome(
+                task, timeout_s=timeout_s, cancellation=cancellation
+            )
+            captured = outcome.result
+            failure = outcome.error if captured is None else captured.error
+            result = None if captured is None else captured.result
+            if result is not None and result.failure is not None:
+                failure = result.failure
+                self._poison_exec()
+            if outcome.timed_out or result is None:
+                self._poison_exec()
+                pending = None if progress is None else progress.pending
+                result = RunnerCleanupResult(
+                    artifact={
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": adapter,
+                        "action": {
+                            "command": "kill_command",
+                            "sandbox": "kill_sandbox",
+                            "none": "none",
+                        }[policy],
+                        "status": "timeout" if outcome.timed_out else "failed",
+                        "timeout_s": timeout_s,
+                    },
+                    close_runner=True,
+                )
+                if pending is not None:
+                    result = RunnerCleanupResult(
+                        artifact={**pending.artifact, "status": result.artifact["status"]},
+                        close_runner=True,
+                        preceding_artifacts=pending.preceding_artifacts,
+                        failure=pending.failure,
+                    )
+                    if failure is None:
+                        failure = pending.failure
+            self._apply_cleanup_result(result)
+        except BaseException:
+            self._poison_exec()
+            raise
+        finally:
+            self._command_cleanups_pending -= 1
+            self._command_cleanup_settled()
+        if failure is not None and _contains_runner_fatal_signal(failure):
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed,
+                cancellation=outcome.cancellation,
+            )
+            raise failure
+        if outcome.cancellation is not None:
+            attach_cancellation_artifacts(outcome.cancellation, result.artifacts)
+            if failure is not None:
+                attach_runner_cancellation_failure(outcome.cancellation, failure)
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed,
+                cancellation=outcome.cancellation,
+            )
+            raise outcome.cancellation
+        return result
+
+    def _command_cleanup_settled(self) -> None:
+        """Let an adapter reconcile its owned deferred fence after settlement."""
+
+        return None
+
+    async def _settle_terminal_lifecycle(
+        self,
+        operation: Callable[[], Awaitable[None]],
+        *,
+        action: str,
+        timeout_s: float | None,
+        progress: RunnerFailureProgress | None = None,
+    ) -> None:
+        """Single-flight terminal cleanup; interruption never abandons ownership."""
+
+        if self._closed:
+            return
+        task = self._terminal_lifecycle_task
+        if task is not None and self._terminal_lifecycle_action != action:
+            raise RuntimeError("A different runner finalization is already in progress.")
+        if task is None:
+            self._closing = True
+            self._close_exec("runner finalization has started")
+            try:
+                task = asyncio.create_task(capture_awaitable_outcome(operation))
+            except BaseException:
+                self._closing = False
+                self._poison_exec()
+                raise
+            self._terminal_lifecycle_task = task
+            self._terminal_failure_progress = progress
+            self._terminal_lifecycle_action = action
+            _PENDING_RUNNER_CLEANUPS.add(task)
+            task.add_done_callback(self._record_terminal_lifecycle)
+        owned_progress = getattr(self, "_terminal_failure_progress", None)
+        outcome = await await_shielded_task_outcome(task, timeout_s=timeout_s)
+        captured = outcome.result
+        failure = outcome.error if captured is None else captured.error
+        if outcome.timed_out:
+            self._poison_exec()
+            failure = (owned_progress or RunnerFailureProgress()).with_timeout(
+                "Runner finalization has not settled within its deadline."
+            )
+        elif captured is not None:
+            self._record_terminal_lifecycle(task)
+        cancellation = outcome.cancellation
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed, cancellation=cancellation
+        )
+        if failure is not None and _contains_runner_fatal_signal(failure):
+            raise failure
+        if cancellation is not None:
+            if failure is not None:
+                attach_runner_cancellation_failure(cancellation, failure)
+                raise cancellation from failure
+            raise cancellation
+        if failure is not None:
+            if isinstance(failure, asyncio.CancelledError):
+                raise RuntimeError("Runner finalization was cancelled by its dependency.") from None
+            raise failure
+
+    def _record_terminal_lifecycle(
+        self, task: asyncio.Task[CapturedAwaitableOutcome[None]]
+    ) -> None:
+        _PENDING_RUNNER_CLEANUPS.discard(task)
+        if task is not self._terminal_lifecycle_task:
+            return
+        self._closing = False
+        try:
+            failure = task.result().error
+        except BaseException as error:
+            failure = error
+        if failure is None:
+            self._closed = True
+        else:
+            self._poison_exec()
+        # Failed, definitely settled cleanup can be retried; an in-flight
+        # attempt stays attached, so retry cannot dispatch overlapping effects.
+        self._terminal_lifecycle_task = None
+        self._terminal_failure_progress = None
+        self._terminal_lifecycle_action = None
 
     def _apply_cleanup_result(self, cleanup: RunnerCleanupResult) -> None:
         artifact = cleanup.artifact
@@ -1124,10 +1380,13 @@ class Runner(ABC):
         if artifact.get("action") == "kill_sandbox" and artifact.get("status") == "completed":
             self._closed = True
             return
-        if artifact.get("action") == "kill_command" and artifact.get("status") != "completed":
-            self._close_exec(
-                f"{self.isolation} command cleanup did not complete; command state is unknown"
-            )
+        if artifact.get("action") == "kill_command" and artifact.get("status") not in {
+            "completed",
+            "deferred",
+        }:
+            self._poison_exec()
+        if artifact.get("action") == "kill_sandbox" and artifact.get("status") != "completed":
+            self._poison_exec()
 
     async def __aenter__(self) -> Self:
         return self

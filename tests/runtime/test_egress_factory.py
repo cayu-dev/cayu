@@ -1153,6 +1153,41 @@ def _broker_request(presented_value: str, path: str) -> CapturedRequest:
     )
 
 
+def test_factory_runner_exposes_inner_cleanup_eligibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", _FakeDockerRunner)
+
+    async def emitter(event: Event) -> Event:
+        return event
+
+    async def run() -> None:
+        result = await _factory(emitter).create(
+            EnvironmentFactoryRequest(
+                session_id="lifecycle-observation",
+                agent_name="agent",
+                environment_name="egress-env",
+                execution_profile_fingerprint="a" * 64,
+            )
+        )
+        runner = result.environment.runner
+        inner = _FakeDockerRunner.last_instance
+        assert runner is not None and inner is not None
+        try:
+            assert runner.lifecycle_state == "reusable"
+            inner._command_cleanups_pending += 1
+            assert runner.lifecycle_state == "closing"
+            inner._command_cleanups_pending -= 1
+            inner._poison_exec()
+            assert runner.lifecycle_state == "poisoned"
+            with pytest.raises(RuntimeError):
+                runner.reopen_exec()
+            assert runner.lifecycle_state == "poisoned"
+        finally:
+            await runner.close()
+        assert runner.lifecycle_state == "closed"
+
+    asyncio.run(run())
+
+
 def test_factory_wires_runner_grants_and_events(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", _FakeDockerRunner)
     events: list[Event] = []

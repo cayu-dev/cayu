@@ -28,9 +28,15 @@ from cayu.runners._cleanup import (
     DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
     RUNNER_COMMAND_KILL_ATTEMPTS,
     RunnerCleanupPolicy,
+    RunnerCleanupResult,
     cleanup_runner_command_with_diagnostic,
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
+)
+from cayu.runners._creation_cleanup import (
+    drain_creation_cleanups,
+    require_creation_cleanup_settled,
+    settle_creation_cleanup,
 )
 from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_allowlist
 from cayu.runners._secrets import (
@@ -211,10 +217,10 @@ def _require_docker(docker_path: str | None) -> str:
     return candidate
 
 
-def _validate_close_action(action: str) -> str:
+def _validate_close_action(action: str) -> DockerCloseAction:
     if action not in {"remove", "stop", "none"}:
         raise ValueError("close_action must be 'remove', 'stop', or 'none'.")
-    return action
+    return cast("DockerCloseAction", action)
 
 
 def _docker_lifecycle_redactor(
@@ -875,7 +881,7 @@ def _supervised_command_body(
         process_group_probe = (
             "process_group=0; "
             "if read observed_pid observed_comm observed_state observed_parent "
-            "observed_group ignored < /proc/$$/stat 2>/dev/null "
+            "observed_group ignored 2>/dev/null < /proc/$$/stat "
             '&& test "$observed_pid" = "$$" && test "$observed_group" = "$$"; '
             "then process_group=1; fi; "
         )
@@ -943,6 +949,26 @@ class _DockerCommandHandle:
         self.pid_file = pid_file
         self.docker_cli_env_allowlist = tuple(docker_cli_env_allowlist)
 
+    async def has_started(self) -> bool:
+        # This unpredictable per-command record is written by the guest
+        # supervisor before execution. It proves start, not quiescence; even
+        # an exited supervisor is sufficient for the explicit `none` opt-out.
+        result = await _run_docker(
+            self.docker_path,
+            [
+                "exec",
+                self.name,
+                "sh",
+                "-c",
+                f"read pid group < {shlex.quote(self.pid_file)} 2>/dev/null || exit 1; "
+                "case \"$pid\" in ''|*[!0-9]*) exit 1 ;; esac; "
+                'case "$group" in 0|1|2) ;; *) exit 1 ;; esac; '
+                'test "$pid" -gt 1',
+            ],
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+        )
+        return result.exit_code == 0 and not result.timed_out
+
     async def kill(self) -> bool:
         for _ in range(RUNNER_COMMAND_KILL_ATTEMPTS):
             result = await _run_docker(
@@ -952,21 +978,10 @@ class _DockerCommandHandle:
             )
             if result.exit_code == 0:
                 return True
-        return await self._verify_command_not_running()
-
-    async def _verify_command_not_running(self) -> bool:
-        # The supervised wrapper writes the pid file before running the command
-        # and removes it when the command exits, so `test -f` exiting 1 (file
-        # absent) after the kill attempts' wait windows means no tracked
-        # command is running — a flaky pid-file wait must not report a live
-        # command. Any other exit code (docker transport failure with the
-        # container still up, etc.) stays a failure.
-        probe = await _run_docker(
-            self.docker_path,
-            ["exec", self.name, "sh", "-c", f"test -f {shlex.quote(self.pid_file)}"],
-            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
-        )
-        return probe.exit_code == 1
+        # Absence cannot distinguish a completed command from an accepted exec
+        # whose supervisor has not started yet. Only acknowledged cleanup may
+        # authorize reuse; otherwise the caller must poison the runner.
+        return False
 
 
 class DockerRunner(Runner, RunnerBinaryStreamCapability):
@@ -989,6 +1004,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
     """
 
     isolation = "docker"
+
+    def _ensure_exec_open(self) -> None:
+        super()._ensure_exec_open()
+        require_creation_cleanup_settled("docker", self.container_reference)
 
     @property
     def resource_key(self) -> tuple[object, ...]:
@@ -1315,6 +1334,15 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         _validate_close_action(close_action)
         if type(replace) is not bool:
             raise TypeError("replace must be a bool.")
+        environment_overlay = dict(env_overlay) if env_overlay else {}
+        # Setup and diagnostics must use the same preflight-owned overlay as
+        # the returned runner, even if caller data changes during allocation.
+        env_overlay = environment_overlay
+        if (
+            _env_overlay_secret_values_present is not None
+            and type(_env_overlay_secret_values_present) is not bool
+        ):
+            raise TypeError("_env_overlay_secret_values_present must be bool or None.")
         cancel_timeout = validate_cancel_timeout(cancel_timeout_s)
         cancellation_policy = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
@@ -1551,21 +1579,30 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     valid_until=observed_at + timedelta(seconds=300),
                 )
         except BaseException as create_error:
-            cleanup_reference = owned_container_id or (None if strict_mode else name)
+            # Retained rollback must never target a name that a replacement
+            # can reuse after this failed constructor returns.
+            cleanup_reference = owned_container_id
             if cleanup_reference is not None:
-                cleanup = await _run_docker(
-                    docker,
-                    ["rm", "-f", cleanup_reference],
-                    docker_cli_env_allowlist=docker_cli_allowlist,
-                )
-                if cleanup.exit_code != 0 or cleanup.timed_out:
-                    cleanup_error = DockerContainerOwnershipError(
-                        "Docker creation failed and exact-container cleanup was not confirmed."
+
+                async def rollback(progress):
+                    cleanup = await _run_docker(
+                        docker,
+                        ["rm", "-f", cleanup_reference],
+                        docker_cli_env_allowlist=docker_cli_allowlist,
                     )
-                    raise BaseExceptionGroup(
-                        "Docker creation and exact-container cleanup both failed.",
-                        [create_error, cleanup_error],
-                    ) from None
+                    if cleanup.exit_code != 0 or cleanup.timed_out:
+                        raise DockerContainerOwnershipError(
+                            "Docker creation failed and exact-container cleanup was not confirmed."
+                        )
+
+                await settle_creation_cleanup(
+                    rollback,
+                    adapter="docker",
+                    original=create_error,
+                    message="Docker creation and cleanup both failed.",
+                    timeout_s=cancel_timeout,
+                    identity=cleanup_reference,
+                )
             raise
         return cls(
             name,
@@ -1580,7 +1617,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             secret_resolver=validated_secret_resolver,
             credential_mode=mode,
             allow_raw_secret_env=allow_raw_secret_env,
-            env_overlay=env_overlay,
+            env_overlay=environment_overlay,
             _env_overlay_secret_values_present=_env_overlay_secret_values_present,
             docker_cli_env_allowlist=docker_cli_allowlist,
             _container_id=owned_container_id,
@@ -1642,6 +1679,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 "toolchain_profile_fingerprint must be a lowercase SHA-256 identity or None."
             )
         docker = _require_docker(docker_path)
+        require_creation_cleanup_settled("docker", container_id)
         inspection = await _inspect_strict_container(
             docker,
             container_id,
@@ -1690,6 +1728,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             observed_at=observed_at,
             valid_until=observed_at + timedelta(seconds=300),
         )
+        require_creation_cleanup_settled("docker", container_id)
         return cls(
             name,
             image=owned_image_identity.reference,
@@ -2244,12 +2283,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     output_redactor=invocation_redactor,
                 )
             except asyncio.CancelledError as exc:
-                cleanup = await cleanup_runner_command_with_diagnostic(
-                    self,
+                cleanup = await self._cleanup_command(
                     handle=handle,
-                    adapter="docker",
-                    timeout_s=self.cancel_timeout_s,
                     policy=self.cancellation_cleanup,
+                    cancellation=exc,
                 )
                 self._apply_cleanup_result(cleanup)
                 attach_cancellation_artifacts(exc, [cleanup.artifact])
@@ -2260,36 +2297,66 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 # the same policy as an interrupted caller before returning the
                 # primary failure; otherwise a failed source/sink can strand work
                 # in the container while the runner still appears reusable.
-                cleanup = await cleanup_runner_command_with_diagnostic(
-                    self,
+                cleanup = await self._cleanup_command(
                     handle=handle,
-                    adapter="docker",
-                    timeout_s=self.cancel_timeout_s,
                     policy=self.cancellation_cleanup,
                 )
                 self._apply_cleanup_result(cleanup)
                 attach_cancellation_artifacts(exc, [cleanup.artifact])
                 raise
         if result.timed_out:
-            cleanup = await cleanup_runner_command_with_diagnostic(
-                self,
+            cleanup = await self._cleanup_command(
                 handle=handle,
-                adapter="docker",
-                timeout_s=self.cancel_timeout_s,
                 policy=self.timeout_cleanup,
             )
             self._apply_cleanup_result(cleanup)
             result = result.model_copy(update={"artifacts": [*result.artifacts, cleanup.artifact]})
         return redact_exec_result(result, resolved_secrets)
 
+    async def _cleanup_command(
+        self,
+        *,
+        handle: _DockerCommandHandle,
+        policy: RunnerCleanupPolicy,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> RunnerCleanupResult:
+        async def cleanup_owned() -> RunnerCleanupResult:
+            if policy == "none" and not await handle.has_started():
+                self._poison_exec()
+            return await cleanup_runner_command_with_diagnostic(
+                self,
+                handle=handle,
+                adapter="docker",
+                timeout_s=self.cancel_timeout_s,
+                policy=policy,
+            )
+
+        return await self._settle_command_cleanup(
+            cleanup_owned,
+            adapter="docker",
+            timeout_s=self.cancel_timeout_s,
+            policy=policy,
+            cancellation=cancellation,
+        )
+
+    @classmethod
+    async def drain_failed_creations(
+        cls, *, timeout_s: float = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS
+    ) -> int:
+        """Join or retry retained constructor rollback without reallocating."""
+        return await drain_creation_cleanups("docker", timeout_s=timeout_s)
+
     async def close(self) -> None:
-        if self._closed:
-            return
-        if self.close_action == "remove":
+        action = self.close_action
+        await self._settle_terminal_lifecycle(
+            lambda: self._close_owned(action), action=action, timeout_s=self.cancel_timeout_s
+        )
+
+    async def _close_owned(self, action: DockerCloseAction) -> None:
+        if action == "remove":
             await self._remove_container()
-        elif self.close_action == "stop":
+        elif action == "stop":
             await self._stop_container()
-        self._closed = True
 
     async def fence_guest_processes_for_egress_cutover(self) -> None:
         """Terminate detached guest work while retaining container/workspace identity."""
@@ -2315,10 +2382,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
     async def kill(self) -> bool:
         """Remove the Docker container for shared runner cleanup diagnostics."""
 
-        if self._closed:
-            return True
-        await self._remove_container()
-        self._closed = True
+        await self._settle_terminal_lifecycle(
+            self._remove_container, action="remove", timeout_s=self.cancel_timeout_s
+        )
         return True
 
     async def _remove_container(self) -> None:
@@ -2327,7 +2393,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             ["rm", "-f", self.container_reference],
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
-        if result.exit_code != 0:
+        if result.exit_code != 0 or result.timed_out:
             detail = _docker_lifecycle_detail(
                 result.stderr,
                 _docker_lifecycle_redactor(
@@ -2345,7 +2411,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             ["stop", self.container_reference],
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
-        if result.exit_code != 0:
+        if result.exit_code != 0 or result.timed_out:
             detail = _docker_lifecycle_detail(
                 result.stderr,
                 _docker_lifecycle_redactor(

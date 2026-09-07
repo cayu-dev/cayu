@@ -135,6 +135,7 @@ class _FakeLambdaRunner(Runner):
         self.closed = False
         self.suspended = False
         self.terminated = False
+        self.close_action = "none"
 
     @classmethod
     async def create(cls, image: str, **kwargs: Any) -> _FakeLambdaRunner:
@@ -205,7 +206,13 @@ class _FakeLambdaRunner(Runner):
         assert self.terminated
 
     async def close(self) -> None:
-        self.closed = True
+        try:
+            if self.close_action == "suspend":
+                await self.suspend()
+            elif self.close_action == "terminate":
+                await self.terminate()
+        finally:
+            self.closed = True
 
 
 class _PreflightSocket:
@@ -957,10 +964,9 @@ def test_lambda_microvm_adapter_does_not_terminate_existing_vm_on_setup_failure(
     assert runner.terminated is False
 
 
-def test_lambda_microvm_adapter_keeps_transport_open_when_suspend_fails(
+def test_lambda_microvm_adapter_closes_owned_transports_when_suspend_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(adapter_module, "LambdaMicroVMRunner", _FakeLambdaRunner)
     adapter = LambdaMicroVMEgressAdapter(
         region_name="us-east-1",
         egress_network_connector_arn="connector-arn",
@@ -968,11 +974,26 @@ def test_lambda_microvm_adapter_keeps_transport_open_when_suspend_fails(
         client=object(),
         proxy_server_factory=_FakeProxyServer,
     )
-    runner = _FakeLambdaRunner()
-    runner.fail_suspend = True
+    closed = []
+
+    class Client:
+        def suspend_microvm(self, **kwargs):
+            raise RuntimeError("suspend failed")
+
+        def close(self):
+            closed.append("provider")
+
+    runner = adapter_module.LambdaMicroVMRunner(
+        Client(), microvm_id="mvm-123", endpoint="mvm.internal", owns_client=True
+    )
+
+    async def close_http():
+        closed.append("http")
+
+    monkeypatch.setattr(runner._endpoint_transport, "aclose", close_http)
 
     with pytest.raises(RuntimeError, match="suspend failed"):
         asyncio.run(adapter.finalize_runner(runner, outcome="interrupted"))
 
-    assert runner.closed is False
-    assert runner.terminated is False
+    assert closed == ["http", "provider"]
+    assert runner.lifecycle_state == "poisoned"

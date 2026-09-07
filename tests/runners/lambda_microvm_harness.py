@@ -14,6 +14,7 @@ class ConformanceLambdaClient:
         self.suspend_calls = 0
         self.resume_calls = 0
         self.terminate_calls = 0
+        self.state = "RUNNING"
 
     def run_microvm(self, **_kwargs: Any) -> dict[str, Any]:
         return {
@@ -31,21 +32,24 @@ class ConformanceLambdaClient:
         return {
             "microvmId": kwargs.get("microvmIdentifier", "mvm-conformance"),
             "endpoint": "conformance.lambda-microvm.invalid",
-            "state": "RUNNING",
+            "state": self.state,
             "imageArn": "arn:aws:lambda:us-east-1:123:microvm-image:conformance",
             "imageVersion": "1",
         }
 
     def suspend_microvm(self, **_kwargs: Any) -> dict[str, Any]:
         self.suspend_calls += 1
+        self.state = "SUSPENDED"
         return {}
 
     def resume_microvm(self, **_kwargs: Any) -> dict[str, Any]:
         self.resume_calls += 1
+        self.state = "RUNNING"
         return {}
 
     def terminate_microvm(self, **_kwargs: Any) -> dict[str, Any]:
         self.terminate_calls += 1
+        self.state = "TERMINATED"
         return {}
 
 
