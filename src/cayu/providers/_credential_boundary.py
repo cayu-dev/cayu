@@ -577,6 +577,7 @@ async def aclosing_provider_stream(
     cleanup_ownership: _ProviderStreamCleanupOwnership | None = None,
     pending_read: Callable[[], asyncio.Future[Any] | None] | None = None,
     retain_cleanup: Callable[[asyncio.Future[Any]], None] | None = None,
+    cancellation_grace_s: float = 0.0,
 ) -> AsyncIterator[AsyncIterator[object]]:
     """Close a nested provider stream before propagating its outcome.
 
@@ -588,8 +589,13 @@ async def aclosing_provider_stream(
     old stream may remain live is unsafe; it retains the primary typed identity
     without exposing provider-controlled cleanup details. Genuine task
     cancellation and process-level cleanup signals remain authoritative.
+    ``cancellation_grace_s`` optionally gives an owned close a bounded chance
+    to settle after caller cancellation. Expiry retains the task; it never
+    cancels it again. Provider stream clock expiry retains its immediate handoff.
     """
 
+    if type(cancellation_grace_s) not in {int, float} or not 0 <= cancellation_grace_s <= 1:
+        raise ValueError("cancellation_grace_s must be between zero and one second.")
     if pending_read is not None and retain_cleanup is None:
         raise ValueError("Interrupted provider reads require retained cleanup ownership.")
 
@@ -662,7 +668,12 @@ async def aclosing_provider_stream(
                     if deadline_failure or current_count > cancellation_baseline:
                         # Start the retained close before releasing the live-model
                         # caller. The child owns any later physical settlement.
-                        await asyncio.sleep(0)
+                        if cancellation_grace_s and not deadline_failure:
+                            # Wait without cancelling the owned close on timeout
+                            # or a second caller cancellation.
+                            await asyncio.wait((cleanup_task,), timeout=cancellation_grace_s)
+                        else:
+                            await asyncio.sleep(0)
                         if deadline_failure and not cleanup_task.done():
                             # Let a caller awakened by cleanup startup deliver
                             # cancellation before the bounded handoff completes.

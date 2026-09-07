@@ -180,11 +180,13 @@ async def _aiter_unclosed_response_bytes(
 
 async def _aiter_owned_stream_response(
     response_context: AbstractAsyncContextManager[httpx.Response],
-) -> AsyncIterator[httpx.Response]:
-    """Yield one HTTP response whose context exit is owned by stream cleanup."""
+) -> AsyncIterator[tuple[httpx.Response, AsyncGenerator[bytes, None]]]:
+    """Own bytes and response closure together, after the interrupted read joins."""
 
     async with response_context as response:
-        yield response
+        response_bytes = _aiter_unclosed_response_bytes(response)
+        async with aclosing(response_bytes):
+            yield response, response_bytes
 
 
 _TRUSTED_HTTPX_REQUEST_ERROR_TYPES: dict[type[httpx.RequestError], str] = {
@@ -573,9 +575,23 @@ async def stream_sse_json_events(
             request_kwargs["json"] = dict(payload)
         response_context = client.stream(method, url, **request_kwargs)
         responses = _aiter_owned_stream_response(response_context)
-        async with aclosing_provider_stream(responses):
-            response = await deadline_controller.wait_for(
+        interrupted_read: asyncio.Future[Any] | None = None
+
+        def retain_interrupted_read(operation: asyncio.Future[Any]) -> None:
+            nonlocal interrupted_read
+            interrupted_read = operation
+
+        async with aclosing_provider_stream(
+            responses,
+            pending_read=lambda: interrupted_read,
+            retain_cleanup=deadline_controller.retain_dispatched_operation,
+            # Socket cancellation can require several event-loop turns.
+            # Retain anything still pending after this local-close grace.
+            cancellation_grace_s=0.05,
+        ):
+            response, response_bytes = await deadline_controller.wait_for(
                 anext(responses),
+                on_interrupted=retain_interrupted_read,
                 kinds=(
                     ProviderDeadlineKind.TRANSPORT_IDLE,
                     ProviderDeadlineKind.PROTOCOL_IDLE,
@@ -631,22 +647,21 @@ async def stream_sse_json_events(
             # ``Response.aiter_raw()`` auto-closes on clean EOF, which would
             # run arbitrary transport cleanup inside the read iterator instead
             # of the response-context owner surrounding this block.
-            response_bytes = _aiter_unclosed_response_bytes(response)
-            async with aclosing(response_bytes):
-                bounded_lines = _aiter_bounded_sse_lines(
-                    response_bytes,
-                    max_line_bytes=DEFAULT_SSE_MAX_EVENT_BYTES,
-                    provider_label=response_label,
-                    emit_byte_activity=True,
-                    deadline_controller=deadline_controller,
-                )
-                async for event in aiter_sse_json_events(
-                    bounded_lines,
-                    deadline_controller=deadline_controller,
-                    provider_label=response_label,
-                    protocol_error=protocol_error,
-                ):
-                    yield _TrustedSseJsonEvent(event, retry_after_s=retry_after_s)
+            bounded_lines = _aiter_bounded_sse_lines(
+                response_bytes,
+                max_line_bytes=DEFAULT_SSE_MAX_EVENT_BYTES,
+                provider_label=response_label,
+                emit_byte_activity=True,
+                deadline_controller=deadline_controller,
+            )
+            async for event in aiter_sse_json_events(
+                bounded_lines,
+                deadline_controller=deadline_controller,
+                provider_label=response_label,
+                protocol_error=protocol_error,
+                on_interrupted=retain_interrupted_read,
+            ):
+                yield _TrustedSseJsonEvent(event, retry_after_s=retry_after_s)
     except ProviderStreamDeadlineExceeded as exc:
         raise ModelStreamDeadlineError(
             provider=response_label.lower().replace(" ", "_"),

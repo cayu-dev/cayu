@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
 from cayu._validation import require_finite
@@ -142,6 +142,7 @@ async def aiter_sse_json_events(
     max_event_bytes: int = DEFAULT_SSE_MAX_EVENT_BYTES,
     max_event_lines: int = DEFAULT_SSE_MAX_EVENT_LINES,
     max_event_duration_s: float | None = None,
+    on_interrupted: Callable[[asyncio.Future[Any]], None] | None = None,
 ) -> AsyncIterator[Mapping[str, Any]]:
     """Decode an SSE line stream into JSON data objects.
 
@@ -205,6 +206,7 @@ async def aiter_sse_json_events(
                 raise SseEventTimeoutError(event_timeout_message)
         read = deadline_controller.wait_for(
             iterator.__anext__(),
+            on_interrupted=on_interrupted,
             kinds=(
                 ProviderDeadlineKind.TRANSPORT_IDLE,
                 ProviderDeadlineKind.PROTOCOL_IDLE,

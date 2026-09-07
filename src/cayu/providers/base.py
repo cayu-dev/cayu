@@ -1641,6 +1641,9 @@ async def _guard_normalized_provider_stream(
             iterator,
             pending_read=lambda: interrupted_read,
             retain_cleanup=controller.retain_dispatched_operation,
+            # Bundled transports join interrupted reads before closing sockets.
+            # Allow that bounded inner cleanup to report its actual outcome.
+            cancellation_grace_s=0.1 if preserves_terminal_on_cancellation else 0.0,
         ) as raw_guarded:
             guarded = cast("AsyncIterator[ModelStreamEvent]", raw_guarded)
             try:
