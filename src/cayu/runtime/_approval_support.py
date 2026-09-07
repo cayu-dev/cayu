@@ -7,6 +7,7 @@ from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from cayu._command_diagnostics import COMMAND_DENIAL_HINTS
 from cayu._validation import copy_durable_json_value, require_durable_clean_nonblank
 from cayu.core.events import (
     Event,
@@ -458,6 +459,14 @@ def public_policy_denial_result(
         raise TypeError("publish_arguments must be a bool.")
     if policy_result.decision is not ToolPolicyDecision.DENY:
         raise ValueError("Public policy result must be a denial.")
+    if policy_result.command_denial_code is not None:
+        code = policy_result.command_denial_code
+        return ToolPolicyResult(
+            decision=ToolPolicyDecision.DENY,
+            reason=COMMAND_DENIAL_HINTS[code],
+            metadata={"command_denial_code": code.value},
+            command_denial_code=code,
+        )
     if secret_resolution_scope == "static" and publish_arguments:
         return policy_result.model_copy(deep=True)
     return ToolPolicyResult(decision=ToolPolicyDecision.DENY)
@@ -1257,6 +1266,9 @@ def pending_tool_call_approvals(
                     default_policy_evidence,
                 ),
                 policy_decision=policy_result.decision.value if policy_result is not None else None,
+                command_denial_code=(
+                    policy_result.command_denial_code if policy_result is not None else None
+                ),
                 reason=resume_ledger.policy_reason_for_pending_tool_call(
                     policy_result,
                     redactor=redactor,

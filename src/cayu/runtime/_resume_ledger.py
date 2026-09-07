@@ -286,6 +286,7 @@ def policy_result_from_pending_tool_call(
     return ToolPolicyResult(
         decision=ToolPolicyDecision(pending_tool_call.policy_decision),
         reason=pending_tool_call.reason,
+        command_denial_code=pending_tool_call.command_denial_code,
         metadata=copy_json_value(pending_tool_call.metadata, "metadata"),
     )
 

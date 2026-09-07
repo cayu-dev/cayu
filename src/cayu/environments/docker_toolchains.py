@@ -20,6 +20,7 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._command_diagnostics import CommandDenialCode, CommandValidationError
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
@@ -1034,6 +1035,15 @@ def _workspace_relative_path(value: str, *, field_name: str, allow_root: bool) -
 
 
 def _validate_model_path_argument(
+    argument: str, *, authority: DockerCodingCommandAuthority
+) -> None:
+    try:
+        _validate_model_path_argument_impl(argument, authority=authority)
+    except ValueError:
+        raise CommandValidationError(CommandDenialCode.DISALLOWED_PATH) from None
+
+
+def _validate_model_path_argument_impl(
     argument: str,
     *,
     authority: DockerCodingCommandAuthority,

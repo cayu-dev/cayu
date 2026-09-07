@@ -95,6 +95,15 @@ additional arguments; a no-argument selector uses `args=[]`. Omit optional field
 to use that selector's defaults. The catalogue does not disclose fixed environment
 values or executable paths, and policy still validates every call independently.
 
+Built-in validation denials provide a fixed correction hint and a
+`command_denial_code`: `unknown_selector`, `argument_shape`, `argument_count`,
+`disallowed_path`, `working_directory`, `timeout_ceiling`, or `output_mode`.
+These codes survive durable tool-round recovery. Hints refer to the published
+selector contract and never interpolate rejected arguments or private profile
+values. Arbitrary policy reasons and metadata remain subject to the existing
+publication restrictions; a code permits only its runtime-owned constant hint.
+
+
 Structured commands also capture bounded content-and-Git-mode manifests immediately
 before dispatch and after complete process settlement. Read-only selectors must
 leave the manifest unchanged; mutating selectors may change only their declared

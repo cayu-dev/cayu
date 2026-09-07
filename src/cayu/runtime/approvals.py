@@ -15,6 +15,7 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
+from cayu._command_diagnostics import CommandDenialCode
 from cayu._validation import (
     copy_durable_json_value,
     require_durable_clean_nonblank,
@@ -385,6 +386,10 @@ class PendingToolCallApproval(BaseModel):
     # ``effective_tool_policy_evidence`` before making an authority decision.
     policy_evidence: ToolPolicyEvidence | None = None
     policy_decision: str | None = None
+    command_denial_code: CommandDenialCode | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     # Taint labels active for this call when the round paused, so the resumed tool sees the same
@@ -1009,6 +1014,7 @@ def copy_pending_tool_call_approval(
         targeted_tool_rejection=call.targeted_tool_rejection,
         policy_evidence=call.policy_evidence,
         policy_decision=call.policy_decision,
+        command_denial_code=call.command_denial_code,
         reason=call.reason,
         metadata=copy_durable_json_value(call.metadata, "metadata"),
         active_taint_labels=list(call.active_taint_labels),

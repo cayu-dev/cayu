@@ -991,6 +991,9 @@ def pending_tool_call_records(
                     default_policy_evidence,
                 ),
                 policy_decision=policy_result.decision.value if policy_result is not None else None,
+                command_denial_code=(
+                    policy_result.command_denial_code if policy_result is not None else None
+                ),
                 reason=resume_ledger.policy_reason_for_pending_tool_call(
                     policy_result,
                     redactor=redactor,

@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cayu._command_diagnostics import CommandDenialCode
 from cayu._validation import (
     copy_durable_json_value,
     require_clean_nonblank,
@@ -95,6 +96,11 @@ class ToolPolicyResult(BaseModel):
     decision: ToolPolicyDecision
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # This closed code grants publication only to runtime-owned constant text.
+    command_denial_code: CommandDenialCode | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     approval_expires_in_seconds: float | None = None
 
     @field_validator("reason")

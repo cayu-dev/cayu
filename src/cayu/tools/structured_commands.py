@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Protocol, runtime_checkable
 
+from cayu._command_diagnostics import CommandDenialCode, CommandValidationError
 from cayu._validation import canonical_durable_json_bytes, copy_json_value
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
@@ -295,7 +296,7 @@ class StructuredCommandToolPolicy(ToolPolicy):
             }
             self._identity = ExecutionProfileBehaviorIdentity(
                 name="cayu.structured_command_tool_policy",
-                behavior_version="1",
+                behavior_version="2",
                 implementation_version="sha256:"
                 + sha256(
                     canonical_durable_json_bytes(material, "structured_command_tool_policy")
@@ -327,6 +328,11 @@ class StructuredCommandToolPolicy(ToolPolicy):
         try:
             authority, arguments, working_directory, timeout_seconds, output_mode = (
                 _resolve_structured_command_request(self._authorities, request.arguments)
+            )
+        except CommandValidationError as exc:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.DENY,
+                command_denial_code=exc.code,
             )
         except ValueError:
             return ToolPolicyResult(
@@ -376,35 +382,45 @@ def _resolve_structured_command_request(
     args: dict,
 ) -> tuple[DockerCodingCommandAuthority, tuple[str, ...], str, int, str]:
     if type(args) is not dict:
-        raise ValueError("Tool arguments must be an object.")
+        raise CommandValidationError(CommandDenialCode.ARGUMENT_SHAPE)
     allowed = {"selector", "args", "workingDirectory", "timeoutSeconds", "outputMode"}
     if set(args) - allowed or "selector" not in args:
-        raise ValueError("Tool arguments contain unknown fields or omit selector.")
+        raise CommandValidationError(CommandDenialCode.ARGUMENT_SHAPE)
     selector = args.get("selector")
     if type(selector) is not str:
-        raise ValueError("Tool argument `selector` must be a string.")
+        raise CommandValidationError(CommandDenialCode.ARGUMENT_SHAPE)
     authority = authorities.get(selector)
     if authority is None:
-        raise ValueError("Tool argument `selector` is not admitted by the active profile.")
+        raise CommandValidationError(CommandDenialCode.UNKNOWN_SELECTOR)
     raw_arguments = args.get("args", [])
     if type(raw_arguments) is not list or any(type(item) is not str for item in raw_arguments):
-        raise ValueError("Tool argument `args` must be an array of strings.")
-    arguments = authority.validate_model_arguments(tuple(raw_arguments))
+        raise CommandValidationError(CommandDenialCode.ARGUMENT_SHAPE)
+    if not authority.min_arguments <= len(raw_arguments) <= authority.max_arguments:
+        raise CommandValidationError(CommandDenialCode.ARGUMENT_COUNT)
+    try:
+        arguments = authority.validate_model_arguments(tuple(raw_arguments))
+    except CommandValidationError:
+        raise
+    except ValueError:
+        raise CommandValidationError(CommandDenialCode.ARGUMENT_SHAPE) from None
     raw_working_directory = args.get("workingDirectory")
     if raw_working_directory is not None and type(raw_working_directory) is not str:
-        raise ValueError("Tool argument `workingDirectory` must be a string.")
-    working_directory = authority.validate_working_directory(raw_working_directory)
+        raise CommandValidationError(CommandDenialCode.WORKING_DIRECTORY)
+    try:
+        working_directory = authority.validate_working_directory(raw_working_directory)
+    except ValueError:
+        raise CommandValidationError(CommandDenialCode.WORKING_DIRECTORY) from None
     timeout_seconds = args.get("timeoutSeconds", authority.timeout_seconds)
     if type(timeout_seconds) is not int or isinstance(timeout_seconds, bool):
-        raise ValueError("Tool argument `timeoutSeconds` must be an integer.")
+        raise CommandValidationError(CommandDenialCode.TIMEOUT_CEILING)
     if not 1 <= timeout_seconds <= authority.timeout_seconds:
-        raise ValueError("Tool argument `timeoutSeconds` must narrow the selector timeout ceiling.")
+        raise CommandValidationError(CommandDenialCode.TIMEOUT_CEILING)
     output_mode = args.get("outputMode", "summary")
     if type(output_mode) is not str or output_mode not in {
         "summary",
         "summary_and_artifact",
     }:
-        raise ValueError("Tool argument `outputMode` is invalid.")
+        raise CommandValidationError(CommandDenialCode.OUTPUT_MODE)
     return authority, arguments, working_directory, timeout_seconds, output_mode
 
 
