@@ -20,6 +20,7 @@ authoritative only where a maintained guide points to the implementation or the
 - Evals: [first evaluation](../src/cayu/guides/evals-first.md), [AI quality](../src/cayu/guides/evals-ai-quality.md), [production sessions and scenarios](../src/cayu/guides/evals-production.md), and the complete [reference](evals.md)
 - [GitHub delivery](github-delivery.md)
 - [Human review](human-review.md)
+- [Host-owned tool execution](host-owned-tool-execution.md)
 - [Memory foundation](memory-foundation.md)
 - [Search when automatic recall is insufficient](knowledge-search-fallback.md)
 - [Opt-in knowledge offers](knowledge-offers.md)
