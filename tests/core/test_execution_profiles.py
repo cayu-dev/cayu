@@ -245,6 +245,7 @@ def test_builtin_provider_deadlines_are_exact_execution_profile_material() -> No
     assert material["version"] == 6
     assert material["stream_deadlines"] == {
         "text_progress_policy_version": 2,
+        "semantic_cleanup_policy_version": 1,
         "transport_idle_timeout_s": 11.0,
         "protocol_idle_timeout_s": 12.0,
         "semantic_progress_timeout_s": 13.0,

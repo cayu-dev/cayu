@@ -8547,6 +8547,29 @@ cancellation and is never translated into a deadline. The exact deadline values
 and material versions are part of execution-profile identity, so continuation
 with changed values requires the normal explicit profile-adoption flow.
 
+For bundled synchronous streams, semantic-idle expiry allows up to 100 ms for
+cooperative read finalization before reporting local cleanup as unconfirmed.
+This bounded join never accepts resumed nonterminal work, and parent cancellation
+remains authoritative. Other deadline kinds retain their existing handoff.
+`semantic_cleanup_policy_version=1` participates in execution-profile identity.
+
+Bundled HTTP response ownership also persists a `model.http_cleanup` receipt
+when a response closes after stream deadline expiry. It records `succeeded` or
+`failed` for the local response-context close, with the exact model step,
+attempt, source run epoch, and deadline evidence. The existing retained close
+task or deadline controller owns receipt persistence. Publication gets a bounded
+50 ms join on semantic expiry; any remaining write stays under the same dispatch
+ownership. It does not start an unbounded detached writer or call user event
+sinks. A delayed close can append this receipt after
+`model.error`; the original error is immutable. If closure or persistence has
+not been confirmed, recovery reports `local_http_cleanup="unknown"` on the
+active model stage. A matching durable receipt changes that evidence to
+`succeeded` or `failed`, including after store reopen. This describes local HTTP
+closure only, not all provider work. A settled task is not proof of successful
+closure, and local closure is never proof of remote settlement. Recovery actions,
+unknown remote outcome, and retry suppression do not change. Opaque transports
+without this response owner do not gain a successful-cleanup claim.
+
 Provider stream configuration also declares `max_concurrent_streams`, defaulting
 to 100 so the normal N9 evaluation capacity does not encounter a lower hidden
 ceiling. Runtime reserves both deadline-read and live cleanup ownership before

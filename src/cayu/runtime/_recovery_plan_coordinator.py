@@ -38,6 +38,7 @@ from cayu.runtime._environment_lifecycle import (
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
+from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired,
     RecoveryCoordinator,
@@ -771,7 +772,35 @@ class RecoveryPlanCoordinator:
                     provider_reattachment = False
                     provider_operation_ref = None
             context = model_completion_recovery_context_from_stage(active.stage)
+            local_http_cleanup = "unknown"
+            cleanup_records = await self._session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_id=local_http_cleanup_event_id(active.stage.stage_id),
+                    limit=1,
+                )
+            )
+            if cleanup_records:
+                receipt = cleanup_records[0].event
+                payload = receipt.payload
+                if (
+                    receipt.type == EventType.MODEL_HTTP_CLEANUP
+                    and receipt.session_id == session.id
+                    and receipt.id == local_http_cleanup_event_id(active.stage.stage_id)
+                    and type(payload.get("source_run_epoch")) is int
+                    and payload.get("source_run_epoch") == active.stage.source_run_epoch
+                    and payload.get("model_step_id") == active.stage.logical_step_id
+                    and payload.get("model_attempt_id")
+                    == active.stage.intent.get("model_attempt_id")
+                    and payload.get("provider") == active.stage.intent.get("provider_name")
+                    and payload.get("execution_profile_fingerprint")
+                    == (None if context is None else context.execution_profile_fingerprint)
+                    and payload.get("provider_effect_outcome") == "unknown"
+                    and payload.get("local_http_cleanup") in ("succeeded", "failed")
+                ):
+                    local_http_cleanup = payload["local_http_cleanup"]
             model_evidence = RecoveryModelStageEvidence(
+                local_http_cleanup=local_http_cleanup,
                 stage_ref=_model_stage_ref(active.stage.stage_id, active.marker_digest),
                 state=active.stage.state,
                 dispatched=dispatch is not None,

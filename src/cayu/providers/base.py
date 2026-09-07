@@ -1653,6 +1653,9 @@ async def _guard_normalized_provider_stream(
                         event = await controller.wait_for(
                             guarded.__anext__(),
                             on_interrupted=retain_interrupted_read,
+                            semantic_cleanup_grace_s=(
+                                0.1 if preserves_terminal_on_cancellation else 0.0
+                            ),
                             kinds=(
                                 ProviderDeadlineKind.SEMANTIC_IDLE,
                                 ProviderDeadlineKind.ABSOLUTE,

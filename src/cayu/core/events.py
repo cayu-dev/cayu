@@ -135,6 +135,7 @@ class EventType(StrEnum):
     MODEL_CITATION = "model.citation"
     MODEL_COMPLETED = "model.completed"
     MODEL_ERROR = "model.error"
+    MODEL_HTTP_CLEANUP = "model.http_cleanup"
     MODEL_RETRY = "model.retry"
     MODEL_ATTEMPT_DISCARDED = "model.attempt_discarded"
     PROVIDER_OPERATION_STARTING = "provider.operation.starting"

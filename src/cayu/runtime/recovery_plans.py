@@ -281,6 +281,7 @@ class RecoveryModelStageEvidence(BaseModel):
     dispatched: StrictBool
     provider_reattachment_supported: StrictBool
     provider_operation_ref: str | None = None
+    local_http_cleanup: Literal["unknown", "succeeded", "failed"] = "unknown"
     reservation_count: StrictInt = Field(ge=0, le=32)
 
     @field_validator("stage_ref", "provider_operation_ref")

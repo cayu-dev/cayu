@@ -18,6 +18,8 @@ from threading import Lock
 from typing import Any, TypeVar, cast
 from weakref import finalize
 
+from cayu.providers._stream_cleanup import _local_http_cleanup_observer
+
 DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS = 120.0
@@ -354,6 +356,7 @@ class ProviderStreamDeadlineController:
         self._last_semantic_at = self._started_at
         self._last_progress_observed_at: float | None = None
         self._last_progress_kind: ProviderProgressKind | None = None
+        self._cleanup_observer = _local_http_cleanup_observer.get()
         self._terminal_observed = False
         self._whitespace_since_progress = False
 
@@ -470,6 +473,31 @@ class ProviderStreamDeadlineController:
             ),
         )
 
+    async def _confirm_cleanup_expiry(self, evidence: ProviderStreamDeadlineEvidence) -> bool:
+        """Retain bounded receipt publication; return whether it is unconfirmed."""
+        observer = self._cleanup_observer
+        if observer is None:
+            return False
+        observer.expired(evidence)
+        publication = observer.confirm_expiry()
+        if publication is None:
+            return False
+        receipt_task = asyncio.create_task(publication)
+        self._await_ownership.retain(receipt_task)
+        if evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE:
+            await asyncio.wait((receipt_task,), timeout=0.05)
+        else:
+            await asyncio.sleep(0)
+        if not receipt_task.done() or receipt_task.cancelled():
+            return True
+        try:
+            receipt_task.result()
+        except Exception:
+            # Missing durable local evidence never replaces the deadline or
+            # grants retry authority. Parent cancellation at the wait propagates.
+            return True
+        return False
+
     async def wait_for(
         self,
         awaitable: Awaitable[_T],
@@ -477,12 +505,18 @@ class ProviderStreamDeadlineController:
         kinds: Iterable[ProviderDeadlineKind],
         accept_cancelled_result: Callable[[_T], bool] | None = None,
         on_interrupted: Callable[[asyncio.Future[_T]], None] | None = None,
+        semantic_cleanup_grace_s: float = 0.0,
     ) -> _T:
         """Wait within stream clocks, handing interrupted reads back to their owner.
 
         ``on_interrupted`` runs only for a read this controller cancelled, so the
         iterator owner can join finalization before closing the stream.
         """
+        if (
+            type(semantic_cleanup_grace_s) not in {int, float}
+            or not 0 <= semantic_cleanup_grace_s <= 0.1
+        ):
+            raise ValueError("semantic_cleanup_grace_s must be between zero and 0.1 seconds.")
         selected = tuple(dict.fromkeys(kinds))
         if not selected:
             raise ValueError("At least one deadline kind is required.")
@@ -492,7 +526,9 @@ class ProviderStreamDeadlineController:
             close = getattr(awaitable, "close", None)
             if callable(close):
                 close()
-            raise ProviderStreamDeadlineExceeded(self.evidence(selected, now=now))
+            expiry = self.evidence(selected, now=now)
+            cleanup_failed = await self._confirm_cleanup_expiry(expiry)
+            raise ProviderStreamDeadlineExceeded(expiry, stream_cleanup_failed=cleanup_failed)
         operation = asyncio.ensure_future(awaitable)
         interrupted = False
         try:
@@ -501,11 +537,18 @@ class ProviderStreamDeadlineController:
                 remaining = min(self._deadline_at(kind) - now for kind in selected)
                 if remaining <= 0:
                     terminal_was_observed = self._terminal_observed
+                    expiry = self.evidence(selected, now=now)
                     interrupted = operation.cancel()
-                    # Give cooperative reads one scheduling boundary to settle,
-                    # but never await opaque cleanup indefinitely. A real caller
-                    # cancellation delivered here remains authoritative.
-                    await asyncio.sleep(0)
+                    # Bundled semantic reads may join nested HTTP shutdown within
+                    # a finite grace. Other deadline kinds keep immediate handoff;
+                    # a real caller cancellation remains authoritative.
+                    if (
+                        semantic_cleanup_grace_s
+                        and expiry.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
+                    ):
+                        await asyncio.wait((operation,), timeout=semantic_cleanup_grace_s)
+                    else:
+                        await asyncio.sleep(0)
                     accepted, accepted_result = _accepted_cancelled_result(
                         operation,
                         accept_cancelled_result,
@@ -514,6 +557,15 @@ class ProviderStreamDeadlineController:
                     if accepted:
                         return cast("_T", accepted_result)
                     cleanup_failed = not operation.cancelled()
+                    if operation.cancelled():
+                        from cayu.providers._credential_boundary import (
+                            provider_cancellation_failures,
+                        )
+
+                        try:
+                            operation.result()
+                        except asyncio.CancelledError as cancellation:
+                            cleanup_failed = bool(provider_cancellation_failures(cancellation))
                     if not operation.done():
                         cleanup_failed = True
                     elif not operation.cancelled():
@@ -525,7 +577,7 @@ class ProviderStreamDeadlineController:
                         cleanup_failed = True
                     self._await_ownership.retain(operation)
                     raise ProviderStreamDeadlineExceeded(
-                        self.evidence(selected),
+                        expiry,
                         stream_cleanup_failed=cleanup_failed,
                     )
 
@@ -569,12 +621,16 @@ class ProviderStreamDeadlineController:
                 # An observed transport/protocol transition may have extended an
                 # idle clock while the read itself remained pending. Re-arm the
                 # wakeup against the controller's current deadlines.
-        except ProviderStreamDeadlineExceeded:
+        except ProviderStreamDeadlineExceeded as expiry_failure:
             # Expiry already cancelled and retained the provider read. Do not
             # inject a second cancellation while it is settling cooperatively.
             self._await_ownership.retain(operation)
             if interrupted and on_interrupted is not None:
                 on_interrupted(operation)
+            if await self._confirm_cleanup_expiry(expiry_failure.evidence):
+                raise ProviderStreamDeadlineExceeded(
+                    expiry_failure.evidence, stream_cleanup_failed=True
+                ) from None
             raise
         except BaseException as failure:
             terminal_was_observed = self._terminal_observed
@@ -713,6 +769,7 @@ def _provider_deadline_material(deadlines: object) -> dict[str, float | int]:
         raise TypeError("Model provider stream_deadlines must be ProviderStreamDeadlines.")
     return {
         "text_progress_policy_version": 2,
+        "semantic_cleanup_policy_version": 1,
         "transport_idle_timeout_s": deadlines.transport_idle_timeout_s,
         "protocol_idle_timeout_s": deadlines.protocol_idle_timeout_s,
         "semantic_progress_timeout_s": deadlines.semantic_progress_timeout_s,

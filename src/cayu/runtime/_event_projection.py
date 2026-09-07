@@ -2219,6 +2219,23 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "step",
         "stream_cleanup_failed",
     )
+    policies[EventType.MODEL_HTTP_CLEANUP] = _policy(
+        "model_attempt_id",
+        "model_step_id",
+        "source_run_epoch",
+        "provider",
+        "local_http_cleanup",
+        "provider_effect_outcome",
+        "provider_deadline_kind",
+        "provider_deadline_timeout_s",
+        "provider_stream_elapsed_s",
+        "provider_last_progress_at",
+        "provider_last_progress_elapsed_s",
+        "provider_last_progress_kind",
+        "provider_whitespace_since_progress",
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+    )
     policies[EventType.MODEL_ERROR] = _policy(
         *model_failure_keys,
         "provider_operation_progress",

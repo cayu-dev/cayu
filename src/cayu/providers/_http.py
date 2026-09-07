@@ -27,6 +27,7 @@ from cayu._exception_state import exception_state_contains
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
+    _contains_fatal_signal,
     aclosing_provider_stream,
     credential_safe_provider_cancellation,
     provider_cancellation_failures,
@@ -180,13 +181,28 @@ async def _aiter_unclosed_response_bytes(
 
 async def _aiter_owned_stream_response(
     response_context: AbstractAsyncContextManager[httpx.Response],
+    deadline_controller: ProviderStreamDeadlineController,
 ) -> AsyncIterator[tuple[httpx.Response, AsyncGenerator[bytes, None]]]:
     """Own bytes and response closure together, after the interrupted read joins."""
 
-    async with response_context as response:
-        response_bytes = _aiter_unclosed_response_bytes(response)
-        async with aclosing(response_bytes):
-            yield response, response_bytes
+    opened = False
+    succeeded = False
+    fatal_failure = False
+    try:
+        async with response_context as response:
+            opened = True
+            response_bytes = _aiter_unclosed_response_bytes(response)
+            async with aclosing(response_bytes):
+                with suppress(GeneratorExit):
+                    yield response, response_bytes
+        succeeded = True
+    except BaseException as failure:
+        fatal_failure = _contains_fatal_signal(failure)
+        raise
+    finally:
+        observer = deadline_controller._cleanup_observer
+        if opened and observer is not None and not fatal_failure:
+            await observer.closed(succeeded=succeeded)
 
 
 _TRUSTED_HTTPX_REQUEST_ERROR_TYPES: dict[type[httpx.RequestError], str] = {
@@ -574,7 +590,7 @@ async def stream_sse_json_events(
         if method != "GET":
             request_kwargs["json"] = dict(payload)
         response_context = client.stream(method, url, **request_kwargs)
-        responses = _aiter_owned_stream_response(response_context)
+        responses = _aiter_owned_stream_response(response_context, deadline_controller)
         interrupted_read: asyncio.Future[Any] | None = None
 
         def retain_interrupted_read(operation: asyncio.Future[Any]) -> None:

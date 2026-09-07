@@ -143,6 +143,10 @@ from cayu.providers._credential_boundary import (
     stream_cleanup_cancelled_after_provider_failure,
 )
 from cayu.providers._openai_protocol import protocol_exception_fields
+from cayu.providers._stream_cleanup import (
+    _local_http_cleanup_observer,
+    _LocalHttpCleanupObserver,
+)
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -158,6 +162,7 @@ from cayu.providers.base import (
 )
 from cayu.providers.deadlines import (
     ProviderStreamDeadlineAdmission,
+    ProviderStreamDeadlineEvidence,
     bind_provider_deadline_admission,
     reset_provider_deadline_admission,
 )
@@ -196,6 +201,7 @@ from cayu.runtime._model_errors import (
     resolve_request_billing_identity,
     runtime_owned_model_stream_error_event,
 )
+from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
     checkpoint_with_provider_operation_cancellation_claim,
@@ -2443,6 +2449,7 @@ async def _admitted_model_provider_events(
     provider: ModelProvider,
     request: ModelRequest,
     admission: ProviderStreamDeadlineAdmission,
+    cleanup_observer: _LocalHttpCleanupObserver | None = None,
 ) -> AsyncGenerator[ModelStreamEvent, None]:
     """Transfer one pre-dispatch deadline admission into the provider stream."""
 
@@ -2452,6 +2459,7 @@ async def _admitted_model_provider_events(
     try:
         while True:
             token = bind_provider_deadline_admission(admission)
+            cleanup_token = _local_http_cleanup_observer.set(cleanup_observer)
             try:
                 try:
                     event = await anext(iterator)
@@ -2459,6 +2467,7 @@ async def _admitted_model_provider_events(
                     return
             finally:
                 reset_provider_deadline_admission(token)
+                _local_http_cleanup_observer.reset(cleanup_token)
             yield event
     finally:
         await _close_async_iterator(iterator)
@@ -6937,9 +6946,43 @@ class ModelStepExecutor:
                 )
             if provider_operation_mode is ProviderOperationMode.SYNCHRONOUS:
                 await consume_child_session_notifications()
+                cleanup_observer = None
+                if completion_dispatch is not None:
+                    cleanup_stage = completion_dispatch.stage
+                    cleanup_identity = copy_model_attempt_identity(model_attempt_identity)
+                    cleanup_writer = self._event_writer
+                    cleanup_session_id = session.id
+                    cleanup_agent_name = registered_agent.spec.name
+                    cleanup_provider_name = registered_provider.name
+
+                    async def publish_http_cleanup(
+                        evidence: ProviderStreamDeadlineEvidence, succeeded: bool
+                    ) -> None:
+                        event = Event(
+                            id=local_http_cleanup_event_id(cleanup_stage.stage_id),
+                            type=EventType.MODEL_HTTP_CLEANUP,
+                            session_id=cleanup_session_id,
+                            agent_name=cleanup_agent_name,
+                            environment_name=environment_name,
+                            payload={
+                                **cleanup_identity.payload(),
+                                **evidence.payload(),
+                                "source_run_epoch": cleanup_stage.source_run_epoch,
+                                "provider": cleanup_provider_name,
+                                "local_http_cleanup": "succeeded" if succeeded else "failed",
+                                "provider_effect_outcome": "unknown",
+                            },
+                        )
+                        event = _event_with_model_identity_authority(event, cleanup_identity)
+                        event = event_with_execution_profile_authority(event, execution_profile)
+                        # Retained close ownership also bounds this write. Persist
+                        # without calling user sinks from a transport finalizer.
+                        await cleanup_writer.persist(event_with_runtime_generated_id(event))
+
+                    cleanup_observer = _LocalHttpCleanupObserver(publish_http_cleanup)
                 provider_events = _owned_model_provider_events(
                     lambda: _admitted_model_provider_events(
-                        provider, model_request, deadline_admission
+                        provider, model_request, deadline_admission, cleanup_observer
                     ),
                     cancellation_baseline=provider_cancellation_baseline,
                     max_concurrent_streams=deadline_admission.max_concurrent_streams,
