@@ -542,6 +542,18 @@ below the proactive trigger. The actual returned summary is remeasured before pr
 dispatch; an unexpectedly oversized projection fails closed while preserving the completed
 checkpoint and compactor accounting evidence.
 
+Set `reserved_summary_tokens` to leave explicit summary-growth headroom during
+size-based suffix selection, for example `4_000` alongside a `20_000` retained-context
+target. The reserve is additional to the estimated existing summary, not generation
+headroom and not a hard cap on compactor output. It must be a nonnegative integer
+smaller than `max_recent_context_tokens`; a positive reserve requires size-based
+compaction. Zero preserves prior selection behavior and execution-profile identity.
+Nonzero values enter the context-selection fingerprint. The final actual-size check,
+source coverage, atomic tool boundaries and accounting behavior are unchanged: a
+summary that outgrows the available space still fails closed. This prevents ordinary
+first summaries from unexpectedly consuming a suffix selected against a tiny placeholder
+without adding implicit compactor model retries.
+
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. A compactor may advance this cursor only across a contiguous source prefix represented in the returned summary; omitted history remains eligible for a later compaction and is included verbatim between the synthetic summary and recent turns in every model-facing projection. Coverage boundaries may not split an assistant tool call from its matching tool result. A custom provider-backed prompt must cover at least one source message. When recompacting an existing checkpoint, every positive-coverage `CompactionResult` must set `represented_existing_summary_sha256` to the lowercase SHA-256 digest of the exact UTF-8 `CompactionRequest.existing_summary` it represents. A zero-coverage result instead must return that existing summary byte-for-byte unchanged. These checks prevent a valid old cursor from outliving the summary that represents its source range. A result may report zero coverage only as validated `progress_exhausted` state for the current compactor configuration; an ordinary zero-coverage success is rejected so it cannot trigger recurring paid work without cursor progress. Version-1 compaction checkpoints predate explicit source coverage and are invalidated on read; the next eligible compaction rebuilds them from the authoritative transcript as version 2. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. The authoritative transcript remains immutable and complete, while the checkpoint controls only the model-facing projection. Compaction lifecycle events report requested and represented source ranges, coverage mode, source chunk count/mode, bounded-input state, and failure state through allowlisted scalar fields; they do not include summary, transcript, attachment, provider-state, or instruction content.
 
 When reservation-bearing cost budgets apply, automatic provider-backed

@@ -5475,7 +5475,10 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
 
     It keeps the durable transcript intact, stores a compact summary in the
     session checkpoint, and sends system messages + summary + recent turns to
-    the model.
+    the model. In size-based mode, ``reserved_summary_tokens`` optionally leaves
+    growth headroom beyond the existing summary when selecting recent context.
+    It is not a cap on generated summaries: the actual projection must still pass
+    the original size checks. Zero preserves the previous selection behavior.
     """
 
     def __init__(
@@ -5487,6 +5490,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         compact_after_estimated_context_tokens: int | None = None,
         max_recent_context_tokens: int | None = None,
         reserved_output_tokens: int = 0,
+        reserved_summary_tokens: int = 0,
         summary_prefix: str = _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX,
         max_attachment_results: int = 1,
     ) -> None:
@@ -5516,6 +5520,17 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             reserved_output_tokens,
             "reserved_output_tokens",
         )
+        reserved_summary_tokens = _validate_nonnegative_int(
+            reserved_summary_tokens, "reserved_summary_tokens"
+        )
+        if reserved_summary_tokens and (
+            max_recent_context_tokens is None
+            or reserved_summary_tokens >= max_recent_context_tokens
+        ):
+            raise ValueError(
+                "reserved_summary_tokens requires size-based compaction and must be "
+                "less than max_recent_context_tokens."
+            )
         if (compact_after_estimated_context_tokens is None) != (max_recent_context_tokens is None):
             raise ValueError(
                 "compact_after_estimated_context_tokens and max_recent_context_tokens "
@@ -5535,6 +5550,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         self.compact_after_messages = compact_after_messages
         self.compact_after_estimated_context_tokens = compact_after_estimated_context_tokens
         self.max_recent_context_tokens = max_recent_context_tokens
+        self.reserved_summary_tokens = reserved_summary_tokens
         self.reserved_output_tokens = reserved_output_tokens
         self.summary_prefix = require_nonblank(summary_prefix, "summary_prefix")
         self.max_attachment_results = _validate_max_attachment_results(max_attachment_results)
@@ -5608,6 +5624,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                     self.compact_after_estimated_context_tokens
                 ),
                 max_recent_context_tokens=self.max_recent_context_tokens,
+                reserved_summary_tokens=self.reserved_summary_tokens,
                 reserved_output_tokens=self.reserved_output_tokens,
                 summary_prefix=self.summary_prefix,
                 max_attachment_results=self.max_attachment_results,
@@ -6552,6 +6569,7 @@ def _split_recent_context_by_size(
     previous_cursor: int,
     compact_after_estimated_context_tokens: int,
     max_recent_context_tokens: int,
+    reserved_summary_tokens: int,
     reserved_output_tokens: int,
     summary_prefix: str,
     max_attachment_results: int,
@@ -6634,7 +6652,11 @@ def _split_recent_context_by_size(
             messages[compactable_cursor:],
             compactable_cursor,
         )
-        if candidate_tokens <= max_recent_context_tokens:
+        # The existing summary (or the first-build placeholder) is not a bound
+        # on the summary this compactor will generate. Leave explicit growth
+        # headroom while selecting the atomic suffix; final projection validation
+        # still checks the actual returned summary against the original target.
+        if candidate_tokens + reserved_summary_tokens <= max_recent_context_tokens:
             return (
                 *candidate,
                 True,
@@ -6645,7 +6667,12 @@ def _split_recent_context_by_size(
             best_candidate_tokens = candidate_tokens
 
     if best_candidate is not None:
-        return *best_candidate, True, False
+        return (
+            *best_candidate,
+            True,
+            best_candidate_tokens is not None
+            and best_candidate_tokens <= max_recent_context_tokens,
+        )
     return [], messages[previous_cursor:], previous_cursor, True, False
 
 

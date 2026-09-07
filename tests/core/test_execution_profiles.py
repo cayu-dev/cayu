@@ -2254,6 +2254,7 @@ def test_nondefault_checkpoint_summary_prefix_is_private_process_local_material(
         {"compact_after_estimated_context_tokens": 1_100},
         {"max_recent_context_tokens": 650},
         {"reserved_output_tokens": 150},
+        {"reserved_summary_tokens": 100},
     ],
 )
 def test_size_based_compaction_settings_change_selection_fingerprint(
@@ -2274,6 +2275,19 @@ def test_size_based_compaction_settings_change_selection_fingerprint(
     changed = selection_component(**override)
 
     assert baseline.fingerprint != changed.fingerprint
+
+
+def test_zero_summary_headroom_preserves_selection_fingerprint() -> None:
+    def component(**settings):
+        return _model_semantics_profile(
+            context_policy=CheckpointCompactionContextPolicy(
+                compact_after_estimated_context_tokens=1000,
+                max_recent_context_tokens=700,
+                **settings,
+            )
+        ).component(ExecutionProfileComponentClass.CONTEXT_SELECTION)
+
+    assert component().fingerprint == component(reserved_summary_tokens=0).fingerprint
 
 
 def test_queued_target_profile_uses_durable_request_controls() -> None:

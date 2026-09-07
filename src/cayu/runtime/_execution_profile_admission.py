@@ -1477,6 +1477,9 @@ def _cayu_context_policy_material(
             ),
             "max_attachment_results": policy.max_attachment_results,
         }
+        if policy.reserved_summary_tokens:
+            # Preserve the existing fingerprint when the opt-in headroom is zero.
+            selection["reserved_summary_tokens"] = policy.reserved_summary_tokens
         return _ContextComponentMaterials(
             selection=selection,
             recall={"kind": "none", "version": 1},
