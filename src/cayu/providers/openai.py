@@ -77,6 +77,7 @@ from cayu.providers._openai_protocol import (
     SearchSourceDiagnostic,
     protocol_exception_fields,
 )
+from cayu.providers._openai_search_trace import SearchStreamDiagnostic, SearchStreamTrace
 from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -330,10 +331,12 @@ class OpenAIProtocolError(OpenAIError, OpenAIProtocolDiagnosticError):
         *,
         reason_code: str = "unspecified",
         source_diagnostic: SearchSourceDiagnostic | None = None,
+        stream_diagnostic: SearchStreamDiagnostic | None = None,
     ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
         self.source_diagnostic = source_diagnostic
+        self.stream_diagnostic = stream_diagnostic
 
 
 class OpenAIUnsupportedSearchSourceError(OpenAIProtocolError):
@@ -967,6 +970,9 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                 str(safe),
                 reason_code=cast("str", fields["provider_protocol_reason"]),
                 source_diagnostic=diagnostic,
+                stream_diagnostic=(
+                    exc.stream_diagnostic if "provider_protocol_stream_trace" in fields else None
+                ),
             )
         if isinstance(exc, ProviderOperationMalformedError):
             return ProviderOperationMalformedError(str(safe))
@@ -3049,12 +3055,14 @@ async def _openai_stream_events(
     pending_replay_items: dict[int, tuple[str, str]] = {}
     response_id: str | None = None
     completed = False
+    search_trace = SearchStreamTrace()
     async for event in _stream_events_with_cancellation_marker(events):
         if not isinstance(event, Mapping):
             raise OpenAIProtocolError(
                 "OpenAI stream event must be a JSON object.",
                 reason_code="stream_event_must_be_a_json_object",
             )
+        search_trace.record(event, pending_web_search_calls, fallback_output_items, response_id)
         event_type = event.get("type")
         if event_type == "cayu.internal.transport_cancelled":
             for call_id, _status in pending_web_search_calls.values():
@@ -3162,6 +3170,7 @@ async def _openai_stream_events(
                     raise OpenAIProtocolError(
                         "OpenAI web_search_call output_item.added was repeated.",
                         reason_code="web_search_call_output_item_added_was_repeated",
+                        stream_diagnostic=search_trace.snapshot(),
                     )
                 normalized = _normalized_web_search_call(item, item_index=output_index)
                 if normalized["status"] != "in_progress":
@@ -3244,15 +3253,23 @@ async def _openai_stream_events(
             output_index = _stream_output_index(event)
             pending = pending_web_search_calls.get(output_index)
             if pending is None:
+                finished = fallback_output_items.get(output_index)
+                after_done = finished is not None and finished.get("type") == "web_search_call"
                 raise OpenAIProtocolError(
-                    "OpenAI web search lifecycle arrived before output_item.added.",
-                    reason_code="web_search_lifecycle_arrived_before_output_item_added",
+                    "OpenAI web search lifecycle has no pending output item.",
+                    reason_code=(
+                        "web_search_lifecycle_arrived_after_output_item_done"
+                        if after_done
+                        else "web_search_lifecycle_arrived_before_output_item_added"
+                    ),
+                    stream_diagnostic=search_trace.snapshot(),
                 )
             item_id = _mapping_optional_string(event, "item_id")
             if item_id is not None and item_id != pending[0]:
                 raise OpenAIProtocolError(
                     "OpenAI web search lifecycle item_id mismatch.",
                     reason_code="web_search_lifecycle_item_id_mismatch",
+                    stream_diagnostic=search_trace.snapshot(),
                 )
             status = event_type.rsplit(".", 1)[-1]
             if status == "searching" and pending[1] != status:
@@ -3273,15 +3290,23 @@ async def _openai_stream_events(
                 output_index = _stream_output_index(event)
                 pending = pending_web_search_calls.pop(output_index, None)
                 if pending is None:
+                    finished = fallback_output_items.get(output_index)
+                    repeated = finished is not None and finished.get("type") == "web_search_call"
                     raise OpenAIProtocolError(
-                        "OpenAI web_search_call output_item.done arrived before added.",
-                        reason_code="web_search_call_output_item_done_arrived_before_added",
+                        "OpenAI web_search_call output_item.done has no pending output item.",
+                        reason_code=(
+                            "web_search_call_output_item_done_was_repeated"
+                            if repeated
+                            else "web_search_call_output_item_done_arrived_before_added"
+                        ),
+                        stream_diagnostic=search_trace.snapshot(),
                     )
                 normalized = _normalized_web_search_call(item, item_index=output_index)
                 if normalized["id"] != pending[0]:
                     raise OpenAIProtocolError(
                         "OpenAI web_search_call output identity mismatch.",
                         reason_code="web_search_call_output_identity_mismatch",
+                        stream_diagnostic=search_trace.snapshot(),
                     )
                 fallback_output_items[output_index] = normalized
                 yield _web_search_call_event(normalized)

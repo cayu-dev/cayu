@@ -8378,6 +8378,28 @@ async def test_openai_protocol_diagnostics_survive_sqlite_and_unknown_retries(
     ]
     public_error = next(event for event in public if event.type == ModelStreamEventType.ERROR)
     expected = {"provider_protocol_reason": reason, "provider_protocol_stage": stage}
+    if reason == "web_search_lifecycle_item_id_mismatch":
+        expected.update(
+            {
+                "provider_protocol_stream_boundary": "native_adapter",
+                "provider_protocol_stream_trace": json.dumps(
+                    [
+                        [1, "response.created", -1, "absent", "missing", "unregistered"],
+                        [2, "response.output_item.added", 0, "absent", "unregistered", "missing"],
+                        [
+                            3,
+                            "response.web_search_call.searching",
+                            0,
+                            "pending",
+                            "differs",
+                            "missing",
+                        ],
+                    ],
+                    separators=(",", ":"),
+                ),
+                "provider_protocol_stream_trace_truncated": 0,
+            }
+        )
     if field is not None:
         expected["provider_protocol_field"] = field
     assert {

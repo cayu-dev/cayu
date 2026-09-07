@@ -6,6 +6,7 @@ here explicitly. No response value, exception text, or dynamic path is copied.
 
 from dataclasses import dataclass
 
+from cayu.providers._openai_search_trace import search_stream_diagnostic_fields
 from cayu.providers.operations import ProviderOperationMalformedError
 
 
@@ -91,6 +92,7 @@ def protocol_exception_fields(
                 credential_values=credential_values,
             )
         )
+    fields.update(search_stream_diagnostic_fields(getattr(error, "stream_diagnostic", None)))
     return fields
 
 
@@ -360,6 +362,8 @@ _PROTOCOL_DIAGNOSTICS: dict[str, tuple[str, str | None]] = {
     "web_search_call_output_item_added_was_repeated": ("stream", None),
     "web_search_call_output_item_done_arrived_before_added": ("stream", None),
     "web_search_lifecycle_arrived_before_output_item_added": ("stream", None),
+    "web_search_lifecycle_arrived_after_output_item_done": ("stream", None),
+    "web_search_call_output_item_done_was_repeated": ("stream", None),
     "web_search_lifecycle_item_id_mismatch": ("stream", None),
     "web_search_progress_has_no_pending_call": ("recovery", None),
 }
