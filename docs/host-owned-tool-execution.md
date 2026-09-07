@@ -105,3 +105,29 @@ Before implementation, settle these semantics:
 
 The characterization tests are not evidence that the proposed durable API,
 cross-process result submission, or restart-safe delegation already exists.
+
+## Runtime-first follow-up audit
+
+`tests/core/test_runtime_reply_admission_contract.py` adds five credential-free
+cases for the reply boundary. Ordinary `LoopPolicy.before_stop` can reject a
+draft and continue through the runtime. Raw text events precede that gate, and
+an interrupted `RunOutcome` can retain nonempty diagnostic `final_text`; a host
+must require an accepted invocation before delivering a customer reply.
+Structured-output validation intentionally takes a separate completion path
+and does not run the generic before-stop gate. Do not assume schema-valid
+structured output also passed an application reply policy.
+
+Current runtime also has work contracts, deterministic completion verifiers,
+bounded repeated-gap/attempt decisions, run limits and execution deadlines.
+Workflow primitives govern application-defined stages; revisioned work context
+and automatic recall support the runtime but do not authorize business effects.
+An ordinary customer question or handoff may complete an interaction without
+completing the customer's larger task.
+
+The targeted audit at the baseline above passed 283 tests with one existing
+failure and six PostgreSQL variants excluded. The failing resume-policy test
+constructs a 16-step profile through `profiled_session_identity`, then resumes
+using the current 64-step default. A diagnostic override aligning those limits
+makes it pass. This is a test-maintenance finding; do not weaken profile fences.
+Five separate existing before-stop tests also pass. No production runtime code
+was changed by the audit.
