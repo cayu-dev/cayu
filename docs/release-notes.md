@@ -93,7 +93,7 @@ guard.
 
 ## Unreleased
 
-### Automatic memory can append bounded frontier-driven deltas
+### Automatic memory can append deltas and restore removed projections
 
 `AutomaticRecallContextPolicy` accepts an opt-in `MemoryDeltaPolicy` for knowledge stores
 that implement Cayu's bounded change, index-readiness, exact-revision, and frontier-search
@@ -108,11 +108,30 @@ semantic timeout or failure retains the prior committed frontier for a bounded l
 The final provider composition links the base and delta recall receipts through the same
 crash-safe `ContextExposure` lifecycle, with exact per-item representation hashes. Explicit
 limits bound page work, once-per-model-step frontier checks, delta count, per-delta and
-cumulative items, and bytes. Typed `MemoryDeltaRefreshOutcome` records distinguish complete
-empty results, retryable incomplete recall, item or byte exhaustion, and appended deltas.
-This does not re-anchor unchanged revisions or infer provider attention. Enabling deltas is
-a deliberate prerelease checkpoint compatibility boundary: `automatic_recall` advances to
-version 4, and version-3 frames are rejected rather than translated or backfilled.
+cumulative items, bytes, and deterministic estimated tokens. Typed
+`MemoryDeltaRefreshOutcome` records distinguish complete empty results, retryable incomplete
+recall, item, byte, or estimated-token exhaustion, and appended deltas.
+
+The same policy has a separate, default-off `reanchor_on_projection_loss` switch. When the
+wrapped context policy demonstrably removes the original automatic-memory anchor, Cayu may
+restore an exact previously exposed knowledge revision for one model step. Restoration
+requires an earlier acknowledged/completed exposure plus fresh exact-revision recall,
+current access/frontier validation, and calibrated strong admission against the compacted
+current task, with the independent `cayu.query_concepts.v2` gate required for restoration.
+Superseded, inaccessible, irrelevant, or contradictory evidence, truncated exposure history,
+incomplete item text, and unavailable or stale semantic indexes fail closed. Bounded search
+truncation and lexical-only stores remain supported. Typed outcomes and explicit exposure,
+refresh, cooldown, repeat, item, byte, estimated-token, and cumulative budgets make the
+decision reconstructable and finite. It
+does not guess a lost-in-the-middle position or claim that a provider forgot or attended to
+anything.
+
+Context-overflow recovery can suppress a cached re-anchor whose placement no longer
+survives, without failing the session, rerunning recall, or reopening consumed budgets.
+
+This is a deliberate prerelease checkpoint compatibility boundary: memory delta contracts
+advance to version 2 and `automatic_recall` advances to version 5. Older frames are rejected
+rather than translated or backfilled.
 
 ### Application fingerprints survive durable numeric normalization
 

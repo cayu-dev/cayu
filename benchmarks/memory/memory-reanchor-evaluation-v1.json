@@ -1,0 +1,187 @@
+{
+  "ceilings": {
+    "max_reanchor_bytes": 32000,
+    "max_reanchor_estimated_tokens": 8000,
+    "memory_incremental_p95_ms": 75.0,
+    "memory_triggered_p95_ms": 100.0,
+    "memory_zero_trigger_p95_ms": 25.0,
+    "sqlite_incremental_p50_ms": 50.0,
+    "sqlite_incremental_p95_ms": 200.0,
+    "sqlite_triggered_p50_ms": 75.0,
+    "sqlite_triggered_p95_ms": 300.0,
+    "sqlite_zero_trigger_p50_ms": 30.0,
+    "sqlite_zero_trigger_p95_ms": 150.0
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "findings": [],
+  "methodology": {
+    "backends": [
+      "memory",
+      "sqlite"
+    ],
+    "cases": [
+      "current_relevant",
+      "disabled_control",
+      "retained_control",
+      "irrelevant_context",
+      "same_entity_unrelated_aspect",
+      "superseded_revision"
+    ],
+    "history_limit_probe_prior_exposures": 32,
+    "kind": "hermetic_real_runtime_projection_loss_matrix",
+    "provider": "scripted",
+    "provider_calls": 546,
+    "samples_per_case": 20,
+    "semantic_model_claim": false,
+    "token_measurement": "Runtime ObservedDeltaContextEstimator over the exact rendered manifest."
+  },
+  "passed": true,
+  "results": [
+    {
+      "backend": "memory",
+      "case_count": 120,
+      "case_outcomes": {
+        "current_relevant": {
+          "dispositions": [
+            "delta_appended"
+          ],
+          "reanchor_count": 20
+        },
+        "disabled_control": {
+          "dispositions": [],
+          "reanchor_count": 0
+        },
+        "irrelevant_context": {
+          "dispositions": [
+            "no_current_relevant_item"
+          ],
+          "reanchor_count": 0
+        },
+        "retained_control": {
+          "dispositions": [],
+          "reanchor_count": 0
+        },
+        "same_entity_unrelated_aspect": {
+          "dispositions": [
+            "no_current_relevant_item"
+          ],
+          "reanchor_count": 0
+        },
+        "superseded_revision": {
+          "dispositions": [
+            "no_current_relevant_item"
+          ],
+          "reanchor_count": 0
+        }
+      },
+      "duplicate_projection_count": 0,
+      "estimated_reanchor_tokens": {
+        "maximum": 262,
+        "total": 5240
+      },
+      "exact_revision_mismatch_count": 0,
+      "false_injection_count": 0,
+      "history_limit_probe": {
+        "false_injection_count": 0,
+        "latency_ms": 100.89025,
+        "prior_exposures": 32,
+        "reanchor_count": 1
+      },
+      "incremental_trigger_latency": {
+        "p50_ms": 36.044958,
+        "p95_ms": 52.781417
+      },
+      "reanchor_bytes": {
+        "maximum": 655,
+        "total": 13100
+      },
+      "sample_count": 20,
+      "stale_injection_count": 0,
+      "triggered_latency": {
+        "p50_ms": 37.777,
+        "p95_ms": 54.684375
+      },
+      "useful_reanchor_precision": 1.0,
+      "useful_reanchor_recall": 1.0,
+      "zero_trigger_latency": {
+        "p50_ms": 2.284458,
+        "p95_ms": 2.770666
+      }
+    },
+    {
+      "backend": "sqlite",
+      "case_count": 120,
+      "case_outcomes": {
+        "current_relevant": {
+          "dispositions": [
+            "delta_appended"
+          ],
+          "reanchor_count": 20
+        },
+        "disabled_control": {
+          "dispositions": [],
+          "reanchor_count": 0
+        },
+        "irrelevant_context": {
+          "dispositions": [
+            "no_current_relevant_item"
+          ],
+          "reanchor_count": 0
+        },
+        "retained_control": {
+          "dispositions": [],
+          "reanchor_count": 0
+        },
+        "same_entity_unrelated_aspect": {
+          "dispositions": [
+            "no_current_relevant_item"
+          ],
+          "reanchor_count": 0
+        },
+        "superseded_revision": {
+          "dispositions": [
+            "no_current_relevant_item"
+          ],
+          "reanchor_count": 0
+        }
+      },
+      "duplicate_projection_count": 0,
+      "estimated_reanchor_tokens": {
+        "maximum": 300,
+        "total": 6000
+      },
+      "exact_revision_mismatch_count": 0,
+      "false_injection_count": 0,
+      "history_limit_probe": {
+        "false_injection_count": 0,
+        "latency_ms": 122.68225,
+        "prior_exposures": 32,
+        "reanchor_count": 1
+      },
+      "incremental_trigger_latency": {
+        "p50_ms": 19.422521,
+        "p95_ms": 21.057041
+      },
+      "reanchor_bytes": {
+        "maximum": 750,
+        "total": 15000
+      },
+      "sample_count": 20,
+      "stale_injection_count": 0,
+      "triggered_latency": {
+        "p50_ms": 20.927542,
+        "p95_ms": 22.677083
+      },
+      "useful_reanchor_precision": 1.0,
+      "useful_reanchor_recall": 1.0,
+      "zero_trigger_latency": {
+        "p50_ms": 2.407541,
+        "p95_ms": 2.533042
+      }
+    }
+  ],
+  "schema_version": "cayu.memory_reanchor_evaluation.v1"
+}

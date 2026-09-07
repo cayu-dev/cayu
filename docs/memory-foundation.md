@@ -422,12 +422,25 @@ committed frontier for one bounded later retry, while complete empty, omitted, a
 outcomes advance it. One provider composition and exposure record binds the base receipt
 plus every delta receipt; nothing is written into user or assistant transcript history.
 
-This first context manager does not claim semantic awareness of everything
-already stated in the provider-visible context and does not reposition material
-around a guessed lost-in-the-middle region. It also does not re-anchor an unchanged
-revision: that remains a future evidence-backed composition decision. The credential-free
-[cross-source example](../examples/cross_source_recall.py) shows retrieval and
-admission as explicit separate steps.
+The same delta policy can separately opt into deterministic re-anchoring after the
+wrapped context policy demonstrably removes the original automatic-memory projection.
+Re-anchoring is not triggered by age, prompt position, or a guess that a model forgot.
+It requires an earlier acknowledged or completed `ContextExposure`, an exact exposed
+knowledge representation, a fresh strong-match recall against the compacted current
+task and current access scope, and confirmation that the referenced revision is still
+current. A qualifying revision is rendered as another append-only `MemoryDelta` for
+one model step. Later steps must re-establish all of that evidence, and per-item repeat,
+boundary-distance, refresh, item, byte, and deterministic estimated-token budgets stop
+unbounded repetition. Missing, truncated, contradictory, superseded, deleted, archived,
+expired, inaccessible, or stale-index evidence fails closed. Here truncation refers to
+exposure history or an individual restored representation; a bounded retrieval head may
+be partial and lexical-only stores remain supported. Restoration always applies the
+`cayu.query_concepts.v2` relevance gate before the configured score threshold, even when
+base admission uses rank-only scoring. Cayu still makes no claim about
+provider attention or a precise lost-in-the-middle location. The credential-free
+[cross-source example](../examples/cross_source_recall.py) shows retrieval and admission as
+explicit separate steps; the checked re-anchor evaluation exercises the complete runtime
+composition and exposure path.
 
 ## Recall receipts and context-exposure evidence
 

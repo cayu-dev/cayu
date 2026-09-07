@@ -13279,8 +13279,9 @@ policy = AutomaticRecallContextPolicy(
         knowledge_required=True,
         transcript_required=False,
     ),
-    # Opt in only for a frontier-aware KnowledgeStore.
-    delta_policy=MemoryDeltaPolicy(),
+    # Opt in only for a frontier-aware KnowledgeStore. Projection restoration
+    # remains independently default-off.
+    delta_policy=MemoryDeltaPolicy(reanchor_on_projection_loss=True),
 )
 ```
 
@@ -13363,7 +13364,7 @@ fingerprints, situation and contribution/projection/manifest digests, receipt
 ID, interaction ID, exact receipt-document digest, purpose-separated receipt-to-manifest HMAC,
 byte count, runtime-authored anchors, initial and committed delta frontiers, and bounded typed
 refresh outcomes are stored under the versioned
-`automatic_recall` checkpoint root (version 4; older frames are rejected).
+`automatic_recall` checkpoint root (version 5; older frames are rejected).
 Presentation version 2 participates in the complete configuration fingerprint.
 Each exposed item's `provider_representation_sha256` binds the exact escaped JSON
 item in the actual manifest, including redacted previews and read arguments.
@@ -13395,27 +13396,82 @@ candidates cannot compete for its fused or evaluated head. A current strong matc
 the base focus, base offer, or an earlier delta becomes a `MemoryDeltaItem` with the
 `newly_relevant` reason.
 
+The wrapped context policy runs before a frontier refresh. If its result no longer contains
+the original unambiguous anchor, no new frontier delta or receipt is constructed, and its
+frontier and emission budgets are not consumed. After original projection loss, this frame
+supports only restoration of previously exposed revisions; a later real user interaction
+can recall new knowledge under a new frame. Ordinary refresh failures, including frontier
+storage and validation errors before recall begins, preserve the wrapped policy's completed
+compaction checkpoint and telemetry without committing a new recall decision. Cancellation
+remains a termination signal rather than being converted to a refresh failure.
+
 Each non-empty `MemoryDelta` has a contiguous interaction-local sequence and renders as
-a separate `<cayu_memory_delta version="1" sequence="N">` text part after the unchanged
+a separate `<cayu_memory_delta version="2" sequence="N">` text part after the unchanged
 base manifest. It binds the exact interaction and base recall receipt as well as its own
 trigger, receipt, and selected revisions. The runtime never edits an earlier manifest or appends the projection to
 the transcript. Count and byte limits bound frontier pages and checks, recall operations, deltas,
 items per delta, cumulative exposed items, each rendered delta, and total automatic-memory
-bytes. Every attempted boundary retains an immutable `MemoryDeltaRefreshOutcome` that
+bytes and deterministic estimated tokens. Every attempted boundary retains an immutable
+`MemoryDeltaRefreshOutcome` that
 distinguishes unchanged frontiers, no current or newly relevant revision, retryable incomplete
-recall, item/byte exhaustion, and an appended delta. Transient semantic timeout or failure
-does not consume the observed frontier: a later distinct model step may retry the same exact
-page until the overall refresh bound is exhausted. Complete empty, omitted, and appended
-outcomes commit the observed frontier, so retries and process recovery do not repeat completed
+recall, item/byte/estimated-token exhaustion, and an appended delta. Transient semantic
+timeout, failure, or incomplete index coverage does not consume the observed frontier: a later
+distinct model step may retry the same exact page until the overall refresh bound is exhausted.
+Complete empty, omitted, and appended outcomes commit the observed frontier, so retries and
+process recovery do not repeat completed
 work. The final
 provider composition links the base receipt and every rendered delta receipt through one
 `ContextExposure`; each item keeps its own receipt ordinal and exact provider
 representation hash.
 
-This slice deliberately does not re-anchor an unchanged previously exposed revision.
-Re-anchoring needs separate evaluation evidence and policy for cooldown, repeat count,
-and useful-repeat precision; prior exposure alone remains neither proof of attention nor
-a reason to repeat material.
+`MemoryDeltaPolicy(reanchor_on_projection_loss=True)` additionally allows exact
+projection restoration after the wrapped context policy removes the original base/delta
+anchor. It does not react to elapsed time, context length, prompt position, or an inferred
+provider attention state. The typed
+`projection_removed_by_context_policy` trigger binds the removed manifest identities,
+the new user-role context anchor, the earlier positive exposure identities, and the
+observed boundary distance. Prior exposure proves only that the representation crossed a
+provider boundary; it is necessary but not sufficient.
+
+At most once per model-step identity, the controller reads one bounded, fully scoped and
+ordered exposure page. Truncated, oversized, cross-scope, duplicate, or contradictory
+evidence fails closed. It considers only exact knowledge entry/chunk items from base or
+delta receipts that were actually rendered in an acknowledged or completed provider
+attempt. It then performs a fresh knowledge-only recall for those exact revisions at the
+current accessible knowledge/readiness frontier and admits only a current calibrated
+strong match to the compacted task. A superseded, archived, deleted, expired,
+inaccessible, changed-representation, incomplete, or irrelevant item is not re-emitted.
+Restoration always applies `cayu.query_concepts.v2` before score admission, independently of
+the base recall relevance policy. This conservative lexical concept check can omit relevant
+paraphrases; it does not establish general semantic relevance. Complete individual items
+may be selected from a bounded, truncated retrieval head. Lexical-only stores are supported;
+semantic timeout, failure, or partial index readiness prevents restoration. Item-evidence
+reads run in batches of at most eight, with cancellation and failure draining the batch.
+
+An accepted item receives the `reanchored_current_revision` reason and a new receipt,
+delta sequence, provider representation hash, and exposure lifecycle. Its projection is
+attached to the latest unambiguous user-role context anchor for that one model step only;
+the next step expires it and must prove currentness, access, relevance, and prior positive
+exposure again. If overflow recovery changes or removes that anchor within the same model
+step, the runtime suppresses the cached restoration and continues with the selected context.
+It does not rerun recall, refund consumed budgets, or erase the original receipt and trigger;
+an unchanged anchor still reuses the exact cached projection. A suppressed placement stays
+suppressed on same-step retries and checkpoint recovery.
+`MemoryReanchorRefreshOutcome` records each bounded decision, including
+missing anchor/evidence, incomplete history/recall, cooldown, repeat or
+count/byte/estimated-token budget exhaustion, no current relevant item, and append. Policy
+bounds cover exposure work, refreshes, boundary cooldown, repeats per exact representation,
+items/bytes/estimated tokens per re-anchor, and the same cumulative delta budget. Byte and
+estimated-token exhaustion have separate typed outcomes. Re-anchoring does not mutate
+transcript history,
+move content toward a guessed lost-middle position, or claim attention, comprehension,
+forgetting, or use.
+
+The checkpoint HMAC-binds an immutable emission ledger containing base/delta item identities,
+receipts, triggers, bytes, estimated tokens, frontier positions, suppression state, repeat
+counts, and all successful and unsuccessful refresh outcomes. Removing a one-step projection
+clears only its current placement fields; it cannot erase historical accounting or reopen
+cumulative budget.
 
 Forks inherit authoritative transcript history but never the source interaction's
 `automatic_recall` checkpoint root. The child derives a new frame from its next

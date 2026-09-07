@@ -166,6 +166,32 @@ checkpoint proposal construction. It excludes entry creation and provider
 latency. In-memory and SQLite provide the credential-free timing matrix;
 PostgreSQL and pgvector run behavioral parity in the integration suite.
 
+## Memory re-anchor evaluation
+
+`memory-reanchor-evaluation-v1.json` is the hermetic runtime matrix for the
+default-off re-anchor policy. Regenerate it, or check its correctness and fixed
+latency/size ceilings, with:
+
+```bash
+PYTHONPATH=src python scripts/run_memory_reanchor_evaluation.py \
+  --output benchmarks/memory/memory-reanchor-evaluation-v1.json \
+  --check
+```
+
+The in-memory and SQLite lanes execute the real two-boundary Cayu runtime with a
+scripted provider. They compare current relevant restoration after verified
+projection loss with disabled, retained-anchor, irrelevant-context,
+same-entity/unrelated-topic, and
+superseded-revision controls. The report records exact/useful restoration,
+false and stale injection, duplicate projection, bytes and estimated tokens,
+and p50/p95 zero-trigger, triggered, and incremental context-build overhead.
+A separate probe restores after 32 acknowledged exposures, at the default history
+count limit; its single latency sample is diagnostic, not a percentile benchmark.
+The regression suite also executes the current runtime matrix with one sample per
+case, rather than relying only on this stored report.
+The scripted provider makes this a structural and safety gate, not evidence of
+model attention or answer-quality improvement.
+
 ## Agent work-context and checkpoint overhead
 
 `agent-work-context-performance-v1.json` is the hermetic 50-sample baseline for

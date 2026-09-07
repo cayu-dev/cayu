@@ -1620,6 +1620,36 @@ measured output changed under an exact declared memory intervention. It does not
 claim that the model attended to a record, used it in hidden reasoning, or that
 the result generalizes beyond the frozen corpus and candidate.
 
+### Hermetic memory re-anchor evaluation
+
+The checked `scripts/run_memory_reanchor_evaluation.py` runner exercises the real
+automatic-recall, context-policy, provider-request, receipt, item-exposure, and checkpoint
+path with a deterministic scripted provider. Run it from the repository root with:
+
+```bash
+PYTHONPATH=src python scripts/run_memory_reanchor_evaluation.py \
+  --output benchmarks/memory/memory-reanchor-evaluation-v1.json \
+  --check
+```
+
+For both in-memory and SQLite stores, the matrix compares a current relevant revision after
+verified projection loss with a re-anchoring-disabled control, an unchanged retained-anchor
+control, an irrelevant compacted task, a same-entity/unrelated-topic hard negative,
+and a revision superseded before the second provider
+boundary. It records useful re-anchor precision/recall, exact-revision mismatch,
+false/stale injection, duplicate projection, rendered UTF-8 bytes, the runtime's deterministic
+context-pressure token estimate, and p50/p95 zero-trigger, triggered, and incremental
+second-boundary latency.
+A separate 32-prior-exposure probe checks restoration at the default history count
+limit and reports a single diagnostic latency. The test suite reruns the live matrix
+with one sample per case; only the explicit benchmark enforces timing ceilings.
+
+This gate proves deterministic composition behavior and negative-case safety for the fixed
+fixtures. Its scripted output is deliberately independent of memory, so it makes no claim
+about model answer quality, hidden attention, or universal benefit. Provider-backed quality
+must be evaluated separately as an authorized private paired campaign; Cayu must not tune
+repetition until a model happens to pass.
+
 ### External-private memory-ablation campaigns
 
 Applications can run the same intervention executor and memory-report schema on

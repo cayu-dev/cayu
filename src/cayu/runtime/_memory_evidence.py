@@ -56,7 +56,7 @@ _MEMORY_EVIDENCE_KEY_DERIVATION_CONTEXT = b"cayu.memory-evidence.request-footpri
 _AUTOMATIC_RECALL_CHECKPOINT_BINDING_CONTEXT = b"cayu.automatic-recall-checkpoint-binding.v1"
 _AUTOMATIC_RECALL_OPEN_TAG = '<cayu_automatic_memory version="2">'
 _AUTOMATIC_RECALL_CLOSE_TAG = "</cayu_automatic_memory>"
-_MEMORY_DELTA_OPEN_TAG_PREFIX = '<cayu_memory_delta version="1" sequence="'
+_MEMORY_DELTA_OPEN_TAG_PREFIX = '<cayu_memory_delta version="2" sequence="'
 _MEMORY_DELTA_CLOSE_TAG = "</cayu_memory_delta>"
 
 

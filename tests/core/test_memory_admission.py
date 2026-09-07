@@ -18,6 +18,9 @@ from cayu.memory import (
     MemoryDeltaRefreshOutcome,
     MemoryDeltaSelectionReason,
     MemoryDeltaTrigger,
+    MemoryDeltaTriggerKind,
+    MemoryReanchorRefreshDisposition,
+    MemoryReanchorRefreshOutcome,
     RecallOffer,
     admit_recall,
 )
@@ -209,6 +212,11 @@ def test_memory_delta_contract_binds_sequence_trigger_and_exact_candidate() -> N
         MemoryDeltaPolicy(max_items_per_delta=4, max_cumulative_items=3)
     with pytest.raises(ValueError, match="max_delta_bytes"):
         MemoryDeltaPolicy().model_copy(update={"max_delta_bytes": 0})
+    with pytest.raises(ValueError, match="max_delta_estimated_tokens"):
+        MemoryDeltaPolicy(
+            max_delta_estimated_tokens=9,
+            max_cumulative_estimated_tokens=8,
+        )
 
 
 def test_memory_delta_refresh_outcome_binds_frontier_decision_and_counts() -> None:
@@ -245,6 +253,67 @@ def test_memory_delta_refresh_outcome_binds_frontier_decision_and_counts() -> No
     )
     with pytest.raises(ValueError, match="budget-exhausted refresh"):
         MemoryDeltaRefreshOutcome.model_validate(payload)
+
+
+def test_memory_reanchor_contract_binds_projection_loss_and_prior_exposure() -> None:
+    trigger = MemoryDeltaTrigger(
+        kind=MemoryDeltaTriggerKind.PROJECTION_REMOVED_BY_CONTEXT_POLICY,
+        model_step_id="mstep_00000000000000000000000000000001",
+        prior_exposure_ids=("exposure-one",),
+        minimum_boundary_distance=1,
+        removed_manifest_sha256s=("d" * 64,),
+        context_anchor_sha256="e" * 64,
+    )
+    item = MemoryDeltaItem(
+        candidate=_candidate("current-revision", score=0.04),
+        fused_rank=1,
+        selection_reason=MemoryDeltaSelectionReason.REANCHORED_CURRENT_REVISION,
+        prior_exposure_id="exposure-one",
+    )
+    delta = MemoryDelta(
+        interaction_id="interaction-one",
+        sequence=1,
+        base_receipt_id="base-receipt-one",
+        base_situation_sha256="a" * 64,
+        situation_sha256="b" * 64,
+        policy_sha256="c" * 64,
+        trigger=trigger,
+        receipt_id="reanchor-receipt-one",
+        items=(item,),
+        eligible_item_count=1,
+        omitted_item_count=0,
+        recall_truncated=False,
+        truncated=False,
+    )
+    outcome = MemoryReanchorRefreshOutcome(
+        interaction_id="interaction-one",
+        ordinal=1,
+        model_step_id=trigger.model_step_id,
+        disposition=MemoryReanchorRefreshDisposition.DELTA_APPENDED,
+        exposure_count_inspected=1,
+        eligible_item_count=1,
+        selected_item_count=1,
+        delta_sequence=delta.sequence,
+    )
+
+    assert delta.items[0].prior_exposure_id == "exposure-one"
+    assert outcome.disposition is MemoryReanchorRefreshDisposition.DELTA_APPENDED
+    with pytest.raises(ValueError, match="prior exposure"):
+        MemoryDeltaItem(
+            candidate=item.candidate,
+            fused_rank=1,
+            selection_reason=MemoryDeltaSelectionReason.REANCHORED_CURRENT_REVISION,
+        )
+    with pytest.raises(ValueError, match="invalid field set"):
+        MemoryDeltaTrigger(
+            kind=MemoryDeltaTriggerKind.PROJECTION_REMOVED_BY_CONTEXT_POLICY,
+            model_step_id=trigger.model_step_id,
+            prior_exposure_ids=("exposure-one",),
+            minimum_boundary_distance=1,
+            removed_manifest_sha256s=("d" * 64,),
+            context_anchor_sha256="e" * 64,
+            knowledge_sequence=3,
+        )
 
 
 def test_automatic_recall_preserves_record_type_diversity_before_filling_capacity() -> None:
