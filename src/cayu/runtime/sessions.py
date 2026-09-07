@@ -7970,6 +7970,11 @@ class EventQueryResultTooLarge(ValueError):
 
 
 class TranscriptRecord(BaseModel):
+    """One retained message with its zero-based absolute transcript index.
+
+    Physical retention never renumbers this index; it is not a page offset.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     index: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
@@ -8478,6 +8483,14 @@ def require_deferred_initial_transcript_replacement(
 
 
 class TranscriptPage(BaseModel):
+    """A retained-row page, not a logical-history extent.
+
+    ``total_records`` counts all retained rows matching the query's role and
+    interaction filters, before offset/limit and thinking-content projection.
+    Use ``load_transcript_cursor`` for logical extent, or
+    ``load_transcript_snapshot`` for retained records and extent in one snapshot.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     records: list[TranscriptRecord] = Field(default_factory=list)
@@ -8526,7 +8539,12 @@ class TranscriptSnapshot(BaseModel):
         return self
 
     def retained_position(self, cursor: int) -> int:
-        """Map an absolute transcript cursor to this retained record sequence."""
+        """Map an exact absolute cursor to this snapshot's retained positions.
+
+        A removed cursor raises ValueError, even if later records survive.
+        The snapshot's append cursor maps to the end, including empty retention.
+        Unlike ``load_transcript_window``, this does not skip missing history.
+        """
 
         if type(cursor) is not int:
             raise TypeError("Transcript cursor must be an integer.")
@@ -9110,6 +9128,13 @@ class SessionLineageResult(BaseModel):
 
 
 class TranscriptQuery(BaseModel):
+    """Paginate retained matching rows in ascending absolute-index order.
+
+    ``offset`` skips retained matches, not absolute indexes. Separate calls are
+    live reads: concurrent retention can shift offsets. Use absolute windows
+    when continuing by message identity instead of retained-row position.
+    """
+
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
@@ -12009,6 +12034,12 @@ class SessionStore(ABC):
     ) -> TranscriptSnapshot:
         """Load a bounded absolute-index window and its permanent append cursor.
 
+        ``start_index`` is inclusive. If its message was removed, return the
+        first surviving records at or after it; at or beyond the append cursor,
+        return no records. The returned cursor is the full logical extent, not
+        the end of this window. Continue from the last returned index plus one.
+        An empty window does not prove that earlier payloads never existed.
+
         Stores may override this method to avoid loading the complete retained
         transcript. The default keeps custom stores correct through their atomic
         ``load_transcript_snapshot`` implementation.
@@ -12079,7 +12110,10 @@ class SessionStore(ABC):
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         """Query provider-neutral transcript messages with stable message indexes.
 
-        Same isolation contract as `load_transcript`.
+        Offset and total_records refer to retained role/interaction-matched
+        rows, not logical extent. Thinking exclusion is applied after pagination;
+        advance by the raw page span, not the number of projected records.
+        Same result-ownership isolation contract as `load_transcript`.
         """
 
     async def search_transcript(

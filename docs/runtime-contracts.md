@@ -1270,6 +1270,60 @@ Streaming consumers should buffer assistant text deltas when structured output i
 
 Creates sessions, stores events, stores provider-neutral transcripts, and checkpoints runtime state.
 
+### Transcript identity, retained pagination, and physical retention
+
+`TranscriptRecord.index` is the zero-based absolute position assigned on append.
+Physical retention removes payloads without renumbering surviving records or
+moving the session's permanent append cursor backwards. The cursor is the
+logical extent (the next append position), not the number of retained messages.
+
+`query_transcript(TranscriptQuery(...))` orders retained rows by absolute index.
+Its `offset` skips retained rows matching `role` and `interaction_id`;
+`TranscriptPage.total_records` is the count of all those retained matches,
+before offset/limit. Neither value is an absolute cursor. `include_thinking=False`
+projects content after row selection, so even an empty projected page can have
+more matching rows. Advance offsets by `min(limit, max(0, total_records - offset))`,
+not by the last absolute index or the number of projected messages.
+
+For example, after appending five records and retaining the last two, an
+unfiltered page has `total_records=2`, indexes `[3, 4]`, and offset `1` selects
+index `4`. The durable cursor remains `5`. Filtering can reduce the total again
+without changing the cursor.
+
+`load_transcript_cursor(session_id)` is the authoritative logical extent.
+`load_transcript_snapshot(session_id)` returns retained records and that cursor
+in one atomic read; `len(snapshot.records)` is the unfiltered retained count.
+Use the snapshot when those values must describe the same read, rather than
+combining independently timed queries. Cursor and indexes survive persistent
+store reopening, including when no payloads remain. No new durable metadata,
+schema revision, or index backfill is introduced by this pagination contract.
+
+`load_transcript_window(session_id, start_index=N, limit=L)` is a separate,
+inclusive absolute-index read: it returns at most L surviving records with
+index >= N. A cursor in a removed prefix skips forward to the retained suffix;
+a start at or beyond the append cursor returns no records. Its returned cursor
+is the full extent, not a continuation token for this limited window. Continue
+from the last returned record's index plus one. Consumers requiring the exact
+record must compare its index, as recovery does. In contrast,
+`snapshot.retained_position(N)` requires that exact index in the snapshot and
+raises `ValueError` for removed history; N equal to the snapshot cursor maps to
+the end even for empty retention.
+
+Offset pages are live reads, not a multi-call snapshot: retention between calls
+can shift row positions. CLI/server `total_messages` and `next_offset` retain
+these row-pagination semantics. Consistent session export uses the separate
+bounded `load_session_export_snapshot` API. Fork and checkpoint OCC continue to
+use absolute cursors, never retained counts; a partial fork can copy only the
+payloads still retained before its absolute boundary.
+
+Only `SQLiteSessionStore` currently exposes `compact_transcript(keep_last=...)`.
+Its existing recovery/publication pins may prevent deletion. In-memory and
+PostgreSQL stores support the same query/snapshot/window interfaces but do not
+offer this public physical-retention operation; their retained count equals
+extent only for an unfiltered, fully retained history. This contract does not
+add backend retention APIs, alter model-context compaction, or promise indefinite
+payload retention.
+
 ### Durable operation ownership and reconstructed session-create claims
 
 Runtime workflows that need a renewable dispatch fence may embed the internal

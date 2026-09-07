@@ -438,6 +438,7 @@ async def _stage_completed_model_boundary(
     usage: dict[str, int] | None = None,
     limits: RunLimits | None = None,
     pending_source_run_epoch: int | None = 1,
+    retain_empty_prefix: bool = False,
 ) -> _StagedCompletion:
     user_message = Message.text("user", "complete this model step once")
     interaction_id = f"interaction-{session_id}"
@@ -464,6 +465,12 @@ async def _stage_completed_model_boundary(
     )
     running = admitted.session
     started_event = admitted.interaction_started_event
+
+    if retain_empty_prefix:
+        assert isinstance(store, SQLiteSessionStore)
+        assert await store.compact_transcript(session_id, keep_last=0) == 1
+        assert await store.load_transcript_cursor(session_id) == 1
+        assert await store.load_transcript(session_id) == []
 
     source_cursor = 1
     model_attempt_identity = ModelAttemptIdentity(
@@ -624,7 +631,9 @@ async def _stage_completed_model_boundary(
     )
     assert completed.stage.state == "completed"
     assert await store.load_active_model_completion_stage(session_id) is not None
-    assert await store.load_transcript(session_id) == [user_message]
+    assert await store.load_transcript(session_id) == (
+        [] if retain_empty_prefix else [user_message]
+    )
     assert await store.load_events(session_id) == [started_event]
     return _StagedCompletion(
         session=running,
@@ -2372,15 +2381,39 @@ def test_approval_close_cancellation_materializes_deferred_input_before_propagat
     assert tool.calls == 0
 
 
-def test_limit_approval_close_materialization_failure_stays_closed() -> None:
+@pytest.mark.parametrize("backend", ["memory", "sqlite-retained"])
+def test_limit_approval_close_materialization_failure_stays_closed(
+    backend: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    addfinalizer = request.addfinalizer
+
     async def run():
-        store = _FailMaterializationStore(failures=1)
+        if backend == "memory":
+            store = _FailMaterializationStore(failures=1)
+        else:
+            store = SQLiteSessionStore(tmp_path / "approval-retention.sqlite")
+            addfinalizer(lambda: asyncio.run(store.close()))
+            materialize = store.materialize_deferred_interaction_input
+            failures = 1
+
+            async def fail_once(session_id: str, **kwargs) -> bool:
+                nonlocal failures
+                if failures:
+                    failures -= 1
+                    raise OSError("process stopped before deferred input materialization")
+                return await materialize(session_id, **kwargs)
+
+            monkeypatch.setattr(store, "materialize_deferred_interaction_input", fail_once)
         provider = _RecordingProvider()
         tool = _NeverExecutedTool()
         limits = RunLimits(max_total_tokens=1, scope="session")
         staged = await _stage_completed_model_boundary(
             store,
             session_id="model-recovery-limit-close-materialization",
+            retain_empty_prefix=backend == "sqlite-retained",
             provider_name=provider.name,
             with_tool_call=True,
             usage={"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
@@ -2418,7 +2451,18 @@ def test_limit_approval_close_materialization_failure_stays_closed() -> None:
         checkpoint_after_close = await store.load_checkpoint(staged.session.id)
         session_after_close = await store.load(staged.session.id)
         deferred_after_close = await store.load_deferred_interaction_input(staged.session.id)
+        if backend == "sqlite-retained":
+            assert receipt is not None
+            assert (
+                len(await store.load_transcript(staged.session.id)) < receipt.transcript_end_cursor
+            )
+            assert (
+                await store.load_transcript_cursor(staged.session.id)
+                == receipt.transcript_end_cursor
+            )
         replayed = [event async for event in app.resolve_tool_approval(request)]
+        replayed_again = [event async for event in app.resolve_tool_approval(request)]
+        assert replayed_again == replayed
         return (
             store,
             provider,

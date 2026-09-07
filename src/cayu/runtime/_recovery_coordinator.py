@@ -13643,8 +13643,8 @@ class RecoveryCoordinator:
             or deferred.interaction_id != receipt.interaction_id
         ):
             return False
-        transcript = await self._session_store.load_transcript(receipt.session_id)
-        if len(transcript) != receipt.transcript_end_cursor:
+        transcript_cursor = await self._session_store.load_transcript_cursor(receipt.session_id)
+        if transcript_cursor != receipt.transcript_end_cursor:
             return False
         _activate_session_run_fence(session)
         try:
