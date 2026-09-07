@@ -3036,10 +3036,23 @@ def budget_check_from_totals(
     limit_reached = False
     if summary.unpriced_model_steps > 0 and not limit.allow_unpriced:
         limit_reached = True
-        message = (
-            "Budget cannot be verified because "
-            f"{summary.unpriced_model_steps} model step(s) have no matching pricing."
+        reasons = []
+        for count, description in (
+            (summary.missing_usage_model_steps, "have missing or invalid completion usage"),
+            (summary.missing_pricing_model_steps, "have no matching pricing"),
+            (summary.unsupported_pricing_model_steps, "have unsupported pricing inputs"),
+        ):
+            if count:
+                reasons.append(f"{count} model step(s) {description}")
+        unknown = summary.unpriced_model_steps - (
+            summary.missing_usage_model_steps
+            + summary.missing_pricing_model_steps
+            + summary.unsupported_pricing_model_steps
         )
+        if unknown:
+            reasons.append(f"{unknown} model step(s) have unavailable cost evidence")
+        message = "Budget cannot be verified because " + "; ".join(reasons) + "."
+
     elif summary.total_cost >= limit.max_estimated_cost:
         limit_reached = True
         message = (

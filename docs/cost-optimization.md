@@ -217,3 +217,17 @@ explicit; neither should be silently treated as permission to spend.
   for the current paired benchmark and reproduction commands.
 - Review [Runtime contracts](runtime-contracts.md) for the complete accounting,
   pricing, budget, reservation, and recovery semantics.
+
+### Unavailable cost diagnostics
+
+Cost line items and grouped unpriced reasons expose a bounded `unpriced_reason`:
+`missing_usage` (missing or invalid completion usage), `missing_pricing` (no
+applicable tariff), or `unsupported_pricing` (other unsupported pricing inputs).
+Session and causal cost summaries retain matching `*_model_steps` counters,
+including across persisted-event reload and incremental accounting refresh.
+Older totals without category evidence receive a generic unavailable-cost message.
+
+A failed compaction with no completion usage remains unpriceable even when its
+provider/model tariff is configured. Budget admission reports the missing usage
+and remains closed; it does not invent zero usage or use a reservation as observed
+usage. Diagnostics contain fixed categories rather than provider error text.

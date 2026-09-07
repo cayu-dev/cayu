@@ -33,6 +33,7 @@ from cayu._validation import (
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
+from cayu.runtime._cost_diagnostics import UnpricedReason, _unpriced_reason
 from cayu.runtime.usage import (
     AggregateCacheUsageMetrics,  # noqa: F401 - compatibility re-export
     AggregateCount,
@@ -1524,6 +1525,7 @@ class UsageUnpricedReason(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    unpriced_reason: UnpricedReason | None = None
     reason: str
     model_steps: AggregateCount = Field(ge=0)
     hosted_resources: AggregateCount = Field(
@@ -2102,6 +2104,7 @@ def _estimate_usage_cost(
         ),
         unpriced_reasons=tuple(
             UsageUnpricedReason(
+                unpriced_reason=_unpriced_reason(reason),
                 reason=reason,
                 model_steps=model_steps,
                 hosted_resources=hosted_resources,

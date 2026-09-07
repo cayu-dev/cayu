@@ -81,6 +81,15 @@ def _apply_delta(
         unpriced_model_steps=total.unpriced_model_steps
         + new.unpriced_model_steps
         - old.unpriced_model_steps,
+        missing_usage_model_steps=total.missing_usage_model_steps
+        + new.missing_usage_model_steps
+        - old.missing_usage_model_steps,
+        missing_pricing_model_steps=total.missing_pricing_model_steps
+        + new.missing_pricing_model_steps
+        - old.missing_pricing_model_steps,
+        unsupported_pricing_model_steps=total.unsupported_pricing_model_steps
+        + new.unsupported_pricing_model_steps
+        - old.unsupported_pricing_model_steps,
         total_cost=add_cost_amounts(total.total_cost, new.total_cost, old.total_cost.copy_negate()),
     )
 

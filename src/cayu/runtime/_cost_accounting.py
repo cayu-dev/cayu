@@ -118,6 +118,10 @@ class _Totals:
     model_steps: int = 0
     priced_model_steps: int = 0
     unpriced_model_steps: int = 0
+    missing_usage_model_steps: int = 0
+    missing_pricing_model_steps: int = 0
+    unsupported_pricing_model_steps: int = 0
+
     total_cost: Decimal = Decimal(0)
 
     def add(self, item: CostLineItem) -> None:
@@ -125,6 +129,16 @@ class _Totals:
             self.model_steps += 1
             self.priced_model_steps += int(item.priced)
             self.unpriced_model_steps += int(not item.priced)
+            self.missing_usage_model_steps += int(
+                not item.priced and item.unpriced_reason == "missing_usage"
+            )
+            self.missing_pricing_model_steps += int(
+                not item.priced and item.unpriced_reason == "missing_pricing"
+            )
+            self.unsupported_pricing_model_steps += int(
+                not item.priced and item.unpriced_reason == "unsupported_pricing"
+            )
+
         self.total_cost = add_cost_amounts(self.total_cost, item.total_cost)
 
     def summary(self, session_id: str, currency: str) -> SessionCostTotals:
@@ -134,6 +148,9 @@ class _Totals:
             model_steps=self.model_steps,
             priced_model_steps=self.priced_model_steps,
             unpriced_model_steps=self.unpriced_model_steps,
+            missing_usage_model_steps=self.missing_usage_model_steps,
+            missing_pricing_model_steps=self.missing_pricing_model_steps,
+            unsupported_pricing_model_steps=self.unsupported_pricing_model_steps,
             total_cost=self.total_cost,
         )
 

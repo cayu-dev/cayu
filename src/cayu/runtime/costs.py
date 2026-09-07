@@ -31,6 +31,7 @@ from cayu._validation import (
 )
 from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.core.events import Event, EventType
+from cayu.runtime._cost_diagnostics import UnpricedReason, _unpriced_reason
 from cayu.runtime.usage import (
     HostedToolUsageMetrics,
     UsageMetrics,
@@ -893,6 +894,7 @@ class CostLineItem(BaseModel):
     cache_write_input_cost: Decimal = Field(ge=0)
     web_search_cost: Decimal = Field(default=Decimal("0"), ge=0)
     total_cost: Decimal = Field(ge=0)
+    unpriced_reason: UnpricedReason | None = None
     missing_pricing_reason: str | None = None
 
     @field_validator("billing_identity", "pricing_provenance", mode="before")
@@ -931,6 +933,7 @@ class ModelStepCostEstimate(BaseModel):
     priced: StrictBool
     currency: str | None = None
     total_cost: Decimal = Field(ge=0)
+    unpriced_reason: UnpricedReason | None = None
     missing_pricing_reason: str | None = None
     pricing_provider_name: str | None = None
     pricing_model: str | None = None
@@ -950,7 +953,11 @@ class ModelStepCostEstimate(BaseModel):
     @model_validator(mode="after")
     def validate_outcome(self) -> ModelStepCostEstimate:
         if self.priced:
-            if self.currency is None or self.missing_pricing_reason is not None:
+            if (
+                self.currency is None
+                or self.missing_pricing_reason is not None
+                or self.unpriced_reason is not None
+            ):
                 raise ValueError("Priced model steps require currency and no missing reason.")
             if (self.pricing_provider_name is None) != (self.pricing_model is None):
                 raise ValueError(
@@ -994,6 +1001,10 @@ class SessionCostTotals(BaseModel):
     model_steps: StrictInt = Field(ge=0)
     priced_model_steps: StrictInt = Field(ge=0)
     unpriced_model_steps: StrictInt = Field(ge=0)
+    missing_usage_model_steps: StrictInt = Field(default=0, ge=0)
+    missing_pricing_model_steps: StrictInt = Field(default=0, ge=0)
+    unsupported_pricing_model_steps: StrictInt = Field(default=0, ge=0)
+
     total_cost: Decimal = Field(ge=0)
 
     @field_validator("session_id", "currency")
@@ -1005,6 +1016,13 @@ class SessionCostTotals(BaseModel):
     def validate_step_totals(self) -> SessionCostTotals:
         if self.priced_model_steps + self.unpriced_model_steps != self.model_steps:
             raise ValueError("Priced and unpriced steps must sum to model_steps.")
+        if (
+            self.missing_usage_model_steps
+            + self.missing_pricing_model_steps
+            + self.unsupported_pricing_model_steps
+            > self.unpriced_model_steps
+        ):
+            raise ValueError("Unpriced categories cannot exceed unpriced_model_steps.")
         if not self.total_cost.is_finite():
             raise ValueError("total_cost must be finite.")
         return self
@@ -1049,6 +1067,10 @@ class CausalBudgetCostSummary(BaseModel):
     model_steps: StrictInt = Field(ge=0)
     priced_model_steps: StrictInt = Field(ge=0)
     unpriced_model_steps: StrictInt = Field(ge=0)
+    missing_usage_model_steps: StrictInt = Field(default=0, ge=0)
+    missing_pricing_model_steps: StrictInt = Field(default=0, ge=0)
+    unsupported_pricing_model_steps: StrictInt = Field(default=0, ge=0)
+
     total_cost: Decimal = Field(ge=0)
     line_items: tuple[CostLineItem, ...] = Field(default_factory=tuple)
     session_costs: tuple[SessionCostSummary, ...] = Field(default_factory=tuple)
@@ -1225,6 +1247,23 @@ def _estimate_session_cost(
         model_steps=model_step,
         priced_model_steps=priced_model_steps,
         unpriced_model_steps=unpriced_model_steps,
+        missing_usage_model_steps=sum(
+            1
+            for item in line_items
+            if item.model_step > 0 and not item.priced and item.unpriced_reason == "missing_usage"
+        ),
+        missing_pricing_model_steps=sum(
+            1
+            for item in line_items
+            if item.model_step > 0 and not item.priced and item.unpriced_reason == "missing_pricing"
+        ),
+        unsupported_pricing_model_steps=sum(
+            1
+            for item in line_items
+            if item.model_step > 0
+            and not item.priced
+            and item.unpriced_reason == "unsupported_pricing"
+        ),
         total_cost=total_cost,
         line_items=tuple(line_items),
     )
@@ -1276,6 +1315,9 @@ def estimate_causal_budget_cost(
         model_steps=summary.model_steps,
         priced_model_steps=summary.priced_model_steps,
         unpriced_model_steps=summary.unpriced_model_steps,
+        missing_usage_model_steps=summary.missing_usage_model_steps,
+        missing_pricing_model_steps=summary.missing_pricing_model_steps,
+        unsupported_pricing_model_steps=summary.unsupported_pricing_model_steps,
         total_cost=summary.total_cost,
         line_items=summary.line_items,
         session_costs=session_costs,
@@ -1373,6 +1415,9 @@ def estimate_model_step_cost(
         return ModelStepCostEstimate(
             priced=False,
             total_cost=Decimal(0),
+            unpriced_reason=_unpriced_reason(
+                resolution.missing_reason or "no matching model pricing"
+            ),
             missing_pricing_reason=(resolution.missing_reason or "no matching model pricing"),
         )
     currency = resolution.resolved.currency.upper()
@@ -1388,6 +1433,7 @@ def estimate_model_step_cost(
         return ModelStepCostEstimate(
             priced=False,
             total_cost=Decimal(0),
+            unpriced_reason=line_item.unpriced_reason,
             missing_pricing_reason=(
                 line_item.missing_pricing_reason or "no matching model pricing"
             ),
@@ -1644,6 +1690,7 @@ def _unpriced_line_item(
         model=model,
         billing_identity=billing_identity,
         priced=False,
+        unpriced_reason=_unpriced_reason(reason),
         currency=currency.upper(),
         input_tokens=0 if metrics is None else metrics.input_tokens,
         output_tokens=0 if metrics is None else metrics.output_tokens,
