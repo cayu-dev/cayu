@@ -469,6 +469,25 @@ def test_remote_git_delivery_is_an_explicit_docker_coding_capability() -> None:
     assert "--with remote-git-delivery" in files["README.md"]
 
 
+def test_github_delivery_implies_remote_git_and_emits_both_host_boundaries() -> None:
+    plan = normalize_application_plan(
+        name="coder",
+        agent_name="coder",
+        preset="coding",
+        execution="docker",
+        with_capabilities=("github-delivery",),
+    )
+    files = project_files("coder", application_plan=plan)
+
+    assert {"github-delivery", "remote-git-delivery"} <= set(plan.capabilities)
+    assert "GITHUB_DELIVERY_ENABLED = True" in files["integrations/github.py"]
+    assert "REMOTE_GIT_DELIVERY_ENABLED = True" in files["integrations/remote_git.py"]
+    assert "--with github-delivery" in files["README.md"]
+    assert "github_pull_request_delivery_request" in files["README.md"]
+    assert "GitHub delivery invariants" in files["AGENTS.md"]
+    assert "generic GitHub API seam" in files["AGENTS.md"]
+
+
 def test_unconfigured_extension_only_capability_fails_before_target_creation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -706,6 +706,24 @@ captured/fresh/judged artifacts, explicit candidate/judge work and cost
 thresholds, and stable comparison exits. CI selection now fails open for all
 package guide and Evals live-acceptance inputs.
 
+### Optional exact-commit GitHub delivery
+
+Docker coding applications may select `cayu new --with github-delivery`, which
+also selects the remote-Git prerequisite. The host-only connector consumes the
+exact pushed commit/ref, verifies configured repository/base/head identity,
+requires durable approval for explicit PR metadata operations, reconciles lost
+acknowledgements before retry, and performs one bounded check/review observation
+per call. GitHub tokens and API mapping never enter the model or coding
+environment.
+
+Required checks are application-declared and exact-head bound. PR state,
+draft/mergeability/merge fields, checks, and review decisions remain separate;
+green checks or approval never claim merge. Provider feedback is deduplicated,
+bounded, redacted, provenance-labelled untrusted input. Selected feedback can
+seed a new ordinary coding-product run, but every update requires a new remote
+Git delivery. Merge, auto-merge, branch deletion, workflow dispatch, releases,
+and arbitrary GitHub requests remain unavailable.
+
 ### Approved host-side remote Git delivery
 
 Docker coding applications may select `cayu new --with remote-git-delivery` to

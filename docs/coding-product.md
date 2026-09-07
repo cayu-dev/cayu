@@ -182,3 +182,6 @@ idempotency, provider authority, and receipts, and retain commit/push/PR/CI/merg
 state independently. Cayu's maintained first layer is the
 [approved remote Git delivery](remote-git-delivery.md) broker, selected in a
 generated Docker coding application with `--with remote-git-delivery`.
+Applications that also need a pull request, exact-head checks, and bounded
+review feedback can select the subsequent [GitHub delivery](github-delivery.md)
+layer with `--with github-delivery`.

@@ -316,6 +316,16 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         files=("integrations/remote_git.py",),
         verification=("uv run --no-sync pytest -q tests/test_coding_composition.py",),
     ),
+    CapabilitySpec(
+        name="github-delivery",
+        summary="Approved exact-commit pull request, checks, reviews, and follow-up evidence.",
+        status="selectable",
+        supported_presets=("coding",),
+        supported_executions=("docker",),
+        implied=("remote-git-delivery",),
+        files=("integrations/github.py", "integrations/remote_git.py", "README.md", "AGENTS.md"),
+        verification=("uv run --no-sync pytest -q tests/test_coding_composition.py",),
+    ),
 )
 
 _PRESET_BY_NAME = {spec.name: spec for spec in PRESETS}

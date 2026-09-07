@@ -282,6 +282,7 @@ class RemoteGitRepositoryAuthority(_FrozenDeliveryModel):
     base_ref: str
     expected_base_commit: str
     destination_ref: str
+    expected_destination_commit: str | None = None
 
     @field_validator(
         "repository_id",
@@ -303,10 +304,23 @@ class RemoteGitRepositoryAuthority(_FrozenDeliveryModel):
     def validate_commit(cls, value: str) -> str:
         return _object_id(value, "expected_base_commit")
 
+    @field_validator("expected_destination_commit")
+    @classmethod
+    def validate_destination_commit(cls, value: str | None) -> str | None:
+        return None if value is None else _object_id(value, "expected_destination_commit")
+
+    @property
+    def parent_commit(self) -> str:
+        return self.expected_destination_commit or self.expected_base_commit
+
     @model_validator(mode="after")
     def validate_distinct_refs(self) -> RemoteGitRepositoryAuthority:
         if self.base_ref == self.destination_ref:
             raise ValueError("Remote Git delivery cannot update its admitted base ref.")
+        if self.expected_destination_commit is not None and len(
+            self.expected_destination_commit
+        ) != len(self.expected_base_commit):
+            raise ValueError("Remote Git commits must use the same object format.")
         return self
 
 
@@ -556,6 +570,7 @@ class RemoteGitDeliveryResult(_FrozenDeliveryModel):
     remote_identity: str
     base_ref: str
     expected_base_commit: str
+    expected_destination_commit: str | None = None
     observed_base_commit: str | None = None
     destination_ref: str
     destination_before: str | None = None
@@ -628,6 +643,7 @@ class RemoteGitDeliveryResult(_FrozenDeliveryModel):
 
     @field_validator(
         "expected_base_commit",
+        "expected_destination_commit",
         "observed_base_commit",
         "destination_before",
         "destination_after",
@@ -649,7 +665,10 @@ class RemoteGitDeliveryResult(_FrozenDeliveryModel):
         if self.local_commit is None:
             if self.parent_commit is not None:
                 raise ValueError("A delivery without a local commit cannot claim its parent.")
-        elif self.parent_commit != self.expected_base_commit or self.tree is None:
+        elif (
+            self.parent_commit != (self.expected_destination_commit or self.expected_base_commit)
+            or self.tree is None
+        ):
             raise ValueError("A local delivery commit requires its exact parent and tree.")
         if self.state is RemoteGitDeliveryState.PUSHED and (
             self.local_commit is None
@@ -931,7 +950,8 @@ class RemoteGitDeliveryRepository:
             or prepared.repository_id != request.repository.repository_id
             or prepared.remote_identity != request.repository.remote_identity
             or prepared.observed_base_commit != request.repository.expected_base_commit
-            or prepared.observed_destination_commit is not None
+            or prepared.observed_destination_commit
+            != request.repository.expected_destination_commit
             or prepared.source_revision != request.source.final_source_revision
             or prepared.commit_message_sha256 != request.commit.message_sha256
         ):
@@ -961,6 +981,7 @@ class RemoteGitDeliveryRepository:
             or result.remote_identity != request.repository.remote_identity
             or result.base_ref != request.repository.base_ref
             or result.expected_base_commit != request.repository.expected_base_commit
+            or result.expected_destination_commit != request.repository.expected_destination_commit
             or result.destination_ref != request.repository.destination_ref
             or result.commit_message_sha256 != request.commit.message_sha256
             or result.policy_fingerprint != request.security.policy_fingerprint
@@ -1775,7 +1796,7 @@ class RemoteGitDeliveryBroker:
             raise RemoteGitDeliveryAdmissionError(
                 "Coding-product publication conflicts with durable result evidence."
             )
-        if candidate.initial_git.head_revision != request.repository.expected_base_commit:
+        if candidate.initial_git.head_revision != request.repository.parent_commit:
             raise RemoteGitDeliveryAdmissionError(
                 "Delivery parent conflicts with the retained coding baseline."
             )
@@ -2154,9 +2175,11 @@ class RemoteGitDeliveryBroker:
                 observed_destination=observed_destination,
             )
         observed_base = request.repository.expected_base_commit
-        if observed_destination is not None:
+        if observed_destination != request.repository.expected_destination_commit:
             raise RemoteGitDeliveryConflictError(
-                "destination_ref_already_exists",
+                "destination_ref_already_exists"
+                if request.repository.expected_destination_commit is None
+                else "destination_ref_changed_before_preparation",
                 observed_base=observed_base,
                 observed_destination=observed_destination,
             )
@@ -2200,6 +2223,36 @@ class RemoteGitDeliveryBroker:
         _require_git_success(result, "verify fetched base")
         if result.stdout.strip() != request.repository.expected_base_commit:
             raise RemoteGitDeliveryAdmissionError("Fetched base conflicts with remote observation.")
+        if request.repository.expected_destination_commit is not None:
+            result, evidence = await self._git(
+                request,
+                "fetch_destination",
+                (
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--depth=1",
+                    remote.url,
+                    request.repository.destination_ref,
+                ),
+                cwd=root,
+                remote=remote,
+            )
+            steps.append(evidence)
+            _require_git_success(result, "fetch admitted destination")
+            result, evidence = await self._git(
+                request,
+                "verify_fetched_destination",
+                ("rev-parse", "--verify", "FETCH_HEAD"),
+                cwd=root,
+            )
+            steps.append(evidence)
+            _require_git_success(result, "verify fetched destination")
+            if result.stdout.strip() != request.repository.expected_destination_commit:
+                raise RemoteGitDeliveryAdmissionError(
+                    "Fetched destination conflicts with exact previous-head authority."
+                )
         result, evidence = await self._git(
             request,
             "initialize_empty_index",
@@ -2268,7 +2321,7 @@ class RemoteGitDeliveryBroker:
             and candidate.git.entry_count == 0
         )
         for operation, arguments, input_text in (
-            ("load_reviewed_parent", ("read-tree", request.repository.expected_base_commit), None),
+            ("load_reviewed_parent", ("read-tree", request.repository.parent_commit), None),
             (
                 "apply_reviewed_delta",
                 ("apply", "--cached", "--whitespace=nowarn", "-"),
@@ -2299,7 +2352,7 @@ class RemoteGitDeliveryBroker:
                 "-z",
                 "-r",
                 "-M",
-                request.repository.expected_base_commit,
+                request.repository.parent_commit,
                 tree,
             ),
             cwd=root,
@@ -2342,7 +2395,7 @@ class RemoteGitDeliveryBroker:
             repository_id=request.repository.repository_id,
             remote_identity=request.repository.remote_identity,
             observed_base_commit=observed_base,
-            observed_destination_commit=None,
+            observed_destination_commit=observed_destination,
             tree=tree,
             changed_paths=changed_paths,
             source_revision=request.source.final_source_revision,
@@ -2395,6 +2448,7 @@ class RemoteGitDeliveryBroker:
             remote_identity=request.repository.remote_identity,
             base_ref=request.repository.base_ref,
             expected_base_commit=request.repository.expected_base_commit,
+            expected_destination_commit=request.repository.expected_destination_commit,
             observed_base_commit=(
                 (None if prepared is None else prepared.observed_base_commit)
                 if isinstance(observed_base_override, _BaseObservationDefault)
@@ -2408,7 +2462,7 @@ class RemoteGitDeliveryBroker:
             ),
             destination_after=destination_after,
             local_commit=commit,
-            parent_commit=request.repository.expected_base_commit if commit is not None else None,
+            parent_commit=request.repository.parent_commit if commit is not None else None,
             tree=None if prepared is None else prepared.tree,
             commit_message_sha256=request.commit.message_sha256,
             policy_fingerprint=request.security.policy_fingerprint,
@@ -2566,7 +2620,7 @@ class RemoteGitDeliveryBroker:
                 "commit-tree",
                 prepared.tree,
                 "-p",
-                request.repository.expected_base_commit,
+                request.repository.parent_commit,
             ),
             cwd=root,
             stdin=request.commit.message,
@@ -2599,7 +2653,7 @@ class RemoteGitDeliveryBroker:
         if (
             not lines
             or lines[0] != f"tree {prepared.tree}"
-            or (f"parent {request.repository.expected_base_commit}" not in lines[:4])
+            or (f"parent {request.repository.parent_commit}" not in lines[:4])
         ):
             raise RemoteGitDeliveryError("Created commit tree or parent conflicts with authority.")
         header_lines = headers.splitlines()
@@ -2632,7 +2686,7 @@ class RemoteGitDeliveryBroker:
         timestamp = int(instant.timestamp())
         timezone = instant.strftime("%z")
         material = (
-            f"tree {prepared.tree}\nparent {request.repository.expected_base_commit}\n"
+            f"tree {prepared.tree}\nparent {request.repository.parent_commit}\n"
             f"author {request.commit.author_name} <{request.commit.author_email}> "
             f"{timestamp} {timezone}\n"
             f"committer {request.commit.committer_name} <{request.commit.committer_email}> "
@@ -2656,7 +2710,8 @@ class RemoteGitDeliveryBroker:
                 "push",
                 "--porcelain",
                 "--no-verify",
-                f"--force-with-lease={request.repository.destination_ref}:",
+                f"--force-with-lease={request.repository.destination_ref}:"
+                f"{request.repository.expected_destination_commit or ''}",
                 remote.url,
                 f"{commit}:{request.repository.destination_ref}",
             ),
@@ -2819,7 +2874,7 @@ class RemoteGitDeliveryBroker:
             raise RemoteGitDeliveryReconstructionRequiredError(
                 "Retained commit conflicts with exact prepared authority."
             )
-        if destination is not None:
+        if destination != request.repository.expected_destination_commit:
             if latest_commit is not None and destination == latest_commit:
                 return await self._settle_remote_commit(
                     request,
@@ -2983,7 +3038,7 @@ class RemoteGitDeliveryBroker:
                 )
             state = (
                 RemoteGitDeliveryState.CONFLICT
-                if destination is not None
+                if destination != request.repository.expected_destination_commit
                 else RemoteGitDeliveryState.AMBIGUOUS
             )
             result = self._result(
@@ -3020,7 +3075,7 @@ class RemoteGitDeliveryBroker:
             )
         state = (
             RemoteGitDeliveryState.CONFLICT
-            if destination is not None
+            if destination != request.repository.expected_destination_commit
             else RemoteGitDeliveryState.FAILED
             if push_result.exit_code != 0 and not push_result.timed_out
             else RemoteGitDeliveryState.AMBIGUOUS
@@ -3076,7 +3131,7 @@ def remote_git_broker_behavior_fingerprint() -> str:
         "schema": REMOTE_GIT_DELIVERY_SCHEMA_VERSION,
         "implementation": "host-broker-v2",
         "transport": "structured-git-posix-process-limits-v2",
-        "destination": "new-branch-only-with-empty-lease-v1",
+        "destination": "new-or-exact-parent-fast-forward-with-lease-v2",
         "credentials": "vault-backed-askpass-v1",
         "recovery": "owned-remote-observation-before-cleanup-v2",
         "configuration": "sealed-host-configuration-v1",

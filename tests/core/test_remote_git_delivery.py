@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -23,6 +26,24 @@ from cayu.coding_products import (
     compile_coding_product_candidate,
 )
 from cayu.core.events import Event, EventType
+from cayu.github_delivery import (
+    GitHubCheckPolicy,
+    GitHubConnectorProfile,
+    GitHubCredentials,
+    GitHubDeliveryRepository,
+    GitHubDeliveryState,
+    GitHubOperation,
+    GitHubPullRequestConnector,
+    GitHubPullRequestMetadata,
+    GitHubRepositoryConfig,
+    GitHubRestTransport,
+    GitHubReviewPolicy,
+    GitHubSecurityAuthority,
+    approve_github_delivery,
+    github_connector_behavior_fingerprint,
+    github_follow_up_coding_input,
+    github_pull_request_delivery_request,
+)
 from cayu.remote_git_delivery import (
     RemoteGitBrokerProfile,
     RemoteGitCommitAuthority,
@@ -51,6 +72,40 @@ from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimits,
     observe_deterministic_workspace,
 )
+
+
+class _UnusedGitHubTransport:
+    """Complete semantic seam that must remain unused by input validation."""
+
+    async def observe_ref(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def find_pull_requests(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def get_pull_request(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def create_pull_request(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def update_pull_request(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def set_labels(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def request_reviewers(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def mark_ready(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def observe_checks(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
+
+    async def observe_reviews(self, *args, **kwargs):
+        raise AssertionError("provider transport must not run")
 
 
 def _digest(value: str) -> str:
@@ -313,6 +368,11 @@ async def _coding_publication(
     *,
     final_content: bytes = b"VALUE = 'after'\n",
     baseline_commit: str | None = None,
+    product_run_id: str = "coding-product",
+    session_id: str = "coding-session",
+    task_id: str = "coding-task",
+    instruction: str = "repair source",
+    store: LocalArtifactStore | None = None,
 ):
     workspace = LocalWorkspace(source, workspace_id="source-workspace")
     limits = WorkspaceRevisionObservationLimits()
@@ -335,8 +395,8 @@ async def _coding_publication(
         _git(seed, "--work-tree=" + str(source), "diff", "--no-ext-diff", "HEAD", "--") + "\n"
     )
     request = CodingProductRequest(
-        product_run_id="coding-product",
-        session_id="coding-session",
+        product_run_id=product_run_id,
+        session_id=session_id,
         agent_name="coder",
         source=CodingSourceAuthority(
             origin_id="application-source",
@@ -353,8 +413,8 @@ async def _coding_publication(
             observation_limits=limits,
         ),
         task=CodingTaskAuthority(
-            task_id="coding-task",
-            instruction_sha256=_digest("repair source"),
+            task_id=task_id,
+            instruction_sha256=_digest(instruction),
         ),
         runtime=CodingRuntimeAuthority(
             toolchain_profile_id="python",
@@ -373,18 +433,21 @@ async def _coding_publication(
             reviewer_required=False,
         ),
     )
-    store = LocalArtifactStore(tmp_path / "artifacts", store_id="delivery-artifacts")
+    store = store or LocalArtifactStore(tmp_path / "artifacts", store_id="delivery-artifacts")
     coding_repository = CodingProductArtifactRepository(store)
     await coding_repository.ensure_request(request)
     candidate = await compile_coding_product_candidate(
         request,
-        (
-            *(
-                _check_event(name, workspace_revision=final.revision)
-                for name in request.settlement.required_checks
-            ),
-            *_git_events(diff_content),
-            *_terminal_events(request, final.revision, diff_content),
+        tuple(
+            event.model_copy(update={"session_id": session_id})
+            for event in (
+                *(
+                    _check_event(name, workspace_revision=final.revision)
+                    for name in request.settlement.required_checks
+                ),
+                *_git_events(diff_content),
+                *_terminal_events(request, final.revision, diff_content),
+            )
         ),
         initial_observation=initial,
         final_observation=final,
@@ -523,6 +586,420 @@ def test_broker_prepares_approves_pushes_and_recovers_exact_commit(tmp_path: Pat
     )
     assert _git(remote, "rev-parse", f"{pushed.result.local_commit}^") == base
     assert "VALUE = 'after'" in _git(remote, "show", f"{pushed.result.local_commit}:app.py")
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_existing_branch_delivery_binds_exact_previous_head(tmp_path: Path, drift: bool) -> None:
+    remote, base = _remote_fixture(tmp_path)
+    seed = tmp_path / "seed"
+    _git(
+        seed,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "prior delivery",
+    )
+    previous = _git(seed, "rev-parse", "HEAD")
+    destination = "refs/heads/cayu/delivery-1"
+    _git(seed, "push", str(remote), f"HEAD:{destination}")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("VALUE = 'before'\n", encoding="utf-8")
+    workspace, product, coding_repository, store = asyncio.run(
+        _coding_publication(tmp_path, source)
+    )
+    broker = _broker(tmp_path, remote, coding_repository, store)
+    original = _request(product, base)
+    request = original.model_copy(
+        update={
+            "repository": original.repository.model_copy(
+                update={"expected_destination_commit": previous}
+            )
+        }
+    )
+    awaiting = asyncio.run(broker.run(request, product, source_workspace=workspace))
+    assert awaiting.result.state is RemoteGitDeliveryState.APPROVAL_REQUIRED
+    prepared = asyncio.run(broker.repository.load_prepared(request))
+    assert prepared is not None
+    assert prepared.observed_destination_commit == previous
+    approval = approve_remote_git_delivery(request, prepared, approval_id="update-approval")
+    if drift:
+        _git(
+            seed,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "concurrent update",
+        )
+        _git(seed, "push", str(remote), f"HEAD:{destination}")
+    outcome = asyncio.run(
+        broker.run(request, product, source_workspace=workspace, approval=approval)
+    )
+    if drift:
+        assert outcome.result.state is RemoteGitDeliveryState.CONFLICT
+        assert _git(remote, "rev-parse", destination) == _git(seed, "rev-parse", "HEAD")
+    else:
+        assert outcome.result.state is RemoteGitDeliveryState.PUSHED
+        assert outcome.result.parent_commit == previous
+        assert outcome.result.expected_destination_commit == previous
+        assert _git(remote, "rev-parse", f"{destination}^") == previous
+        assert _git(remote, "rev-parse", "refs/heads/main") == base
+        assert _git(remote, "show", f"{destination}:app.py") == "VALUE = 'after'"
+        recovered = asyncio.run(
+            broker.run(request, product, source_workspace=workspace, approval=approval)
+        )
+        assert recovered == outcome
+
+
+def test_github_delivery_consumes_exact_durable_product_and_remote_receipts(
+    tmp_path: Path,
+) -> None:
+    remote, base = _remote_fixture(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("VALUE = 'before'\n", encoding="utf-8")
+    workspace, product, coding_repository, store = asyncio.run(
+        _coding_publication(tmp_path, source)
+    )
+    broker = _broker(tmp_path, remote, coding_repository, store)
+    remote_request = _request(product, base)
+    prepared = asyncio.run(broker.prepare(remote_request, product, source_workspace=workspace))
+    delivered = asyncio.run(
+        broker.run(
+            remote_request,
+            product,
+            source_workspace=workspace,
+            approval=approve_remote_git_delivery(
+                remote_request,
+                prepared,
+                approval_id="github-prerequisite-approval",
+            ),
+        )
+    )
+    security = GitHubSecurityAuthority(
+        connector_id="github-connector",
+        connector_behavior_fingerprint=github_connector_behavior_fingerprint(),
+        credential_profile_id="github-token",
+        egress_profile_id="github-only",
+        policy_fingerprint=_digest("github-policy"),
+        approval_policy_fingerprint=_digest("github-approval"),
+        redaction_profile_fingerprint=_digest("github-redaction"),
+        allowed_operations=(GitHubOperation.CREATE_PULL_REQUEST,),
+    )
+    request = github_pull_request_delivery_request(
+        product,
+        delivered,
+        connector_run_id="github-run",
+        session_id="github-session",
+        idempotency_key="github-idempotency",
+        requested_at="2026-08-30T12:00:00Z",
+        repository_alias="github",
+        installation_id="installation",
+        account_id="account",
+        mode="create",
+        existing_pull_request_number=None,
+        metadata=GitHubPullRequestMetadata(title="Repair source"),
+        checks=GitHubCheckPolicy(required_checks=("test",)),
+        reviews=GitHubReviewPolicy(),
+        security=security,
+    )
+    credentials = GitHubCredentials(
+        credential_profile_id="github-token",
+        token=SecretRef(name="github-token"),
+        resolver=StaticVault({"github-token": "host-only-token"}),
+    )
+    connector = GitHubPullRequestConnector(
+        GitHubConnectorProfile(
+            connector_id="github-connector",
+            behavior_fingerprint=github_connector_behavior_fingerprint(),
+            repositories={
+                "github": GitHubRepositoryConfig(
+                    alias="github",
+                    repository_id="fixture-repository",
+                    installation_id="installation",
+                    account_id="account",
+                    api_base_url="https://api.github.example",
+                    owner="cayu",
+                    name="runtime",
+                    credential_profile_id="github-token",
+                    egress_profile_id="github-only",
+                    credentials=credentials,
+                )
+            },
+        ),
+        repository=GitHubDeliveryRepository(store),
+        transport=_UnusedGitHubTransport(),
+    )
+
+    asyncio.run(connector._validate_inputs(request, product, delivered))
+
+    assert request.source.product_result_artifact_id == product.artifact.artifact_id
+    assert request.source.remote_result_artifact_id == delivered.artifact.artifact_id
+    assert request.repository.head_commit == delivered.result.next_commit
+
+
+def test_two_public_deliveries_update_one_pr_through_rest_transport(tmp_path: Path) -> None:
+    """Compile source evidence, really push twice, and retain one forge identity."""
+    remote, base = _remote_fixture(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("VALUE = 'before'\n", encoding="utf-8")
+    token = "host-only-integration-token"
+    destination = "refs/heads/cayu/delivery-1"
+
+    async def exercise():
+        workspace, product, coding_repository, store = await _coding_publication(tmp_path, source)
+        broker = _broker(tmp_path, remote, coding_repository, store)
+        remote_request = _request(product, base)
+        prepared = await broker.prepare(remote_request, product, source_workspace=workspace)
+        delivered = await broker.run(
+            remote_request,
+            product,
+            source_workspace=workspace,
+            approval=approve_remote_git_delivery(remote_request, prepared, approval_id="first"),
+        )
+        assert delivered.result.state is RemoteGitDeliveryState.PUSHED
+        first_head = delivered.result.next_commit
+        pr = None
+        writes = []
+
+        def snapshot():
+            assert pr is not None
+            return {
+                **pr,
+                "head": {
+                    "ref": "cayu/delivery-1",
+                    "sha": _git(remote, "rev-parse", destination),
+                    "repo": {"full_name": "cayu/runtime"},
+                },
+            }
+
+        async def provider(request):
+            nonlocal pr
+            assert request.url.host == "api.github.example"
+            assert request.headers["authorization"] == f"Bearer {token}"
+            path = request.url.path
+            if request.method == "GET" and "/git/ref/" in path:
+                ref = "refs/" + path.split("/git/ref/", 1)[1]
+                return httpx.Response(200, json={"object": {"sha": _git(remote, "rev-parse", ref)}})
+            if request.method == "POST" and path.endswith("/pulls"):
+                assert pr is None
+                payload = json.loads(request.content)
+                writes.append(("create", 7))
+                pr = {
+                    "number": 7,
+                    "node_id": "PR_exact_7",
+                    "html_url": "https://github.example/pr/7",
+                    "state": "open",
+                    "draft": payload["draft"],
+                    "merged": False,
+                    "base": {"ref": "main", "sha": base, "repo": {"full_name": "cayu/runtime"}},
+                    "title": payload["title"],
+                    "body": payload["body"],
+                    "labels": [],
+                }
+                return httpx.Response(201, json=snapshot())
+            if request.method == "PATCH":
+                assert path.endswith("/pulls/7")
+                writes.append(("update", 7))
+                pr.update(json.loads(request.content))
+                return httpx.Response(200, json=snapshot())
+            assert request.method == "GET"
+            if path.endswith("/pulls"):
+                return httpx.Response(200, json=[] if pr is None else [snapshot()])
+            if path.endswith("/pulls/7"):
+                return httpx.Response(200, json=snapshot())
+            if path.endswith("/check-runs"):
+                head = path.split("/commits/", 1)[1].split("/", 1)[0]
+                return httpx.Response(
+                    200,
+                    json={
+                        "total_count": 1,
+                        "check_runs": [
+                            {
+                                "id": 10,
+                                "name": "test",
+                                "head_sha": head,
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ],
+                    },
+                )
+            if path.endswith("/reviews"):
+                head = _git(remote, "rev-parse", destination)
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": 20 if head == first_head else 21,
+                            "user": {"login": "reviewer", "type": "User"},
+                            "state": "CHANGES_REQUESTED" if head == first_head else "APPROVED",
+                            "commit_id": head,
+                            "submitted_at": "2026-08-30T12:00:30Z",
+                            "body": f"Please improve the value; provider echoed {token}",
+                        }
+                    ],
+                )
+            if path.endswith(("/statuses", "/comments")):
+                return httpx.Response(200, json=[])
+            raise AssertionError(f"Unexpected fixed provider endpoint: {path}")
+
+        credentials = GitHubCredentials(
+            credential_profile_id="github-token",
+            token=SecretRef(name="github-token"),
+            resolver=StaticVault({"github-token": token}),
+        )
+        config = GitHubRepositoryConfig(
+            alias="github",
+            repository_id="fixture-repository",
+            installation_id="installation",
+            account_id="account",
+            api_base_url="https://api.github.example",
+            owner="cayu",
+            name="runtime",
+            credential_profile_id="github-token",
+            egress_profile_id="github-only",
+            credentials=credentials,
+        )
+        profile = GitHubConnectorProfile(
+            connector_id="github-connector",
+            behavior_fingerprint=github_connector_behavior_fingerprint(),
+            repositories={"github": config},
+        )
+
+        def github_request(current_product, current_delivery, *, update):
+            return github_pull_request_delivery_request(
+                current_product,
+                current_delivery,
+                connector_run_id="github-second" if update else "github-first",
+                session_id="github-session",
+                idempotency_key="second" if update else "first",
+                requested_at="2026-08-30T12:00:00Z",
+                repository_alias="github",
+                installation_id="installation",
+                account_id="account",
+                mode="update" if update else "create",
+                existing_pull_request_number=7 if update else None,
+                metadata=GitHubPullRequestMetadata(title="Follow-up" if update else "First patch"),
+                checks=GitHubCheckPolicy(required_checks=("test",)),
+                reviews=GitHubReviewPolicy(
+                    approval_required=True, required_approvers=("reviewer",), allow_follow_up=True
+                ),
+                security=GitHubSecurityAuthority(
+                    connector_id="github-connector",
+                    connector_behavior_fingerprint=github_connector_behavior_fingerprint(),
+                    credential_profile_id="github-token",
+                    egress_profile_id="github-only",
+                    policy_fingerprint=_digest("github-policy"),
+                    approval_policy_fingerprint=_digest("github-approval"),
+                    redaction_profile_fingerprint=_digest("github-redaction"),
+                    allowed_operations=(
+                        GitHubOperation.UPDATE_PULL_REQUEST
+                        if update
+                        else GitHubOperation.CREATE_PULL_REQUEST,
+                    ),
+                ),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+            connector = GitHubPullRequestConnector(
+                profile,
+                repository=GitHubDeliveryRepository(store),
+                transport=GitHubRestTransport(client),
+                clock=lambda: datetime(2026, 8, 30, 12, 1, tzinfo=UTC),
+            )
+            first_request = github_request(product, delivered, update=False)
+            first = await connector.run(
+                first_request,
+                product,
+                delivered,
+                approval=approve_github_delivery(first_request, approval_id="github-first"),
+            )
+            assert first.result.state is GitHubDeliveryState.CHANGES_REQUESTED
+            follow_up = github_follow_up_coding_input(
+                first.result,
+                provider_ids=("review:20",),
+                iteration=1,
+                product_run_id="coding-follow-up",
+                session_id="coding-follow-up-session",
+                task_id="coding-follow-up-task",
+            )
+            assert token not in follow_up.model_dump_json()
+            phase = tmp_path / "follow-up"
+            phase.mkdir()
+            _git(
+                phase,
+                "clone",
+                "--quiet",
+                "--branch",
+                "cayu/delivery-1",
+                str(remote),
+                str(phase / "seed"),
+            )
+            next_source = phase / "source"
+            next_source.mkdir()
+            (next_source / "app.py").write_text("VALUE = 'after'\n", encoding="utf-8")
+            next_workspace, next_product, _, _ = await _coding_publication(
+                phase,
+                next_source,
+                final_content=b"VALUE = 'reviewed'\n",
+                product_run_id=follow_up.product_run_id,
+                session_id=follow_up.session_id,
+                task_id=follow_up.task_id,
+                instruction="\n".join(follow_up.messages),
+                store=store,
+            )
+            next_request = _request(next_product, base).model_copy(
+                update={
+                    "delivery_id": "delivery-2",
+                    "idempotency_key": "delivery-2",
+                    "repository": remote_request.repository.model_copy(
+                        update={"expected_destination_commit": first_head}
+                    ),
+                }
+            )
+            next_prepared = await broker.prepare(
+                next_request, next_product, source_workspace=next_workspace
+            )
+            next_delivered = await broker.run(
+                next_request,
+                next_product,
+                source_workspace=next_workspace,
+                approval=approve_remote_git_delivery(
+                    next_request, next_prepared, approval_id="second"
+                ),
+            )
+            assert next_delivered.result.state is RemoteGitDeliveryState.PUSHED
+            second_request = github_request(next_product, next_delivered, update=True)
+            second = await connector.run(
+                second_request,
+                next_product,
+                next_delivered,
+                approval=approve_github_delivery(second_request, approval_id="github-second"),
+            )
+            assert second.result.state is GitHubDeliveryState.APPROVED
+            assert second.result.pull_request.number == first.result.pull_request.number == 7
+            assert second.result.head_commit != first_head
+            assert _git(remote, "rev-parse", f"{destination}^") == first_head
+            assert _git(remote, "show", f"{destination}:app.py") == "VALUE = 'reviewed'"
+            assert writes == [("create", 7), ("update", 7)]
+            assert token not in second.result.model_dump_json()
+            assert all(
+                token.encode() not in path.read_bytes()
+                for path in (tmp_path / "artifacts").rglob("*")
+                if path.is_file()
+            )
+
+    asyncio.run(exercise())
 
 
 def test_delivery_rejects_default_branch_and_changed_source(tmp_path: Path) -> None:

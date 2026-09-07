@@ -143,6 +143,12 @@ durable approval, and can push one exact commit to a new configured branch. It
 does not expose Git remotes, credentials, or network authority to the coding
 agent. See [Approved remote Git delivery](remote-git-delivery.md).
 
+Selecting `--with github-delivery` implies remote Git delivery and activates
+`integrations/github.py`. That separate host-only connector owns GitHub
+repository/installation mapping, vault credentials, fixed PR metadata effects,
+bounded exact-head checks and review observations, and follow-up evidence. It
+never edits code, pushes Git, or merges. See [GitHub delivery](github-delivery.md).
+
 The composition selects concrete implementations; selection is not authority.
 The registered exposure policy separately decides which tools are model-visible,
 and ordinary tool policy, approval policy, and runtime gates independently

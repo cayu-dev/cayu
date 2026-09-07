@@ -145,6 +145,10 @@ and push one exact commit to a new configured branch without exposing remote or
 credential authority to the coding agent. See
 [approved remote Git delivery](docs/remote-git-delivery.md).
 
+Add `--with github-delivery` to include the subsequent host-only PR, exact-head
+checks, review, and provenance-labelled follow-up seam. It implies remote Git
+delivery and does not authorize merge. See [GitHub delivery](docs/github-delivery.md).
+
 The generated repository starts from a clean Git commit, and each new product
 run requires a clean committed Git source baseline. It also requires `git`,
 `rg`, and the POSIX descriptor-relative filesystem primitives used by secure
@@ -594,6 +598,7 @@ Start with the document that matches the job:
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
 | Produce a durable checked patch without external delivery | [Maintained coding product](docs/coding-product.md) |
 | Deliver an approved exact patch to a new remote Git branch | [Approved remote Git delivery](docs/remote-git-delivery.md) |
+| Create a bound GitHub PR and observe exact-head checks/reviews | [GitHub delivery](docs/github-delivery.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
 | Contain a non-cooperative trusted host dependency behind a hard deadline | [Process-isolated host tools](https://github.com/cayu-tech/cayu/blob/main/docs/process-isolated-tools.md) |
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |

@@ -10183,8 +10183,12 @@ Structured Git invocations use the profile's exact executable with isolated
 home/config, disabled hooks, helpers, prompting, external diff, signing, editor,
 pager, submodule recursion, and ambient SSH state. Remote credentials are
 resolved only for the subprocess and output is secret-redacted before step
-evidence. The push is one exact commit to one new branch with an empty
-expected-value lease; default-branch, existing-ref, force, delete, tag, merge,
+evidence. The push is one exact commit to one destination branch. New branches
+use an empty expected-value lease. Existing-branch updates require an explicit
+`expected_destination_commit`, fetch and verify that head, and use it as both
+the reviewed coding baseline and the new commit's parent. Their push lease binds
+that exact previous head; a competing change fails closed. The PR base remains
+separately bound to `expected_base_commit`. Default-branch, history-rewriting, delete, tag, merge,
 and multi-ref effects are not representable in v1. Applications separately
 enforce the declared egress profile around this trusted host process.
 
@@ -10196,6 +10200,40 @@ local commit, pushing, failure, cancellation, partial cleanup, ambiguous
 acknowledgement, and reconstruction. Recovery observes the remote before retry,
 reuses only the retained exact commit, and never broadens or duplicates an
 uncertain write. See [Approved remote Git delivery](remote-git-delivery.md).
+
+### GitHub pull-request delivery
+
+`GitHubPullRequestConnector` is an optional provider layer that consumes only a
+`pushed` remote-Git publication and its originating patch-ready coding result.
+The immutable request binds those artifacts to configured
+repository/installation/account identities, exact base/head refs and commits,
+one create or exact-PR update mode, bounded metadata, declared checks/review
+policy, finite polling and content limits, named provider operations, and all
+security/profile identities. GitHub owner/name, API origin, credential refs,
+resolver, and egress authority remain application-host configuration.
+
+Every needed mutation requires a durable `GitHubDeliveryApproval` bound to the
+complete request, metadata, policy, and allowed operation set. The connector
+freshly observes refs and reconciles an exact matching PR before mutation or
+retry. A lost acknowledgement cannot create a second PR. Each run performs at
+most one bounded exact-head check/review observation and publishes durable
+progress; it never occupies a sleeping polling loop. Retry uses the same
+identity, poll count, elapsed bound, provider IDs, and prior operation evidence.
+
+The fixed provider transport uses REST plus one owned draft-to-ready GraphQL
+mutation, rejects redirects, bounds response bytes/time, resolves the token only
+at the HTTP boundary, and exposes no generic request operation.
+The semantic transport protocol may instead be implemented by a hardened `gh`
+broker with the same contract. Provider text is untrusted, secret-redacted,
+byte-bounded, provenance-labelled, and deduplicated before publication.
+
+PR state, draft, mergeability, merged state, declared-check settlement, and
+review settlement are independent. Missing, pending, failed, cancelled,
+timed-out, superseded, ambiguous, rate-limited, denied, and permission outcomes
+cannot be reported as success. Follow-up input retains provider and exact-head
+lineage but must enter a new ordinary coding-product run and remote-Git delivery;
+the connector never edits or executes code. Merge and all merge-adjacent effects
+are unrepresentable in v1. See [GitHub delivery](github-delivery.md).
 
 An isolation boundary separates guest execution from the host or control
 plane. Network denial restricts reachable destinations but does not itself

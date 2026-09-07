@@ -2,7 +2,8 @@
 
 Cayu's optional remote Git delivery product turns one accepted
 `patch_ready_for_delivery` coding-product publication into one exact commit on a
-new remote branch. The broker runs on the application host, outside the coding
+new remote branch or an approved exact-head update of an existing branch.
+The broker runs on the application host, outside the coding
 agent and its environment. It never gives the model a remote URL, credentials,
 raw Git command authority, or network authority.
 
@@ -26,7 +27,8 @@ commit or push, it fixes:
 
 - the broker-configured remote alias and public remote identity;
 - one full expected base commit and canonical base ref;
-- one new destination branch under the configured namespace;
+- one destination branch under the configured namespace and, for an update,
+  its exact `expected_destination_commit`;
 - exact author, committer, timestamp, title, and body;
 - credential, egress, policy, approval, redaction, and broker behavior
   identities; and
@@ -68,7 +70,8 @@ egress profile around the broker process.
 Delivery deliberately requires two calls:
 
 1. `broker.prepare(...)` revalidates the durable coding-product result, checks,
-   final source manifest, retained diff, remote base, and destination absence.
+   final source manifest, retained diff, remote base, and destination absence
+   or its exact expected previous commit.
    It materializes the exact source into a broker-owned isolated repository,
    stages it, verifies every Git blob byte, and publishes a durable
    `RemoteGitPreparedIntent`. It does not create a commit or write remotely.
@@ -85,9 +88,14 @@ commits or pushes. An exact terminal replay retrieves its original receipt
 without authorizing new execution. Returning a successful receipt still requires
 a fresh observation that the remote destination equals its exact commit.
 
-The push is limited to a new `refs/heads/cayu/...` branch by default. It uses an
-empty expected-value lease, so a destination created by another actor is a
-conflict. The default branch, force-updating an existing ref, ref deletion,
+The push is limited to the configured `refs/heads/cayu/...` namespace by default.
+An absent `expected_destination_commit` requires a new branch with an empty
+expected-value lease. An explicit previous commit requires fetching and verifying
+that existing branch, using it as the exact coding baseline and new commit's
+parent, and pushing with a lease bound to that previous commit. This permits only
+a fast-forward child, not a history rewrite. A competing destination change is a
+conflict. The separately admitted base branch must still match its expected commit.
+The default branch, non-fast-forward updates, ref deletion,
 tags, merge, pull-request creation, CI waiting, and merge are outside this
 product and cannot be expressed by `RemoteGitDeliveryRequest`.
 

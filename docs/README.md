@@ -17,6 +17,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Docker coding toolchains](docker-coding-toolchains.md)
 - [Environment factories](environment-factories.md)
 - Evals: [first evaluation](../src/cayu/guides/evals-first.md), [AI quality](../src/cayu/guides/evals-ai-quality.md), [production sessions and scenarios](../src/cayu/guides/evals-production.md), and the complete [reference](evals.md)
+- [GitHub delivery](github-delivery.md)
 - [Memory foundation](memory-foundation.md)
 - [Model catalog](model-catalog.md)
 - [Named checks](named-checks.md)
