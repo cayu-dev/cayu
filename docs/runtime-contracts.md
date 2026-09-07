@@ -4805,7 +4805,19 @@ only a terminal session with its prior invocation run fence released can advance
 to the new active generation. This owner transfer interrupts the predecessor
 session epoch but does not publish a terminal lifecycle event for the work
 attempt's immutable interaction; the replacement generation resumes that same
-still-open interaction. Ordinary incomplete-session recovery remains unavailable
+still-open interaction. The private recovery request carries that exact interaction
+identity to interruption finalization, which validates the reconstructed invocation
+context and live recovery claim before publishing a session-only interruption.
+It does not elect a new interaction terminal decision. This is independent of
+process-local interaction context and does not retain the expired invocation or
+skip environment cleanup. Cancellation waits for owned settlement to quiesce;
+an exact retry finishes cleanup before the replacement can become active.
+An already-durable terminal decision remains authoritative: recovery finishes its
+exact terminal publication, and replacement activation raises
+`WorkAttemptRecoveryRequired` rather than reopening the closed interaction. The
+activation checkpoint transition checks both elected and settled terminal decisions,
+so a retry after terminal publication obeys the same rule.
+Ordinary incomplete-session recovery remains unavailable
 to contracted sessions. If a predecessor
 committed the session recovery transition but failed before task-store
 activation, its exact checkpoint marker is reconciled only after the runtime

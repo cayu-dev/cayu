@@ -150,6 +150,10 @@ from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
     prepare_rebind_invocation_command,
 )
+from cayu.runtime._invocation_terminal_decision import (
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.runtime._isolated_tool_process import (
     isolated_tool_execution_contract,
     validate_process_isolated_tool_registration,
@@ -3628,6 +3632,7 @@ class CayuApp:
                     reason="work_attempt_predecessor_owner_expired",
                 ),
                 before_mutation=require_exact_recovery_claim,
+                interaction_id=recovering.interaction_id,
             )
         except _WorkAttemptRecoveryAlreadyActive:
             return
@@ -4126,6 +4131,16 @@ class CayuApp:
                         interaction_id if admission_kind == "initial" else None
                     ),
                 )
+                # Replacing an execution owner cannot undo a terminal winner,
+                # including one published while settling the expired epoch.
+                for decision in (
+                    invocation_terminal_decision_from_checkpoint(current_checkpoint),
+                    settled_invocation_terminal_decision_from_checkpoint(current_checkpoint),
+                ):
+                    if decision is not None and decision.interaction_id == interaction_id:
+                        raise WorkAttemptRecoveryRequired(
+                            "Work-attempt interaction has a durable terminal decision."
+                        )
                 current_profile = active_invocation_execution_profile_from_checkpoint(
                     current_checkpoint
                 )
@@ -6897,6 +6912,7 @@ class CayuApp:
             execution_profile=request.execution_profile,
             invocation_context=request.invocation_context,
             run_terminal_hooks=request.run_terminal_hooks,
+            preserve_interaction_id=request.preserve_interaction_id,
         )
 
     def _pending_session_interrupt_checkpoint_for_recovery(
@@ -7654,6 +7670,7 @@ class CayuApp:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         run_terminal_hooks: bool = True,
+        preserve_interaction_id: str | None = None,
     ) -> AsyncIterator[Event]:
         stream = self._session_engine._handle_session_interrupted(
             session=session,
@@ -7666,6 +7683,7 @@ class CayuApp:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             run_terminal_hooks=run_terminal_hooks,
+            preserve_interaction_id=preserve_interaction_id,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

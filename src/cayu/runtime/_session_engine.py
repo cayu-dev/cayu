@@ -6692,6 +6692,7 @@ class SessionEngine:
         self,
         request: IncompleteSessionRecoveryRequest,
         *,
+        interaction_id: str,
         before_mutation: Callable[[], Awaitable[None]],
     ) -> IncompleteSessionRecoveryResult:
         """Settle one contracted predecessor under authenticated attempt authority."""
@@ -6713,6 +6714,7 @@ class SessionEngine:
             return await self._recovery_coordinator.recover_incomplete_session(
                 request,
                 before_mutation=before_mutation,
+                preserve_interaction_id=interaction_id,
             )
 
         try:
@@ -27484,6 +27486,7 @@ class SessionEngine:
         provider_cancellation_failures: tuple[dict[str, Any], ...] = (),
         terminal_finalization_handoff_source_task: asyncio.Task[Any] | None = None,
         run_terminal_hooks: bool = True,
+        preserve_interaction_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         clear_current_task_cancellation()
         current_task = asyncio.current_task()
@@ -27724,8 +27727,28 @@ class SessionEngine:
                 operation_name="Live interruption terminal-decision read",
             )
             terminal_decision = invocation_terminal_decision_from_checkpoint(decision_checkpoint)
+            if preserve_interaction_id is not None:
+                active_profile = active_invocation_execution_profile_from_checkpoint(
+                    decision_checkpoint
+                )
+                if (
+                    invocation_context is None
+                    or invocation_context.recovery_claim_id is None
+                    or invocation_context.binding.session_id != loaded_interrupted.id
+                    or invocation_context.binding.session_instance_id
+                    != loaded_interrupted.instance_id
+                    or invocation_context.binding.run_epoch != loaded_interrupted.run_epoch
+                    or invocation_context.active_profile != active_profile
+                    or active_profile is None
+                    or active_profile.interaction_id != preserve_interaction_id
+                ):
+                    raise SessionRunFenced(
+                        "Execution-owner replacement lost its exact recovery interaction authority."
+                    )
+
             if (
                 terminal_decision is None
+                and preserve_interaction_id is None
                 and loaded_interrupted.status is SessionStatus.INTERRUPTING
                 and active_invocation_execution_profile_from_checkpoint(decision_checkpoint)
                 is not None
@@ -27868,7 +27891,20 @@ class SessionEngine:
                     yield emitted
                 return
             interaction_event: Event | None = None
-            if loaded_interrupted.status != SessionStatus.INTERRUPTED:
+            if preserve_interaction_id is not None:
+                assert invocation_context is not None
+                recovery_claim_id = invocation_context.recovery_claim_id
+                assert recovery_claim_id is not None
+                loaded_interrupted = await await_handoff_operation(
+                    lambda: self._transition_status_under_terminal_finalization_claim(
+                        session=loaded_interrupted,
+                        from_statuses={loaded_interrupted.status},
+                        to_status=SessionStatus.INTERRUPTED,
+                        claim_id=recovery_claim_id,
+                    ),
+                    operation_name="Execution-owner replacement epoch interruption",
+                )
+            elif loaded_interrupted.status != SessionStatus.INTERRUPTED:
                 (
                     loaded_interrupted,
                     interaction_event,
@@ -27892,7 +27928,8 @@ class SessionEngine:
                     operation_name="Live interruption interaction transition",
                 )
             if (
-                interaction_event is None
+                preserve_interaction_id is None
+                and interaction_event is None
                 and _current_session_interaction_id(session.id) is not None
             ):
                 _, interaction_event, _ = await await_handoff_operation(

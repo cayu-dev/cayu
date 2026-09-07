@@ -47,6 +47,7 @@ from cayu import (
     InMemorySessionStore,
     InMemoryTaskStore,
     Message,
+    PostgresSessionStore,
     ResumeRequest,
     RunRequest,
     SecretRedactor,
@@ -88,6 +89,10 @@ from cayu.runtime import (
 from cayu.runtime import sessions as sessions_module
 from cayu.runtime._invocation_lifecycle import (
     _release_invocation_command_with_cleanup_authority,
+)
+from cayu.runtime._invocation_terminal_decision import (
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -390,6 +395,7 @@ class _SecretBearingTaskResultStore(InMemoryTaskStore):
 class _SecretBearingSessionCreationResult(InMemorySessionStore):
     """Commit session creation, then substitute a secret-bearing return identity."""
 
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, secret: str) -> None:
@@ -420,6 +426,7 @@ class _SecretBearingSessionCreationResult(InMemorySessionStore):
 class _SecretBearingCheckpointResult(InMemorySessionStore):
     """Return a secret-bearing checkpoint after committing session creation."""
 
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, secret: str) -> None:
@@ -436,6 +443,7 @@ class _SecretBearingCheckpointResult(InMemorySessionStore):
 class _MalformedReceiptIdentityCheckpointResult(InMemorySessionStore):
     """Return a malformed receipt whose identity field contains a workload secret."""
 
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, secret: str) -> None:
@@ -457,6 +465,7 @@ class _MalformedReceiptIdentityCheckpointResult(InMemorySessionStore):
 class _FailWorkAttemptDeferredInputRead(InMemorySessionStore):
     """Raise one secret-bearing authority-read failure after session publication."""
 
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, secret: str) -> None:
@@ -488,6 +497,7 @@ class _BlockingWorkAttemptEventSink(EventSink):
 class _LeaseAdvancingWorkAttemptSessionStore(InMemorySessionStore):
     """Spend more than one task-store lease during selected event lookups."""
 
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, now: list[datetime]) -> None:
@@ -655,6 +665,7 @@ class _IneligibleWorkAttemptTransitionStore(InMemoryTaskStore):
 
 
 class _BlockFirstWorkAttemptSessionCreation(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
@@ -688,6 +699,7 @@ class _BlockFirstWorkAttemptSessionCreation(InMemorySessionStore):
 
 
 class _BlockFirstWorkAttemptRecoveryTransition(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
@@ -708,11 +720,12 @@ class _BlockFirstWorkAttemptRecoveryTransition(InMemorySessionStore):
         return await super().transition_status_and_checkpoint(session_id, **kwargs)
 
 
-class _BlockFirstWorkAttemptSettlementFence(InMemorySessionStore):
+class _BlockFirstWorkAttemptSettlementFenceMixin:
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.fence_committed = asyncio.Event()
         self.release_fence = asyncio.Event()
         self._block_first_fence = True
@@ -738,7 +751,29 @@ class _BlockFirstWorkAttemptSettlementFence(InMemorySessionStore):
         return fenced
 
 
+class _BlockFirstWorkAttemptSettlementFence(
+    _BlockFirstWorkAttemptSettlementFenceMixin, InMemorySessionStore
+):
+    terminal_interaction_publication_version = 1
+    invocation_lifecycle_command_version = 1
+
+
+class _BlockFirstSQLiteWorkAttemptSettlementFence(
+    _BlockFirstWorkAttemptSettlementFenceMixin, SQLiteSessionStore
+):
+    terminal_interaction_publication_version = 1
+    invocation_lifecycle_command_version = 1
+
+
+class _BlockFirstPostgresWorkAttemptSettlementFence(
+    _BlockFirstWorkAttemptSettlementFenceMixin, PostgresSessionStore
+):
+    terminal_interaction_publication_version = 1
+    invocation_lifecycle_command_version = 1
+
+
 class _BlockNextWorkAttemptCheckpointLoad(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
@@ -758,6 +793,7 @@ class _BlockNextWorkAttemptCheckpointLoad(InMemorySessionStore):
 
 
 class _FailOnceWorkAttemptRunFenceRelease(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
@@ -772,6 +808,7 @@ class _FailOnceWorkAttemptRunFenceRelease(InMemorySessionStore):
 
 
 class _BlockFirstWorkAttemptRunFenceRelease(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
@@ -789,6 +826,7 @@ class _BlockFirstWorkAttemptRunFenceRelease(InMemorySessionStore):
 
 
 class _FailWorkAttemptSettlementFence(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, message: str) -> None:
@@ -808,6 +846,7 @@ class _FailWorkAttemptSettlementFence(InMemorySessionStore):
 
 
 class _BlockFirstWorkAttemptContinuationAdmission(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
@@ -825,6 +864,7 @@ class _BlockFirstWorkAttemptContinuationAdmission(InMemorySessionStore):
 
 
 class _CancelFirstWorkAttemptSessionCreation(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, message: str) -> None:
@@ -853,6 +893,7 @@ class _CancelFirstWorkAttemptSessionCreation(InMemorySessionStore):
 
 
 class _FailCancelledWorkAttemptSessionCreation(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, message: str) -> None:
@@ -885,6 +926,7 @@ class _FailCancelledWorkAttemptSessionCreation(InMemorySessionStore):
 
 
 class _FailWorkAttemptSessionCreation(InMemorySessionStore):
+    terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
     def __init__(self, message: str) -> None:
@@ -3734,6 +3776,8 @@ def test_public_first_crash_recovery_needs_no_direct_store_mutation(
         assert recovered_session.run_epoch == source_session.run_epoch + 3
         recovered_checkpoint = await sessions.load_checkpoint(admitted.session_id)
         assert recovered_checkpoint is not None
+        assert invocation_terminal_decision_from_checkpoint(recovered_checkpoint) is None
+        assert settled_invocation_terminal_decision_from_checkpoint(recovered_checkpoint) is None
         assert "initial_transcript_pending" not in recovered_checkpoint
         assert await sessions.load_deferred_interaction_input(admitted.session_id) is None
         assert await sessions.load_transcript(admitted.session_id) == [
@@ -4191,10 +4235,25 @@ def test_first_crash_settlement_extension_failure_is_diagnostic_safe(
     assert all(secret not in str(item.message) for item in caught_warnings)
 
 
-def test_cancelled_first_crash_settlement_is_quiescent_and_exactly_retryable() -> None:
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_cancelled_first_crash_settlement_is_quiescent_and_exactly_retryable(
+    backend: str,
+    tmp_path,
+    request: pytest.FixtureRequest,
+) -> None:
+    postgres_dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
-        sessions = _BlockFirstWorkAttemptSettlementFence()
+        sessions = (
+            _BlockFirstWorkAttemptSettlementFence()
+            if backend == "memory"
+            else _BlockFirstSQLiteWorkAttemptSettlementFence(tmp_path / "cancelled-sessions.sqlite")
+            if backend == "sqlite"
+            else _BlockFirstPostgresWorkAttemptSettlementFence(
+                postgres_dsn, schema_mode=SchemaMode.CREATE
+            )
+        )
         tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         source_app, run, execution = await _configured_public_initial_admission(
             prefix="cancelled-first-crash",
@@ -4249,6 +4308,9 @@ def test_cancelled_first_crash_settlement_is_quiescent_and_exactly_retryable() -
             }
             for record in lifecycle
         )
+
+        if backend != "memory":
+            await sessions.close()
 
     asyncio.run(scenario())
 
@@ -5597,3 +5659,180 @@ def test_sqlite_revision_61_migrates_and_validates_admission_authority(
 
     with pytest.raises(RuntimeError, match="work-attempt admission schema"):
         SQLiteTaskStore(path, schema_mode=SchemaMode.VALIDATE)
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_work_attempt_recovery_honors_durable_interruption_decision(
+    backend: str,
+    tmp_path,
+    request: pytest.FixtureRequest,
+) -> None:
+    postgres_dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+
+    async def scenario() -> None:
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        sessions = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "decided-sessions.sqlite")
+            if backend == "sqlite"
+            else PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        )
+        tasks = (
+            InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
+            if backend != "sqlite"
+            else SQLiteTaskStore(
+                tmp_path / "decided-tasks.sqlite",
+                clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
+            )
+        )
+        app, run, execution = await _configured_public_initial_admission(
+            prefix="decided-recovery",
+            sessions=sessions,
+            tasks=tasks,
+            redactor=SecretRedactor(),
+        )
+        admitted = await app.admit_work_attempt(
+            run, execution=execution.model_copy(update={"lease_seconds": 1})
+        )
+        payload = {
+            "interruption_type": "runtime_interrupted",
+            "interruption_request_id": "decided-recovery-interruption",
+        }
+        interrupted = await app._runtime_session_store.transition_status_and_checkpoint(
+            admitted.session_id,
+            from_statuses={SessionStatus.RUNNING},
+            to_status=SessionStatus.INTERRUPTING,
+            checkpoint_transform=lambda _session, checkpoint: {
+                **(checkpoint or {}),
+                "pending_session_interrupt": payload,
+            },
+        )
+        decision = await app._session_engine._ensure_interruption_terminal_decision(
+            session=interrupted,
+            terminal_payload=payload,
+            interruption_request_id=payload["interruption_request_id"],
+        )
+        assert decision is not None
+        now[0] += timedelta(seconds=2)
+        replacement = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        replacement.register_provider(_RecordingProvider(), default=True)
+        replacement.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        recovery = WorkAttemptRecoveryRequest(
+            admission_id=admitted.admission_id,
+            claim_id="decided-recovery-claim-2",
+            worker_id="decided-recovery-worker-2",
+            generation=2,
+            lease_seconds=300,
+        )
+        # Both the elected winner and an already-published winner must survive
+        # the exact retry; neither may be turned into a running interaction.
+        for _ in range(2):
+            with pytest.raises(WorkAttemptRecoveryRequired, match="durable terminal decision"):
+                await replacement.recover_work_attempt(recovery)
+            session = await sessions.load(admitted.session_id)
+            assert session is not None and session.status is SessionStatus.INTERRUPTED
+            checkpoint = await sessions.load_checkpoint(admitted.session_id)
+            assert invocation_terminal_decision_from_checkpoint(checkpoint) is None
+            assert settled_invocation_terminal_decision_from_checkpoint(checkpoint) == decision
+            events = await sessions.query_events(
+                EventQuery(session_id=admitted.session_id, limit=100)
+            )
+            assert [
+                r.event.id for r in events if r.event.type is EventType.INTERACTION_INTERRUPTED
+            ] == [decision.interaction_event_id]
+            assert [
+                r.event.id for r in events if r.event.type is EventType.SESSION_INTERRUPTED
+            ] == [decision.terminal_event_id]
+            current = await tasks.load_work_attempt_admission(admitted.admission_id)
+            assert current is not None and current.state is WorkAttemptAdmissionState.RECOVERING
+        if backend != "memory":
+            await sessions.close()
+            if backend == "sqlite":
+                await tasks.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_work_attempt_recovery_retries_after_session_only_interruption(
+    backend: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    postgres_dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+
+    async def scenario() -> None:
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        sessions = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "partial-interruption.sqlite")
+            if backend == "sqlite"
+            else PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        )
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
+        app, run, execution = await _configured_public_initial_admission(
+            prefix="partial-interruption",
+            sessions=sessions,
+            tasks=tasks,
+            redactor=SecretRedactor(),
+        )
+        admitted = await app.admit_work_attempt(
+            run, execution=execution.model_copy(update={"lease_seconds": 1})
+        )
+        now[0] += timedelta(seconds=2)
+        replacement = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        replacement.register_provider(_RecordingProvider(), default=True)
+        replacement.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        engine = replacement._session_engine
+        transition = engine._transition_status_under_terminal_finalization_claim
+        fail_once = True
+
+        async def fail_after_status(**kwargs):
+            nonlocal fail_once
+            result = await transition(**kwargs)
+            if fail_once:
+                fail_once = False
+                raise RuntimeError("lost after session-only interruption")
+            return result
+
+        monkeypatch.setattr(
+            engine, "_transition_status_under_terminal_finalization_claim", fail_after_status
+        )
+        recovery = WorkAttemptRecoveryRequest(
+            admission_id=admitted.admission_id,
+            claim_id="partial-interruption-claim-2",
+            worker_id="partial-interruption-worker-2",
+            generation=2,
+            lease_seconds=300,
+        )
+        with pytest.raises(RuntimeError, match="lost after session-only interruption"):
+            await replacement.recover_work_attempt(recovery)
+        interrupted = await sessions.load(admitted.session_id)
+        assert interrupted is not None and interrupted.status is SessionStatus.INTERRUPTED
+        recovering = await tasks.load_work_attempt_admission(admitted.admission_id)
+        assert recovering is not None and recovering.state is WorkAttemptAdmissionState.RECOVERING
+        recovered = await replacement.recover_work_attempt(recovery)
+        assert recovered.state is WorkAttemptAdmissionState.ACTIVE
+        assert recovered.claim == recovering.claim
+        events = await sessions.query_events(EventQuery(session_id=admitted.session_id, limit=100))
+        assert sum(r.event.type is EventType.INTERACTION_STARTED for r in events) == 1
+        assert not any(
+            r.event.type
+            in {
+                EventType.INTERACTION_INTERRUPTED,
+                EventType.INTERACTION_FAILED,
+                EventType.INTERACTION_COMPLETED,
+            }
+            for r in events
+        )
+        checkpoint = await sessions.load_checkpoint(admitted.session_id)
+        assert invocation_terminal_decision_from_checkpoint(checkpoint) is None
+        assert settled_invocation_terminal_decision_from_checkpoint(checkpoint) is None
+        if backend != "memory":
+            await sessions.close()
+
+    asyncio.run(scenario())

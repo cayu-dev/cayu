@@ -1332,6 +1332,8 @@ class RecoveryTaskEventRequest:
 
 @dataclass(frozen=True)
 class RecoveryInterruptionRequest:
+    """Interrupt an epoch, optionally preserving an authenticated replacement interaction."""
+
     session: Session
     registered_agent: runtime_records.RegisteredAgentState
     registered_environment: runtime_records.RegisteredEnvironment | None
@@ -1339,6 +1341,7 @@ class RecoveryInterruptionRequest:
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
     run_terminal_hooks: bool = True
+    preserve_interaction_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -15100,10 +15103,17 @@ class RecoveryCoordinator:
         before_mutation: RecoveryMutationHook | None = None,
         retain_open_interaction_invocation: bool = False,
         retain_invocation_context: Callable[[InvocationContext], None] | None = None,
+        preserve_interaction_id: str | None = None,
     ) -> IncompleteSessionRecoveryResult:
         """Repair one incomplete session without executing providers or tools."""
         if retain_invocation_context is not None and not retain_open_interaction_invocation:
             raise ValueError("Invocation context retention requires an open recovery invocation.")
+        if preserve_interaction_id is not None:
+            require_clean_nonblank(preserve_interaction_id, "preserve_interaction_id")
+            if before_mutation is None or retain_open_interaction_invocation:
+                raise ValueError(
+                    "Execution-owner replacement requires an exact claim hook and full cleanup."
+                )
         retained_invocation_context: InvocationContext | None = None
 
         def retain_context(context: InvocationContext) -> None:
@@ -15116,6 +15126,7 @@ class RecoveryCoordinator:
         if session is None:
             raise KeyError(f"Session not found: {request.session_id}") from None
         recovered = await self._recover_incomplete_session_scoped(
+            preserve_interaction_id=preserve_interaction_id,
             session=session,
             inactive_for_seconds=request.inactive_for_seconds,
             reason=request.reason,
@@ -15684,6 +15695,7 @@ class RecoveryCoordinator:
         provider_disposition_task_handoff_id: str | None = None,
         provider_disposition_after_admission: RecoveryMutationHook | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
+        preserve_interaction_id: str | None = None,
     ) -> IncompleteSessionRecoveryResult:
         reason = require_clean_nonblank(reason, "reason")
         metadata = copy_json_value(metadata, "metadata")
@@ -15700,6 +15712,7 @@ class RecoveryCoordinator:
             )
 
         return await self._recover_incomplete_session_owned(
+            preserve_interaction_id=preserve_interaction_id,
             session=session,
             inactive_for_seconds=inactive_for_seconds,
             reason=reason,
@@ -15731,6 +15744,7 @@ class RecoveryCoordinator:
         provider_disposition_task_handoff_id: str | None = None,
         provider_disposition_after_admission: RecoveryMutationHook | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
+        preserve_interaction_id: str | None = None,
     ) -> IncompleteSessionRecoveryResult:
 
         if (provider_disposition_task_id is None) != (
@@ -16182,6 +16196,7 @@ class RecoveryCoordinator:
                     observed_at=self._clock(),
                 )
                 recovered = await self._recover_incomplete_session(
+                    preserve_interaction_id=preserve_interaction_id,
                     session=claim.session,
                     session_before_fence=claim.session_before_fence,
                     previous_status=previous_status,
@@ -19772,6 +19787,7 @@ class RecoveryCoordinator:
         provider_disposition_task_worker_id: str | None = None,
         provider_disposition_task_handoff_id: str | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
+        preserve_interaction_id: str | None = None,
     ) -> IncompleteSessionRecoveryResult:
         if (execution_profile_snapshot is None) != (invocation_context is None):
             raise RuntimeError(
@@ -19874,6 +19890,7 @@ class RecoveryCoordinator:
                 )
             if session.status is SessionStatus.INTERRUPTING:
                 session = await self._finalize_interrupting_for_recovery(
+                    preserve_interaction_id=preserve_interaction_id,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -19923,6 +19940,7 @@ class RecoveryCoordinator:
                     "Provider cancellation interruption marker conflicts with session status."
                 )
             session = await self._finalize_interrupting_for_recovery(
+                preserve_interaction_id=preserve_interaction_id,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -20520,6 +20538,7 @@ class RecoveryCoordinator:
                     pending_round=pending_tool_round,
                 )
                 session = await self._finalize_interrupting_for_recovery(
+                    preserve_interaction_id=preserve_interaction_id,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -20579,6 +20598,7 @@ class RecoveryCoordinator:
                     ),
                 )
             session = await self._finalize_interrupting_for_recovery(
+                preserve_interaction_id=preserve_interaction_id,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -20622,6 +20642,7 @@ class RecoveryCoordinator:
                     "Pending user-input recovery authority changed before finalization."
                 )
             session = await self._finalize_interrupting_for_recovery(
+                preserve_interaction_id=preserve_interaction_id,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -20647,6 +20668,7 @@ class RecoveryCoordinator:
 
         if session.status == SessionStatus.INTERRUPTING:
             session = await self._finalize_interrupting_for_recovery(
+                preserve_interaction_id=preserve_interaction_id,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -20744,10 +20766,12 @@ class RecoveryCoordinator:
         events: list[Event],
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
+        preserve_interaction_id: str | None = None,
     ) -> Session:
         if session.status == SessionStatus.INTERRUPTING:
             async for event in self._interrupt_session_for_recovery(
                 RecoveryInterruptionRequest(
+                    preserve_interaction_id=preserve_interaction_id,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
