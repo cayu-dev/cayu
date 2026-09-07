@@ -9811,6 +9811,33 @@ Runner commands use `ExecCommand`:
 The runtime should not pass a single ambiguous command string to runners. Use process mode unless shell parsing, expansion, and quoting are intentional.
 Runner output capture is bounded by `output_limit_bytes` and returns `stdout_truncated` / `stderr_truncated` flags when output is capped. Direct runner calls default to 1 MiB per stream; the model-facing `exec_command` tool passes its smaller 50,000-byte default into the runner. This limit belongs in the runner, not only in tool post-processing, so commands cannot exhaust runtime memory before the model-facing result is built. Runners continue draining both streams after the capture bound is reached so a child cannot block on a full pipe. `ExecResult.stdout_bytes` and `stderr_bytes` report the total bytes observed before truncation when the adapter can know that value; `None` means the total is unavailable, not zero. The captured strings may therefore be smaller than their total byte counts.
 
+The built-in `exec_command` result preserves each stream's observed byte total as
+`stdout_bytes` / `stderr_bytes` (including `None` when unknown). Its
+`stdout_encoding` / `stderr_encoding` fields are `text` for ordinary captured
+text. If a stream contains NUL or a non-scalar Unicode code point, that stream is
+represented as a complete ASCII JSON string literal and its encoding is
+`json-string`; JSON-decoding that field recovers the captured text, including
+literal backslashes. The human-readable content labels encoded streams. Durable
+text inputs still reject literal NUL and non-scalar Unicode.
+
+Encoding happens after runner redaction and capture limits. It adds at most six
+times the captured UTF-8 byte budget plus two quote bytes per stream, without
+further truncation or binary artifact retention. Capture byte counts, truncation,
+exit code, timeout, and cancellation retain their runner meanings. Bundled text
+capture decodes invalid UTF-8 with replacement; escaping preserves that decoded
+text, not the original invalid bytes. Output encoding never reruns a command or
+changes nonzero-exit policy, and is not evidence of remote business-side settlement.
+
+The `run_check` and `run_command` projections preserve these encoding fields in
+results and retained output records, including the material hashed by
+`output_sha256`. Their content labels encoded streams. If a model preview or
+publication ceiling cuts an encoded string, its encoding is `json-string-preview`:
+this is a display-only preview, not a complete JSON literal. The retained output
+record, when available, still contains the complete `json-string` representation.
+Structured-command recovery applies the same encoding when reconstructing an
+observed runner result and preserves metadata from checkpointed tool results.
+
+
 When either truncation flag is set, `ExecCommandTool` includes an explicit truncation marker in
 model-facing content even if conservative runner validation suppressed every captured byte. The
 suppressed bytes remain absent from both content and structured output.

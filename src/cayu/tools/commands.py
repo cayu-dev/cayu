@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from enum import StrEnum
 from inspect import isawaitable
 from typing import Protocol, runtime_checkable
@@ -336,9 +338,11 @@ class ExecCommandTool(Tool):
             return _runner_unavailable_result(exc)
         result = _require_exec_result(result)
         mutation_settlement = runner_workspace_mutation_settlement(result=result, error=None)
+        stdout, stdout_encoding = _portable_command_output(result.stdout)
+        stderr, stderr_encoding = _portable_command_output(result.stderr)
         content = _command_content(
-            stdout=result.stdout,
-            stderr=result.stderr,
+            stdout=stdout,
+            stderr=stderr,
             exit_code=result.exit_code,
             timed_out=result.timed_out,
             cancelled=result.cancelled,
@@ -346,9 +350,20 @@ class ExecCommandTool(Tool):
             stdout_truncated=result.stdout_truncated,
             stderr_truncated=result.stderr_truncated,
         )
+        encoded_streams = [
+            stream
+            for stream, encoding in (("stdout", stdout_encoding), ("stderr", stderr_encoding))
+            if encoding == "json-string"
+        ]
+        if encoded_streams:
+            content = f"[JSON string encoding: {', '.join(encoded_streams)}]\n{content}"
         structured = {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_encoding": stdout_encoding,
+            "stderr_encoding": stderr_encoding,
+            "stdout_bytes": result.stdout_bytes,
+            "stderr_bytes": result.stderr_bytes,
             "stdout_truncated": result.stdout_truncated,
             "stderr_truncated": result.stderr_truncated,
             "exit_code": result.exit_code,
@@ -359,8 +374,6 @@ class ExecCommandTool(Tool):
         if include_runner_evidence:
             structured.update(
                 {
-                    "stdout_bytes": result.stdout_bytes,
-                    "stderr_bytes": result.stderr_bytes,
                     "workspace_mutation_settlement": mutation_settlement,
                 }
             )
@@ -664,6 +677,42 @@ def _require_exec_result(result: object) -> ExecResult:
     if type(result) is not ExecResult:
         raise TypeError("Runner returned invalid result type.")
     return result
+
+
+def _portable_command_output(text: str) -> tuple[str, str]:
+    """Encode captured text after runner redaction, before durable validation.
+
+    JSON string syntax is unambiguous even for literal backslashes. Expansion
+    is bounded by six times the captured UTF-8 bytes plus two quotes. Runners
+    own capture limits and decoding; this representation does not recover bytes
+    already replaced by a runner's UTF-8 decoder.
+    """
+
+    if "\0" in text or any(0xD800 <= ord(char) <= 0xDFFF for char in text):
+        return json.dumps(text, ensure_ascii=True), "json-string"
+    return text, "text"
+
+
+def _command_output_encoding(structured: Mapping[str, object], stream: str) -> str:
+    # Older durable results contain ordinary text without encoding metadata.
+    encoding = structured.get(f"{stream}_encoding", "text")
+    if encoding not in ("text", "json-string", "json-string-preview"):
+        raise TypeError("Runner returned invalid output encoding.")
+    return str(encoding)
+
+
+def _command_output_preview_encoding(encoding: str, truncated: bool) -> str:
+    if truncated and encoding == "json-string":
+        return "json-string-preview"
+    return encoding
+
+
+def _command_output_label(stream: str, encoding: str) -> str:
+    if encoding == "json-string":
+        return f"{stream} (JSON string)"
+    if encoding == "json-string-preview":
+        return f"{stream} (JSON string preview; not a complete JSON literal)"
+    return stream
 
 
 def _command_content(

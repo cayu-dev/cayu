@@ -35,6 +35,9 @@ from cayu.tools.commands import (
     MAX_TIMEOUT_SECONDS,
     CommandPolicy,
     ExecCommandTool,
+    _command_output_encoding,
+    _command_output_label,
+    _command_output_preview_encoding,
 )
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservation,
@@ -47,7 +50,7 @@ if TYPE_CHECKING:
     from cayu.workspaces.base import Workspace
 
 NAMED_CHECK_DECLARATION_BEHAVIOR_VERSION = "1"
-RUN_CHECK_RESULT_PROJECTION_VERSION = "4"
+RUN_CHECK_RESULT_PROJECTION_VERSION = "5"
 DEFAULT_CHECK_MODEL_OUTPUT_BYTES = 16_000
 MAX_CHECK_MODEL_OUTPUT_BYTES = 50_000
 MAX_NAMED_CHECKS = 128
@@ -516,6 +519,8 @@ class RunCheckTool(Tool):
 
         stdout = _required_result_text(structured, "stdout")
         stderr = _required_result_text(structured, "stderr")
+        stdout_encoding = _command_output_encoding(structured, "stdout")
+        stderr_encoding = _command_output_encoding(structured, "stderr")
         stdout_preview, stdout_projection_truncated = _truncate_utf8(
             stdout,
             maximum=self._max_model_output_bytes,
@@ -537,6 +542,8 @@ class RunCheckTool(Tool):
                 "check_profile_fingerprint": check.profile_fingerprint,
                 "stdout": stdout,
                 "stderr": stderr,
+                "stdout_encoding": stdout_encoding,
+                "stderr_encoding": stderr_encoding,
                 "stdout_runner_truncated": stdout_runner_truncated,
                 "stderr_runner_truncated": stderr_runner_truncated,
             },
@@ -591,6 +598,12 @@ class RunCheckTool(Tool):
             "exit_code": exit_code,
             "stdout": stdout_preview,
             "stderr": stderr_preview,
+            "stdout_encoding": _command_output_preview_encoding(
+                stdout_encoding, stdout_projection_truncated
+            ),
+            "stderr_encoding": _command_output_preview_encoding(
+                stderr_encoding, stderr_projection_truncated
+            ),
             "stdout_truncated": stdout_runner_truncated or stdout_projection_truncated,
             "stderr_truncated": stderr_runner_truncated or stderr_projection_truncated,
             "stdout_runner_truncated": stdout_runner_truncated,
@@ -633,7 +646,9 @@ class RunCheckTool(Tool):
                 status=status,
                 exit_code=exit_code,
                 stdout=stdout_preview,
+                stdout_encoding=_command_output_encoding(projected, "stdout"),
                 stderr=stderr_preview,
+                stderr_encoding=_command_output_encoding(projected, "stderr"),
                 stdout_truncated=stdout_runner_truncated or stdout_projection_truncated,
                 stderr_truncated=stderr_runner_truncated or stderr_projection_truncated,
             ),
@@ -830,6 +845,8 @@ def _model_content(
     exit_code: int,
     stdout: str,
     stderr: str,
+    stdout_encoding: str,
+    stderr_encoding: str,
     stdout_truncated: bool,
     stderr_truncated: bool,
 ) -> str:
@@ -842,9 +859,9 @@ def _model_content(
         first = f"{first[:-1]} with exit code {exit_code}."
     sections = [first]
     if stdout.strip():
-        sections.append(f"stdout:\n{stdout.strip()}")
+        sections.append(f"{_command_output_label('stdout', stdout_encoding)}:\n{stdout.strip()}")
     if stderr.strip():
-        sections.append(f"stderr:\n{stderr.strip()}")
+        sections.append(f"{_command_output_label('stderr', stderr_encoding)}:\n{stderr.strip()}")
     if stdout_truncated or stderr_truncated:
         sections.append("Check output was truncated; inspect the structured artifact evidence.")
     return "\n\n".join(sections)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -837,15 +838,17 @@ def test_structured_command_durable_recovery_never_replays_forced_interruption(
 
 
 @pytest.mark.parametrize("recovery_source", ("journal", "runner"))
+@pytest.mark.parametrize("output", ["ok", "a\0b"])
 def test_structured_command_recovery_projects_checkpointed_runner_terminal(
     tmp_path: Path,
+    output: str,
     monkeypatch: pytest.MonkeyPatch,
     recovery_source: str,
 ) -> None:
     (tmp_path / "uv.lock").write_bytes(b"locked\n")
     workspace = LocalWorkspace(tmp_path, workspace_id="workspace")
     profile = _profile()
-    runner = _AdmittedRunner(profile)
+    runner = _AdmittedRunner(profile, result=ExecResult(stdout=output, stderr=output))
     tool = RunCommandTool(toolchain_profile=profile)
     arguments = {"selector": "focused-test", "args": ["tests/test_unit.py"]}
     records: dict[str, dict[str, object]] = {}
@@ -953,6 +956,10 @@ def test_structured_command_recovery_projects_checkpointed_runner_terminal(
     )
 
     assert recovered is not None
+    for stream in ("stdout", "stderr"):
+        encoding = recovered.structured[f"{stream}_encoding"]
+        value = recovered.structured[stream]
+        assert (json.loads(value) if encoding == "json-string" else value) == output
     assert recovered.structured["status"] == "succeeded"
     assert recovered.structured["process_status"] == "succeeded"
     assert recovered.structured["dispatch"] == "runner_terminal_evidence"
@@ -963,13 +970,17 @@ def test_structured_command_recovery_projects_checkpointed_runner_terminal(
     assert len(runner.commands) == 1
 
 
+@pytest.mark.parametrize(
+    "output", ["ok", "a\0b", "\0" * 2_000], ids=["text", "encoded", "encoded-preview"]
+)
 def test_structured_command_durable_recovery_reconstructs_terminal_result(
     tmp_path: Path,
+    output: str,
 ) -> None:
     (tmp_path / "uv.lock").write_bytes(b"locked\n")
     workspace = LocalWorkspace(tmp_path, workspace_id="workspace")
     profile = _profile()
-    runner = _AdmittedRunner(profile)
+    runner = _AdmittedRunner(profile, result=ExecResult(stdout=output, stderr=output))
     tool = RunCommandTool(toolchain_profile=profile)
     arguments = {"selector": "focused-test", "args": ["tests/test_unit.py"]}
     records: dict[str, dict[str, object]] = {}
@@ -1032,6 +1043,19 @@ def test_structured_command_durable_recovery_reconstructs_terminal_result(
 
     assert next(iter(records.values()))["state"] == "terminal"
     assert recovered is not None
+    for stream in ("stdout", "stderr"):
+        encoding = recovered.structured[f"{stream}_encoding"]
+        value = recovered.structured[stream]
+        assert encoding == completed.structured[f"{stream}_encoding"]
+        if encoding == "json-string-preview":
+            assert recovered.structured[f"{stream}_projection_truncated"]
+            assert "not a complete JSON literal" in recovered.content
+            # Recovery metadata can require a shorter preview under the same ceiling.
+            assert completed.structured[stream].startswith(value.split("\n", 1)[0])
+            assert len(recovered.model_dump_json().encode()) <= profile.result_publication_max_bytes
+        else:
+            assert value == completed.structured[stream]
+            assert (json.loads(value) if encoding == "json-string" else value) == output
     assert recovered.structured["status"] == completed.structured["status"]
     assert recovered.structured["output_sha256"] == completed.structured["output_sha256"]
     assert recovered.structured["recovered"] is True

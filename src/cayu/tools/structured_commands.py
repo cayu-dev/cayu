@@ -45,6 +45,10 @@ from cayu.tools.commands import (
     CommandPolicyResult,
     CommandRequest,
     ExecCommandTool,
+    _command_output_encoding,
+    _command_output_label,
+    _command_output_preview_encoding,
+    _portable_command_output,
 )
 from cayu.workspaces import WorkspaceGitEntry, WorkspaceGitEntryListResult, WorkspaceReadResult
 
@@ -924,6 +928,8 @@ class RunCommandTool(Tool):
             )
         stdout = _required_text(structured, "stdout")
         stderr = _required_text(structured, "stderr")
+        stdout_encoding = _command_output_encoding(structured, "stdout")
+        stderr_encoding = _command_output_encoding(structured, "stderr")
         stdout_preview, stdout_projection_truncated = _truncate_utf8(
             stdout,
             maximum=authority.max_model_output_bytes,
@@ -947,6 +953,8 @@ class RunCommandTool(Tool):
                 "argv_sha256": argv_digest,
                 "stdout": stdout,
                 "stderr": stderr,
+                "stdout_encoding": stdout_encoding,
+                "stderr_encoding": stderr_encoding,
                 "stdout_runner_truncated": stdout_runner_truncated,
                 "stderr_runner_truncated": stderr_runner_truncated,
             },
@@ -1034,6 +1042,12 @@ class RunCommandTool(Tool):
             "cancelled": cancelled,
             "stdout": stdout_preview,
             "stderr": stderr_preview,
+            "stdout_encoding": _command_output_preview_encoding(
+                stdout_encoding, stdout_projection_truncated
+            ),
+            "stderr_encoding": _command_output_preview_encoding(
+                stderr_encoding, stderr_projection_truncated
+            ),
             "stdout_truncated": stdout_runner_truncated or stdout_projection_truncated,
             "stderr_truncated": stderr_runner_truncated or stderr_projection_truncated,
             "stdout_runner_truncated": stdout_runner_truncated,
@@ -1071,7 +1085,9 @@ class RunCommandTool(Tool):
                 status=status,
                 exit_code=exit_code,
                 stdout=stdout_preview,
+                stdout_encoding=_command_output_encoding(projected, "stdout"),
                 stderr=stderr_preview,
+                stderr_encoding=_command_output_encoding(projected, "stderr"),
                 truncated=projected["stdout_truncated"] or projected["stderr_truncated"],
             ),
             structured=projected,
@@ -1117,7 +1133,9 @@ class RunCommandTool(Tool):
                     status=status,
                     exit_code=exit_code,
                     stdout=stdout_preview,
+                    stdout_encoding=_command_output_encoding(projected, "stdout"),
                     stderr=stderr_preview,
+                    stderr_encoding=_command_output_encoding(projected, "stderr"),
                     truncated=(projected["stdout_truncated"] or projected["stderr_truncated"]),
                 ),
                 structured=projected,
@@ -1685,9 +1703,13 @@ async def _recover_command_journal_result(
 
 def _raw_command_tool_result(result: ExecResult) -> ToolResult:
     settlement = runner_workspace_mutation_settlement(result=result, error=None)
+    stdout, stdout_encoding = _portable_command_output(result.stdout)
+    stderr, stderr_encoding = _portable_command_output(result.stderr)
     structured = {
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_encoding": stdout_encoding,
+        "stderr_encoding": stderr_encoding,
         "stdout_truncated": result.stdout_truncated,
         "stderr_truncated": result.stderr_truncated,
         "exit_code": result.exit_code,
@@ -2153,11 +2175,21 @@ def _bound_command_result_publication(
             stderr,
             maximum=preview_maximum,
         )
+        # Terminal recovery can re-bound a preview that was already shortened.
+        # Preserve that evidence even when this pass does not cut more bytes.
+        stdout_publication_truncated |= bool(original.get("stdout_projection_truncated"))
+        stderr_publication_truncated |= bool(original.get("stderr_projection_truncated"))
         projected = dict(original)
         projected.update(
             {
                 "stdout": stdout_preview,
                 "stderr": stderr_preview,
+                "stdout_encoding": _command_output_preview_encoding(
+                    _command_output_encoding(original, "stdout"), stdout_publication_truncated
+                ),
+                "stderr_encoding": _command_output_preview_encoding(
+                    _command_output_encoding(original, "stderr"), stderr_publication_truncated
+                ),
                 "stdout_truncated": bool(projected.get("stdout_runner_truncated"))
                 or stdout_publication_truncated,
                 "stderr_truncated": bool(projected.get("stderr_runner_truncated"))
@@ -2173,7 +2205,9 @@ def _bound_command_result_publication(
                 status=str(projected["status"]),
                 exit_code=int(projected["exit_code"]),
                 stdout=stdout_preview,
+                stdout_encoding=_command_output_encoding(projected, "stdout"),
                 stderr=stderr_preview,
+                stderr_encoding=_command_output_encoding(projected, "stderr"),
                 truncated=(projected["stdout_truncated"] or projected["stderr_truncated"]),
             ),
             structured=projected,
@@ -2278,6 +2312,8 @@ def _model_content(
     exit_code: int,
     stdout: str,
     stderr: str,
+    stdout_encoding: str,
+    stderr_encoding: str,
     truncated: bool,
 ) -> str:
     first = f"Command selector {selector!r} {status}."
@@ -2285,9 +2321,9 @@ def _model_content(
         first = f"Command selector {selector!r} settled with exit code {exit_code}."
     sections = [first]
     if stdout.strip():
-        sections.append(f"stdout:\n{stdout.strip()}")
+        sections.append(f"{_command_output_label('stdout', stdout_encoding)}:\n{stdout.strip()}")
     if stderr.strip():
-        sections.append(f"stderr:\n{stderr.strip()}")
+        sections.append(f"{_command_output_label('stderr', stderr_encoding)}:\n{stderr.strip()}")
     if truncated:
         sections.append("Command output was truncated; inspect retained artifact evidence.")
     return "\n\n".join(sections)
