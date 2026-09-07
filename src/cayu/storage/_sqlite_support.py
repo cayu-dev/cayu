@@ -57,6 +57,7 @@ from cayu.runtime.tasks import (
 from cayu.runtime.work_contracts import WorkContractRef
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
+from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL
 from cayu.storage._diagnostic_inspection import (
     DiagnosticStoreInspectionChanged,
     current_diagnostic_store_inspection,
@@ -277,6 +278,18 @@ def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
         "cayu_transcript_search_tokenizer_version",
         0,
         lambda: TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
+        deterministic=True,
+    )
+    connection.create_function(
+        "cayu_canonical_accounting_json",
+        1,
+        lambda value: (
+            None
+            if value is None
+            else json.dumps(
+                json.loads(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        ),
         deterministic=True,
     )
     connection.create_aggregate(
@@ -940,6 +953,8 @@ _MIGRATIONS_TABLE_DDL = """
         applied_at TEXT NOT NULL
     )
 """
+
+_BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 
 # Per-revision forward-migration DDL, keyed by revision number. The baseline
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
@@ -4082,6 +4097,7 @@ _MIGRATION_STEPS: dict[int, str] = {
         );
     """,
     80: "ALTER TABLE cayu_eval_runs ADD COLUMN failure_diagnostic_json TEXT;",
+    82: SQLITE_ACCOUNTING_DDL,
     79: """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
             child_session_id TEXT COLLATE BINARY PRIMARY KEY

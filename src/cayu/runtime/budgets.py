@@ -53,17 +53,20 @@ from cayu.core.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime.costs import (
     CostLineItem,
     ModelPrice,
     PriceBook,
     Provenance,
     SessionCostSummary,
+    SessionCostTotals,
     _normalize_provider,
     _resolve_price_book,
     _ResolvedPrice,
     estimate_session_cost,
     resolve_price_book,
+    session_cost_totals,
 )
 from cayu.runtime.execution_units import (
     BudgetLimitIdentity,
@@ -1261,7 +1264,7 @@ class BudgetCheck(BaseModel):
     unpriced_model_steps: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     limit_reached: StrictBool
     message: str
-    cost_summary: SessionCostSummary
+    cost_summary: SessionCostTotals
 
     @field_validator("key")
     @classmethod
@@ -1295,7 +1298,9 @@ class BudgetCheck(BaseModel):
     @field_validator("cost_summary", mode="before")
     @classmethod
     def copy_cost_summary(cls, value: object) -> object:
-        return revalidate_model_input(value, SessionCostSummary)
+        if type(value) is SessionCostSummary or (isinstance(value, dict) and "line_items" in value):
+            return session_cost_totals(revalidate_model_input(value, SessionCostSummary))
+        return revalidate_model_input(value, SessionCostTotals)
 
 
 class BudgetSettlementFallback(BaseModel):
@@ -1859,6 +1864,21 @@ class BudgetStore(ABC):
     ) -> list[Event]:
         """Return events that contribute to the given budget scope."""
 
+    async def read_cost_for_budget(
+        self,
+        *,
+        scope: BudgetScope,
+        key: str | None,
+        window: BudgetWindow,
+        pricing: PriceBook,
+        currency: str = "USD",
+        now: datetime | None = None,
+        additional_events: tuple[Event, ...] = (),
+        previous: CostAccountingSnapshot | None = None,
+    ) -> CostAccountingSnapshot:
+        """Read exact budget totals with bounded memory; unsupported stores fail closed."""
+        raise NotImplementedError("This BudgetStore does not support bounded cost accounting.")
+
 
 class BudgetLedger(ABC):
     """Atomic reservation ledger for strict budget enforcement.
@@ -2080,8 +2100,14 @@ class InMemoryBudgetStore(BudgetStore):
     """In-memory budget store for tests and local apps."""
 
     def __init__(self) -> None:
+        from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
+
+        self._cost_accounting_authority = CostAccountingAuthority()
         self._events: list[Event] = []
         self._events_by_id: dict[tuple[str, str], Event] = {}
+        from cayu.runtime._cost_accounting_index import CostEventIndex
+
+        self._cost_event_index = CostEventIndex()
         self._lock = asyncio.Lock()
 
     async def append_event(self, event: Event) -> None:
@@ -2096,8 +2122,13 @@ class InMemoryBudgetStore(BudgetStore):
                         f"{copied.session_id}/{copied.id}"
                     )
                 return
+            from cayu.runtime.sessions import EventRecord
+
+            record = EventRecord(sequence=len(self._events) + 1, event=copied)
+            self._cost_event_index.validate(record)
             self._events_by_id[identity] = copied
             self._events.append(copied)
+            self._cost_event_index.append(record)
 
     async def load_events_for_budget(
         self,
@@ -2120,6 +2151,68 @@ class InMemoryBudgetStore(BudgetStore):
                 "Use SessionBudgetStore for causal budgets."
             )
         raise ValueError(f"Unsupported budget scope: {scope}")
+
+    async def read_cost_for_budget(
+        self,
+        *,
+        scope: BudgetScope,
+        key: str | None,
+        window: BudgetWindow,
+        pricing: PriceBook,
+        currency: str = "USD",
+        now: datetime | None = None,
+        additional_events: tuple[Event, ...] = (),
+        previous: CostAccountingSnapshot | None = None,
+    ) -> CostAccountingSnapshot:
+        from cayu.runtime._cost_accounting import (
+            COST_ACCOUNTING_PAGE_SIZE,
+            cost_accounting_query,
+            cost_pending_events,
+        )
+        from cayu.runtime._cost_accounting_refresh import CostAccountingRead
+        from cayu.runtime.sessions import _event_record_matches
+
+        if scope == "causal":
+            raise ValueError(
+                "InMemoryBudgetStore cannot resolve causal budget scope. Use SessionBudgetStore."
+            )
+        query = cost_accounting_query(
+            _budget_cost_query(scope=scope, key=key, window=window, now=now)
+        )
+        pending = cost_pending_events(query, additional_events)
+        kinds = frozenset({str(EventType.MODEL_COMPLETED), str(EventType.MODEL_HOSTED_TOOL_CALL)})
+        async with self._lock:
+            pending = tuple(
+                event
+                for event in pending
+                if (existing := self._events_by_id.get((event.session_id, event.id))) is None
+                or not cost_pending_events(query, (existing,))
+            )
+            reducer = CostAccountingRead(
+                query,
+                pricing,
+                currency=currency,
+                additional_events=pending,
+                previous=previous,
+                authority=self._cost_accounting_authority,
+                through_sequence=len(self._events),
+            )
+            scanned = 0
+            for _group_key, records in self._cost_event_index.groups(reducer):
+                for kind in (EventType.MODEL_HOSTED_TOOL_CALL, EventType.MODEL_COMPLETED):
+                    for record in records:
+                        sequence, event = record.sequence, record.event
+                        scanned += 1
+                        if scanned % COST_ACCOUNTING_PAGE_SIZE == 0:
+                            await asyncio.sleep(0)
+                        if event.type == kind and _event_record_matches(
+                            record,
+                            reducer.source_query,
+                            kinds,
+                            frozenset(),
+                        ):
+                            reducer.add(sequence, event)
+            return reducer.snapshot()
 
 
 class SessionBudgetStore(BudgetStore):
@@ -2177,6 +2270,44 @@ class SessionBudgetStore(BudgetStore):
             if len(page) < 5000:
                 break
         return [copy_event(record.event) for record in records]
+
+    async def read_cost_for_budget(
+        self,
+        *,
+        scope: BudgetScope,
+        key: str | None,
+        window: BudgetWindow,
+        pricing: PriceBook,
+        currency: str = "USD",
+        now: datetime | None = None,
+        additional_events: tuple[Event, ...] = (),
+        previous: CostAccountingSnapshot | None = None,
+    ) -> CostAccountingSnapshot:
+        return await self._session_store.read_cost_accounting(
+            _budget_cost_query(scope=scope, key=key, window=window, now=now),
+            pricing,
+            currency=currency,
+            additional_events=additional_events,
+            previous=previous,
+        )
+
+
+def _budget_cost_query(
+    *, scope: BudgetScope, key: str | None, window: BudgetWindow, now: datetime | None
+):
+    from cayu.runtime.sessions import EventQuery
+
+    since, until = copy_budget_window(window).bounds(now)
+    if scope not in {"app", "agent", "causal"}:
+        raise ValueError(f"Unsupported budget scope: {scope}")
+    if scope != "app":
+        key = require_clean_nonblank(key or "", "key")
+    return EventQuery(
+        causal_budget_id=key if scope == "causal" else None,
+        agent_name=key if scope == "agent" else None,
+        since=since,
+        until=until,
+    )
 
 
 class InMemoryBudgetLedger(BudgetLedger):
@@ -2875,6 +3006,33 @@ def budget_check_from_events(
         pricing=limit.pricing,
         currency=limit.currency,
     )
+    return budget_check_from_totals(
+        limit=limit,
+        summary=session_cost_totals(summary),
+        provider_name=provider_name,
+        model=model,
+        billing_identity_state=billing_identity_state,
+        effective_at=effective_at,
+    )
+
+
+def budget_check_from_totals(
+    *,
+    limit: BudgetLimit,
+    summary: SessionCostTotals,
+    provider_name: str | None = None,
+    model: str | None = None,
+    billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+    effective_at: datetime | None = None,
+) -> BudgetCheck:
+    """Evaluate exact store totals without retaining historical pricing line items."""
+    if type(limit) not in {BudgetLimit, _EffectiveBudgetLimit}:
+        raise TypeError("limit must be a BudgetLimit.")
+    limit = _ensure_effective_budget_limit(limit, identity_namespace="app_policy")
+    summary = session_cost_totals(summary)
+    if summary.currency != limit.currency:
+        raise ValueError("Cost accounting currency does not match the budget limit.")
+    summary.session_id = _budget_summary_id(limit)
     limit_reached = False
     if summary.unpriced_model_steps > 0 and not limit.allow_unpriced:
         limit_reached = True

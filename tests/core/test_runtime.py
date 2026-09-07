@@ -15124,7 +15124,8 @@ def test_automatic_compaction_uses_its_bedrock_billing_identity(
         assert ledger._records == {}
 
 
-def test_automatic_contextual_budget_counts_prior_hierarchy_dispatches() -> None:
+@pytest.mark.parametrize("scope", ["app", "run"])
+def test_automatic_contextual_budget_counts_prior_hierarchy_dispatches(scope) -> None:
     requested_identity = bedrock_billing_identity(
         invoked_model="global.anthropic.claude-sonnet-4-6",
         source_region="us-east-1",
@@ -15198,6 +15199,8 @@ def test_automatic_contextual_budget_counts_prior_hierarchy_dispatches() -> None
                     pricing=pricing,
                 ),
             )
+            if scope == "app"
+            else ()
         )
     )
     app.register_provider(runtime_provider, default=True)
@@ -15220,6 +15223,13 @@ def test_automatic_contextual_budget_counts_prior_hierarchy_dispatches() -> None
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_automatic_contextual_hierarchy_budget",
+                budget_limits=(
+                    BudgetLimit(
+                        scope="run", max_estimated_cost=Decimal("0.000004"), pricing=pricing
+                    ),
+                )
+                if scope == "run"
+                else (),
                 messages=[
                     Message.text("user", "oversized " + "x" * 5000),
                     Message.text("user", "current"),
@@ -45690,6 +45700,11 @@ def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():
             super().__init__()
             self.load_events_called = False
             self.event_queries: list[EventQuery] = []
+            self.accounting_queries: list[EventQuery] = []
+
+        async def read_usage_accounting(self, query: EventQuery, *, by_session: bool = False):
+            self.accounting_queries.append(query)
+            return await super().read_usage_accounting(query, by_session=by_session)
 
         async def load_events(self, session_id: str) -> list[Event]:
             self.load_events_called = True
@@ -45737,20 +45752,17 @@ def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():
     asyncio.run(run())
 
     assert store.load_events_called is False
-    # One query carrying all usage-bearing types: per-type queries sharing a
-    # watermark can skip events appended between them (issue #101).
-    assert len(store.event_queries) == 1
-    assert store.event_queries[0].event_type is None
-    assert [str(event_type) for event_type in store.event_queries[0].event_types] == [
-        "model.completed",
-        "model.hosted_tool_call",
-        "tool.call.started",
-    ]
+    # The store owns one snapshot and one watermark across all usage-bearing
+    # types. The app never pages full event payloads into a retained history.
+    assert store.event_queries == []
+    assert len(store.accounting_queries) == 1
+    assert store.accounting_queries[0].session_id == "usage_query"
 
 
-def test_cayu_app_query_all_event_records_preserves_filters():
+def test_query_all_event_records_preserves_filters():
+    from cayu.runtime._session_queries import query_all_event_records
+
     store = InMemorySessionStore()
-    app = CayuApp(session_store=store)
 
     async def run() -> None:
         for session_id in ("query_all_a", "query_all_b"):
@@ -45779,14 +45791,15 @@ def test_cayu_app_query_all_event_records_preserves_filters():
             ),
         )
 
-        records = await app._query_all_event_records(
+        records = await query_all_event_records(
+            store,
             EventQuery(
                 session_ids=("query_all_b",),
                 event_type=EventType.MODEL_COMPLETED,
                 since=datetime(2026, 1, 1, 12, 30, tzinfo=UTC),
                 until=datetime(2026, 1, 1, 13, 30, tzinfo=UTC),
                 limit=1,
-            )
+            ),
         )
         assert [record.event.session_id for record in records] == ["query_all_b"]
 
@@ -45798,33 +45811,36 @@ def test_cayu_app_query_all_event_records_preserves_filters():
             payload={"delta": "noise"},
         )
         await store.append_event("query_all_b", delta_event)
-        multi_type_records = await app._query_all_event_records(
+        multi_type_records = await query_all_event_records(
+            store,
             EventQuery(
                 session_ids=("query_all_b",),
                 event_types=(EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED),
                 limit=1,
-            )
+            ),
         )
         assert [record.event.type for record in multi_type_records] == [EventType.MODEL_COMPLETED]
 
-        descending_records = await app._query_all_event_records(
+        descending_records = await query_all_event_records(
+            store,
             EventQuery(
                 session_id="query_all_b",
                 order_by=EventOrder.SEQUENCE_DESC,
                 limit=1,
-            )
+            ),
         )
         assert [record.event.type for record in descending_records] == [
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
         ]
 
-        multi_session_descending_records = await app._query_all_event_records(
+        multi_session_descending_records = await query_all_event_records(
+            store,
             EventQuery(
                 session_ids=("query_all_a", "query_all_b"),
                 order_by=EventOrder.SEQUENCE_DESC,
                 limit=1,
-            )
+            ),
         )
         assert [record.event.type for record in multi_session_descending_records] == [
             EventType.MODEL_TEXT_DELTA,
@@ -45837,22 +45853,24 @@ def test_cayu_app_query_all_event_records_preserves_filters():
             "query_all_a",
         ]
 
-        bounded_records = await app._query_all_event_records(
+        bounded_records = await query_all_event_records(
+            store,
             EventQuery(
                 session_id="query_all_b",
                 before_sequence=descending_records[0].sequence,
                 order_by=EventOrder.SEQUENCE_DESC,
                 limit=1,
-            )
+            ),
         )
         assert [record.event.type for record in bounded_records] == [EventType.MODEL_COMPLETED]
 
-        event_id_records = await app._query_all_event_records(
+        event_id_records = await query_all_event_records(
+            store,
             EventQuery(
                 session_id="query_all_b",
                 event_id=delta_event.id,
                 limit=1,
-            )
+            ),
         )
         assert [record.event.id for record in event_id_records] == [delta_event.id]
 
@@ -45893,7 +45911,8 @@ def test_cayu_app_query_all_event_records_preserves_filters():
                 ),
             ],
         )
-        workflow_records = await app._query_all_event_records(
+        workflow_records = await query_all_event_records(
+            store,
             EventQuery(
                 session_id="query_all_b",
                 interaction_id="workflow-interaction",
@@ -45902,7 +45921,7 @@ def test_cayu_app_query_all_event_records_preserves_filters():
                 workflow_attempt_id="attempt-2",
                 workflow_step_id="step-a",
                 limit=1,
-            )
+            ),
         )
         assert [record.event.id for record in workflow_records] == [
             "workflow-target-1",
@@ -45949,7 +45968,8 @@ def test_cayu_app_query_all_event_records_preserves_filters():
                 ),
             ],
         )
-        fenced_records = await app._query_all_event_records(
+        fenced_records = await query_all_event_records(
+            store,
             EventQuery(
                 session_id="query_all_b",
                 event_type=EventType.WORKFLOW_STEP_STARTED,
@@ -45957,7 +45977,7 @@ def test_cayu_app_query_all_event_records_preserves_filters():
                 workflow_step_id="step-a",
                 workflow_attempt_fenced=True,
                 limit=1,
-            )
+            ),
         )
         assert [record.event.id for record in fenced_records] == [
             "workflow-valid-attempt-1",

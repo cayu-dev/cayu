@@ -433,6 +433,8 @@ REVISIONS: tuple[Revision, ...] = (
     # Watcher acknowledgements now use immutable claim receipts and lease fences.
     # Older writers neither enforce expiry nor preserve these settlements.
     Revision(revision=81, kind=RevisionKind.BREAKING, compatible_from=81),
+    # Transactional accounting invalidation requires all writers to participate.
+    Revision(revision=82, kind=RevisionKind.BREAKING, compatible_from=82),
 )
 
 #: The revision an empty database is initialized to.

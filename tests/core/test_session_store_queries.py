@@ -275,11 +275,7 @@ def test_event_query_requires_session_id_for_event_id() -> None:
 
 
 def test_event_query_requires_ordered_sequence_bounds() -> None:
-    with pytest.raises(
-        ValidationError,
-        match="before_sequence requires exactly one session",
-    ):
-        EventQuery(before_sequence=2)
+    assert EventQuery(before_sequence=2).before_sequence == 2
 
     with pytest.raises(
         ValidationError,

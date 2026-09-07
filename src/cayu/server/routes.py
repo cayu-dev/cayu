@@ -42,7 +42,6 @@ if TYPE_CHECKING:
 from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
-    JsonUtf8SizeCounter,
     canonical_durable_json_bytes,
     compact_json_utf8_size,
     copy_durable_json_object,
@@ -238,7 +237,6 @@ from cayu.runtime.aggregates import (
     UsageRollupStoreResult,
     estimate_usage_rollup_cost,
     estimate_usage_session_cost_breakdown,
-    summary_usage_metrics_from_event_payload,
 )
 from cayu.runtime.approvals import (
     ResolutionActor,
@@ -255,12 +253,6 @@ from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     PriceBook,
     SessionCostSummary,
-)
-from cayu.runtime.costs import (
-    estimate_causal_budget_cost as build_causal_budget_cost_summary,
-)
-from cayu.runtime.costs import (
-    estimate_session_cost as build_session_cost_summary,
 )
 from cayu.runtime.errors import TerminalEventPublicationUncertain
 from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
@@ -290,7 +282,6 @@ from cayu.runtime.sessions import (
     EnqueueSessionMessageRequest,
     EventOrder,
     EventQuery,
-    EventQueryResultTooLarge,
     EventRecord,
     InterruptSessionRequest,
     LabelSelectorOperator,
@@ -321,10 +312,8 @@ from cayu.runtime.sessions import (
     _with_runtime_resume_transport_metadata,
     decode_session_cursor,
     decode_session_topology_cursor,
-    event_summary_from_records,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
-    session_outcome_from_records,
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
@@ -352,13 +341,8 @@ from cayu.runtime.tool_discovery import (
 )
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import (
-    AggregateUsageMetrics,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
-    UsageMetrics,
-    add_aggregate_usage,
-    build_aggregate_usage_metrics,
-    causal_budget_usage_summary,
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server._capabilities import inspect_control_plane_capabilities
@@ -1114,8 +1098,6 @@ _KNOWLEDGE_PENDING_DETAIL_MAX_BYTES = 128_000
 _KNOWLEDGE_REVIEW_AUTH_SUBJECT_DIGEST_DOMAIN = b"cayu-knowledge-review-auth-subject-v1\0"
 _KNOWLEDGE_REVIEW_AUTH_SUBJECT_DIGEST_PREFIX = "cayu:http-auth-subject-sha256:"
 _CAUSAL_BUDGET_SUMMARY_MAX_SESSIONS = 500
-_CAUSAL_BUDGET_SUMMARY_MAX_EVENTS = 10_000
-_CAUSAL_BUDGET_SUMMARY_MAX_EVENT_INPUT_BYTES = 4 * 1024 * 1024
 _CAUSAL_BUDGET_SUMMARY_MAX_RESULT_BYTES = 4 * 1024 * 1024
 _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
@@ -3374,46 +3356,16 @@ def _artifact_header_value(value: str, fallback: str) -> str:
     return "unknown"
 
 
-def _usage_breakdown(
-    events: list[Event],
-    *,
-    key_fn: Callable[[UsageMetrics], tuple[str | None, str | None]],
-) -> list[dict[str, Any]]:
-    buckets: dict[tuple[str | None, str | None], dict[str, Any]] = {}
-    for event in events:
-        if event.type != EventType.MODEL_COMPLETED:
-            continue
-        try:
-            metrics = summary_usage_metrics_from_event_payload(event.payload)
-        except (TypeError, ValueError):
-            continue
-        if metrics is None:
-            continue
-        provider_name, model = key_fn(metrics)
-        key = (provider_name, model)
-        bucket = buckets.setdefault(
-            key,
-            {
-                "provider_name": provider_name,
-                "model": model,
-                "session_ids": set(),
-                "model_steps": 0,
-                "usage": build_aggregate_usage_metrics(),
-            },
-        )
-        bucket["session_ids"].add(event.session_id)
-        bucket["model_steps"] += 1
-        bucket["usage"] = _add_usage_metrics(bucket["usage"], metrics)
-
+def _usage_breakdown(rows) -> list[dict[str, Any]]:
     items = [
         UsageBreakdownItem(
-            provider_name=provider_name,
-            model=model,
-            session_count=len(bucket["session_ids"]),
-            model_steps=bucket["model_steps"],
-            usage=bucket["usage"],
+            provider_name=row.provider_name,
+            model=row.model,
+            session_count=len(row.session_ids),
+            model_steps=row.model_steps,
+            usage=row.usage,
         ).model_dump()
-        for (provider_name, model), bucket in buckets.items()
+        for row in rows
     ]
     return sorted(
         items,
@@ -3423,17 +3375,6 @@ def _usage_breakdown(
             item["model"] or "",
         ),
     )
-
-
-def _add_usage_metrics(
-    left: AggregateUsageMetrics | UsageMetrics,
-    right: UsageMetrics,
-) -> AggregateUsageMetrics:
-    if isinstance(left, UsageMetrics):
-        aggregate = add_aggregate_usage(build_aggregate_usage_metrics(), left)
-    else:
-        aggregate = left
-    return add_aggregate_usage(aggregate, right)
 
 
 def _parse_session_label_filters(values: list[str] | None) -> dict[str, str]:
@@ -10359,82 +10300,53 @@ def create_router(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         sessions = result.sessions
-        session_event_records_by_id: dict[str, list[EventRecord]] = {}
-        session_ids = [session.id for session in sessions]
-        all_event_records = await _query_all_session_event_records(session_ids)
-        for record in all_event_records:
-            session_event_records_by_id.setdefault(record.event.session_id, []).append(record)
-        for session in sessions:
-            session_event_records_by_id.setdefault(session.id, [])
+        from cayu.runtime._cost_accounting import causal_cost_summary
+        from cayu.runtime._usage_accounting import UsageAccountingReducer, causal_usage_summary
 
-        usage_event_records = [
-            record
-            for record in all_event_records
-            if record.event.type in {EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED}
-        ]
-        usage_events = [
-            record.event
-            for record in sorted(usage_event_records, key=lambda record: record.sequence)
-        ]
+        session_ids = list(dict.fromkeys(session.id for session in sessions))
+        query = EventQuery(session_ids=tuple(session_ids))
+        usage_snapshot = (
+            await session_store.read_usage_accounting(query, by_session=True, by_identity=True)
+            if session_ids
+            else UsageAccountingReducer(query, by_session=True).snapshot()
+        )
         usage_summary = _serialize_causal_budget_usage_summary(
             cayu_app,
-            causal_budget_usage_summary(
-                causal_budget_id="session-query",
-                session_ids=session_ids,
-                events=usage_events,
-            ),
+            causal_usage_summary(usage_snapshot, "session-query", session_ids),
         )
         usage_summary.pop("causal_budget_id", None)
-        model_events = [
-            record.event
-            for record in sorted(all_event_records, key=lambda record: record.sequence)
-            if record.event.type == EventType.MODEL_COMPLETED
-        ]
-        provider_breakdown = _usage_breakdown(
-            model_events,
-            key_fn=lambda metrics: (metrics.provider_name, None),
-        )
-        model_breakdown = _usage_breakdown(
-            model_events,
-            key_fn=lambda metrics: (metrics.provider_name, metrics.model),
-        )
-
+        provider_breakdown = _usage_breakdown(usage_snapshot.provider_summaries)
+        model_breakdown = _usage_breakdown(usage_snapshot.model_summaries)
         cost_summary = None
         if body.pricing is not None:
-            aggregate_cost = build_session_cost_summary(
-                session_id="session-query",
-                events=model_events,
-                pricing=body.pricing,
-                currency=body.currency,
-            ).model_dump(mode="json")
-            aggregate_cost.pop("session_id", None)
-            aggregate_cost["session_ids"] = [
-                cayu_app.project_session_id_for_exposure(session_id) for session_id in session_ids
-            ]
-            aggregate_cost["session_count"] = len(session_ids)
-            aggregate_cost["session_costs"] = [
-                _serialize_session_cost_summary(
-                    cayu_app,
-                    build_session_cost_summary(
-                        session_id=session.id,
-                        events=[
-                            record.event
-                            for record in session_event_records_by_id[session.id]
-                            if record.event.type == EventType.MODEL_COMPLETED
-                        ],
-                        pricing=body.pricing,
-                        currency=body.currency,
-                    ),
+            from cayu.runtime._cost_accounting import CostAccountingReducer
+
+            cost_query = query.model_copy(
+                update={
+                    "before_sequence": usage_snapshot.through_sequence + 1
+                    if usage_snapshot.through_sequence < MAX_DURABLE_JSON_INTEGER
+                    else None
+                }
+            )
+            cost_snapshot = (
+                await session_store.read_cost_accounting(
+                    cost_query, body.pricing, currency=body.currency, details=True, by_session=True
                 )
-                for session in sessions
-            ]
-            cost_summary = aggregate_cost
+                if session_ids
+                else CostAccountingReducer(
+                    cost_query, body.pricing, currency=body.currency, details=True, by_session=True
+                ).snapshot()
+            )
+            cost_summary = _serialize_causal_budget_cost_summary(
+                cayu_app,
+                causal_cost_summary(cost_snapshot, "session-query", session_ids),
+            )
+            cost_summary.pop("causal_budget_id", None)
 
         session_items = []
         for session in sessions:
-            records = session_event_records_by_id[session.id]
-            outcome = session_outcome_from_records(session, records)
-            event_summary = event_summary_from_records(session.id, records)
+            outcome = await session_store.summarize_outcome(session.id)
+            event_summary = await session_store.summarize_events(session.id)
             session_items.append(
                 {
                     "session": _serialize_session(cayu_app, session),
@@ -10548,57 +10460,44 @@ def create_router(
         if not sessions:
             raise HTTPException(status_code=404, detail="Causal budget not found")
 
-        session_ids = [session.id for session in sessions]
-        causal_event_records = await _query_all_causal_event_records(
-            private_causal_budget_id,
-            max_events=_CAUSAL_BUDGET_SUMMARY_MAX_EVENTS,
-            max_bytes=_CAUSAL_BUDGET_SUMMARY_MAX_EVENT_INPUT_BYTES,
+        from cayu.runtime._cost_accounting import CostAccountingOutputTooLarge, causal_cost_summary
+        from cayu.runtime._usage_accounting import causal_usage_summary
+
+        session_ids = list(dict.fromkeys(session.id for session in sessions))
+        query = EventQuery(
+            causal_budget_id=private_causal_budget_id, session_ids=tuple(session_ids)
         )
-        event_records_by_session_id: dict[str, list[EventRecord]] = {
-            session_id: [] for session_id in session_ids
-        }
-        for record in causal_event_records:
-            event_records_by_session_id.setdefault(record.event.session_id, []).append(record)
-        usage_event_records = [
-            record
-            for record in causal_event_records
-            if record.event.type == EventType.MODEL_COMPLETED
-        ]
-        tool_event_records = [
-            record
-            for record in causal_event_records
-            if record.event.type == EventType.TOOL_CALL_STARTED
-        ]
-        usage_events = [
-            record.event
-            for record in sorted(
-                [*usage_event_records, *tool_event_records],
-                key=lambda record: record.sequence,
+        try:
+            usage_snapshot = await session_store.read_usage_accounting(query, by_session=True)
+            cost_snapshot = await session_store.read_cost_accounting(
+                query.model_copy(
+                    update={
+                        "before_sequence": usage_snapshot.through_sequence + 1
+                        if usage_snapshot.through_sequence < MAX_DURABLE_JSON_INTEGER
+                        else None
+                    }
+                ),
+                body.pricing,
+                currency=body.currency,
+                details=True,
+                by_session=True,
+                max_detail_bytes=_CAUSAL_BUDGET_SUMMARY_MAX_RESULT_BYTES,
             )
-        ]
-        usage_summary = causal_budget_usage_summary(
-            causal_budget_id=private_causal_budget_id,
-            session_ids=session_ids,
-            events=usage_events,
-        )
-        cost_summary = build_causal_budget_cost_summary(
-            causal_budget_id=private_causal_budget_id,
-            session_ids=session_ids,
-            events=[record.event for record in usage_event_records],
-            pricing=body.pricing,
-            currency=body.currency,
-        )
+        except CostAccountingOutputTooLarge as exc:
+            raise HTTPException(
+                status_code=413, detail="Causal-budget summary exceeds max_result_bytes."
+            ) from exc
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=501,
+                detail="The configured session store cannot enforce bounded accounting reads.",
+            ) from exc
+        usage_summary = causal_usage_summary(usage_snapshot, private_causal_budget_id, session_ids)
+        cost_summary = causal_cost_summary(cost_snapshot, private_causal_budget_id, session_ids)
         session_items = []
         for session in sessions:
-            session_event_records = event_records_by_session_id[session.id]
-            outcome = session_outcome_from_records(
-                session,
-                session_event_records,
-            )
-            event_summary = event_summary_from_records(
-                session.id,
-                session_event_records,
-            )
+            outcome = await session_store.summarize_outcome(session.id)
+            event_summary = await session_store.summarize_events(session.id)
             session_items.append(
                 {
                     "session": _serialize_session(cayu_app, session),
@@ -10776,100 +10675,6 @@ def create_router(
             if result.next_cursor is None:
                 return sessions
             cursor = result.next_cursor
-
-    async def _query_all_session_event_records(session_ids: list[str]) -> list[EventRecord]:
-        if not session_ids:
-            return []
-        records: list[EventRecord] = []
-        after_sequence = None
-        while True:
-            page = await session_store.query_events(
-                EventQuery(
-                    session_ids=tuple(session_ids),
-                    after_sequence=after_sequence,
-                    limit=5000,
-                )
-            )
-            if not page:
-                return records
-            records.extend(page)
-            if len(page) < 5000:
-                return records
-            after_sequence = page[-1].sequence
-
-    async def _query_all_causal_event_records(
-        causal_budget_id: str,
-        *,
-        max_events: int,
-        max_bytes: int,
-    ) -> list[EventRecord]:
-        records: list[EventRecord] = []
-        after_sequence = None
-        remaining_bytes = max_bytes
-        while True:
-            if remaining_bytes <= 0:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"Causal-budget summary exceeds the {max_bytes}-byte "
-                        "event-input safety limit. Use the bounded session topology "
-                        "and store-native usage rollup."
-                    ),
-                )
-            remaining_with_sentinel = max_events + 1 - len(records)
-            try:
-                page = await session_store.query_events_bounded(
-                    EventQuery(
-                        causal_budget_id=causal_budget_id,
-                        after_sequence=after_sequence,
-                        limit=min(5000, remaining_with_sentinel),
-                    ),
-                    max_bytes=remaining_bytes,
-                )
-            except EventQueryResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"Causal-budget summary exceeds the {max_bytes}-byte "
-                        "event-input safety limit. Use the bounded session topology "
-                        "and store-native usage rollup."
-                    ),
-                ) from exc
-            except NotImplementedError as exc:
-                raise HTTPException(
-                    status_code=501,
-                    detail=(
-                        "The configured session store cannot enforce byte-bounded "
-                        "causal-budget event reads."
-                    ),
-                ) from exc
-            if not page:
-                return records
-            size_counter = JsonUtf8SizeCounter(remaining_bytes)
-            for record in page:
-                if not size_counter.value(record):
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"Causal-budget summary exceeds the {max_bytes}-byte "
-                            "event-input safety limit. Use the bounded session "
-                            "topology and store-native usage rollup."
-                        ),
-                    )
-            remaining_bytes = size_counter.remaining
-            records.extend(page)
-            if len(records) > max_events:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"Causal-budget summary exceeds the {max_events}-event "
-                        "safety limit. Use the bounded session topology and "
-                        "store-native usage rollup."
-                    ),
-                )
-            if len(page) < min(5000, remaining_with_sentinel):
-                return records
-            after_sequence = page[-1].sequence
 
     @router.get(
         "/sessions/{session_id}/interactions",

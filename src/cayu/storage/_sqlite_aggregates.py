@@ -363,11 +363,11 @@ bounded_candidates AS (
         input_bytes > (SELECT max_input_bytes FROM scope) AS input_oversized,
         CASE
             WHEN input_bytes <= (SELECT max_input_bytes FROM scope)
-            THEN usage_metrics_json
+            THEN cayu_canonical_accounting_json(usage_metrics_json)
         END AS usage_metrics_json,
         CASE
             WHEN input_bytes <= (SELECT max_input_bytes FROM scope)
-            THEN billing_identity_json
+            THEN cayu_canonical_accounting_json(billing_identity_json)
         END AS billing_identity_json
     FROM measured_candidates
 )
@@ -450,11 +450,11 @@ bounded_candidates AS (
         input_bytes > (SELECT max_input_bytes FROM scope) AS input_oversized,
         CASE
             WHEN input_bytes <= (SELECT max_input_bytes FROM scope)
-            THEN usage_metrics_json
+            THEN cayu_canonical_accounting_json(usage_metrics_json)
         END AS usage_metrics_json,
         CASE
             WHEN input_bytes <= (SELECT max_input_bytes FROM scope)
-            THEN billing_identity_json
+            THEN cayu_canonical_accounting_json(billing_identity_json)
         END AS billing_identity_json
     FROM measured_candidates
 )

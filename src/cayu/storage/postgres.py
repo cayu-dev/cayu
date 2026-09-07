@@ -17,6 +17,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, LiteralString, NoRetur
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from cayu.runtime._cost_accounting import CostAccountingSnapshot
+from cayu.runtime._usage_accounting import UsageAccountingSnapshot
+from cayu.runtime.costs import PriceBook
+
 if TYPE_CHECKING:
     from cayu.knowledge_maintenance_governance import (
         KnowledgeMaintenanceGovernanceAuthority,
@@ -994,7 +998,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
     }
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 62
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 81
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 76
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
@@ -1310,7 +1314,9 @@ def _event_query_is_single_session(query: EventQuery) -> bool:
 
 
 def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
-    return query.after_sequence is not None and not _event_query_is_single_session(query)
+    return (
+        query.after_sequence is not None or query.before_sequence is not None
+    ) and not _event_query_is_single_session(query)
 
 
 # Per-revision forward-migration DDL, keyed by revision number. The baseline
@@ -3022,6 +3028,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         """,
     ),
     80: ("ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS failure_diagnostic_json TEXT",),
+    82: pg_support.POSTGRES_ACCOUNTING_DDL,
     79: (
         """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
@@ -24510,6 +24517,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         migration_operation_sha256: str | None = None,
         migration_receipt_json: str | None = None,
     ) -> None:
+        from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
+
+        self._cost_accounting_authority = CostAccountingAuthority()
         if public_authority_alias_codec is not None and not isinstance(
             public_authority_alias_codec,
             PublicAuthorityAliasCodec,
@@ -33505,6 +33515,204 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             return await self._query_events(cur, query, safe_insert_xid=None)
+
+    async def event_exists(self, query: EventQuery) -> bool:
+        plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    "SELECT EXISTS(SELECT 1 FROM cayu_events "
+                    "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                    f"{plan.where_sql})",
+                ),
+                plan.params,
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise RuntimeError("Failed to read event existence result.")
+            return bool(row[0])
+
+    async def read_usage_accounting(
+        self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
+    ) -> UsageAccountingSnapshot:
+        from cayu.runtime._usage_accounting import (
+            USAGE_ACCOUNTING_PAGE_SIZE,
+            UsageAccountingReducer,
+            usage_accounting_query,
+        )
+
+        query = usage_accounting_query(query)
+        reducer = UsageAccountingReducer(query, by_session=by_session, by_identity=by_identity)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                await cur.execute(
+                    "SELECT generation FROM cayu_accounting_state WHERE singleton = 1"
+                )
+                generation_row = await cur.fetchone()
+                if generation_row is None:
+                    raise RuntimeError("Accounting deletion revision is missing.")
+                generation = generation_row[0]
+
+            plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
+            # A named server cursor prevents libpq from buffering all rows in the
+            # client, while REPEATABLE READ pins one snapshot across fetches.
+            async with conn.cursor(name=f"usage_{uuid4().hex}") as cur:
+                await cur.execute(
+                    cast(
+                        "LiteralString",
+                        "SELECT cayu_events.sequence, cayu_events.event FROM cayu_events "
+                        "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                        f"{plan.where_sql} ORDER BY cayu_events.sequence ASC",
+                    ),
+                    plan.params,
+                )
+                while rows := await cur.fetchmany(USAGE_ACCOUNTING_PAGE_SIZE):
+                    reducer.add_page(
+                        [
+                            EventRecord(sequence=row[0], event=Event(**_json_obj(row[1])))
+                            for row in rows
+                        ]
+                    )
+            return reducer.snapshot().model_copy(update={"generation": generation})
+
+    async def read_cost_accounting(
+        self,
+        query: EventQuery,
+        pricing: PriceBook,
+        *,
+        currency: str = "USD",
+        details: bool = False,
+        by_session: bool = False,
+        additional_events: tuple[Event, ...] = (),
+        max_detail_bytes: int | None = None,
+        previous: CostAccountingSnapshot | None = None,
+    ) -> CostAccountingSnapshot:
+        from cayu.runtime._cost_accounting import (
+            COST_ACCOUNTING_PAGE_SIZE,
+            cost_accounting_query,
+            cost_pending_events,
+        )
+        from cayu.runtime._cost_accounting_refresh import CostAccountingRead
+        from cayu.storage._cost_accounting_sql import (
+            changed_cost_groups_statement,
+            cost_boundary_statement,
+            cost_group_lookup_statement,
+            cost_group_statement,
+        )
+
+        if previous is not None and type(previous) is not CostAccountingSnapshot:
+            raise TypeError("previous must be a CostAccountingSnapshot.")
+        query = cost_accounting_query(query)
+        pending = cost_pending_events(query, additional_events)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                await cur.execute(
+                    "SELECT generation FROM cayu_accounting_state WHERE singleton = 1"
+                )
+                generation_row = await cur.fetchone()
+                if generation_row is None:
+                    raise RuntimeError("Accounting deletion revision is missing.")
+                generation = generation_row[0]
+                if query.causal_budget_id is not None and pending:
+                    await cur.execute(
+                        "SELECT id FROM cayu_sessions WHERE causal_budget_id = %s AND id = ANY(%s)",
+                        (query.causal_budget_id, [event.session_id for event in pending]),
+                    )
+                    allowed_sessions = {row[0] for row in await cur.fetchall()}
+                    pending = tuple(
+                        event for event in pending if event.session_id in allowed_sessions
+                    )
+
+            plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
+            unique_pending: list[Event] = []
+            async with conn.cursor() as cur:
+                for event in pending:
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            "SELECT 1 FROM cayu_events "
+                            "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                            f"{plan.where_sql} AND cayu_events.session_id = %s AND cayu_events.event_id = %s LIMIT 1",
+                        ),
+                        (*plan.params, event.session_id, event.id),
+                    )
+                    if await cur.fetchone() is None:
+                        unique_pending.append(event)
+            boundary_sql, boundary_params = cost_boundary_statement(query, dialect=_SQL_DIALECT)
+            async with conn.cursor() as cur:
+                await cur.execute(cast("LiteralString", boundary_sql), boundary_params)
+                boundary_row = await cur.fetchone()
+                if boundary_row is None:
+                    raise RuntimeError("Accounting event boundary is missing.")
+                boundary = boundary_row[0] or 0
+            reducer = CostAccountingRead(
+                query,
+                pricing,
+                currency=currency,
+                details=details,
+                max_detail_bytes=max_detail_bytes,
+                previous=previous if _event_query_is_single_session(query) else None,
+                generation=generation,
+                through_sequence=boundary,
+                authority=self._cost_accounting_authority,
+                by_session=by_session,
+                additional_events=tuple(unique_pending),
+            )
+            source_plan = session_store_sql.build_accounting_event_query_sql(
+                reducer.source_query,
+                dialect=_SQL_DIALECT,
+            )
+            columns = "cayu_events.sequence, cayu_events.event, cayu_events.session_id, cayu_events.event_id, cayu_events.event_type"
+
+            async def add_group(key: tuple[str, bool, str]) -> None:
+                statement, params = cost_group_lookup_statement(
+                    columns=columns, plan=source_plan, key=key, postgres=True
+                )
+                async with conn.cursor(name=f"cost_group_{uuid4().hex}") as group_cursor:
+                    await group_cursor.execute(cast("LiteralString", statement), params)
+                    while rows := await group_cursor.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
+                        for row in rows:
+                            reducer.add(row[0], Event(**_json_obj(row[1])))
+
+            if reducer.incremental:
+                statement, params = changed_cost_groups_statement(reducer, dialect=_SQL_DIALECT)
+                async with conn.cursor(name=f"changed_cost_{uuid4().hex}") as cur:
+                    await cur.execute(cast("LiteralString", statement), params)
+                    while groups := await cur.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
+                        for group in groups:
+                            await add_group(
+                                (
+                                    group[0],
+                                    group[1] is not None,
+                                    group[1] if group[1] is not None else group[2],
+                                )
+                            )
+                for key in reducer.remaining_pending_keys:
+                    await add_group(key)
+            else:
+                statement, group_params = cost_group_statement(
+                    columns=columns, where_sql=source_plan.where_sql, postgres=True
+                )
+                async with conn.cursor(name=f"cost_{uuid4().hex}") as cur:
+                    await cur.execute(
+                        cast("LiteralString", statement), (*group_params, *source_plan.params)
+                    )
+                    while rows := await cur.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
+                        for row in rows:
+                            reducer.add(row[0], Event(**_json_obj(row[1])))
+            result = reducer.snapshot()
+            # Global sequence allocation is not commit order. A later commit can
+            # become visible below this snapshot's maximum sequence, so it is not
+            # a safe incremental baseline across independently written sessions.
+            if not _event_query_is_single_session(query):
+                result = result.model_copy(update={"cursor": None})
+            return result
 
     async def query_events_bounded(
         self,

@@ -152,7 +152,6 @@ from cayu.server import (
 )
 from cayu.server.routes import (
     _accepted_event_stream_response,
-    _add_usage_metrics,
     _detached_event_stream_response,
     _log_mutation_acceptance_failure,
     _next_replay_poll_interval,
@@ -247,7 +246,9 @@ def _aggregate_usage_json(
 
 
 def test_server_usage_aggregation_preserves_cache_ttl_buckets() -> None:
-    combined = _add_usage_metrics(
+    from cayu.runtime._usage_accounting import UsageAccountingReducer
+
+    metrics = (
         UsageMetrics(
             cache=CacheUsageMetrics(
                 write_tokens=5,
@@ -263,6 +264,22 @@ def test_server_usage_aggregation_preserves_cache_ttl_buckets() -> None:
             )
         ),
     )
+
+    reducer = UsageAccountingReducer(EventQuery(), by_session=False, by_identity=True)
+    reducer.add_page(
+        [
+            EventRecord(
+                sequence=index,
+                event=Event(
+                    session_id="cache-summary",
+                    type=EventType.MODEL_COMPLETED,
+                    payload={"usage_metrics": item.model_dump(mode="json")},
+                ),
+            )
+            for index, item in enumerate(metrics, 1)
+        ]
+    )
+    combined = reducer.snapshot().provider_summaries[0].usage
 
     assert combined.cache.write_tokens == 12
     assert combined.cache.write_5m_tokens == 9
@@ -4436,7 +4453,7 @@ def test_server_exposes_filtered_sessions_summary() -> None:
     ]
 
 
-def test_server_filtered_sessions_summary_queries_events_in_one_batch() -> None:
+def test_server_filtered_sessions_summary_uses_one_native_accounting_read() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -4454,14 +4471,13 @@ def test_server_filtered_sessions_summary_queries_events_in_one_batch() -> None:
         )
 
     queries: list[EventQuery] = []
-    original_query_events = app.session_store.query_events
+    original_accounting = app.session_store.read_usage_accounting
 
-    async def query_events(query: EventQuery | None = None):
-        copied = EventQuery() if query is None else query
-        queries.append(copied)
-        return await original_query_events(query)
+    async def read_usage_accounting(query, *, by_session=False, by_identity=False):
+        queries.append(query)
+        return await original_accounting(query, by_session=by_session, by_identity=by_identity)
 
-    app.session_store.query_events = query_events
+    app.session_store.read_usage_accounting = read_usage_accounting
 
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
     response = client.post(

@@ -13586,6 +13586,7 @@ class ModelStepRun:
                     identified_dispatch,
                     completed_events=completed_events,
                     prior_completion_events=prior_completion_events,
+                    operation_parent_model_step_id=model_step_identity.model_step_id,
                     budget_limits=limits,
                     session=self._session,
                     agent_name=self._registered_agent.spec.name,

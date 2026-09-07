@@ -7402,7 +7402,7 @@
     },
     "SessionCostSummary": {
       "additionalProperties": false,
-      "description": "Estimated session cost derived from durable completion and resource evidence.",
+      "description": "Detailed cost inspection, retaining one line item per completed step.",
       "properties": {
         "currency": {
           "title": "Currency",

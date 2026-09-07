@@ -2484,16 +2484,12 @@ class CausalBudgetSummaryResponse(ApiBaseModel):
 CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     413: {
         "description": (
-            "The causal-budget summary exceeds its session, event-count, event-input-byte, "
-            "or serialized response safety bound."
+            "The causal-budget summary exceeds its session or serialized response safety bound."
         ),
         "model": ApiErrorResponse,
     },
     501: {
-        "description": (
-            "The configured session store cannot enforce byte-bounded event reads "
-            "for this legacy summary."
-        ),
+        "description": ("The configured session store cannot enforce bounded accounting reads."),
         "model": ApiErrorResponse,
     },
 }

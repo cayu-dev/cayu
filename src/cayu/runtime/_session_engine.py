@@ -412,7 +412,7 @@ from cayu.runtime.context import (
     validate_context_messages,
 )
 from cayu.runtime.costs import (
-    SessionCostSummary,
+    SessionCostTotals,
 )
 from cayu.runtime.dispatch import DispatchRequest
 from cayu.runtime.egress import (
@@ -758,7 +758,6 @@ from cayu.runtime.usage import (
     SessionUsageSummary,
     aggregate_usage_metrics_payload,
     combine_session_usage_summaries,
-    session_usage_summary,
     session_usage_summary_payload,
 )
 from cayu.runtime.user_input import (
@@ -4284,7 +4283,7 @@ def _limit_reached_payload(
     *,
     decision: StopDecision,
     usage_summary: SessionUsageSummary,
-    cost_summary: SessionCostSummary | None,
+    cost_summary: SessionCostTotals | None,
 ) -> dict[str, Any]:
     payload = {
         "reason": "limit_reached",
@@ -14090,10 +14089,7 @@ class SessionEngine:
                 )
                 if limit_decision is not None:
                     raise RuntimeError(f"Compaction limit reached: {limit_decision.message}")
-                budget_operation_events = [
-                    *attempt_events,
-                    *observed_dispatch_completion_events,
-                ]
+                budget_operation_events = list(attempt_events)
                 budget_operation_event_count = len(budget_operation_events)
                 budget_error = await self._enforce_compaction_budget_limits(
                     session=loaded_session,
@@ -14589,10 +14585,7 @@ class SessionEngine:
             )
             if limit_decision is not None:
                 raise RuntimeError(f"Compaction limit reached: {limit_decision.message}")
-            final_budget_operation_events = [
-                *attempt_events,
-                *observed_dispatch_completion_events,
-            ]
+            final_budget_operation_events = list(attempt_events)
             final_budget_operation_event_count = len(final_budget_operation_events)
             budget_error = await self._enforce_compaction_budget_limits(
                 session=loaded_session,
@@ -15540,6 +15533,8 @@ class SessionEngine:
             session=session,
             budget_limits=budget_limits,
             operation_events=attempt_events,
+            operation_model_step_id=execution_identity.model_step_id,
+            operation_attempt_id=attempt_id,
             provider_name=provider_name,
             model=model,
             billing_identity_state=billing_identity_state,
@@ -21598,10 +21593,8 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                 )
             await turn_usage_tracker.mark_current_position()
-            if has_run_limit_accounting_authority(limits, budget_limits):
-                baseline_events = await self._run_limit_controller.session_usage_events(session.id)
             if limits.scope == "run" and has_run_limits(limits) and run_limit_accounting is None:
-                run_baseline = session_usage_summary(session.id, baseline_events)
+                run_baseline = await self._run_limit_controller.session_usage_summary(session.id)
 
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
                 session,
@@ -24516,8 +24509,7 @@ class SessionEngine:
     ) -> Event:
         """Prepare one invocation summary before a crash-sensitive terminal boundary."""
 
-        usage_events = await usage_tracker.usage_events()
-        summary = session_usage_summary(session.id, usage_events)
+        summary = await usage_tracker.usage_summary()
         duration_ms = max(0, int((time.monotonic() - run_started_at) * 1000))
         interaction_ids = _current_session_invocation_interaction_ids(session.id)
         turn_completed = event_with_runtime_nested_payload_authority(
@@ -26049,7 +26041,7 @@ class SessionEngine:
         environment_name: str | None,
         decision: StopDecision,
         usage_summary: SessionUsageSummary,
-        cost_summary: SessionCostSummary | None,
+        cost_summary: SessionCostTotals | None,
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
@@ -26191,10 +26183,7 @@ class SessionEngine:
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
-        usage_summary = session_usage_summary(
-            session.id,
-            await self._run_limit_controller.session_usage_events(session.id),
-        )
+        usage_summary = await self._run_limit_controller.session_usage_summary(session.id)
         decision = StopDecision(
             limit=StopLimit.MODEL_STEPS,
             maximum=max_steps,
@@ -26252,8 +26241,7 @@ class SessionEngine:
                 execution_profile,
             )
         )
-        session_events = await self._run_limit_controller.session_usage_events(session.id)
-        usage_summary = session_usage_summary(session.id, session_events)
+        usage_summary = await self._run_limit_controller.session_usage_summary(session.id)
         decision = StopDecision(
             limit=StopLimit.ESTIMATED_COST,
             maximum=result.maximum,
@@ -26317,8 +26305,7 @@ class SessionEngine:
             actual=check.actual,
             message=check.message,
         )
-        session_events = await self._run_limit_controller.session_usage_events(session.id)
-        usage_summary = session_usage_summary(session.id, session_events)
+        usage_summary = await self._run_limit_controller.session_usage_summary(session.id)
         async for event in self._stop_session_for_limit_reached(
             session=session,
             registered_agent=registered_agent,

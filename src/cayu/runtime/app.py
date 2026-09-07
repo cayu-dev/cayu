@@ -197,7 +197,7 @@ from cayu.runtime._session_engine import (
     _WorkAttemptRecoveryAlreadyActive,
     _WorkAttemptRuntimeAuthority,
 )
-from cayu.runtime._session_queries import query_all_event_records, query_all_sessions
+from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
 from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
@@ -272,8 +272,7 @@ from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     PriceBook,
     SessionCostSummary,
-    estimate_causal_budget_cost,
-    estimate_session_cost,
+    SessionCostTotals,
 )
 from cayu.runtime.dispatch import (
     Dispatcher,
@@ -508,11 +507,8 @@ from cayu.runtime.tool_rounds import (
 )
 from cayu.runtime.tool_terminal_publication import ToolTerminalPublicationMetricsSnapshot
 from cayu.runtime.usage import (
-    USAGE_BEARING_EVENT_TYPES,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
-    causal_budget_usage_summary,
-    session_usage_summary,
 )
 from cayu.runtime.user_input import (
     UserInputRecoveryRequest,
@@ -6023,8 +6019,9 @@ class CayuApp:
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
-        events = await self._run_limit_controller.session_usage_events(session_id)
-        summary = session_usage_summary(session_id, events)
+        summary = (
+            await self.session_store.read_usage_accounting(EventQuery(session_id=session_id))
+        ).summary
         return summary.model_copy(
             update={"session_id": self.project_session_id_for_exposure(session_id)},
             deep=True,
@@ -6043,17 +6040,29 @@ class CayuApp:
         )
         if not sessions:
             raise KeyError("Causal budget not found") from None
-        records = await self._query_all_event_records(
+        session_ids = list(dict.fromkeys(session.id for session in sessions))
+        snapshot = await self.session_store.read_usage_accounting(
             EventQuery(
                 causal_budget_id=causal_budget_id,
-                event_types=USAGE_BEARING_EVENT_TYPES,
-            )
+                session_ids=tuple(session_ids),
+            ),
+            by_session=True,
         )
-        events = [record.event for record in records]
-        summary = causal_budget_usage_summary(
+        per_session = {row.session_id: row for row in snapshot.session_summaries}
+        total = snapshot.summary
+        summary = CausalBudgetUsageSummary(
             causal_budget_id=causal_budget_id,
-            session_ids=[session.id for session in sessions],
-            events=events,
+            session_ids=session_ids,
+            session_count=len(session_ids),
+            model_steps=total.model_steps,
+            tool_calls=total.tool_calls,
+            provider_names=total.provider_names,
+            models=total.models,
+            usage=total.usage,
+            session_summaries=tuple(
+                per_session.get(session_id, SessionUsageSummary(session_id=session_id))
+                for session_id in session_ids
+            ),
         )
         public_session_ids = [
             self.project_session_id_for_exposure(session_id) for session_id in summary.session_ids
@@ -6083,9 +6092,6 @@ class CayuApp:
 
     async def _list_all_sessions(self, query: SessionQuery) -> list[Session]:
         return await query_all_sessions(self.session_store, query)
-
-    async def _query_all_event_records(self, query: EventQuery) -> list[EventRecord]:
-        return await query_all_event_records(self.session_store, query)
 
     async def run_event_watchers(
         self,
@@ -6246,23 +6252,15 @@ class CayuApp:
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
-        # Token cost derives from completions; independently terminal hosted
-        # calls also carry priceable resource evidence when completion is absent.
-        cost_event_records = await self._query_all_event_records(
-            EventQuery(
-                session_id=session_id,
-                event_types=(
-                    EventType.MODEL_COMPLETED,
-                    EventType.MODEL_HOSTED_TOOL_CALL,
-                ),
-            )
-        )
-        summary = estimate_session_cost(
-            session_id=session_id,
-            events=[record.event for record in cost_event_records],
-            pricing=pricing,
+        snapshot = await self.session_store.read_cost_accounting(
+            EventQuery(session_id=session_id),
+            pricing,
             currency=currency,
+            details=True,
         )
+        summary = snapshot.details
+        if summary is None:
+            raise RuntimeError("Cost accounting store omitted requested details.")
         return summary.model_copy(
             update={"session_id": self.project_session_id_for_exposure(session_id)},
             deep=True,
@@ -6284,22 +6282,17 @@ class CayuApp:
         )
         if not sessions:
             raise KeyError("Causal budget not found") from None
-        records = await self._query_all_event_records(
-            EventQuery(
-                causal_budget_id=causal_budget_id,
-                event_types=(
-                    EventType.MODEL_COMPLETED,
-                    EventType.MODEL_HOSTED_TOOL_CALL,
-                ),
-            )
-        )
-        summary = estimate_causal_budget_cost(
-            causal_budget_id=causal_budget_id,
-            session_ids=[session.id for session in sessions],
-            events=[record.event for record in records],
-            pricing=pricing,
+        from cayu.runtime._cost_accounting import causal_cost_summary
+
+        session_ids = list(dict.fromkeys(session.id for session in sessions))
+        snapshot = await self.session_store.read_cost_accounting(
+            EventQuery(causal_budget_id=causal_budget_id, session_ids=tuple(session_ids)),
+            pricing,
             currency=currency,
+            details=True,
+            by_session=True,
         )
+        summary = causal_cost_summary(snapshot, causal_budget_id, session_ids)
         public_causal_budget_id = self.project_causal_budget_id_for_exposure(
             causal_budget_id,
             session_ids=(session.id for session in sessions),
@@ -7531,7 +7524,7 @@ class CayuApp:
         environment_name: str | None,
         decision: StopDecision,
         usage_summary: SessionUsageSummary,
-        cost_summary: SessionCostSummary | None,
+        cost_summary: SessionCostTotals | None,
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],

@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
 
+from cayu.runtime._cost_accounting import CostAccountingSnapshot
+from cayu.runtime._usage_accounting import UsageAccountingSnapshot
+from cayu.runtime.costs import PriceBook
+
 if TYPE_CHECKING:
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
@@ -668,7 +672,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 62
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 81
 _SQLITE_TASK_MIN_REQUIRED_REVISION = 76
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
@@ -1732,6 +1736,9 @@ class SQLiteSessionStore(SessionStore):
         public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
         ownership_clock: Callable[[], datetime] | None = None,
     ) -> None:
+        from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
+
+        self._cost_accounting_authority = CostAccountingAuthority()
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:
@@ -1806,6 +1813,8 @@ class SQLiteSessionStore(SessionStore):
         else:
             self._read_connection = self._connect_read_only(effective_db_path)
             self._read_lock = asyncio.Lock()
+        self._read_connection.execute("PRAGMA temp_store = FILE")
+        self._read_connection.execute("PRAGMA temp.cache_size = -2048")
 
     def durable_state_paths(self) -> tuple[Path, ...]:
         """Return the primary SQLite file for state-boundary validation."""
@@ -10356,6 +10365,199 @@ class SQLiteSessionStore(SessionStore):
             ]
 
         return await self._run_read(run_query)
+
+    async def read_usage_accounting(
+        self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
+    ) -> UsageAccountingSnapshot:
+        from cayu.runtime._usage_accounting import (
+            USAGE_ACCOUNTING_PAGE_SIZE,
+            UsageAccountingReducer,
+            usage_accounting_query,
+        )
+
+        query = usage_accounting_query(query)
+        plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
+
+        def read(connection: sqlite3.Connection) -> UsageAccountingSnapshot:
+            with connection:
+                connection.execute("BEGIN")
+                generation_row = connection.execute(
+                    "SELECT generation FROM cayu_accounting_state WHERE singleton = 1"
+                ).fetchone()
+                if generation_row is None:
+                    raise RuntimeError("Accounting deletion revision is missing.")
+                generation = generation_row[0]
+                reducer = UsageAccountingReducer(
+                    query, by_session=by_session, by_identity=by_identity
+                )
+                event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
+                # One statement holds one read snapshot. fetchmany bounds hydration;
+                # query.limit is a page size, never a cap on authoritative history.
+                cursor = connection.execute(
+                    f"SELECT cayu_events.sequence, {event_columns} FROM cayu_events "
+                    "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                    f"{plan.where_sql} ORDER BY cayu_events.sequence ASC",
+                    plan.params,
+                )
+                try:
+                    while rows := cursor.fetchmany(USAGE_ACCOUNTING_PAGE_SIZE):
+                        reducer.add_page(
+                            [
+                                EventRecord(sequence=row["sequence"], event=_event_from_row(row))
+                                for row in rows
+                            ]
+                        )
+                    return reducer.snapshot().model_copy(update={"generation": generation})
+                finally:
+                    cursor.close()
+
+        return await self._run_read(read)
+
+    async def read_cost_accounting(
+        self,
+        query: EventQuery,
+        pricing: PriceBook,
+        *,
+        currency: str = "USD",
+        details: bool = False,
+        by_session: bool = False,
+        additional_events: tuple[Event, ...] = (),
+        max_detail_bytes: int | None = None,
+        previous: CostAccountingSnapshot | None = None,
+    ) -> CostAccountingSnapshot:
+        from cayu.runtime._cost_accounting import (
+            COST_ACCOUNTING_PAGE_SIZE,
+            cost_accounting_query,
+            cost_pending_events,
+        )
+        from cayu.runtime._cost_accounting_refresh import CostAccountingRead
+        from cayu.storage._cost_accounting_sql import (
+            changed_cost_groups_statement,
+            cost_boundary_statement,
+            cost_group_lookup_statement,
+            cost_group_statement,
+        )
+
+        query = cost_accounting_query(query)
+        pending = cost_pending_events(query, additional_events)
+        plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
+
+        def read(connection: sqlite3.Connection) -> CostAccountingSnapshot:
+            with connection:
+                connection.execute("BEGIN")
+                generation_row = connection.execute(
+                    "SELECT generation FROM cayu_accounting_state WHERE singleton = 1"
+                ).fetchone()
+                if generation_row is None:
+                    raise RuntimeError("Accounting deletion revision is missing.")
+                generation = generation_row[0]
+                scoped_pending = pending
+                if query.causal_budget_id is not None and pending:
+                    allowed_sessions = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT id FROM cayu_sessions WHERE causal_budget_id = ? "
+                            "AND id IN (SELECT value FROM json_each(?))",
+                            (
+                                query.causal_budget_id,
+                                json.dumps([event.session_id for event in pending]),
+                            ),
+                        )
+                    }
+                    scoped_pending = tuple(
+                        event for event in pending if event.session_id in allowed_sessions
+                    )
+                scoped_pending = tuple(
+                    event
+                    for event in scoped_pending
+                    if connection.execute(
+                        "SELECT 1 FROM cayu_events "
+                        "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                        f"{plan.where_sql} AND cayu_events.session_id = ? AND cayu_events.event_id = ? LIMIT 1",
+                        (*plan.params, event.session_id, event.id),
+                    ).fetchone()
+                    is None
+                )
+                boundary_sql, boundary_params = cost_boundary_statement(query, dialect=_SQL_DIALECT)
+                boundary = connection.execute(boundary_sql, boundary_params).fetchone()[0] or 0
+                reducer = CostAccountingRead(
+                    query,
+                    pricing,
+                    currency=currency,
+                    details=details,
+                    max_detail_bytes=max_detail_bytes,
+                    previous=previous,
+                    generation=generation,
+                    through_sequence=boundary,
+                    authority=self._cost_accounting_authority,
+                    by_session=by_session,
+                    additional_events=scoped_pending,
+                )
+                source_plan = session_store_sql.build_accounting_event_query_sql(
+                    reducer.source_query, dialect=_SQL_DIALECT
+                )
+                event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
+                columns = f"cayu_events.sequence, {event_columns}"
+
+                def add_group(key: tuple[str, bool, str]) -> None:
+                    statement, params = cost_group_lookup_statement(
+                        columns=columns, plan=source_plan, key=key, postgres=False
+                    )
+                    cursor = connection.execute(statement, params)
+                    try:
+                        while rows := cursor.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
+                            for row in rows:
+                                reducer.add(row["sequence"], _event_from_row(row))
+                    finally:
+                        cursor.close()
+
+                if reducer.incremental:
+                    statement, params = changed_cost_groups_statement(reducer, dialect=_SQL_DIALECT)
+                    cursor = connection.execute(statement, params)
+                    try:
+                        while groups := cursor.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
+                            for group in groups:
+                                add_group(
+                                    (
+                                        group[0],
+                                        group[1] is not None,
+                                        group[1] if group[1] is not None else group[2],
+                                    )
+                                )
+                    finally:
+                        cursor.close()
+                    for key in reducer.remaining_pending_keys:
+                        add_group(key)
+                else:
+                    statement, group_params = cost_group_statement(
+                        columns=columns, where_sql=source_plan.where_sql, postgres=False
+                    )
+                    cursor = connection.execute(statement, (*group_params, *source_plan.params))
+                    try:
+                        while rows := cursor.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
+                            for row in rows:
+                                reducer.add(row["sequence"], _event_from_row(row))
+                    finally:
+                        cursor.close()
+                return reducer.snapshot()
+
+        return await self._run_read(read)
+
+    async def event_exists(self, query: EventQuery) -> bool:
+        plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
+
+        def read(connection: sqlite3.Connection) -> bool:
+            return (
+                connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM cayu_events "
+                    "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                    f"{plan.where_sql})",
+                    plan.params,
+                ).fetchone()[0]
+                == 1
+            )
+
+        return await self._run_read(read)
 
     async def query_events_bounded(
         self,

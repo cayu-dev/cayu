@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,7 +38,12 @@ class SessionStoreSqlDialect:
             return f"{column} COLLATE NOCASE LIKE {self.placeholder} ESCAPE '\\'"
         return f"{column} ILIKE {self.placeholder} ESCAPE '\\'"
 
-    def event_payload_text(self, key: Literal["attempt_id", "step_id"]) -> str:
+    def event_payload_text(
+        self,
+        key: Literal[
+            "attempt_id", "step_id", "budget_limit_id", "model_step_id", "parent_model_step_id"
+        ],
+    ) -> str:
         if self.contains_style == "sqlite_nocase_like":
             return f"json_extract(cayu_events.payload_json, '$.{key}')"
         return f"(cayu_events.event -> 'payload' ->> '{key}')"
@@ -99,6 +105,31 @@ def session_order_sql(order_by: SessionOrder) -> str:
     return f"{session_sort_column(order_by)} {direction}, id ASC"
 
 
+def build_accounting_event_query_sql(
+    query: EventQuery,
+    *,
+    dialect: SessionStoreSqlDialect,
+    extra_after_sequence_clauses: Sequence[SqlClause] = (),
+) -> EventQuerySqlPlan:
+    """Keep an arbitrarily large caller identity set inside one read snapshot."""
+    query = copy_event_query(query)
+    clauses = list(extra_after_sequence_clauses)
+    if query.session_ids:
+        if dialect.contains_style == "sqlite_nocase_like":
+            clauses.append(
+                SqlClause(
+                    "cayu_events.session_id IN (SELECT value FROM json_each(?))",
+                    (json.dumps(query.session_ids),),
+                )
+            )
+        else:
+            clauses.append(
+                SqlClause("cayu_events.session_id = ANY(%s)", (list(query.session_ids),))
+            )
+        query = copy_event_query(query, update={"session_ids": ()})
+    return build_event_query_sql(query, dialect=dialect, extra_after_sequence_clauses=clauses)
+
+
 def build_event_query_sql(
     query: EventQuery | None,
     *,
@@ -142,6 +173,15 @@ def build_event_query_sql(
     if query.event_type is not None:
         clauses.append(f"cayu_events.event_type = {dialect.placeholder}")
         params.append(str(query.event_type))
+    if query.budget_limit_id is not None:
+        if dialect.contains_style == "sqlite_nocase_like":
+            clauses.append("json_type(cayu_events.payload_json, '$.budget_limit_id') = 'text'")
+        else:
+            clauses.append(
+                "jsonb_typeof(cayu_events.event -> 'payload' -> 'budget_limit_id') = 'string'"
+            )
+        clauses.append(f"{dialect.event_payload_text('budget_limit_id')} = {dialect.placeholder}")
+        params.append(query.budget_limit_id)
     if query.event_types:
         clauses.append(
             f"cayu_events.event_type IN ({dialect.placeholders(len(query.event_types))})"
@@ -162,6 +202,20 @@ def build_event_query_sql(
     if query.workflow_name is not None:
         clauses.append(f"cayu_events.workflow_name = {dialect.placeholder}")
         params.append(query.workflow_name)
+    for value, key in (
+        (query.model_step_id, "model_step_id"),
+        (query.parent_model_step_id, "parent_model_step_id"),
+        (query.operation_attempt_id, "attempt_id"),
+    ):
+        if value is not None:
+            if dialect.contains_style == "sqlite_nocase_like":
+                clauses.append(f"json_type(cayu_events.payload_json, '$.{key}') = 'text'")
+            else:
+                clauses.append(
+                    f"jsonb_typeof(cayu_events.event -> 'payload' -> '{key}') = 'string'"
+                )
+            clauses.append(f"{dialect.event_payload_text(key)} = {dialect.placeholder}")
+            params.append(value)
     if query.workflow_attempt_id is not None:
         clauses.append(f"{dialect.event_payload_text('attempt_id')} = {dialect.placeholder}")
         params.append(query.workflow_attempt_id)

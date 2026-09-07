@@ -28,6 +28,7 @@ from cayu.runtime.tasks import (
 )
 from cayu.runtime.work_contracts import WorkContractRef
 from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
 # but uses Postgres-native types: TEXT ids, JSONB payloads, TIMESTAMPTZ times,
@@ -479,6 +480,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     WHERE event_type = 'budget.reserved'
       AND jsonb_typeof(payload -> 'reservation_id') = 'string'
     """,
+    *POSTGRES_ACCOUNTING_DDL,
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_sequence "
     "ON cayu_events(session_id, sequence)",
     """

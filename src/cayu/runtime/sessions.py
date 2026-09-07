@@ -163,6 +163,7 @@ from cayu.runtime._child_session_notifications import (
     child_session_notification_stage_binding,
     child_session_notification_storage_key,
 )
+from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._invocation_terminal_decision import (
     InvocationTerminalDecision,
     InvocationTerminalOutcome,
@@ -186,6 +187,7 @@ from cayu.runtime._terminal_evidence import (
     TERMINAL_LIFECYCLE_EVENT_TYPES,
     classify_current_terminal_evidence,
 )
+from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime.aggregates import (
     _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL,
     EXACT_AGGREGATE,
@@ -246,6 +248,7 @@ from cayu.runtime.checkpoints import (
     decode_runtime_checkpoint,
 )
 from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.runtime.costs import PriceBook
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
@@ -7819,6 +7822,10 @@ class EventQuery(BaseModel):
     event_id: str | None = None
     interaction_id: str | None = None
     causal_budget_id: str | None = None
+    budget_limit_id: str | None = None
+    model_step_id: str | None = None
+    parent_model_step_id: str | None = None
+    operation_attempt_id: str | None = None
     event_type: EventType | str | None = None
     event_types: tuple[EventType | str, ...] = Field(default_factory=tuple)
     exclude_event_types: tuple[EventType | str, ...] = Field(default_factory=tuple)
@@ -7841,6 +7848,10 @@ class EventQuery(BaseModel):
         "event_id",
         "interaction_id",
         "causal_budget_id",
+        "budget_limit_id",
+        "model_step_id",
+        "parent_model_step_id",
+        "operation_attempt_id",
         "agent_name",
         "environment_name",
         "workflow_name",
@@ -7941,12 +7952,6 @@ class EventQuery(BaseModel):
             )
         if self.since is not None and self.until is not None and self.since >= self.until:
             raise ValueError("EventQuery since must be before until.")
-        if (
-            self.before_sequence is not None
-            and self.session_id is None
-            and len(self.session_ids) != 1
-        ):
-            raise ValueError("EventQuery before_sequence requires exactly one session.")
         if (
             self.after_sequence is not None
             and self.before_sequence is not None
@@ -11461,6 +11466,40 @@ class SessionStore(ABC):
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         """Query stored events with durable sequence cursors."""
 
+    async def read_usage_accounting(
+        self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
+    ) -> UsageAccountingSnapshot:
+        """Reduce exact usage in one stable store snapshot with 256-row pages.
+
+        The result retains totals, identity lists and optional per-session rows,
+        never historical events. ``after_sequence`` is a single shared watermark
+        across every usage-bearing event type. Unsupported stores fail closed.
+        """
+        raise NotImplementedError("This SessionStore does not support bounded usage accounting.")
+
+    async def read_cost_accounting(
+        self,
+        query: EventQuery,
+        pricing: PriceBook,
+        *,
+        currency: str = "USD",
+        details: bool = False,
+        by_session: bool = False,
+        additional_events: tuple[Event, ...] = (),
+        max_detail_bytes: int | None = None,
+        previous: CostAccountingSnapshot | None = None,
+    ) -> CostAccountingSnapshot:
+        """Price a stable snapshot with bounded working memory plus requested output.
+
+        Built-ins group hosted evidence and completions by session and attempt;
+        totals-only reads retain no historical line items. Unsupported stores fail closed.
+        """
+        raise NotImplementedError("This SessionStore does not support bounded cost accounting.")
+
+    async def event_exists(self, query: EventQuery) -> bool:
+        """Test matching durable evidence without hydrating event payloads."""
+        raise NotImplementedError("This SessionStore does not support event existence queries.")
+
     async def query_events_bounded(
         self,
         query: EventQuery,
@@ -12244,6 +12283,10 @@ class InMemorySessionStore(SessionStore):
         public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
         ownership_clock: Callable[[], datetime] | None = None,
     ) -> None:
+        from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
+
+        self._cost_accounting_authority = CostAccountingAuthority()
+        self._accounting_generation = 0
         if public_authority_alias_codec is not None and not isinstance(
             public_authority_alias_codec,
             PublicAuthorityAliasCodec,
@@ -12343,6 +12386,9 @@ class InMemorySessionStore(SessionStore):
         self._pending_action_latest_barrier_records: dict[str, EventRecord] = {}
         self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
         self._type_event_records: dict[str, list[EventRecord]] = {}
+        from cayu.runtime._cost_accounting_index import CostEventIndex
+
+        self._cost_event_index = CostEventIndex()
         self._workflow_step_event_records: dict[
             tuple[str, str, str, str, str],
             list[EventRecord],
@@ -14544,6 +14590,9 @@ class InMemorySessionStore(SessionStore):
                 for key, record in self._event_records_by_id.items()
                 if key[0] != session_id
             }
+            self._accounting_generation += 1
+            self._cost_event_index.remove_session(session_id)
+
             self._workflow_step_event_records = {
                 key: records
                 for key, records in self._workflow_step_event_records.items()
@@ -15876,6 +15925,7 @@ class InMemorySessionStore(SessionStore):
         for event in event_batch:
             stored_event = event if events_are_detached else event.model_copy(deep=True)
             record = EventRecord(sequence=next_sequence, event=stored_event)
+            self._cost_event_index.validate(record)
             event_type = str(stored_event.type)
             projected_record: EventRecord | None = None
             retention_keys: list[str] = []
@@ -15978,6 +16028,7 @@ class InMemorySessionStore(SessionStore):
             self._events[session_id].append(stored_event)
             self._event_records.append(record)
             self._event_records_by_id[(session_id, stored_event.id)] = record
+            self._cost_event_index.append(record)
             session_records.append(record)
             if session.parent_session_id is not None and stored_event.type in {
                 EventType.SESSION_STARTED,
@@ -18253,6 +18304,159 @@ class InMemorySessionStore(SessionStore):
         async with self._lock:
             return self._query_events_unlocked(query, max_bytes=None)
 
+    async def event_exists(self, query: EventQuery) -> bool:
+        query = copy_event_query(query)
+        event_types = frozenset(
+            (str(query.event_type),)
+            if query.event_type is not None
+            else map(str, query.event_types)
+        )
+        excluded_types = frozenset(map(str, query.exclude_event_types))
+        async with self._lock:
+            records = (
+                self._session_event_records.get(query.session_id, [])
+                if query.session_id is not None
+                else self._event_records
+            )
+            start = bisect_right(records, query.after_sequence or 0, key=lambda row: row.sequence)
+            for index in range(start, len(records)):
+                record = records[index]
+                if query.before_sequence is not None and record.sequence >= query.before_sequence:
+                    break
+                if _event_record_matches(
+                    record, query, event_types, excluded_types
+                ) and _event_record_matches_session(record, query, self._sessions):
+                    return True
+            return False
+
+    async def read_usage_accounting(
+        self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
+    ) -> UsageAccountingSnapshot:
+        from cayu.runtime._usage_accounting import (
+            USAGE_ACCOUNTING_PAGE_SIZE,
+            UsageAccountingReducer,
+            usage_accounting_query,
+        )
+
+        query = usage_accounting_query(query)
+        reducer = UsageAccountingReducer(query, by_session=by_session, by_identity=by_identity)
+        event_types = frozenset(str(kind) for kind in query.event_types)
+        async with self._lock:
+            generation = self._accounting_generation
+            # Reuse durable indexes without merging complete per-type/session lists.
+            candidates = (
+                self._session_event_records.get(query.session_id, [])
+                if query.session_id is not None
+                else self._event_records
+            )
+            start = bisect_right(
+                candidates, query.after_sequence or 0, key=lambda row: row.sequence
+            )
+            page: list[EventRecord] = []
+            for index in range(start, len(candidates)):
+                record = candidates[index]
+                if query.before_sequence is not None and record.sequence >= query.before_sequence:
+                    break
+                if not _event_record_matches(record, query, event_types, frozenset()):
+                    continue
+                if not _event_record_matches_session(record, query, self._sessions):
+                    continue
+                page.append(record)
+                if len(page) == USAGE_ACCOUNTING_PAGE_SIZE:
+                    reducer.add_page(page)
+                    page.clear()
+                    await asyncio.sleep(0)
+            if page:
+                reducer.add_page(page)
+        return reducer.snapshot().model_copy(update={"generation": generation})
+
+    async def read_cost_accounting(
+        self,
+        query: EventQuery,
+        pricing: PriceBook,
+        *,
+        currency: str = "USD",
+        details: bool = False,
+        by_session: bool = False,
+        additional_events: tuple[Event, ...] = (),
+        max_detail_bytes: int | None = None,
+        previous: CostAccountingSnapshot | None = None,
+    ) -> CostAccountingSnapshot:
+        from cayu.runtime._cost_accounting import (
+            COST_ACCOUNTING_PAGE_SIZE,
+            cost_accounting_query,
+            cost_pending_events,
+        )
+        from cayu.runtime._cost_accounting_refresh import CostAccountingRead
+
+        query = cost_accounting_query(query)
+        pending = cost_pending_events(query, additional_events)
+        event_types = frozenset(str(kind) for kind in query.event_types)
+        async with self._lock:
+            if query.causal_budget_id is not None:
+                pending = tuple(
+                    event
+                    for event in pending
+                    if (session := self._sessions.get(event.session_id)) is not None
+                    and session.causal_budget_id == query.causal_budget_id
+                )
+            pending = tuple(
+                event
+                for event in pending
+                if (record := self._event_records_by_id.get((event.session_id, event.id))) is None
+                or not _event_record_matches(record, query, event_types, frozenset())
+            )
+            boundary_session_id = query.session_id or (
+                query.session_ids[0] if len(query.session_ids) == 1 else None
+            )
+            boundary_records = (
+                self._session_event_records.get(boundary_session_id, [])
+                if boundary_session_id is not None
+                else self._event_records
+            )
+            boundary_end = (
+                bisect_left(boundary_records, query.before_sequence, key=lambda row: row.sequence)
+                if query.before_sequence is not None
+                else len(boundary_records)
+            )
+            through_sequence = boundary_records[boundary_end - 1].sequence if boundary_end else 0
+            reducer = CostAccountingRead(
+                query,
+                pricing,
+                currency=currency,
+                details=details,
+                max_detail_bytes=max_detail_bytes,
+                previous=previous,
+                generation=self._accounting_generation,
+                through_sequence=through_sequence,
+                authority=self._cost_accounting_authority,
+                by_session=by_session,
+                additional_events=pending,
+            )
+            scanned = 0
+            for key, records in self._cost_event_index.groups(reducer):
+                if query.session_id is not None and key[0] != query.session_id:
+                    continue
+                if query.session_ids and key[0] not in query.session_ids:
+                    continue
+                if (
+                    query.causal_budget_id is not None
+                    and self._sessions[key[0]].causal_budget_id != query.causal_budget_id
+                ):
+                    continue
+                for kind in (EventType.MODEL_HOSTED_TOOL_CALL, EventType.MODEL_COMPLETED):
+                    for record in records:
+                        scanned += 1
+                        if scanned % COST_ACCOUNTING_PAGE_SIZE == 0:
+                            await asyncio.sleep(0)
+                        if record.event.type != kind:
+                            continue
+                        if _event_record_matches(
+                            record, reducer.source_query, event_types, frozenset()
+                        ) and _event_record_matches_session(record, query, self._sessions):
+                            reducer.add(record.sequence, record.event)
+            return reducer.snapshot()
+
     async def query_events_bounded(
         self,
         query: EventQuery,
@@ -20209,16 +20413,19 @@ def session_outcome_from_records(
     records: list[EventRecord],
 ) -> SessionOutcome:
     session = copy_session(session)
-    session_records = [record for record in records if record.event.session_id == session.id]
 
     latest_lifecycle_sequence = 0
-    for record in reversed(session_records):
+    for record in reversed(records):
+        if record.event.session_id != session.id:
+            continue
         if _is_outcome_lifecycle_event(record.event):
             latest_lifecycle_sequence = record.sequence
             break
 
     terminal_record: EventRecord | None = None
-    for record in reversed(session_records):
+    for record in reversed(records):
+        if record.event.session_id != session.id:
+            continue
         if record.sequence <= latest_lifecycle_sequence:
             break
         if _is_outcome_terminal_event(record.event):
@@ -20226,7 +20433,9 @@ def session_outcome_from_records(
             break
 
     retry_record: EventRecord | None = None
-    for record in reversed(session_records):
+    for record in reversed(records):
+        if record.event.session_id != session.id:
+            continue
         if record.sequence <= latest_lifecycle_sequence:
             break
         if record.event.type == EventType.MODEL_RETRY:
@@ -31955,6 +32164,26 @@ def _event_record_matches(
     if query.event_id is not None and event.id != query.event_id:
         return False
     if query.interaction_id is not None and event.interaction_id != query.interaction_id:
+        return False
+    if (
+        query.budget_limit_id is not None
+        and event.payload.get("budget_limit_id") != query.budget_limit_id
+    ):
+        return False
+    if (
+        query.model_step_id is not None
+        and event.payload.get("model_step_id") != query.model_step_id
+    ):
+        return False
+    if (
+        query.operation_attempt_id is not None
+        and event.payload.get("attempt_id") != query.operation_attempt_id
+    ):
+        return False
+    if (
+        query.parent_model_step_id is not None
+        and event.payload.get("parent_model_step_id") != query.parent_model_step_id
+    ):
         return False
     event_timestamp = event.timestamp.astimezone(UTC)
     if query.since is not None and event_timestamp < query.since:

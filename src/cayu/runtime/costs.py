@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import MAX_EMAX, MIN_EMIN, Decimal, localcontext
 from importlib import resources
 from itertools import pairwise
 from pathlib import Path
@@ -970,8 +970,22 @@ class ModelStepCostEstimate(BaseModel):
         return self
 
 
-class SessionCostSummary(BaseModel):
-    """Estimated session cost derived from durable completion and resource evidence."""
+def add_cost_amounts(*amounts: Decimal) -> Decimal:
+    """Add already-priced amounts without order-dependent Decimal context rounding."""
+    nonzero = [amount for amount in amounts if amount]
+    if not nonzero:
+        return Decimal(0)
+    lowest = min(int(amount.as_tuple().exponent) for amount in nonzero)
+    highest = max(amount.adjusted() for amount in nonzero)
+    with localcontext() as context:
+        context.prec = max(context.prec, highest - lowest + len(str(len(nonzero))) + 2)
+        context.Emax = MAX_EMAX
+        context.Emin = MIN_EMIN
+        return sum(nonzero, Decimal(0))
+
+
+class SessionCostTotals(BaseModel):
+    """Exact cost counters for routine enforcement, without historical line items."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -981,12 +995,6 @@ class SessionCostSummary(BaseModel):
     priced_model_steps: StrictInt = Field(ge=0)
     unpriced_model_steps: StrictInt = Field(ge=0)
     total_cost: Decimal = Field(ge=0)
-    line_items: tuple[CostLineItem, ...] = Field(default_factory=tuple)
-
-    @field_validator("line_items", mode="before")
-    @classmethod
-    def copy_line_items(cls, value: object) -> object:
-        return revalidate_model_inputs(value, CostLineItem)
 
     @field_validator("session_id", "currency")
     @classmethod
@@ -994,13 +1002,39 @@ class SessionCostSummary(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
     @model_validator(mode="after")
-    def validate_step_accounting(self) -> SessionCostSummary:
+    def validate_step_totals(self) -> SessionCostTotals:
         if self.priced_model_steps + self.unpriced_model_steps != self.model_steps:
             raise ValueError("Priced and unpriced steps must sum to model_steps.")
+        if not self.total_cost.is_finite():
+            raise ValueError("total_cost must be finite.")
+        return self
+
+
+class SessionCostSummary(SessionCostTotals):
+    """Detailed cost inspection, retaining one line item per completed step."""
+
+    line_items: tuple[CostLineItem, ...] = Field(default_factory=tuple)
+
+    @field_validator("line_items", mode="before")
+    @classmethod
+    def copy_line_items(cls, value: object) -> object:
+        return revalidate_model_inputs(value, CostLineItem)
+
+    @model_validator(mode="after")
+    def validate_step_accounting(self) -> SessionCostSummary:
         completed_steps = [item.model_step for item in self.line_items if item.model_step > 0]
         if completed_steps != list(range(1, self.model_steps + 1)):
             raise ValueError("Completion cost line items must cover each model step exactly once.")
         return self
+
+
+def session_cost_totals(summary: SessionCostTotals) -> SessionCostTotals:
+    """Project a validated detailed result to the constant-size enforcement shape."""
+    if type(summary) not in {SessionCostTotals, SessionCostSummary}:
+        raise TypeError("summary must be SessionCostTotals or SessionCostSummary.")
+    return SessionCostTotals.model_validate(
+        {field: getattr(summary, field) for field in SessionCostTotals.model_fields}
+    )
 
 
 class CausalBudgetCostSummary(BaseModel):
@@ -1087,7 +1121,7 @@ def _estimate_session_cost(
     )
 
     line_items: list[CostLineItem] = []
-    hosted_by_attempt: dict[str, tuple[UsageMetrics, datetime, str | None]] = {}
+    hosted_by_attempt: dict[tuple[str, str], tuple[UsageMetrics, datetime, str | None]] = {}
     hosted_without_attempt: list[tuple[UsageMetrics, datetime, str | None]] = []
     for event in events:
         if type(event) is not Event:
@@ -1106,8 +1140,9 @@ def _estimate_session_cost(
                 (hosted_metrics, event.timestamp, execution_profile_fingerprint)
             )
             continue
-        existing = hosted_by_attempt.get(model_attempt_id)
-        hosted_by_attempt[model_attempt_id] = (
+        attempt_key = (event.session_id, model_attempt_id)
+        existing = hosted_by_attempt.get(attempt_key)
+        hosted_by_attempt[attempt_key] = (
             hosted_metrics
             if existing is None
             else _combine_hosted_cost_metrics(existing[0], hosted_metrics),
@@ -1130,7 +1165,9 @@ def _estimate_session_cost(
         )
         model_attempt_id = _optional_nonblank(event.payload.get("model_attempt_id"))
         hosted_evidence = (
-            None if model_attempt_id is None else hosted_by_attempt.pop(model_attempt_id, None)
+            None
+            if model_attempt_id is None
+            else hosted_by_attempt.pop((event.session_id, model_attempt_id), None)
         )
         if hosted_evidence is not None:
             metrics = _merge_hosted_cost_metrics(metrics, hosted_evidence[0])
@@ -1177,7 +1214,9 @@ def _estimate_session_cost(
             )
         )
 
-    total_cost = sum((item.total_cost for item in line_items), Decimal("0"))
+    total_cost = Decimal(0)
+    for item in line_items:
+        total_cost = add_cost_amounts(total_cost, item.total_cost)
     priced_model_steps = sum(1 for item in line_items if item.model_step > 0 and item.priced)
     unpriced_model_steps = sum(1 for item in line_items if item.model_step > 0 and not item.priced)
     return SessionCostSummary(
@@ -1200,7 +1239,7 @@ def estimate_causal_budget_cost(
     currency: str = "USD",
 ) -> CausalBudgetCostSummary:
     causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
-    copied_session_ids = _copy_string_list(session_ids, "session_ids")
+    copied_session_ids = list(dict.fromkeys(_copy_string_list(session_ids, "session_ids")))
     known_session_ids = set(copied_session_ids)
     filtered_events: list[Event] = []
     events_by_session: dict[str, list[Event]] = {session_id: [] for session_id in known_session_ids}

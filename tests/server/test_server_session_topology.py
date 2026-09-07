@@ -352,7 +352,7 @@ def test_session_topology_corruption_does_not_echo_durable_identifiers() -> None
     assert response.headers["cache-control"] == "private, no-store"
 
 
-def test_causal_budget_summary_rejects_session_and_event_overflow(monkeypatch) -> None:
+def test_causal_budget_summary_rejects_session_and_response_overflow(monkeypatch) -> None:
     store = InMemorySessionStore()
 
     async def seed() -> None:
@@ -387,15 +387,13 @@ def test_causal_budget_summary_rejects_session_and_event_overflow(monkeypatch) -
     assert "session safety limit" in sessions_overflow.json()["detail"]
 
     monkeypatch.setattr(server_routes, "_CAUSAL_BUDGET_SUMMARY_MAX_SESSIONS", 2)
-    monkeypatch.setattr(server_routes, "_CAUSAL_BUDGET_SUMMARY_MAX_EVENTS", 1)
-    events_overflow = client.post(
+    complete = client.post(
         "/api/causal-budgets/bounded-budget/summary",
         json={"pricing": pricing},
     )
-    assert events_overflow.status_code == 413
-    assert "event safety limit" in events_overflow.json()["detail"]
+    assert complete.status_code == 200
+    assert complete.json()["sessions"][0]["events"]["total_events"] == 2
 
-    monkeypatch.setattr(server_routes, "_CAUSAL_BUDGET_SUMMARY_MAX_EVENTS", 2)
     monkeypatch.setattr(server_routes, "_CAUSAL_BUDGET_SUMMARY_MAX_RESULT_BYTES", 1)
     response_overflow = client.post(
         "/api/causal-budgets/bounded-budget/summary",
@@ -405,7 +403,7 @@ def test_causal_budget_summary_rejects_session_and_event_overflow(monkeypatch) -
     assert "max_result_bytes" in response_overflow.json()["detail"]
 
 
-def test_causal_budget_summary_rejects_event_bytes_before_processing(monkeypatch) -> None:
+def test_causal_budget_summary_rejects_oversized_result_bytes(monkeypatch) -> None:
     store = InMemorySessionStore()
 
     async def seed() -> None:
@@ -426,7 +424,7 @@ def test_causal_budget_summary_rejects_event_bytes_before_processing(monkeypatch
     client = _client(CayuApp(session_store=store, enable_logging=False))
     monkeypatch.setattr(
         server_routes,
-        "_CAUSAL_BUDGET_SUMMARY_MAX_EVENT_INPUT_BYTES",
+        "_CAUSAL_BUDGET_SUMMARY_MAX_RESULT_BYTES",
         1024,
     )
 
@@ -436,15 +434,15 @@ def test_causal_budget_summary_rejects_event_bytes_before_processing(monkeypatch
     )
 
     assert response.status_code == 413
-    assert "event-input safety limit" in response.json()["detail"]
+    assert "max_result_bytes" in response.json()["detail"]
 
 
-def test_causal_budget_summary_fails_closed_without_bounded_event_reads() -> None:
+def test_causal_budget_summary_fails_closed_without_bounded_accounting() -> None:
     class UnboundedEventStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
 
-        async def query_events_bounded(self, query, *, max_bytes):
-            del query, max_bytes
+        async def read_cost_accounting(self, query, pricing, **kwargs):
+            del query, pricing, kwargs
             raise NotImplementedError
 
     store = UnboundedEventStore()
@@ -457,4 +455,4 @@ def test_causal_budget_summary_fails_closed_without_bounded_event_reads() -> Non
     )
 
     assert response.status_code == 501
-    assert "cannot enforce byte-bounded" in response.json()["detail"]
+    assert "cannot enforce bounded accounting" in response.json()["detail"]

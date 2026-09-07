@@ -1059,7 +1059,7 @@ def causal_budget_usage_summary(
     events: list[Event],
 ) -> CausalBudgetUsageSummary:
     causal_budget_id = require_durable_clean_nonblank(causal_budget_id, "causal_budget_id")
-    session_ids = _copy_string_list(session_ids, "session_ids")
+    session_ids = list(dict.fromkeys(_copy_string_list(session_ids, "session_ids")))
     known_session_ids = set(session_ids)
     filtered_events = [event for event in events if event.session_id in known_session_ids]
     summary = session_usage_summary(causal_budget_id, filtered_events)

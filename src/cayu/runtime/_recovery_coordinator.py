@@ -241,7 +241,7 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
-from cayu.runtime.costs import SessionCostSummary
+from cayu.runtime.costs import SessionCostTotals
 from cayu.runtime.dispatch import (
     _new_prepared_subagent_dispatch_envelope,
     _require_dispatch_task_authority,
@@ -1309,7 +1309,7 @@ class RecoveryLimitStopRequest:
     environment_name: str | None
     decision: StopDecision
     usage_summary: SessionUsageSummary
-    cost_summary: SessionCostSummary | None
+    cost_summary: SessionCostTotals | None
     messages: list[Message]
     tool_calls: list[runtime_records.ToolCallRequest]
     completed_tool_outcomes: list[runtime_records.ToolCallOutcome]

@@ -158,7 +158,7 @@ def test_session_usage_tracker_accumulates_tail_events_incrementally():
         await _create_running_session(store, "sess_tracker")
         tracker = SessionUsageTracker(store, session_id="sess_tracker")
 
-        assert await tracker.usage_events() == []
+        assert (await tracker.usage_summary()).model_steps == 0
 
         await store.append_events(
             "sess_tracker",
@@ -177,14 +177,12 @@ def test_session_usage_tracker_accumulates_tail_events_incrementally():
                 ),
             ],
         )
-        first = await tracker.usage_events()
-        assert [event.type for event in first] == [
-            EventType.MODEL_COMPLETED,
-            EventType.TOOL_CALL_STARTED,
-        ]
+        first = await tracker.usage_summary()
+        assert first.model_steps == 1
+        assert first.tool_calls == 1
 
-        # No new events: the cached tail is returned as-is.
-        assert await tracker.usage_events() is first
+        # No new events: refreshing totals does not count the tail twice.
+        assert await tracker.usage_summary() == first
 
         await store.append_events(
             "sess_tracker",
@@ -197,15 +195,12 @@ def test_session_usage_tracker_accumulates_tail_events_incrementally():
                 usage_event(2),
             ],
         )
-        second = await tracker.usage_events()
-        assert [event.type for event in second] == [
-            EventType.MODEL_COMPLETED,
-            EventType.TOOL_CALL_STARTED,
-            EventType.MODEL_COMPLETED,
-        ]
+        second = await tracker.usage_summary()
+        assert second.model_steps == 2
+        assert second.tool_calls == 1
 
         all_events = await store.load_events("sess_tracker")
-        tracked_summary = session_usage_summary("sess_tracker", second)
+        tracked_summary = second
         full_summary = session_usage_summary("sess_tracker", all_events)
         assert tracked_summary == full_summary
         assert tracked_summary.usage.total_tokens == 33
@@ -216,27 +211,18 @@ def test_session_usage_tracker_accumulates_tail_events_incrementally():
 
 
 class _MidRefreshAppendingStore(InMemorySessionStore):
-    """Deterministically replays the issue-#101 watermark race.
-
-    On the first ``query_events`` call it appends one ``model.completed`` and
-    one ``tool.call.started`` event after computing its result. With the old
-    per-type refresh (two queries sharing one watermark), the second query of
-    the same refresh returned only the tool event, the shared watermark jumped
-    past the model event, and its tokens were lost forever. A single
-    ``event_types`` query sees nothing mid-refresh, so the next refresh picks
-    both events up.
-    """
+    """Append both usage types after returning a captured accounting snapshot."""
 
     invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
         super().__init__()
-        self.query_events_calls = 0
+        self.accounting_reads = 0
         self._raced = False
 
-    async def query_events(self, query=None):
-        self.query_events_calls += 1
-        records = await super().query_events(query)
+    async def read_usage_accounting(self, query, *, by_session=False):
+        self.accounting_reads += 1
+        records = await super().read_usage_accounting(query, by_session=by_session)
         if not self._raced:
             self._raced = True
             await super().append_events(
@@ -277,19 +263,16 @@ def test_session_usage_tracker_never_skips_events_appended_mid_refresh():
         # First refresh: the store races an append mid-refresh. The refresh
         # must be ONE store query, and must not advance the watermark past
         # the raced events it never saw.
-        assert await tracker.usage_events() == []
-        assert store.query_events_calls == 1
+        assert (await tracker.usage_summary()).model_steps == 0
+        assert store.accounting_reads == 1
 
         # Second refresh recovers BOTH raced events — the old two-query
         # refresh skipped the model.completed event forever.
-        events = await tracker.usage_events()
-        assert [event.type for event in events] == [
-            EventType.MODEL_COMPLETED,
-            EventType.TOOL_CALL_STARTED,
-        ]
-        assert store.query_events_calls == 2
+        summary = await tracker.usage_summary()
+        assert summary.model_steps == 1
+        assert summary.tool_calls == 1
+        assert store.accounting_reads == 2
 
-        summary = session_usage_summary("sess_race", events)
         assert summary.usage.total_tokens == 11
         assert summary.tool_calls == 1
 

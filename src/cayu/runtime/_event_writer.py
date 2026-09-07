@@ -466,7 +466,7 @@ class RuntimeEventWriter:
         return delivered_event, True
 
     async def _forward_budget_event_if_required(self, event: Event) -> None:
-        if event.type == EventType.MODEL_COMPLETED:
+        if event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_HOSTED_TOOL_CALL}:
             await self._budget_store.append_event(event.model_copy(deep=True))
 
     async def _handle_unclaimed_persisted_side_effect(self, event: Event) -> int:
@@ -530,7 +530,7 @@ class RuntimeEventWriter:
                 public.id,
                 public.type,
                 delivery.attempts,
-                claim.event.type == EventType.MODEL_COMPLETED,
+                claim.event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_HOSTED_TOOL_CALL},
             )
         return delivery
 

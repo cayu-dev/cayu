@@ -6449,6 +6449,94 @@ enforces the schema.
 
 ## Usage Metrics
 
+`SessionStore.read_usage_accounting(EventQuery(...), by_session=False,
+by_identity=False)` reduces all matching usage-bearing events in one store
+snapshot. `UsageAccountingSnapshot` returns exact totals, a deletion `generation`,
+and `through_sequence`: one shared ordered watermark for model completions,
+hosted-tool usage, and started tool calls. For a single session, supplying that
+watermark as `after_sequence` reads the next tail. Query limits are page sizes and never
+truncate accounting history. `by_identity=True` additionally returns provider
+and model breakdowns with distinct session membership.
+
+Usage reads retain at most 256 event rows plus requested result identities and
+per-session or identity groups. Cost reads retain at most 256 event rows, one
+attempt's aggregate hosted-tool evidence, scalar totals, and an optional tail of
+at most 256 in-flight events. These are bounds on event working sets; individual
+source payloads and requested output identities still contribute their own
+size. In-memory stores maintain append/delete indexes over their authoritative
+records instead of copying histories into readers. SQLite uses a read
+transaction, file-backed temporary sorting, and a 2 MiB temporary page cache.
+PostgreSQL uses named server cursors in a repeatable-read transaction and
+database-configured sort memory. `EventQuery.before_sequence` can bound a cross-session prefix as well as
+a single session.
+
+`SessionStore.read_cost_accounting(query, pricing, currency="USD", details=False,
+by_session=False, additional_events=(), max_detail_bytes=None, previous=None)`
+returns `CostAccountingSnapshot`. Its `totals` are `SessionCostTotals`; setting
+`details=True` also requests the complete `SessionCostSummary`. Hosted evidence
+is paired by `(session_id, model_attempt_id)`, including evidence separated by
+many pages. Pricing, currency, unpriced-step decisions, and detailed provenance
+use the same estimator as explicit cost inspection. Scalar addition preserves
+small charges when large contributions are added or removed.
+
+Routine `BudgetCheck.cost_summary` and emitted budget-check cost payloads now
+contain `SessionCostTotals`, without historical `line_items`. Reading a legacy
+budget check validates its detailed summary before projecting it to totals.
+`CayuApp.get_session_cost` and `get_causal_budget_cost` retain their detailed
+return types. Reservation settlement also retains its individual pricing
+provenance. `max_detail_bytes` is an optional caller-selected output bound;
+exceeding it raises `CostAccountingOutputTooLarge` instead of truncating results.
+The causal-summary HTTP route uses that bound and its existing response limit.
+Session and causal summary routes use native accounting, event-count, and outcome
+reads, with no total-event cap.
+
+Active readers pass `previous` to refresh cost totals. They retain one snapshot
+per currently configured budget scope, not event histories or past policy
+configurations. Refresh reprices only affected attempt groups: newly appended
+groups, groups with events entering or leaving the window, and groups referenced
+by the bounded in-flight tail. An affected group can itself contain many events;
+its evidence is still streamed with the same working-set bound. An authenticated
+cursor binds durable totals to the store instance, scope, price book, window,
+sequence boundary, and deletion generation. In-flight charges never become the
+cached durable baseline. Changed pricing or scope, a reopened store, modified
+cursor totals, or a deletion-generation change causes a bounded cold rebuild.
+PostgreSQL cross-session totals always stream the complete visible repeatable-read
+snapshot and return no incremental cost cursor; active readers accept those exact
+totals without caching a baseline. Global event sequence allocation
+is not commit order. This includes committed spend even while an unrelated older
+transaction remains open, and includes late commits below an earlier maximum
+sequence. Single-session reads retain incremental refresh. Cross-session usage
+boundaries likewise describe that snapshot, not a safe append-only feed cursor.
+
+Operation budgets read persisted evidence by `EventQuery.model_step_id` and, for
+explicit compaction, `operation_attempt_id` (the payload's compaction `attempt_id`).
+Automatic compaction uses `parent_model_step_id` to include its independently
+identified provider calls, including recovered completion evidence. Run-only
+budgets therefore exclude unrelated steps and earlier explicit-compaction attempts.
+Only unresolved cost-bearing events enter the bounded pending overlay; retained
+replay history does not consume its 256-event capacity.
+
+Database deletion triggers maintain the generation across store instances;
+in-memory deletion updates it under the store lock. Concurrent refreshes are
+serialized, and all event kinds advance the cost snapshot's boundary so an
+inactive scope does not repeatedly inspect the same unrelated tail.
+
+`BudgetStore.read_cost_for_budget` exposes the same totals/cursor contract for
+app, agent, and causal budgets, including all supported windows. Request, policy,
+and operation budget checks use it or the session-store primitive. Token/tool/
+time checks, turn summaries, and limit-stop summaries use bounded usage reads.
+In-flight evidence is deduplicated by its exact session/event identity inside the
+captured snapshot, so a concurrent later publication neither disappears from
+the current check nor counts twice on the next one.
+
+`SessionStore.event_exists(EventQuery(...))` returns a boolean without hydrating
+events. `EventQuery.budget_limit_id` matches an exact string-valued durable payload
+identity. Policy notification deduplication combines it with scope and window
+filters and never loads prior cost breakdowns. Custom stores must implement the
+native accounting and existence contracts; unsupported implementations fail
+closed. Custom budget stores must support incremental durable cursors for active
+enforcement. There is no fallback to loading complete histories.
+
 Provider `completed` stream events may include the provider's raw `usage` payload.
 The runtime keeps that raw payload in the durable `model.completed` event and,
 when token counters are available, adds provider-neutral `usage_metrics` beside

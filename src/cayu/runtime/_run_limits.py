@@ -19,6 +19,7 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     copy_durable_json_object,
     copy_json_value,
     require_clean_nonblank,
@@ -41,9 +42,10 @@ from cayu.core.events import (
 )
 from cayu.providers import ModelProviderError
 from cayu.providers._credential_boundary import provider_cancellation_failures
+from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limit_accounting import RunBudgetAccountingAuthority
-from cayu.runtime._session_queries import query_all_event_records
+from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime.budgets import (
     MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
     BudgetCheck,
@@ -71,6 +73,7 @@ from cayu.runtime.budgets import (
     _operation_budget_limits_for_session,
     budget_actual_cost_for_event,
     budget_check_from_events,
+    budget_check_from_totals,
     budget_check_payload,
     budget_limits_for_session,
     budget_price,
@@ -88,7 +91,12 @@ from cayu.runtime.budgets import (
     new_budget_reservation_id,
     request_budget_limits_for_session,
 )
-from cayu.runtime.costs import SessionCostSummary, estimate_session_cost
+from cayu.runtime.costs import (
+    SessionCostSummary,
+    SessionCostTotals,
+    estimate_session_cost,
+    session_cost_totals,
+)
 from cayu.runtime.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
@@ -100,7 +108,6 @@ from cayu.runtime.execution_units import (
 )
 from cayu.runtime.sessions import (
     EventQuery,
-    EventRecord,
     ModelCompletionStage,
     Session,
     SessionOperationPublication,
@@ -119,6 +126,7 @@ from cayu.runtime.usage import (
     USAGE_BEARING_EVENT_TYPES,
     SessionUsageSummary,
     build_aggregate_usage_metrics,
+    combine_session_usage_summaries,
     session_usage_summary,
 )
 
@@ -1171,7 +1179,7 @@ def _model_completion_with_reconciliation_evidence(
 class LimitEvaluation:
     decision: StopDecision | None
     usage_summary: SessionUsageSummary
-    cost_summary: SessionCostSummary | None
+    cost_summary: SessionCostTotals | None
     events: tuple[Event, ...] = ()
 
 
@@ -1246,32 +1254,89 @@ class SessionUsageTracker:
     def __init__(self, session_store: SessionStore, *, session_id: str) -> None:
         self._session_store = session_store
         self._session_id = require_clean_nonblank(session_id, "session_id")
-        self._after_sequence: int | None = None
-        self._events: list[Event] = []
-
-    async def _new_usage_records(self) -> list[EventRecord]:
-        # One multi-type query and one shared watermark are essential. Separate
-        # per-type reads can skip spend appended between queries.
-        return await query_all_event_records(
-            self._session_store,
-            EventQuery(
-                session_id=self._session_id,
-                event_types=USAGE_BEARING_EVENT_TYPES,
-                after_sequence=self._after_sequence,
-            ),
-        )
+        self._summary = SessionUsageSummary(session_id=self._session_id)
+        self._summary_after_sequence = 0
+        self._summary_start_sequence = 0
+        self._summary_generation: int | None = None
+        self._summary_lock = asyncio.Lock()
+        self._cost_lock = asyncio.Lock()
+        self._cost_snapshots: dict[tuple[str, str], CostAccountingSnapshot] = {}
+        self._cost_scope_ids: dict[str, set[str]] = {}
 
     async def mark_current_position(self) -> None:
-        new_records = await self._new_usage_records()
-        if new_records:
-            self._after_sequence = new_records[-1].sequence
+        async with self._summary_lock:
+            snapshot = await self._session_store.read_usage_accounting(
+                EventQuery(session_id=self._session_id)
+            )
+            self._summary_after_sequence = snapshot.through_sequence
+            self._summary_start_sequence = snapshot.through_sequence
+            self._summary_generation = snapshot.generation
 
-    async def usage_events(self) -> list[Event]:
-        new_records = await self._new_usage_records()
-        if new_records:
-            self._events.extend(record.event for record in new_records)
-            self._after_sequence = new_records[-1].sequence
-        return self._events
+    async def usage_summary(self) -> SessionUsageSummary:
+        return (await self.usage_snapshot()).summary.model_copy(deep=True)
+
+    async def usage_snapshot(self) -> UsageAccountingSnapshot:
+        async with self._summary_lock:
+            snapshot = await self._session_store.read_usage_accounting(
+                EventQuery(session_id=self._session_id, after_sequence=self._summary_after_sequence)
+            )
+            if snapshot.through_sequence < self._summary_after_sequence:
+                raise ValueError("Usage accounting watermark moved backwards.")
+            if (
+                self._summary_generation is not None
+                and snapshot.generation != self._summary_generation
+            ):
+                snapshot = await self._session_store.read_usage_accounting(
+                    EventQuery(
+                        session_id=self._session_id, after_sequence=self._summary_start_sequence
+                    )
+                )
+                self._summary = snapshot.summary
+            else:
+                self._summary = combine_session_usage_summaries(
+                    self._session_id, (self._summary, snapshot.summary)
+                )
+            self._summary_after_sequence = max(
+                self._summary_after_sequence, snapshot.through_sequence
+            )
+            self._summary_generation = snapshot.generation
+            return UsageAccountingSnapshot(
+                through_sequence=self._summary_after_sequence,
+                generation=snapshot.generation,
+                summary=self._summary.model_copy(deep=True),
+            )
+
+    async def retain_cost_scopes(self, namespace: str, identities: set[str]) -> None:
+        """Retain only currently configured scopes, never past policy generations."""
+        async with self._cost_lock:
+            self._cost_scope_ids[namespace] = identities.copy()
+            self._cost_snapshots = {
+                key: value
+                for key, value in self._cost_snapshots.items()
+                if key[0] != namespace or key[1] in identities
+            }
+
+    async def cost_snapshot(
+        self,
+        namespace: str,
+        identity: str,
+        read: Callable[[CostAccountingSnapshot | None], Awaitable[CostAccountingSnapshot]],
+    ) -> CostAccountingSnapshot:
+        async with self._cost_lock:
+            key = (namespace, identity)
+            snapshot = await read(self._cost_snapshots.get(key))
+            if snapshot.details is not None or snapshot.session_details or snapshot.session_totals:
+                raise ValueError("Routine cost accounting must return totals only.")
+            if snapshot.durable_totals is None:
+                raise NotImplementedError("Active cost accounting requires exact durable totals.")
+            if snapshot.cursor is None:
+                # Some stores can prove exact totals but cannot safely use a
+                # sequence cursor for this scope. Do not cache that baseline.
+                self._cost_snapshots.pop(key, None)
+                return snapshot
+            if identity in self._cost_scope_ids.get(namespace, set()):
+                self._cost_snapshots[key] = snapshot.model_copy(deep=True)
+            return snapshot
 
 
 class BudgetReservationIdentityGuard:
@@ -1793,15 +1858,37 @@ class RunLimitController:
 
         return self._clock()
 
-    async def session_usage_events(self, session_id: str) -> list[Event]:
-        records = await query_all_event_records(
-            self._session_store,
-            EventQuery(
-                session_id=session_id,
-                event_types=USAGE_BEARING_EVENT_TYPES,
-            ),
+    async def session_usage_summary(self, session_id: str) -> SessionUsageSummary:
+        return (
+            await self._session_store.read_usage_accounting(EventQuery(session_id=session_id))
+        ).summary
+
+    async def _usage_with_additional_events(
+        self, snapshot: UsageAccountingSnapshot, additional_events: list[Event]
+    ) -> SessionUsageSummary:
+        pending: list[Event] = []
+        for event in _merge_events_by_id(additional_events):
+            # A later append is outside the snapshot and must still count as
+            # in-flight usage. Only evidence inside the captured boundary is
+            # already represented by the durable totals.
+            if snapshot.through_sequence and await self._session_store.event_exists(
+                EventQuery(
+                    session_id=snapshot.summary.session_id,
+                    event_id=event.id,
+                    event_types=USAGE_BEARING_EVENT_TYPES,
+                    before_sequence=(
+                        snapshot.through_sequence + 1
+                        if snapshot.through_sequence < MAX_DURABLE_JSON_INTEGER
+                        else None
+                    ),
+                )
+            ):
+                continue
+            pending.append(event)
+        return combine_session_usage_summaries(
+            snapshot.summary.session_id,
+            (snapshot.summary, session_usage_summary(snapshot.summary.session_id, pending)),
         )
-        return [record.event for record in records]
 
     async def evaluate_operation_run_limit(
         self,
@@ -1817,8 +1904,8 @@ class RunLimitController:
             return None
         usage_events = _merge_events_by_id(operation_events)
         if limits.scope == "session":
-            usage_events = _merge_events_by_id(
-                await self.session_usage_events(session.id),
+            usage = await self._usage_with_additional_events(
+                await self._session_store.read_usage_accounting(EventQuery(session_id=session.id)),
                 usage_events,
             )
             created_at = session.created_at
@@ -1829,12 +1916,100 @@ class RunLimitController:
                 int((self._clock() - created_at.astimezone(UTC)).total_seconds()),
             )
         else:
+            usage = session_usage_summary(session.id, usage_events)
             elapsed_seconds = max(0, int(time.monotonic() - operation_started_at))
         return first_reached_limit(
             limits=limits,
-            usage=session_usage_summary(session.id, usage_events),
+            usage=usage,
             elapsed_seconds=elapsed_seconds,
         )
+
+    async def _cost_for_budget(
+        self,
+        *,
+        session_id: str,
+        limit: BudgetLimit,
+        additional_events: list[Event],
+        now: datetime,
+        started_at: datetime | None = None,
+        operation_only: bool = False,
+        operation_model_step_id: str | None = None,
+        operation_attempt_id: str | None = None,
+        operation_parent_model_step_id: str | None = None,
+        tracker: SessionUsageTracker | None = None,
+        cache_namespace: str = "request",
+    ) -> SessionCostTotals:
+        from cayu.runtime._cost_accounting import (
+            COST_ACCOUNTING_MAX_PENDING_EVENTS,
+            COST_EVENT_TYPES,
+        )
+
+        # The caller may retain replay/telemetry history. Only unresolved cost
+        # evidence belongs in the bounded pending overlay passed to the store.
+        unresolved: dict[tuple[str, str], Event] = {}
+        for event in additional_events:
+            if event.type not in COST_EVENT_TYPES:
+                continue
+            if await self._session_store.event_exists(
+                EventQuery(session_id=event.session_id, event_id=event.id)
+            ):
+                continue
+            unresolved[(event.session_id, event.id)] = event
+            if len(unresolved) > COST_ACCOUNTING_MAX_PENDING_EVENTS:
+                raise ValueError(
+                    "Cost accounting unresolved evidence exceeds the working-set bound."
+                )
+        pending = tuple(unresolved.values())
+
+        async def read(previous: CostAccountingSnapshot | None) -> CostAccountingSnapshot:
+            if limit.scope in {"app", "agent", "causal"}:
+                snapshot = await self._budget_store.read_cost_for_budget(
+                    scope=limit.scope,
+                    key=limit.key,
+                    window=limit.window,
+                    pricing=limit.pricing,
+                    currency=limit.currency,
+                    now=now,
+                    additional_events=pending,
+                    previous=previous,
+                )
+            elif limit.scope in {"session", "run"}:
+                since, until = limit.window.bounds(now)
+                if started_at is not None:
+                    since = max(since, started_at) if since is not None else started_at
+                query = EventQuery(session_id=session_id, since=since, until=until)
+                if operation_only and operation_parent_model_step_id is not None:
+                    query = query.model_copy(
+                        update={"parent_model_step_id": operation_parent_model_step_id}
+                    )
+                elif operation_only:
+                    if operation_model_step_id is None:
+                        raise ValueError(
+                            "Operation budget accounting requires its model-step identity."
+                        )
+                    query = query.model_copy(
+                        update={
+                            "model_step_id": operation_model_step_id,
+                            "operation_attempt_id": operation_attempt_id,
+                        }
+                    )
+                snapshot = await self._session_store.read_cost_accounting(
+                    query,
+                    limit.pricing,
+                    currency=limit.currency,
+                    additional_events=pending,
+                    previous=previous,
+                )
+            else:
+                raise ValueError(f"Unsupported budget scope: {limit.scope}")
+            return snapshot
+
+        snapshot = (
+            await tracker.cost_snapshot(cache_namespace, _effective_budget_limit_id(limit), read)
+            if tracker is not None and not operation_only
+            else await read(None)
+        )
+        return snapshot.totals.model_copy(update={"session_id": session_id}, deep=True)
 
     async def evaluate_operation_budgets(
         self,
@@ -1842,6 +2017,9 @@ class RunLimitController:
         session: Session,
         budget_limits: tuple[BudgetLimit, ...],
         operation_events: list[Event],
+        operation_model_step_id: str,
+        operation_attempt_id: str | None = None,
+        operation_parent_model_step_id: str | None = None,
         provider_name: str | None,
         model: str | None,
         billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
@@ -1855,41 +2033,28 @@ class RunLimitController:
         )
         checks: list[OperationBudgetCheck] = []
         for limit in budget_limits:
-            if limit.scope in {"app", "agent", "causal"}:
-                existing_events = await self._budget_store.load_events_for_budget(
-                    scope=limit.scope,
-                    key=limit.key,
-                    window=limit.window,
-                )
-            elif limit.scope == "session":
-                existing_events = await self.session_usage_events(session.id)
-            elif limit.scope == "run":
-                existing_events = []
-            else:
-                raise ValueError(f"Unsupported request budget scope: {limit.scope}")
-            events = events_for_budget_window(
-                _merge_events_by_id(existing_events, operation_events),
-                limit.window,
+            summary = await self._cost_for_budget(
+                session_id=session.id,
+                limit=limit,
+                additional_events=operation_events,
                 now=self._clock(),
+                operation_only=limit.scope == "run",
+                operation_model_step_id=operation_model_step_id,
+                operation_attempt_id=operation_attempt_id,
+                operation_parent_model_step_id=operation_parent_model_step_id,
             )
             event_provider_name, event_model = _latest_model_event_identity(operation_events)
             effective_provider_name = event_provider_name or provider_name
             effective_model = event_model or model
-            if effective_provider_name is None or effective_model is None:
-                summary = estimate_session_cost(
-                    session_id=session.id,
-                    events=events,
-                    pricing=limit.pricing,
-                    currency=limit.currency,
-                )
-                if (
-                    summary.unpriced_model_steps == 0
-                    and summary.total_cost < limit.max_estimated_cost
-                ):
-                    continue
-            check = budget_check_from_events(
+            if (
+                (effective_provider_name is None or effective_model is None)
+                and summary.unpriced_model_steps == 0
+                and summary.total_cost < limit.max_estimated_cost
+            ):
+                continue
+            check = budget_check_from_totals(
                 limit=limit,
-                events=events,
+                summary=summary,
                 provider_name=effective_provider_name,
                 model=effective_model,
                 billing_identity_state=billing_identity_state,
@@ -1925,22 +2090,25 @@ class RunLimitController:
             agent_name=agent_name,
             causal_budget_id=session.causal_budget_id,
         )
+        if usage_tracker is not None:
+            await usage_tracker.retain_cost_scopes(
+                "request", {_effective_budget_limit_id(limit) for limit in budget_limits}
+            )
         if not has_run_limits(limits) and not budget_limits:
             return LimitEvaluation(
                 decision=None,
                 usage_summary=SessionUsageSummary(session_id=session.id),
                 cost_summary=None,
             )
-        events = (
-            await usage_tracker.usage_events()
-            if usage_tracker is not None
-            else await self.session_usage_events(session.id)
-        )
         additional_events = [
             event.model_copy(deep=True) for event in (additional_usage_events or [])
         ]
-        events = _merge_events_by_id(events, additional_events)
-        usage_summary = session_usage_summary(session.id, events)
+        snapshot = (
+            await usage_tracker.usage_snapshot()
+            if usage_tracker is not None
+            else await self._session_store.read_usage_accounting(EventQuery(session_id=session.id))
+        )
+        usage_summary = await self._usage_with_additional_events(snapshot, additional_events)
         usage_for_limits = usage_summary
         if limits.scope == "run" and run_baseline is not None:
             current, baseline = usage_summary.usage, run_baseline.usage
@@ -1997,58 +2165,35 @@ class RunLimitController:
                         "Run budget authority does not match its effective budget limit."
                     )
 
-        cost_summary: SessionCostSummary | None = None
+        cost_summary: SessionCostTotals | None = None
         emitted_events: list[Event] = []
         for budget_limit in budget_limits:
-            budget_events = events
-            budget_baseline: SessionCostSummary | None = None
+            budget_baseline: SessionCostTotals | None = None
             budget_window_now = self._clock()
-            if budget_limit.scope in {"app", "agent", "causal"}:
-                budget_events = await self._budget_store.load_events_for_budget(
-                    scope=budget_limit.scope,
-                    key=budget_limit.key,
-                    window=budget_limit.window,
-                )
-                budget_events = _merge_events_by_id(
-                    budget_events,
-                    additional_events,
-                )
-            elif budget_limit.scope == "run":
-                budget_events = events_for_budget_window(
-                    events,
-                    budget_limit.window,
-                    now=budget_window_now,
-                )
+            started_at = None
+            if budget_limit.scope == "run":
                 if run_budget_authorities is not None:
-                    authority = run_budget_authorities[_effective_budget_limit_id(budget_limit)]
-                    budget_events = [
-                        event for event in budget_events if event.timestamp >= authority.started_at
-                    ]
-                else:
-                    budget_baseline = estimate_session_cost(
-                        session_id=session.id,
-                        events=events_for_budget_window(
-                            budget_baseline_events or [],
-                            budget_limit.window,
-                            now=budget_window_now,
-                        ),
-                        pricing=budget_limit.pricing,
-                        currency=budget_limit.currency,
+                    started_at = run_budget_authorities[
+                        _effective_budget_limit_id(budget_limit)
+                    ].started_at
+                elif budget_baseline_events:
+                    budget_baseline = session_cost_totals(
+                        estimate_session_cost(
+                            session_id=session.id,
+                            events=events_for_budget_window(
+                                budget_baseline_events, budget_limit.window, now=budget_window_now
+                            ),
+                            pricing=budget_limit.pricing,
+                            currency=budget_limit.currency,
+                        )
                     )
-            elif budget_limit.scope == "session":
-                budget_events = events_for_budget_window(
-                    events,
-                    budget_limit.window,
-                    now=budget_window_now,
-                )
-            else:
-                raise ValueError(f"Unsupported request budget scope: {budget_limit.scope}")
-
-            cost_summary = estimate_session_cost(
+            cost_summary = await self._cost_for_budget(
                 session_id=session.id,
-                events=budget_events,
-                pricing=budget_limit.pricing,
-                currency=budget_limit.currency,
+                limit=budget_limit,
+                additional_events=additional_events,
+                now=budget_window_now,
+                started_at=started_at,
+                tracker=usage_tracker,
             )
             budget_outcome = _first_budget_limit_outcome(
                 session=session,
@@ -2105,12 +2250,17 @@ class RunLimitController:
         additional_usage_events: list[Event] | None = None,
         execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
         execution_profile_fingerprint: str | None = None,
+        usage_tracker: SessionUsageTracker | None = None,
     ) -> BudgetEvaluation:
         limits = budget_limits_for_session(
             policy=budget_policy,
             agent_name=agent_name,
             causal_budget_id=session.causal_budget_id,
         )
+        if usage_tracker is not None:
+            await usage_tracker.retain_cost_scopes(
+                "policy", {_effective_budget_limit_id(limit) for limit in limits}
+            )
         if not limits:
             return BudgetEvaluation(check=None)
         emitted_events: list[Event] = []
@@ -2120,15 +2270,17 @@ class RunLimitController:
             event.model_copy(deep=True) for event in (additional_usage_events or [])
         ]
         for limit in limits:
-            events = await self._budget_store.load_events_for_budget(
-                scope=limit.scope,
-                key=limit.key,
-                window=limit.window,
-            )
-            events = _merge_events_by_id(events, additional_events)
-            check = budget_check_from_events(
+            summary = await self._cost_for_budget(
+                session_id=session.id,
                 limit=limit,
-                events=events,
+                additional_events=additional_events,
+                now=self._clock(),
+                tracker=usage_tracker,
+                cache_namespace="policy",
+            )
+            check = budget_check_from_totals(
+                limit=limit,
+                summary=summary,
                 provider_name=effective_provider_name,
                 model=effective_model,
                 billing_identity_state=billing_identity_state,
@@ -2204,20 +2356,16 @@ class RunLimitController:
         elif limit.scope != "app":
             return False
 
-        records = await query_all_event_records(
-            self._session_store,
+        return await self._session_store.event_exists(
             EventQuery(
                 causal_budget_id=causal_budget_id,
                 event_type=EventType.BUDGET_LIMIT_REACHED,
+                budget_limit_id=check.budget_limit_id,
                 agent_name=agent_name,
                 since=since,
                 until=until,
-                limit=5000,
+                limit=1,
             ),
-        )
-        return any(
-            _budget_limit_reached_payload_matches(record.event.payload, check=check)
-            for record in records
         )
 
     async def _emit_budget_limit_reached(
@@ -3923,6 +4071,7 @@ class RunLimitController:
         *,
         completed_events: Callable[[], list[Event]],
         prior_completion_events: list[Event] | None = None,
+        operation_parent_model_step_id: str | None = None,
         budget_limits: tuple[BudgetLimit, ...],
         session: Session,
         agent_name: str,
@@ -3974,6 +4123,8 @@ class RunLimitController:
                 session=session,
                 budget_limits=dispatch_preflight_limits,
                 operation_events=prior_completion_events,
+                operation_model_step_id=model_attempt_identity.model_step_id,
+                operation_parent_model_step_id=operation_parent_model_step_id,
                 provider_name=effective_pricing_provider_name,
                 model=model,
                 billing_identity_state=resolved_billing_identity(billing_identity),
@@ -4891,6 +5042,7 @@ class RunLimitGate:
             agent_name=self._agent_name,
             environment_name=self._environment_name,
             budget_policy=budget_policy,
+            usage_tracker=self._usage_tracker,
             billing_identity_state=billing_identity_state,
             pricing_provider_name=pricing_provider_name or self._pricing_provider_name,
             model=model,
@@ -4973,8 +5125,8 @@ def _first_budget_limit_outcome(
     *,
     session: Session,
     limit: BudgetLimit,
-    cost_summary: SessionCostSummary,
-    cost_baseline: SessionCostSummary | None,
+    cost_summary: SessionCostTotals,
+    cost_baseline: SessionCostTotals | None,
     effective_at: datetime,
     billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
     pricing_provider_name: str | None = None,
@@ -4984,10 +5136,13 @@ def _first_budget_limit_outcome(
         raise TypeError("session must be a Session instance.")
     if type(limit) is not _EffectiveBudgetLimit:
         raise TypeError("limit must be a BudgetLimit instance.")
-    if type(cost_summary) is not SessionCostSummary:
-        raise TypeError("cost_summary must be a SessionCostSummary.")
-    if cost_baseline is not None and type(cost_baseline) is not SessionCostSummary:
-        raise TypeError("cost_baseline must be a SessionCostSummary.")
+    if type(cost_summary) not in {SessionCostTotals, SessionCostSummary}:
+        raise TypeError("cost_summary must be SessionCostTotals.")
+    if cost_baseline is not None and type(cost_baseline) not in {
+        SessionCostTotals,
+        SessionCostSummary,
+    }:
+        raise TypeError("cost_baseline must be SessionCostTotals.")
 
     actual_cost = cost_summary.total_cost
     unpriced_model_steps = cost_summary.unpriced_model_steps
@@ -5070,7 +5225,7 @@ def _budget_check_from_stop_decision(
     *,
     limit: _EffectiveBudgetLimit,
     decision: StopDecision,
-    cost_summary: SessionCostSummary,
+    cost_summary: SessionCostTotals,
     unpriced_model_steps: int,
 ) -> BudgetCheck:
     if decision.limit != StopLimit.ESTIMATED_COST:

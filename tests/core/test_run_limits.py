@@ -923,7 +923,16 @@ def test_controller_fails_closed_on_malformed_normalized_usage_without_crashing(
     assert "cannot be verified" in result.decision.message
     assert result.cost_summary is not None
     assert result.cost_summary.unpriced_model_steps == 1
-    assert result.cost_summary.line_items[0].missing_pricing_reason == (
+    assert "line_items" not in result.cost_summary.model_dump()
+    detailed = asyncio.run(
+        store.read_cost_accounting(
+            EventQuery(session_id=session.id),
+            _pricing(),
+            details=True,
+        )
+    ).details
+    assert detailed is not None
+    assert detailed.line_items[0].missing_pricing_reason == (
         "model.completed event has no valid normalized usage metrics"
     )
     assert session.status is SessionStatus.RUNNING
