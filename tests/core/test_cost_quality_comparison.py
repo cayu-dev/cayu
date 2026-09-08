@@ -452,6 +452,12 @@ def test_status_precedence_and_exclusions_keep_raw_measured_costs() -> None:
     report = compare_paired_cost_quality(
         PairedCostQualityComparisonRequest(pairs=(unpriced, verified, unavailable, measured))
     )
+    assert ComparisonCostLineItem.from_cost_line_item(unpriced_cost).unpriced_reason == (
+        "missing_pricing"
+    )
+    unpriced_report = next(pair for pair in report.pairs if pair.pair_id == "unpriced")
+    assert unpriced_report.candidate is not None
+    assert unpriced_report.candidate.attempts[0].cost.unpriced_reason == "missing_pricing"
 
     assert [pair.pair_id for pair in report.pairs] == [
         "measured",

@@ -303,6 +303,14 @@ export type AggregateCostSummary = {
      */
     line_items: Array<CostLineItem>;
     /**
+     * Missing Pricing Model Steps
+     */
+    missing_pricing_model_steps?: number;
+    /**
+     * Missing Usage Model Steps
+     */
+    missing_usage_model_steps?: number;
+    /**
      * Model Steps
      */
     model_steps: number;
@@ -330,6 +338,10 @@ export type AggregateCostSummary = {
      * Unpriced Model Steps
      */
     unpriced_model_steps: number;
+    /**
+     * Unsupported Pricing Model Steps
+     */
+    unsupported_pricing_model_steps?: number;
 };
 
 /**
@@ -16728,7 +16740,7 @@ export type WebSearchApiSource = {
 /**
  * WebSearchAction
  *
- * Bounded provider-neutral terminal web-search action evidence.
+ * Bounded terminal evidence; optional provider details may be absent.
  */
 export type WebSearchAction = {
     /**

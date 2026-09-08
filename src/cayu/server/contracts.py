@@ -2231,6 +2231,9 @@ class AggregateCostSummary(ApiBaseModel):
     model_steps: StrictInt = Field(ge=0)
     priced_model_steps: StrictInt = Field(ge=0)
     unpriced_model_steps: StrictInt = Field(ge=0)
+    missing_usage_model_steps: StrictInt = Field(default=0, ge=0)
+    missing_pricing_model_steps: StrictInt = Field(default=0, ge=0)
+    unsupported_pricing_model_steps: StrictInt = Field(default=0, ge=0)
     total_cost: Decimal = Field(ge=0)
     line_items: tuple[CostLineItem, ...]
     session_costs: tuple[SessionCostSummary, ...]

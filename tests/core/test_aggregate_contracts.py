@@ -1091,6 +1091,7 @@ def test_missing_hosted_pricing_metrics_are_unpriced_resource_not_model_step() -
     assert cost.unpriced_model_steps == 0
     assert cost.unpriced_reasons == (
         UsageUnpricedReason(
+            unpriced_reason="unsupported_pricing",
             reason="model.hosted_tool_call event has no valid normalized usage metrics",
             model_steps=0,
             hosted_resources=1,
@@ -2346,6 +2347,7 @@ def test_sqlite_usage_rollup_matches_hosted_search_accounting_reference(tmp_path
             )
             assert cost.unpriced_reasons == (
                 UsageUnpricedReason(
+                    unpriced_reason="unsupported_pricing",
                     reason="hosted web-search outcome and billing are unknown",
                     model_steps=0,
                     hosted_resources=1,

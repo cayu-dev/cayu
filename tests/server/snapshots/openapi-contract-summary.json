@@ -136,6 +136,18 @@
           "title": "Line Items",
           "type": "array"
         },
+        "missing_pricing_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Missing Pricing Model Steps",
+          "type": "integer"
+        },
+        "missing_usage_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Missing Usage Model Steps",
+          "type": "integer"
+        },
         "model_steps": {
           "minimum": 0.0,
           "title": "Model Steps",
@@ -173,6 +185,12 @@
         "unpriced_model_steps": {
           "minimum": 0.0,
           "title": "Unpriced Model Steps",
+          "type": "integer"
+        },
+        "unsupported_pricing_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Unsupported Pricing Model Steps",
           "type": "integer"
         }
       },
@@ -4160,6 +4178,18 @@
           "title": "Line Items",
           "type": "array"
         },
+        "missing_pricing_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Missing Pricing Model Steps",
+          "type": "integer"
+        },
+        "missing_usage_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Missing Usage Model Steps",
+          "type": "integer"
+        },
         "model_steps": {
           "minimum": 0.0,
           "title": "Model Steps",
@@ -4198,6 +4228,12 @@
         "unpriced_model_steps": {
           "minimum": 0.0,
           "title": "Unpriced Model Steps",
+          "type": "integer"
+        },
+        "unsupported_pricing_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Unsupported Pricing Model Steps",
           "type": "integer"
         }
       },
@@ -5014,6 +5050,22 @@
           "minimum": 0.0,
           "title": "Uncached Input Tokens",
           "type": "integer"
+        },
+        "unpriced_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "missing_usage",
+                "missing_pricing",
+                "unsupported_pricing"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unpriced Reason"
         },
         "web_search_calls": {
           "default": 0,
@@ -7415,6 +7467,18 @@
           "title": "Line Items",
           "type": "array"
         },
+        "missing_pricing_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Missing Pricing Model Steps",
+          "type": "integer"
+        },
+        "missing_usage_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Missing Usage Model Steps",
+          "type": "integer"
+        },
         "model_steps": {
           "minimum": 0.0,
           "title": "Model Steps",
@@ -7437,6 +7501,12 @@
         "unpriced_model_steps": {
           "minimum": 0.0,
           "title": "Unpriced Model Steps",
+          "type": "integer"
+        },
+        "unsupported_pricing_model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Unsupported Pricing Model Steps",
           "type": "integer"
         }
       },
@@ -10650,6 +10720,22 @@
         "reason": {
           "title": "Reason",
           "type": "string"
+        },
+        "unpriced_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "missing_usage",
+                "missing_pricing",
+                "unsupported_pricing"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unpriced Reason"
         }
       },
       "required": [

@@ -5894,6 +5894,9 @@ def test_server_exposes_session_cost_estimate() -> None:
         "model_steps": 1,
         "priced_model_steps": 1,
         "unpriced_model_steps": 0,
+        "missing_usage_model_steps": 0,
+        "missing_pricing_model_steps": 0,
+        "unsupported_pricing_model_steps": 0,
         "total_cost": "0.000011",
         "line_items": [
             {
@@ -5929,6 +5932,7 @@ def test_server_exposes_session_cost_estimate() -> None:
                 "web_search_cost": "0",
                 "total_cost": "0.000011",
                 "missing_pricing_reason": None,
+                "unpriced_reason": None,
             }
         ],
     }

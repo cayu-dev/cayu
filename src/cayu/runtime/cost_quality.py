@@ -24,6 +24,7 @@ from cayu._validation import (
     revalidate_model_input,
     revalidate_model_inputs,
 )
+from cayu.runtime._cost_diagnostics import UnpricedReason
 from cayu.runtime.costs import CostLineItem, Provenance
 
 COST_QUALITY_COMPARISON_SCHEMA_VERSION = 3
@@ -95,6 +96,7 @@ class ComparisonCostLineItem(BaseModel):
         le=MAX_DURABLE_JSON_INTEGER,
     )
     priced: StrictBool
+    unpriced_reason: UnpricedReason | None = None
     currency: str = Field(max_length=_MAX_IDENTITY_CHARS)
     input_tokens: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     output_tokens: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
@@ -152,6 +154,7 @@ class ComparisonCostLineItem(BaseModel):
             pricing_effective_through=item.pricing_effective_through,
             pricing_tier_max_input_tokens=item.pricing_tier_max_input_tokens,
             priced=item.priced,
+            unpriced_reason=item.unpriced_reason,
             currency=item.currency,
             input_tokens=item.input_tokens,
             output_tokens=item.output_tokens,
