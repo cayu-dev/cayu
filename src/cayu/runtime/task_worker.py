@@ -586,6 +586,9 @@ async def run_task_worker(
             maximum_active_s=lease_seconds,
         )
         task = claim.value
+        # The poller's wrapper aliases the task. Drop it before fallible task
+        # handling so detached failures cannot retain a second task reference.
+        del claim
         if task is None:
             if continuation_activity and continuation_after is not None:
                 return DurableWorkerStep(
