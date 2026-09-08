@@ -35979,6 +35979,17 @@ def test_cayu_app_recover_incomplete_session_preserves_pending_tool_approval():
         checkpoint["pending_tool_approval"]["approval_id"]
         == private_approval.payload["approval_id"]
     )
+    assert "invocation_terminal_decision" not in checkpoint
+    assert "settled_invocation_terminal_decision" not in checkpoint
+    replay = asyncio.run(
+        app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session.id))
+    )
+    assert replay.status == SessionStatus.INTERRUPTED
+    replay_checkpoint = asyncio.run(store.load_checkpoint(session.id))
+    assert replay_checkpoint is not None
+    assert replay_checkpoint["pending_tool_approval"] == checkpoint["pending_tool_approval"]
+    assert "invocation_terminal_decision" not in replay_checkpoint
+    assert "settled_invocation_terminal_decision" not in replay_checkpoint
     assert "pending_session_interrupt" not in checkpoint
     assert tool.calls == []
 

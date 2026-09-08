@@ -4813,6 +4813,23 @@ def _raise_terminal_finalization_process_control(
     raise signal from cause
 
 
+def _pending_interaction_action_kind(
+    checkpoint: dict[str, Any] | None, *, run_epoch: int
+) -> str | None:
+    """Use the same durable gate classification for pause and terminal election."""
+
+    if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+        return "tool_approval"
+    if (
+        user_input_lifecycle_authority_from_checkpoint(checkpoint, current_run_epoch=run_epoch)[0]
+        is not None
+    ):
+        return "user_input"
+    if tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
+        return "tool_recovery"
+    return None
+
+
 def _session_interruption_failure_with_additional_control(
     authoritative_failure: BaseException,
     additional_failure: BaseException,
@@ -8519,18 +8536,9 @@ class SessionEngine:
         pending_action_kind: str | None = None
         if to_status is not SessionStatus.COMPLETED:
             checkpoint = await self.session_store.load_checkpoint(session.id)
-            if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
-                pending_action_kind = "tool_approval"
-            elif (
-                user_input_lifecycle_authority_from_checkpoint(
-                    checkpoint,
-                    current_run_epoch=session.run_epoch,
-                )[0]
-                is not None
-            ):
-                pending_action_kind = "user_input"
-            elif tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
-                pending_action_kind = "tool_recovery"
+            pending_action_kind = _pending_interaction_action_kind(
+                checkpoint, run_epoch=session.run_epoch
+            )
         completion_pending_finalization = (
             to_status is SessionStatus.RUNNING and checkpoint_mutation is not None
         )
@@ -27753,6 +27761,10 @@ class SessionEngine:
                 and active_invocation_execution_profile_from_checkpoint(decision_checkpoint)
                 is not None
                 and not user_input_supersession_retained
+                and _pending_interaction_action_kind(
+                    decision_checkpoint, run_epoch=loaded_interrupted.run_epoch
+                )
+                is None
                 and self._supports_terminal_interaction_publication_protocol()
             ):
                 terminal_decision = await await_handoff_operation(
