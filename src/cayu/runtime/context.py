@@ -4422,6 +4422,24 @@ async def _await_owned_compaction_provider_stream(
 
     provider_task = asyncio.ensure_future(capture_provider_abandonment())
     caller_cancellation: asyncio.CancelledError | None = None
+
+    def preserve_completed_failure(failure: BaseException) -> None:
+        # Only the governed stream's runtime-owned terminal records may
+        # transfer completion evidence onto the original caller signal.
+        if caller_cancellation is None or type(failure) not in {
+            asyncio.CancelledError,
+            _CompactionCompletionValueError,
+            _CompactionCompletionObservationError,
+            _CompactionToolCallError,
+            _ProviderDispatchFailed,
+        }:
+            return
+        completed_metadata = failure.__dict__.get("completed_metadata")
+        if type(completed_metadata) is dict:
+            caller_cancellation.__dict__["completed_metadata"] = copy_durable_json_object(
+                completed_metadata, "completed_metadata"
+            )
+
     try:
         while True:
             try:
@@ -4441,6 +4459,11 @@ async def _await_owned_compaction_provider_stream(
                         provider_task.cancel("Automatic compaction provider cancelled")
                     continue
                 if caller_cancellation is not None:
+                    if provider_task.done():
+                        try:
+                            provider_task.result()
+                        except BaseException as terminal_failure:
+                            preserve_completed_failure(terminal_failure)
                     raise caller_cancellation from None
                 if provider_task.done():
                     terminal_result = provider_task.result()
@@ -4453,10 +4476,14 @@ async def _await_owned_compaction_provider_stream(
                     raise
                 if isinstance(provider_failure, (GeneratorExit, KeyboardInterrupt, SystemExit)):
                     raise provider_failure from caller_cancellation
+                preserve_completed_failure(provider_failure)
                 raise caller_cancellation from provider_failure
             if isinstance(result, GeneratorExit):
                 raise result from caller_cancellation
             if caller_cancellation is not None:
+                caller_cancellation.__dict__["completed_metadata"] = copy_durable_json_object(
+                    result[1], "completed_metadata"
+                )
                 raise caller_cancellation
             return result
     finally:
