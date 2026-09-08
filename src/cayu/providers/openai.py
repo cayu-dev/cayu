@@ -3942,11 +3942,13 @@ def _url_citation_event(
     start_index = annotation.get("start_index")
     end_index = annotation.get("end_index")
     url = _normalized_external_web_url(url, path=f"citation {path}.url")
-    if title is not None and (not isinstance(title, str) or not title.strip() or len(title) > 1024):
+    if title is not None and (not isinstance(title, str) or len(title) > 1024):
         raise OpenAIProtocolError(
             f"OpenAI citation {path}.title must be a bounded string.",
             reason_code="citation_title_must_be_a_bounded_string",
         )
+    if isinstance(title, str) and not title.strip():
+        title = None
     if (start_index is None) != (end_index is None):
         raise OpenAIProtocolError(
             f"OpenAI citation {path} has invalid text offsets.",

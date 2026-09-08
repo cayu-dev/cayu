@@ -8538,7 +8538,13 @@ validation, and `find_in_page` still requires both URL and pattern. See the
 Hosted search delegates network, filtering, retry, quota, and billing execution
 to OpenAI. Cayu local approvals, tool policy, runners, DNS, and egress do not
 intercept it. Returned queries, sources, and URL citations are bounded and
-labeled untrusted external evidence. Token usage remains provider-reported;
+labeled untrusted external evidence. Optional URL citation titles that are empty
+or whitespace-only normalize to unavailable metadata (`None`), like absent
+titles, through parsing, transcript persistence, and neutral replay. Opaque
+provider state retains the original wire representation; re-parsing it yields
+the same unavailable title. Title type and
+raw length limits are checked before normalization; valid URLs and offsets
+are preserved without inventing a title. Token usage remains provider-reported;
 terminal lifecycle events are the authoritative resource counters, while the
 completion-side copy is used only for per-attempt pricing. This prevents a
 successful response from being counted twice and still meters a completed,
