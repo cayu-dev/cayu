@@ -60,6 +60,65 @@ empty results are complete.
 `--output` retains a report. Keep private production-shaped corpora and reports
 outside this repository.
 
+### Generated-standard default qualification
+
+The historical cross-source baseline above uses its own reference calibration;
+it is not evidence about the generated application's defaults. Qualify the
+actual standard scaffold separately, without credentials:
+
+```bash
+PYTHONPATH=src python scripts/run_recall_baseline.py --shipped-default \
+  --output /tmp/shipped-memory-quality.json
+```
+
+This mode generates a temporary standard application through `cayu new`, then
+uses its `build_app` factory with injected scripted providers and isolated
+in-memory/SQLite stores. It does not copy calibration numbers into the runner
+or replace the generated admission, fusion, source, or context policies.
+It records and compares the generated and registered runtime configuration,
+including query-resolution/presentation versions and behavior-affecting bounds.
+Generated Python source hashes and a deterministic fixture fingerprint identify
+the code and cases behind the report. Operator `CAYU_*` settings are temporarily
+excluded, then restored; run this sequential probe in its own process, not
+concurrently with an application.
+
+The fixed English regression set has 15 cases per backend and 17 model
+boundaries: empty-store and weak-overlap silence, positive recall with 1/20/100
+distractors, missing antecedents, a genuine follow-up after a verbose answer,
+independent topic switching, current revisions, expiration, namespace isolation,
+title-supported retrieval, exact identifiers, and bounded offers. Each turn
+constructs a fresh application; the SQLite continuation also reopens its store
+connections. This establishes next-turn durable reconstruction, **not** fresh-
+process interrupted recovery or compaction coverage.
+
+The `cayu.shipped_memory_quality.v1` JSON report labels these results
+`generated_standard_default`, retains every failed/incomplete case, and includes
+per-turn focus/offer identities, exact-current read checks, receipt/item-exposure
+agreement, source coverage, query-resolution decisions, and rendered manifest
+bytes. Model-facing focus text, offer previews, and completeness flags must also
+match the fixed public fixtures, whose records fit within the preview budget;
+correct references alone cannot hide stale or corrupted delivered content.
+Token counts are explicitly UTF-8 byte estimates. Entire scripted-runtime
+turn p50/p95 timings are descriptive: they include persistence and composition,
+exclude setup/seeding, and are not isolated retrieval timings or latency gates.
+An incomplete matrix, unexpected injection/offer, missed positive, configuration
+drift, or inconsistent delivery evidence makes the command exit nonzero after
+writing the report. Positive controls prevent an always-silent policy passing.
+
+This is the first generated-default qualification slice, not completion of the
+memory-quality program. It does not tune thresholds, provide a held-out or
+calibration split, use semantic embeddings, or establish PostgreSQL parity.
+Missing semantic support remains explicitly partial. Semantic quality/failure
+matrices, multilingual cases, scope variants, compaction, interrupted recovery,
+and broader calibration remain separate qualification work. Re-anchoring stays
+at its shipped default (off); its opt-in matrix is documented below.
+
+For model-answer and cost-benefit evidence, reuse the external-private ablation
+contracts below with separately authorized data, provider/model, trial schedule,
+and spend. Keep the historical reference policy, generated default, and any
+candidate distinct. Neither this green scripted gate nor the causal reference
+campaign proves improved live-model answers.
+
 ## Causal-memory reference campaign
 
 `causal-memory-campaign-corpus-v1.json` is a standard Evals corpus for the

@@ -22,15 +22,22 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--corpus",
         type=Path,
-        default=Path("benchmarks/memory/recall-corpus-v2.json"),
         help="Public hermetic or private external corpus JSON.",
+    )
+    parser.add_argument(
+        "--shipped-default",
+        action="store_true",
+        help="Qualify the generated standard application's defaults on fixed public runtime cases.",
     )
     parser.add_argument(
         "--output",
         type=Path,
         help="Write the report to this path instead of stdout.",
     )
-    return parser.parse_args()
+    arguments = parser.parse_args()
+    if arguments.shipped_default and arguments.corpus is not None:
+        parser.error("--shipped-default uses fixed public cases and cannot accept --corpus")
+    return arguments
 
 
 async def _run(corpus_path: Path) -> dict:
@@ -67,12 +74,21 @@ async def _run(corpus_path: Path) -> dict:
 
 def main() -> None:
     arguments = _arguments()
-    report = asyncio.run(_run(arguments.corpus))
+    if arguments.shipped_default:
+        from _shipped_memory_quality import run_shipped_default_quality
+
+        report = asyncio.run(run_shipped_default_quality())
+    else:
+        report = asyncio.run(
+            _run(arguments.corpus or Path("benchmarks/memory/recall-corpus-v2.json"))
+        )
     serialized = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if arguments.output is None:
         print(serialized, end="")
-        return
-    arguments.output.write_text(serialized, encoding="utf-8")
+    else:
+        arguments.output.write_text(serialized, encoding="utf-8")
+    if arguments.shipped_default and not report["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
