@@ -141,7 +141,7 @@ def diagnostics(events):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("case", ["normal", "interleaved", "repeated", "missing_id", "tail"])
+@pytest.mark.parametrize("case", ["normal", "interleaved", "repeated", "missing_id"])
 async def test_valid_hosted_search_sse(tmp_path, case):
     raw = normal()
     if case == "interleaved":
@@ -159,8 +159,6 @@ async def test_valid_hosted_search_sse(tmp_path, case):
         raw[4:4] = [lifecycle(), lifecycle(status="in_progress")]
     elif case == "missing_id":
         del raw[3]["item_id"]  # Existing compatibility remains explicit.
-    elif case == "tail":
-        raw.append(lifecycle())  # Accepted response.completed closes the stream.
     events, durable = await run_sse(tmp_path, [raw])
     assert not diagnostics(durable)
     assert events[-1].type == EventType.SESSION_COMPLETED
@@ -169,6 +167,18 @@ async def test_valid_hosted_search_sse(tmp_path, case):
     finished = [e for e in hosted if e["status"] == "completed"]
     assert len(finished) == (2 if case == "interleaved" else 1)
     assert all(e["action"]["sources"][0]["url"] == "https://example.com/" for e in finished)
+
+
+@pytest.mark.anyio
+async def test_postterminal_hosted_search_sse_fails_without_losing_accounting(tmp_path):
+    events, durable = await run_sse(tmp_path, [[*normal(), lifecycle()]])
+    assert events[-1].type == EventType.SESSION_FAILED
+    completed = [event for event in durable if event.type == EventType.MODEL_COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].payload["usage_metrics"]["input_tokens"] == 1
+    assert completed[0].payload["usage_metrics"]["output_tokens"] == 1
+    assert not [event for event in durable if event.type == EventType.MODEL_RETRY]
+    assert not [event for event in durable if event.type == EventType.TOOL_CALL_STARTED]
 
 
 FAILURES = [

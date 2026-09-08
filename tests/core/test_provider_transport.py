@@ -581,29 +581,31 @@ async def test_public_provider_closes_task_affine_custom_stream_in_owner_task() 
 
 
 @pytest.mark.anyio
-async def test_provider_closes_without_reading_post_completion_heartbeat_tail() -> None:
+async def test_provider_rejects_and_closes_post_completion_heartbeat_tail() -> None:
     source = _HeartbeatTailEventStream(_successful_raw_stream_events("openai")[0])
     provider = OpenAIProvider(
         api_key="test-key",
         transport=_ClosableProviderTransport(source),
     )
 
-    async def collect() -> list[Any]:
-        return [
-            event
-            async for event in provider.stream(
-                ModelRequest(
-                    model="test-model",
-                    messages=[Message.text("user", "hello")],
-                )
-            )
-        ]
+    events = []
 
-    events = await asyncio.wait_for(collect(), timeout=0.5)
+    async def collect() -> None:
+        async for event in provider.stream(
+            ModelRequest(
+                model="test-model",
+                messages=[Message.text("user", "hello")],
+            )
+        ):
+            events.append(event)
+
+    with pytest.raises(ModelProviderError) as failure:
+        await asyncio.wait_for(collect(), timeout=0.5)
 
     assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert failure.value.retryable is False
     assert source.closed
-    assert source.tail_reads == 0
+    assert source.tail_reads == 1
 
 
 @pytest.mark.anyio

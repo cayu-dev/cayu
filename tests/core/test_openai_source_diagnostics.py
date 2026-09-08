@@ -255,14 +255,15 @@ async def test_background_recovery_retains_diagnostics_without_redispatch(
     )
 
     transport = BackgroundTransport()
+    response = bad_response("file")
+    response["id"] = "resp_background_123"
     start = [_created()]
+    start[0]["response"]["model"] = response["model"]
     if reconnect:
         start.append(
             {"type": "response.output_text.delta", "sequence_number": 1, "delta": "accepted"}
         )
     transport.start_batches.append([*start, SimulatedWorkerLoss("worker lost")])
-    response = bad_response("file")
-    response["id"] = "resp_background_123"
     if reconnect:
         transport.reconnect_batches.append(
             [{"type": "response.completed", "sequence_number": 2, "response": response}]

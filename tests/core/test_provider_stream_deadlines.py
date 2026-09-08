@@ -177,7 +177,7 @@ async def test_duplicate_metadata_empty_deltas_and_unknown_events_do_not_refresh
             yield created
             while True:
                 await asyncio.sleep(0.003)
-                yield created
+                yield {"type": "response.in_progress", "response": {"id": "resp-1"}}
                 yield {"type": "response.output_text.delta", "delta": ""}
                 yield {"type": "response.keepalive"}
 

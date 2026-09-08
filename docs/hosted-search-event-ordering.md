@@ -30,10 +30,13 @@ SQLite durable event readback. JSON frames are split across byte chunks.
 
 Repeated lifecycle progress remains idempotent. An omitted lifecycle `item_id`
 retains existing compatibility behavior; this change does not make it required.
-`response.completed` closes an accepted stream, so later transport input is not
-consumed. Invalid streams never produce model completion or executable tool
-calls. The late-lifecycle control can have an already settled hosted call before
-its model attempt fails; that evidence is not a successful model completion.
+`response.completed` seals semantic state. The adapter validates subsequent
+transport input and rejects post-terminal events before they can produce an
+executable tool call. Completion already accepted before a tail failure remains
+accounting evidence; it does not authorize a successful continuation after that
+failure. Invalid pre-terminal streams do not produce model completion. The
+late-lifecycle control can have an already settled hosted call before its model
+attempt fails; that evidence is not a successful model completion.
 
 ## Bounded diagnostic contract
 

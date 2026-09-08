@@ -3092,7 +3092,7 @@ def test_openai_provider_rejects_nonfinite_timeout(timeout_s: int | float) -> No
 
 
 @pytest.mark.anyio
-async def test_openai_stream_events_stops_at_first_completed_event() -> None:
+async def test_openai_stream_events_rejects_text_after_completed_event() -> None:
     yielded = 0
 
     async def raw_events():
@@ -3111,10 +3111,13 @@ async def test_openai_stream_events_stops_at_first_completed_event() -> None:
         yielded += 1
         yield {"type": "response.output_text.delta", "delta": "late"}
 
-    events = [event async for event in openai_stream_events(raw_events())]
+    events = []
+    with pytest.raises(OpenAIProtocolError, match="after terminal response"):
+        async for event in openai_stream_events(raw_events()):
+            events.append(event)
 
     assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
-    assert yielded == 1
+    assert yielded == 2
 
 
 @pytest.mark.anyio
@@ -8189,7 +8192,7 @@ def test_server_recovery_payload_drops_chain_and_provider_state():
     "failure_kind",
     ["cleanup", "post_completion_provider", "post_completion_overflow", "post_completion_overload"],
 )
-def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
+def test_cayu_app_preserves_completion_when_tail_or_cleanup_fails(
     failure_kind: str,
 ) -> None:
     class CompletedThenFailureStream:
@@ -8281,11 +8284,9 @@ def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
 
     assert transport.calls == 1
     assert transport.source.closed
-    assert transport.source.tail_reads == 0
+    assert transport.source.tail_reads == (0 if failure_kind == "cleanup" else 1)
     assert EventType.MODEL_RETRY not in {event.type for event in events}
-    assert sum(event.type is EventType.MODEL_ERROR for event in events) == (
-        1 if failure_kind == "cleanup" else 0
-    )
+    assert sum(event.type is EventType.MODEL_ERROR for event in events) == 1
     model_completions = [
         event for event in durable_events if event.type == EventType.MODEL_COMPLETED
     ]
@@ -8298,16 +8299,9 @@ def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
     assert completion.payload["usage_metrics"]["input_tokens"] == 2
     assert completion.payload["usage_metrics"]["output_tokens"] == 1
     assert completion.payload["usage_metrics"]["total_tokens"] == 3
-    if failure_kind == "cleanup":
-        assert completion.payload["step_classification"]["type"] == "failed"
-        assert events[-1].type == EventType.SESSION_FAILED
-        assert [message.role for message in transcript] == ["user"]
-        return
-
-    assert completion.payload["step_classification"]["type"] == "final"
-    assert events[-1].type == EventType.SESSION_COMPLETED
-    assert [message.role for message in transcript] == ["user", "assistant"]
-    assert transcript[-1] == Message.text("assistant", "ok")
+    assert completion.payload["step_classification"]["type"] == "failed"
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert [message.role for message in transcript] == ["user"]
 
 
 @pytest.mark.anyio

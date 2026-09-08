@@ -58,6 +58,15 @@ from cayu.providers._reasoning_state import (
     reasoning_state,
     reasoning_state_matches,
 )
+from cayu.providers._stream_lifecycle import (
+    StreamLifecycle,
+    StreamPhase,
+    StreamPolicy,
+    StreamTerminal,
+    StreamTransition,
+    StreamTransitionKind,
+    StreamViolation,
+)
 from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountConfidence,
@@ -98,6 +107,7 @@ DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
 DEFAULT_ANTHROPIC_TIMEOUT_SECONDS = 60.0
+_MESSAGES_STREAM_POLICY = StreamPolicy(require_start=True)
 ANTHROPIC_CONTEXT_PRESSURE_IMAGE_MIN_TOKENS = 100
 ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS = 1800
 _DEFAULT_ANTHROPIC_REASONING_PROVENANCE = ReasoningStateProvenance(
@@ -1121,15 +1131,25 @@ async def anthropic_stream_events(
     """
     blocks: dict[int, _PendingContentBlock] = {}
     started_block_indexes: set[int] = set()
-    message_id: str | None = None
-    model: str | None = None
     stop_reason: str | None = None
     stop_sequence: str | None = None
     usage: dict[str, Any] | None = None
-    started = False
-    completed = False
     completed_payload: dict[str, Any] | None = None
     post_terminal_failure: BaseException | None = None
+
+    def lifecycle_error(violation: StreamViolation) -> Exception:
+        message = {
+            StreamViolation.BEFORE_START: (
+                "stream event arrived before message_start or before content_block_start"
+            ),
+            StreamViolation.REPEATED_START: "stream emitted duplicate message_start",
+            StreamViolation.AFTER_TERMINAL: "stream emitted an event after message_stop",
+            StreamViolation.REPEATED_TERMINAL: "stream emitted an event after message_stop",
+            StreamViolation.MISSING_TERMINAL: "streaming response ended before message_stop",
+        }.get(violation, f"stream lifecycle rejected {violation.value}")
+        return protocol_error(f"{provider_label} {message}.")
+
+    lifecycle = StreamLifecycle(_MESSAGES_STREAM_POLICY, error_factory=lifecycle_error)
 
     def optional_string(mapping: Mapping[str, Any], key: str) -> str | None:
         value = mapping.get(key)
@@ -1158,12 +1178,12 @@ async def anthropic_stream_events(
         except StopAsyncIteration:
             break
         except asyncio.CancelledError as exc:
-            if not completed:
+            if lifecycle.phase is not StreamPhase.TERMINAL:
                 raise
             post_terminal_failure = exc
             break
         except Exception as exc:
-            if not completed:
+            if lifecycle.phase is not StreamPhase.TERMINAL:
                 raise
             post_terminal_failure = exc
             break
@@ -1171,52 +1191,33 @@ async def anthropic_stream_events(
             raise protocol_error(f"{provider_label} stream event must be a JSON object.")
         event_type = event.get("type")
         if event_type == "ping":
+            lifecycle.accept(StreamTransition(StreamTransitionKind.IGNORE))
             continue
-        if completed and event_type in {
-            "message_start",
+        if event_type in {
             "content_block_start",
             "content_block_delta",
             "content_block_stop",
             "message_delta",
-            "message_stop",
-            "error",
         }:
-            raise protocol_error(f"{provider_label} stream emitted an event after message_stop.")
-        if completed:
-            continue
+            lifecycle.accept(StreamTransition(StreamTransitionKind.SEMANTIC))
         if event_type == "message_start":
-            if started:
-                raise protocol_error(f"{provider_label} stream emitted duplicate message_start.")
             message = event.get("message")
             if not isinstance(message, Mapping):
                 raise protocol_error(f"{provider_label} message_start requires message object.")
-            message_id = optional_string(message, "id")
-            model = optional_string(message, "model")
             start_usage = message.get("usage")
             if start_usage is not None and not isinstance(start_usage, Mapping):
                 raise protocol_error(f"{provider_label} message_start usage must be an object.")
+            lifecycle.accept(
+                StreamTransition(
+                    StreamTransitionKind.START,
+                    response_id=optional_string(message, "id"),
+                    model=optional_string(message, "model"),
+                )
+            )
             if isinstance(start_usage, Mapping):
                 usage = {**(usage or {}), **start_usage}
-            started = True
             observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
             continue
-        if (
-            event_type
-            in {
-                "content_block_start",
-                "content_block_delta",
-                "content_block_stop",
-                "message_delta",
-                "message_stop",
-            }
-            and not started
-        ):
-            if event_type in {"content_block_delta", "content_block_stop"}:
-                raise protocol_error(
-                    f"{provider_label} {event_type} arrived before content_block_start "
-                    "or message_start."
-                )
-            raise protocol_error(f"{provider_label} {event_type} arrived before message_start.")
         if event_type == "content_block_start":
             index = block_index(event)
             if index in started_block_indexes:
@@ -1382,17 +1383,25 @@ async def anthropic_stream_events(
                 raise protocol_error(
                     f"{provider_label} message_stop arrived with unfinished content blocks."
                 )
-            completed = True
+            lifecycle.accept(
+                StreamTransition(
+                    StreamTransitionKind.TERMINAL,
+                    terminal=StreamTerminal(stop_reason or "unknown"),
+                )
+            )
             observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
             completed_payload = {
-                "id": message_id,
-                "model": model,
+                "id": lifecycle.response_id,
+                "model": lifecycle.model,
                 "stop_reason": stop_reason,
                 "stop_sequence": stop_sequence,
                 "usage": copy_json_value(usage, "usage"),
             }
             continue
         if event_type == "error":
+            # Provider errors before start retain their native error classification;
+            # after stop they are no longer admissible stream output.
+            lifecycle.accept(StreamTransition(StreamTransitionKind.FAILURE))
             raw_error = event.get("error")
             error = raw_error if isinstance(raw_error, Mapping) else {}
             error_type = optional_error_string(error.get("type"))
@@ -1436,9 +1445,10 @@ async def anthropic_stream_events(
             raise failure from None
         # Unknown event types are ignored for forward compatibility, as the
         # Anthropic streaming docs require.
+        lifecycle.accept(StreamTransition(StreamTransitionKind.IGNORE))
 
-    if completed_payload is None:
-        raise protocol_error(f"{provider_label} streaming response ended before message_stop.")
+    lifecycle.claim_completion()
+    assert completed_payload is not None
     yield ModelStreamEvent.completed(completed_payload)
     if post_terminal_failure is not None:
         failure = post_terminal_failure

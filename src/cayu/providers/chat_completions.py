@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import unquote_plus, urlencode, urlsplit, urlunsplit
 
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_durable_json_value,
     copy_json_value,
     require_clean_nonblank,
@@ -54,6 +55,15 @@ from cayu.providers._http import (
     stream_sse_json_events,
     validate_url,
 )
+from cayu.providers._stream_lifecycle import (
+    StreamLifecycle,
+    StreamPhase,
+    StreamPolicy,
+    StreamTerminal,
+    StreamTransition,
+    StreamTransitionKind,
+    StreamViolation,
+)
 from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     ModelContextOverflowError,
@@ -84,6 +94,12 @@ if TYPE_CHECKING:
 # ".../v1beta/openai", Together is ".../v1", Azure is ".../deployments/<dep>".
 DEFAULT_CHAT_COMPLETIONS_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CHAT_COMPLETIONS_TIMEOUT_SECONDS = 60.0
+_CHAT_STREAM_POLICY = StreamPolicy(
+    max_terminal_repeats=1,
+    max_usage_tails=1,
+    max_metadata_tails=1,
+    max_total_tails=1,
+)
 DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV = "OPENAI_API_KEY"
 # OpenAI/Together use `Authorization: Bearer <key>`; Azure uses `api-key: <key>`.
 DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER = "Authorization"
@@ -976,6 +992,41 @@ def _safe_openrouter_metadata(
     return projected
 
 
+def _chat_stream_terminal(
+    event: Mapping[str, Any], choice: Mapping[str, Any]
+) -> StreamTerminal | None:
+    finish = choice.get("finish_reason")
+    if finish is None:
+        return None
+    if not isinstance(finish, str):
+        raise ChatCompletionsProtocolError("Chat Completions finish_reason must be a string.")
+    return StreamTerminal(
+        _canonical_chat_finish_reason(finish),
+        canonical_durable_json_bytes(
+            {
+                "logprobs": choice.get("logprobs"),
+                "usage": event.get("usage"),
+                "provider": event.get("provider"),
+                "openrouter_metadata": event.get("openrouter_metadata"),
+            },
+            "terminal_metadata",
+        ),
+    )
+
+
+def _chat_lifecycle_error(violation: StreamViolation) -> Exception:
+    message = {
+        StreamViolation.RESPONSE_CONFLICT: "stream emitted conflicting response ids",
+        StreamViolation.MODEL_CONFLICT: "stream emitted conflicting models",
+        StreamViolation.TERMINAL_CONFLICT: "stream emitted conflicting finish_reason values",
+        StreamViolation.REPEATED_TERMINAL: "stream emitted repeated finish_reason metadata",
+        StreamViolation.MISSING_TERMINAL: "streaming response ended before a finish_reason",
+        StreamViolation.AFTER_TERMINAL: "stream emitted semantic output after finish_reason",
+        StreamViolation.TAIL_LIMIT: "stream exceeded its metadata tail after finish_reason",
+    }.get(violation, f"stream lifecycle rejected {violation.value}")
+    return ChatCompletionsProtocolError(f"Chat Completions {message}.")
+
+
 async def chat_completions_stream_events(
     events: AsyncIterator[Mapping[str, Any]],
     *,
@@ -987,8 +1038,7 @@ async def chat_completions_stream_events(
     )
     tool_calls = _ToolCallAccumulator()
     reasoning_details = _ReasoningDetailsAccumulator()
-    response_id: str | None = None
-    model: str | None = None
+    lifecycle = StreamLifecycle(_CHAT_STREAM_POLICY, error_factory=_chat_lifecycle_error)
     upstream_provider_evidence: tuple[str, str] | None = None
     openrouter_metadata: dict[str, Any] | None = None
     choice_index: int | None = None
@@ -1006,7 +1056,7 @@ async def chat_completions_stream_events(
             # Preserve real task cancellation without losing authoritative
             # completion evidence already carried by a finish reason. Runtime
             # publishes the completion before restoring the same cancellation.
-            if finish_reason is None:
+            if lifecycle.phase is not StreamPhase.TERMINAL:
                 raise
             post_terminal_failure = exc
             break
@@ -1015,7 +1065,7 @@ async def chat_completions_stream_events(
             # the accumulated response and usage when the real HTTP iterator
             # fails while closing after that terminal chunk; the provider will
             # surface this failure only after runtime has observed COMPLETED.
-            if finish_reason is None:
+            if lifecycle.phase is not StreamPhase.TERMINAL:
                 raise
             post_terminal_failure = exc
             break
@@ -1023,20 +1073,57 @@ async def chat_completions_stream_events(
             raise ChatCompletionsProtocolError(
                 "Chat Completions stream event must be a JSON object."
             )
-        chunk_response_id = _optional_string(event, "id")
-        if response_id is not None and chunk_response_id not in {None, response_id}:
+        choices = event.get("choices")
+        if choices is not None and not isinstance(choices, list):
+            raise ChatCompletionsProtocolError("Chat Completions choices must be a list.")
+        if choices is not None and len(choices) > 1:
             raise ChatCompletionsProtocolError(
-                "Chat Completions stream emitted conflicting response ids."
+                "Chat Completions stream emitted multiple choices in one chunk."
             )
-        if response_id is None and chunk_response_id is not None:
+        choice = choices[0] if choices else None
+        if choices and not isinstance(choice, Mapping):
+            raise ChatCompletionsProtocolError("Chat Completions choice must be an object.")
+        native_terminal = None if choice is None else _chat_stream_terminal(event, choice)
+        if event.get("error") is not None:
+            kind = StreamTransitionKind.FAILURE
+        elif choice is None:
+            kind = (
+                StreamTransitionKind.USAGE
+                if event.get("usage") is not None
+                else StreamTransitionKind.METADATA
+            )
+        elif (
+            native_terminal is not None
+            and choice.get("delta") in (None, {})
+            and set(choice).issubset({"index", "delta", "finish_reason", "logprobs"})
+        ):
+            kind = StreamTransitionKind.TERMINAL
+        else:
+            kind = StreamTransitionKind.SEMANTIC
+        accepted = lifecycle.accept(
+            StreamTransition(
+                kind,
+                response_id=_optional_string(event, "id"),
+                model=_optional_string(event, "model"),
+                terminal=native_terminal if kind is StreamTransitionKind.TERMINAL else None,
+            )
+        )
+        if accepted.identity_started:
             observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
-        response_id = response_id or chunk_response_id
-        chunk_model = _optional_string(event, "model")
-        if model is not None and chunk_model not in {None, model}:
-            raise ChatCompletionsProtocolError(
-                "Chat Completions stream emitted conflicting models."
-            )
-        model = model or chunk_model
+        if choice is not None:
+            chunk_choice_index = choice.get("index")
+            if chunk_choice_index is not None:
+                if type(chunk_choice_index) is not int or chunk_choice_index < 0:
+                    raise ChatCompletionsProtocolError(
+                        "Chat Completions choice index must be a non-negative integer."
+                    )
+                if choice_index is not None and chunk_choice_index != choice_index:
+                    raise ChatCompletionsProtocolError(
+                        "Chat Completions stream emitted conflicting choice indexes."
+                    )
+                choice_index = chunk_choice_index
+        if accepted.repeated:
+            continue
         chunk_upstream_provider_evidence = _openrouter_provider_evidence(event.get("provider"))
         if chunk_upstream_provider_evidence is not None:
             if (
@@ -1050,7 +1137,7 @@ async def chat_completions_stream_events(
         chunk_router_metadata = _safe_openrouter_metadata(
             event.get("openrouter_metadata"),
             requested_model=requested_model,
-            effective_model=model,
+            effective_model=lifecycle.model,
         )
         if chunk_router_metadata is not None:
             if openrouter_metadata is not None and chunk_router_metadata != openrouter_metadata:
@@ -1085,51 +1172,8 @@ async def chat_completions_stream_events(
             del events
             raise failure from None
 
-        choices = event.get("choices")
-        if choices is None:
+        if choice is None:
             continue
-        if not isinstance(choices, list):
-            raise ChatCompletionsProtocolError("Chat Completions choices must be a list.")
-        if len(choices) > 1:
-            raise ChatCompletionsProtocolError(
-                "Chat Completions stream emitted multiple choices in one chunk."
-            )
-        if not choices:
-            continue
-        choice = choices[0]
-        if not isinstance(choice, Mapping):
-            raise ChatCompletionsProtocolError("Chat Completions choice must be an object.")
-        chunk_choice_index = choice.get("index")
-        if chunk_choice_index is not None:
-            if type(chunk_choice_index) is not int or chunk_choice_index < 0:
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions choice index must be a non-negative integer."
-                )
-            if choice_index is not None and chunk_choice_index != choice_index:
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions stream emitted conflicting choice indexes."
-                )
-            choice_index = chunk_choice_index
-        if finish_reason is not None:
-            repeated_finish = choice.get("finish_reason")
-            repeated_delta = choice.get("delta")
-            if isinstance(repeated_finish, str) and _canonical_chat_finish_reason(
-                repeated_finish
-            ) != _canonical_chat_finish_reason(finish_reason):
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions stream emitted conflicting finish_reason values."
-                )
-            if (
-                isinstance(repeated_finish, str)
-                and _canonical_chat_finish_reason(repeated_finish)
-                == _canonical_chat_finish_reason(finish_reason)
-                and (repeated_delta is None or repeated_delta == {})
-                and set(choice).issubset({"index", "delta", "finish_reason", "logprobs"})
-            ):
-                continue
-            raise ChatCompletionsProtocolError(
-                "Chat Completions stream emitted semantic output after finish_reason."
-            )
         delta = choice.get("delta")
         if delta is not None:
             if not isinstance(delta, Mapping):
@@ -1156,25 +1200,18 @@ async def chat_completions_stream_events(
             chunk_tool_calls = delta.get("tool_calls")
             if tool_calls.record(chunk_tool_calls):
                 observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
-        choice_finish = choice.get("finish_reason")
-        if choice_finish is not None:
-            if not isinstance(choice_finish, str):
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions finish_reason must be a string."
+        if native_terminal is not None:
+            if not accepted.terminal_started:
+                lifecycle.accept(
+                    StreamTransition(StreamTransitionKind.TERMINAL, terminal=native_terminal)
                 )
-            if finish_reason is not None and _canonical_chat_finish_reason(
-                choice_finish
-            ) != _canonical_chat_finish_reason(finish_reason):
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions stream emitted conflicting finish_reason values."
-                )
-            if finish_reason is None:
-                finish_reason = choice_finish
-                observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
+            finish_reason = choice.get("finish_reason")
+            observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
 
     # Tool calls are emitted once, after the upstream stream, before Cayu's terminal
     # completed event. Deferring normalization lets trailing usage or repeated
     # identical finish metadata arrive without producing multiple terminal events.
+    lifecycle.require_terminal()
     provider_state = [
         *reasoning_details.provider_state_items(
             target_sha256=provider_state_target_sha256,
@@ -1192,14 +1229,9 @@ async def chat_completions_stream_events(
         if finish_reason in {"stop", "end_turn"}:
             finish_reason = "tool_calls"
 
-    if finish_reason is None:
-        raise ChatCompletionsProtocolError(
-            "Chat Completions streaming response ended before a finish_reason."
-        )
-
     completed_payload = {
-        "id": response_id,
-        "model": model,
+        "id": lifecycle.response_id,
+        "model": lifecycle.model,
         "finish_reason": finish_reason,
         "usage": copy_json_value(usage, "usage"),
     }
@@ -1210,7 +1242,9 @@ async def chat_completions_stream_events(
         completed_payload[f"upstream_{upstream_key}"] = upstream_value
     if openrouter_metadata is not None:
         completed_payload["openrouter_metadata"] = openrouter_metadata
-    yield ModelStreamEvent.completed(completed_payload)
+    completion = ModelStreamEvent.completed(completed_payload)
+    lifecycle.claim_completion()
+    yield completion
     if post_terminal_failure is not None:
         failure = post_terminal_failure
         post_terminal_failure = None

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import warnings
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
@@ -29,6 +30,7 @@ from cayu.providers import (
     ModelContextOverflowError,
     ModelFinishReason,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
@@ -44,6 +46,206 @@ from tests.providers.conformance import (
     require_conformance,
 )
 from tests.providers.registrations import REGISTRATIONS
+
+_LIFECYCLE_SCENARIOS: tuple[ProviderScenario, ...] = (
+    "lifecycle_clean",
+    "lifecycle_missing_start",
+    "lifecycle_unfinished",
+    "lifecycle_terminal_before_content",
+    "lifecycle_start_after_terminal",
+    "lifecycle_repeated_terminal",
+    "lifecycle_conflicting_terminal",
+    "lifecycle_conflicting_terminal_metadata",
+    "lifecycle_postterminal_text",
+    "lifecycle_postterminal_tool",
+    "lifecycle_postterminal_reasoning",
+    "lifecycle_tail",
+    "lifecycle_excess_tail",
+    "lifecycle_response_conflict",
+    "lifecycle_model_conflict",
+    "lifecycle_omitted_terminal_identity",
+    "lifecycle_excess_terminal",
+    "lifecycle_invalid_response",
+    "lifecycle_invalid_model",
+)
+
+
+def test_lifecycle_matrix_covers_every_declared_lifecycle_scenario() -> None:
+    assert set(_LIFECYCLE_SCENARIOS) == {
+        scenario for scenario in get_args(ProviderScenario) if scenario.startswith("lifecycle_")
+    }
+
+
+async def _assert_lifecycle_contract(
+    registration: ProviderConformanceRegistration, scenario: ProviderScenario
+) -> None:
+    if scenario in {
+        "lifecycle_response_conflict",
+        "lifecycle_model_conflict",
+        "lifecycle_invalid_response",
+        "lifecycle_invalid_model",
+    } and (not registration.reports_model_identity):
+        # Converse's wire events expose neither response ID nor model ID. Do not
+        # pretend a synthetic invented field proves an unsupported wire contract.
+        assert registration is registrations_module.BEDROCK
+        return
+    succeeds = (
+        scenario in {"lifecycle_clean", "lifecycle_omitted_terminal_identity"}
+        or (
+            scenario == "lifecycle_missing_start"
+            and registration not in {registrations_module.ANTHROPIC, registrations_module.VERTEX}
+        )
+        or (
+            scenario in {"lifecycle_tail", "lifecycle_repeated_terminal"}
+            and registration
+            in {registrations_module.CHAT_COMPLETIONS, registrations_module.BEDROCK}
+        )
+    )
+    harness = await registration.factory(scenario)
+    events: list[ModelStreamEvent] = []
+    failure: ModelProviderError | None = None
+    try:
+        request = ModelRequest(model=harness.model, messages=[Message.text("user", "hello")])
+        try:
+            async for event in harness.provider.runtime_stream(request):
+                events.append(event)
+        except ModelProviderError as exc:
+            failure = exc
+    finally:
+        await harness.aclose()
+    completions = [event for event in events if event.type is ModelStreamEventType.COMPLETED]
+    errors = [event for event in events if event.type is ModelStreamEventType.ERROR]
+    protocol_failure = (
+        failure is not None
+        and isinstance(failure.error_type, str)
+        and failure.error_type.endswith("ProtocolError")
+    ) or any(
+        isinstance(event.payload.get("error_type"), str)
+        and event.payload["error_type"].endswith("ProtocolError")
+        for event in errors
+    )
+    # The maintained public credential boundary intentionally projects failures
+    # after accepted completion to a nonretryable ModelProviderError without raw
+    # protocol details. Native error-type coverage lives at the parser seam.
+    terminal_failure = (
+        type(failure) is ModelProviderError and failure.retryable is False and len(completions) == 1
+    )
+    text = "".join(event.delta for event in events if event.type is ModelStreamEventType.TEXT_DELTA)
+    require_conformance(
+        len(completions) <= 1
+        and text in {"", "hello"}
+        and not any(
+            event.type in {ModelStreamEventType.TOOL_CALL, ModelStreamEventType.THINKING}
+            for event in events
+        )
+        and (
+            (len(completions) == 1 and not errors and failure is None and text == "hello")
+            if succeeds
+            else protocol_failure or terminal_failure
+        ),
+        registration=registration,
+        scenario=scenario,
+        observed={
+            "event_types": [event.type for event in events],
+            "failure_type": None if failure is None else failure.error_type,
+            "raised_type": None if failure is None else type(failure).__name__,
+            "expected_success": succeeds,
+        },
+    )
+    if succeeds and registration.reports_model_identity:
+        require_conformance(
+            completions[0].payload.get("model") == harness.model
+            and bool(completions[0].payload.get("id")),
+            registration=registration,
+            scenario=scenario,
+            observed={"identity_retained": False},
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+@pytest.mark.parametrize("scenario", _LIFECYCLE_SCENARIOS)
+async def test_registered_provider_lifecycle_matrix(
+    registration: ProviderConformanceRegistration, scenario: ProviderScenario
+) -> None:
+    await _assert_lifecycle_contract(registration, scenario)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "registration",
+    [item for item in REGISTRATIONS if item.reports_model_identity],
+    ids=lambda item: item.name,
+)
+@pytest.mark.parametrize("scenario", ["lifecycle_invalid_response", "lifecycle_invalid_model"])
+async def test_registered_lifecycle_identity_rejection_is_diagnostically_safe(
+    registration,
+    scenario,
+    monkeypatch,
+    capsys,
+    caplog,
+) -> None:
+    class HostileIdentity:
+        def __repr__(self) -> str:
+            return "LIFECYCLE_SECRET_CANARY"
+
+        __str__ = __repr__
+
+    original = registrations_module.lifecycle_events
+
+    def hostile_frames(protocol, selected):
+        frames = original(protocol, selected)
+        if frames is not None and selected == scenario:
+
+            def replace(value):
+                if value is True:
+                    return HostileIdentity()
+                if isinstance(value, dict):
+                    return {key: replace(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [replace(item) for item in value]
+                return value
+
+            frames = replace(frames)
+        return frames
+
+    monkeypatch.setattr(registrations_module, "lifecycle_events", hostile_frames)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        await _assert_lifecycle_contract(registration, scenario)
+    output = capsys.readouterr()
+    diagnostic_text = (
+        output.out
+        + output.err
+        + caplog.text
+        + "".join(str(warning.message) for warning in recorded)
+    )
+    assert "LIFECYCLE_SECRET_CANARY" not in diagnostic_text
+
+
+@pytest.mark.anyio
+async def test_lifecycle_matrix_detects_weakened_terminal_admission(monkeypatch) -> None:
+    from cayu.providers._stream_lifecycle import StreamLifecycle
+
+    monkeypatch.setattr(StreamLifecycle, "_validate_phase", lambda self, transition: False)
+    with pytest.raises(ProviderConformanceFailure, match="lifecycle_postterminal_tool"):
+        await _assert_lifecycle_contract(
+            registrations_module.CHAT_COMPLETIONS, "lifecycle_postterminal_tool"
+        )
+
+
+@pytest.mark.anyio
+async def test_lifecycle_matrix_detects_bypassed_validator(monkeypatch) -> None:
+    from cayu.providers._stream_lifecycle import AcceptedTransition, StreamLifecycle
+
+    monkeypatch.setattr(
+        StreamLifecycle, "accept", lambda self, transition: AcceptedTransition(self.phase)
+    )
+    monkeypatch.setattr(StreamLifecycle, "require_terminal", lambda self: None)
+    with pytest.raises(ProviderConformanceFailure, match="lifecycle_response_conflict"):
+        await _assert_lifecycle_contract(
+            registrations_module.CHAT_COMPLETIONS, "lifecycle_response_conflict"
+        )
 
 
 class _NoopProvider(ModelProvider):

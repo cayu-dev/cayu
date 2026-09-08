@@ -8,8 +8,16 @@ from typing import Any
 import httpx
 import pytest
 
-from cayu import AgentSpec, CayuApp, InMemorySessionStore, ResumeRequest, RetryPolicy, RunRequest
-from cayu.core import EventType, Message
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    InMemorySessionStore,
+    ResumeRequest,
+    RetryPolicy,
+    RunRequest,
+    SQLiteSessionStore,
+)
+from cayu.core import EventType, ExecutionProfileBehaviorIdentity, Message
 from cayu.core.messages import MessageRole, ProviderStatePart, TextPart
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import (
@@ -462,6 +470,153 @@ async def test_openai_background_start_publishes_identity_before_output() -> Non
         for event in events
         if event.recovery_metadata
     ] == [1, 2]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("boundary", ["reconnect", "retrieve", "cancel"])
+@pytest.mark.parametrize("conflict", [None, "id", "model", "omitted_model"])
+async def test_background_identity_survives_serialized_progress(
+    boundary: str, conflict: str | None
+) -> None:
+    transport = BackgroundTransport()
+    transport.start_batches.append(
+        [
+            _created(),
+            {"type": "response.output_text.delta", "sequence_number": 1, "delta": "prefix"},
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", background=True, transport=transport)
+    adapter = provider.provider_operations
+    assert adapter is not None
+    started = await adapter.start(
+        ProviderOperationStartRequest(request=_request(), idempotency_key="identity-start")
+    )
+    [accepted] = [event async for event in started.events]
+    assert accepted.recovery_metadata is not None
+    assert started.state.recovery_metadata.opaque["stream_model"] == "gpt-test"
+    assert accepted.recovery_metadata.opaque["stream_model"] == "gpt-test"
+    checkpoint = ProviderOperationState(
+        operation_id=started.state.operation_id,
+        stream_protocol=started.state.stream_protocol,
+        recovery_metadata=accepted.recovery_metadata,
+    )
+    serialized = checkpoint.model_dump_json()
+    assert "prefix" not in serialized
+    recovered = ProviderOperationState.model_validate_json(serialized)
+    fresh_transport = BackgroundTransport()
+    fresh_provider = OpenAIProvider(api_key="test-key", background=True, transport=fresh_transport)
+    fresh = fresh_provider.provider_operations
+    assert fresh is not None
+    terminal = _completed(sequence_number=2)
+    is_conflict = conflict in {"id", "model"}
+    if conflict == "omitted_model":
+        terminal["response"].pop("model")
+    elif conflict is not None:
+        terminal["response"][conflict] = "foreign-identity"
+    try:
+        if boundary == "reconnect":
+            fresh_transport.reconnect_batches.append([terminal])
+            connection = await fresh.reconnect(recovered)
+            assert connection.state == recovered
+            events = []
+            if is_conflict:
+                with pytest.raises(OpenAIProtocolError) as failure:
+                    async for event in connection.events:
+                        events.append(event)
+                assert failure.value.reason_code == (
+                    "stream_emitted_conflicting_response_identities"
+                    if conflict == "id"
+                    else "stream_emitted_conflicting_model_identities"
+                )
+                assert not events
+                return
+            events = [event async for event in connection.events]
+        else:
+            getattr(fresh_transport, f"{boundary}_responses").append(terminal["response"])
+            snapshot = await getattr(fresh, boundary)(recovered)
+            assert snapshot.state == recovered
+            assert snapshot.status is ProviderOperationStatus.COMPLETED
+            events = list(snapshot.events)
+            if is_conflict:
+                assert not events  # Status-only malformed reconciliation, never output/usage.
+                return
+        assert len([event for event in events if event.type is ModelStreamEventType.COMPLETED]) == 1
+        completion = next(event for event in events if event.type is ModelStreamEventType.COMPLETED)
+        assert completion.payload["model"] == "gpt-test"
+        assert completion.payload["id"] == recovered.operation_id
+        assert all(
+            event.recovery_metadata is not None
+            and event.recovery_metadata.opaque["stream_model"] == "gpt-test"
+            for event in events
+        )
+        assert recovered.model_dump_json() == serialized
+    finally:
+        await provider.aclose()
+        await fresh_provider.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("field", ["response_id", "model"])
+async def test_background_identity_conflict_rejected_before_text(field: str) -> None:
+    transport = BackgroundTransport()
+    transport.start_batches.append(
+        [
+            _created(),
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "must-not-be-exposed",
+                field: "foreign-identity",
+            },
+            _completed(),
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", background=True, transport=transport)
+    adapter = provider.provider_operations
+    assert adapter is not None
+    connection = await adapter.start(
+        ProviderOperationStartRequest(request=_request(), idempotency_key="identity-conflict")
+    )
+    observed = []
+    try:
+        with pytest.raises(OpenAIProtocolError):
+            async for event in connection.events:
+                observed.append(event)
+        assert not observed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.anyio
+async def test_background_terminal_rejects_late_tool_before_another_event() -> None:
+    transport = BackgroundTransport()
+    transport.start_batches.append(
+        [
+            _created(),
+            _completed(),
+            {
+                "type": "response.function_call_arguments.done",
+                "sequence_number": 3,
+                "output_index": 0,
+                "arguments": "{}",
+            },
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", background=True, transport=transport)
+    adapter = provider.provider_operations
+    assert adapter is not None
+    connection = await adapter.start(
+        ProviderOperationStartRequest(request=_request(), idempotency_key="terminal-tail")
+    )
+    observed = []
+    try:
+        with pytest.raises(OpenAIProtocolError) as failure:
+            async for event in connection.events:
+                observed.append(event)
+        assert failure.value.reason_code == "stream_event_arrived_after_terminal_response"
+        assert [event.type for event in observed] == [ModelStreamEventType.COMPLETED]
+    finally:
+        await provider.aclose()
 
 
 @pytest.mark.anyio
@@ -967,7 +1122,7 @@ async def test_openai_background_reconnect_handoff_excludes_semantic_idle_pause(
                 "sequence_number": 1,
                 "delta": "finished",
             },
-            _completed(sequence_number=2),
+            _completed(sequence_number=2, response_id="resp_background_pause"),
         ]
     )
     provider = OpenAIProvider(
@@ -2253,11 +2408,44 @@ async def test_openai_background_request_options_cannot_disable_runtime_authorit
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("loss_after_cursor", [False, True])
+@pytest.mark.parametrize(
+    ("loss_after_cursor", "terminal_tail"), [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 async def test_openai_background_worker_loss_recovers_without_resubmission(
     loss_after_cursor: bool,
+    terminal_tail: bool,
+    backend: str,
+    tmp_path,
 ) -> None:
-    transport = BackgroundTransport()
+    class RestartableProvider(OpenAIProvider):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            # The scripted custom transport needs declared identity across app
+            # instances; production admission must not infer that equivalence.
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:openai-background-lifecycle",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
+    class ObservedTransport(BackgroundTransport):
+        reconnect_delivered = 0
+        reconnect_closed = False
+
+        async def reconnect_response_events(
+            self, **kwargs: Any
+        ) -> AsyncIterator[Mapping[str, Any]]:
+            events = super().reconnect_response_events(**kwargs)
+            try:
+                async for event in events:
+                    self.reconnect_delivered += 1
+                    yield event
+            finally:
+                await events.aclose()
+                self.reconnect_closed = True
+
+    transport = ObservedTransport()
     start_batch: list[Mapping[str, Any] | BaseException] = [_created()]
     if loss_after_cursor:
         start_batch.append(
@@ -2269,8 +2457,9 @@ async def test_openai_background_worker_loss_recovers_without_resubmission(
         )
     start_batch.append(SimulatedWorkerLoss("worker disappeared"))
     transport.start_batches.append(start_batch)
-    provider = OpenAIProvider(api_key="test-key", background=True, transport=transport)
-    store = InMemorySessionStore()
+    provider = RestartableProvider(api_key="test-key", background=True, transport=transport)
+    database = tmp_path / "background-recovery.db"
+    store = InMemorySessionStore() if backend == "memory" else SQLiteSessionStore(database)
 
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
@@ -2291,8 +2480,35 @@ async def test_openai_background_worker_loss_recovers_without_resubmission(
 
     if loss_after_cursor:
         transport.reconnect_batches.append([_completed(sequence_number=2)])
+        if terminal_tail:
+            transport.reconnect_batches[-1].append(
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 3,
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_late",
+                        "call_id": "call_late",
+                        "name": "remember_knowledge",
+                        "arguments": '{"fact":"must not be staged"}',
+                        "status": "completed",
+                    },
+                }
+            )
     else:
         transport.retrieve_responses.append(_completed()["response"])
+    if backend == "sqlite":
+        # Reconstruct through a fresh runtime/provider/store rather than retaining
+        # in-process model authority across the durable progress boundary.
+        await provider.aclose()
+        assert isinstance(store, SQLiteSessionStore)
+        await store.close()
+        store = SQLiteSessionStore(database)
+        provider = RestartableProvider(api_key="test-key", background=True, transport=transport)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
     recovered = await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
@@ -2306,6 +2522,12 @@ async def test_openai_background_worker_loss_recovers_without_resubmission(
     assert len(transport.start_calls) == 1
     assert len(transport.reconnect_calls) == int(loss_after_cursor)
     assert len(transport.retrieve_calls) == int(not loss_after_cursor)
+    if loss_after_cursor:
+        assert transport.reconnect_closed
+        assert transport.reconnect_delivered == 1
+    checkpoint = await store.load_checkpoint(session_id)
+    assert checkpoint is not None
+    assert not checkpoint.get("pending_tool_round")
     transcript = await store.load_transcript(session_id)
     assert len(transcript) == 2
     assert transcript[1].content[0].text == "finished"
@@ -2318,6 +2540,9 @@ async def test_openai_background_worker_loss_recovers_without_resubmission(
     inspection = await inspect_provider_operation(store, session_id)
     assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
     assert inspection.recovery_reason is None
+    await provider.aclose()
+    if isinstance(store, SQLiteSessionStore):
+        await store.close()
 
 
 @pytest.mark.anyio

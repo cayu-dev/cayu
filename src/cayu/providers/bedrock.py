@@ -13,7 +13,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import canonical_durable_json_bytes, copy_json_value, require_clean_nonblank
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -47,6 +47,15 @@ from cayu.providers._reasoning_state import (
     reasoning_state,
     reasoning_state_matches,
 )
+from cayu.providers._stream_lifecycle import (
+    StreamLifecycle,
+    StreamPhase,
+    StreamPolicy,
+    StreamTerminal,
+    StreamTransition,
+    StreamTransitionKind,
+    StreamViolation,
+)
 from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountConfidence,
@@ -77,6 +86,12 @@ from cayu.providers.deadlines import (
 
 DEFAULT_BEDROCK_MAX_TOKENS = 4096
 DEFAULT_BEDROCK_STREAM_CLOSE_TIMEOUT_SECONDS = 5.0
+_BEDROCK_STREAM_POLICY = StreamPolicy(
+    max_terminal_repeats=1,
+    max_metadata_tails=1,
+    max_total_tails=1,
+    max_metadata_events=1,
+)
 BedrockResourceType = Literal[
     "foundation_model",
     "inference_profile",
@@ -800,10 +815,18 @@ async def bedrock_converse_stream_events(
     started_block_indexes: set[int] = set()
     stop_reason: str | None = None
     completion_metadata_payload: dict[str, Any] = {}
-    metadata_seen = False
-    saw_message_stop = False
-    completion_emitted = False
     post_terminal_failure: BaseException | None = None
+
+    def lifecycle_error(violation: StreamViolation) -> Exception:
+        message = {
+            StreamViolation.MISSING_TERMINAL: "stream ended before messageStop",
+            StreamViolation.METADATA_LIMIT: "stream emitted repeated metadata",
+            StreamViolation.TAIL_LIMIT: "stream emitted repeated metadata",
+            StreamViolation.REPEATED_START: "stream emitted repeated messageStart",
+        }.get(violation, "stream emitted an event after messageStop")
+        return BedrockProtocolError(f"Bedrock {message}.")
+
+    lifecycle = StreamLifecycle(_BEDROCK_STREAM_POLICY, error_factory=lifecycle_error)
 
     def validate_terminal_assembly() -> None:
         if tool_blocks:
@@ -813,8 +836,7 @@ async def bedrock_converse_stream_events(
 
     def completed_event() -> ModelStreamEvent:
         validate_terminal_assembly()
-        if not saw_message_stop or stop_reason is None:
-            raise BedrockProtocolError("Bedrock stream ended before messageStop.")
+        lifecycle.claim_completion()
         return ModelStreamEvent.completed(
             {
                 "stop_reason": stop_reason,
@@ -829,34 +851,31 @@ async def bedrock_converse_stream_events(
         except StopAsyncIteration:
             break
         except asyncio.CancelledError as exc:
-            if not saw_message_stop:
+            if lifecycle.phase is not StreamPhase.TERMINAL:
                 raise
             post_terminal_failure = exc
             break
         except Exception as exc:
-            if not saw_message_stop:
+            if lifecycle.phase is not StreamPhase.TERMINAL:
                 raise
             post_terminal_failure = exc
             break
         if not isinstance(raw, Mapping):
             raise BedrockProtocolError("Bedrock stream events must be objects.")
-        if saw_message_stop:
-            if "metadata" in raw and len(raw) == 1:
-                if metadata_seen:
-                    raise BedrockProtocolError("Bedrock stream emitted repeated metadata.")
-                new_metadata = _mapping(raw["metadata"], "metadata")
-                completion_metadata_payload = _bedrock_completion_metadata_payload(new_metadata)
-                metadata_seen = True
-                if "usage" in completion_metadata_payload:
-                    observe_provider_semantic_progress(ProviderProgressKind.USAGE)
-                completion_emitted = True
-                yield completed_event()
-                continue
-            if "messageStop" in raw and len(raw) == 1:
-                repeated = _mapping(raw["messageStop"], "messageStop")
-                if _required_string(repeated, "stopReason") == stop_reason:
-                    continue
-            raise BedrockProtocolError("Bedrock stream emitted an event after messageStop.")
+        if len(raw) != 1:
+            raise BedrockProtocolError("Bedrock stream events require exactly one union member.")
+        if "messageStart" in raw:
+            _mapping(raw["messageStart"], "messageStart")
+            lifecycle.accept(StreamTransition(StreamTransitionKind.START))
+            continue
+        if "messageStop" not in raw and "metadata" not in raw:
+            lifecycle.accept(
+                StreamTransition(
+                    StreamTransitionKind.FAILURE
+                    if any(key in raw for key in _STREAM_ERROR_STATUS)
+                    else StreamTransitionKind.SEMANTIC
+                )
+            )
         _raise_stream_error(raw)
         if "contentBlockStart" in raw:
             start_event = _mapping(raw["contentBlockStart"], "contentBlockStart")
@@ -991,23 +1010,33 @@ async def bedrock_converse_stream_events(
             message_stop = _mapping(raw["messageStop"], "messageStop")
             candidate_stop_reason = _required_string(message_stop, "stopReason")
             validate_terminal_assembly()
+            accepted = lifecycle.accept(
+                StreamTransition(
+                    StreamTransitionKind.TERMINAL,
+                    terminal=StreamTerminal(
+                        candidate_stop_reason,
+                        canonical_durable_json_bytes(dict(message_stop), "messageStop"),
+                    ),
+                )
+            )
+            if accepted.repeated:
+                continue
             stop_reason = candidate_stop_reason
-            saw_message_stop = True
             observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
-            if metadata_seen:
-                completion_emitted = True
+            if lifecycle.metadata_received:
                 yield completed_event()
             continue
         if "metadata" in raw:
-            if metadata_seen:
-                raise BedrockProtocolError("Bedrock stream emitted repeated metadata.")
             new_metadata = _mapping(raw["metadata"], "metadata")
-            completion_metadata_payload = _bedrock_completion_metadata_payload(new_metadata)
-            metadata_seen = True
+            candidate_metadata = _bedrock_completion_metadata_payload(new_metadata)
+            lifecycle.accept(StreamTransition(StreamTransitionKind.METADATA))
+            completion_metadata_payload = candidate_metadata
             if "usage" in completion_metadata_payload:
                 observe_provider_semantic_progress(ProviderProgressKind.USAGE)
+            if lifecycle.phase is StreamPhase.TERMINAL:
+                yield completed_event()
 
-    if not completion_emitted:
+    if not lifecycle.completion_claimed:
         yield completed_event()
     if post_terminal_failure is not None:
         failure = post_terminal_failure

@@ -8428,6 +8428,41 @@ exported adapter from silently bypassing the suite. Seeded broken adapters also
 exercise the validators so a failure reports the scenario, adapter, optional
 capability, and observed behavior.
 
+Built-in native stream adapters share the private provider lifecycle owner in
+`providers/_stream_lifecycle.py`. Adapters retain native event decoding, item
+assembly and usage normalization. The shared owner admits typed transitions,
+freezes accepted response/model identities, seals semantic state at terminality,
+and permits only one normalized completion. A later supplied contradictory
+identity fails before its output or accounting is accepted.
+
+| Native stream | Start policy | Terminal repeats | Retained accounting tail |
+| --- | --- | --- | --- |
+| OpenAI Responses and Subscription | Explicit or implicit start; no late/repeated start | Rejected | None |
+| Anthropic Messages and Vertex | One explicit `message_start` | Rejected | None; ping/unknown events are discarded without progress |
+| Chat Completions | Implicit start | At most one exact canonical terminal-metadata repeat | At most one usage-only or metadata-only frame |
+| Bedrock Converse | Explicit or implicit `messageStart` | At most one exact `messageStop` repeat | One metadata event total, before or after stop |
+
+Post-terminal text, reasoning, tool fragments and new-response events are not
+admissible. Exact terminal repeats do not refresh semantic progress or emit
+another completion. A validated completion may already have been published
+when a later stream read or cleanup fails; runtime retains its accounting and
+fails continuation rather than retrying the completed provider operation.
+Native incomplete-output handling remains provider-specific: OpenAI output-limit
+terminals discard unusable partial tool/reasoning state, while an unfinished
+item in a completed response remains a protocol error.
+
+OpenAI background streams restore response identity from the exact operation
+state and carry model-identity comparison evidence in private, bounded recovery
+metadata. Reconnect and completed readback validate that binding before exposing
+output or usage. Readback still returns the exact queried operation state;
+newly accepted model evidence travels with normalized event checkpoints, not
+with a replacement snapshot identity.
+Generic operation recovery retains its existing close-at-completion contract:
+it closes the reconnect iterator after accepting completion rather than draining
+unconsumed transport frames. Those frames cannot enter recovered tool staging.
+Consumers that continue reading a background stream receive the same lifecycle
+rejection for a consumed post-terminal semantic frame as ordinary streams.
+
 This suite is hermetic CI evidence. It uses no credentials, network access, or
 paid provider calls, and it proves Cayu's adapter-level normalization against
 recorded protocol shapes. It does not prove that credentials work, a particular

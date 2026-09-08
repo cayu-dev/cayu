@@ -83,6 +83,15 @@ from cayu.providers._openai_search_trace import (
     SearchStreamDiagnostic,
     SearchStreamTrace,
 )
+from cayu.providers._stream_lifecycle import (
+    StreamLifecycle,
+    StreamPhase,
+    StreamPolicy,
+    StreamTerminal,
+    StreamTransition,
+    StreamTransitionKind,
+    StreamViolation,
+)
 from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -1289,8 +1298,6 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                         )
                         completion_emitted = is_completion
                         yield event
-                        if completion_emitted:
-                            break
                 return
             except OpenAIAPIError as exc:
                 recoverable = (
@@ -1322,8 +1329,6 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                     )
                     completion_emitted = is_completion
                     yield event
-                    if completion_emitted:
-                        break
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
@@ -2063,7 +2068,17 @@ def _require_openai_background_state(state: ProviderOperationState) -> ProviderO
     _openai_recovery_sequence_number(state.recovery_metadata)
     _openai_background_targeted_tool_marker_id(state.recovery_metadata)
     _openai_background_discovery_loaded_tool_names(state.recovery_metadata)
+    _openai_background_lifecycle(state)
     return state
+
+
+def _openai_background_lifecycle(state: ProviderOperationState) -> StreamLifecycle:
+    return StreamLifecycle(
+        _OPENAI_STREAM_POLICY,
+        resumed_response_id=state.operation_id,
+        resumed_model=cast("str | None", state.recovery_metadata.opaque.get("stream_model")),
+        error_factory=_openai_lifecycle_error,
+    )
 
 
 def _openai_response_operation_status(value: object) -> ProviderOperationStatus | None:
@@ -2105,6 +2120,8 @@ def _openai_background_created_state(
             "OpenAI response.created requires queued or in_progress status.",
             reason_code="response_created_requires_queued_or_in_progress_status",
         )
+    lifecycle = StreamLifecycle(_OPENAI_STREAM_POLICY, error_factory=_openai_lifecycle_error)
+    lifecycle.accept(_openai_stream_transition(event))
     return (
         ProviderOperationState(
             operation_id=response_id,
@@ -2115,6 +2132,7 @@ def _openai_background_created_state(
                     "opaque": {
                         "sequence_number": sequence_number,
                         "targeted_tool_marker_id": targeted_tool_marker_id,
+                        "stream_model": lifecycle.model,
                         **(
                             {"tool_discovery_loaded_tool_names": list(discovery_loaded_tool_names)}
                             if discovery_loaded_tool_names is not None
@@ -2140,11 +2158,24 @@ def _openai_background_snapshot(
             status=ProviderOperationStatus.COMPLETED,
         )
     response_id = response.get("id")
-    if type(response_id) is not str or response_id != state.operation_id:
+    if type(response_id) is not str:
         return ProviderOperationSnapshot(
             state=state,
             status=ProviderOperationStatus.COMPLETED,
         )
+    lifecycle = _openai_background_lifecycle(state)
+    try:
+        lifecycle.accept(
+            StreamTransition(
+                StreamTransitionKind.IDENTITY,
+                response_id=response_id,
+                model=_optional_string(response, "model"),
+            )
+        )
+    except OpenAIProtocolError:
+        # Preserve the existing status-only reconciliation shape: contradictory
+        # readback is not authoritative output, usage, or replay evidence.
+        return ProviderOperationSnapshot(state=state, status=ProviderOperationStatus.COMPLETED)
     status = _openai_response_operation_status(response.get("status"))
     if status is None:
         return ProviderOperationSnapshot(
@@ -2154,11 +2185,22 @@ def _openai_background_snapshot(
     if status is not ProviderOperationStatus.COMPLETED:
         return ProviderOperationSnapshot(state=state, status=status)
     try:
-        parsed = openai_response_events(response, reasoning_state=reasoning_state)
+        parsed = openai_response_events(
+            {**response, "id": lifecycle.response_id, "model": lifecycle.model},
+            reasoning_state=reasoning_state,
+        )
     except OpenAIProtocolError:
         raise
     except (OpenAIAPIError, TypeError, ValueError):
         return ProviderOperationSnapshot(state=state, status=status)
+    terminal_completion = parsed[-1].completion
+    assert terminal_completion is not None
+    lifecycle.accept(
+        StreamTransition(
+            StreamTransitionKind.TERMINAL,
+            terminal=StreamTerminal(terminal_completion.finish_reason.value),
+        )
+    )
     cursor = state.recovery_metadata.cursor
     cursor = 0 if cursor is None else cursor
     targeted_tool_marker_id = _openai_background_targeted_tool_marker_id(state.recovery_metadata)
@@ -2167,6 +2209,8 @@ def _openai_background_snapshot(
     )
     events: list[ModelStreamEvent] = []
     for event in parsed:
+        if event.type is ModelStreamEventType.COMPLETED:
+            lifecycle.claim_completion()
         cursor += 1
         event = _event_with_server_dynamic_tool_ownership(
             event,
@@ -2184,6 +2228,7 @@ def _openai_background_snapshot(
                                 state.recovery_metadata
                             ),
                             "targeted_tool_marker_id": targeted_tool_marker_id,
+                            "stream_model": lifecycle.model,
                             **(
                                 {
                                     "tool_discovery_loaded_tool_names": list(
@@ -2470,10 +2515,12 @@ def _openai_background_recovery_metadata(
     completed_function_call_digests: Mapping[int, str],
     targeted_tool_marker_id: str | None,
     discovery_loaded_tool_names: tuple[str, ...] | None,
+    stream_model: str | None,
 ) -> ProviderOperationRecoveryMetadata:
     opaque: dict[str, object] = {
         "sequence_number": sequence_number,
         "targeted_tool_marker_id": targeted_tool_marker_id,
+        "stream_model": stream_model,
         **(
             {"tool_discovery_loaded_tool_names": list(discovery_loaded_tool_names)}
             if discovery_loaded_tool_names is not None
@@ -2550,6 +2597,7 @@ def _openai_background_event_with_recovery(
     completed_function_call_digests: Mapping[int, str],
     targeted_tool_marker_id: str | None,
     discovery_loaded_tool_names: tuple[str, ...] | None,
+    stream_model: str | None,
 ) -> ModelStreamEvent:
     return event.model_copy(
         update={
@@ -2564,6 +2612,7 @@ def _openai_background_event_with_recovery(
                 completed_function_call_digests=completed_function_call_digests,
                 targeted_tool_marker_id=targeted_tool_marker_id,
                 discovery_loaded_tool_names=discovery_loaded_tool_names,
+                stream_model=stream_model,
             )
         },
         deep=True,
@@ -2577,6 +2626,7 @@ async def _openai_background_stream_events(
     first: Mapping[str, Any] | None,
     reasoning_state: str,
 ) -> AsyncIterator[ModelStreamEvent]:
+    lifecycle = _openai_background_lifecycle(state)
     cursor = state.recovery_metadata.cursor
     cursor = 0 if cursor is None else cursor
     last_sequence_number = _openai_recovery_sequence_number(state.recovery_metadata)
@@ -2611,6 +2661,9 @@ async def _openai_background_stream_events(
                 "OpenAI background sequence_number did not advance.",
                 reason_code="background_sequence_number_did_not_advance",
             )
+        accepted = lifecycle.accept(_openai_stream_transition(event))
+        if accepted.identity_started:
+            observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
         last_sequence_number = sequence_number
         cursor += 1
         event_type = event.get("type")
@@ -2829,13 +2882,25 @@ async def _openai_background_stream_events(
                     "OpenAI background response completed with unfinished output items.",
                     reason_code="background_response_completed_with_unfinished_output_items",
                 )
-            for terminal_event in _stream_terminal_events(
-                event,
+            terminal_events = _stream_terminal_events(
+                _openai_terminal_identity_projection(event, lifecycle),
                 completed_tool_search_items,
                 excluded_output_indexes=unfinished,
                 reasoning_state=reasoning_state,
                 emitted_function_call_digests=completed_function_call_digests,
-            ):
+            )
+            terminal_completion = terminal_events[-1].completion
+            assert terminal_completion is not None
+            lifecycle.accept(
+                StreamTransition(
+                    StreamTransitionKind.TERMINAL,
+                    terminal=StreamTerminal(terminal_completion.finish_reason.value),
+                )
+            )
+            observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
+            for terminal_event in terminal_events:
+                if terminal_event.type is ModelStreamEventType.COMPLETED:
+                    lifecycle.claim_completion()
                 terminal_event = _event_with_server_dynamic_tool_ownership(
                     terminal_event,
                     reasoning_state=reasoning_state,
@@ -2854,8 +2919,9 @@ async def _openai_background_stream_events(
                     completed_function_call_digests=completed_function_call_digests,
                     targeted_tool_marker_id=targeted_tool_marker_id,
                     discovery_loaded_tool_names=discovery_loaded_tool_names,
+                    stream_model=lifecycle.model,
                 )
-            return
+            continue
         elif event_type == "response.failed":
             failure = _openai_stream_error_exception(event)
             normalized = ModelStreamEvent.error(
@@ -2885,6 +2951,18 @@ async def _openai_background_stream_events(
             )
         else:
             normalized = ModelStreamEvent.thinking()
+        if normalized.provider_operation_status in {
+            ProviderOperationStatus.FAILED,
+            ProviderOperationStatus.CANCELLED,
+            ProviderOperationStatus.EXPIRED,
+        }:
+            lifecycle.accept(
+                StreamTransition(
+                    StreamTransitionKind.TERMINAL,
+                    terminal=StreamTerminal(normalized.provider_operation_status.value),
+                )
+            )
+            observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
         yield _openai_background_event_with_recovery(
             normalized,
             cursor=cursor,
@@ -2897,15 +2975,8 @@ async def _openai_background_stream_events(
             completed_function_call_digests=completed_function_call_digests,
             targeted_tool_marker_id=targeted_tool_marker_id,
             discovery_loaded_tool_names=discovery_loaded_tool_names,
+            stream_model=lifecycle.model,
         )
-        if event_type in {
-            "response.completed",
-            "response.incomplete",
-            "response.failed",
-            "response.cancelled",
-            "response.expired",
-        }:
-            return
 
 
 async def _empty_model_stream() -> AsyncIterator[ModelStreamEvent]:
@@ -3059,6 +3130,76 @@ async def _openai_stream_events(
         raise
 
 
+_OPENAI_STREAM_POLICY = StreamPolicy()
+
+
+def _openai_lifecycle_error(violation: StreamViolation) -> Exception:
+    reason, message = {
+        StreamViolation.RESPONSE_CONFLICT: (
+            "stream_emitted_conflicting_response_identities",
+            "stream emitted conflicting response identities",
+        ),
+        StreamViolation.MODEL_CONFLICT: (
+            "stream_emitted_conflicting_model_identities",
+            "stream emitted conflicting model identities",
+        ),
+        StreamViolation.REPEATED_START: (
+            "stream_response_start_was_repeated",
+            "stream response start was repeated or arrived after output",
+        ),
+        StreamViolation.INVALID_IDENTITY: (
+            "response_field_must_be_a_string",
+            "stream identities must be nonblank strings",
+        ),
+        StreamViolation.MISSING_TERMINAL: (
+            "streaming_response_ended_before_response_completed",
+            "streaming response ended before response.completed",
+        ),
+    }.get(
+        violation,
+        ("stream_event_arrived_after_terminal_response", "stream mutated after terminal response"),
+    )
+    return OpenAIProtocolError(f"OpenAI {message}.", reason_code=reason)
+
+
+def _openai_stream_transition(event: Mapping[str, Any]) -> StreamTransition:
+    """Decode envelope identities and classify wire events, not lifecycle state."""
+    event_type = event.get("type")
+    response = event.get("response")
+    outer_id = _optional_string(event, "response_id")
+    outer_model = _optional_string(event, "model")
+    response_id = _optional_string(response, "id") if isinstance(response, Mapping) else None
+    model = _optional_string(response, "model") if isinstance(response, Mapping) else None
+    if outer_id is not None and response_id is not None and outer_id != response_id:
+        raise _openai_lifecycle_error(StreamViolation.RESPONSE_CONFLICT)
+    if outer_model is not None and model is not None and outer_model != model:
+        raise _openai_lifecycle_error(StreamViolation.MODEL_CONFLICT)
+    if event_type == "response.created":
+        kind = StreamTransitionKind.START
+    elif event_type in {"response.failed", "response.cancelled", "response.expired", "error"}:
+        kind = StreamTransitionKind.FAILURE
+    else:
+        # Terminal candidates are admitted as active native work first; their
+        # terminal transition follows successful output/usage assembly below.
+        kind = StreamTransitionKind.SEMANTIC
+    return StreamTransition(
+        kind,
+        response_id=response_id if response_id is not None else outer_id,
+        model=model if model is not None else outer_model,
+    )
+
+
+def _openai_terminal_identity_projection(
+    event: Mapping[str, Any], lifecycle: StreamLifecycle
+) -> dict[str, Any]:
+    """Project already-admitted identities, including omitted terminal fields."""
+    response = _stream_response_object(event)
+    return {
+        **event,
+        "response": {**response, "id": lifecycle.response_id, "model": lifecycle.model},
+    }
+
+
 async def _openai_stream_events_impl(
     events: AsyncIterator[Mapping[str, Any]],
     *,
@@ -3078,8 +3219,7 @@ async def _openai_stream_events_impl(
     assembled_text_length = 0
     fallback_output_items: dict[int, dict[str, Any]] = {}
     pending_replay_items: dict[int, tuple[str, str]] = {}
-    response_id: str | None = None
-    completed = False
+    lifecycle = StreamLifecycle(_OPENAI_STREAM_POLICY, error_factory=_openai_lifecycle_error)
     search_trace = SearchStreamTrace()
     async for event in _stream_events_with_cancellation_marker(events):
         if not isinstance(event, Mapping):
@@ -3087,34 +3227,23 @@ async def _openai_stream_events_impl(
                 "OpenAI stream event must be a JSON object.",
                 reason_code="stream_event_must_be_a_json_object",
             )
-        search_trace.record(event, pending_web_search_calls, fallback_output_items, response_id)
-        function_trace.record(event, pending_function_calls, fallback_output_items, response_id)
-        event_type = event.get("type")
-        if completed:
-            raise OpenAIProtocolError(
-                "OpenAI stream mutated after terminal response.",
-                reason_code="stream_event_arrived_after_terminal_response",
-            )
-        _validate_function_stream_boundary(
-            event, pending_function_calls, fallback_output_items, response_id
+        search_trace.record(
+            event, pending_web_search_calls, fallback_output_items, lifecycle.response_id
         )
+        function_trace.record(
+            event, pending_function_calls, fallback_output_items, lifecycle.response_id
+        )
+        event_type = event.get("type")
         if event_type == "cayu.internal.transport_cancelled":
             for call_id, _status in pending_web_search_calls.values():
                 yield _web_search_outcome_unknown_event(call_id)
             pending_web_search_calls.clear()
             continue
+        accepted = lifecycle.accept(_openai_stream_transition(event))
+        if accepted.identity_started:
+            observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
+        _validate_function_stream_boundary(event, pending_function_calls, fallback_output_items)
         if event_type == "response.created":
-            response = event.get("response")
-            candidate_response_id = response.get("id") if isinstance(response, Mapping) else None
-            if isinstance(candidate_response_id, str) and candidate_response_id.strip():
-                if response_id is None:
-                    response_id = candidate_response_id
-                    observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
-                elif candidate_response_id != response_id:
-                    raise OpenAIProtocolError(
-                        "OpenAI stream emitted conflicting response identities.",
-                        reason_code="stream_emitted_conflicting_response_identities",
-                    )
             continue
         if event_type == "response.output_text.delta":
             delta = event.get("delta")
@@ -3465,20 +3594,28 @@ async def _openai_stream_events_impl(
                     yield _web_search_outcome_unknown_event(call_id)
                 pending_web_search_calls.clear()
                 pending_tool_search_calls.clear()
-            observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
-            for terminal_event in _stream_terminal_events(
-                event,
+            terminal_events = _stream_terminal_events(
+                _openai_terminal_identity_projection(event, lifecycle),
                 fallback_output_items,
                 excluded_output_indexes=unfinished_output_indexes,
                 reasoning_state=reasoning_state,
                 streamed_visible_text=(
                     "".join(streamed_visible_text) if streamed_visible_text else None
                 ),
-            ):
+            )
+            completion = terminal_events[-1].completion
+            assert completion is not None
+            lifecycle.accept(
+                StreamTransition(
+                    StreamTransitionKind.TERMINAL,
+                    terminal=StreamTerminal(completion.finish_reason.value),
+                )
+            )
+            observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
+            for terminal_event in terminal_events:
+                if terminal_event.type is ModelStreamEventType.COMPLETED:
+                    lifecycle.claim_completion()
                 yield terminal_event
-            if event_type == "response.completed":
-                return
-            completed = True
             continue
         if event_type in {"response.failed", "error"}:
             failure = _openai_stream_error_exception(event)
@@ -3490,13 +3627,10 @@ async def _openai_stream_events_impl(
             del events
             raise failure from None
 
-    if not completed:
+    if lifecycle.phase is not StreamPhase.TERMINAL:
         for call_id, _status in pending_web_search_calls.values():
             yield _web_search_outcome_unknown_event(call_id)
-        raise OpenAIProtocolError(
-            "OpenAI streaming response ended before response.completed.",
-            reason_code="streaming_response_ended_before_response_completed",
-        )
+        lifecycle.require_terminal()
 
 
 async def _stream_events_with_cancellation_marker(
@@ -4949,7 +5083,6 @@ def _validate_function_stream_boundary(
     event: Mapping[str, Any],
     pending: Mapping[int, _PendingFunctionCall],
     finished: Mapping[int, Mapping[str, Any]],
-    response_id: str | None,
 ) -> None:
     """Validate supplied identities and distinguish missing from consumed registration."""
     kind = event.get("type")
@@ -4958,20 +5091,6 @@ def _validate_function_stream_boundary(
         "response.function_call_arguments.delta",
         "response.function_call_arguments.done",
     } or (isinstance(item, Mapping) and item.get("type") == "function_call")
-    response = event.get("response")
-    incoming_response_id = (
-        response.get("id") if isinstance(response, Mapping) else event.get("response_id")
-    )
-    if (
-        response_id is not None
-        and incoming_response_id is not None
-        and (is_function or kind in {"response.completed", "response.incomplete"})
-        and incoming_response_id != response_id
-    ):
-        raise OpenAIProtocolError(
-            "OpenAI stream emitted conflicting response identities.",
-            reason_code="stream_emitted_conflicting_response_identities",
-        )
     if not is_function:
         if kind in {"response.output_item.added", "response.output_item.done"}:
             index = _stream_output_index(event)

@@ -40,6 +40,7 @@ from tests.providers.conformance import (
     ProviderHarness,
     ProviderScenario,
 )
+from tests.providers.lifecycle_cases import lifecycle_events
 
 
 class _AsyncTransport:
@@ -98,6 +99,11 @@ class _OpenAITransport(_AsyncTransport):
     ) -> AsyncIterator[Mapping[str, Any]]:
         del url, headers, timeout_s
         self.calls.append(dict(payload))
+        lifecycle = lifecycle_events("responses", self.scenario)
+        if lifecycle is not None:
+            for event in lifecycle:
+                yield event
+            return
         if self.scenario == "cancellation":
             await self.block()
             return
@@ -218,6 +224,11 @@ class _AnthropicShapeTransport(_AsyncTransport):
     ) -> AsyncIterator[Mapping[str, Any]]:
         del url, headers, timeout_s
         self.calls.append(dict(payload))
+        lifecycle = lifecycle_events("messages", self.scenario)
+        if lifecycle is not None:
+            for event in lifecycle:
+                yield event
+            return
         if self.scenario == "cancellation":
             await self.block()
             return
@@ -350,6 +361,11 @@ class _ChatCompletionsTransport(_AsyncTransport):
     ) -> AsyncIterator[Mapping[str, Any]]:
         del url, headers, timeout_s
         self.calls.append(dict(payload))
+        lifecycle = lifecycle_events("chat", self.scenario)
+        if lifecycle is not None:
+            for event in lifecycle:
+                yield event
+            return
         if self.scenario == "cancellation":
             await self.block()
             return
@@ -466,6 +482,9 @@ class _BedrockClient:
 
     def converse_stream(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
+        lifecycle = lifecycle_events("bedrock", self.scenario)
+        if lifecycle is not None:
+            return {"stream": iter(lifecycle)}
         if self.scenario in {"cancellation", "idle_timeout"}:
             self.blocking_stream = _BlockingBedrockStream()
             return {"stream": self.blocking_stream}

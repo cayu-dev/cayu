@@ -142,7 +142,6 @@ async def test_function_ordering_failures(raw, reason):
         "no_deltas",
         "empty_object",
         "terminal_fallback",
-        "tail",
     ],
 )
 async def test_valid_function_streams(case):
@@ -183,14 +182,21 @@ async def test_valid_function_streams(case):
         expected = {}
     elif case == "terminal_fallback":
         raw[-1]["response"]["output"] = []
-    elif case == "tail":
-        raw.append(arguments_done())  # Completed responses close before reading a tail.
     seen = []
     await parse(raw, seen)
     calls = [e.payload for e in seen if e.type == ModelStreamEventType.TOOL_CALL]
     assert len(calls) == count
     assert {c["id"] for c in calls} == {f"call_{i}" for i in range(count)}
     assert all(c["name"] == "echo" and c["arguments"] == expected for c in calls)
+    assert len([e for e in seen if e.type == ModelStreamEventType.COMPLETED]) == 1
+
+
+@pytest.mark.anyio
+async def test_postterminal_function_arguments_fail_before_another_tool_event():
+    seen = []
+    with pytest.raises(OpenAIProtocolError, match="after terminal response"):
+        await parse([*normal(), arguments_done()], seen)
+    assert len([e for e in seen if e.type == ModelStreamEventType.TOOL_CALL]) == 1
     assert len([e for e in seen if e.type == ModelStreamEventType.COMPLETED]) == 1
 
 
@@ -367,6 +373,18 @@ async def run_sse(tmp_path, attempts):
     durable = await SQLiteSessionStore(database).load_events("ordering")
     assert len(requests) == len(attempts)
     return events, durable, executed
+
+
+@pytest.mark.anyio
+async def test_postterminal_function_arguments_prevent_runtime_tool_execution(tmp_path):
+    from cayu import EventType
+
+    events, durable, executed = await run_sse(tmp_path, [[*normal(), arguments_done()]])
+    assert not executed
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert len([e for e in durable if e.type == EventType.MODEL_COMPLETED]) == 1
+    assert not [e for e in durable if e.type == EventType.MODEL_RETRY]
+    assert not [e for e in durable if e.type == EventType.TOOL_CALL_STARTED]
 
 
 @pytest.mark.anyio

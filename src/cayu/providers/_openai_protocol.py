@@ -278,6 +278,8 @@ _PROTOCOL_DIAGNOSTICS: dict[str, tuple[str, str | None]] = {
     "stream_contains_multiple_hosted_tool_search_calls": ("stream", None),
     "stream_contains_too_many_tool_search_calls": ("stream", None),
     "stream_emitted_conflicting_response_identities": ("stream", None),
+    "stream_emitted_conflicting_model_identities": ("stream", None),
+    "stream_response_start_was_repeated": ("stream", None),
     "stream_event_must_be_a_json_object": ("stream", None),
     "stream_event_output_index_must_be_non_negative": ("stream", None),
     "stream_event_requires_integer_output_index": ("stream", None),

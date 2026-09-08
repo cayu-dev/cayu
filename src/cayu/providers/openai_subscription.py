@@ -778,8 +778,6 @@ class OpenAISubscriptionProvider(ModelProvider):
                 async for event in events:
                     completion_emitted = event.type == ModelStreamEventType.COMPLETED
                     yield event
-                    if completion_emitted:
-                        break
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
