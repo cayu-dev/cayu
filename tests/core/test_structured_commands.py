@@ -556,6 +556,48 @@ def test_structured_command_refuses_same_image_different_profile_without_dispatc
     assert runner.commands == []
 
 
+@pytest.mark.parametrize("renewed", [True, False, "error", "cancel"])
+def test_structured_command_renews_then_rechecks_expired_admission(tmp_path, renewed):
+    (tmp_path / "uv.lock").write_bytes(b"locked\n")
+    profile = _profile()
+
+    class RenewableRunner(_AdmittedRunner):
+        renewals = 0
+
+        async def refresh_execution_admission(self):
+            self.renewals += 1
+            if renewed == "error":
+                raise RuntimeError("private deployment diagnostic")
+            if renewed == "cancel":
+                raise asyncio.CancelledError("cancel renewal")
+            if renewed:
+                self.candidate = _AdmittedRunner(profile).candidate
+
+    runner = RenewableRunner(
+        profile, admission_observed_at=datetime.now(UTC) - timedelta(minutes=5)
+    )
+    if renewed == "cancel":
+        with pytest.raises(asyncio.CancelledError, match="cancel renewal"):
+            _run(
+                RunCommandTool(toolchain_profile=profile),
+                runner,
+                LocalWorkspace(tmp_path, workspace_id="workspace"),
+                {"selector": "focused-test", "args": ["tests/test_unit.py"]},
+            )
+        assert runner.commands == []
+        return
+    result = _run(
+        RunCommandTool(toolchain_profile=profile),
+        runner,
+        LocalWorkspace(tmp_path, workspace_id="workspace"),
+        {"selector": "focused-test", "args": ["tests/test_unit.py"]},
+    )
+    assert runner.renewals == 1
+    assert result.is_error is not (renewed is True)
+    assert len(runner.commands) == int(renewed is True)
+    assert "private deployment diagnostic" not in str(result)
+
+
 def test_structured_command_rechecks_admission_after_manifest_before_dispatch(
     tmp_path: Path,
 ) -> None:

@@ -27,7 +27,7 @@ from cayu.environments.docker_toolchains import (
     DockerCodingCommandAuthority,
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
-    docker_coding_toolchain_runner_admission_failure,
+    ensure_docker_coding_toolchain_runner_admission,
     verify_docker_coding_toolchain_dependencies,
 )
 from cayu.runners import ExecCommand, ExecResult, RunnerExecutionError
@@ -573,7 +573,7 @@ class RunCommandTool(Tool):
             authority, arguments, working_directory, timeout_seconds, output_mode = (
                 self._resolve_arguments(args)
             )
-        runner_failure = docker_coding_toolchain_runner_admission_failure(
+        runner_failure = await ensure_docker_coding_toolchain_runner_admission(
             ctx.runner,
             profile=self._profile,
         )
@@ -626,7 +626,7 @@ class RunCommandTool(Tool):
                 ),
             )
         pre_capture_timing = _timing_evidence(pre_capture_started_at, datetime.now(UTC))
-        runner_failure = docker_coding_toolchain_runner_admission_failure(
+        runner_failure = await ensure_docker_coding_toolchain_runner_admission(
             ctx.runner,
             profile=self._profile,
         )
@@ -663,7 +663,7 @@ class RunCommandTool(Tool):
                 error="durable_command_journal_unavailable",
                 content="Structured command durable dispatch evidence was unavailable.",
             )
-        runner_failure = docker_coding_toolchain_runner_admission_failure(
+        runner_failure = await ensure_docker_coding_toolchain_runner_admission(
             ctx.runner,
             profile=self._profile,
         )

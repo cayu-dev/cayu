@@ -1068,6 +1068,15 @@ class Runner(ABC):
 
         return False
 
+    async def refresh_execution_admission(self) -> None:
+        """Re-probe live admission evidence when supported by this runner.
+
+        The default makes no new claim. Callers must still validate the returned
+        candidate; requesting renewal never authorizes execution by itself.
+        """
+
+        return None
+
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate | None:
         """Return explicit provider-neutral admission evidence, when implemented.
 

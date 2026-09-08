@@ -1566,6 +1566,98 @@ def test_invocation_preflight_failure_preserves_pending_caller_cancellation() ->
     assert secret not in repr(cancellation.__cause__)
 
 
+@pytest.mark.parametrize("failure_kind", ("error", "cancel", "group", "exit"))
+def test_admission_renewal_detaches_extension_failures(failure_kind: str) -> None:
+    secret = "PRIVATE_RENEWAL_CANARY"
+
+    class RenewalRunner(Runner):
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            raise AssertionError("Renewal must not execute a user command.")
+
+        async def refresh_execution_admission(self) -> None:
+            if failure_kind == "cancel":
+                raise asyncio.CancelledError(secret)
+            if failure_kind == "group":
+                raise BaseExceptionGroup(
+                    secret, [asyncio.CancelledError(secret), ValueError(secret)]
+                )
+            if failure_kind == "exit":
+                raise SystemExit(secret)
+            raise ValueError(secret)
+
+    runner = RenewalRunner()
+    handle = InvocationRunnerHandle(runner, redactor_snapshot_provider=lambda: None)
+
+    async def scenario() -> BaseException:
+        try:
+            await handle.refresh_execution_admission()
+        except BaseException as error:
+            task = asyncio.current_task()
+            assert task is not None and task.cancelling() == 0
+            return error
+        raise AssertionError("Expected renewal failure.")
+
+    error = asyncio.run(scenario())
+    if failure_kind == "exit":
+        assert type(error) is SystemExit and error.code == 1
+    else:
+        assert type(error) is RunnerExecutionError
+    assert secret not in repr(error)
+    assert error.__cause__ is None and error.__context__ is None
+    assert_cayu_traceback_does_not_retain(error, runner)
+    assert_cayu_traceback_does_not_retain(error, handle)
+
+
+@pytest.mark.parametrize("suppress", (False, True))
+@pytest.mark.parametrize("pending", (False, True))
+def test_admission_renewal_preserves_caller_cancellation(suppress: bool, pending: bool) -> None:
+    secret = "PRIVATE_RENEWAL_CANCELLATION_CANARY"
+    started = asyncio.Event()
+
+    class RenewalRunner(Runner):
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            raise AssertionError("Renewal must not execute a user command.")
+
+        async def refresh_execution_admission(self) -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if not suppress:
+                    raise
+
+    runner = RenewalRunner()
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0, redactor=SecretRedactor(secret)
+        ),
+    )
+
+    async def invoke() -> None:
+        if pending:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel(secret)
+        await handle.refresh_execution_admission()
+
+    async def scenario() -> asyncio.CancelledError:
+        task = asyncio.create_task(invoke())
+        if not pending:
+            await started.wait()
+            task.cancel(secret)
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        assert task.cancelling() == 1
+        assert started.is_set() is not pending
+        return raised.value
+
+    error = asyncio.run(scenario())
+    assert error.args == (REDACTED_SECRET,)
+    assert_cayu_traceback_does_not_retain(error, runner)
+    assert_cayu_traceback_does_not_retain(error, handle)
+
+
 @pytest.mark.parametrize("operation", ("preflight_exec", "exec"))
 def test_invocation_preflight_does_not_trust_runner_cancellation(operation: str) -> None:
     class ForgingPreflightRunner(Runner):

@@ -8,7 +8,7 @@ import re
 import shlex
 import shutil
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import BinaryIO, Literal, cast
@@ -1095,6 +1095,8 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         image: str | None = None,
         _container_id: str | None = None,
         _runtime_evidence: _DockerRuntimeEvidence | None = None,
+        _admission_seccomp_profile: str | None = None,
+        _admission_immutable_input_mounts: tuple[DockerImmutableInputMount, ...] = (),
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self._container_removed = False
@@ -1108,6 +1110,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         ):
             raise TypeError("_runtime_evidence must be Docker runtime evidence or None.")
         self._runtime_evidence = _runtime_evidence
+        self._admission_seccomp_profile = _admission_seccomp_profile
+        self._admission_immutable_input_mounts = _admission_immutable_input_mounts
+        self._admission_refresh_lock = asyncio.Lock()
         if _container_id is not None and (
             type(_container_id) is not str
             or _DOCKER_CONTAINER_ID_PATTERN.fullmatch(_container_id) is None
@@ -1632,6 +1637,8 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             docker_cli_env_allowlist=docker_cli_allowlist,
             _container_id=owned_container_id,
             _runtime_evidence=runtime_evidence,
+            _admission_seccomp_profile=seccomp_profile,
+            _admission_immutable_input_mounts=immutable_mounts,
         )
 
     @classmethod
@@ -1751,7 +1758,69 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             timeout_cleanup="sandbox",
             _container_id=container_id,
             _runtime_evidence=runtime_evidence,
+            _admission_seccomp_profile=seccomp_profile,
+            _admission_immutable_input_mounts=immutable_mounts,
         )
+
+    async def refresh_execution_admission(self) -> None:
+        """Revalidate one exact strict container without extending stale claims."""
+
+        async with self._admission_refresh_lock:
+            self._ensure_exec_open()
+            evidence = self._runtime_evidence
+            if evidence is None or evidence.valid_until > datetime.now(UTC):
+                return
+            if (
+                self.container_id != evidence.container_id
+                or _seccomp_profile_fingerprint(self._admission_seccomp_profile)
+                != evidence.seccomp_profile_sha256
+                or tuple(
+                    (mount.projection_fingerprint, mount.target_path)
+                    for mount in self._admission_immutable_input_mounts
+                )
+                != evidence.immutable_input_mounts
+            ):
+                raise DockerRuntimeConfigurationError("admission_configuration_drift")
+            # Timestamp the start, not the end, of live observation. Slow probes
+            # must not turn old observations into newly valid evidence.
+            observed_at = datetime.now(UTC)
+            inspection = await _inspect_strict_container(
+                self.docker_path,
+                evidence.container_id,
+                docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+            )
+            image_id, image_reference = _verify_strict_container_inspection(
+                inspection,
+                container_id=evidence.container_id,
+                image_identity=evidence.image_identity,
+                restrictions=evidence.restrictions,
+                network_mode=evidence.network_mode,
+                runtime=evidence.runtime,
+                seccomp_profile=self._admission_seccomp_profile,
+                immutable_input_mounts=self._admission_immutable_input_mounts,
+            )
+            if (image_id, image_reference) != (evidence.image_id, evidence.image_reference):
+                raise DockerRuntimeConfigurationError("image_identity_drift")
+            await _probe_immutable_input_mounts(
+                self.docker_path,
+                evidence.container_id,
+                self._admission_immutable_input_mounts,
+                docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+            )
+            availability = await _probe_strict_container(
+                self.docker_path,
+                evidence.container_id,
+                restrictions=evidence.restrictions,
+                required_executables=evidence.required_executables,
+                docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+            )
+            self._ensure_exec_open()
+            self._runtime_evidence = replace(
+                evidence,
+                observed_at=observed_at,
+                valid_until=observed_at + timedelta(seconds=300),
+                executable_availability=availability,
+            )
 
     def execution_capability_evidence(self):
         """Describe Docker honestly and bind strict evidence to the exact container."""

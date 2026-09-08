@@ -781,6 +781,30 @@ class _AdmittedRunner(Protocol):
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate | None: ...
 
 
+@runtime_checkable
+class _RenewableAdmissionRunner(Protocol):
+    async def refresh_execution_admission(self) -> None: ...
+
+
+async def ensure_docker_coding_toolchain_runner_admission(
+    runner: object,
+    *,
+    profile: DockerCodingToolchainProfile,
+) -> str | None:
+    """Renew stale evidence, then independently validate the same authority."""
+
+    failure = docker_coding_toolchain_runner_admission_failure(runner, profile=profile)
+    if failure != "docker_admission_stale" or not isinstance(runner, _RenewableAdmissionRunner):
+        return failure
+    try:
+        await runner.refresh_execution_admission()
+    except Exception:
+        # Admission probe diagnostics can contain deployment-private material.
+        # Cancellation remains authoritative and is never swallowed here.
+        return "docker_admission_unavailable"
+    return docker_coding_toolchain_runner_admission_failure(runner, profile=profile)
+
+
 def docker_coding_toolchain_runner_admission_failure(
     runner: object,
     *,

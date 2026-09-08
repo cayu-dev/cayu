@@ -245,6 +245,36 @@ class InvocationRunnerHandle:
             del preflight_failure, self
             raise published_failure from None
 
+    async def refresh_execution_admission(self) -> None:
+        """Renew evidence without exposing the underlying runner owner."""
+
+        outcome = await await_invocation_operation(self.__runner.refresh_execution_admission)
+        failure = None
+        if outcome.error is not None:
+            failure = detached_workspace_mutation_process_signal(outcome.error)
+            if failure is None:
+                # A child-generated cancellation (including a grouped one) is
+                # an opaque probe failure, not authority to cancel this caller.
+                failure = (
+                    _safe_runner_unavailable_error(self.__runner, outcome.error)
+                    if isinstance(outcome.error, RunnerUnavailableError)
+                    else _safe_runner_execution_error(self.__runner, outcome.error)
+                )
+            _clear_preflight_traceback_frames(outcome.error)
+        cancellation = None
+        if outcome.cancellation is not None:
+            cancellation = _detached_runner_cancellation_state(
+                outcome.cancellation,
+                redactor=_current_runner_redactor(self.__redactor_snapshot_provider),
+                caller_cancelled=True,
+            )
+            _clear_preflight_traceback_frames(outcome.cancellation)
+        del outcome, self
+        if cancellation is not None:
+            _raise_clean_runner_cancellation(*cancellation, cause=failure)
+        if failure is not None:
+            raise failure from None
+
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate | None:
         """Return a detached capability snapshot without exposing runner ownership."""
 

@@ -22,7 +22,7 @@ from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments.docker_toolchains import (
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
-    docker_coding_toolchain_runner_admission_failure,
+    ensure_docker_coding_toolchain_runner_admission,
     verify_docker_coding_toolchain_dependencies,
 )
 from cayu.runners import ExecCommand, RunnerExecutionError
@@ -318,7 +318,7 @@ class RunCheckTool(Tool):
         dependency_sensitive = False
 
         if self._toolchain_profile is not None:
-            runner_failure = docker_coding_toolchain_runner_admission_failure(
+            runner_failure = await ensure_docker_coding_toolchain_runner_admission(
                 ctx.runner,
                 profile=self._toolchain_profile,
             )
@@ -370,7 +370,7 @@ class RunCheckTool(Tool):
                         started_ns=started_ns,
                     )
 
-            runner_failure = docker_coding_toolchain_runner_admission_failure(
+            runner_failure = await ensure_docker_coding_toolchain_runner_admission(
                 ctx.runner,
                 profile=self._toolchain_profile,
             )

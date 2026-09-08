@@ -362,10 +362,14 @@ def test_run_check_rejects_a_pass_that_changes_toolchain_dependencies(
         ),
     )
     workspace = LocalWorkspace(tmp_path, workspace_id="dependency-check-workspace")
+
+    async def admitted(_runner, **_kwargs):
+        return None
+
     monkeypatch.setattr(
         named_checks,
-        "docker_coding_toolchain_runner_admission_failure",
-        lambda _runner, **_kwargs: None,
+        "ensure_docker_coding_toolchain_runner_admission",
+        admitted,
     )
     tool = RunCheckTool(
         checks=[

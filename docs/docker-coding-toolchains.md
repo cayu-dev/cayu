@@ -71,10 +71,18 @@ The factory verifies source dependency hashes before allocating Docker. It then
 admits the exact final image, no-network restrictions, executable evidence,
 platform, and bounded profile probes. Checks and commands repeat image,
 executable, evidence-expiry, and dependency admission before dispatch. If live
-evidence expires or a task changes a declared manifest or lockfile, affected checks
-and commands return a stale-toolchain/unavailable result before execution.
-Prepare and admit a new immutable image/profile revision; Cayu never runs an
-installer or falls back to the host.
+evidence expires, the strict Docker runner re-inspects the same container ID and
+repeats live restriction, immutable-input, and executable probes before issuing
+fresh evidence. Concurrent renewals share one probe pass; fresh evidence needs no
+additional Docker calls. Renewal preserves image, toolchain profile, and
+environment identity, and never extends an old observation's lifetime.
+Invocation-scoped renewal detaches private probe failures and preserves genuine
+caller cancellation even when a runner suppresses or fabricates cancellation.
+Missing renewal support, failed probes, configuration drift, and evidence that
+expires during renewal still fail closed. A task that changes a declared manifest
+or lockfile still receives a stale-toolchain result before execution: prepare and
+admit a new immutable image/profile revision. Cayu never runs an installer or
+falls back to the host.
 
 The generated built-in Python path is selected explicitly with:
 
