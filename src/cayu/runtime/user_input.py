@@ -45,6 +45,7 @@ from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_b
 from cayu.runtime.checkpoints import AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY
 from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.runtime.human_review import HumanReviewReference
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -134,6 +135,9 @@ class UserInputResponse(BaseModel):
         hide_input_in_errors=True,
     )
 
+    review_reference: HumanReviewReference | None = Field(
+        default=None, repr=False, exclude_if=lambda value: value is None
+    )
     session_id: str
     task_worker_id: str | None = None
     task_handoff_id: str | None = None
@@ -724,6 +728,11 @@ def copy_user_input_response(response: UserInputResponse) -> UserInputResponse:
     if type(response) is not UserInputResponse:
         raise TypeError("User input resolution requires a UserInputResponse.")
     return UserInputResponse(
+        review_reference=(
+            None
+            if response.review_reference is None
+            else HumanReviewReference.model_validate(response.review_reference.model_dump())
+        ),
         session_id=response.session_id,
         task_worker_id=response.task_worker_id,
         task_handoff_id=response.task_handoff_id,
@@ -909,6 +918,15 @@ class UserInputRecoveryRequest(BaseModel):
         hide_input_in_errors=True,
     )
 
+    review_reference: HumanReviewReference | None = Field(
+        default=None, repr=False, exclude_if=lambda value: value is None
+    )
+    # The accepted answer keeps its original identity across recovery. This
+    # reference carries no new decision authority; review_reference authorizes
+    # the current recovery operation and may belong to a different recipient.
+    answer_review_reference: HumanReviewReference | None = Field(
+        default=None, repr=False, exclude_if=lambda value: value is None
+    )
     session_id: str
     task_worker_id: str | None = None
     task_handoff_id: str | None = None
@@ -1007,6 +1025,16 @@ def copy_user_input_recovery_request(
     if type(request) is not UserInputRecoveryRequest:
         raise TypeError("User input recovery requires a UserInputRecoveryRequest.")
     return UserInputRecoveryRequest(
+        answer_review_reference=(
+            None
+            if request.answer_review_reference is None
+            else HumanReviewReference.model_validate(request.answer_review_reference.model_dump())
+        ),
+        review_reference=(
+            None
+            if request.review_reference is None
+            else HumanReviewReference.model_validate(request.review_reference.model_dump())
+        ),
         session_id=request.session_id,
         task_worker_id=request.task_worker_id,
         task_handoff_id=request.task_handoff_id,
@@ -1188,6 +1216,7 @@ def _user_input_request_payload(
     document = copied.model_dump(
         mode="json",
         include={
+            "review_reference",
             "session_id",
             "input_id",
             "answer",
@@ -1222,7 +1251,7 @@ def user_input_answer_request_digest(
 ) -> str:
     """Bind the answer and continuation semantics shared by both entrances."""
 
-    _copied, document = _user_input_request_payload(request)
+    copied, document = _user_input_request_payload(request)
     answer_document = {
         field_name: document[field_name]
         for field_name in (
@@ -1235,6 +1264,10 @@ def user_input_answer_request_digest(
             "resolved_by",
         )
     }
+    if isinstance(copied, UserInputRecoveryRequest) and copied.answer_review_reference is not None:
+        answer_document["review_reference"] = copied.answer_review_reference.model_dump(mode="json")
+    elif "review_reference" in document:
+        answer_document["review_reference"] = document["review_reference"]
     return sha256(
         canonical_durable_json_bytes(answer_document, "user_input_answer_request")
     ).hexdigest()
@@ -1251,6 +1284,10 @@ def user_input_resolution_request_digest(
         "answer": document,
     }
     if type(copied) is UserInputRecoveryRequest:
+        if copied.answer_review_reference is not None:
+            operation["answer_review_reference"] = copied.answer_review_reference.model_dump(
+                mode="json"
+            )
         operation.update(
             {
                 "tool_call_id": copied.tool_call_id,

@@ -256,6 +256,12 @@ from cayu.runtime.costs import (
 )
 from cayu.runtime.errors import TerminalEventPublicationUncertain
 from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
+from cayu.runtime.human_review import (
+    HumanReviewContext,
+    HumanReviewDenied,
+    HumanReviewReference,
+    HumanReviewView,
+)
 from cayu.runtime.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
@@ -1991,6 +1997,7 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
     they preserve the invocation's frozen execution profile.
     """
 
+    review_reference: HumanReviewReference | None = None
     session_id: NonBlankString
     task_worker_id: NonBlankString | None = None
     task_handoff_id: NonBlankString | None = None
@@ -2057,6 +2064,7 @@ class ToolApprovalRecoveryBody(_BoundedControlPlaneMetadataBody):
     they preserve the invocation's frozen execution profile.
     """
 
+    review_reference: HumanReviewReference | None = None
     session_id: NonBlankString
     task_worker_id: NonBlankString | None = None
     task_handoff_id: NonBlankString | None = None
@@ -2142,6 +2150,7 @@ class UserInputResolveBody(_BoundedControlPlaneMetadataBody):
     profile.
     """
 
+    review_reference: HumanReviewReference | None = None
     session_id: NonBlankString
     task_worker_id: NonBlankString | None = None
     task_handoff_id: NonBlankString | None = None
@@ -2181,6 +2190,8 @@ class UserInputRecoveryBody(_BoundedControlPlaneMetadataBody):
     profile.
     """
 
+    review_reference: HumanReviewReference | None = None
+    answer_review_reference: HumanReviewReference | None = None
     session_id: NonBlankString
     task_worker_id: NonBlankString | None = None
     task_handoff_id: NonBlankString | None = None
@@ -9239,6 +9250,38 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
+    @router.get("/sessions/{session_id}/human-review", response_model=HumanReviewView)
+    async def inspect_human_review(
+        session_id: str,
+        purpose: Annotated[str, Query(min_length=1, max_length=128)],
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
+        if auth_context is None:
+            raise HTTPException(
+                status_code=403, detail="Human-review inspection requires authentication."
+            )
+        try:
+            view = await cayu_app.inspect_human_review(
+                session_id,
+                context=HumanReviewContext(
+                    recipient=auth_context.subject,
+                    tenant=auth_context.tenant,
+                    purpose=purpose,
+                ),
+            )
+        except (HumanReviewDenied, KeyError, ValueError):
+            raise HTTPException(
+                status_code=403, detail="Human-review access is not authorized."
+            ) from None
+        return JSONResponse(
+            view.model_dump(mode="json"),
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @bounded_control_plane_router.post(
         "/tool-approvals/resolve",
         response_class=EventSourceResponse,
@@ -9250,6 +9293,30 @@ def create_router(
         auth_context: AuthContext | None = optional_auth_context,
         mutation_id: MutationIdHeader = None,
     ):
+        if body.review_reference is not None and (
+            auth_context is None
+            or body.review_reference.context.recipient != auth_context.subject
+            or body.review_reference.context.tenant != auth_context.tenant
+        ):
+            raise HTTPException(
+                status_code=403, detail="Human-review recipient does not match authentication."
+            )
+        if body.review_reference is not None and (
+            auth_context is None
+            or body.review_reference.context.recipient != auth_context.subject
+            or body.review_reference.context.tenant != auth_context.tenant
+        ):
+            raise HTTPException(
+                status_code=403, detail="Human-review recipient does not match authentication."
+            )
+        try:
+            await cayu_app.require_human_review_resolution_authority(
+                body.session_id, body.review_reference
+            )
+        except HumanReviewDenied:
+            raise HTTPException(
+                status_code=403, detail="Human-review decision is not authorized."
+            ) from None
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -9265,6 +9332,7 @@ def create_router(
             )
 
         request = ToolApprovalRequest(
+            review_reference=body.review_reference,
             session_id=body.session_id,
             task_worker_id=body.task_worker_id,
             task_handoff_id=body.task_handoff_id,
@@ -9319,6 +9387,22 @@ def create_router(
         auth_context: AuthContext | None = optional_auth_context,
         mutation_id: MutationIdHeader = None,
     ):
+        if body.review_reference is not None and (
+            auth_context is None
+            or body.review_reference.context.recipient != auth_context.subject
+            or body.review_reference.context.tenant != auth_context.tenant
+        ):
+            raise HTTPException(
+                status_code=403, detail="Human-review recipient does not match authentication."
+            )
+        try:
+            await cayu_app.require_human_review_resolution_authority(
+                body.session_id, body.review_reference
+            )
+        except HumanReviewDenied:
+            raise HTTPException(
+                status_code=403, detail="Human-review decision is not authorized."
+            ) from None
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -9334,6 +9418,7 @@ def create_router(
             )
 
         request = ToolApprovalRecoveryRequest(
+            review_reference=body.review_reference,
             session_id=body.session_id,
             task_worker_id=body.task_worker_id,
             task_handoff_id=body.task_handoff_id,
@@ -9458,6 +9543,30 @@ def create_router(
         auth_context: AuthContext | None = optional_auth_context,
         mutation_id: MutationIdHeader = None,
     ):
+        if body.review_reference is not None and (
+            auth_context is None
+            or body.review_reference.context.recipient != auth_context.subject
+            or body.review_reference.context.tenant != auth_context.tenant
+        ):
+            raise HTTPException(
+                status_code=403, detail="Human-review recipient does not match authentication."
+            )
+        if body.review_reference is not None and (
+            auth_context is None
+            or body.review_reference.context.recipient != auth_context.subject
+            or body.review_reference.context.tenant != auth_context.tenant
+        ):
+            raise HTTPException(
+                status_code=403, detail="Human-review recipient does not match authentication."
+            )
+        try:
+            await cayu_app.require_human_review_resolution_authority(
+                body.session_id, body.review_reference
+            )
+        except HumanReviewDenied:
+            raise HTTPException(
+                status_code=403, detail="Human-review decision is not authorized."
+            ) from None
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -9473,6 +9582,7 @@ def create_router(
             )
 
         response = UserInputResponse(
+            review_reference=body.review_reference,
             session_id=body.session_id,
             task_worker_id=body.task_worker_id,
             task_handoff_id=body.task_handoff_id,
@@ -9518,6 +9628,22 @@ def create_router(
         auth_context: AuthContext | None = optional_auth_context,
         mutation_id: MutationIdHeader = None,
     ):
+        if body.review_reference is not None and (
+            auth_context is None
+            or body.review_reference.context.recipient != auth_context.subject
+            or body.review_reference.context.tenant != auth_context.tenant
+        ):
+            raise HTTPException(
+                status_code=403, detail="Human-review recipient does not match authentication."
+            )
+        try:
+            await cayu_app.require_human_review_resolution_authority(
+                body.session_id, body.review_reference
+            )
+        except HumanReviewDenied:
+            raise HTTPException(
+                status_code=403, detail="Human-review decision is not authorized."
+            ) from None
         replay = await _replay_events_response(
             http_request,
             expected_session_id=body.session_id,
@@ -9533,6 +9659,8 @@ def create_router(
             )
 
         request = UserInputRecoveryRequest(
+            answer_review_reference=body.answer_review_reference,
+            review_reference=body.review_reference,
             session_id=body.session_id,
             task_worker_id=body.task_worker_id,
             task_handoff_id=body.task_handoff_id,

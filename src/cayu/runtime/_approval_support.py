@@ -5,7 +5,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._command_diagnostics import COMMAND_DENIAL_HINTS
 from cayu._validation import copy_durable_json_value, require_durable_clean_nonblank
@@ -138,13 +138,19 @@ class ApprovalResolutionIntent(BaseModel):
     # ``None`` loads checkpoints written before request digests existed. It is
     # intentionally non-authoritative and must never be upgraded after the fact.
     resolution_request_digest: str | None = None
+    # Reviewed tool arguments remain immutable even as the paired round's
+    # publication coverage advances. Legacy/unreviewed claims do not acquire
+    # this authority retroactively.
+    reviewed_approval_digest: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("approval_id", "tool_call_id")
     @classmethod
     def validate_nonblank_identity(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
 
-    @field_validator("resolution_request_digest")
+    @field_validator("resolution_request_digest", "reviewed_approval_digest")
     @classmethod
     def validate_resolution_request_digest(cls, value: str | None) -> str | None:
         if value is None:
@@ -172,6 +178,7 @@ def approval_resolution_intent_for(
     *,
     decision: ToolApprovalDecision,
     resolution_request_digest: str | None,
+    reviewed_approval_digest: str | None = None,
 ) -> ApprovalResolutionIntent:
     if type(approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
@@ -185,6 +192,7 @@ def approval_resolution_intent_for(
         model_attempt_id=approval.model_attempt_id,
         decision=decision,
         resolution_request_digest=resolution_request_digest,
+        reviewed_approval_digest=reviewed_approval_digest,
     )
 
 
@@ -197,6 +205,7 @@ def approval_resolution_request_digest(request: ToolApprovalRequest) -> str:
         request.model_dump(
             mode="json",
             include={
+                "review_reference",
                 "decision",
                 "reason",
                 "metadata",
@@ -246,6 +255,11 @@ def require_resolution_intent_matches_approval(
         approval,
         decision=intent.decision,
         resolution_request_digest=intent.resolution_request_digest,
+        reviewed_approval_digest=(
+            None
+            if intent.reviewed_approval_digest is None
+            else runtime_publication_checkpoint_value_digest(approval.model_dump(mode="json"))
+        ),
     )
     if intent != expected:
         raise RuntimeError("Approval resolution intent conflicts with its pending approval.")
@@ -258,6 +272,7 @@ def checkpoint_with_approval_resolution_intent(
     decision: ToolApprovalDecision,
     resolution_request_digest: str,
     redactor: SecretRedactor,
+    reviewed_approval_digest: str | None = None,
 ) -> dict[str, Any]:
     """Set or validate one immutable decision inside an approval claim."""
 
@@ -270,6 +285,7 @@ def checkpoint_with_approval_resolution_intent(
         approval,
         decision=decision,
         resolution_request_digest=resolution_request_digest,
+        reviewed_approval_digest=reviewed_approval_digest,
     )
     current = approval_resolution_intent_from_checkpoint(copied, redactor=redactor)
     if current is not None:
@@ -282,6 +298,8 @@ def checkpoint_with_approval_resolution_intent(
             raise RuntimeError(
                 "Tool approval was already claimed with a different resolution request."
             )
+        if current.reviewed_approval_digest != reviewed_approval_digest:
+            raise RuntimeError("Tool approval cannot replace its accepted content binding.")
     copied[APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY] = expected.model_dump(mode="json")
     return copied
 

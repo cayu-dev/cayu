@@ -468,6 +468,18 @@ from cayu.runtime.hooks import (
     RuntimeHookPhase,
     ToolCallHookContext,
 )
+from cayu.runtime.human_review import (
+    HumanReviewCall,
+    HumanReviewConflict,
+    HumanReviewContext,
+    HumanReviewDenied,
+    HumanReviewDisclosure,
+    HumanReviewField,
+    HumanReviewPolicy,
+    HumanReviewReference,
+    HumanReviewSource,
+    HumanReviewView,
+)
 from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.runtime.invocation import (
     InvocationOrigin,
@@ -1459,6 +1471,16 @@ __all__ = [
     "ForkSystemPromptReplacement",
     "HostedToolManifest",
     "HostedToolUsageMetrics",
+    "HumanReviewCall",
+    "HumanReviewConflict",
+    "HumanReviewContext",
+    "HumanReviewDenied",
+    "HumanReviewDisclosure",
+    "HumanReviewField",
+    "HumanReviewPolicy",
+    "HumanReviewReference",
+    "HumanReviewSource",
+    "HumanReviewView",
     "InMemoryBudgetLedger",
     "InMemoryBudgetStore",
     "InMemoryEventSink",

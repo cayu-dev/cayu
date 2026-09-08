@@ -267,6 +267,19 @@ from cayu.runtime.execution_units import (
     copy_tool_round_identity,
 )
 from cayu.runtime.hooks import RuntimeHookPhase
+from cayu.runtime.human_review import (
+    HumanReviewCall,
+    HumanReviewConflict,
+    HumanReviewContext,
+    HumanReviewDenied,
+    HumanReviewPolicy,
+    HumanReviewReference,
+    HumanReviewSource,
+    HumanReviewView,
+    build_review,
+    require_current_review,
+    require_review_authority,
+)
 from cayu.runtime.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
@@ -1848,9 +1861,11 @@ class RecoveryCoordinator:
         cancel_provider_operation: CancelProviderOperation,
         interaction_transition_replay_failures: InteractionTransitionReplayFailures,
         recovery_cleanup_supervisor: RecoveryCleanupSupervisor,
+        human_review_policy: HumanReviewPolicy | None = None,
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...] = (),
         loop_policies: tuple[LoopPolicy, ...] = (),
     ) -> None:
+        self._human_review_policy = human_review_policy
         self._session_store = session_store
         self._task_store = task_store
         self._event_writer = event_writer
@@ -1892,6 +1907,221 @@ class RecoveryCoordinator:
         self._workspace_artifact_recovery_operations = BoundedInvocationOperationRegistry(
             max_operations=64
         )
+
+    def _build_human_review(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        context: HumanReviewContext,
+    ) -> HumanReviewView:
+        policy = self._human_review_policy
+        if policy is None:
+            raise HumanReviewDenied()
+        approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+        )
+        if approval is not None:
+            approval, pending_round = _pending_approval_and_round_for_atomic_claim(
+                checkpoint,
+                approval_id=approval.approval_id,
+                tool_round_id=approval.tool_round_id,
+                gating_tool_call_id=approval.tool_call_id,
+                redactor=self._secret_redactor,
+            )
+            pending = approval
+            kind = "tool_approval"
+            interaction_id = approval.approval_id
+            scope = approval.secret_resolution_scope
+            content = [approval.model_dump(mode="json"), pending_round.model_dump(mode="json")]
+            resolution_intent = approval_support.approval_resolution_intent_from_checkpoint(
+                checkpoint, redactor=self._secret_redactor
+            )
+            question, options = None, ()
+            expires_at = approval.expires_at
+        else:
+            pending, resolution_intent = user_input_lifecycle_authority_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                current_run_epoch=session.run_epoch,
+            )
+            if (
+                pending is None
+                or pending.session_id != session.id
+                or pending.session_instance_id != session.instance_id
+            ):
+                raise HumanReviewConflict()
+            kind = "user_input"
+            interaction_id = pending.input_id
+            scope = (
+                "unknown"
+                if pending.assistant_publication is None
+                else pending.assistant_publication.secret_resolution_scope
+            )
+            content = pending.model_dump(mode="json")
+            question, options = pending.question, tuple(pending.options)
+            expires_at = None
+        if resolution_intent is not None:
+            # Publication progress can change the checkpoint after a decision
+            # was accepted. Bind a fresh recovery view to that exact progress
+            # and claim; it must never become a new grant to execute the round.
+            content = [content, resolution_intent.model_dump(mode="json")]
+        if len(pending.tool_calls) > 128:
+            raise HumanReviewConflict()
+        calls = tuple(
+            HumanReviewCall(
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                on_grant=(
+                    "withheld"
+                    if approval_support.effective_tool_policy_evidence(call)
+                    is not ToolPolicyEvidence.AUTHORITATIVE
+                    else "denied"
+                    if call.policy_decision == ToolPolicyDecision.DENY.value
+                    else "eligible"
+                    if call.policy_decision
+                    in {ToolPolicyDecision.ALLOW.value, ToolPolicyDecision.REQUIRE_APPROVAL.value}
+                    else "withheld"
+                ),
+            )
+            for call in pending.tool_calls
+        )
+        executable = resolution_intent is None and all(
+            approval_support.effective_tool_policy_evidence(call)
+            is not ToolPolicyEvidence.AMBIGUOUS
+            for call in pending.tool_calls
+        )
+        source = HumanReviewSource(
+            kind=kind,
+            interaction_id=interaction_id,
+            tool_round_id=pending.tool_round_id,
+            tool_call_id=pending.tool_call_id,
+            secret_resolution_scope=scope,
+            calls=calls,
+            arguments_by_call={
+                call.tool_call_id: copy_json_value(call.arguments, "review arguments")
+                for call in pending.tool_calls
+            },
+            question=question,
+            options=options,
+            expires_at=expires_at,
+            executable=executable,
+        )
+        return build_review(
+            policy=policy,
+            context=context,
+            source=source,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            authoritative_content=content,
+            redactor=self._secret_redactor,
+            now=self._clock(),
+        )
+
+    async def inspect_human_review(
+        self,
+        session_id: str,
+        context: HumanReviewContext,
+    ) -> HumanReviewView:
+        session = await self._session_store.load(session_id)
+        if session is None:
+            raise HumanReviewDenied()
+        policy = require_review_authority(
+            self._human_review_policy,
+            context,
+            session_id=session.id,
+            session_metadata=session.metadata,
+            action="inspect",
+        )
+        unavailable = HumanReviewView(
+            status="unavailable",
+            session_id=session_id,
+            guidance="No current review is available; refresh pending interactions.",
+        )
+        try:
+            checkpoint = await self._session_store.load_checkpoint(session_id)
+            if session.status in {
+                SessionStatus.COMPLETED,
+                SessionStatus.INTERRUPTING,
+            }:
+                return unavailable
+            approval_intent = approval_support.approval_resolution_intent_from_checkpoint(
+                checkpoint, redactor=self._secret_redactor
+            )
+            _pending, intent = user_input_lifecycle_authority_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                current_run_epoch=session.run_epoch,
+            )
+            if (
+                session.status is SessionStatus.FAILED
+                and approval_intent is None
+                and intent is None
+            ):
+                return unavailable
+            result = self._build_human_review(session, checkpoint, context)
+            # Never return a view read across incarnation, claim or checkpoint changes.
+            current = await self._session_store.load(session_id)
+            if (
+                current != session
+                or await self._session_store.load_checkpoint(session_id) != checkpoint
+            ):
+                return unavailable
+            policy.audit(action="inspect", status=result.status)
+            return result
+        except Exception:
+            return unavailable
+
+    async def require_human_review_resolution_authority(
+        self,
+        session_id: str,
+        reference: HumanReviewReference | None,
+    ) -> None:
+        if self._human_review_policy is None and reference is None:
+            return
+        if reference is None:
+            raise HumanReviewDenied()
+        session = await self._session_store.load(session_id)
+        if session is None:
+            raise HumanReviewDenied()
+        require_review_authority(
+            self._human_review_policy,
+            reference.context,
+            session_id=session_id,
+            session_metadata=session.metadata,
+            action="decide",
+        )
+
+    def _require_human_review_decision(
+        self,
+        reference: HumanReviewReference | None,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        *,
+        denying: bool,
+        accepted_request: bool = False,
+    ) -> None:
+        if reference is None and self._human_review_policy is None:
+            return
+        if reference is None:
+            raise HumanReviewDenied()
+        policy = require_review_authority(
+            self._human_review_policy,
+            reference.context,
+            session_id=session.id,
+            session_metadata=session.metadata,
+            action="decide",
+        )
+        # Callers may reuse an accepted decision only after matching its exact
+        # durable request digest inside this same atomic claim. Its original
+        # view is not a new decision against mutable publication progress.
+        if not accepted_request:
+            current = self._build_human_review(session, checkpoint, reference.context)
+            require_current_review(reference, current, denying=denying)
+        try:
+            policy.audit(action="decide", status="denied" if denying else "accepted")
+        except Exception:
+            raise HumanReviewDenied() from None
 
     def bind_committed_runtime_task_failure_recovery(
         self,
@@ -5031,6 +5261,13 @@ class RecoveryCoordinator:
                 raise SessionRuntimePublicationConflict(
                     "Pending user-input authority changed before answer claim."
                 )
+            self._require_human_review_decision(
+                getattr(response, "review_reference", None),
+                current_session,
+                current_checkpoint,
+                denying=False,
+                accepted_request=current_intent is not None,
+            )
             claimed_checkpoint, claimed_intent = checkpoint_with_user_input_resolution_intent(
                 current_checkpoint,
                 pending=pending,
@@ -5308,6 +5545,17 @@ class RecoveryCoordinator:
                 raise SessionRuntimePublicationConflict(
                     "Pending user-input authority changed before recovery claim."
                 )
+            self._require_human_review_decision(
+                request.review_reference,
+                current_session,
+                current_checkpoint,
+                denying=current_intent is not None,
+                accepted_request=(
+                    current_intent is not None
+                    and current_intent.resolution_stage == "manual-recovery"
+                    and current_intent.resolution_request_digest == resolution_request_digest
+                ),
+            )
             claimed_checkpoint, claimed_intent = checkpoint_with_user_input_resolution_intent(
                 current_checkpoint,
                 pending=pending,
@@ -5650,6 +5898,27 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Approval resolution intent changed before the approval was claimed."
                 )
+            accepted_request = current_intent is not None and (
+                current_intent.decision is request.decision
+                and current_intent.resolution_request_digest == resolution_request_digest
+                and (
+                    self._human_review_policy is None
+                    or current_intent.reviewed_approval_digest is not None
+                )
+            )
+            if (
+                current_intent is not None
+                and not accepted_request
+                and self._human_review_policy is not None
+            ):
+                raise HumanReviewConflict()
+            self._require_human_review_decision(
+                request.review_reference,
+                _current_session,
+                checkpoint,
+                denying=request.decision is ToolApprovalDecision.DENY,
+                accepted_request=accepted_request,
+            )
             claimed_checkpoint = _checkpoint_with_legacy_approval_round(
                 checkpoint,
                 approval=pending_approval,
@@ -5668,6 +5937,13 @@ class RecoveryCoordinator:
                 decision=intent_decision,
                 resolution_request_digest=resolution_request_digest,
                 redactor=self._secret_redactor,
+                reviewed_approval_digest=(
+                    None
+                    if request.review_reference is None
+                    else runtime_publication_checkpoint_value_digest(
+                        pending_approval.model_dump(mode="json")
+                    )
+                ),
             )
             claimed_intent = approval_support.approval_resolution_intent_from_checkpoint(
                 claimed_checkpoint,
@@ -6888,6 +7164,9 @@ class RecoveryCoordinator:
             )
             if pending_approval != candidate_approval or pending_round != candidate_round:
                 raise RuntimeError("Pending tool approval changed before it was claimed.")
+            self._require_human_review_decision(
+                request.review_reference, _current_session, checkpoint, denying=True
+            )
             current_intent = approval_support.approval_resolution_intent_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
@@ -10849,6 +11128,7 @@ class RecoveryCoordinator:
         abandoned = False
         try:
             response = UserInputResponse(
+                review_reference=request.answer_review_reference or request.review_reference,
                 session_id=request.session_id,
                 task_worker_id=request.task_worker_id,
                 input_id=request.input_id,

@@ -330,6 +330,12 @@ from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookPhase,
 )
+from cayu.runtime.human_review import (
+    HumanReviewContext,
+    HumanReviewPolicy,
+    HumanReviewReference,
+    HumanReviewView,
+)
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
@@ -782,6 +788,7 @@ class CayuApp:
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
         mcp_manifest_policy: McpManifestPolicy | None = None,
+        human_review_policy: HumanReviewPolicy | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
         completion_verifier_profile_policy: CompletionVerifierProfilePolicy | None = None,
@@ -1127,6 +1134,7 @@ class CayuApp:
             ),
         )
         self._recovery_coordinator = RecoveryCoordinator(
+            human_review_policy=human_review_policy,
             session_store=self._runtime_session_store,
             task_store=self.task_store,
             event_writer=self._event_writer,
@@ -1970,6 +1978,32 @@ class CayuApp:
         if codec is None:
             raise RuntimeError("Targeted grant inspection requires public alias authority.")
         return tuple(targeted_tool_grant_inspection(record, codec) for record in records)
+
+    async def require_human_review_resolution_authority(
+        self,
+        session_id: str,
+        reference: HumanReviewReference | None,
+    ) -> None:
+        """Check decision permission independently of inspection and receipt replay."""
+        session_id = await self._resolve_public_session_id(session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id, reference
+        )
+
+    async def inspect_human_review(
+        self,
+        session_id: str,
+        *,
+        context: HumanReviewContext,
+    ) -> HumanReviewView:
+        """Inspect protected review content without executing or claiming work.
+
+        Direct SDK callers are trusted to supply verified recipient provenance.
+        The configured policy must authorize the exact session and tenant.
+        """
+        context = HumanReviewContext.model_validate(context.model_dump())
+        session_id = await self._resolve_public_session_id(session_id)
+        return await self._recovery_coordinator.inspect_human_review(session_id, context)
 
     async def inspect_tool_discovery_view(
         self,
@@ -6997,6 +7031,10 @@ class CayuApp:
         if type(response) is not UserInputResponse:
             raise TypeError("Runtime user input resolution requires a UserInputResponse.")
         session_id = await self._resolve_public_session_id(response.session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id,
+            response.review_reference,
+        )
         response = copy_user_input_response(response).model_copy(
             update={
                 "session_id": session_id,
@@ -7075,6 +7113,9 @@ class CayuApp:
         if type(request) is not UserInputRecoveryRequest:
             raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
         session_id = await self._resolve_public_session_id(request.session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id, request.review_reference
+        )
         request = copy_user_input_recovery_request(request).model_copy(
             update={
                 "session_id": session_id,
@@ -7161,6 +7202,10 @@ class CayuApp:
         if type(request) is not ToolApprovalRequest:
             raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
         session_id = await self._resolve_public_session_id(request.session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id,
+            request.review_reference,
+        )
         request = copy_tool_approval_request(request).model_copy(
             update={
                 "session_id": session_id,
@@ -7321,6 +7366,9 @@ class CayuApp:
         if type(request) is not ToolApprovalRecoveryRequest:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
         session_id = await self._resolve_public_session_id(request.session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id, request.review_reference
+        )
         request = copy_tool_approval_recovery_request(request).model_copy(
             update={
                 "session_id": session_id,

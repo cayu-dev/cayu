@@ -8917,6 +8917,128 @@ export type HostedToolManifest = {
 };
 
 /**
+ * HumanReviewCall
+ */
+export type HumanReviewCall = {
+    /**
+     * On Grant
+     */
+    on_grant: 'eligible' | 'denied' | 'withheld';
+    /**
+     * Tool Call Id
+     */
+    tool_call_id: string;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
+ * HumanReviewContext
+ *
+ * Verified recipient supplied by trusted SDK code or server authentication.
+ */
+export type HumanReviewContext = {
+    /**
+     * Purpose
+     */
+    purpose: string;
+    /**
+     * Recipient
+     */
+    recipient: string;
+    /**
+     * Tenant
+     */
+    tenant?: string | null;
+};
+
+/**
+ * HumanReviewField
+ *
+ * Untrusted plain text selected by the application policy.
+ */
+export type HumanReviewField = {
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Text
+     */
+    text: string;
+};
+
+/**
+ * HumanReviewReference
+ *
+ * Opaque content binding; conveys no authority to execute or resolve.
+ */
+export type HumanReviewReference = {
+    /**
+     * Content Tag
+     */
+    content_tag: string;
+    context: HumanReviewContext;
+    /**
+     * Policy Version
+     */
+    policy_version: string;
+};
+
+/**
+ * HumanReviewView
+ *
+ * Protected response. All display fields are HTML-escaped untrusted text.
+ *
+ * This response has no generic event, trace, transcript or export contract.
+ */
+export type HumanReviewView = {
+    /**
+     * Calls
+     */
+    calls?: Array<HumanReviewCall>;
+    /**
+     * Display Format
+     */
+    display_format?: 'html_escaped_text';
+    /**
+     * Fields
+     */
+    fields?: Array<HumanReviewField>;
+    /**
+     * Guidance
+     */
+    guidance: 'Review all calls before deciding.' | 'Review content is withheld; contact the application owner or deny the action.' | 'No current review is available; refresh pending interactions.' | 'This recovery gate cannot authorize execution; use explicit blocked recovery.';
+    /**
+     * Interaction Id
+     */
+    interaction_id?: string | null;
+    /**
+     * Kind
+     */
+    kind?: 'user_input' | 'tool_approval' | null;
+    reference?: HumanReviewReference | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Status
+     */
+    status: 'permitted' | 'redacted' | 'unavailable';
+    /**
+     * Tool Call Id
+     */
+    tool_call_id?: string | null;
+    /**
+     * Tool Round Id
+     */
+    tool_round_id?: string | null;
+};
+
+/**
  * InteractionStatus
  */
 export type InteractionStatus = 'active' | 'paused' | 'completed' | 'failed' | 'interrupted';
@@ -13429,7 +13551,7 @@ export type RecallItemAdmission = 'admitted' | 'offered';
 /**
  * RecallItemSelectionReason
  */
-export type RecallItemSelectionReason = 'calibrated_strong_match' | 'calibrated_plausible_match' | 'duplicate_strong_reference' | 'strong_match_not_focused' | 'strong_match_offered_by_mode' | 'explicit_application_selection' | 'newly_relevant';
+export type RecallItemSelectionReason = 'calibrated_strong_match' | 'calibrated_plausible_match' | 'duplicate_strong_reference' | 'strong_match_not_focused' | 'strong_match_offered_by_mode' | 'explicit_application_selection' | 'newly_relevant' | 'reanchored_current_revision';
 
 /**
  * RecoveryCleanupPolicyManifest
@@ -15651,6 +15773,7 @@ export type ToolApprovalBody = {
     reason?: string | null;
     resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
+    review_reference?: HumanReviewReference | null;
     /**
      * Session Id
      */
@@ -15727,6 +15850,7 @@ export type ToolApprovalRecoveryBody = {
     reason?: string | null;
     resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
+    review_reference?: HumanReviewReference | null;
     /**
      * Session Id
      */
@@ -16865,6 +16989,7 @@ export type UserInputRecoveryBody = {
      * Answer
      */
     answer: string;
+    answer_review_reference?: HumanReviewReference | null;
     /**
      * Artifacts
      */
@@ -16901,6 +17026,7 @@ export type UserInputRecoveryBody = {
     reason?: string | null;
     resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
+    review_reference?: HumanReviewReference | null;
     /**
      * Session Id
      */
@@ -16969,6 +17095,7 @@ export type UserInputResolveBody = {
     };
     resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
+    review_reference?: HumanReviewReference | null;
     /**
      * Session Id
      */
@@ -20700,6 +20827,41 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetResponses = {
 };
 
 export type ListSessionEventsApiSessionsSessionIdEventsGetResponse = ListSessionEventsApiSessionsSessionIdEventsGetResponses[keyof ListSessionEventsApiSessionsSessionIdEventsGetResponses];
+
+export type InspectHumanReviewApiSessionsSessionIdHumanReviewGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query: {
+        /**
+         * Purpose
+         */
+        purpose: string;
+    };
+    url: '/api/sessions/{session_id}/human-review';
+};
+
+export type InspectHumanReviewApiSessionsSessionIdHumanReviewGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type InspectHumanReviewApiSessionsSessionIdHumanReviewGetError = InspectHumanReviewApiSessionsSessionIdHumanReviewGetErrors[keyof InspectHumanReviewApiSessionsSessionIdHumanReviewGetErrors];
+
+export type InspectHumanReviewApiSessionsSessionIdHumanReviewGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: HumanReviewView;
+};
+
+export type InspectHumanReviewApiSessionsSessionIdHumanReviewGetResponse = InspectHumanReviewApiSessionsSessionIdHumanReviewGetResponses[keyof InspectHumanReviewApiSessionsSessionIdHumanReviewGetResponses];
 
 export type ListSessionInteractionsApiSessionsSessionIdInteractionsGetData = {
     body?: never;

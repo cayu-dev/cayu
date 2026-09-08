@@ -14622,6 +14622,17 @@ Old records without these fields remain unknown; no historical classification is
 inferred. The diagnostic fields do not increase budgets or override completion,
 operation, deadline, or cancellation authority.
 
+### Protected human-review disclosure
+
+`CayuApp.inspect_human_review` is a separate, policy-controlled disclosure contract
+for authoritative pending user input and whole-round approval. It does not relax
+argument quarantine in ordinary events, hooks, traces, transcripts, exports or
+subsequent model requests. Inspection and decision authorization are separate;
+a review reference binds policy-selected display material and the complete pending
+execution content inside the existing atomic decision claim. See
+[human review](human-review.md) for the trusted SDK boundary, authenticated server
+path, sensitivity attestation, unavailable outcomes, restart configuration and
+bounded untrusted rendering rules.
 
 ### Docker virtual-egress retained ownership
 

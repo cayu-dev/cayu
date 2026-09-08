@@ -5482,6 +5482,241 @@
       "title": "HostedToolCallPart",
       "type": "object"
     },
+    "HumanReviewCall": {
+      "additionalProperties": false,
+      "properties": {
+        "on_grant": {
+          "enum": [
+            "eligible",
+            "denied",
+            "withheld"
+          ],
+          "title": "On Grant",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "maxLength": 512,
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_name": {
+          "maxLength": 512,
+          "title": "Tool Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_call_id",
+        "tool_name",
+        "on_grant"
+      ],
+      "title": "HumanReviewCall",
+      "type": "object"
+    },
+    "HumanReviewContext": {
+      "additionalProperties": false,
+      "description": "Verified recipient supplied by trusted SDK code or server authentication.",
+      "properties": {
+        "purpose": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Purpose",
+          "type": "string"
+        },
+        "recipient": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Recipient",
+          "type": "string"
+        },
+        "tenant": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tenant"
+        }
+      },
+      "required": [
+        "recipient",
+        "purpose"
+      ],
+      "title": "HumanReviewContext",
+      "type": "object"
+    },
+    "HumanReviewField": {
+      "additionalProperties": false,
+      "description": "Untrusted plain text selected by the application policy.",
+      "properties": {
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "text"
+      ],
+      "title": "HumanReviewField",
+      "type": "object"
+    },
+    "HumanReviewReference": {
+      "additionalProperties": false,
+      "description": "Opaque content binding; conveys no authority to execute or resolve.",
+      "properties": {
+        "content_tag": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Tag",
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/components/schemas/HumanReviewContext"
+        },
+        "policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Policy Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "context",
+        "policy_version",
+        "content_tag"
+      ],
+      "title": "HumanReviewReference",
+      "type": "object"
+    },
+    "HumanReviewView": {
+      "additionalProperties": false,
+      "description": "Protected response. All display fields are HTML-escaped untrusted text.\n\nThis response has no generic event, trace, transcript or export contract.",
+      "properties": {
+        "calls": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/HumanReviewCall"
+          },
+          "title": "Calls",
+          "type": "array"
+        },
+        "display_format": {
+          "const": "html_escaped_text",
+          "default": "html_escaped_text",
+          "title": "Display Format",
+          "type": "string"
+        },
+        "fields": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/HumanReviewField"
+          },
+          "title": "Fields",
+          "type": "array"
+        },
+        "guidance": {
+          "enum": [
+            "Review all calls before deciding.",
+            "Review content is withheld; contact the application owner or deny the action.",
+            "No current review is available; refresh pending interactions.",
+            "This recovery gate cannot authorize execution; use explicit blocked recovery."
+          ],
+          "title": "Guidance",
+          "type": "string"
+        },
+        "interaction_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Interaction Id"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "user_input",
+                "tool_approval"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Kind"
+        },
+        "reference": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/HumanReviewReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "permitted",
+            "redacted",
+            "unavailable"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Call Id"
+        },
+        "tool_round_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Round Id"
+        }
+      },
+      "required": [
+        "status",
+        "guidance",
+        "session_id"
+      ],
+      "title": "HumanReviewView",
+      "type": "object"
+    },
     "InteractionStatus": {
       "enum": [
         "active",
@@ -9064,6 +9299,16 @@
             }
           ]
         },
+        "review_reference": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/HumanReviewReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_id": {
           "minLength": 1,
           "title": "Session Id",
@@ -9234,6 +9479,16 @@
           "anyOf": [
             {
               "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "review_reference": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/HumanReviewReference"
             },
             {
               "type": "null"
@@ -10753,6 +11008,16 @@
           "title": "Answer",
           "type": "string"
         },
+        "answer_review_reference": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/HumanReviewReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "artifacts": {
           "items": {
             "additionalProperties": true,
@@ -10842,6 +11107,16 @@
           "anyOf": [
             {
               "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "review_reference": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/HumanReviewReference"
             },
             {
               "type": "null"
@@ -11003,6 +11278,16 @@
           "anyOf": [
             {
               "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "review_reference": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/HumanReviewReference"
             },
             {
               "type": "null"
@@ -13610,6 +13895,52 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ListSessionEventsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/human-review": {
+      "get": {
+        "operation_id": "inspect_human_review_api_sessions__session_id__human_review_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "purpose",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Purpose",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HumanReviewView"
               }
             }
           },

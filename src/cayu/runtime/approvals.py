@@ -32,6 +32,7 @@ from cayu.runtime._tool_argument_publication import pause_checkpoint_validation_
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
 from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.runtime.human_review import HumanReviewReference
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -165,6 +166,9 @@ class ToolApprovalRequest(BaseModel):
         hide_input_in_errors=True,
     )
 
+    review_reference: HumanReviewReference | None = Field(
+        default=None, repr=False, exclude_if=lambda value: value is None
+    )
     session_id: str
     task_worker_id: str | None = None
     task_handoff_id: str | None = None
@@ -264,6 +268,9 @@ class ToolApprovalRecoveryRequest(BaseModel):
         hide_input_in_errors=True,
     )
 
+    review_reference: HumanReviewReference | None = Field(
+        default=None, repr=False, exclude_if=lambda value: value is None
+    )
     session_id: str
     task_worker_id: str | None = None
     task_handoff_id: str | None = None
@@ -936,6 +943,11 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
     if type(request) is not ToolApprovalRequest:
         raise TypeError("Tool approval resolution requires a ToolApprovalRequest.")
     return ToolApprovalRequest(
+        review_reference=(
+            None
+            if request.review_reference is None
+            else HumanReviewReference.model_validate(request.review_reference.model_dump())
+        ),
         session_id=request.session_id,
         approval_id=request.approval_id,
         tool_round_id=request.tool_round_id,
@@ -951,6 +963,11 @@ def copy_tool_approval_recovery_request(
     if type(request) is not ToolApprovalRecoveryRequest:
         raise TypeError("Tool approval recovery requires a ToolApprovalRecoveryRequest.")
     return ToolApprovalRecoveryRequest(
+        review_reference=(
+            None
+            if request.review_reference is None
+            else HumanReviewReference.model_validate(request.review_reference.model_dump())
+        ),
         session_id=request.session_id,
         approval_id=request.approval_id,
         tool_round_id=request.tool_round_id,
