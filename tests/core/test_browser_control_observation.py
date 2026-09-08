@@ -73,6 +73,7 @@ def test_runtime_observation_atomically_releases_handback_fence(
     terminal_operation="observe",
     takeover_race=False,
     operator_count=0,
+    disconnect_race=False,
 ):
     async def scenario():
         store = (
@@ -87,6 +88,16 @@ def test_runtime_observation_atomically_releases_handback_fence(
         async def faulted_publication(*args, operation_transform, **kwargs):
             nonlocal publication_task
             observation = False
+            if disconnect_race and not injected:
+                from cayu.runtime._browser_control_checkpoint import _MUTATION
+
+                mutation = _MUTATION.get()
+                if mutation is not None and any(
+                    record.state == "closed" for record in mutation.desired.records
+                ):
+                    injected.append("disconnect")
+                    close_dispatched.set()
+                    await release_close.wait()
 
             def transform(*values):
                 nonlocal observation
@@ -264,7 +275,7 @@ def test_runtime_observation_atomically_releases_handback_fence(
             operation = run_to_completion(
                 app, RunRequest(agent_name="agent", messages=[Message.text("user", "observe")])
             )
-            if takeover_race:
+            if takeover_race or disconnect_race:
                 running = asyncio.create_task(operation)
                 operation = running
                 try:
@@ -272,24 +283,40 @@ def test_runtime_observation_atomically_releases_handback_fence(
                         await close_dispatched.wait()
                     assert bound is not None and app._browser_control_runtime is not None
                     assert not running.done()
-                    now = int(time.time() * 1000)
-                    intent = BrowserTakeoverIntent(
-                        identity=bound.identity,
-                        request_id="bt_" + "2" * 32,
-                        expected_record_revision=bound.revision,
-                        expected_control_epoch=bound.control_epoch,
-                        pages=takeover_request().pages,
-                        purpose_code="login",
-                        requested_at_ms=now,
-                        expires_at_ms=now + 10_000,
-                        maximum_until_ms=now + 30_000,
-                    )
-                    bound = await app._browser_control_runtime.coordinator.request_takeover(
-                        principal=BrowserControlPrincipal(subject="operator", tenant="tenant"),
-                        operator_session_id="competing-operator-session",
-                        intent=intent,
-                    )
-                    assert bound.state == "takeover_requested" and bound.lease_until_ms is None
+                    if disconnect_race:
+                        from cayu.runtime._browser_control_channel import (
+                            BoundBrowserGuest,
+                            BrowserGuestCommandOwner,
+                        )
+
+                        coordinator = app._browser_control_runtime.coordinator
+                        channel = BrowserGuestCommandOwner(
+                            coordinator=coordinator,
+                            connection=object(),
+                            bound=BoundBrowserGuest(bound, "channel", "a" * 64),
+                        )
+                        await channel.disconnect()
+                        _, bound = await coordinator._load_channel_record(bound.identity)
+                        assert bound.state == "control_uncertain"
+                    else:
+                        now = int(time.time() * 1000)
+                        intent = BrowserTakeoverIntent(
+                            identity=bound.identity,
+                            request_id="bt_" + "2" * 32,
+                            expected_record_revision=bound.revision,
+                            expected_control_epoch=bound.control_epoch,
+                            pages=takeover_request().pages,
+                            purpose_code="login",
+                            requested_at_ms=now,
+                            expires_at_ms=now + 10_000,
+                            maximum_until_ms=now + 30_000,
+                        )
+                        bound = await app._browser_control_runtime.coordinator.request_takeover(
+                            principal=BrowserControlPrincipal(subject="operator", tenant="tenant"),
+                            operator_session_id="competing-operator-session",
+                            intent=intent,
+                        )
+                        assert bound.state == "takeover_requested" and bound.lease_until_ms is None
                     assert not running.done()
                     release_close.set()
                     await running
@@ -345,7 +372,13 @@ def test_runtime_observation_atomically_releases_handback_fence(
             assert result.ok
             assert provider.count == 3
             assert [call["operation"] for call in fake.calls] == ["navigate", terminal_operation]
-            assert injected == ([mode] if mode in {"ack_loss", "precommit_failure"} else [])
+            assert injected == (
+                ["disconnect"]
+                if disconnect_race
+                else [mode]
+                if mode in {"ack_loss", "precommit_failure"}
+                else []
+            )
             if terminal_operation == "close" and mode in {"protected", "ack_loss"}:
                 from cayu.runtime._browser_control_channel import (
                     BoundBrowserGuest,
@@ -393,6 +426,20 @@ def test_dispatched_close_settles_concurrent_takeover_without_grant(
         "protected",
         terminal_operation="close",
         takeover_race=True,
+    )
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_confirmed_close_settles_disconnect_before_terminal_commit(
+    tmp_path, monkeypatch, persistent
+):
+    test_runtime_observation_atomically_releases_handback_fence(
+        tmp_path,
+        monkeypatch,
+        persistent,
+        "protected",
+        terminal_operation="close",
+        disconnect_race=True,
     )
 
 

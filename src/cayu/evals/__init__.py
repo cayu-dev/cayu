@@ -13,6 +13,7 @@ if TYPE_CHECKING:
         BrowserAcceptanceAgentReportState,
         BrowserAcceptanceAggregateV1,
         BrowserAcceptanceArtifactEvidenceV1,
+        BrowserAcceptanceAuthenticationPhaseV1,
         BrowserAcceptanceCaseAggregateV1,
         BrowserAcceptanceCaseCategory,
         BrowserAcceptanceCaseV1,
@@ -28,7 +29,9 @@ if TYPE_CHECKING:
         BrowserAcceptanceMode,
         BrowserAcceptanceOperationEvidenceV1,
         BrowserAcceptanceOperationState,
+        BrowserAcceptanceOperatorEvidenceV1,
         BrowserAcceptancePlanV1,
+        BrowserAcceptanceProfileEvidenceV1,
         BrowserAcceptanceReportV1,
         BrowserAcceptanceRequestSummaryV1,
         BrowserAcceptanceRuntimeIdentityV1,
@@ -50,6 +53,10 @@ if TYPE_CHECKING:
         render_browser_acceptance_html,
         run_browser_acceptance,
         write_browser_acceptance_report,
+    )
+    from cayu.evals.browser_acceptance_authenticated import BrowserAcceptanceAuthenticatedConfigV1
+    from cayu.evals.browser_acceptance_authentication import (
+        BrowserAcceptanceAuthenticationCollector,
     )
     from cayu.evals.browser_acceptance_fixture import (
         BROWSER_ACCEPTANCE_FIXTURE_REVISION,
@@ -1064,6 +1071,9 @@ __all__ = [
     "BrowserAcceptanceAgentReportState",
     "BrowserAcceptanceAggregateV1",
     "BrowserAcceptanceArtifactEvidenceV1",
+    "BrowserAcceptanceAuthenticatedConfigV1",
+    "BrowserAcceptanceAuthenticationCollector",
+    "BrowserAcceptanceAuthenticationPhaseV1",
     "BrowserAcceptanceCaseAggregateV1",
     "BrowserAcceptanceCaseCategory",
     "BrowserAcceptanceCaseV1",
@@ -1080,7 +1090,9 @@ __all__ = [
     "BrowserAcceptanceMode",
     "BrowserAcceptanceOperationEvidenceV1",
     "BrowserAcceptanceOperationState",
+    "BrowserAcceptanceOperatorEvidenceV1",
     "BrowserAcceptancePlanV1",
+    "BrowserAcceptanceProfileEvidenceV1",
     "BrowserAcceptanceReportV1",
     "BrowserAcceptanceRequestSummaryV1",
     "BrowserAcceptanceRuntimeIdentityV1",
@@ -1707,6 +1719,7 @@ __all__ = [
 
 _LAZY_MODULE_EXPORTS = {
     "cayu.evals.browser_acceptance": (
+        "BrowserAcceptanceAuthenticationPhaseV1",
         "BROWSER_ACCEPTANCE_HTML_MAX_BYTES",
         "BROWSER_ACCEPTANCE_MANIFEST_MAX_BYTES",
         "BROWSER_ACCEPTANCE_REPORT_MAX_BYTES",
@@ -1723,12 +1736,14 @@ _LAZY_MODULE_EXPORTS = {
         "BrowserAcceptanceDiagnosticState",
         "BrowserAcceptanceDiagnosticV1",
         "BrowserAcceptanceFaultEvidenceV1",
+        "BrowserAcceptanceProfileEvidenceV1",
         "BrowserAcceptanceFaultScenario",
         "BrowserAcceptanceInfrastructureState",
         "BrowserAcceptanceLimitsV1",
         "BrowserAcceptanceManifestV1",
         "BrowserAcceptanceMode",
         "BrowserAcceptanceOperationEvidenceV1",
+        "BrowserAcceptanceOperatorEvidenceV1",
         "BrowserAcceptanceOperationState",
         "BrowserAcceptancePlanV1",
         "BrowserAcceptanceReportV1",
@@ -1753,6 +1768,8 @@ _LAZY_MODULE_EXPORTS = {
         "run_browser_acceptance",
         "write_browser_acceptance_report",
     ),
+    "cayu.evals.browser_acceptance_authenticated": ("BrowserAcceptanceAuthenticatedConfigV1",),
+    "cayu.evals.browser_acceptance_authentication": ("BrowserAcceptanceAuthenticationCollector",),
     "cayu.evals.browser_acceptance_fixture": (
         "BROWSER_ACCEPTANCE_FIXTURE_REVISION",
         "BrowserAcceptanceFixtureV1",

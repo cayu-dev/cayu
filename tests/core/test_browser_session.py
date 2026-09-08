@@ -11070,6 +11070,24 @@ def test_browser_session_wire_requires_positive_allocation_retirement_evidence()
     assert malformed.allocation_disposition == "uncertain"
 
 
+@pytest.mark.parametrize("disposition", ["live", "retired", "uncertain"])
+def test_browser_error_without_page_registry_rejects_orphan_delta(disposition: str) -> None:
+    payload = _browser_guest._interactive_error_payload(
+        _browser_guest._GuestFailure("browser_crash", allocation_disposition=disposition),
+        page_delta={"closed_page_ids": ["page_0123456789abcdef"]},
+    )
+    response = browser_session_module._parse_runner_response(
+        json.dumps(payload),
+        max_artifact_bytes=1024,
+        max_page_records=4,
+        max_page_creations_per_operation=2,
+    )
+    assert response.failure == BrowserBackendFailure("browser_crash")
+    assert response.allocation_disposition == "uncertain"
+    assert response.page_set is None
+    assert response.page_delta == BrowserPageSetDelta()
+
+
 def test_interactive_guest_shutdown_settles_background_limit_abort_first() -> None:
     class _Page:
         def __init__(self) -> None:

@@ -7,7 +7,10 @@ from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_control_coordinator import coordinator, intent_for
 from tests.core.test_browser_control_publisher import publication_fixture
 
-from cayu.runtime._browser_control_authorization import BrowserControlPermissionDenied
+from cayu.runtime._browser_control_authorization import (
+    BrowserControlInputRejected,
+    BrowserControlPermissionDenied,
+)
 from cayu.runtime._browser_control_channel import BoundBrowserGuest, BrowserGuestCommandOwner
 from cayu.runtime._browser_control_input_tickets import BrowserInputTickets
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
@@ -21,7 +24,9 @@ from cayu.runtime.browser_control import (
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-@pytest.mark.parametrize("publication_failure", [False, True])
+@pytest.mark.parametrize(
+    "publication_failure", [None, BrowserControlPermissionDenied, BrowserControlInputRejected]
+)
 def test_final_input_denial_preserves_control_and_allows_handback(
     backend, tmp_path, monkeypatch, publication_failure
 ):
@@ -91,10 +96,10 @@ def test_final_input_denial_preserves_control_and_allows_handback(
 
                 async def commit_then_deny(publication):
                     await publish(publication)
-                    raise BrowserControlPermissionDenied()
+                    raise publication_failure()
 
                 monkeypatch.setattr(owner, "_publish_text_input_admission", commit_then_deny)
-                with pytest.raises(BrowserControlPermissionDenied):
+                with pytest.raises(publication_failure):
                     await commands.step()
                 with pytest.raises(BrowserControlConflict):
                     await task

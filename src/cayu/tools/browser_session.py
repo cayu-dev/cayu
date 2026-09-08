@@ -7164,15 +7164,18 @@ def _parse_runner_response(
         code = raw.get("error")
         if type(code) is not str or code not in _BACKEND_FAILURE_CODES:
             return BrowserBackendResponse(failure=BrowserBackendFailure("browser_crash"))
-        return BrowserBackendResponse(
-            failure=BrowserBackendFailure(code),
-            page_set=page_set,
-            page_delta=page_delta,
-            allocation_disposition=cast(
-                'Literal["live", "retired", "uncertain"]',
-                allocation_disposition,
-            ),
-        )
+        try:
+            return BrowserBackendResponse(
+                failure=BrowserBackendFailure(code),
+                page_set=page_set,
+                page_delta=page_delta,
+                allocation_disposition=cast(
+                    'Literal["live", "retired", "uncertain"]',
+                    allocation_disposition,
+                ),
+            )
+        except ValueError:
+            return BrowserBackendResponse(failure=BrowserBackendFailure("browser_crash"))
     if kind == "closed":
         try:
             return BrowserBackendResponse(

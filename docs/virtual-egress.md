@@ -110,6 +110,15 @@ values. Chromium's opaque
 observed broker response can distinguish policy denial from capacity or proxy
 failure.
 
+The HTTPX upstream preserves repeated `Set-Cookie` fields in wire order through
+broker scrubbing and proxy delivery; they are never comma-joined (including
+cookies with an `Expires` date containing a comma). Custom upstreams use
+`CapturedResponse.set_cookie_headers`, an ordered sequence of at most 64 HTTP
+field values totalling at most 64 KiB. Resolved workload secrets are scrubbed
+from these values just like other response headers. Invalid or oversized values
+in this sequence fail closed. A single `Set-Cookie` entry in `headers` remains supported
+and precedes the separate sequence if both are supplied.
+
 In the explicitly selected Docker topology shown above, direct egress is blocked
 by construction: the container joins an `--internal`
 Docker network with no route to the internet, so the only reachable egress is a

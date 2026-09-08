@@ -470,7 +470,7 @@ class BrowserControlConflict(ValueError):
 def closed_browser_control_successor(record: BrowserControlRecord) -> BrowserControlRecord | None:
     """Exact state shape for runtime-confirmed close; not authority to publish it."""
     record = BrowserControlRecord.model_validate(record)
-    if record.state not in {"agent_controlled", "takeover_requested"}:
+    if record.state not in {"agent_controlled", "takeover_requested", "control_uncertain"}:
         return None
     return record.model_copy(
         update={

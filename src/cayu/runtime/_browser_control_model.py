@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Any
 from cayu._validation import canonical_durable_json_bytes
 from cayu.browser_profiles import BrowserProfileCheckpointConsentDenied
 from cayu.core.tools import _RuntimeBrowserControlAdmission
-from cayu.runtime._browser_control_checkpoint import BrowserControlCheckpointMutation
+from cayu.runtime._browser_control_checkpoint import (
+    BrowserControlCheckpointMutation,
+    BrowserControlCloseCheckpointMutation,
+)
 from cayu.runtime.browser_control import (
     BrowserControlAllocation,
     BrowserControlCheckpoint,
@@ -54,7 +57,11 @@ def browser_terminal_checkpoint_mutation(
         ),
         None,
     )
-    if record is None or record.state not in {"agent_controlled", "takeover_requested"}:
+    if record is None or record.state not in {
+        "agent_controlled",
+        "takeover_requested",
+        "control_uncertain",
+    }:
         return None
     if (
         type(operation.get("invocation_control_epoch")) is not int
@@ -77,7 +84,7 @@ def browser_terminal_checkpoint_mutation(
         desired = closed_browser_control_successor(record)
         if desired is None:
             return None
-        return BrowserControlCheckpointMutation(
+        return BrowserControlCloseCheckpointMutation(
             session_id, controls, controls.replace_record(expected=record, desired=desired)
         )
     if record.state != "agent_controlled" or not record.fresh_observation_required:

@@ -3063,10 +3063,87 @@ covers navigation, redirect, back, forward, and reload behavior; semantic scroll
 strict reference-bound hover; artifact-backed file-input upload; supported form and
 action operations; delayed, replaced, hidden, detached, occluded, duplicate, stale,
 frame, popup, truncation, artifact, denial, hostile-content, capacity, cancellation,
-crash, acknowledgement-loss, replay, conflict, and cleanup cases. Trace/video
-capture, multiple-page control, and visual-only interaction remain explicit
-`unsupported` rows in schema V1. Absence of a required case, trial, semantic oracle,
+crash, acknowledgement-loss, replay, conflict, and cleanup cases. Multiple-page
+control and visual-only interaction have executable corpus cases. Trace/video
+capture remains explicitly `unsupported`. Absence of a required case, trial, semantic oracle,
 diagnostic, or terminal allocation disposition can never be reported as a pass.
+
+The `profile-cookie-restoration` case uses disposable local fixture state. It
+navigates to the fixture login, closes and checkpoints the browser, opens a new
+browser session, verifies the account cookie at the fixture, and closes again.
+Its oracle requires two distinct browser-session identities, two profile generation
+advances, restore/checkpoint receipt identities, and an available profile with no
+active writer. The authenticated-request count comes from exact fixture cookie
+validation, not a page URL or a model's completion text. Profile evidence records
+the store kind; the default deterministic builder uses an in-memory encrypted
+profile store. The gated SQLite test exercises the same canonical case with a
+caller-owned durable profile binding. Neither result alone proves worker-restart
+recovery or authenticated access to an external account.
+
+Cases can bind different registered WebBridge instances through
+`BrowserAcceptancePlanV1.case_bridges`. These bindings remain subject to the
+common browser schema, workload, artifact-store and environment checks; each
+case's structural browser configuration is included in the executable suite
+identity. This keeps profile-bound capture restrictions separate from the
+credential-free visual cases. The artifact ceiling is checked against the sum
+of each case's own bounded allowance.
+
+The deterministic `operator-private-handoff` case uses disposable private fixture
+input through the protected operator API, not through a model tool. Its evidence
+requires acquired and handed-back control epochs, two settled input operations,
+the fixture's input effect, a durable protected fresh observation, and closed
+control with no pending input or uncertain mutation. The report contains hashed
+authority and audit identities, not the input value or operator credential. This
+case proves local operator handoff, not authentication to an external account.
+Without an application-owned operator fixture binding, the case is reported as
+`operator_configuration_unavailable` before provider or environment dispatch.
+
+For the complete deterministic corpus, run the command **inside an existing
+application container** configured for Cayu's documented colocated Docker egress
+adapter. Supply its exact container ID and private TLS file paths; the certificate
+must cover `cayu-control` and `127.0.0.1`, and port 8443 must be available there.
+
+The integrated corpus has a finite 20-minute trial budget, including profile,
+operator and fresh-process recovery cases. Fixture-server setup and final fixture
+cleanup are additional; successful trial rows alone do not establish successful
+cleanup.
+
+```bash
+export CAYU_BROWSER_ACCEPTANCE_CONTROL_CONTAINER='<exact 64-character container ID>'
+export CAYU_BROWSER_ACCEPTANCE_CONTROL_CERTIFICATE='/private/control.crt'
+export CAYU_BROWSER_ACCEPTANCE_CONTROL_PRIVATE_KEY='/private/server.key'
+python scripts/run_browser_acceptance.py --mode deterministic \
+  --operator-setup cayu.evals.internal.browser_acceptance_operator_server:configured_fixture \
+  --output-directory browser-acceptance-results
+```
+
+This opt-in fixture uses the existing protected server, verified HTTPS/WSS,
+temporary operator credentials and disposable private input. It installs no
+dependencies and creates no application container. Only parsed public certificates
+are copied into the browser workspace; the server key stays outside it. Environment
+cleanup runs before server/client retirement. Failed or uncertain cleanup fails the
+command, even if trial report files have already been written; inspect both the
+report and command outcome. The setup is not authorization for live-account tests.
+
+An application may instead name a trusted async context factory yielding an
+`OperatorFixtureSetup`. Its binding supplies the existing operator client; its
+`serve(plan)` context must serve the exact supplied canonical application and own
+the selected apps through environment cleanup and store closure. The outer context
+owns client and private configuration lifetime. The command still invokes Cayu's
+canonical builder and checks the canonical manifest, execution identity and bounds;
+the setup does not replace the corpus. `--operator-setup` is deterministic-only.
+
+Deterministic plans may use `case_apps` with matching `case_bridges` to isolate
+operator-specific secret and control configuration from visual and restart cases.
+Registration checks, dispatch and evidence readback use the selected application;
+the runtime identity binds each case's runner and execution profile, and provider
+configuration is keyed by case rather than shared provider name. The pinned
+browser workload, public schema, artifact-store identity and manifest egress
+allowlist remain common. Case-specific applications are not accepted for live
+campaigns, where splitting app-wide spend authority would weaken the budget.
+The caller owns every selected application's lifetime through cleanup and report
+projection. Colocated Docker workers use the explicit container identity for
+broker routing; that infrastructure setting does not grant operator authority.
 
 Redirect conformance binds the final browser-observed destination rather than only
 the submitted navigation target. Stale-observation coverage retains a pre-action
@@ -3099,8 +3176,32 @@ python scripts/run_browser_acceptance.py myapp.browser_acceptance:build_live \
 
 It records three immutable trials per case and reports variability instead of folding
 an unavailable provider or site into deterministic conformance. Authenticated-site
-acceptance is deliberately disabled in V1; selecting `live_authenticated` exits
-unavailable before loading a target or resolving credentials.
+acceptance is separately opt-in. Without `--authorize-authenticated`, selecting
+`live_authenticated` exits unavailable before loading a target or resolving
+credentials. An authorized target is an async context factory yielding a
+`BrowserAcceptancePlanV1` with an exact `BrowserAcceptanceAuthenticatedConfigV1`
+and a bounded, application/site-owned authenticated-request counter. The canonical
+manifest binds explicit consent, opaque account/observer revisions, profile and
+operator-policy fingerprints, one HTTPS origin, exact GET/POST routes, and a finite
+cost ceiling. All live modes share the existing pricing, aggregate-token and
+reserving app-budget checks; authenticated mode cannot split its budget across apps.
+
+The authenticated scorecard requires two distinct browser sessions, successful
+fresh protected observations after handback and restoration, exact durable
+operation identities, settled operator control, and matching profile checkpoint/
+restore evidence. Site-owned request counts are sampled around the trial; prior
+requests cannot satisfy a later trial. An application-registered
+`BrowserAcceptanceAuthenticationCollector` samples the exclusive site counter at
+ordinary tool boundaries; its exact instance must also belong to the plan. Durable
+readback binds each sample to its invocation, tool call and browser operation.
+Both post-handback and restored observations require positive phase-local evidence;
+requests from the first browser cannot satisfy restoration. Reports retain these
+phase counts and observation/browser digests. Reports contain bounded counts and evidence
+digests, not profile plaintext or private operator input. The setup context owns
+its protected server and stores through positive environment cleanup. See the
+[complete disposable local MFA example](../examples/browser_acceptance/README.md)
+for public Cayu/WebBridge setup and the standard JSON/HTML report path. Local
+fixture acceptance is not evidence that an external account or site is available.
 
 Every trial is published to the output directory's `.trials` journal before the next
 trial starts. Re-running an interrupted command with the same exact runtime and output

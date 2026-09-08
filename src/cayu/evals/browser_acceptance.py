@@ -12,6 +12,7 @@ import asyncio
 import errno
 import html
 import json
+import math
 import os
 import platform
 import tempfile
@@ -22,6 +23,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, Self, TypeVar
 from urllib.parse import urlsplit
@@ -38,15 +40,22 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     compact_json_utf8_size,
     copy_durable_json_object,
     require_durable_clean_nonblank,
     require_unicode_scalar_text,
     revalidate_model_input,
 )
+from cayu.browser_profiles import BrowserProfileInspection, BrowserProfileStatus
 from cayu.build_provenance import RuntimeBuildProvenance, current_runtime_build_provenance
 from cayu.core.events import EventType
 from cayu.egress import EgressAuthorityIdentity
+from cayu.evals.browser_acceptance_authenticated import BrowserAcceptanceAuthenticatedConfigV1
+from cayu.evals.browser_acceptance_authentication import (
+    BrowserAcceptanceAuthenticationCollector,
+    _AuthenticationSample,
+)
 from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
 from cayu.evals.corpus import (
     EvaluationEvidencePolicySpec,
@@ -63,6 +72,7 @@ from cayu.evals.models import EvalStatus, EvalTrialResult
 from cayu.evals.runner import EvalPlan, EvalSuite, _run_eval_suite, run_eval_suite
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.runtime.browser_control import BrowserControlRecord, BrowserControlState
 from cayu.runtime.costs import PriceBook
 from cayu.runtime.usage import SessionUsageSummary
 from cayu.tools.browser_session import BrowserSessionTool
@@ -532,7 +542,9 @@ class BrowserAcceptanceManifestV1(BaseModel):
                 )
             if self.limits.max_estimated_cost is not None:
                 raise ValueError("Deterministic acceptance cannot declare live model cost.")
-        if self.mode is BrowserAcceptanceMode.LIVE_PUBLIC:
+        if self.mode is BrowserAcceptanceMode.LIVE_PUBLIC or (
+            self.mode is BrowserAcceptanceMode.LIVE_AUTHENTICATED and self.enabled
+        ):
             if not self.enabled:
                 raise ValueError("The live-public manifest must remain explicitly runnable.")
             if (
@@ -541,8 +553,6 @@ class BrowserAcceptanceManifestV1(BaseModel):
                 or self.limits.max_estimated_cost is None
             ):
                 raise ValueError("Live-public acceptance requires finite model budgets.")
-        if self.mode is BrowserAcceptanceMode.LIVE_AUTHENTICATED and self.enabled:
-            raise ValueError("Authenticated browser acceptance is not enabled in schema v1.")
         material = self.model_dump(mode="json", exclude={"revision"})
         if self.revision != _content_revision(material, "browser acceptance manifest"):
             raise ValueError("Browser acceptance manifest revision does not match its content.")
@@ -726,6 +736,7 @@ class BrowserAcceptanceOperationEvidenceV1(BaseModel):
     state: BrowserAcceptanceOperationState
     error_category: StrictStr | None = None
     allocation_disposition: BrowserAllocationDisposition
+    browser_session_revision: StrictStr | None = None
     target_revision: StrictStr | None = None
     observed_target_revision: StrictStr | None = None
     observation_revision: StrictStr | None = None
@@ -747,7 +758,7 @@ class BrowserAcceptanceOperationEvidenceV1(BaseModel):
     def validate_invocation_revision(cls, value: str, info) -> str:
         return _revision(value, info.field_name)
 
-    @field_validator("target_revision", "observed_target_revision")
+    @field_validator("target_revision", "observed_target_revision", "browser_session_revision")
     @classmethod
     def validate_target_revision(cls, value: str | None, info) -> str | None:
         return None if value is None else _revision(value, info.field_name)
@@ -838,6 +849,397 @@ class BrowserAcceptanceFaultEvidenceV1(BaseModel):
         return self
 
 
+class BrowserAcceptanceOperatorEvidenceV1(BaseModel):
+    """Content-free projection of one durable browser-control allocation."""
+
+    model_config = _MODEL_CONFIG
+    identity_revision: StrictStr
+    browser_session_revision: StrictStr
+    state: BrowserControlState
+    control_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    acquired_epoch: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    handed_back_epoch: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    acquisition_revision: StrictStr | None = None
+    handback_revision: StrictStr | None = None
+    fresh_observation_revision: StrictStr | None = None
+    restored_observation_revision: StrictStr | None = None
+    restored_browser_session_revision: StrictStr | None = None
+    settled_inputs: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    input_pending: StrictBool
+    fresh_observation_required: StrictBool
+    sensitive_entry_pending: StrictBool
+    mutation_uncertain: StrictBool
+
+    @field_validator(
+        "identity_revision",
+        "browser_session_revision",
+        "acquisition_revision",
+        "handback_revision",
+        "fresh_observation_revision",
+        "restored_observation_revision",
+        "restored_browser_session_revision",
+    )
+    @classmethod
+    def validate_revision(cls, value: str | None, info) -> str | None:
+        return None if value is None else _revision(value, info.field_name)
+
+
+def _project_operator_record(record: BrowserControlRecord) -> BrowserAcceptanceOperatorEvidenceV1:
+    """Project a store-read record; construction alone never authenticates a caller."""
+    owned = BrowserControlRecord.model_validate(record)
+    acquired, returned = owned.acquisition_audit, owned.handback_audit
+    return BrowserAcceptanceOperatorEvidenceV1(
+        identity_revision=_content_revision(
+            owned.identity.model_dump(mode="json"), "browser acceptance operator allocation"
+        ),
+        browser_session_revision=_content_revision(
+            {"session_id": owned.identity.browser_session_id},
+            "browser acceptance browser session",
+        ),
+        state=owned.state,
+        control_epoch=owned.control_epoch,
+        acquired_epoch=None if acquired is None else acquired.control_epoch,
+        handed_back_epoch=None if returned is None else returned.control_epoch,
+        acquisition_revision=(
+            None
+            if acquired is None
+            else _content_revision(
+                acquired.model_dump(mode="json"), "browser acceptance operator acquisition"
+            )
+        ),
+        handback_revision=(
+            None
+            if returned is None
+            else _content_revision(
+                returned.model_dump(mode="json"), "browser acceptance operator handback"
+            )
+        ),
+        settled_inputs=owned.settled_input_sequence,
+        input_pending=owned.pending_input_sequence is not None,
+        fresh_observation_required=owned.fresh_observation_required,
+        sensitive_entry_pending=owned.sensitive_entry_pending,
+        mutation_uncertain=owned.manual_mutation_uncertain,
+    )
+
+
+async def _case_operator_evidence(
+    app: Any,
+    case: BrowserAcceptanceCaseV1,
+    trial: EvalTrialResult,
+    *,
+    expected_execution_profile_fingerprint: str,
+) -> BrowserAcceptanceOperatorEvidenceV1 | None:
+    if "required_operator_inputs" not in case.oracle_parameters:
+        return None
+    from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
+    from cayu.runtime.browser_control import BrowserControlCheckpoint
+    from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+
+    session = None if trial.trajectory is None else trial.trajectory.session
+    if session is None or trial.session_id is None or session.id != trial.session_id:
+        raise ValueError("Browser operator acceptance has no captured session authority.")
+    with browser_control_checkpoint_read_scope(session.id):
+        raw = await app.session_store.load_checkpoint(session.id)
+    if raw is None or BROWSER_CONTROLS_CHECKPOINT_KEY not in raw:
+        raise ValueError("Browser operator acceptance has no durable control evidence.")
+    checkpoint = BrowserControlCheckpoint.model_validate(raw[BROWSER_CONTROLS_CHECKPOINT_KEY])
+    restored_id = case.oracle_parameters.get("required_restored_observation_id")
+    expected_records = 1 if restored_id is None else 2
+    if len(checkpoint.records) != expected_records:
+        raise ValueError("Browser operator acceptance has an unexpected allocation set.")
+    for candidate in checkpoint.records:
+        if (
+            candidate.identity.session_id != session.id
+            or candidate.identity.session_instance_id != session.instance_id
+            or candidate.identity.execution_profile_fingerprint
+            != expected_execution_profile_fingerprint
+        ):
+            raise ValueError("Browser operator acceptance has conflicting invocation authority.")
+    from cayu.tools.browser_session import _durable_browser_operation_key
+
+    operation_id = case.oracle_parameters.get("required_operator_observation_id")
+    if type(operation_id) is not str or not operation_id:
+        raise ValueError("Browser operator acceptance requires an exact fresh observation.")
+    raw_operation = await app.session_store.load_session_operation(
+        session.id, _durable_browser_operation_key(operation_id)
+    )
+    if type(raw_operation) is not dict:
+        raise ValueError("Browser operator acceptance has no durable fresh observation.")
+    operation = copy_durable_json_object(raw_operation, "browser operator observation evidence")
+    records = tuple(
+        candidate
+        for candidate in checkpoint.records
+        if candidate.identity.browser_session_id == operation.get("browser_session_id")
+    )
+    if len(records) != 1:
+        raise ValueError("Browser operator observation has no exact allocation.")
+    record = records[0]
+    fresh_revision = _validated_operator_observation_revision(operation, operation_id, record)
+    restored_values: dict[str, str] = {}
+    if restored_id is not None:
+        if type(restored_id) is not str or not restored_id or restored_id == operation_id:
+            raise ValueError("Browser restoration requires a distinct exact observation.")
+        restored_raw = await app.session_store.load_session_operation(
+            session.id, _durable_browser_operation_key(restored_id)
+        )
+        if type(restored_raw) is not dict:
+            raise ValueError("Browser restoration has no durable observation.")
+        restored = copy_durable_json_object(restored_raw, "browser restored observation evidence")
+        successors = tuple(
+            candidate
+            for candidate in checkpoint.records
+            if candidate.identity.browser_session_id == restored.get("browser_session_id")
+            and candidate.identity.browser_session_id != record.identity.browser_session_id
+        )
+        if (
+            len(successors) != 1
+            or successors[0].state != "closed"
+            or successors[0].identity.run_epoch != record.identity.run_epoch
+        ):
+            raise ValueError("Browser restoration requires a distinct closed allocation.")
+        successor = successors[0]
+        restored_values = {
+            "restored_observation_revision": _validated_operator_observation_revision(
+                restored, restored_id, successor
+            ),
+            "restored_browser_session_revision": _project_operator_record(
+                successor
+            ).browser_session_revision,
+        }
+    return _project_operator_record(record).model_copy(
+        update={"fresh_observation_revision": fresh_revision, **restored_values}
+    )
+
+
+def _validated_operator_observation_revision(
+    operation: Mapping[str, Any], operation_id: str, record: BrowserControlRecord
+) -> str:
+    """Validate private store evidence before publishing only its content digest."""
+    from cayu._validation import canonical_durable_json_bytes
+    from cayu.tools.browser_session import _browser_operation_id_sha256
+
+    expected = {
+        "record_type": "cayu.browser-operation",
+        "schema_version": 1,
+        "state": "terminal",
+        "operation": "observe",
+        "operation_id_sha256": _browser_operation_id_sha256(operation_id),
+        "parent_session_id": record.identity.session_id,
+        "parent_run_epoch": record.identity.run_epoch,
+        "execution_profile_fingerprint": record.identity.execution_profile_fingerprint,
+        "environment_name": record.identity.environment_name,
+        "allocation_fingerprint": record.identity.allocation_fingerprint,
+        "browser_session_id": record.identity.browser_session_id,
+        "invocation_control_epoch": record.control_epoch,
+        "observation_confirmed": True,
+        "observation_protected": True,
+    }
+    if canonical_durable_json_bytes(
+        {key: operation.get(key) for key in expected}, "browser operator observation authority"
+    ) != canonical_durable_json_bytes(expected, "browser operator expected authority"):
+        raise ValueError("Browser operator fresh observation belongs to another control boundary.")
+    return _content_revision(dict(operation), "browser operator fresh observation")
+
+
+class BrowserAcceptanceProfileEvidenceV1(BaseModel):
+    """Bounded store inspection evidence; no profile plaintext or application labels."""
+
+    model_config = _MODEL_CONFIG
+    store_kind: Literal["memory", "sqlite", "custom"]
+    status: BrowserProfileStatus
+    authority_fingerprint: StrictStr
+    generation_before: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    generation_after: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    active_writer: StrictBool
+    cookie_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    checkpoint_receipt_revision: StrictStr | None = None
+    restore_receipt_revision: StrictStr | None = None
+
+    @field_validator("authority_fingerprint")
+    @classmethod
+    def validate_authority(cls, value: str) -> str:
+        return _fingerprint(value, "browser profile authority")
+
+    @field_validator("checkpoint_receipt_revision", "restore_receipt_revision")
+    @classmethod
+    def validate_receipt(cls, value: str | None, info) -> str | None:
+        return None if value is None else _revision(value, info.field_name)
+
+
+async def _inspect_case_profile(
+    plan: BrowserAcceptancePlanV1, case: BrowserAcceptanceCaseV1
+) -> BrowserProfileInspection | None:
+    if "required_profile_checkpoint_delta" not in case.oracle_parameters:
+        return None
+    binding = _case_browser_bridge(plan, case.case_id).tools[0].browser_profile
+    if binding is None:
+        raise ValueError("Browser acceptance profile case has no application binding.")
+    inspection = await binding.store.inspect_profile(binding.access)
+    if type(inspection) is not BrowserProfileInspection:
+        raise ValueError("Browser acceptance profile inspection is unavailable.")
+    owned = BrowserProfileInspection.model_validate(inspection)
+    if (
+        owned.profile_id != binding.authority.profile_id
+        or owned.authority_fingerprint != binding.authority.fingerprint
+    ):
+        raise ValueError("Browser acceptance profile inspection has conflicting authority.")
+    return owned
+
+
+async def _case_profile_evidence(
+    plan: BrowserAcceptancePlanV1,
+    case: BrowserAcceptanceCaseV1,
+    before: BrowserProfileInspection | None,
+) -> BrowserAcceptanceProfileEvidenceV1 | None:
+    from cayu.browser_profiles import InMemoryBrowserProfileStore, SQLiteBrowserProfileStore
+
+    if before is None:
+        return None
+    after = await _inspect_case_profile(plan, case)
+    if after is None or before.authority_fingerprint != after.authority_fingerprint:
+        raise ValueError("Browser acceptance profile authority changed during the trial.")
+    binding = _case_browser_bridge(plan, case.case_id).tools[0].browser_profile
+    if binding is None:
+        raise ValueError("Browser acceptance profile binding disappeared during the trial.")
+    store = binding.store
+    return BrowserAcceptanceProfileEvidenceV1(
+        store_kind=(
+            "memory"
+            if type(store) is InMemoryBrowserProfileStore
+            else "sqlite"
+            if type(store) is SQLiteBrowserProfileStore
+            else "custom"
+        ),
+        authority_fingerprint=after.authority_fingerprint,
+        status=after.status,
+        generation_before=before.generation,
+        generation_after=after.generation,
+        active_writer=after.active_writer,
+        cookie_count=after.cookie_count,
+        checkpoint_receipt_revision=(
+            None
+            if after.last_checkpoint_receipt_id is None
+            else _content_revision(
+                {"receipt_id": after.last_checkpoint_receipt_id},
+                "browser profile checkpoint receipt",
+            )
+        ),
+        restore_receipt_revision=(
+            None
+            if after.last_restore_receipt_id is None
+            else _content_revision(
+                {"receipt_id": after.last_restore_receipt_id}, "browser profile restore receipt"
+            )
+        ),
+    )
+
+
+class BrowserAcceptanceAuthenticationPhaseV1(BaseModel):
+    """Validated phase-local site evidence bound to its durable observation."""
+
+    model_config = _MODEL_CONFIG
+    phase: Literal["handback", "restoration"]
+    browser_session_revision: StrictStr
+    observation_revision: StrictStr
+    authenticated_requests: StrictInt = Field(ge=0, le=1 << 20)
+
+    @field_validator("browser_session_revision", "observation_revision")
+    @classmethod
+    def validate_revision(cls, value: str, info) -> str:
+        return _revision(value, info.field_name)
+
+
+async def _case_authentication_evidence(
+    app: Any,
+    trial: EvalTrialResult,
+    samples: tuple[_AuthenticationSample, ...],
+    operator: BrowserAcceptanceOperatorEvidenceV1 | None,
+) -> tuple[BrowserAcceptanceAuthenticationPhaseV1, ...]:
+    from cayu.tools.browser_session import (
+        _browser_operation_id_sha256,
+        _durable_browser_operation_key,
+    )
+
+    if operator is None or len(samples) != 6 or trial.trajectory is None:
+        raise ValueError("Authenticated acceptance lacks complete phase samples.")
+    session = trial.trajectory.session
+    if (
+        session is None
+        or tuple(sample.operation for sample in samples) != ("navigate", "observe", "close") * 2
+    ):
+        raise ValueError("Authenticated acceptance phase order differs.")
+    counts = tuple(value for sample in samples for value in (sample.before, sample.after))
+    if any(left > right for left, right in pairwise(counts)):
+        raise ValueError("Authenticated acceptance counter reset or overlapped.")
+    browsers = tuple(sample.browser_session_id for sample in samples)
+    if browsers != (browsers[0],) * 3 + (browsers[3],) * 3 or browsers[0] == browsers[3]:
+        raise ValueError("Authenticated acceptance phase allocations differ.")
+    if (
+        samples[1].operation_id != "acceptance-post-handback"
+        or samples[4].operation_id != "acceptance-restored"
+    ):
+        raise ValueError("Authenticated acceptance observation identity differs.")
+    revisions = []
+    for sample in samples:
+        if (
+            sample.session_id != session.id
+            or sample.instance_id != session.instance_id
+            or sample.run_epoch != samples[0].run_epoch
+        ):
+            raise ValueError("Authenticated acceptance sample belongs to another invocation.")
+        raw = await app.session_store.load_session_operation(
+            session.id, _durable_browser_operation_key(sample.operation_id)
+        )
+        if type(raw) is not dict:
+            raise ValueError("Authenticated acceptance sample has no durable operation.")
+        expected = {
+            "record_type": "cayu.browser-operation",
+            "schema_version": 1,
+            "state": "terminal",
+            "operation": sample.operation,
+            "operation_id_sha256": _browser_operation_id_sha256(sample.operation_id),
+            "parent_session_id": sample.session_id,
+            "parent_run_epoch": sample.run_epoch,
+            "execution_profile_fingerprint": sample.execution_profile,
+            "tool_call_id": sample.tool_call_id,
+            "effective_arguments_sha256": sample.arguments_sha256,
+            "browser_session_id": sample.browser_session_id,
+        }
+        if any(
+            type(raw.get(key)) is not type(value) or raw.get(key) != value
+            for key, value in expected.items()
+        ):
+            raise ValueError("Authenticated acceptance sample conflicts with durable authority.")
+        result = raw.get("result")
+        if type(result) is not dict or result.get("is_error") is not False:
+            raise ValueError("Authenticated acceptance operation did not succeed.")
+        if sample.operation == "close" and raw.get("close_confirmed") is not True:
+            raise ValueError("Authenticated acceptance phase did not close.")
+        revisions.append(_content_revision(raw, "browser operator fresh observation"))
+    if (
+        revisions[1] != operator.fresh_observation_revision
+        or revisions[4] != operator.restored_observation_revision
+    ):
+        raise ValueError("Authenticated acceptance samples differ from protected observations.")
+    assert operator.fresh_observation_revision is not None
+    assert operator.restored_observation_revision is not None
+    assert operator.restored_browser_session_revision is not None
+    return (
+        BrowserAcceptanceAuthenticationPhaseV1(
+            phase="handback",
+            browser_session_revision=operator.browser_session_revision,
+            observation_revision=operator.fresh_observation_revision,
+            authenticated_requests=samples[1].after - samples[0].before,
+        ),
+        BrowserAcceptanceAuthenticationPhaseV1(
+            phase="restoration",
+            browser_session_revision=operator.restored_browser_session_revision,
+            observation_revision=operator.restored_observation_revision,
+            authenticated_requests=samples[4].after - samples[3].before,
+        ),
+    )
+
+
 class BrowserAcceptanceDiagnosticV1(BaseModel):
     model_config = _MODEL_CONFIG
 
@@ -845,6 +1247,7 @@ class BrowserAcceptanceDiagnosticV1(BaseModel):
     error_code: StrictStr | None = None
     fixture_route_observed: StrictBool | None = None
     fixture_route_request_count: StrictInt | None = Field(default=None, ge=0)
+    fixture_authenticated_request_count: StrictInt | None = Field(default=None, ge=0, le=1 << 20)
     browser_dispatches: StrictInt | None = Field(
         default=None,
         ge=0,
@@ -853,6 +1256,11 @@ class BrowserAcceptanceDiagnosticV1(BaseModel):
     fixture_effects: dict[StrictStr, StrictInt] = Field(default_factory=dict)
     chromium_identity: StrictStr | None = None
     fault: BrowserAcceptanceFaultEvidenceV1 | None = None
+    profile: BrowserAcceptanceProfileEvidenceV1 | None = None
+    operator: BrowserAcceptanceOperatorEvidenceV1 | None = None
+    authentication_phases: tuple[BrowserAcceptanceAuthenticationPhaseV1, ...] = Field(
+        default=(), max_length=2
+    )
     operations: tuple[BrowserAcceptanceOperationEvidenceV1, ...] = Field(
         default=(),
         max_length=BROWSER_ACCEPTANCE_MAX_OPERATIONS_PER_ROW,
@@ -888,6 +1296,23 @@ class BrowserAcceptanceDiagnosticV1(BaseModel):
     def copy_fault(cls, value: object) -> object:
         return None if value is None else _copy_model(value, BrowserAcceptanceFaultEvidenceV1)
 
+    @field_validator("profile", mode="before")
+    @classmethod
+    def copy_profile(cls, value: object) -> object:
+        return None if value is None else _copy_model(value, BrowserAcceptanceProfileEvidenceV1)
+
+    @field_validator("operator", mode="before")
+    @classmethod
+    def copy_operator(cls, value: object) -> object:
+        return None if value is None else _copy_model(value, BrowserAcceptanceOperatorEvidenceV1)
+
+    @field_validator("authentication_phases", mode="before")
+    @classmethod
+    def copy_authentication_phases(cls, value: object) -> object:
+        if not isinstance(value, (list, tuple)) or len(value) > 2:
+            raise ValueError("Authentication phase evidence must be bounded.")
+        return tuple(_copy_model(item, BrowserAcceptanceAuthenticationPhaseV1) for item in value)
+
     @field_validator("requests", mode="before")
     @classmethod
     def copy_requests(cls, value: object) -> object:
@@ -921,7 +1346,14 @@ class BrowserAcceptanceDiagnosticV1(BaseModel):
         ):
             raise ValueError("Unavailable diagnostics require exactly one stable error code.")
         if self.state is BrowserAcceptanceDiagnosticState.NOT_REQUESTED and (
-            self.operations or self.requests or self.truncated_categories or self.fault is not None
+            self.operations
+            or self.requests
+            or self.truncated_categories
+            or self.fault is not None
+            or self.profile is not None
+            or self.operator is not None
+            or self.authentication_phases
+            or self.fixture_authenticated_request_count is not None
         ):
             raise ValueError("Diagnostics that were not requested cannot carry evidence.")
         return self
@@ -1468,6 +1900,11 @@ class BrowserAcceptancePlanV1:
     manifest: BrowserAcceptanceManifestV1
     eval_plan: EvalPlan
     bridge: WebBridge
+    authenticated: BrowserAcceptanceAuthenticatedConfigV1 | None = None
+    authenticated_request_count: Callable[[], int] | None = None
+    authentication_collector: BrowserAcceptanceAuthenticationCollector | None = None
+    case_bridges: tuple[tuple[str, WebBridge], ...] = ()
+    case_apps: tuple[tuple[str, Any], ...] = ()
     pricing: PriceBook | None = None
     cost_currencies: tuple[str, ...] = ()
     scenario_executor_revision: str | None = None
@@ -1492,6 +1929,81 @@ class BrowserAcceptancePlanV1:
             raise ValueError("Browser acceptance requires interactive browser identity.")
         if self.eval_plan.app is None or self.eval_plan.suite is None:
             raise ValueError("Browser acceptance requires a direct application EvalPlan.")
+        if self.manifest.mode is BrowserAcceptanceMode.LIVE_AUTHENTICATED:
+            if type(
+                self.authenticated
+            ) is not BrowserAcceptanceAuthenticatedConfigV1 or not callable(
+                self.authenticated_request_count
+            ):
+                raise ValueError(
+                    "Authenticated acceptance requires explicit authority and a site-owned observer."
+                )
+            owned = revalidate_model_input(
+                self.authenticated, BrowserAcceptanceAuthenticatedConfigV1
+            )
+            object.__setattr__(self, "authenticated", owned)
+            from cayu.evals.browser_acceptance_manifests import (
+                live_authenticated_browser_acceptance_manifest,
+            )
+
+            if self.manifest != live_authenticated_browser_acceptance_manifest(owned):
+                raise ValueError(
+                    "Authenticated acceptance conflicts with its canonical authorized manifest."
+                )
+            profile = self.bridge.tools[0].browser_profile
+            if (
+                profile is None
+                or profile.authority.fingerprint != owned.profile_authority_fingerprint
+            ):
+                raise ValueError("Authenticated acceptance has no matching profile authority.")
+        elif (
+            self.authenticated is not None
+            or self.authenticated_request_count is not None
+            or self.authentication_collector is not None
+        ):
+            raise ValueError("Authenticated bindings require authenticated mode.")
+        if type(self.case_bridges) is not tuple:
+            raise TypeError("case_bridges must be an immutable tuple of case bindings.")
+        case_ids = {case.id for case in self.eval_plan.suite.cases}
+        from cayu.runtime.app import CayuApp
+
+        if type(self.case_apps) is not tuple:
+            raise TypeError("case_apps must be an immutable tuple of case bindings.")
+        app_ids: set[str] = set()
+        for binding in self.case_apps:
+            if (
+                type(binding) is not tuple
+                or len(binding) != 2
+                or type(binding[0]) is not str
+                or binding[0] not in case_ids
+                or binding[0] in app_ids
+                or not isinstance(binding[1], CayuApp)
+            ):
+                raise ValueError("Browser acceptance application binding is invalid or duplicated.")
+            app_ids.add(binding[0])
+        if self.case_apps and self.manifest.mode is not BrowserAcceptanceMode.DETERMINISTIC:
+            raise ValueError("Case-specific applications require the deterministic corpus.")
+        seen: set[str] = set()
+        for binding in self.case_bridges:
+            if (
+                type(binding) is not tuple
+                or len(binding) != 2
+                or type(binding[0]) is not str
+                or binding[0] not in case_ids
+                or binding[0] in seen
+                or type(binding[1]) is not WebBridge
+            ):
+                raise ValueError("Browser acceptance case binding is invalid or duplicated.")
+            seen.add(binding[0])
+            candidate = binding[1]
+            if (
+                candidate.kind is not WebBridgeProfileKind.SANDBOXED_BROWSER
+                or candidate.browser_protocol != self.bridge.browser_protocol
+                or candidate.browser_worker_version != self.bridge.browser_worker_version
+                or candidate.playwright_version != self.bridge.playwright_version
+                or candidate.artifact_store_id != self.bridge.artifact_store_id
+            ):
+                raise ValueError("Browser acceptance case binding changes its shared workload.")
         if self.pricing is not None and type(self.pricing) is not PriceBook:
             raise TypeError("pricing must be an exact PriceBook or None.")
         cleaned_currencies = tuple(
@@ -1503,7 +2015,7 @@ class BrowserAcceptancePlanV1:
             raise ValueError("cost_currencies must be unique sorted uppercase identifiers.")
         if bool(self.pricing) != bool(cleaned_currencies):
             raise ValueError("Pricing and cost currencies must be configured together.")
-        if self.manifest.mode is BrowserAcceptanceMode.LIVE_PUBLIC and self.pricing is None:
+        if self.manifest.mode is not BrowserAcceptanceMode.DETERMINISTIC and self.pricing is None:
             raise ValueError("Live browser acceptance requires exact pricing evidence.")
         if (self.scenario_executor is None) != (self.scenario_executor_revision is None):
             raise ValueError("Scenario execution and its revision must be configured together.")
@@ -1515,6 +2027,78 @@ class BrowserAcceptancePlanV1:
             raise ValueError("Executable fault cases require a scenario executor.")
 
 
+def _case_browser_bridge(plan: BrowserAcceptancePlanV1, case_id: str) -> WebBridge:
+    return next((bridge for key, bridge in plan.case_bridges if key == case_id), plan.bridge)
+
+
+def _case_browser_app(plan: BrowserAcceptancePlanV1, case_id: str) -> Any:
+    return next((app for key, app in plan.case_apps if key == case_id), plan.eval_plan.app)
+
+
+def _authenticated_site_count(plan: BrowserAcceptancePlanV1) -> int | None:
+    if plan.authenticated is None:
+        return None
+    if not callable(plan.authenticated_request_count):
+        raise ValueError("Authenticated acceptance lost its site-owned observer.")
+    count = plan.authenticated_request_count()
+    if type(count) is not int or not 0 <= count <= 1 << 20:
+        raise ValueError("Authenticated site evidence is unavailable or outside its bound.")
+    return count
+
+
+def _authenticated_site_delta(plan: BrowserAcceptancePlanV1, before: int) -> int:
+    after = _authenticated_site_count(plan)
+    if after is None or after < before:
+        raise ValueError("Authenticated site evidence reset during the trial.")
+    return after - before
+
+
+def _require_authenticated_plan_authority(plan: BrowserAcceptancePlanV1) -> None:
+    if plan.manifest.mode is not BrowserAcceptanceMode.LIVE_AUTHENTICATED:
+        return
+    from hashlib import sha256
+
+    from cayu.evals.browser_acceptance_manifests import (
+        live_authenticated_browser_acceptance_manifest,
+    )
+
+    if type(plan.authenticated) is not BrowserAcceptanceAuthenticatedConfigV1:
+        raise ValueError("Authenticated acceptance requires explicit application authority.")
+    config = revalidate_model_input(plan.authenticated, BrowserAcceptanceAuthenticatedConfigV1)
+    if plan.manifest != live_authenticated_browser_acceptance_manifest(config):
+        raise ValueError("Authenticated acceptance authority differs from its manifest.")
+    _registered_browser_acceptance_tool(plan)
+    suite = plan.eval_plan.suite
+    if suite is None:
+        raise ValueError("Authenticated acceptance has no executable suite.")
+    for case in suite.cases:
+        profile = _case_browser_bridge(plan, case.id).tools[0].browser_profile
+        if profile is None or profile.authority.fingerprint != config.profile_authority_fingerprint:
+            raise ValueError("Authenticated acceptance profile authority changed.")
+    # Read the existing composition owner; do not create a parallel operator driver.
+    app = plan.eval_plan.app
+    if app is None:
+        raise ValueError("Authenticated acceptance has no application.")
+    collector = plan.authentication_collector
+    if (
+        type(collector) is not BrowserAcceptanceAuthenticationCollector
+        or sum(hook.hook is collector for hook in app._runtime_hooks) != 1
+        or collector.counter is not plan.authenticated_request_count
+        or collector.observer_revision != config.site_observer_revision
+    ):
+        raise ValueError("Authenticated acceptance requires its exact registered phase collector.")
+    runtime = app._browser_control_runtime
+    policy = None if runtime is None else runtime.coordinator._policy
+    if (
+        runtime is None
+        or policy is None
+        or sha256(policy.identity.encode("utf-8")).hexdigest() != config.operator_policy_fingerprint
+        or runtime.coordinator._purpose.expected_origins != (config.origin,)
+    ):
+        raise ValueError("Authenticated acceptance operator authority differs from configuration.")
+    _authenticated_site_count(plan)
+
+
 def _registered_browser_acceptance_tool(plan: BrowserAcceptancePlanV1) -> BrowserSessionTool:
     app = plan.eval_plan.app
     suite = plan.eval_plan.suite
@@ -1523,22 +2107,25 @@ def _registered_browser_acceptance_tool(plan: BrowserAcceptancePlanV1) -> Browse
     if len(plan.bridge.tools) != 1 or type(plan.bridge.tools[0]) is not BrowserSessionTool:
         raise ValueError("Browser acceptance requires the closed browser_session tool.")
     bridge_tool = plan.bridge.tools[0]
-    checked_agents: set[str] = set()
     for eval_case in suite.cases:
+        app = _case_browser_app(plan, eval_case.id)
+        case_bridge = _case_browser_bridge(plan, eval_case.id)
+        if len(case_bridge.tools) != 1 or type(case_bridge.tools[0]) is not BrowserSessionTool:
+            raise ValueError("Browser acceptance requires the closed browser_session tool.")
+        case_tool = case_bridge.tools[0]
+        if case_tool.schema != bridge_tool.schema:
+            raise ValueError("Browser acceptance cases must share the public browser schema.")
         agent_name = eval_case.request.agent_name
-        if agent_name in checked_agents:
-            continue
         registered_agent = app.get_agent(agent_name)
         if set(registered_agent.tools) != {"browser_session"} or registered_agent.hosted_tools:
             raise ValueError(
                 "Browser acceptance requires one closed registered browser_session surface."
             )
         registered_tool = registered_agent.tools["browser_session"].tool
-        if registered_tool is not bridge_tool:
+        if registered_tool is not case_tool:
             raise ValueError(
                 "Browser acceptance plan WebBridge is not the registered browser_session tool."
             )
-        checked_agents.add(agent_name)
     return bridge_tool
 
 
@@ -1554,6 +2141,8 @@ def _browser_public_operations(browser_tool: BrowserSessionTool) -> frozenset[st
 
 def _portable_execution_value(value: object, field_name: str) -> object:
     if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is float and math.isfinite(value):
         return value
     if isinstance(value, StrEnum):
         return value.value
@@ -1578,8 +2167,14 @@ def _browser_acceptance_execution_suite_fingerprint(plan: BrowserAcceptancePlanV
     cases: list[dict[str, object]] = []
     providers: dict[str, object] = {}
     for eval_case in suite.cases:
+        app = _case_browser_app(plan, eval_case.id)
         target = app.resolve_run_model_target(eval_case.request)
         provider = app.get_provider(target.provider_name)
+        browser_material = (
+            _case_browser_bridge(plan, eval_case.id).tools[0]._execution_profile_material()
+        )
+        if plan.case_bridges and browser_material is None:
+            raise ValueError("Browser acceptance case lacks structural browser authority.")
         assertions = [
             {
                 "type": f"{type(assertion).__module__}.{type(assertion).__qualname__}",
@@ -1593,6 +2188,9 @@ def _browser_acceptance_execution_suite_fingerprint(plan: BrowserAcceptancePlanV
         cases.append(
             {
                 "case_id": eval_case.id,
+                "browser_authority": _portable_execution_value(
+                    browser_material, "browser acceptance case authority"
+                ),
                 "request": eval_case.request.model_dump(mode="json", warnings="error"),
                 "assertions": assertions,
                 "metadata": eval_case.metadata,
@@ -1615,7 +2213,7 @@ def _browser_acceptance_execution_suite_fingerprint(plan: BrowserAcceptancePlanV
                     execution_revision,
                     "browser acceptance provider execution revision",
                 )
-        providers[target.provider_name] = provider_material
+        providers[eval_case.id] = provider_material
     return _identity_fingerprint(
         {
             "suite_id": suite.id,
@@ -1623,6 +2221,11 @@ def _browser_acceptance_execution_suite_fingerprint(plan: BrowserAcceptancePlanV
             "cases": cases,
             "providers": providers,
             "scenario_executor_revision": plan.scenario_executor_revision,
+            "case_bridge_bindings": sorted(case_id for case_id, _ in plan.case_bridges),
+            "case_application_bindings": sorted(case_id for case_id, _ in plan.case_apps),
+            "authenticated_authority": None
+            if plan.authenticated is None
+            else plan.authenticated.revision,
         },
         "browser acceptance executable suite",
     )
@@ -1663,10 +2266,11 @@ def _manifest_origin_hosts(origins: tuple[str, ...]) -> tuple[str, ...]:
 def _require_browser_acceptance_egress_authority(
     manifest: BrowserAcceptanceManifestV1,
     authority: EgressAuthorityIdentity | None,
+    authenticated: BrowserAcceptanceAuthenticatedConfigV1 | None = None,
 ) -> EgressAuthorityIdentity:
     if type(authority) is not EgressAuthorityIdentity:
         raise ValueError("Browser acceptance requires factory-backed virtual-egress authority.")
-    owned = EgressAuthorityIdentity.model_validate(authority)
+    owned = revalidate_model_input(authority, EgressAuthorityIdentity)
     hosts = _manifest_origin_hosts(manifest.allowed_origins)
     if owned.authority_scope != "session":
         raise ValueError("Browser acceptance egress authority must be session-scoped.")
@@ -1679,6 +2283,28 @@ def _require_browser_acceptance_egress_authority(
             "Browser acceptance egress authority conflicts with the manifest allowlist."
         )
     policies = {policy.name: policy for policy in owned.policies}
+    if authenticated is not None:
+        expected = tuple(
+            (method, path, "exact") for method, path in authenticated.allowed_endpoints
+        )
+        if (
+            manifest.mode is not BrowserAcceptanceMode.LIVE_AUTHENTICATED
+            or manifest.allowed_origins != (authenticated.origin,)
+            or len(policies) != 1
+            or any(
+                policy.kind != "http"
+                or not policy.comparison_available
+                or tuple((item.method, item.path, item.match) for item in policy.operations)
+                != expected
+                or policy.allowed_destinations != hosts
+                or policy.denied_path_prefixes
+                for policy in policies.values()
+            )
+        ):
+            raise ValueError(
+                "Authenticated acceptance egress differs from its exact approved routes."
+            )
+        return owned
     if any(
         policies[binding.policy_name].kind != "browser"
         or binding.destination not in policies[binding.policy_name].allowed_destinations
@@ -1693,18 +2319,10 @@ def _require_browser_acceptance_execution_limits(plan: BrowserAcceptancePlanV1) 
     if suite is None:  # narrowed by BrowserAcceptancePlanV1
         raise RuntimeError("Browser acceptance plan lost its EvalSuite.")
     limits = plan.manifest.limits
-    browser_tool = _registered_browser_acceptance_tool(plan)
-    artifact_limit = getattr(browser_tool, "max_artifact_bytes", None)
-    operation_limit = getattr(browser_tool, "max_operations", None)
-    if (
-        type(artifact_limit) is not int
-        or artifact_limit > limits.max_artifact_bytes
-        or type(operation_limit) is not int
-        or operation_limit > limits.max_browser_operations
-    ):
-        raise ValueError("Browser acceptance tool limits exceed the manifest ceilings.")
+    _registered_browser_acceptance_tool(plan)
     maximum_model_steps = 0
     maximum_browser_operations = 0
+    maximum_artifact_bytes = 0
     maximum_input_tokens = 0
     maximum_output_tokens = 0
     pricing_fingerprint = (
@@ -1712,6 +2330,16 @@ def _require_browser_acceptance_execution_limits(plan: BrowserAcceptancePlanV1) 
     )
     common_live_app_budget: dict[str, Any] | None = None
     for eval_case in suite.cases:
+        browser_tool = _case_browser_bridge(plan, eval_case.id).tools[0]
+        artifact_limit = getattr(browser_tool, "max_artifact_bytes", None)
+        operation_limit = getattr(browser_tool, "max_operations", None)
+        if (
+            type(artifact_limit) is not int
+            or artifact_limit > limits.max_artifact_bytes
+            or type(operation_limit) is not int
+            or operation_limit > limits.max_browser_operations
+        ):
+            raise ValueError("Browser acceptance tool limits exceed the manifest ceilings.")
         request = eval_case.request
         run_limits = request.limits
         maximum_model_steps += request.max_steps * plan.manifest.trial_count
@@ -1723,13 +2351,16 @@ def _require_browser_acceptance_execution_limits(plan: BrowserAcceptancePlanV1) 
         ):
             raise ValueError("Browser acceptance request lacks its browser-operation ceiling.")
         maximum_browser_operations += run_limits.max_tool_calls * plan.manifest.trial_count
+        maximum_artifact_bytes += (
+            artifact_limit * run_limits.max_tool_calls * plan.manifest.trial_count
+        )
         maximum_seconds = max(1, (limits.max_wall_time_ms + 999) // 1_000)
         if (
             run_limits.max_elapsed_seconds is None
             or run_limits.max_elapsed_seconds > maximum_seconds
         ):
             raise ValueError("Browser acceptance request lacks its runtime wall-time ceiling.")
-        if plan.manifest.mode is not BrowserAcceptanceMode.LIVE_PUBLIC:
+        if plan.manifest.mode is BrowserAcceptanceMode.DETERMINISTIC:
             continue
         if (
             limits.max_input_tokens is None
@@ -1776,9 +2407,9 @@ def _require_browser_acceptance_execution_limits(plan: BrowserAcceptancePlanV1) 
         raise ValueError("Browser acceptance suite exceeds its aggregate model-step ceiling.")
     if maximum_browser_operations > limits.max_browser_operations:
         raise ValueError("Browser acceptance suite exceeds its aggregate operation ceiling.")
-    if artifact_limit * maximum_browser_operations > limits.max_artifact_bytes:
+    if maximum_artifact_bytes > limits.max_artifact_bytes:
         raise ValueError("Browser acceptance suite exceeds its aggregate artifact ceiling.")
-    if plan.manifest.mode is BrowserAcceptanceMode.LIVE_PUBLIC and (
+    if plan.manifest.mode is not BrowserAcceptanceMode.DETERMINISTIC and (
         limits.max_input_tokens is None
         or limits.max_output_tokens is None
         or maximum_input_tokens > limits.max_input_tokens
@@ -2006,10 +2637,12 @@ async def inspect_browser_acceptance_runtime_identity(
         raise RuntimeError("Browser acceptance plan lost its direct eval application.")
     _registered_browser_acceptance_tool(plan)
 
+    _require_authenticated_plan_authority(plan)
     case_profile_fingerprints: list[dict[str, str]] = []
     model_targets: set[tuple[str, str]] = set()
     environment_materials: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for eval_case in suite.cases:
+        app = _case_browser_app(plan, eval_case.id)
         manifest_case = next(
             (case for case in plan.manifest.cases if case.case_id == eval_case.id),
             None,
@@ -2056,6 +2689,7 @@ async def inspect_browser_acceptance_runtime_identity(
         egress = _require_browser_acceptance_egress_authority(
             plan.manifest,
             factory.egress_authority_identity,
+            plan.authenticated,
         )
         if candidate is None or authority is None:
             raise ValueError("Browser acceptance runtime identity is unavailable.")
@@ -2076,7 +2710,7 @@ async def inspect_browser_acceptance_runtime_identity(
         _identity_fingerprint(egress, "browser acceptance egress identity")
         for _, egress in environment_materials
     }
-    if len(runner_fingerprints) != 1 or len(egress_fingerprints) != 1:
+    if (len(runner_fingerprints) != 1 and not plan.case_apps) or len(egress_fingerprints) != 1:
         raise ValueError("Browser acceptance cases do not share one execution environment.")
     provider_name, model = next(iter(model_targets))
     workload_fingerprint = _identity_fingerprint(
@@ -2114,7 +2748,19 @@ async def inspect_browser_acceptance_runtime_identity(
         browser_worker_version=plan.bridge.browser_worker_version,
         playwright_version=plan.bridge.playwright_version,
         chromium_identity=_browser_identity_from_evidence(evidence_views, bridge=plan.bridge),
-        runner_fingerprint=next(iter(runner_fingerprints)),
+        runner_fingerprint=(
+            _identity_fingerprint(
+                {
+                    "case_runners": [
+                        {"case_id": case.id, "runner": material[0]}
+                        for case, material in zip(suite.cases, environment_materials, strict=True)
+                    ]
+                },
+                "browser acceptance case runners",
+            )
+            if plan.case_apps
+            else next(iter(runner_fingerprints))
+        ),
         workload_fingerprint=workload_fingerprint,
         egress_fingerprint=next(iter(egress_fingerprints)),
         artifact_store_fingerprint=artifact_store_fingerprint,
@@ -2579,6 +3225,8 @@ async def run_browser_acceptance(
 
     if type(plan) is not BrowserAcceptancePlanV1:
         raise TypeError("plan must be an exact BrowserAcceptancePlanV1.")
+    if not plan.manifest.enabled:
+        raise ValueError("The selected browser acceptance manifest is disabled.")
     loop = asyncio.get_running_loop()
     campaign_deadline = loop.time() + (plan.manifest.limits.max_wall_time_ms / 1_000)
     async with _exclusive_trial_journal(receipt_directory, deadline=campaign_deadline):
@@ -2741,6 +3389,7 @@ async def _run_browser_acceptance_locked(
     campaign_aborted = False
     campaign_abort_code = "campaign_aborted"
     for case in executable:
+        app = _case_browser_app(plan, case.case_id)
         eval_case = suite_cases[case.case_id]
         for trial_number in range(1, plan.manifest.trial_count + 1):
             key = (case.case_id, trial_number)
@@ -2766,6 +3415,31 @@ async def _run_browser_acceptance_locked(
                 rows.append(projected)
                 _persist_trial_receipt(projected, receipt_directory)
                 continue
+            if (
+                plan.manifest.mode is BrowserAcceptanceMode.DETERMINISTIC
+                and "required_operator_inputs" in case.oracle_parameters
+            ):
+                from cayu.evals.internal.browser_acceptance import (
+                    BrowserAcceptanceDeterministicProvider,
+                )
+
+                target = app.resolve_run_model_target(eval_case.request)
+                provider = app.get_provider(target.provider_name)
+                if (
+                    type(provider) is BrowserAcceptanceDeterministicProvider
+                    and provider.operator_fixture is None
+                ):
+                    projected = _uninitialized_trial_receipt(
+                        case=case,
+                        run_identity_revision=run_identity_revision,
+                        trial_number=trial_number,
+                        attempt_number=attempt_number,
+                        observed_at=datetime.now(UTC),
+                        error_code="operator_configuration_unavailable",
+                    )
+                    rows.append(projected)
+                    _persist_trial_receipt(projected, receipt_directory)
+                    continue
             _persist_trial_intent(
                 _BrowserAcceptanceTrialIntentV1.build(
                     run_identity_revision=run_identity_revision,
@@ -2781,15 +3455,25 @@ async def _run_browser_acceptance_locked(
             fixture_before = (
                 {} if deterministic_fixture is None else deterministic_fixture.request_counts()
             )
+            authenticated_before = (
+                _authenticated_site_count(plan)
+                if deterministic_fixture is None
+                else deterministic_fixture.authenticated_request_count()
+            )
             fault_evidence: BrowserAcceptanceFaultEvidenceV1 | None = None
             recovered_tool_calls: tuple[ToolCallEvidenceV1, ...] = ()
             execution_app = app
+            collector = plan.authentication_collector
+            authentication_samples: tuple[_AuthenticationSample, ...] = ()
+            if collector is not None:
+                collector._begin()
             try:
+                profile_before = await _inspect_case_profile(plan, case)
                 if case.fault_scenario is None:
                     trial_suite = EvalSuite(id=suite.id, cases=[eval_case], metadata=suite.metadata)
-                    if (
-                        plan.manifest.mode is BrowserAcceptanceMode.DETERMINISTIC
-                        and "upload" in case.operations
+                    if plan.manifest.mode is BrowserAcceptanceMode.DETERMINISTIC and (
+                        "upload" in case.operations
+                        or "required_operator_inputs" in case.oracle_parameters
                     ):
                         from cayu.evals.internal.browser_acceptance import bind_trial_session
 
@@ -2864,6 +3548,9 @@ async def _run_browser_acceptance_locked(
                 # Preserve every remaining row without dispatching another trial.
                 campaign_aborted = True
                 continue
+            finally:
+                if collector is not None:
+                    authentication_samples = collector._finish()
             started_at = (
                 trial_started_at if started_at is None else min(started_at, trial_started_at)
             )
@@ -2922,6 +3609,18 @@ async def _run_browser_acceptance_locked(
                 request_summaries, request_summaries_truncated = _request_summaries_from_trajectory(
                     trial
                 )
+                operator = (
+                    await _case_operator_evidence(
+                        execution_app,
+                        case,
+                        trial,
+                        expected_execution_profile_fingerprint=await app.inspect_run_execution_profile(
+                            eval_case.request
+                        ),
+                    )
+                    if "required_operator_inputs" in case.oracle_parameters
+                    else None
+                )
                 projected = project_browser_acceptance_trial(
                     case=case,
                     run_identity_revision=run_identity_revision,
@@ -2929,12 +3628,29 @@ async def _run_browser_acceptance_locked(
                     evidence=evidence,
                     fixture_route_observed=(None if route_count is None else route_count > 0),
                     fixture_route_request_count=route_count,
+                    fixture_authenticated_request_count=(
+                        None
+                        if authenticated_before is None
+                        else _authenticated_site_delta(plan, authenticated_before)
+                        if deterministic_fixture is None
+                        else deterministic_fixture.authenticated_request_count()
+                        - authenticated_before
+                    ),
                     fixture_effects=fixture_effects,
                     public_operations=public_operations,
                     request_summaries=request_summaries,
                     request_summaries_truncated=request_summaries_truncated,
                     agent_report_state=agent_state,
                     fault=fault_evidence,
+                    profile=await _case_profile_evidence(plan, case, profile_before),
+                    operator=operator,
+                    authentication_phases=(
+                        await _case_authentication_evidence(
+                            execution_app, trial, authentication_samples, operator
+                        )
+                        if collector is not None
+                        else ()
+                    ),
                     recovered_tool_calls=recovered_tool_calls,
                     attempt_number=attempt_number,
                     required_cost_currencies=plan.cost_currencies,
@@ -3123,12 +3839,16 @@ def project_browser_acceptance_diagnostic(
     *,
     fixture_route_observed: bool | None = None,
     fixture_route_request_count: int | None = None,
+    fixture_authenticated_request_count: int | None = None,
     browser_dispatches: int | None = None,
     fixture_effects: Mapping[str, int] | None = None,
     request_summaries: tuple[BrowserAcceptanceRequestSummaryV1, ...] = (),
     request_summaries_truncated: bool = False,
     capture_error_code: str | None = None,
     fault: BrowserAcceptanceFaultEvidenceV1 | None = None,
+    profile: BrowserAcceptanceProfileEvidenceV1 | None = None,
+    operator: BrowserAcceptanceOperatorEvidenceV1 | None = None,
+    authentication_phases: tuple[BrowserAcceptanceAuthenticationPhaseV1, ...] = (),
     recovered_tool_calls: tuple[ToolCallEvidenceV1, ...] = (),
 ) -> BrowserAcceptanceDiagnosticV1:
     """Project the already-bounded eval evidence into browser-only diagnostics."""
@@ -3265,6 +3985,14 @@ def project_browser_acceptance_diagnostic(
                 state=operation_state,
                 error_category=error_category,
                 allocation_disposition=allocation_disposition,
+                browser_session_revision=(
+                    _content_revision(
+                        {"session_id": structured["session_id"]},
+                        "browser acceptance browser session",
+                    )
+                    if type(structured.get("session_id")) is str
+                    else None
+                ),
                 target_revision=(
                     _content_revision(
                         {"url": arguments["url"]},
@@ -3323,8 +4051,12 @@ def project_browser_acceptance_diagnostic(
         fixture_route_request_count=fixture_route_request_count,
         browser_dispatches=browser_dispatches,
         fixture_effects={} if fixture_effects is None else dict(fixture_effects),
+        fixture_authenticated_request_count=fixture_authenticated_request_count,
         chromium_identity=next(iter(chromium_identities), None),
         fault=fault,
+        profile=profile,
+        operator=operator,
+        authentication_phases=authentication_phases,
         operations=tuple(operations),
         requests=owned_requests,
         truncated_categories=tuple(sorted(diagnostic_truncation)),
@@ -3555,6 +4287,110 @@ def _semantic_state(
         ):
             return BrowserAcceptanceSemanticState.FAILED
     parameters = case.oracle_parameters
+    if "required_operator_inputs" in parameters:
+        expected_inputs = parameters["required_operator_inputs"]
+        operator = diagnostic.operator
+        if (
+            type(expected_inputs) is not int
+            or expected_inputs < 1
+            or operator is None
+            or operator.state != "closed"
+            or operator.acquired_epoch is None
+            or operator.handed_back_epoch != operator.acquired_epoch + 1
+            or operator.control_epoch != operator.handed_back_epoch
+            or operator.acquisition_revision is None
+            or operator.handback_revision is None
+            or operator.fresh_observation_revision is None
+            or operator.settled_inputs != expected_inputs
+            or operator.input_pending
+            or operator.fresh_observation_required
+            or operator.sensitive_entry_pending
+            or operator.mutation_uncertain
+        ):
+            return BrowserAcceptanceSemanticState.FAILED
+        if "required_restored_observation_id" in parameters:
+            phases = diagnostic.authentication_phases
+            if (
+                tuple(item.phase for item in phases) != ("handback", "restoration")
+                or any(item.authenticated_requests < 1 for item in phases)
+                or phases[0].browser_session_revision != operator.browser_session_revision
+                or phases[1].browser_session_revision != operator.restored_browser_session_revision
+                or phases[0].observation_revision != operator.fresh_observation_revision
+                or phases[1].observation_revision != operator.restored_observation_revision
+            ):
+                return BrowserAcceptanceSemanticState.FAILED
+            operations = diagnostic.operations
+            protected_target = parameters.get("required_protected_observation_target")
+            if type(protected_target) is not str or not protected_target:
+                return BrowserAcceptanceSemanticState.FAILED
+            protected_revision = _content_revision(
+                {"url": protected_target}, "browser acceptance observed target"
+            )
+            if (
+                operator.restored_observation_revision is None
+                or operator.restored_browser_session_revision is None
+                or operator.restored_browser_session_revision == operator.browser_session_revision
+                or operator.restored_observation_revision == operator.fresh_observation_revision
+                or tuple(item.operation for item in operations)
+                != ("navigate", "observe", "close", "navigate", "observe", "close")
+                or tuple(item.browser_session_revision for item in operations)
+                != (operator.browser_session_revision,) * 3
+                + (operator.restored_browser_session_revision,) * 3
+                or any(
+                    item.state is not BrowserAcceptanceOperationState.TERMINAL
+                    or item.error_category is not None
+                    for item in operations
+                )
+                or any(
+                    operations[index].allocation_disposition
+                    is not BrowserAllocationDisposition.RETIRED
+                    for index in (2, 5)
+                )
+                or any(
+                    operations[index].observed_target_revision != protected_revision
+                    for index in (1, 4)
+                )
+                or parameters.get("required_distinct_browser_sessions") != 2
+                or "required_profile_checkpoint_delta" not in parameters
+                or "required_authenticated_requests" not in parameters
+            ):
+                return BrowserAcceptanceSemanticState.FAILED
+        elif {item.browser_session_revision for item in diagnostic.operations} != {
+            operator.browser_session_revision
+        }:
+            return BrowserAcceptanceSemanticState.FAILED
+    if "required_distinct_browser_sessions" in parameters:
+        expected_sessions = parameters["required_distinct_browser_sessions"]
+        sessions = {item.browser_session_revision for item in diagnostic.operations}
+        if (
+            type(expected_sessions) is not int
+            or expected_sessions < 1
+            or None in sessions
+            or len(sessions) != expected_sessions
+        ):
+            return BrowserAcceptanceSemanticState.FAILED
+    if "required_profile_checkpoint_delta" in parameters:
+        expected_delta = parameters["required_profile_checkpoint_delta"]
+        profile = diagnostic.profile
+        if (
+            type(expected_delta) is not int
+            or expected_delta < 1
+            or profile is None
+            or profile.generation_after - profile.generation_before != expected_delta
+            or profile.active_writer
+            or profile.status is not BrowserProfileStatus.AVAILABLE
+            or profile.cookie_count < 1
+            or profile.restore_receipt_revision is None
+            or profile.checkpoint_receipt_revision is None
+        ):
+            return BrowserAcceptanceSemanticState.FAILED
+    expected_authenticated_requests = parameters.get("required_authenticated_requests")
+    if "required_authenticated_requests" in parameters and (
+        type(expected_authenticated_requests) is not int
+        or expected_authenticated_requests < 1
+        or diagnostic.fixture_authenticated_request_count != expected_authenticated_requests
+    ):
+        return BrowserAcceptanceSemanticState.FAILED
     expected_observed_target = parameters.get("expected_observed_target")
     if expected_observed_target is not None:
         if type(expected_observed_target) is not str:
@@ -3769,6 +4605,7 @@ def project_browser_acceptance_trial(
     evidence: AssertionEvidenceView,
     fixture_route_observed: bool | None = None,
     fixture_route_request_count: int | None = None,
+    fixture_authenticated_request_count: int | None = None,
     fixture_effects: Mapping[str, int] | None = None,
     public_operations: frozenset[str] = frozenset(),
     request_summaries: tuple[BrowserAcceptanceRequestSummaryV1, ...] = (),
@@ -3778,6 +4615,9 @@ def project_browser_acceptance_trial(
     ),
     diagnostic_capture_error: str | None = None,
     fault: BrowserAcceptanceFaultEvidenceV1 | None = None,
+    profile: BrowserAcceptanceProfileEvidenceV1 | None = None,
+    operator: BrowserAcceptanceOperatorEvidenceV1 | None = None,
+    authentication_phases: tuple[BrowserAcceptanceAuthenticationPhaseV1, ...] = (),
     recovered_tool_calls: tuple[ToolCallEvidenceV1, ...] = (),
     attempt_number: int = 1,
     required_cost_currencies: tuple[str, ...] = (),
@@ -3798,12 +4638,16 @@ def project_browser_acceptance_trial(
         owned_evidence,
         fixture_route_observed=fixture_route_observed,
         fixture_route_request_count=fixture_route_request_count,
+        fixture_authenticated_request_count=fixture_authenticated_request_count,
         browser_dispatches=_browser_dispatches_from_trial(owned_trial),
         fixture_effects=fixture_effects,
         request_summaries=request_summaries,
         request_summaries_truncated=request_summaries_truncated,
         capture_error_code=diagnostic_capture_error,
         fault=fault,
+        profile=profile,
+        operator=operator,
+        authentication_phases=authentication_phases,
         recovered_tool_calls=recovered_tool_calls,
     )
     infrastructure_state = (
@@ -4176,6 +5020,24 @@ def browser_acceptance_report_from_json(source: str | bytes) -> BrowserAcceptanc
 
 def render_browser_acceptance_html(report: BrowserAcceptanceReportV1) -> str:
     validated = BrowserAcceptanceReportV1.model_validate(report)
+
+    def profile_summary(profile: BrowserAcceptanceProfileEvidenceV1 | None) -> str:
+        if profile is None:
+            return "—"
+        return html.escape(
+            f"{profile.store_kind}: {profile.generation_before} → {profile.generation_after}; "
+            f"{profile.status.value}; writer={'active' if profile.active_writer else 'released'}"
+        )
+
+    def operator_summary(operator: BrowserAcceptanceOperatorEvidenceV1 | None) -> str:
+        if operator is None:
+            return "—"
+        return html.escape(
+            f"{operator.state}; inputs={operator.settled_inputs}; "
+            f"epochs={operator.acquired_epoch} → {operator.handed_back_epoch}; "
+            f"restored observation={'recorded' if operator.restored_observation_revision else 'absent'}"
+        )
+
     rows = "".join(
         "<tr>"
         f"<td>{html.escape(row.case_id)}</td>"
@@ -4186,6 +5048,10 @@ def render_browser_acceptance_html(report: BrowserAcceptanceReportV1) -> str:
         f"<td>{html.escape(row.conformance.value)}</td>"
         f"<td>{row.usage.browser_operations}</td>"
         f"<td>{row.elapsed_ms}</td>"
+        f"<td>{row.diagnostic.fixture_authenticated_request_count if row.diagnostic.fixture_authenticated_request_count is not None else '—'}</td>"
+        f"<td>{profile_summary(row.diagnostic.profile)}</td>"
+        f"<td>{operator_summary(row.diagnostic.operator)}</td>"
+        f"<td>{html.escape(', '.join(f'{item.phase}: {item.authenticated_requests}' for item in row.diagnostic.authentication_phases)) or '—'}</td>"
         "</tr>"
         for row in validated.rows
     )
@@ -4196,7 +5062,9 @@ def render_browser_acceptance_html(report: BrowserAcceptanceReportV1) -> str:
         f"<p>Overall: <strong>{html.escape(validated.aggregate.overall_status.value)}</strong></p>"
         "<table><thead><tr><th>Case</th><th>Trial</th><th>Expected</th>"
         "<th>Observed</th><th>Semantic</th><th>Conformance</th>"
-        "<th>Browser operations</th><th>Elapsed ms</th></tr></thead>"
+        "<th>Browser operations</th><th>Elapsed ms</th>"
+        "<th>Authenticated fixture requests</th><th>Profile checkpoint</th>"
+        "<th>Operator handoff</th><th>Phase authentication</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
     )
     if len(document.encode("utf-8")) > BROWSER_ACCEPTANCE_HTML_MAX_BYTES:
@@ -4291,6 +5159,7 @@ __all__ = [
     "BrowserAcceptanceAgentReportState",
     "BrowserAcceptanceAggregateV1",
     "BrowserAcceptanceArtifactEvidenceV1",
+    "BrowserAcceptanceAuthenticationPhaseV1",
     "BrowserAcceptanceCaseAggregateV1",
     "BrowserAcceptanceCaseCategory",
     "BrowserAcceptanceCaseV1",
@@ -4306,7 +5175,9 @@ __all__ = [
     "BrowserAcceptanceMode",
     "BrowserAcceptanceOperationEvidenceV1",
     "BrowserAcceptanceOperationState",
+    "BrowserAcceptanceOperatorEvidenceV1",
     "BrowserAcceptancePlanV1",
+    "BrowserAcceptanceProfileEvidenceV1",
     "BrowserAcceptanceReportV1",
     "BrowserAcceptanceRequestSummaryV1",
     "BrowserAcceptanceRuntimeIdentityV1",

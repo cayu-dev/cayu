@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
@@ -100,3 +102,40 @@ def test_browser_acceptance_fixture_preserves_redirect_and_bounded_artifact_shap
     assert artifact.status == 200
     assert artifact.headers["content-disposition"] == 'attachment; filename="report.txt"'
     assert artifact.read() == b"bounded browser acceptance download\n"
+
+
+@pytest.mark.parametrize("change", ["detached", "replaced"])
+def test_action_mutation_requires_release_and_separate_page_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    monkeypatch.setattr(fixture_module, "_fixture_address", lambda: "127.0.0.1")
+    with BrowserAcceptanceFixtureV1() as fixture:
+        fixture.prepare_visual_change(change)
+        page = _fetch(fixture, f"/{change}").read()
+        assert b"setTimeout" not in page
+        assert b"if(!response.ok)return" in page
+        assert f"/visual-gate/{change}".encode() in page
+        assert f"/visual-applied/{change}".encode() in page
+        entered = Event()
+        gate = fixture._visual_gates[change]
+        original_wait = gate.wait
+
+        def wait(timeout=None):
+            entered.set()
+            return original_wait(timeout)
+
+        monkeypatch.setattr(gate, "wait", wait)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(_fetch, fixture, f"/visual-gate/{change}")
+            try:
+                assert entered.wait(1)
+                assert not pending.done()
+                assert not fixture.visual_change_applied(change)
+            finally:
+                fixture.release_visual_change(change)
+            assert pending.result(timeout=2).status == 200
+        assert not fixture.visual_change_applied(change)
+        assert _fetch(fixture, f"/visual-applied/{change}").status == 204
+        assert fixture.visual_change_applied(change)
+        fixture.prepare_visual_change(change)
+        assert not fixture.visual_change_applied(change)

@@ -12,14 +12,15 @@ import json
 import multiprocessing
 import os
 import secrets
+import shlex
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from itertools import pairwise
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import SecretStr
 
@@ -46,6 +47,13 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import canonical_durable_json_bytes
+from cayu.browser_profiles import (
+    AESGCMBrowserProfileKeyAuthority,
+    BrowserProfileBinding,
+    BrowserProfileDestinationPolicy,
+    BrowserProfileScope,
+    InMemoryBrowserProfileStore,
+)
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import TextPart, ToolResultPart
@@ -99,6 +107,8 @@ from cayu.runtime.sessions import (
 )
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.browser_session import (
+    BROWSER_SESSION_PROTOCOL_VERSION,
+    BROWSER_SESSION_WORKER_VERSION,
     BrowserBackendFailure,
     BrowserBackendResponse,
     BrowserSessionTool,
@@ -106,7 +116,11 @@ from cayu.tools.browser_session import (
 )
 from cayu.vaults import SecretRedactor
 
+if TYPE_CHECKING:
+    from cayu.evals.internal.browser_acceptance_operator import OperatorFixtureBinding
+
 _AGENT = "browser-acceptance"
+_PROFILE_AGENT = "browser-acceptance-profile"
 _MODEL = "browser-acceptance-deterministic-v1"
 _POLICY = "browser-acceptance"
 _PLANNER_REVISION = _content_revision(
@@ -114,7 +128,7 @@ _PLANNER_REVISION = _content_revision(
         "version": 3,
         "case_prompt": "browser acceptance case: <case-id>",
         "selection": "accessible-name exact first match",
-        "detached_element_settlement_ms": 3_000,
+        "action_mutation": "gated after observation; positive page acknowledgement",
         "browser_crash_wait_ms": 2_000,
         "visual_selection": "retained visual target; bounded fixture-gated mutations",
         "upload_fixture": "session-scoped content-bound artifact reference",
@@ -306,8 +320,14 @@ class _FaultControl:
 class _FaultSQLiteSessionStore(SQLiteSessionStore):
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
 
-    def __init__(self, path: Path, *, control: _FaultControl | None) -> None:
-        codec = None
+    def __init__(
+        self,
+        path: Path,
+        *,
+        control: _FaultControl | None,
+        public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+    ) -> None:
+        codec = public_authority_alias_codec
         if (
             control is not None
             and control.scenario is BrowserAcceptanceFaultScenario.SECRET_BEFORE_CAPTURE
@@ -403,8 +423,17 @@ class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
         self._cases = dict(cases)
         self._artifact_store = artifact_store
         self._acceptance_temporary_directory: TemporaryDirectory[str] | None = None
-        self.execution_revision = _PLANNER_REVISION
         self.visual_fixture: BrowserAcceptanceFixtureV1 | None = None
+        self.operator_fixture: OperatorFixtureBinding | None = None
+
+    @property
+    def execution_revision(self) -> str:
+        if self.operator_fixture is None:
+            return _PLANNER_REVISION
+        return _content_revision(
+            {"planner": _PLANNER_REVISION, "operator": self.operator_fixture.authority_revision},
+            "browser acceptance operator planner",
+        )
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
@@ -420,10 +449,21 @@ class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
             raise RuntimeError("Browser acceptance request does not name a canonical case.")
         results = _browser_results(request)
         operation_index = len(results)
+        if case_id == "operator-private-handoff":
+            if self.operator_fixture is None:
+                raise RuntimeError("Canonical operator case requires its protected server binding.")
+            if operation_index == 1:
+                await self.operator_fixture.handoff(
+                    session_id=_parent_session_id(request),
+                    browser_session_id=results[0]["session_id"],
+                )
         change = {
             "visual-virtualized-movement": "moved",
             "visual-sticky-overlay": "overlay",
             "visual-viewport-scroll-change": "scroll",
+            "action-detached-control": "detached",
+            "action-hover-detached": "detached",
+            "action-replaced-element": "replaced",
         }.get(case_id)
         if change is not None:
             fixture = self.visual_fixture
@@ -431,7 +471,7 @@ class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
                 raise RuntimeError("Visual mutation scenario has no owned fixture.")
             if operation_index == 0:
                 fixture.prepare_visual_change(change)
-            elif operation_index == 2:
+            elif operation_index == (1 if change in {"detached", "replaced"} else 2):
                 fixture.release_visual_change(change)
                 async with asyncio.timeout(5):
                     while not fixture.visual_change_applied(change):
@@ -441,12 +481,6 @@ class BrowserAcceptanceDeterministicProvider(ScriptedModelProvider):
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
         operation = case.operations[operation_index]
-        if operation_index == 1 and case_id in {
-            "action-detached-control",
-            "action-replaced-element",
-            "action-hover-detached",
-        }:
-            await asyncio.sleep(3)
         upload_artifact_id: str | None = None
         if operation == "upload":
             parent_session_id = _parent_session_id(request)
@@ -871,6 +905,8 @@ def _operation_arguments(
         operation_id = f"{case_id}:1:navigate"
     if operation == "navigate":
         route = fixture_route or "/basic"
+        if case_id == "profile-cookie-restoration" and operation_index == 2:
+            route = "/auth/account"
         if case_id == "recovery-conflicting-operation-id" and operation_index == 1:
             route = "/forms"
         url = route if route.startswith("https://") else f"https://docs.browser.test{route}"
@@ -916,7 +952,7 @@ def _operation_arguments(
         arguments["expected_control_epoch"] = control_epoch
     if operation in {"click_visual_target", "click_visual_point"}:
         visual = state.get("visual")
-        if not isinstance(visual, dict) or not visual.get("targets"):
+        if not isinstance(visual, Mapping) or not visual.get("targets"):
             raise RuntimeError("Browser acceptance observation lacks its visual target.")
         arguments["visual_revision"] = visual["visual_revision"]
         target = visual["targets"][0]
@@ -1040,7 +1076,7 @@ def _case_request(case: Any, *, session_id: str | None = None) -> RunRequest:
     manifest = deterministic_browser_acceptance_manifest()
     return RunRequest(
         session_id=session_id,
-        agent_name=_AGENT,
+        agent_name=_PROFILE_AGENT if case.case_id == "profile-cookie-restoration" else _AGENT,
         messages=[
             Message.text(
                 "user",
@@ -1064,20 +1100,38 @@ def _build_runtime(
     cases: dict[str, Any],
     seccomp_profile: Path,
     control: _FaultControl | None,
+    operator_fixture: OperatorFixtureBinding | None = None,
+    control_server_container_id: str | None = None,
 ) -> tuple[CayuApp, WebBridge, BrowserAcceptanceDeterministicProvider]:
     root.mkdir(parents=True, exist_ok=True)
     artifact_store = _FaultArtifactStore(root / "artifacts", control=control)
     provider = BrowserAcceptanceDeterministicProvider(cases, artifact_store)
-    store = _FaultSQLiteSessionStore(root / "sessions.sqlite", control=control)
+    store = _FaultSQLiteSessionStore(
+        root / "sessions.sqlite",
+        control=control,
+        public_authority_alias_codec=(
+            None
+            if operator_fixture is None
+            else PublicAuthorityAliasCodec(
+                PublicAuthorityAliasKeyring(
+                    active_key_id="browser-operator-acceptance",
+                    keys={"browser-operator-acceptance": SecretStr(secrets.token_urlsafe(32))},
+                )
+            )
+        ),
+    )
     artifact_store = _FaultArtifactStore(root / "artifacts", control=control)
     app = CayuApp(
         session_store=store,
         event_sinks=[_AcceptanceEventJournalSink(root / _OBSERVED_EVENTS_FILENAME)],
         enable_logging=False,
+        browser_control=None if operator_fixture is None else operator_fixture.control,
         secret_redactor=(
             SecretRedactor(["browser-acceptance-private-pixel-canary"])
             if control is not None
             and control.scenario is BrowserAcceptanceFaultScenario.SECRET_BEFORE_CAPTURE
+            else SecretRedactor([operator_fixture.private_text.get_secret_value()])
+            if operator_fixture is not None
             else None
         ),
     )
@@ -1093,10 +1147,30 @@ def _build_runtime(
         approved_destinations=tuple(
             ApprovedEgressDestination(destination=host, policy_name=_POLICY) for host in hosts
         ),
-        adapter=DockerEgressAdapter(seccomp_profile=str(seccomp_profile)),
+        adapter=DockerEgressAdapter(
+            seccomp_profile=str(seccomp_profile),
+            control_server_container_id=(
+                control_server_container_id
+                if operator_fixture is None
+                else operator_fixture.server_container_id
+            ),
+        ),
         upstream=HttpxUpstream(routes=upstream_routes),
         image=PINNED_BROWSER_SESSION_WORKLOAD.image,
         artifact_store=artifact_store,
+        host_workspace_path=(
+            None if operator_fixture is None else str(operator_fixture.ca_certificate.parent)
+        ),
+        setup_commands=(
+            ()
+            if operator_fixture is None
+            else (
+                "cp "
+                + shlex.quote(str(operator_fixture.ca_certificate))
+                + " /usr/local/share/ca-certificates/cayu-acceptance-control.crt"
+                + " && update-ca-certificates",
+            )
+        ),
         event_emitter=app.scoped_event_emitter(event_types=VIRTUAL_EGRESS_EVENT_TYPES),
         execution_profile_identity=_ENVIRONMENT_EXECUTION_PROFILE_IDENTITY,
     )
@@ -1653,6 +1727,7 @@ def _process_scenario_worker(
     seccomp_value: str,
     scenario_value: str,
     session_id: str,
+    control_server_container_id: str | None = None,
 ) -> None:
     async def execute() -> None:
         from cayu.evals.browser_acceptance import BrowserAcceptanceCaseV1
@@ -1671,6 +1746,7 @@ def _process_scenario_worker(
             cases={case.case_id: case},
             seccomp_profile=Path(seccomp_value),
             control=control,
+            control_server_container_id=control_server_container_id,
         )
         await _consume_run(
             app,
@@ -1682,7 +1758,7 @@ def _process_scenario_worker(
 
 
 _ProcessScenarioWorker = Callable[
-    [str, dict[str, str], tuple[str, ...], dict[str, Any], str, str, str],
+    [str, dict[str, str], tuple[str, ...], dict[str, Any], str, str, str, str | None],
     None,
 ]
 
@@ -1697,6 +1773,7 @@ class _DeterministicScenarioExecutor:
         cases: dict[str, Any],
         seccomp_profile: Path,
         process_worker: _ProcessScenarioWorker = _process_scenario_worker,
+        control_server_container_id: str | None = None,
     ) -> None:
         self._root = root
         self._upstream_routes = dict(upstream_routes)
@@ -1704,6 +1781,7 @@ class _DeterministicScenarioExecutor:
         self._cases = cases
         self._seccomp_profile = seccomp_profile
         self._process_worker = process_worker
+        self._control_server_container_id = control_server_container_id
 
     async def __call__(
         self,
@@ -1734,6 +1812,7 @@ class _DeterministicScenarioExecutor:
                     str(self._seccomp_profile),
                     scenario.value,
                     session_id,
+                    self._control_server_container_id,
                 ),
             )
             try:
@@ -1756,6 +1835,7 @@ class _DeterministicScenarioExecutor:
                 cases={case.case_id: case},
                 seccomp_profile=self._seccomp_profile,
                 control=None,
+                control_server_container_id=self._control_server_container_id,
             )
             parent_run_epoch = await _active_parent_run_epoch(app, session_id)
             recovery = await _recover_scenario(app, session_id)
@@ -1769,6 +1849,7 @@ class _DeterministicScenarioExecutor:
                 cases={case.case_id: case},
                 seccomp_profile=self._seccomp_profile,
                 control=control,
+                control_server_container_id=self._control_server_container_id,
             )
             run_task = asyncio.create_task(
                 _consume_run(
@@ -1893,11 +1974,23 @@ class _DeterministicScenarioExecutor:
         )
 
 
-async def build(fixture: BrowserAcceptanceFixtureV1) -> BrowserAcceptancePlanV1:
+async def build(
+    fixture: BrowserAcceptanceFixtureV1,
+    *,
+    profile_binding: BrowserProfileBinding | None = None,
+    operator_fixture: OperatorFixtureBinding | None = None,
+) -> BrowserAcceptancePlanV1:
     """Build the exact local/Docker deterministic acceptance plan."""
 
     if type(fixture) is not BrowserAcceptanceFixtureV1:
         raise TypeError("fixture must be Cayu's exact BrowserAcceptanceFixtureV1.")
+    if profile_binding is not None and type(profile_binding) is not BrowserProfileBinding:
+        raise TypeError("profile_binding must be an exact BrowserProfileBinding.")
+    if operator_fixture is not None:
+        from cayu.evals.internal.browser_acceptance_operator import OperatorFixtureBinding
+
+        if type(operator_fixture) is not OperatorFixtureBinding:
+            raise TypeError("operator_fixture must be an exact OperatorFixtureBinding.")
     manifest = deterministic_browser_acceptance_manifest()
     executable = tuple(
         case for case in manifest.cases if case.expected_state.value != "unsupported"
@@ -1905,6 +1998,12 @@ async def build(fixture: BrowserAcceptanceFixtureV1) -> BrowserAcceptancePlanV1:
     cases = {case.case_id: case for case in executable}
     temporary_directory = TemporaryDirectory(prefix="cayu-browser-acceptance-")
     temporary_root = Path(temporary_directory.name)
+    if operator_fixture is not None:
+        public_trust = temporary_root / "operator-trust"
+        public_trust.mkdir()
+        certificate = public_trust / "control.crt"
+        certificate.write_bytes(operator_fixture.public_ca_pem())
+        operator_fixture = replace(operator_fixture, ca_certificate=certificate)
     root = Path(__file__).resolve().parents[4]
     seccomp_profile = root / "examples" / "browser_fetch" / "seccomp_profile.json"
     if not seccomp_profile.is_file():
@@ -1916,9 +2015,54 @@ async def build(fixture: BrowserAcceptanceFixtureV1) -> BrowserAcceptancePlanV1:
         cases=cases,
         seccomp_profile=seccomp_profile,
         control=None,
+        operator_fixture=operator_fixture,
     )
     provider._acceptance_temporary_directory = temporary_directory
     provider.visual_fixture = fixture
+    provider.operator_fixture = operator_fixture
+    ordinary_app, ordinary_bridge = app, bridge
+    if operator_fixture is not None:
+        ordinary_app, ordinary_bridge, ordinary_provider = _build_runtime(
+            root=temporary_root / "unprofiled",
+            upstream_routes=fixture.upstream_routes,
+            hosts=fixture.hosts,
+            cases=cases,
+            seccomp_profile=seccomp_profile,
+            control=None,
+            control_server_container_id=operator_fixture.server_container_id,
+        )
+        ordinary_provider.visual_fixture = fixture
+        ordinary_provider._acceptance_temporary_directory = temporary_directory
+    # The default local fixture owns no persistent credentials. Callers selecting
+    # a durable profile store retain that store's lifetime and must close it only
+    # after browser/environment cleanup has quiesced.
+    profile = profile_binding or BrowserProfileBinding.build(
+        scope=BrowserProfileScope.build(
+            application_id="browser-acceptance", tenant_id="fixture", sharing_scope="corpus-v1"
+        ),
+        destination_policy=BrowserProfileDestinationPolicy.build(("https://docs.browser.test",)),
+        browser_protocol=BROWSER_SESSION_PROTOCOL_VERSION,
+        browser_worker_version=BROWSER_SESSION_WORKER_VERSION,
+        store=InMemoryBrowserProfileStore(store_id="browser-acceptance-profiles"),
+        key_authority=AESGCMBrowserProfileKeyAuthority(
+            authority_id="browser-acceptance-fixture-key", key=secrets.token_bytes(32)
+        ),
+        profile_id="bprof_browser_acceptance_fixture",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    await profile.initialize()
+    profile_bridge = WebBridge.sandboxed_browser(
+        environment=ordinary_app.get_environment_factory("browser"),
+        browser_image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+        interactive=True,
+        browser_profile=profile,
+        interactive_options={
+            "max_artifact_bytes": DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION,
+            "max_operations": 4,
+            "max_sessions": 1,
+        },
+    )
+    profile_bridge.register_agent(ordinary_app, AgentSpec(name=_PROFILE_AGENT, model=_MODEL))
     suite = EvalSuite(
         id=manifest.suite_id,
         cases=[
@@ -1935,6 +2079,33 @@ async def build(fixture: BrowserAcceptanceFixtureV1) -> BrowserAcceptancePlanV1:
         manifest=manifest,
         eval_plan=EvalPlan(app=app, suite=suite),
         bridge=bridge,
+        case_bridges=(
+            tuple(
+                (case.case_id, profile_bridge)
+                for case in executable
+                if case.case_id == "profile-cookie-restoration"
+            )
+            if operator_fixture is None
+            else tuple(
+                (
+                    case.case_id,
+                    profile_bridge
+                    if case.case_id == "profile-cookie-restoration"
+                    else ordinary_bridge,
+                )
+                for case in executable
+                if case.case_id != "operator-private-handoff"
+            )
+        ),
+        case_apps=(
+            ()
+            if operator_fixture is None
+            else tuple(
+                (case.case_id, ordinary_app)
+                for case in executable
+                if case.case_id != "operator-private-handoff"
+            )
+        ),
         scenario_executor_revision=_SCENARIO_EXECUTOR_REVISION,
         scenario_executor=_DeterministicScenarioExecutor(
             root=temporary_root / "scenarios",
@@ -1942,6 +2113,9 @@ async def build(fixture: BrowserAcceptanceFixtureV1) -> BrowserAcceptancePlanV1:
             hosts=fixture.hosts,
             cases=cases,
             seccomp_profile=seccomp_profile,
+            control_server_container_id=(
+                None if operator_fixture is None else operator_fixture.server_container_id
+            ),
         ),
     )
 

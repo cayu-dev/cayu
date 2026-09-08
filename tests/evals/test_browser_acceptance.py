@@ -497,6 +497,7 @@ def test_checked_browser_manifests_cover_required_categories_and_modes() -> None
     live = live_public_browser_acceptance_manifest()
     authenticated = live_authenticated_browser_acceptance_manifest()
 
+    assert deterministic.limits.max_wall_time_ms == 1_200_000
     assert {case.category for case in deterministic.cases} >= set(BrowserAcceptanceCaseCategory)
     assert {case.expected_state for case in deterministic.cases} >= {
         BrowserAcceptanceState.PASSED,

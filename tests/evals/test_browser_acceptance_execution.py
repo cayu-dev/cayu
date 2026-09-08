@@ -43,6 +43,7 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     SQLiteBrowserProfileStore,
+    ToolResult,
     VirtualEgressEnvironmentFactory,
     WebBridge,
 )
@@ -187,7 +188,7 @@ class _ProtocolBrowserRunner(Runner):
         if urlsplit(page["url"]).path == "/upload":
             names += ("Upload file",)
         page["ref_count"] += len(names)
-        refs = [
+        refs: list[dict[str, Any]] = [
             {
                 "ref": "ref_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:16],
                 "role": "textbox" if name in {"Account", "Frame value", "Name"} else "button",
@@ -545,6 +546,7 @@ class _ProtocolBrowserRunner(Runner):
                 "selected_file_count": 1,
             }
             upstream = urlsplit(self._upstream_origin)
+            assert upstream.hostname is not None
             connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=2)
             try:
                 connection.request("GET", "/effect/upload-selected")
@@ -657,6 +659,7 @@ def _run_protocol_process_scenario(
     seccomp_value: str,
     scenario_value: str,
     session_id: str,
+    control_server_container_id: str | None = None,
 ) -> None:
     internal_acceptance.DockerEgressAdapter = (  # ty: ignore[invalid-assignment]
         lambda **kwargs: _ProtocolEgressAdapter(upstream_origin)
@@ -669,6 +672,7 @@ def _run_protocol_process_scenario(
         seccomp_value,
         scenario_value,
         session_id,
+        control_server_container_id,
     )
 
 
@@ -810,13 +814,13 @@ def _run_browser_profile_acceptance_process(
                 )
             )
         ]
-        if not events or events[-1].type.value != "session.completed":
+        if not events or events[-1].type != "session.completed":
             raise AssertionError("browser profile acceptance session did not complete")
         terminal_tool = next(
             (
                 event
                 for event in events
-                if event.type.value in {"tool.call.completed", "tool.call.failed"}
+                if event.type in {"tool.call.completed", "tool.call.failed"}
             ),
             None,
         )
@@ -850,7 +854,9 @@ def _block_process_scenario_until_killed(
     seccomp_value: str,
     scenario_value: str,
     session_id: str,
+    control_server_container_id: str | None = None,
 ) -> None:
+    del control_server_container_id
     del upstream_routes, hosts, case_document, seccomp_value, scenario_value, session_id
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     root = Path(root_value)
@@ -883,6 +889,8 @@ def _plan(
     navigation_url: str = "https://docs.browser.test/basic",
     provider_type: type[ScriptedModelProvider] = ScriptedModelProvider,
     repetitions: int = 1,
+    environment_profile_identity=None,
+    session_store=None,
 ) -> BrowserAcceptancePlanV1:
     executable = BrowserAcceptanceCaseV1.build(
         case_id="navigation",
@@ -975,6 +983,7 @@ def _plan(
             for host in factory_hosts
         ),
         adapter=_ProtocolEgressAdapter(fixture.upstream_origin),
+        execution_profile_identity=environment_profile_identity,
         upstream=HttpxUpstream(routes=fixture.upstream_routes),
         image=PINNED_BROWSER_SESSION_WORKLOAD.image,
         artifact_store=artifact_store,
@@ -985,7 +994,7 @@ def _plan(
         interactive=True,
         interactive_options={"max_artifact_bytes": 1 << 20, "max_operations": 4},
     )
-    app = CayuApp(enable_logging=False)
+    app = CayuApp(enable_logging=False, session_store=session_store)
     app.register_provider(provider, default=True)
     app.register_environment_factory(
         EnvironmentSpec(name="browser"),
@@ -1574,6 +1583,46 @@ def test_deterministic_planner_emits_closed_scroll_hover_and_upload_arguments() 
     assert upload["artifact_ids"] == ["art_0123456789abcdef0123456789abcdef"]
 
 
+@pytest.mark.parametrize("operation", ["click_visual_target", "click_visual_point"])
+def test_visual_recovery_preserves_authority_from_read_only_result(operation: str) -> None:
+    state = {
+        "session_id": "browser-session",
+        "page_id": "browser-page",
+        "revision": "revision-1",
+        "control_epoch": 3,
+        "visual": {
+            "visual_revision": "visual-revision-1",
+            "screenshot_sha256": "a" * 64,
+            "targets": [
+                {"ref": "visual-ref", "geometry": {"x": 10, "y": 20, "width": 8, "height": 6}}
+            ],
+        },
+    }
+    result = ToolResult(structured=state)
+    assert result.structured is not None
+    arguments = {
+        "case_id": "visual-process-terminal-replay",
+        "operation": operation,
+        "operation_index": 2,
+        "fixture_route": "/visual-popup",
+    }
+    plain = internal_acceptance._operation_arguments(**arguments, results=(state,))
+    frozen = internal_acceptance._operation_arguments(
+        **arguments, results=(dict(result.structured),)
+    )
+    assert frozen == plain
+    assert frozen["expected_control_epoch"] == 3
+    assert frozen["visual_revision"] == "visual-revision-1"
+    if operation == "click_visual_target":
+        assert frozen["visual_ref"] == "visual-ref"
+    else:
+        assert (frozen["x"], frozen["y"], frozen["screenshot_sha256"]) == (14, 23, "a" * 64)
+    with pytest.raises(RuntimeError, match="lacks its visual target"):
+        internal_acceptance._operation_arguments(
+            **arguments, results=({**state, "visual": {"targets": []}},)
+        )
+
+
 def test_deterministic_planner_uses_browser_history_operations_not_navigation_substitutes() -> None:
     initial = internal_acceptance._operation_arguments(
         case_id="navigation-history-forward",
@@ -1661,7 +1710,10 @@ def test_cayu_owned_fault_executor_delivers_real_task_cancellation(
         assert plan.eval_plan.suite is not None
         eval_case = next(item for item in plan.eval_plan.suite.cases if item.id == case_id)
         assert eval_case.request.limits is not None
-        assert eval_case.request.limits.max_elapsed_seconds == 900
+        assert (
+            eval_case.request.limits.max_elapsed_seconds
+            == plan.manifest.limits.max_wall_time_ms // 1000
+        )
         assert (
             result.execution_profile_fingerprint
             == await plan.eval_plan.app.inspect_run_execution_profile(eval_case.request)
@@ -2340,7 +2392,7 @@ def test_live_browser_acceptance_rejects_split_app_budget_authorities_before_dis
             manifest=manifest,
             eval_plan=EvalPlan(
                 app=source.eval_plan.app,
-                suite=EvalSuite(id=manifest.suite_id, cases=suite_cases),
+                suite=EvalSuite(id=manifest.suite_id, cases=list(suite_cases)),
             ),
             bridge=source.bridge,
             pricing=pricing,
@@ -2378,7 +2430,7 @@ def test_live_browser_acceptance_rejects_split_app_budget_authorities_before_dis
             manifest=manifest,
             eval_plan=EvalPlan(
                 app=source.eval_plan.app,
-                suite=EvalSuite(id=manifest.suite_id, cases=distinct_authority_cases),
+                suite=EvalSuite(id=manifest.suite_id, cases=list(distinct_authority_cases)),
             ),
             bridge=source.bridge,
             pricing=pricing,

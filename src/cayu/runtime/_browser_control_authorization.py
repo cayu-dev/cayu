@@ -33,6 +33,10 @@ class BrowserControlRevisionChanged(BrowserControlConflict):
     """A validated record positively proves that a read request is stale."""
 
 
+class BrowserControlInputRejected(BrowserControlConflict):
+    """Validated live authority refuses input before any admission publication."""
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class AuthorizedBrowserControl:
     """Runtime-owned exact permission, never serialized as a client capability."""

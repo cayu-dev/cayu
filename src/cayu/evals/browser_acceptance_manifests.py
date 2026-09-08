@@ -13,6 +13,7 @@ from cayu.evals.browser_acceptance import (
     BrowserAcceptanceSemanticOracle,
     BrowserAcceptanceState,
 )
+from cayu.evals.browser_acceptance_authenticated import BrowserAcceptanceAuthenticatedConfigV1
 from cayu.evals.browser_acceptance_fixture import BROWSER_ACCEPTANCE_FIXTURE_REVISION
 from cayu.evals.corpus import _content_revision
 
@@ -97,6 +98,33 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
     cases = tuple(
         sorted(
             (
+                _case(
+                    "operator-private-handoff",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "observe", "close"),
+                    route="/auth/operator",
+                    oracle=BrowserAcceptanceSemanticOracle.FIXTURE_EFFECT,
+                    parameters={
+                        "required_operations": ["navigate", "observe", "close"],
+                        "required_operator_inputs": 2,
+                        "required_operator_observation_id": "operator-private-handoff:2:observe",
+                        "expected_effects": {"operator-input": 1},
+                        "allocation_disposition": "retired",
+                    },
+                ),
+                _case(
+                    "profile-cookie-restoration",
+                    category=BrowserAcceptanceCaseCategory.SUCCESS,
+                    operations=("navigate", "close", "navigate", "close"),
+                    route="/auth/login",
+                    parameters={
+                        "required_operations": ["navigate", "close", "navigate", "close"],
+                        "required_authenticated_requests": 1,
+                        "required_distinct_browser_sessions": 2,
+                        "required_profile_checkpoint_delta": 2,
+                        "allocation_disposition": "retired",
+                    },
+                ),
                 _case(
                     "access-broker-denial",
                     category=BrowserAcceptanceCaseCategory.REFUSAL,
@@ -1064,7 +1092,7 @@ def deterministic_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
                 for case in cases
                 if case.expected_state is not BrowserAcceptanceState.UNSUPPORTED
             ),
-            max_wall_time_ms=900_000,
+            max_wall_time_ms=1_200_000,
             max_artifact_bytes=(
                 DETERMINISTIC_BROWSER_ACCEPTANCE_MAX_ARTIFACT_BYTES_PER_OPERATION
                 * sum(
@@ -1129,8 +1157,66 @@ def live_public_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
     )
 
 
-def live_authenticated_browser_acceptance_manifest() -> BrowserAcceptanceManifestV1:
-    """Return the disabled v1 authenticated-suite capability declaration."""
+def live_authenticated_browser_acceptance_manifest(
+    authorized: BrowserAcceptanceAuthenticatedConfigV1 | None = None,
+) -> BrowserAcceptanceManifestV1:
+    """Default off; explicit application authority selects one bounded login trial."""
+
+    if authorized is not None:
+        if type(authorized) is not BrowserAcceptanceAuthenticatedConfigV1:
+            raise TypeError("Authenticated acceptance requires exact application configuration.")
+        from cayu._validation import revalidate_model_input
+
+        config = revalidate_model_input(authorized, BrowserAcceptanceAuthenticatedConfigV1)
+        flow = ("navigate", "observe", "close", "navigate", "observe", "close")
+        case = _case(
+            "authenticated-profile-restoration",
+            category=BrowserAcceptanceCaseCategory.SUCCESS,
+            operations=flow,
+            route=config.origin + config.login_path,
+            parameters={
+                "required_operations": list(flow),
+                "required_operator_inputs": config.operator_inputs,
+                "required_operator_observation_id": "acceptance-post-handback",
+                "required_restored_observation_id": "acceptance-restored",
+                "required_protected_observation_target": config.origin + config.protected_path,
+                "required_distinct_browser_sessions": 2,
+                "required_profile_checkpoint_delta": 2,
+                "required_authenticated_requests": 2,
+                "authentication_evidence": "allocation-phase-v1",
+                "allocation_disposition": "retired",
+                "forbidden_operations": [
+                    "screenshot",
+                    "capture_visual",
+                    "click_visual",
+                    "upload",
+                    "download",
+                ],
+            },
+        )
+        return BrowserAcceptanceManifestV1.build(
+            suite_id=LIVE_AUTHENTICATED_BROWSER_ACCEPTANCE_SUITE_ID,
+            corpus_revision=_content_revision(
+                {"authority_revision": config.revision, "cases": [case.revision]},
+                "live authenticated browser acceptance corpus",
+            ),
+            mode=BrowserAcceptanceMode.LIVE_AUTHENTICATED,
+            enabled=True,
+            trial_count=1,
+            allowed_origins=(config.origin,),
+            limits=BrowserAcceptanceLimitsV1(
+                max_destinations=1,
+                max_browser_operations=10,
+                max_model_steps=12,
+                max_wall_time_ms=360_000,
+                max_artifact_bytes=40 * 1024 * 1024,
+                max_concurrency=1,
+                max_input_tokens=96_000,
+                max_output_tokens=12_288,
+                max_estimated_cost=config.max_estimated_cost,
+            ),
+            cases=(case,),
+        )
 
     case = _unsupported("authenticated-profile-restoration", "restore_profile")
     return BrowserAcceptanceManifestV1.build(

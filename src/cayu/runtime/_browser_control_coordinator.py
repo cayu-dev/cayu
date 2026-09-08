@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 from cayu.runtime._browser_control_authorization import (
     AuthorizedBrowserControl,
+    BrowserControlInputRejected,
     BrowserControlPermissionDenied,
     BrowserControlRevisionChanged,
     authorize_browser_control,
@@ -726,6 +727,7 @@ class BrowserControlCoordinator:
             or record.state != "operator_controlled"
             or record.sensitive_entry_pending
             or record.pending_lease_until_ms is not None
+            or record.pending_input_sequence is not None
         ):
             raise BrowserControlConflict("Browser handback differs from its operator authority.")
         desired = record.model_copy(
@@ -830,7 +832,7 @@ class BrowserControlCoordinator:
             or record.lease_until_ms is None
             or record.lease_until_ms <= int(self._clock().timestamp() * 1000)
         ):
-            raise BrowserControlConflict("Browser text input differs from its live authority.")
+            raise BrowserControlInputRejected("Browser text input differs from its live authority.")
         return controls, record, authorized
 
     async def _admit_text_input(

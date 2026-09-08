@@ -8,7 +8,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.runtime._browser_control_authorization import BrowserControlPermissionDenied
+from cayu.runtime._browser_control_authorization import (
+    BrowserControlInputRejected,
+    BrowserControlPermissionDenied,
+)
 from cayu.runtime.browser_control import (
     BrowserControlConflict,
     BrowserControlPrincipal,
@@ -47,7 +50,7 @@ async def dispatch_browser_text(owner: BrowserGuestCommandOwner, entry: PendingB
                 operator_session_id=entry.operator_session_id,
                 intent=entry.intent,
             )
-        except BrowserControlPermissionDenied as error:
+        except (BrowserControlPermissionDenied, BrowserControlInputRejected) as error:
             # Positive pre-publication refusal: no native operation or durable
             # reservation exists. Do not tear down the shared command owner.
             if not entry.result.done():

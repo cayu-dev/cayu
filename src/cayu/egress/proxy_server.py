@@ -1050,6 +1050,9 @@ def _content_length(headers: dict[str, str]) -> int | None:
 
 
 def _serialize_response_head(response: CapturedResponse) -> bytes:
+    from cayu.egress.broker import _validated_set_cookie_headers
+
+    cookies = _validated_set_cookie_headers(response.set_cookie_headers)
     try:
         reason = HTTPStatus(response.status_code).phrase
     except ValueError:
@@ -1060,6 +1063,7 @@ def _serialize_response_head(response: CapturedResponse) -> bytes:
     headers["Connection"] = "close"
     for key, value in headers.items():
         lines.append(f"{key}: {value}")
+    lines.extend(f"Set-Cookie: {value}" for value in cookies)
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
 

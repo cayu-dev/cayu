@@ -19,6 +19,7 @@ from cayu.evals import (
     BrowserAcceptancePlanV1,
     browser_acceptance_report_from_json,
     deterministic_browser_acceptance_manifest,
+    live_authenticated_browser_acceptance_manifest,
     live_public_browser_acceptance_manifest,
     run_browser_acceptance,
     write_browser_acceptance_report,
@@ -33,7 +34,7 @@ def _arguments() -> argparse.Namespace:
         "target",
         nargs="?",
         help=(
-            "Trusted live-public module:attribute returning BrowserAcceptancePlanV1. "
+            "Trusted live-public plan factory, or authenticated async context factory yielding a plan. "
             "Deterministic mode always uses Cayu's checked-in target."
         ),
     )
@@ -41,6 +42,18 @@ def _arguments() -> argparse.Namespace:
         "--mode",
         choices=tuple(mode.value for mode in BrowserAcceptanceMode),
         default=BrowserAcceptanceMode.DETERMINISTIC.value,
+    )
+    parser.add_argument(
+        "--authorize-authenticated",
+        action="store_true",
+        help="Explicitly authorize loading the configured authenticated setup (off by default).",
+    )
+    parser.add_argument(
+        "--operator-setup",
+        help=(
+            "Trusted module:attribute async context factory supplying the protected "
+            "operator fixture/server. Deterministic mode only; cannot replace the corpus."
+        ),
     )
     parser.add_argument(
         "--resume-report",
@@ -79,18 +92,54 @@ async def _load_plan(
 
 async def _run(args: argparse.Namespace) -> int:
     requested_mode = BrowserAcceptanceMode(args.mode)
+    operator_setup = getattr(args, "operator_setup", None)
+    if operator_setup is not None and requested_mode is not BrowserAcceptanceMode.DETERMINISTIC:
+        raise ValueError("Operator fixture setup requires deterministic mode.")
     if requested_mode is BrowserAcceptanceMode.LIVE_AUTHENTICATED:
-        raise RuntimeError("Authenticated browser acceptance is disabled in schema v1.")
+        if not getattr(args, "authorize_authenticated", False):
+            raise RuntimeError(
+                "Authenticated browser acceptance is disabled without explicit authorization."
+            )
+        if args.target is None:
+            raise ValueError("Authenticated acceptance requires an explicit application setup.")
+        factory = load_target(
+            args.target, label="Authenticated acceptance setup", normalize_errors=True
+        )
+        if not callable(factory):
+            raise TypeError("Authenticated setup must be an async context factory.")
+        async with factory() as plan:
+            if type(plan) is not BrowserAcceptancePlanV1:
+                raise TypeError("Authenticated setup must yield an exact BrowserAcceptancePlanV1.")
+            return await _run_plan(args, plan=plan)
     if requested_mode is BrowserAcceptanceMode.DETERMINISTIC:
         if args.target not in {None, _DETERMINISTIC_TARGET}:
             raise ValueError("Deterministic browser acceptance uses Cayu's checked-in target.")
         with BrowserAcceptanceFixtureV1() as fixture:
+            if operator_setup is not None:
+                return await _run_with_operator_setup(args, fixture, operator_setup)
             plan = await _load_plan(_DETERMINISTIC_TARGET, deterministic_fixture=fixture)
             return await _run_plan(args, plan=plan, deterministic_fixture=fixture)
     if args.target is None:
         raise ValueError("Live-public browser acceptance requires an explicit target.")
     plan = await _load_plan(args.target)
     return await _run_plan(args, plan=plan)
+
+
+async def _run_with_operator_setup(
+    args: argparse.Namespace, fixture: BrowserAcceptanceFixtureV1, target: str
+) -> int:
+    from cayu.evals.internal.browser_acceptance import build
+    from cayu.evals.internal.browser_acceptance_operator import OperatorFixtureSetup
+
+    factory = load_target(target, label="Browser operator setup", normalize_errors=True)
+    if not callable(factory):
+        raise TypeError("Browser operator setup must be an async context factory.")
+    async with factory() as setup:
+        if type(setup) is not OperatorFixtureSetup:
+            raise TypeError("Browser operator setup must yield an exact OperatorFixtureSetup.")
+        plan = await build(fixture, operator_fixture=setup.binding)
+        async with setup.serve(plan):
+            return await _run_plan(args, plan=plan, deterministic_fixture=fixture)
 
 
 async def _run_plan(
@@ -105,6 +154,8 @@ async def _run_plan(
     canonical_manifest = (
         deterministic_browser_acceptance_manifest()
         if requested_mode is BrowserAcceptanceMode.DETERMINISTIC
+        else live_authenticated_browser_acceptance_manifest(plan.authenticated)
+        if requested_mode is BrowserAcceptanceMode.LIVE_AUTHENTICATED
         else live_public_browser_acceptance_manifest()
     )
     if plan.manifest != canonical_manifest:

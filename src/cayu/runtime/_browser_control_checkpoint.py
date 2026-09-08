@@ -15,7 +15,11 @@ from hashlib import sha256
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.runtime.browser_control import BrowserControlCheckpoint, BrowserControlConflict
+from cayu.runtime.browser_control import (
+    BrowserControlCheckpoint,
+    BrowserControlConflict,
+    closed_browser_control_successor,
+)
 from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY as _KEY
 
 BROWSER_CONTROL_OPERATION_PREFIX = "browser-control:"
@@ -51,6 +55,8 @@ def require_browser_control_operation_owner(key: str, record: Any = None) -> Non
     mutation = _MUTATION.get()
     if mutation is None:
         raise BrowserControlConflict("Browser control receipts require their exact runtime owner.")
+    if type(mutation) is BrowserControlCloseCheckpointMutation:
+        raise BrowserControlConflict("Browser close uses its terminal operation receipt.")
     owned = BrowserControlCheckpointMutation(
         mutation.session_id, mutation.expected, mutation.desired
     )
@@ -98,6 +104,49 @@ class BrowserControlCheckpointMutation:
         object.__setattr__(self, "desired", desired)
 
 
+@dataclass(frozen=True)
+class BrowserControlCloseCheckpointMutation(BrowserControlCheckpointMutation):
+    """Confirmed native close may settle its exact concurrent disconnect fence.
+
+    Created only by the built-in terminal publication owner after verifying
+    positive close evidence. It grants no input, reconnect or operator authority.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.expected is None:
+            raise BrowserControlConflict("Browser close requires its existing allocation.")
+        source = next(
+            (record for record in self.expected.records if record not in self.desired.records), None
+        )
+        if source is None:
+            raise BrowserControlConflict("Browser close cannot create allocation authority.")
+        closed = closed_browser_control_successor(source)
+        if closed is None or self.desired != self.expected.replace_record(
+            expected=source, desired=closed
+        ):
+            raise BrowserControlConflict("Browser close publication differs from confirmed close.")
+
+    def resolve(self, actual: BrowserControlCheckpoint | None) -> BrowserControlCheckpoint:
+        assert self.expected is not None
+        if actual == self.expected:
+            return self.desired
+        source = next(
+            record for record in self.expected.records if record not in self.desired.records
+        )
+        if source.state not in {"agent_controlled", "takeover_requested"}:
+            raise BrowserControlConflict("Browser close lost its exact control generation.")
+        fenced = source.model_copy(
+            update={"revision": source.revision + 1, "state": "control_uncertain"}
+        )
+        expected_fence = self.expected.replace_record(expected=source, desired=fenced)
+        if actual != expected_fence:
+            raise BrowserControlConflict("Browser close lost its exact disconnect successor.")
+        closed = closed_browser_control_successor(fenced)
+        assert closed is not None
+        return expected_fence.replace_record(expected=fenced, desired=closed)
+
+
 _MUTATION: ContextVar[BrowserControlCheckpointMutation | None] = ContextVar(
     "cayu_exact_browser_control_checkpoint_mutation", default=None
 )
@@ -122,9 +171,12 @@ def browser_control_checkpoint_mutation_scope(
     mutation: BrowserControlCheckpointMutation,
 ) -> Iterator[None]:
     # Reconstruct without serialization, including nested post-construction edits.
-    owned = BrowserControlCheckpointMutation(
-        mutation.session_id, mutation.expected, mutation.desired
+    mutation_type = (
+        BrowserControlCloseCheckpointMutation
+        if type(mutation) is BrowserControlCloseCheckpointMutation
+        else BrowserControlCheckpointMutation
     )
+    owned = mutation_type(mutation.session_id, mutation.expected, mutation.desired)
     if _MUTATION.get() is not None:
         raise BrowserControlConflict("Browser control publication scopes cannot be nested.")
     token = _MUTATION.set(owned)
@@ -160,6 +212,16 @@ def project_browser_control_checkpoint(
     mutation = _MUTATION.get()
     if mutation is None:
         return None if actual is None else actual.model_dump(mode="json")
+    if type(mutation) is BrowserControlCloseCheckpointMutation:
+        if mutation.session_id != session_id:
+            raise BrowserControlConflict("Browser close belongs to another session.")
+        desired = mutation.resolve(actual)
+        proposed = BrowserControlCheckpoint.model_validate(replacement.get(_KEY))
+        if proposed not in (mutation.desired, desired):
+            raise BrowserControlConflict(
+                "Browser close publication differs from its exact command."
+            )
+        return desired.model_dump(mode="json")
     if mutation.session_id != session_id or mutation.expected != actual:
         raise BrowserControlConflict("Browser control changed before publication.")
     proposed = BrowserControlCheckpoint.model_validate(replacement.get(_KEY))

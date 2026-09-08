@@ -148,13 +148,56 @@ class CapturedRequest(BaseModel):
 
 
 class CapturedResponse(BaseModel):
-    """The provider response returned to the sandbox after scrubbing."""
+    """The provider response returned to the sandbox after scrubbing.
 
-    model_config = ConfigDict(extra="forbid")
+    Repeated Set-Cookie values belong in ``set_cookie_headers``, in wire order,
+    not a comma-joined mapping value. A single Set-Cookie in ``headers`` is also
+    supported and precedes the separate values when both are supplied.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     status_code: int
     headers: dict[str, str] = Field(default_factory=dict)
+    set_cookie_headers: tuple[str, ...] = Field(default_factory=tuple, repr=False)
     body: bytes = b""
+
+    @field_validator("set_cookie_headers", mode="before")
+    @classmethod
+    def validate_set_cookie_headers(cls, value: object) -> tuple[str, ...]:
+        return _validated_set_cookie_headers(value)
+
+
+class _UpstreamCookieHeadersError(ValueError):
+    pass
+
+
+def _validated_set_cookie_headers(value: object) -> tuple[str, ...]:
+    # Validate again at scrubbing/serialization because extension-owned response
+    # models may have been mutated or copied without Pydantic validation.
+    if not isinstance(value, (tuple, list)) or len(value) > 64:
+        raise _UpstreamCookieHeadersError("Set-Cookie headers must be a bounded sequence.")
+    result = []
+    size = 0
+    for item in value:
+        if type(item) is not str:
+            raise _UpstreamCookieHeadersError(
+                "Set-Cookie headers must contain valid HTTP field values."
+            )
+        # Every permitted character is one Latin-1 byte. Bound the value before
+        # scanning or allocating an encoded copy of extension-controlled text.
+        size += len(item)
+        if size > 64 * 1024:
+            raise _UpstreamCookieHeadersError("Set-Cookie headers exceed their byte bound.")
+        if any(
+            (ord(char) < 32 and char != "\t") or ord(char) == 127 or ord(char) > 255
+            for char in item
+        ):
+            raise _UpstreamCookieHeadersError(
+                "Set-Cookie headers must contain valid HTTP field values."
+            )
+        result.append(item)
+    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -649,7 +692,14 @@ class HttpxUpstream:
                 body.extend(chunk)
             return CapturedResponse(
                 status_code=response.status_code,
-                headers=_identity_response_headers(dict(response.headers)),
+                headers=_identity_response_headers(
+                    {key: value for key, value in response.headers.items() if key != "set-cookie"}
+                ),
+                set_cookie_headers=tuple(
+                    value.decode("latin-1")
+                    for key, value in response.headers.raw
+                    if key.lower() == b"set-cookie"
+                ),
                 body=bytes(body),
             )
 
@@ -1464,6 +1514,16 @@ class TransparentEgressBroker:
                 secrets=authorization.secrets,
                 max_body_bytes=response_limit,
             )
+        except _UpstreamCookieHeadersError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream Set-Cookie headers are invalid or exceed their bound.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="fetch_failed",
+            )
         except _UpstreamResponseTooLargeError:
             return self._deny(
                 request,
@@ -1779,11 +1839,15 @@ def _scrub_response(
     max_body_bytes: int,
 ) -> CapturedResponse:
     headers = _forwardable_headers(response.headers)
+    cookies = _validated_set_cookie_headers(response.set_cookie_headers)
     if not secrets:
-        return response.model_copy(update={"headers": headers})
+        return response.model_copy(update={"headers": headers, "set_cookie_headers": cookies})
 
     redactor = SecretRedactor(secrets)
     redacted_headers = {key: redactor.redact_text(value) for key, value in headers.items()}
+    redacted_cookies = _validated_set_cookie_headers(
+        tuple(redactor.redact_text(value) for value in cookies)
+    )
     redacted_body = response.body
     replacement = REDACTED_SECRET.encode()
     for secret in secrets:
@@ -1797,4 +1861,10 @@ def _scrub_response(
                     "Redaction would expand the response beyond its byte limit."
                 )
         redacted_body = redacted_body.replace(encoded_secret, replacement)
-    return response.model_copy(update={"headers": redacted_headers, "body": redacted_body})
+    return response.model_copy(
+        update={
+            "headers": redacted_headers,
+            "set_cookie_headers": redacted_cookies,
+            "body": redacted_body,
+        }
+    )

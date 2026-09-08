@@ -7,6 +7,7 @@ import ipaddress
 import socket
 import threading
 from collections import Counter
+from http.cookies import CookieError, SimpleCookie
 from types import TracebackType
 from typing import Any
 
@@ -17,6 +18,7 @@ _FIXTURE_PAGE_ROUTES = (
     "/auth/account",
     "/auth/login",
     "/auth/login-expired",
+    "/auth/operator",
     "/basic",
     "/challenge",
     "/cross-origin-frame",
@@ -74,6 +76,15 @@ def _fixture_pages() -> dict[str, str]:
     """Return the exact page bodies bound into the fixture revision."""
 
     return {
+        "/auth/operator": """<!doctype html><title>Private operator fixture</title>
+            <label>Private input <input type="password" autocomplete="off"></label>
+            <h1 id="outcome">Awaiting operator</h1><script>
+            const input=document.querySelector('input');
+            input.addEventListener('input',()=>{
+              if(input.value && !input.disabled){input.disabled=true;input.hidden=true;
+                document.querySelector('#outcome').textContent='Operator input accepted';
+                fetch('/effect/operator-input');}
+            });</script>""",
         **{
             f"/visual-{change}": (
                 "<!doctype html><title>Changing visual control</title>"
@@ -82,7 +93,7 @@ def _fixture_pages() -> dict[str, str]:
                 "const ctx=control.getContext('2d');ctx.fillStyle='green';"
                 "ctx.fillRect(0,0,200,100);"
                 "control.onclick=()=>fetch('/effect/visual-activated');"
-                f"fetch('/visual-gate/{change}').then(()=>{{{mutation};"
+                f"fetch('/visual-gate/{change}').then(response=>{{if(!response.ok)return;{mutation};"
                 f"fetch('/visual-applied/{change}')}})</script>"
             )
             for change, mutation in (
@@ -181,8 +192,9 @@ def _fixture_pages() -> dict[str, str]:
             document.getElementById('continue').onclick=()=>fetch('/effect/delayed-clicked')},150)
             </script>""",
         "/replaced": """<!doctype html><title>Replaced control</title><button id="target">Old</button>
-            <script>setTimeout(()=>{document.getElementById('target').outerHTML=
-            '<button id="target">New</button>'},100)</script>""",
+            <script>fetch('/visual-gate/replaced').then(response=>{if(!response.ok)return;
+            document.getElementById('target').outerHTML='<button id="target">New</button>';
+            fetch('/visual-applied/replaced')})</script>""",
         "/actionability": """<!doctype html><title>Actionability</title>
             <button hidden>Hidden</button><button disabled>Disabled</button>
             <button style="position:absolute;left:0;top:0">Covered</button>
@@ -191,7 +203,8 @@ def _fixture_pages() -> dict[str, str]:
             <button onpointerover="this.hidden=true">Hidden action</button>""",
         "/detached": """<!doctype html><title>Detached control</title>
             <button id="target">Detach me</button>
-            <script>setTimeout(()=>document.getElementById('target').remove(),100)</script>""",
+            <script>fetch('/visual-gate/detached').then(response=>{if(!response.ok)return;
+            document.getElementById('target').remove();fetch('/visual-applied/detached')})</script>""",
         "/occluded": """<!doctype html><title>Occluded control</title>
             <button style="position:absolute;left:0;top:0">Covered action</button>
             <div style="position:absolute;left:0;top:0;width:200px;height:100px"></div>""",
@@ -280,6 +293,7 @@ def _fixture_pages() -> dict[str, str]:
 BROWSER_ACCEPTANCE_FIXTURE_REVISION = _content_revision(
     {
         "schema_version": 1,
+        "authenticated_request_oracle": "exact-parsed-session-cookie:v1",
         "hosts": ["docs.browser.test", "static.browser.test"],
         "page_routes": list(_FIXTURE_PAGE_ROUTES),
         "page_revisions": {
@@ -326,10 +340,9 @@ BROWSER_ACCEPTANCE_FIXTURE_REVISION = _content_revision(
         },
         "semantic_boundaries": {
             "visual_gate_timeout_seconds": 10,
-            "visual_changes": ["moved", "overlay", "scroll"],
+            "visual_changes": ["moved", "overlay", "scroll", "detached", "replaced"],
             "delayed_control_ms": 150,
-            "detached_control_ms": 100,
-            "replaced_control_ms": 100,
+            "action_mutation": "gated after observation; positive page acknowledgement",
             "long_page_height_px": 5000,
             "long_observation_blocks": _FIXTURE_LONG_OBSERVATION_BLOCKS,
             "long_observation_block_bytes": len(_FIXTURE_LONG_OBSERVATION_TEXT.encode("utf-8")),
@@ -404,10 +417,15 @@ class _FixtureHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         if path == "/auth/account":
-            authenticated = "cayu_fixture_session=active" in self.headers.get(
-                "Cookie",
-                "",
-            )
+            cookies = SimpleCookie()
+            try:
+                cookies.load(self.headers.get("Cookie", ""))
+            except CookieError:
+                cookies.clear()
+            session_cookie = cookies.get("cayu_fixture_session")
+            authenticated = session_cookie is not None and session_cookie.value == "active"
+            if authenticated:
+                fixture._record_authenticated_request()
             body = (
                 "<!doctype html><title>Authenticated fixture account</title>"
                 "<main><h1>Authenticated</h1></main>"
@@ -481,7 +499,11 @@ class BrowserAcceptanceFixtureV1:
         self._address: str | None = None
         self._lock = threading.Lock()
         self._requests: Counter[str] = Counter()
-        self._visual_gates = {name: threading.Event() for name in ("moved", "overlay", "scroll")}
+        self._authenticated_requests = 0
+        self._visual_gates = {
+            name: threading.Event()
+            for name in ("moved", "overlay", "scroll", "detached", "replaced")
+        }
         self._visual_applied = {name: threading.Event() for name in self._visual_gates}
 
     def prepare_visual_change(self, change: str) -> None:
@@ -511,6 +533,15 @@ class BrowserAcceptanceFixtureV1:
     def request_counts(self) -> dict[str, int]:
         with self._lock:
             return dict(sorted(self._requests.items()))
+
+    def authenticated_request_count(self) -> int:
+        """Return successful account checks, never inferred from requested paths."""
+        with self._lock:
+            return self._authenticated_requests
+
+    def _record_authenticated_request(self) -> None:
+        with self._lock:
+            self._authenticated_requests += 1
 
     def _record(self, path: str) -> None:
         route = path.split("?", 1)[0]
