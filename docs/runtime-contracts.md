@@ -2,6 +2,13 @@
 
 This is a design/maintainer document for Cayu's production agent runtime. It names contracts that must stay stable as the runtime evolves.
 
+Interrupted tool rounds publish recovery-safe staged results before closing the
+round. A result staged before cancellation is not rerun or replaced by an
+interruption placeholder merely because its terminal event was not yet appended.
+Unfinished sibling calls retain their interruption results. Interruption and
+ordinary recovery share staged-result validation, hook-state handling, and atomic
+round publication; unsafe or conflicting evidence remains fail-closed.
+
 ## Application Runtime Configuration
 
 `CayuConfig` is the immutable application tuning API. `CayuApp()` uses a

@@ -55,6 +55,7 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -90,6 +91,112 @@ class _EchoTool(Tool):
             content=args["text"],
             structured={"agent": ctx.agent_name, "echoed": args["text"]},
         )
+
+
+@pytest.mark.parametrize("unfinished_sibling", [False, True])
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_cancellation_publishes_completed_stage_without_reexecuting_tool(
+    tmp_path, unfinished_sibling, backend
+):
+    class PausedTerminalMixin:
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.started = asyncio.Event()
+            self.paused = False
+
+        async def append_events(self, session_id, events):
+            if not self.paused and any(e.type == EventType.TOOL_CALL_COMPLETED for e in events):
+                self.paused = True
+                self.started.set()
+                await asyncio.Event().wait()
+            await super().append_events(session_id, events)
+
+    class MemoryStore(PausedTerminalMixin, InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+    class SQLiteStore(PausedTerminalMixin, SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
+
+    store = MemoryStore() if backend == "memory" else SQLiteStore(tmp_path / "sessions.sqlite")
+
+    class StagedEcho(_EchoTool):
+        spec = _EchoTool.spec.model_copy(
+            update={"workspace_mutation": True, "parallel_safe": False}
+        )
+        calls = 0
+
+        async def run(self, ctx, args):
+            self.calls += 1
+            if unfinished_sibling and self.calls == 2:
+                store.paused = True
+                store.started.set()
+                await asyncio.Event().wait()
+            return await super().run(ctx, args)
+
+    async def scenario():
+        tool = StagedEcho()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="staged-call", name="echo", arguments={"text": "finished"}
+                        ),
+                        *(
+                            [
+                                ModelStreamEvent.tool_call(
+                                    id="unfinished-call",
+                                    name="echo",
+                                    arguments={"text": "unfinished"},
+                                )
+                            ]
+                            if unfinished_sibling
+                            else []
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ]
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancel-staged-result",
+                    messages=[Message.text("user", "echo")],
+                ),
+            )
+        )
+        try:
+            await asyncio.wait_for(store.started.wait(), timeout=10)
+            consumer.cancel("stop after tool effect")
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+        finally:
+            if not consumer.done():
+                consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+        events = await store.load_events("cancel-staged-result")
+        terminals = [e for e in events if e.type == EventType.TOOL_CALL_COMPLETED]
+        assert len(terminals) == 1
+        assert terminals[0].payload["result"]["content"] == "finished"
+        assert tool.calls == (2 if unfinished_sibling else 1)
+        if unfinished_sibling:
+            failures = [e for e in events if e.type == EventType.TOOL_CALL_FAILED]
+            assert len(failures) == 1
+            assert failures[0].payload["tool_call_id"] == "unfinished-call"
+            assert failures[0].payload["interrupted"] is True
+        checkpoint = await store.load_checkpoint("cancel-staged-result")
+        assert checkpoint is not None
+        assert "pending_tool_round" not in checkpoint
+        if isinstance(store, SQLiteSessionStore):
+            await store.close()
+
+    asyncio.run(scenario())
 
 
 def _tool_round_identity() -> ToolRoundIdentity:

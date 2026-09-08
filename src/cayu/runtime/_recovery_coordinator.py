@@ -13298,89 +13298,21 @@ class RecoveryCoordinator:
             )[0]
             for outcome in interrupted_results
         ]
-        source_checkpoint, pending_round = await self._complete_recovery_assistant_publication(
-            session_id=request.session.id,
+        async for event in self._publish_recovered_tool_outcomes(
+            session=request.session,
             registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            messages=request.messages,
             pending_round=pending_round,
-            execution_scope_unknown_ids=(
-                (started_ids - isolated_call_ids) | isolated_dispatched_ids
-            ),
-        )
-        if pending_round.assistant_message_state == "quarantined":
-            tool_round_recovery.ready_assistant_publication_message(pending_round)
-        planned_terminal_events = [
-            _interrupted_tool_call_event(
-                session=request.session,
-                registered_agent=request.registered_agent,
-                registered_environment=request.registered_environment,
-                tool_call_outcome=interrupted_result,
-                tool_round_identity=tool_round_identity,
-            )
-            for interrupted_result in interrupted_results
-        ]
-        tool_round_publication.collect_tool_round_publication_evidence(
-            session_id=request.session.id,
-            pending_round=pending_round,
-            durable_events=[*lifecycle_events, *planned_terminal_events],
-        )
-
-        emitted_events: list[Event] = []
-        for interrupted_result, terminal_event in zip(
-            interrupted_results,
-            planned_terminal_events,
-            strict=True,
-        ):
-            expected_public_outcome = runtime_records.ToolCallOutcome(
-                call=runtime_records.copy_tool_call_request(
-                    interrupted_result.call,
-                    arguments={},
-                ),
-                result=interrupted_result.result,
-            )
-            async for event, outcome in self._tool_round_executor.emit_tool_call_result_with_hooks(
-                event=terminal_event,
-                session=request.session,
-                registered_agent=request.registered_agent,
-                registered_environment=request.registered_environment,
-                tool_call=interrupted_result.call,
-                result=interrupted_result.result,
-                task_id=pending_round.task_id,
-                execution_profile=request.execution_profile,
-                invocation_context=request.invocation_context,
-            ):
-                emitted_events.append(event)
-                if outcome is not None and outcome != expected_public_outcome:
-                    raise RuntimeError("Interrupted tool-round hooks changed terminal evidence.")
-
-        lifecycle_events = await self._load_tool_round_lifecycle_events(
-            session_id=request.session.id,
-            pending_round=pending_round,
-        )
-        prepared = tool_round_publication.prepare_tool_round_publication(
-            session_id=request.session.id,
-            pending_round=pending_round,
-            source_checkpoint=source_checkpoint,
-            durable_events=lifecycle_events,
-            expected_statuses={
-                SessionStatus.RUNNING,
-                SessionStatus.INTERRUPTING,
-                SessionStatus.INTERRUPTED,
-            },
-            expected_run_epoch=request.session.run_epoch,
+            lifecycle_events=lifecycle_events,
+            synthesized_outcomes=interrupted_results,
+            effective_started_ids=(started_ids - isolated_call_ids) | isolated_dispatched_ids,
             expected_transcript_cursor=expected_transcript_cursor,
-        )
-        cancellation = await self._publish_tool_round_with_exact_replay(prepared)
-        materialized = await self.materialize_expected_deferred_input(
-            request.session.id,
-            pending_round.deferred_messages,
-            cancellation=cancellation,
-        )
-        request.messages[:] = materialized.messages
-        cancellation = materialized.cancellation
-        for event in emitted_events:
+            execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
+            interrupted=True,
+        ):
             yield event
-        if cancellation is not None:
-            raise cancellation
 
     async def _load_tool_round_lifecycle_events(
         self,
@@ -14651,6 +14583,40 @@ class RecoveryCoordinator:
             synthesized_outcomes,
             self._secret_redactor,
         )
+        async for event in self._publish_recovered_tool_outcomes(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            messages=messages,
+            pending_round=pending_round,
+            lifecycle_events=lifecycle_events,
+            synthesized_outcomes=synthesized_outcomes,
+            effective_started_ids=effective_started_ids,
+            expected_transcript_cursor=expected_transcript_cursor,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+        ):
+            yield event
+
+    async def _publish_recovered_tool_outcomes(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        messages: list[Message],
+        pending_round: tool_round_recovery.PendingToolRound,
+        lifecycle_events: list[Event],
+        synthesized_outcomes: list[runtime_records.ToolCallOutcome],
+        effective_started_ids: set[str],
+        expected_transcript_cursor: int,
+        execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
+        interrupted: bool = False,
+    ) -> AsyncGenerator[Event, None]:
+        """Publish safe staged outcomes and synthesized results without replaying tools."""
+
+        environment_name = _environment_name(registered_environment)
         # Classify staged evidence against the durable coverage exactly as it
         # existed when recovery took ownership. Completing the assistant
         # projection below may conservatively add coverage for calls that never
@@ -14742,6 +14708,21 @@ class RecoveryCoordinator:
             outcome = synthesized_by_id.get(pending_call.tool_call_id)
             if outcome is None:
                 raise RuntimeError("Recovery lost terminal evidence for a pending tool call.")
+            if interrupted:
+                planned_terminal_events.append(
+                    _interrupted_tool_call_event(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call_outcome=outcome,
+                        tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                            pending_round
+                        ),
+                    )
+                )
+                planned_outcomes.append(outcome)
+                planned_hook_states.append("finalized")
+                continue
             policy_evidence = approval_support.effective_tool_policy_evidence(pending_call)
             is_unexposed = policy_evidence is ToolPolicyEvidence.UNEXPOSED
             event_type = (

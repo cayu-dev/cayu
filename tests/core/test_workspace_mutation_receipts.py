@@ -6159,13 +6159,18 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
             )
             for candidate in failures
         )
-        == 1
+        == 0
     )
     paused_events = [
         event for event in durable_events if event.type is EventType.INTERACTION_PAUSED
     ]
-    assert len(paused_events) == 1
-    assert paused_events[0].payload["pending_action_kind"] == "tool_recovery"
+    assert paused_events == []
+    assert any(
+        event.type is EventType.TOOL_CALL_FAILED
+        and event.payload["tool_call_id"] == "call-workspace"
+        for event in durable_events
+    )
+    assert any(event.type is EventType.INTERACTION_INTERRUPTED for event in durable_events)
     assert any(event.type is EventType.SESSION_INTERRUPTED for event in durable_events)
     assert not any(
         event.type
@@ -6293,8 +6298,13 @@ def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
     paused_events = [
         event for event in durable_events if event.type is EventType.INTERACTION_PAUSED
     ]
-    assert len(paused_events) == 1
-    assert paused_events[0].payload["pending_action_kind"] == "tool_recovery"
+    assert paused_events == []
+    assert any(
+        event.type is EventType.TOOL_CALL_FAILED
+        and event.payload["tool_call_id"] == "call-workspace"
+        for event in durable_events
+    )
+    assert any(event.type is EventType.INTERACTION_INTERRUPTED for event in durable_events)
     assert any(event.type is EventType.SESSION_INTERRUPTED for event in durable_events)
 
 
@@ -7146,14 +7156,14 @@ def test_terminal_failure_after_capture_cancellation_preserves_caller_cancellati
         cleanup_group = exception_cause(raised.value)
         assert isinstance(cleanup_group, BaseExceptionGroup)
         cleanup_failures = tuple(iter_exception_tree(cleanup_group))
-        assert any(isinstance(failure, ValueError) for failure in cleanup_failures)
+        assert not any(isinstance(failure, ValueError) for failure in cleanup_failures)
+        assert any(
+            isinstance(failure, ConnectionError) and str(failure) == "terminal publication failed"
+            for failure in cleanup_failures
+        )
         closure_failure = exception_cause(cleanup_group)
         assert isinstance(closure_failure, RuntimeError)
         assert str(closure_failure) == "Interrupted tool-round closure failed."
-        assert all(
-            "terminal publication failed" not in str(failure)
-            for failure in (*cleanup_failures, closure_failure)
-        )
         durable = await store.query_events(
             EventQuery(session_id="session-cancelled-terminal-failure")
         )
