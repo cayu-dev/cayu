@@ -2097,7 +2097,8 @@ class WriteFileTool(Tool):
         workspace_mutation=True,
         description=(
             "Create a missing UTF-8 file or conditionally overwrite an existing file. "
-            "Overwrite requires the opaque revision returned by a complete read_file."
+            "Overwrite requires the opaque revision returned by a complete read_file "
+            "or a successful write_file receipt."
         ),
         input_schema={
             "type": "object",
@@ -2196,7 +2197,7 @@ class WriteFileTool(Tool):
         except FileNotFoundError:
             return _missing_workspace_file_result("Write", path)
         return ToolResult(
-            content=f"Wrote {len(encoded)} bytes to {path}.",
+            content=(f"Wrote {len(encoded)} bytes to {path}.\nRevision: {mutation.after_revision}"),
             structured={
                 "path": path,
                 "bytes": len(encoded),
