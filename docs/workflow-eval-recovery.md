@@ -83,13 +83,43 @@ Use the original target configuration and an app connected to the **original
 saved session store**. Per-trial factories may have used a different store from
 the profile-probe app: explicitly reconnect that store for recovery. The recovery
 functions do not invoke the factory, projector, workflow, providers, tools, or
-model judges. Supply the original messages and explicitly recovered projected
-output; their hashes must match the recorded anchor.
+model judges. Supply the original messages. Omit `output` to consume the exact
+`retained_workflow_output` in a trusted saved trial; an explicit original
+`WorkflowEvalResult` remains supported. Both paths validate output hashes and the
+original anchor against the saved store. Eager capture, incremental capture, and
+incremental scoring support omission.
+
+Before child capture, trials with `retain_final_output=True` seal a detached private
+projection and its complete attempt anchor in `retained_workflow_output`. This is
+one record, at most 1 MiB of canonical JSON, including the anchor. The existing
+65,536-character final-output and 256 KiB structured-output limits also apply.
+This separate allowance does not consume or increase child evidence bounds.
+Validation runs synchronously over the bounded projection within the existing case
+deadline; it performs no storage I/O or background work. Later capture limits,
+timeouts, or store-read failures cannot clear this field. `workflow_output_retention`
+records `retained`, `disabled`, or `limit_exceeded` without including output text.
+
+The field belongs to the private EvalRun JSON, with the same persistence and cleanup
+lifecycle: save it using the application's private report storage, and delete it
+with that report. There is no separately written artifact, storage transaction, or
+cancellation cleanup worker. Cancellation before a report is returned, a failed
+report save, or report deletion provides no durable retention guarantee. Recovery
+requires the saved report and original store to remain available and trusted;
+hashes bind identity and integrity, they do not authenticate an attacker-controlled
+report. Never expose private EvalRun JSON as a public preview.
+
+`retain_final_output=False` disables this retention, including public corpus/server
+execution paths. Public preview projection does not include the private field.
+Missing, deleted, disabled, oversized, or inconsistent retained output fails closed
+with a diagnostic; recovery never reconstructs from completion payloads or replays
+a projector. Older saved trials can still supply a separately retained exact original
+result. Original status, incomplete evidence, unavailable score, and historical
+usage remain unchanged; recovery creates a separate receipt.
 
 ```python
 from pathlib import Path
 from cayu import (
-    SessionTrajectoryBounds, WorkflowEvalResult,
+    SessionTrajectoryBounds,
     capture_workflow_eval_attempt, score_workflow_eval_capture,
 )
 from cayu.evals.corpus import FinalOutputEqualsAssertionSpec
@@ -100,10 +130,7 @@ capture = await capture_workflow_eval_attempt(
     original_target,
     source_trial,
     messages=tuple(original_case.request.messages),
-    output=WorkflowEvalResult(
-        final_output=original_projected_text,
-        structured_output=original_projected_structured_output,
-    ),
+    # Uses the exact private projection retained in source_trial.
     bounds=SessionTrajectoryBounds(max_events=50_000),
 )
 with Path("recovered-capture.json").open("x") as stream:

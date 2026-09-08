@@ -14556,6 +14556,10 @@ exception text, tracebacks, corpus values, prompts, provider responses or creden
 
 Workflow eval targets own finite aggregate child capture bounds independently of
 execution budgets. Capture rejection preserves completed execution and blocks scoring.
+With output retention enabled, the private trial seals one bounded projected-output
+record and its attempt anchor before child capture. Saved recovery can consume it
+without projector replay; disabled/missing retention fails closed. This field shares
+the private report's persistence/cleanup lifecycle and is absent from public previews.
 Saved-attempt recovery validates exact root/attempt/input/projector identity and
 fresh terminal lineage without dispatching workflows, tools, providers, or judges.
 See [workflow capture and saved-attempt recovery](workflow-eval-recovery.md) for

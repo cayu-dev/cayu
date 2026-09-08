@@ -30,7 +30,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
 from cayu.core.workflows import WorkflowSpec, copy_workflow_spec
-from cayu.evals.capture_policy import SessionTrajectoryBounds
+from cayu.evals.capture_policy import SessionTrajectoryBounds, WorkflowAttemptAnchor
 from cayu.runtime.app import CayuApp
 from cayu.workflows import WorkflowBase
 
@@ -300,6 +300,27 @@ class WorkflowEvalResult(BaseModel):
         ):
             raise ValueError("structured_output exceeds its canonical JSON byte limit.")
         return copied
+
+
+class RetainedWorkflowEvalOutput(BaseModel):
+    """Private single-record projected output, owned by the saved trial document.
+
+    The anchor is an integrity binding, not authentication. Only recover from a
+    trusted original report and its original session store.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, hide_input_in_errors=True, revalidate_instances="always"
+    )
+    schema_version: Literal["cayu.retained-workflow-output.v1"] = "cayu.retained-workflow-output.v1"
+    anchor: WorkflowAttemptAnchor
+    output: WorkflowEvalResult
+
+    @model_validator(mode="after")
+    def bounded_record(self) -> RetainedWorkflowEvalOutput:
+        if not json_utf8_size_within_limit(self.model_dump(mode="json"), 1 << 20):
+            raise ValueError("Retained workflow output exceeds its 1 MiB record limit.")
+        return self
 
 
 class WorkflowEvalTerminalEvidence(BaseModel):

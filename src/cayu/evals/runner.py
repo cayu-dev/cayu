@@ -106,6 +106,7 @@ from cayu.evals.trajectory import (
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.evals.workflow_target import (
+    RetainedWorkflowEvalOutput,
     WorkflowEvalExecution,
     WorkflowEvalFailure,
     WorkflowEvalFailureCode,
@@ -1726,6 +1727,8 @@ async def _run_workflow_case_once_with_public_projection(
     capture_stage: WorkflowCaptureStage = "execution"
     capture_diagnostic: WorkflowCaptureDiagnostic | None = None
     workflow_attempt: WorkflowAttemptAnchor | None = None
+    retained_workflow_output: RetainedWorkflowEvalOutput | None = None
+    workflow_output_retention = None
     execution_status = None
     case_timed_out = False
     publication_attempt_id: str | None = None
@@ -1922,6 +1925,17 @@ async def _run_workflow_case_once_with_public_projection(
                 final_output_sha256=output_evidence.final_output_sha256,
                 structured_output_sha256=_workflow_structured_sha256(structured_output),
             )
+            # Seal a detached private value before any descendant read can fail.
+            # This record has no storage lifecycle beyond its owning saved report.
+            workflow_output_retention = "disabled"
+            if retain_final_output:
+                try:
+                    retained_workflow_output = RetainedWorkflowEvalOutput(
+                        anchor=workflow_attempt, output=projected
+                    )
+                    workflow_output_retention = "retained"
+                except ValueError:
+                    workflow_output_retention = "limit_exceeded"
             capture_stage = "child_capture"
             capture_state = _CaptureState(
                 bounds=target.capture_bounds, strict=False, fail_closed=True
@@ -2274,6 +2288,8 @@ async def _run_workflow_case_once_with_public_projection(
             capture_bounds=target.capture_bounds,
             capture_diagnostic=capture_diagnostic,
             workflow_attempt=workflow_attempt,
+            retained_workflow_output=retained_workflow_output,
+            workflow_output_retention=workflow_output_retention,
             trial_number=trial_number,
             status=status,
             session_id=root_session_id,

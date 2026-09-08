@@ -48,7 +48,7 @@ from cayu.evals.memory_attribution import (
 )
 from cayu.evals.operation_outcomes import OperationOutcomeSummary, trajectory_operation_outcomes
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
-from cayu.evals.workflow_target import WorkflowEvalOutputEvidenceV1
+from cayu.evals.workflow_target import RetainedWorkflowEvalOutput, WorkflowEvalOutputEvidenceV1
 from cayu.memory_attribution import MemoryAttribution
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.sessions import Session, SessionStatus
@@ -361,6 +361,12 @@ class EvalTrialResult(BaseModel):
         default=None, exclude_if=lambda value: value is None
     )
     workflow_attempt: WorkflowAttemptAnchor | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    retained_workflow_output: RetainedWorkflowEvalOutput | None = Field(
+        default=None, exclude_if=lambda value: value is None, repr=False
+    )
+    workflow_output_retention: Literal["retained", "disabled", "limit_exceeded"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     evidence_complete: StrictBool = False

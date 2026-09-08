@@ -256,7 +256,13 @@ def test_legacy_import_is_explicit_and_does_not_replace_existing_anchor():
             await import_workflow_eval_attempt(target, run, **kwargs)
         document = run.model_dump(mode="json")
         trial = document["cases"][0]["trials"][0]
-        for key in ("workflow_attempt", "execution_status", "capture_bounds"):
+        for key in (
+            "workflow_attempt",
+            "execution_status",
+            "capture_bounds",
+            "retained_workflow_output",
+            "workflow_output_retention",
+        ):
             trial.pop(key)
         legacy = EvalRun.model_validate(document)
         original = legacy.model_dump_json()
@@ -292,7 +298,9 @@ def test_corpus_report_keeps_completed_runtime_and_unavailable_scoring():
             _corpus(FinalOutputEqualsAssertionSpec(id="answer", expected="x")),
             "workflow-suite",
         )
-        restored = corpus_execution_result_from_json(corpus_execution_result_to_json(result))
+        public_json = corpus_execution_result_to_json(result)
+        assert "retained_workflow_output" not in public_json
+        restored = corpus_execution_result_from_json(public_json)
         trial = restored.run.cases[0].trials[0]
         assert trial.status == "unavailable"
         assert trial.score is None
@@ -379,5 +387,15 @@ def test_post_execution_timeout_retains_safe_phase_and_progress(monkeypatch):
         assert trial.capture_diagnostic.consumed_events > 0
         assert trial.capture_diagnostic.consumed_bytes > 0
         assert "phase=probe_capture" in trial.error
+        assert trial.workflow_output_retention == "retained"
+        assert trial.retained_workflow_output.output.structured_output == {"answer": "x"}
+        monkeypatch.undo()
+        capture = await capture_workflow_eval_attempt(
+            target,
+            trial,
+            messages=tuple(suite.cases[0].request.messages),
+            bounds=SessionTrajectoryBounds(),
+        )
+        assert capture.trajectory.final_output == "x"
 
     asyncio.run(exercise())

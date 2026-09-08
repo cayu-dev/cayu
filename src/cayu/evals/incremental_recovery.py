@@ -180,7 +180,7 @@ async def capture_incremental_workflow_eval_attempt(
     source_trial: EvalTrialResult,
     *,
     messages: tuple[Message, ...],
-    output: WorkflowEvalResult,
+    output: WorkflowEvalResult | None = None,
     limits: IncrementalEvidenceLimits,
     admission: IncrementalEvidenceAdmission,
     expected_evidence_sha256: str | None = None,
@@ -473,7 +473,7 @@ async def score_incremental_workflow_eval_capture(
     assertions: tuple[AssertionSpec, ...],
     *,
     messages: tuple[Message, ...],
-    output: WorkflowEvalResult,
+    output: WorkflowEvalResult | None = None,
     admission: IncrementalEvidenceAdmission,
 ) -> SavedIncrementalWorkflowScore:
     """Freshly validate a capture seal, then apply closed incremental assertions.
@@ -491,6 +491,9 @@ async def score_incremental_workflow_eval_capture(
     capture = SavedIncrementalWorkflowCapture.model_validate(capture.model_dump(mode="python"))
     if capture.source_attempt != source_trial.workflow_attempt:
         raise IncrementalEvidenceError("source_attempt_mismatch")
+    target, source_trial, output, _ = _prepare_workflow_attempt_capture(
+        target, source_trial, messages, output, omit_retained_trajectory=True
+    )
     fresh = await capture_incremental_workflow_eval_attempt(
         target,
         source_trial,

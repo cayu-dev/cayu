@@ -182,7 +182,7 @@ def _prepare_workflow_attempt_capture(
     target: WorkflowEvalTarget,
     source_trial: EvalTrialResult,
     messages: tuple[Message, ...],
-    output: WorkflowEvalResult,
+    output: WorkflowEvalResult | None,
     *,
     omit_retained_trajectory: bool = False,
 ) -> tuple[WorkflowEvalTarget, EvalTrialResult, WorkflowEvalResult, WorkflowAttemptAnchor]:
@@ -197,10 +197,22 @@ def _prepare_workflow_attempt_capture(
             mode="python", exclude={"trajectory"} if omit_retained_trajectory else None
         )
     )
-    output = WorkflowEvalResult.model_validate(output.model_dump(mode="python"))
     anchor = source_trial.workflow_attempt
     if anchor is None or source_trial.execution_status != "completed":
         raise ValueError("Recovery requires an original completed workflow attempt anchor.")
+    retained = source_trial.retained_workflow_output
+    if retained is not None and retained.anchor != anchor:
+        _reject(anchor)
+    if output is None:
+        if retained is None or source_trial.workflow_output_retention != "retained":
+            raise ValueError(
+                "Exact retained workflow output is unavailable ("
+                + (source_trial.workflow_output_retention or "missing")
+                + "). Supply the trusted original projected WorkflowEvalResult; "
+                "completion payloads and projector replay are not recovery substitutes."
+            )
+        output = retained.output
+    output = WorkflowEvalResult.model_validate(output.model_dump(mode="python"))
     identity = target.identity()
     if (
         source_trial.session_id != anchor.session_id
@@ -277,14 +289,14 @@ async def capture_workflow_eval_attempt(
     source_trial: EvalTrialResult,
     *,
     messages: tuple[Message, ...],
-    output: WorkflowEvalResult,
+    output: WorkflowEvalResult | None = None,
     bounds: SessionTrajectoryBounds,
     expected_evidence_sha256: str | None = None,
 ) -> SavedWorkflowEvalCapture:
     """Recapture an exact completed attempt without invoking application callbacks.
 
-    Supply the original target (including its original capture policy), exact input,
-    and original projected output. ``bounds`` controls only this new capture revision.
+    Supply the original target (including its original capture policy) and exact input. Omit ``output`` to use the private retained projection, or
+    supply the trusted original projected output. ``bounds`` controls this revision.
     To reject changes since a prior successful capture, supply its evidence_sha256.
     Persist the returned document separately from the original EvalRun.
     """
