@@ -1567,6 +1567,7 @@ class KnowledgeEnrichmentWorker:
         if task.lease_expires_at is None:
             raise TaskClaimLost("Claimed enrichment task has no worker lease.")
         stop_heartbeat = asyncio.Event()
+        lease_lock = asyncio.Lock()
         heartbeat = asyncio.create_task(
             _heartbeat_claim(
                 self._queue.task_store,
@@ -1575,12 +1576,15 @@ class KnowledgeEnrichmentWorker:
                 lease_expires_at=task.lease_expires_at,
                 lease_seconds=lease_seconds,
                 stop=stop_heartbeat,
+                lease_task=task,
+                lease_lock=lease_lock,
             )
         )
         operation = asyncio.create_task(
             self._execute_claimed(
                 task,
                 worker_id=worker_id,
+                lease_lock=lease_lock,
             )
         )
         coordination = asyncio.create_task(
@@ -1640,6 +1644,7 @@ class KnowledgeEnrichmentWorker:
         task: Task,
         *,
         worker_id: str,
+        lease_lock: asyncio.Lock,
     ) -> KnowledgeEnrichmentJob | None:
         request: KnowledgeEnrichmentRequest | None = None
         request_sha256: str | None = None
@@ -1728,14 +1733,32 @@ class KnowledgeEnrichmentWorker:
             result_payload = None
             error_payload = _failure_payload(failure)
             retry_after_seconds = decision.retry_after_seconds
-        await self._settle(
-            task,
-            worker_id=worker_id,
-            disposition=disposition,
-            result=result_payload,
-            error=error_payload,
-            retry_after_seconds=retry_after_seconds,
-        )
+        for lease_attempt in range(3):
+            # Wait for any in-flight renewal acknowledgement, but let the
+            # heartbeat run throughout settlement I/O and retry backoff.
+            async with lease_lock:
+                settlement_task = copy_task(task)
+            try:
+                await self._settle(
+                    settlement_task,
+                    worker_id=worker_id,
+                    disposition=disposition,
+                    result=result_payload,
+                    error=error_payload,
+                    retry_after_seconds=retry_after_seconds,
+                )
+            except TaskClaimLost:
+                async with lease_lock:
+                    if (
+                        lease_attempt == 2
+                        or task.lease_expires_at == settlement_task.lease_expires_at
+                    ):
+                        raise
+                # Only this worker's acknowledged renewal permits a new
+                # request. That renewal fences the old lease; the store's
+                # exact receipt replay still precedes lease validation.
+            else:
+                break
         if request is None:
             return None
         return await self._queue.load(request.operation_id)
@@ -1978,6 +2001,7 @@ class KnowledgeEnrichmentWorker:
         request = TaskRetrySettlementRequest(
             task_id=task.id,
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
             causal_budget_id=series.causal_budget_id,
             idempotency_key=f"knowledge-enrichment:{series.series_id}:{series.attempt}",
             disposition=disposition,
@@ -2029,6 +2053,7 @@ class KnowledgeEnrichmentWorker:
         request = TaskTerminalizationRequest(
             task_id=task.id,
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
             kind=TaskTerminalKind.FAILED,
             error=error,
             idempotency_key=(
@@ -2429,19 +2454,23 @@ async def _heartbeat_claim(
     lease_expires_at: datetime,
     lease_seconds: int,
     stop: asyncio.Event,
+    lease_task: Task,
+    lease_lock: asyncio.Lock,
 ) -> None:
     async def heartbeat() -> Task:
         nonlocal lease_expires_at
-        renewed = await task_store.heartbeat(
-            task_id,
-            worker_id,
-            lease_expires_at=lease_expires_at,
-            extend_seconds=lease_seconds,
-        )
-        if renewed.lease_expires_at is None:
-            raise TaskClaimLost("Enrichment heartbeat returned no worker lease.")
-        lease_expires_at = renewed.lease_expires_at
-        return renewed
+        async with lease_lock:
+            renewed = await task_store.heartbeat(
+                task_id,
+                worker_id,
+                lease_expires_at=lease_expires_at,
+                extend_seconds=lease_seconds,
+            )
+            if renewed.lease_expires_at is None:
+                raise TaskClaimLost("Enrichment heartbeat returned no worker lease.")
+            lease_expires_at = renewed.lease_expires_at
+            lease_task.lease_expires_at = lease_expires_at
+            return renewed
 
     async def reconcile_failure(heartbeat_error: Exception) -> None:
         try:

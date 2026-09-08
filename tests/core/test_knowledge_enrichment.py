@@ -1629,3 +1629,258 @@ def test_durable_knowledge_enrichment_example_uses_a_fresh_worker_process() -> N
 
     assert "completed" in completed.stdout
     assert "Run database migrations before starting" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    "backend", ["memory", "sqlite", pytest.param("postgres", marks=pytest.mark.postgres)]
+)
+@pytest.mark.parametrize("retryable", [False, True])
+def test_renewed_lease_settlement_waits_for_heartbeat_acknowledgement(
+    tmp_path, backend, retryable, request
+) -> None:
+    async def run() -> None:
+        if backend == "postgres":
+            dsn = request.getfixturevalue("postgres_dsn")
+            await drop_cayu_tables(dsn)
+            store = PostgresTaskStore(dsn, min_size=1, max_size=2, schema_mode=SchemaMode.CREATE)
+        else:
+            store = (
+                InMemoryTaskStore()
+                if backend == "memory"
+                else SQLiteTaskStore(tmp_path / "renewal.sqlite3")
+            )
+        renewal_committed = asyncio.Event()
+        release_heartbeat = asyncio.Event()
+        settlement_started = asyncio.Event()
+        generator = _BlockingGenerator()
+        curator, _, _ = _curator(generator=generator)
+        original_commit = curator._commit_prepared_curation
+
+        async def commit(*args, **kwargs):
+            if retryable:
+                raise ConnectionError("retry after renewed lease")
+            return await original_commit(*args, **kwargs)
+
+        curator._commit_prepared_curation = commit
+        queue = KnowledgeEnrichmentQueue(
+            store,
+            curator_config=curator.config,
+            access_scope=curator.access_scope,
+            config=_queue_config(),
+        )
+        await queue.submit(_request(queue, operation_id=f"renewed-{backend}-{retryable}-{uuid4()}"))
+        original_heartbeat = store.heartbeat
+        original_settle = store.settle_task_retry_attempt
+        renewed_lease = None
+
+        async def heartbeat(*args, **kwargs):
+            nonlocal renewed_lease
+            renewed = await original_heartbeat(*args, **kwargs)
+            assert renewed.lease_expires_at != kwargs["lease_expires_at"]
+            renewed_lease = renewed.lease_expires_at
+            renewal_committed.set()
+            await release_heartbeat.wait()
+            return renewed
+
+        async def settle(request):
+            settlement_started.set()
+            assert release_heartbeat.is_set()
+            assert request.lease_expires_at == renewed_lease
+            return await original_settle(request)
+
+        store.heartbeat = heartbeat
+        store.settle_task_retry_attempt = settle
+        task = asyncio.create_task(
+            KnowledgeEnrichmentWorker(queue, curator).process_next(
+                worker_id="renewed-worker", lease_seconds=1
+            )
+        )
+        try:
+            await asyncio.wait_for(generator.started.wait(), 5)
+            await asyncio.wait_for(renewal_committed.wait(), 5)
+            generator.release.set()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not settlement_started.is_set()
+            release_heartbeat.set()
+            job = await asyncio.wait_for(task, 5)
+            assert job is not None
+            assert job.status is (
+                KnowledgeEnrichmentJobStatus.RETRY_SCHEDULED
+                if retryable
+                else KnowledgeEnrichmentJobStatus.COMPLETED
+            )
+            assert settlement_started.is_set()
+        finally:
+            release_heartbeat.set()
+            generator.release.set()
+            if not task.done():
+                await task
+            if backend != "memory":
+                await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "backend", ["memory", "sqlite", pytest.param("postgres", marks=pytest.mark.postgres)]
+)
+@pytest.mark.parametrize("retryable", [False, True])
+@pytest.mark.parametrize("delay_kind", ["backoff", "slow_write", "lost_ack"])
+def test_settlement_keeps_lease_live_during_store_delays(
+    tmp_path, backend, retryable, delay_kind, request
+) -> None:
+    async def run() -> None:
+        if backend == "postgres":
+            dsn = request.getfixturevalue("postgres_dsn")
+            await drop_cayu_tables(dsn)
+            store = PostgresTaskStore(dsn, min_size=1, max_size=2, schema_mode=SchemaMode.CREATE)
+        else:
+            store = (
+                InMemoryTaskStore()
+                if backend == "memory"
+                else SQLiteTaskStore(tmp_path / "settlement-delay.sqlite3")
+            )
+        curator, generator, evaluator = _curator()
+        original_commit = curator._commit_prepared_curation
+
+        async def commit(*args, **kwargs):
+            if retryable:
+                raise ConnectionError("retry curation after preparation")
+            return await original_commit(*args, **kwargs)
+
+        curator._commit_prepared_curation = commit
+        queue = KnowledgeEnrichmentQueue(
+            store,
+            curator_config=curator.config,
+            access_scope=curator.access_scope,
+            config=_queue_config(
+                terminalization_retry_policy=TaskTerminalizationRetryPolicy(
+                    initial_backoff_seconds=1.2,
+                    max_backoff_seconds=1.2,
+                )
+            ),
+        )
+        submitted = await queue.submit(_request(queue, operation_id=f"settlement-delay-{uuid4()}"))
+        original_settle = store.settle_task_retry_attempt
+        original_heartbeat = store.heartbeat
+        original_lookup = store.load_task_retry_settlement
+        requests = []
+        renewed_leases = []
+        reconciled_receipts = []
+
+        async def heartbeat(*args, **kwargs):
+            renewed = await original_heartbeat(*args, **kwargs)
+            renewed_leases.append(renewed.lease_expires_at)
+            return renewed
+
+        async def settle(settlement_request):
+            requests.append(settlement_request)
+            if len(requests) == 1:
+                if delay_kind == "backoff":
+                    raise ConnectionError("temporary pre-commit settlement outage")
+                if delay_kind == "slow_write":
+                    await asyncio.sleep(1.2)
+                if delay_kind == "lost_ack":
+                    await original_settle(settlement_request)
+                    await asyncio.sleep(1.2)
+                    raise ConnectionError("committed settlement acknowledgement lost")
+            return await original_settle(settlement_request)
+
+        async def lookup(*args, **kwargs):
+            receipt = await original_lookup(*args, **kwargs)
+            if receipt is not None:
+                reconciled_receipts.append(receipt)
+            return receipt
+
+        store.heartbeat = heartbeat
+        store.settle_task_retry_attempt = settle
+        store.load_task_retry_settlement = lookup
+        try:
+            job = await asyncio.wait_for(
+                KnowledgeEnrichmentWorker(queue, curator).process_next(
+                    worker_id="delayed-settlement-worker", lease_seconds=1
+                ),
+                timeout=10,
+            )
+            assert job is not None
+            assert job.status is (
+                KnowledgeEnrichmentJobStatus.RETRY_SCHEDULED
+                if retryable
+                else KnowledgeEnrichmentJobStatus.COMPLETED
+            )
+            assert generator.calls == evaluator.calls == 1
+            if delay_kind == "lost_ack":
+                assert len(requests) == len(reconciled_receipts) == 1
+            else:
+                assert renewed_leases
+                assert requests[-1].lease_expires_at in renewed_leases
+                assert requests[-1].lease_expires_at != requests[0].lease_expires_at
+            tasks = await store.list_tasks()
+            successors = [
+                task
+                for task in tasks
+                if task.retry_series is not None
+                and task.retry_series.predecessor_task_id == submitted.current_task_id
+            ]
+            assert len(successors) == int(retryable)
+        finally:
+            if backend != "memory":
+                await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_malformed_claim_keeps_lease_live_during_terminalization_backoff(tmp_path, backend) -> None:
+    async def run() -> None:
+        store = (
+            InMemoryTaskStore()
+            if backend == "memory"
+            else SQLiteTaskStore(tmp_path / "malformed-delay.sqlite3")
+        )
+        curator, _, _ = _curator()
+        queue = KnowledgeEnrichmentQueue(
+            store,
+            curator_config=curator.config,
+            access_scope=curator.access_scope,
+            config=_queue_config(
+                terminalization_retry_policy=TaskTerminalizationRetryPolicy(
+                    initial_backoff_seconds=1.2,
+                    max_backoff_seconds=1.2,
+                )
+            ),
+        )
+        malformed = await store.create_task(
+            TaskCreate(
+                task_id="malformed-delayed-enrichment",
+                type=queue.task_type,
+                input={"knowledge_enrichment": {"contract": "invalid"}},
+            )
+        )
+        original_terminalize = store.terminalize_task
+        requests = []
+
+        async def terminalize(terminal_request):
+            requests.append(terminal_request)
+            if len(requests) == 1:
+                raise ConnectionError("temporary terminalization outage")
+            return await original_terminalize(terminal_request)
+
+        store.terminalize_task = terminalize
+        try:
+            with pytest.raises(KnowledgeEnrichmentJobRejected, match="durably rejected"):
+                await asyncio.wait_for(
+                    KnowledgeEnrichmentWorker(queue, curator).process_next(
+                        worker_id="malformed-worker", lease_seconds=1
+                    ),
+                    timeout=10,
+                )
+            rejected = await store.load_task(malformed.id)
+            assert rejected is not None and rejected.status is TaskStatus.FAILED
+            assert requests[-1].lease_expires_at != requests[0].lease_expires_at
+        finally:
+            if backend != "memory":
+                await store.close()
+
+    asyncio.run(run())
