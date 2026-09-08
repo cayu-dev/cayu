@@ -27515,6 +27515,7 @@ class SessionEngine:
         terminal_finalization_handoff_source_task: asyncio.Task[Any] | None = None,
         run_terminal_hooks: bool = True,
         preserve_interaction_id: str | None = None,
+        recovery_claim_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         clear_current_task_cancellation()
         current_task = asyncio.current_task()
@@ -27889,6 +27890,9 @@ class SessionEngine:
                             finalize_unsettled_cancellation=False,
                             terminal_event=prepared_terminal_event,
                             terminal_decision=terminal_decision,
+                            expected_recovery_claim_id=(
+                                terminal_finalization_claim_id or recovery_claim_id
+                            ),
                         ),
                         operation_name="Live interruption atomic terminal publication",
                     )
@@ -27952,9 +27956,7 @@ class SessionEngine:
                         execution_profile=execution_profile,
                         finalize_unsettled_cancellation=False,
                         expected_recovery_claim_id=(
-                            terminal_finalization_claim_id
-                            if user_input_supersession_retained
-                            else None
+                            terminal_finalization_claim_id or recovery_claim_id
                         ),
                     ),
                     operation_name="Live interruption interaction transition",
@@ -27976,9 +27978,7 @@ class SessionEngine:
                         execution_profile=execution_profile,
                         finalize_unsettled_cancellation=False,
                         expected_recovery_claim_id=(
-                            terminal_finalization_claim_id
-                            if user_input_supersession_retained
-                            else None
+                            terminal_finalization_claim_id or recovery_claim_id
                         ),
                     ),
                     operation_name="Live interruption residual interaction transition",

@@ -8999,7 +8999,9 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                     recovered = await replay_app.recover_incomplete_session(
                         IncompleteSessionRecoveryRequest(session_id=session_id)
                     )
-                    assert recovered.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+                    assert recovered.actions == (
+                        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,
+                    )
                     assert all(
                         event.type is not EventType.SESSION_INTERRUPTED
                         for event in recovered.events
@@ -9160,7 +9162,7 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
             monkeypatch.setattr(
                 recovery_coordinator_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
-                timedelta(milliseconds=150),
+                timedelta(seconds=1),
             )
             monkeypatch.setattr(
                 recovery_coordinator_module,
@@ -9255,7 +9257,7 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
                 # The live worker is delayed beyond the original lease before
                 # it can enter terminal publication. Its retained handoff must
                 # renew the exact claim rather than letting a peer take it.
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(1.2)
                 renewed_checkpoint = await store.load_checkpoint(session_id)
                 assert renewed_checkpoint is not None
                 renewed_claim = renewed_checkpoint["incomplete_session_recovery_claim"]
@@ -10733,8 +10735,9 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                     timeout=10,
                 )
             assert isinstance(run_outcome, BaseException)
-            assert isinstance(interrupt_events, list)
-            assert interrupt_events[-1].id == peer_events[-1].id
+            assert isinstance(
+                interrupt_events, recovery_coordinator_module._IncompleteRecoveryClaimLost
+            )
             final_checkpoint = await store.load_checkpoint(session_id)
             assert final_checkpoint is not None
             assert "pending_session_interrupt" not in final_checkpoint

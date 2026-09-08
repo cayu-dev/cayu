@@ -1342,6 +1342,7 @@ class RecoveryInterruptionRequest:
     invocation_context: InvocationContext | None = None
     run_terminal_hooks: bool = True
     preserve_interaction_id: str | None = None
+    recovery_claim_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -19904,6 +19905,7 @@ class RecoveryCoordinator:
                 )
             if session.status is SessionStatus.INTERRUPTING:
                 session = await self._finalize_interrupting_for_recovery(
+                    recovery_claim_id=claim_id,
                     preserve_interaction_id=preserve_interaction_id,
                     session=session,
                     registered_agent=registered_agent,
@@ -19954,6 +19956,7 @@ class RecoveryCoordinator:
                     "Provider cancellation interruption marker conflicts with session status."
                 )
             session = await self._finalize_interrupting_for_recovery(
+                recovery_claim_id=claim_id,
                 preserve_interaction_id=preserve_interaction_id,
                 session=session,
                 registered_agent=registered_agent,
@@ -20552,6 +20555,7 @@ class RecoveryCoordinator:
                     pending_round=pending_tool_round,
                 )
                 session = await self._finalize_interrupting_for_recovery(
+                    recovery_claim_id=claim_id,
                     preserve_interaction_id=preserve_interaction_id,
                     session=session,
                     registered_agent=registered_agent,
@@ -20612,6 +20616,7 @@ class RecoveryCoordinator:
                     ),
                 )
             session = await self._finalize_interrupting_for_recovery(
+                recovery_claim_id=claim_id,
                 preserve_interaction_id=preserve_interaction_id,
                 session=session,
                 registered_agent=registered_agent,
@@ -20656,6 +20661,7 @@ class RecoveryCoordinator:
                     "Pending user-input recovery authority changed before finalization."
                 )
             session = await self._finalize_interrupting_for_recovery(
+                recovery_claim_id=claim_id,
                 preserve_interaction_id=preserve_interaction_id,
                 session=session,
                 registered_agent=registered_agent,
@@ -20682,6 +20688,7 @@ class RecoveryCoordinator:
 
         if session.status == SessionStatus.INTERRUPTING:
             session = await self._finalize_interrupting_for_recovery(
+                recovery_claim_id=claim_id,
                 preserve_interaction_id=preserve_interaction_id,
                 session=session,
                 registered_agent=registered_agent,
@@ -20781,10 +20788,12 @@ class RecoveryCoordinator:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         preserve_interaction_id: str | None = None,
+        recovery_claim_id: str | None = None,
     ) -> Session:
         if session.status == SessionStatus.INTERRUPTING:
             async for event in self._interrupt_session_for_recovery(
                 RecoveryInterruptionRequest(
+                    recovery_claim_id=recovery_claim_id,
                     preserve_interaction_id=preserve_interaction_id,
                     session=session,
                     registered_agent=registered_agent,

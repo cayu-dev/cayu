@@ -6913,6 +6913,7 @@ class CayuApp:
             invocation_context=request.invocation_context,
             run_terminal_hooks=request.run_terminal_hooks,
             preserve_interaction_id=request.preserve_interaction_id,
+            recovery_claim_id=request.recovery_claim_id,
         )
 
     def _pending_session_interrupt_checkpoint_for_recovery(
@@ -7671,6 +7672,7 @@ class CayuApp:
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         run_terminal_hooks: bool = True,
         preserve_interaction_id: str | None = None,
+        recovery_claim_id: str | None = None,
     ) -> AsyncIterator[Event]:
         stream = self._session_engine._handle_session_interrupted(
             session=session,
@@ -7684,6 +7686,7 @@ class CayuApp:
             active_run=active_run,
             run_terminal_hooks=run_terminal_hooks,
             preserve_interaction_id=preserve_interaction_id,
+            recovery_claim_id=recovery_claim_id,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
