@@ -303,6 +303,7 @@ class BrowserControlRecord(_ControlModel):
     identity: BrowserControlIdentity
     revision: _Counter = 1
     control_epoch: _Counter = 1
+    transport_generation: _Counter = 1
     state: BrowserControlState = "agent_controlled"
     request: BrowserTakeoverRequest | None = Field(default=None, repr=False)
     lease_until_ms: _Time | None = None
@@ -380,6 +381,8 @@ class BrowserControlRecord(_ControlModel):
             if self.revision <= self.request.expected_record_revision:
                 raise ValueError("Browser control must advance its request's source revision.")
             expected_epoch = self.request.expected_control_epoch
+            if expected_epoch < self.transport_generation:
+                raise ValueError("Browser takeover precedes its transport generation.")
             if self.state == "takeover_requested" and (
                 self.control_epoch != expected_epoch or self.lease_until_ms is not None
             ):
@@ -403,7 +406,7 @@ class BrowserControlRecord(_ControlModel):
         ):
             raise ValueError("Browser control state requires an exact takeover request.")
         if self.request is None and (
-            self.control_epoch != 1
+            self.control_epoch != self.transport_generation
             or self.pending_input_sequence is not None
             or self.settled_input_sequence != 0
             or self.operator_page_operations
@@ -478,6 +481,46 @@ def closed_browser_control_successor(record: BrowserControlRecord) -> BrowserCon
     )
 
 
+def rebound_browser_control_successor(
+    current: BrowserControlRecord, identity: BrowserControlIdentity
+) -> BrowserControlRecord:
+    """Exact surviving guest, newer invocation, and no native-input authority.
+
+    Native acknowledgement still must establish the matching transport fence.
+    A prior takeover (including uncertain input) requires explicit closure instead.
+    """
+    current = BrowserControlRecord.model_validate(current)
+    identity = BrowserControlIdentity.model_validate(identity)
+    if (
+        identity.run_epoch <= current.identity.run_epoch
+        or identity.model_dump(exclude={"run_epoch", "interaction_id"})
+        != current.identity.model_dump(exclude={"run_epoch", "interaction_id"})
+        or current.state not in {"agent_controlled", "control_uncertain"}
+        or current.request is not None
+        or current.sensitive_entry
+        or current.sensitive_entry_pending
+        or current.capture_restricted
+        or current.manual_mutation_uncertain
+        or current.pending_input_sequence is not None
+        or current.settled_input_sequence != 0
+        or current.operator_page_operations
+    ):
+        raise BrowserControlConflict(
+            "Browser control recovery requires the same view-only allocation; "
+            "resolve uncertain takeover through exact allocation closure."
+        )
+    return current.model_copy(
+        update={
+            "identity": identity,
+            "revision": current.revision + 1,
+            "control_epoch": current.control_epoch + 1,
+            "transport_generation": current.transport_generation + 1,
+            "state": "agent_controlled",
+            "fresh_observation_required": True,
+        }
+    )
+
+
 class BrowserControlCheckpoint(_ControlModel):
     """Bounded allocation records owned by one parent session transaction."""
 
@@ -530,7 +573,13 @@ class BrowserControlCheckpoint(_ControlModel):
             pristine = BrowserControlRecord(identity=desired.identity)
             if desired != pristine:
                 raise BrowserControlConflict("Browser control initialization must be pristine.")
-        elif desired.identity != expected.identity or desired.revision != expected.revision + 1:
+        elif desired.identity != expected.identity:
+            if desired != rebound_browser_control_successor(expected, desired.identity):
+                raise BrowserControlConflict("Browser reconnect must advance its exact fence.")
+        elif (
+            desired.revision != expected.revision + 1
+            or desired.transport_generation != expected.transport_generation
+        ):
             raise BrowserControlConflict(
                 "Browser control publication must advance the exact owner."
             )

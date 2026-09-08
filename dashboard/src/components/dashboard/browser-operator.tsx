@@ -290,6 +290,15 @@ export function BrowserOperator({ sessionId }: { sessionId: string }) {
                       target.getContext("2d")?.drawImage(bitmap, 0, 0)
                     },
                     clear,
+                    createImageBitmap,
+                    (state) => {
+                      if (!current()) return
+                      setStatus(
+                        state === "live"
+                          ? "Live private view. Viewing grants no input authority."
+                          : "Private view unavailable or disconnected. Rediscover the browser and reopen its view.",
+                      )
+                    },
                   )
                   ticket = ""
                   setStatus(

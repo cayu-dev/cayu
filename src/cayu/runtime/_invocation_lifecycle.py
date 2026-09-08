@@ -2940,8 +2940,16 @@ async def apply_invocation_lifecycle_command(
                 result_session=session,
             )
 
+        from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
+
         try:
-            with _invocation_lifecycle_authority_mutation_scope():
+            # This typed command compares the complete source checkpoint. Give
+            # its internal transform the same private view used in preparation;
+            # generic callbacks still cannot read or mutate browser authority.
+            with (
+                _invocation_lifecycle_authority_mutation_scope(),
+                browser_control_checkpoint_read_scope(copied.session_id),
+            ):
                 if copied.target_status is None:
                     session = await store.fence_run_and_transform_checkpoint(
                         copied.session_id,

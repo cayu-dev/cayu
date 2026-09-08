@@ -518,10 +518,3 @@ def test_preflight_failure_never_admits_or_thaws_retained_guest(tmp_path, monkey
         claim.close()
 
     asyncio.run(scenario())
-
-
-def test_reconnect_refuses_unqualified_colocated_control_server(tmp_path):
-    from cayu.egress import UnsupportedEgressError
-
-    with pytest.raises(UnsupportedEgressError, match="colocated control server"):
-        DockerEgressAdapter(reconnect_state_dir=tmp_path, control_server_container_id="a" * 64)

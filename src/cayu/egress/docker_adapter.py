@@ -346,10 +346,6 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             )
         self._control_server_container_id = control_server_container_id
         self._preparation_cleanups: dict[str, _PreparationCleanup] = {}
-        if reconnect_state_dir is not None and control_server_container_id is not None:
-            raise UnsupportedEgressError(
-                "Local reconnect does not support a colocated control server."
-            )
         self._docker_cli_env_allowlist = normalize_docker_cli_env_allowlist(
             docker_cli_env_allowlist
         )
@@ -503,8 +499,12 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         validate_grant_scope(session_id=session_id, grants=grants)
         await self.drain_preparation_cleanup()
         control_server_container_id = self._control_server_container_id
-        if control_server_container_id is not None and (
-            await self._container_id(control_server_container_id) != control_server_container_id
+        if (
+            self._reconnect is None
+            and control_server_container_id is not None
+            and (
+                await self._container_id(control_server_container_id) != control_server_container_id
+            )
         ):
             raise UnsupportedEgressError("The exact control server container is unavailable.")
         loop = self._loop or asyncio.get_running_loop()
@@ -560,7 +560,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 await self._run(
                     ["network", "create", "--internal", "--label", label, *ownership_label, network]
                 )
-            if control_server_container_id is not None:
+            if control_server_container_id is not None and self._reconnect is not None:
+                assert reconnect_token is not None
+                await self._reconnect.attach_control_server(reconnect_token, network)
+            elif control_server_container_id is not None:
                 attachment = asyncio.create_task(
                     self._run(
                         [
@@ -1119,7 +1122,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         # incomplete teardown closed.
         await broker.revoke_authority_and_wait(tuple(grant.presented_value for grant in grants))
         errors: list[str] = []
-        if control_server_container_id is not None:
+        if control_server_container_id is not None and not skip_docker:
             try:
                 await self._disconnect_control_server(network, control_server_container_id)
             except Exception as exc:

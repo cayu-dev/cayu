@@ -126,8 +126,12 @@ the same alias; the application broker listens on container interfaces without
 publishing its port to the host. The control server is application-owned: binding
 cleanup detaches its network endpoint but does not stop or delete the server.
 Cancellation during attachment waits for the command outcome before rollback;
-unconfirmed detachment leaves binding cleanup retryable. This does not add Docker
-allocation reconnection or process-loss recovery capabilities.
+unconfirmed detachment leaves binding cleanup retryable. Combine this with
+`reconnect_state_dir` to retain allocations across worker restart inside that exact
+surviving application container. The [combined runnable composition](../examples/browser_view_reconnect/README.md)
+uses SQLite, protected human review and the existing view-only operator UI.
+The reconnect claim binds and fences this exact attachment; container replacement
+is an explicit rebuild boundary, never a same-name reconnect.
 
 If preparation fails before returning a binding, the adapter retains the exact
 rollback owner. Keep the adapter alive and call

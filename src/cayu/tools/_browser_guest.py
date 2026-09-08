@@ -103,7 +103,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "10"
+INTERACTIVE_WORKER_VERSION = "11"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -4755,12 +4755,39 @@ class _InteractiveDaemon:
             raise GuestControlFailure()
         GuestControlFence._digest(scope)
         async with self.lock:
-            if (
-                self.closing
-                or self.close_requested.is_set()
-                or self._operator_bootstrap_task is not None
-            ):
+            if self.closing or self.close_requested.is_set():
                 raise GuestControlFailure()
+            if self._operator_bootstrap_task is not None:
+                # Docker's exclusive retained-allocation owner rotates the CA
+                # while this exact guest is frozen. Merely losing a socket is
+                # never permission to reset its input fence or bootstrap again.
+                _proxy, ca_path = _proxy_and_ca()
+                if (
+                    hashlib.sha256(Path(ca_path).read_bytes()).hexdigest()
+                    == self._trusted_ca_digest
+                ):
+                    raise GuestControlFailure()
+                if (
+                    self.control.request_id is not None
+                    or self.control.capture_restricted
+                    or self.control.sensitive_entry
+                ):
+                    raise GuestControlFailure()
+                previous = self._operator_bootstrap_task
+                previous.cancel()
+                async with asyncio.timeout(5):
+                    await asyncio.shield(previous)
+                if self._operator_channel_id is not None:
+                    raise GuestControlFailure()
+                if self._operator_connection is not None:
+                    async with asyncio.timeout(5):
+                        await self._operator_connection.close()
+                await self.operator_frames.pause()
+                await self._refresh_egress_trust()
+                self.control.prepare_rebind()
+                self._operator_connection = None
+                self._operator_bootstrap_task = None
+                self.session_cleanup_tasks.pop("operator-transport", None)
 
             async def connect_and_own(token: str) -> tuple[BaseException, ...]:
                 try:

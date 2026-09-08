@@ -26,6 +26,7 @@ def test_guest_encoded_frame_requires_exact_capture(corruption, monkeypatch):
         daemon = _InteractiveDaemon("bs_fixture")
         channel = GuestControlChannel(daemon, scope_sha256="a" * 64)
         channel._binding = "b" * 64
+        daemon.control.bind(channel._binding)
         page = BrowserControlPage(page_id="page", revision="revision", control_epoch=1)
         bound = BoundBrowserGuest(
             BrowserControlRecord(

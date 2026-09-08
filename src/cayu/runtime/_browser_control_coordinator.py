@@ -48,6 +48,7 @@ from cayu.runtime.browser_control import (
     BrowserTakeoverRequest,
     BrowserTextInputIntent,
     closed_browser_control_successor,
+    rebound_browser_control_successor,
     request_browser_takeover,
 )
 from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
@@ -119,7 +120,18 @@ class BrowserControlCoordinator:
             None,
         )
         if current is not None:
-            if current.identity != identity or current.state in {"closed", "allocation_lost"}:
+            if current.identity != identity:
+                desired = rebound_browser_control_successor(current, identity)
+                return await self._publisher.publish(
+                    BrowserControlPublication(
+                        BrowserControlCheckpointMutation(
+                            identity.session_id,
+                            controls,
+                            controls.replace_record(expected=current, desired=desired),
+                        )
+                    )
+                )
+            if current.state in {"closed", "allocation_lost"}:
                 raise BrowserControlConflict(
                     "Browser bootstrap conflicts with its admitted worker."
                 )

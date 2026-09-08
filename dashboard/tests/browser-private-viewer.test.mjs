@@ -195,3 +195,63 @@ test("decoder failure closes the viewer without publishing diagnostics", async (
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(closed, 1)
 })
+
+test("silent worker loss clears pixels and rejects a late decode", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] })
+  let cleared = 0
+  let drawn = 0
+  let disposed = 0
+  let release
+  const states = []
+  const socket = { send() {}, close() {} }
+  startPrivateBrowserViewer(
+    socket,
+    "ticket",
+    () => drawn++,
+    () => cleared++,
+    () =>
+      new Promise((resolve) => {
+        release = resolve
+      }),
+    (state) => states.push(state),
+  )
+  socket.onopen()
+  socket.onmessage({ data: "ready" })
+  socket.onmessage({ data: frame() })
+  await Promise.resolve()
+  context.mock.timers.tick(5000)
+  assert.equal(cleared, 1)
+  assert.deepEqual(states, ["unavailable"])
+  release({ width: 16, height: 16, close: () => disposed++ })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(drawn, 0)
+  assert.equal(disposed, 1)
+})
+
+test("missing frame after a live frame expires the displayed pixels", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] })
+  let visible = false
+  const states = []
+  const socket = { send() {}, close() {} }
+  startPrivateBrowserViewer(
+    socket,
+    "ticket",
+    () => {
+      visible = true
+    },
+    () => {
+      visible = false
+    },
+    async () => ({ width: 16, height: 16, close() {} }),
+    (state) => states.push(state),
+  )
+  socket.onopen()
+  socket.onmessage({ data: "ready" })
+  socket.onmessage({ data: frame() })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(visible, true)
+  context.mock.timers.tick(550)
+  context.mock.timers.tick(5000)
+  assert.equal(visible, false)
+  assert.deepEqual(states, ["live", "unavailable"])
+})

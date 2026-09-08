@@ -444,7 +444,7 @@ factory = VirtualEgressEnvironmentFactory(
     adapter=DockerEgressAdapter(
         seccomp_profile="/absolute/path/to/browser_fetch/seccomp_profile.json",
     ),
-    image="cayu-browser-fetch:10-playwright-1.62.0",
+    image="cayu-browser-fetch:11-playwright-1.62.0",
     artifact_store=S3ArtifactStore("production-artifacts"),
 )
 
@@ -973,14 +973,41 @@ and grants cannot authenticate to the new authority. Brokered TLS and direct-net
 denial preflights run before final execution admission; surviving processes resume
 only when admitted work first executes. A second worker fails with
 `ownership_conflict`; closed/stale runner handles cannot dispatch or clean up.
-A colocated Docker control-server container is not supported in this local
-reconnect mode. Hot egress-policy authority adoption is also unsupported; reconnect uses the existing exact execution profile.
+A colocated control server is supported when every worker also supplies the same
+`control_server_container_id` (the full 64-character ID of the surviving application
+container). Its exact ID is part of the configuration fingerprint and private
+ownership journal. The claim owns only that container's attachment to this
+allocation's exact internal network; Runtime never stops or removes the application
+container. Attachment reuse requires matching network/container endpoint IDs and
+the allocation-local `cayu-control` alias. Foreign members or alias conflicts fail
+closed. Detachment and removal use the same exclusive claim and Docker mutation
+settlement fence as allocation recovery. Separate allocations sharing the server
+retain independent network attachments.
+
+The [runnable protected viewer/reconnect composition](../examples/browser_view_reconnect/README.md)
+uses the existing operator UI, view-only policy, SQLite, protected human-review
+references and real TLS/WSS. Worker restart keeps the original browser/page;
+reopening a view requires fresh authorization and observation. The native guest
+settles the old channel before acknowledging a newer invocation's control epoch.
+Takeover history, sensitive entry and uncertain manual input remain fenced and
+require explicit exact-allocation closure; reconnect cannot clear those fences.
+The UI clears disconnected frames and expires an unresponsive live view within
+five seconds. Browser actions also invalidate page authority; rediscover and
+reauthorize the updated page rather than treating an old view ticket as current.
+
+Hot egress-policy authority adoption remains unsupported; reconnect uses the
+existing exact execution profile. Application-container replacement and cross-host
+failover require explicit disposal/rebuild, not name-based attachment.
 
 `DockerEgressReconnectError` (exported from `cayu.egress`, a subclass of
 `EgressReconnectError`) carries a bounded `code`: `allocation_absent`,
 `identity_mismatch`, `configuration_mismatch`, `ownership_conflict`,
 `ownership_uncertain`, `daemon_unavailable`, `fencing_failed`, `state_unavailable`,
-`unsupported_host`, `preflight_failed`, `listener_conflict`, or `disposed`. Confirmed absence is distinguished from daemon
+`unsupported_host`, `preflight_failed`, `listener_conflict`,
+`control_server_unavailable`, `control_server_alias_conflict`, or `disposed`.
+A missing/replaced control server requires restoring that exact container or
+explicit disposal/rebuild. Alias conflicts require deployment-owner reconciliation;
+Runtime does not detach foreign endpoints. Confirmed absence is distinguished from daemon
 lookup failure. Reconnect never creates a replacement main container.
 
 Terminal finalization records `disposal_pending` before exact-ID removal. A later
@@ -995,7 +1022,7 @@ uncertainty. The journal's `creating`, `recovering`, `retained`, `disposal_pendi
 `disposed` and `ownership_uncertain` states describe control-plane settlement;
 they are not permission to attach through `docker exec` outside the factory.
 
-The pinned browser workload v10 refreshes its NSS trust database after CA rotation,
+The pinned browser workload v11 refreshes its NSS trust database after CA rotation,
 invalidates page refs and advances control epochs before new operations. Existing
 Runtime browser receipts recover terminal observations without replaying a mutation.
 An application tool round with incomplete dynamic secret scope can still be
@@ -1011,7 +1038,7 @@ DockerRunner/coding-allocation recovery alone does not establish virtual-egress 
 browser continuity. Explicit application rebuild creates a new allocation; browser
 profile restore imports selected profile data into a new browser.
 
-Real-Docker acceptance (requires the pinned v10 image built from
+Real-Docker acceptance (requires the pinned v11 image built from
 `examples/browser_fetch/Dockerfile`):
 
 ```bash

@@ -21,7 +21,7 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:10-playwright-1.62.0` image, the
+`cayu-browser-fetch:11-playwright-1.62.0` image, the
 `cayu.browser-session.v4` protocol and worker version 9, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
@@ -520,7 +520,7 @@ therefore do not reset when a fresh Cayu process reconnects, while `close`
 retains its separate bounded cleanup allowance.
 
 Docker virtual-egress continuity is opt-in through
-`DockerEgressAdapter(reconnect_state_dir=...)`, using the pinned worker v10 and the
+`DockerEgressAdapter(reconnect_state_dir=...)`, using the pinned worker v11 and the
 same application execution-profile identity. See
 [Docker retained-allocation reconnect](virtual-egress.md#docker-retained-allocation-reconnect)
 for local-host ownership, fencing, CA rotation and the real process-loss tests.

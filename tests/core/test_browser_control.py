@@ -657,3 +657,62 @@ async def _assert_control_publication(backend: str, tmp_path) -> None:
     finally:
         if isinstance(raw_store, SQLiteSessionStore):
             await raw_store.close()
+
+
+def test_reconnect_advances_only_the_same_view_only_guest():
+    from cayu.runtime.browser_control import rebound_browser_control_successor
+
+    old = BrowserControlRecord(identity=identity(), state="control_uncertain")
+    current = old.identity.model_copy(update={"run_epoch": 2, "interaction_id": "resumed"})
+    desired = rebound_browser_control_successor(old, current)
+    assert desired.control_epoch == old.control_epoch + 1
+    assert desired.revision == old.revision + 1
+    assert desired.fresh_observation_required and desired.state == "agent_controlled"
+    checkpoint = BrowserControlCheckpoint(records=(old,))
+    changed = checkpoint.replace_record(expected=old, desired=desired)
+    assert changed.records == (desired,)
+    with pytest.raises(BrowserControlConflict):
+        changed.replace_record(expected=old, desired=desired)
+    with pytest.raises(BrowserControlConflict):
+        checkpoint.replace_record(
+            expected=old, desired=desired.model_copy(update={"fresh_observation_required": False})
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("worker_instance_id", "other-worker"),
+        ("allocation_fingerprint", "f" * 64),
+        ("execution_profile_fingerprint", "f" * 64),
+        ("browser_session_id", "other-browser"),
+        ("session_id", "other-session"),
+        ("session_instance_id", "other-instance"),
+        ("environment_name", "other-environment"),
+        ("run_epoch", 1),
+    ],
+)
+def test_reconnect_never_substitutes_an_allocation_or_reuses_an_epoch(field, value):
+    from cayu.runtime.browser_control import rebound_browser_control_successor
+
+    old = BrowserControlRecord(identity=identity(), state="control_uncertain")
+    desired = old.identity.model_copy(
+        update={"run_epoch": 2, "interaction_id": "resumed", field: value}
+    )
+    with pytest.raises(BrowserControlConflict):
+        rebound_browser_control_successor(old, desired)
+
+
+def test_reconnect_preserves_active_takeover_and_sensitive_entry_fences():
+    from cayu.runtime.browser_control import rebound_browser_control_successor
+
+    old = request_browser_takeover(
+        BrowserControlRecord(identity=identity()), request(), now_ms=1000
+    )
+    desired = old.identity.model_copy(update={"run_epoch": 2, "interaction_id": "resumed"})
+    with pytest.raises(BrowserControlConflict):
+        rebound_browser_control_successor(old, desired)
+    fenced = old.model_copy(update={"state": "control_uncertain", "revision": old.revision + 1})
+    with pytest.raises(BrowserControlConflict):
+        rebound_browser_control_successor(fenced, desired)
+    assert fenced.request == old.request

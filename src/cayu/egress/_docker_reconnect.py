@@ -307,6 +307,11 @@ class DockerReconnect:
                 ),
                 self.adapter._docker_cli_env_allowlist,
                 self.adapter._proxy_host,
+                *(
+                    []
+                    if self.adapter._control_server_container_id is None
+                    else [self.adapter._control_server_container_id]
+                ),
             ]
         )
 
@@ -541,6 +546,127 @@ class DockerReconnect:
         ):
             raise DockerEgressReconnectError("identity_mismatch")
 
+    async def control_attachment(self, claim: _Claim, network: dict[str, Any]) -> bool:
+        """Read both exact endpoints; never adopt a container by name or alias."""
+        claim.require_owned()
+        control_id = claim.journal.get("control_server_container_id")
+        if control_id != self.adapter._control_server_container_id:
+            raise DockerEgressReconnectError("configuration_mismatch")
+        if control_id is None:
+            return False
+        if (
+            network.get("Id") != claim.journal.get("network_id")
+            or network.get("Labels", {}).get(OWNER_LABEL) != claim.token
+            or network.get("Internal") is not True
+        ):
+            raise DockerEgressReconnectError("identity_mismatch")
+        control = await self.inspect("container", control_id, absent_ok=True)
+        if (
+            control is None
+            or control.get("Id") != control_id
+            or not control.get("State", {}).get("Running")
+            or control.get("State", {}).get("Paused", False)
+        ):
+            raise DockerEgressReconnectError("control_server_unavailable")
+        members = network.get("Containers")
+        if type(members) is not dict:
+            raise DockerEgressReconnectError("identity_mismatch")
+        endpoints = control.get("NetworkSettings", {}).get("Networks", {})
+        matches = [value for value in endpoints.values() if value.get("NetworkID") == network["Id"]]
+        if control_id not in members:
+            if matches:
+                raise DockerEgressReconnectError("identity_mismatch")
+            return False
+        if (
+            len(matches) != 1
+            or not matches[0].get("EndpointID")
+            or matches[0]["EndpointID"] != members[control_id].get("EndpointID")
+            or "cayu-control" not in (matches[0].get("Aliases") or [])
+        ):
+            raise DockerEgressReconnectError("control_server_alias_conflict")
+        return True
+
+    async def attach_control_server(self, token: str, reference: str) -> None:
+        claim = next(
+            (item for item in self.claims if item.token == token and not item.closed), None
+        )
+        if claim is None:
+            raise DockerEgressReconnectError("ownership_uncertain")
+        claim.require_owned()
+        control_id = self.adapter._control_server_container_id
+        if control_id is None:
+            raise DockerEgressReconnectError("configuration_mismatch")
+        network = await self.inspect("network", reference)
+        assert network is not None
+        if network.get("Labels", {}).get(OWNER_LABEL) != token or not _ID.fullmatch(
+            network.get("Id", "")
+        ):
+            raise DockerEgressReconnectError("identity_mismatch")
+        if claim.journal.get("network_id", network["Id"]) != network["Id"]:
+            raise DockerEgressReconnectError("identity_mismatch")
+        claim.write(network_id=network["Id"])
+        # Only allocation-owned guests/sidecars may share this private network.
+        # Checking all other endpoint aliases also rejects a stolen control alias.
+        for member in network.get("Containers", {}):
+            if member == self.adapter._control_server_container_id:
+                continue
+            inspected = await self.inspect("container", member)
+            assert inspected is not None
+            if (
+                member != claim.journal.get("identity", {}).get("container_id")
+                and inspected.get("Config", {}).get("Labels", {}).get(OWNER_LABEL) != token
+            ):
+                raise DockerEgressReconnectError("identity_mismatch")
+            for endpoint in inspected.get("NetworkSettings", {}).get("Networks", {}).values():
+                if endpoint.get("NetworkID") == network["Id"] and "cayu-control" in (
+                    endpoint.get("Aliases") or []
+                ):
+                    raise DockerEgressReconnectError("control_server_alias_conflict")
+        if await self.control_attachment(claim, network):
+            return
+        await self.run(
+            [
+                "network",
+                "connect",
+                "--alias",
+                "cayu-control",
+                network["Id"],
+                control_id,
+            ]
+        )
+        network = await self.inspect("network", network["Id"])
+        assert network is not None
+        if not await self.control_attachment(claim, network):
+            raise DockerEgressReconnectError("identity_mismatch")
+
+    async def detach_control_server(self, claim: _Claim) -> None:
+        claim.require_owned()
+        control_id = claim.journal.get("control_server_container_id")
+        if control_id != self.adapter._control_server_container_id:
+            raise DockerEgressReconnectError("configuration_mismatch")
+        if control_id is None:
+            return
+        reference = claim.journal.get("network_id") or claim.journal.get("network_name")
+        if reference is None:
+            return
+        network = await self.inspect("network", reference, absent_ok=True)
+        if network is None:
+            return
+        if (
+            network.get("Id") != claim.journal.get("network_id")
+            or network.get("Labels", {}).get(OWNER_LABEL) != claim.token
+        ):
+            raise DockerEgressReconnectError("identity_mismatch")
+        members = network.get("Containers")
+        if type(members) is not dict:
+            raise DockerEgressReconnectError("identity_mismatch")
+        if control_id not in members:
+            return
+        await self.run(["network", "disconnect", "--force", network["Id"], control_id])
+        network = await self.inspect("network", network["Id"])
+        if network is None or control_id in network.get("Containers", {control_id: {}}):
+            raise DockerEgressReconnectError("identity_mismatch")
+
     async def remove_sidecar(self, claim: _Claim) -> None:
         claim.require_owned()
         reference = claim.journal.get("sidecar_id") or claim.journal.get("sidecar_name")
@@ -608,6 +734,7 @@ class DockerReconnect:
                     state="creating",
                     session_id=session_id,
                     network_name=f"cayu-egress-net-{claim.token}",
+                    control_server_container_id=self.adapter._control_server_container_id,
                 )
             sidecar_name = f"cayu-egress-{secrets.token_hex(12)}"
             claim.write(sidecar_name=sidecar_name, sidecar_id=None)
@@ -644,6 +771,7 @@ class DockerReconnect:
                 if original_close is not None:
                     await original_close()
                 await self.remove_sidecar(claim)
+                await self.detach_control_server(claim)
                 if claim.journal["state"] in {"disposal_pending", "disposed", "creating"}:
                     await self.remove_network(claim)
                     with contextlib.suppress(FileNotFoundError):
@@ -780,6 +908,8 @@ class DockerReconnect:
         return validate_identity(runner._owner.journal["identity"])
 
     async def remove_network(self, claim: _Claim) -> None:
+        claim.require_owned()
+        await self.detach_control_server(claim)
         reference = claim.journal.get("network_id") or claim.journal.get("network_name")
         if reference is None:
             return

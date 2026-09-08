@@ -61,6 +61,8 @@ class DockerEgressReconnectError(EgressReconnectError):
             "state_unavailable",
             "unsupported_host",
             "listener_conflict",
+            "control_server_unavailable",
+            "control_server_alias_conflict",
         }:
             raise ValueError("Unknown Docker reconnect error code.")
         self.code = code

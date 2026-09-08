@@ -1,6 +1,7 @@
 """Private guest bootstrap owns connection startup without public receipts."""
 
 import asyncio
+import hashlib
 import sys
 import tempfile
 from pathlib import Path
@@ -99,7 +100,7 @@ def test_bootstrap_requires_exact_acceptance_without_replay(monkeypatch, respons
     asyncio.run(scenario())
 
 
-def test_bootstrap_retains_connect_owner_and_never_records_bearer(monkeypatch):
+def test_bootstrap_retains_connect_owner_and_never_records_bearer(monkeypatch, tmp_path):
     async def scenario():
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -114,6 +115,10 @@ def test_bootstrap_retains_connect_owner_and_never_records_bearer(monkeypatch):
 
         monkeypatch.setattr(_browser_guest, "open_guest_control_channel", connect)
         daemon = _browser_guest._InteractiveDaemon("bs_bootstrap")
+        certificate = tmp_path / "ca.pem"
+        certificate.write_bytes(b"unchanged bootstrap trust")
+        daemon._trusted_ca_digest = hashlib.sha256(certificate.read_bytes()).hexdigest()
+        monkeypatch.setattr(_browser_guest, "_proxy_and_ca", lambda: ("proxy", certificate))
         raw = {
             "endpoint": "wss://control.example/guest",
             "credential": "a" * 64,

@@ -203,3 +203,27 @@ def test_exact_scope_cannot_change_its_receipt_payload(tmp_path):
                 )
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_invocation_rebind_compares_and_preserves_private_browser_root(backend, tmp_path):
+    from tests.core._execution_profile_fixtures import rebind_test_invocation
+
+    async def scenario():
+        async with publication_fixture(backend, tmp_path) as (store, bootstrap):
+            publisher = BrowserControlPublisher(store)
+            original = await publisher.publish(bootstrap)
+            rebound = await rebind_test_invocation(store, original.identity.session_id)
+            assert rebound.run_epoch == original.identity.run_epoch + 1
+            checkpoint = await store.load_checkpoint(original.identity.session_id)
+            assert checkpoint["browser_controls"] == bootstrap.mutation.desired.model_dump(
+                mode="json"
+            )
+            # Advancing the invocation does not itself grant a new browser owner.
+            assert (
+                checkpoint["browser_controls"]["records"][0]["identity"]["run_epoch"]
+                == original.identity.run_epoch
+            )
+            assert await publisher.drain()
+
+    asyncio.run(scenario())

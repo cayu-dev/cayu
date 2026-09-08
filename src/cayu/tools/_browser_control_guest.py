@@ -268,6 +268,7 @@ class GuestControlChannel:
             or message["channel_id"] != self._nonce
             or message["worker_instance"] != self._daemon.visual_worker_instance
             or message["binding_sha256"] != self._binding
+            or self._daemon.control.binding_sha256 != self._binding
             or type(message["sequence"]) is not int
             or message["sequence"] != self._sequence + 1
             or message["sequence"] > 2**53 - 1
@@ -484,6 +485,26 @@ class GuestControlFence:
             or self.state not in {"agent_controlled", "takeover_requested", "operator_controlled"}
         ):
             raise GuestControlFailure()
+
+    def prepare_rebind(self) -> None:
+        """Called only after exact egress rotation and old channel settlement."""
+        if (
+            self.binding_sha256 is None
+            or self.state not in {"agent_controlled", "control_uncertain"}
+            or self.request_id is not None
+            or self.sensitive_entry
+            or self.capture_restricted
+            or self.pending_sequence is not None
+            or self.settled_sequence != 0
+        ):
+            raise GuestControlFailure()
+        self.binding_sha256 = None
+        self.state = "unbound"
+        self.epoch += 1
+        self.fresh_observation_required = True
+        self.view_id = None
+        self.view_until = 0.0
+        self.view_epoch = 0
 
     def bind(self, binding_sha256: str) -> None:
         self._digest(binding_sha256)

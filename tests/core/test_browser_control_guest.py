@@ -389,3 +389,163 @@ def test_takeover_joins_cleanup_registered_during_settlement() -> None:
         assert (await takeover)["state"] == "operator_controlled"
 
     asyncio.run(scenario())
+
+
+def test_view_only_rebind_rotates_native_epoch_and_discards_view():
+    from cayu.tools._browser_control_guest import GuestControlFence
+
+    fence = GuestControlFence(worker_instance="vw_" + "a" * 32)
+    fence.bind("a" * 64)
+    fence.view_id, fence.view_epoch, fence.view_until = "bv_" + "b" * 32, 1, 999999
+    fence.uncertain()
+    fence.prepare_rebind()
+    assert fence.epoch == 2 and fence.fresh_observation_required
+    assert fence.binding_sha256 is None and fence.view_id is None and fence.view_until == 0
+    fence.bind("c" * 64)
+    with pytest.raises(GuestControlFailure):
+        fence.check_model(1, "observe")
+    with pytest.raises(GuestControlFailure):
+        fence.check_model(2, "click")
+    fence.check_model(2, "observe")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request_id", "bt_" + "a" * 32),
+        ("sensitive_entry", True),
+        ("capture_restricted", True),
+        ("pending_sequence", 1),
+        ("settled_sequence", 1),
+        ("state", "operator_controlled"),
+    ],
+)
+def test_rebind_never_clears_native_input_or_privacy_fences(field, value):
+    from cayu.tools._browser_control_guest import GuestControlFence
+
+    fence = GuestControlFence(worker_instance="vw_" + "a" * 32)
+    fence.bind("a" * 64)
+    setattr(fence, field, value)
+    before = dict(vars(fence))
+    with pytest.raises(GuestControlFailure):
+        fence.prepare_rebind()
+    assert vars(fence) == before
+
+
+def test_old_guest_channel_cannot_read_or_mutate_a_rebound_generation():
+    from cayu.tools._browser_control_guest import GuestControlChannel
+
+    async def scenario():
+        daemon = guest._InteractiveDaemon("bs_test")
+        old = GuestControlChannel(daemon, scope_sha256="a" * 64)
+        old._binding = "b" * 64
+        daemon.control.bind(old._binding)
+        daemon.control.uncertain()
+        daemon.control.prepare_rebind()
+        daemon.control.bind("c" * 64)
+        for kind in ("status", "pages", "view", "takeover", "text_input", "frame"):
+            with pytest.raises(GuestControlFailure):
+                await old._command(
+                    {
+                        "kind": kind,
+                        "channel_id": old._nonce,
+                        "worker_instance": daemon.visual_worker_instance,
+                        "binding_sha256": old._binding,
+                        "sequence": 1,
+                    },
+                    None,
+                )
+        assert old._sequence == 0
+        assert daemon.control.epoch == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("changed_ca", [False, True])
+def test_private_rebootstrap_cannot_reset_takeover_or_reuse_old_egress(
+    tmp_path, monkeypatch, changed_ca
+):
+    import hashlib
+
+    async def scenario():
+        daemon = guest._InteractiveDaemon("bs_test")
+        daemon.control.bind(_BINDING)
+        certificate = tmp_path / "ca.pem"
+        certificate.write_bytes(b"new" if changed_ca else b"old")
+        daemon._trusted_ca_digest = hashlib.sha256(b"old").hexdigest()
+        monkeypatch.setattr(guest, "_proxy_and_ca", lambda: ("proxy", str(certificate)))
+        if changed_ca:
+            daemon.control.request_id = _REQUEST
+        old = asyncio.create_task(asyncio.sleep(0, result=()))
+        await old
+        daemon._operator_bootstrap_task = old
+        before = dict(vars(daemon.control))
+        with pytest.raises(GuestControlFailure):
+            await daemon.bootstrap_operator_channel(
+                {
+                    "endpoint": "wss://control.test/api/guest",
+                    "credential": "c" * 64,
+                    "scope_sha256": "d" * 64,
+                }
+            )
+        assert vars(daemon.control) == before
+        assert daemon._operator_bootstrap_task is old
+
+    asyncio.run(scenario())
+
+
+def test_private_rebootstrap_joins_previous_frame_before_reset(tmp_path, monkeypatch):
+    import hashlib
+
+    async def scenario():
+        daemon = guest._InteractiveDaemon("bs_test")
+        daemon.control.bind(_BINDING)
+        certificate = tmp_path / "ca.pem"
+        certificate.write_bytes(b"new")
+        daemon._trusted_ca_digest = hashlib.sha256(b"old").hexdigest()
+        monkeypatch.setattr(guest, "_proxy_and_ca", lambda: ("proxy", str(certificate)))
+        old = asyncio.create_task(asyncio.sleep(0, result=()))
+        await old
+        daemon._operator_bootstrap_task = old
+        closed, release = asyncio.Event(), asyncio.Event()
+
+        async def close():
+            closed.set()
+
+        daemon._operator_connection = SimpleNamespace(close=close)
+
+        async def frame():
+            await release.wait()
+            return ()
+
+        daemon.operator_frames.task = asyncio.create_task(frame())
+
+        async def refresh():
+            daemon._trusted_ca_digest = hashlib.sha256(b"new").hexdigest()
+
+        monkeypatch.setattr(daemon, "_refresh_egress_trust", refresh)
+
+        async def unavailable(**kwargs):
+            raise GuestControlFailure()
+
+        monkeypatch.setattr(guest, "open_guest_control_channel", unavailable)
+        bootstrap = asyncio.create_task(
+            daemon.bootstrap_operator_channel(
+                {
+                    "endpoint": "wss://control.test/api/guest",
+                    "credential": "c" * 64,
+                    "scope_sha256": "d" * 64,
+                }
+            )
+        )
+        await closed.wait()
+        await asyncio.sleep(0)
+        assert not bootstrap.done()
+        assert daemon.control.binding_sha256 == _BINDING and daemon.control.epoch == 1
+        release.set()
+        assert (await bootstrap)["bootstrap_accepted"]
+        await daemon._operator_bootstrap_task
+        assert daemon.control.binding_sha256 is None and daemon.control.epoch == 2
+        assert daemon.operator_frames.paused and daemon.operator_frames.task is None
+
+    asyncio.run(scenario())

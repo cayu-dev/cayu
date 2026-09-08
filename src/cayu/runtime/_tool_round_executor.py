@@ -4556,6 +4556,38 @@ class ToolRoundExecutor:
                     )
                     with browser_control_checkpoint_read_scope(session.id):
                         checkpoint = await self._session_store.load_checkpoint(session.id)
+                    if checkpoint is not None and "browser_controls" in checkpoint:
+                        from cayu.runtime.browser_control import (
+                            BrowserControlCheckpoint,
+                            BrowserControlIdentity,
+                            rebound_browser_control_successor,
+                        )
+
+                        controls = BrowserControlCheckpoint.model_validate(
+                            checkpoint["browser_controls"]
+                        )
+                        prior = next(
+                            (
+                                record
+                                for record in controls.records
+                                if record.identity.browser_session_id == browser_session_id
+                            ),
+                            None,
+                        )
+                        if prior is not None and prior.identity.run_epoch != allocation.run_epoch:
+                            # Validate the strict view-only transition before issuing a
+                            # private capability. The owned runner/native guest must
+                            # settle old transport and acknowledge the new fence first.
+                            rebound_browser_control_successor(
+                                prior,
+                                BrowserControlIdentity(
+                                    **allocation.model_dump(),
+                                    worker_instance_id=prior.identity.worker_instance_id,
+                                ),
+                            )
+                            await bootstrap_browser_control(browser_session_id)
+                            with browser_control_checkpoint_read_scope(session.id):
+                                checkpoint = await self._session_store.load_checkpoint(session.id)
                     return browser_model_control_admission(
                         checkpoint, allocation=allocation, operation_name=operation_name
                     )

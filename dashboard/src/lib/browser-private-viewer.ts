@@ -5,6 +5,7 @@ export function startPrivateBrowserViewer(
   draw: (bitmap: ImageBitmap) => void,
   clear: () => void,
   decode: (blob: Blob) => Promise<ImageBitmap> = createImageBitmap,
+  status: (state: "live" | "unavailable") => void = () => {},
 ) {
   let closed = false
   let generation = 0
@@ -20,6 +21,9 @@ export function startPrivateBrowserViewer(
   let rejectRetirement: ((error: Error) => void) | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   const decoding = new Set<Promise<void>>()
+  // An open TCP socket does not prove a responsive worker or current pixels.
+  // This deadline covers connection, frame delivery and bitmap decoding.
+  let freshnessTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(stop, 5000)
 
   function stop() {
     if (closed) return
@@ -28,7 +32,9 @@ export function startPrivateBrowserViewer(
     ticket = ""
     clearTimeout(timer)
     clearTimeout(retirementTimer)
+    clearTimeout(freshnessTimer)
     clear()
+    status("unavailable")
     if (!retired) rejectRetirement?.(new Error("Private viewer retirement did not settle."))
     socket.close()
   }
@@ -52,6 +58,8 @@ export function startPrivateBrowserViewer(
   function requestFrame() {
     if (closed || retiring || !ready || outstanding) return
     outstanding = true
+    clearTimeout(freshnessTimer)
+    freshnessTimer = setTimeout(stop, 5000)
     socket.send("frame")
   }
 
@@ -136,7 +144,10 @@ export function startPrivateBrowserViewer(
             stop()
             return
           }
-          if (!closed && !retiring && ready && frameGeneration === generation) draw(bitmap)
+          if (!closed && !retiring && ready && frameGeneration === generation) {
+            draw(bitmap)
+            status("live")
+          }
         } finally {
           bitmap.close()
         }
