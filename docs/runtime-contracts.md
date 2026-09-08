@@ -14621,3 +14621,17 @@ rules. No response body or upstream message is needed to explain suppression.
 Old records without these fields remain unknown; no historical classification is
 inferred. The diagnostic fields do not increase budgets or override completion,
 operation, deadline, or cancellation authority.
+
+
+### Docker virtual-egress retained ownership
+
+The opt-in Docker reconnect composition uses the existing
+`VirtualEgressEnvironmentFactory` metadata and managed-runner lifecycle, plus a
+private local POSIX journal/lock directory. Exact allocation fingerprints are
+independent of hot egress-authority adoption support. A supported human pause
+retains a frozen allocation; a fresh worker owns and validates its exact IDs,
+replaces egress authority, repeats enforcement preflights and completes final
+admission before resuming existing processes. Terminal/uncertain cleanup never
+reattaches a replacement by name. See
+[Docker reconnect](virtual-egress.md#docker-retained-allocation-reconnect) for
+platform requirements, typed outcomes and browser fidelity.

@@ -1186,6 +1186,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             if (
                 adapter.egress_authority_cutover_strategy
                 is EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
+                or adapter.supports_allocation_fingerprint
             ):
                 environment_fingerprint = await adapter.egress_environment_fingerprint(runner)
                 stable_environment_fingerprint: str | None = environment_fingerprint
@@ -1306,6 +1307,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     )
                 )
 
+            adapter.complete_runner_admission(managed_runner._runner)
             return EnvironmentFactoryResult(
                 environment=environment,
                 metadata=result_metadata,

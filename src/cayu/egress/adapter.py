@@ -685,6 +685,8 @@ class SandboxEgressAdapter(ABC):
     allocation_adapter_generation: str | None = None
     #: True only when same-sandbox reconnect has durable single-owner semantics.
     supports_reconnect: bool = False
+    #: Exact allocation identity may be available independently of authority adoption.
+    supports_allocation_fingerprint: bool = False
     #: How this adapter can adopt a new egress authority at a quiescent boundary.
     #: Missing declarations remain fail-closed rather than implying a hot update.
     egress_authority_cutover_strategy: EgressAuthorityCutoverStrategy = (
@@ -777,6 +779,14 @@ class SandboxEgressAdapter(ABC):
         raise UnsupportedEgressAuthorityCutoverError(
             f"Runner {self.runner_kind!r} cannot reconcile governed egress cutover."
         )
+
+    def complete_runner_admission(self, runner: Runner) -> None:
+        """Mark completion of factory admission before retained workloads may resume.
+
+        Adapters may keep retained guest work frozen while capability/workspace
+        probes run. This hook grants no independent dispatch authority.
+        """
+        del runner
 
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
         """Return durable identity required to reattach to ``runner``."""

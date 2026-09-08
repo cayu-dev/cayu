@@ -8,14 +8,23 @@ import os
 import secrets
 import shutil
 import tempfile
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from hashlib import sha256
+from pathlib import Path
+from typing import Any
 
 from cayu._exception_groups import add_exception_note_safely
 from cayu._task_wait import await_shielded_task_outcome
 from cayu.credentials import CredentialMode
+from cayu.egress._docker_reconnect import (
+    OWNER_LABEL,
+    PROXY_ALIAS,
+    DockerReconnect,
+    _OwnedDockerRunner,
+    validate_identity,
+)
 from cayu.egress._remote_adapter import run_enforcement_preflight
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
@@ -38,7 +47,11 @@ from cayu.egress.authority import (
     _build_adapter_verified_egress_authority_cutover_receipt,
 )
 from cayu.egress.broker import TransparentEgressBroker
-from cayu.egress.errors import EgressAuthorityCutoverNeedsAttention, UnsupportedEgressError
+from cayu.egress.errors import (
+    DockerEgressReconnectError,
+    EgressAuthorityCutoverNeedsAttention,
+    UnsupportedEgressError,
+)
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_server import SessionCertificateAuthority, TransparentEgressProxyServer
 from cayu.environments.admission import (
@@ -233,6 +246,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
 
     runner_kind = "docker"
     process_external_allocation = False
+    supports_allocation_fingerprint = True
     egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
 
     def execution_capability_evidence(
@@ -256,8 +270,12 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             "unprivileged_guest": "container_guest_user_unverified",
             "host_filesystem_isolation": "container_host_boundary_unsupported",
             "read_only_host_inputs": "container_host_boundary_unsupported",
-            "reconnect": "reconnect_unsupported",
+            **({} if self.supports_reconnect else {"reconnect": "reconnect_unsupported"}),
         }
+        if self.supports_reconnect:
+            available = (*available, "reconnect")
+            if runner is not None:
+                self.reconnect_metadata(runner)
         return ExecutionCapabilityEvidence(
             subject=self.runner_kind,
             claims=(
@@ -304,7 +322,18 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         seccomp_profile: str | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
         control_server_container_id: str | None = None,
+        reconnect_state_dir: str | Path | None = None,
+        reconnect_timeout_s: float = 20.0,
     ) -> None:
+        if type(reconnect_timeout_s) not in {int, float} or not 0 < reconnect_timeout_s <= 60:
+            raise ValueError("reconnect_timeout_s must be positive and at most 60 seconds.")
+        self._reconnect = (
+            None
+            if reconnect_state_dir is None
+            else DockerReconnect(self, Path(reconnect_state_dir), reconnect_timeout_s)
+        )
+        if self._reconnect is not None:
+            self.egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.UNSUPPORTED
         if control_server_container_id is not None and (
             type(control_server_container_id) is not str
             or len(control_server_container_id) != 64
@@ -317,6 +346,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             )
         self._control_server_container_id = control_server_container_id
         self._preparation_cleanups: dict[str, _PreparationCleanup] = {}
+        if reconnect_state_dir is not None and control_server_container_id is not None:
+            raise UnsupportedEgressError(
+                "Local reconnect does not support a colocated control server."
+            )
         self._docker_cli_env_allowlist = normalize_docker_cli_env_allowlist(
             docker_cli_env_allowlist
         )
@@ -343,6 +376,57 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 docker_cli_env_allowlist=self._docker_cli_env_allowlist,
             ),
         )
+
+    @property
+    def supports_reconnect(self) -> bool:
+        return self._reconnect is not None
+
+    def configuration_metadata(self) -> dict[str, Any]:
+        return (
+            {} if self._reconnect is None else {"docker_reconnect": self._reconnect.configuration}
+        )
+
+    async def prepare_reconnect(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+        grants: Sequence[VirtualCredentialGrant],
+        broker: TransparentEgressBroker,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> EgressBinding:
+        if self._reconnect is None:
+            return await super().prepare_reconnect(
+                session_id=session_id,
+                environment_name=environment_name,
+                grants=grants,
+                broker=broker,
+                reconnect_metadata=reconnect_metadata,
+            )
+        return await self._reconnect.prepare(
+            session_id=session_id,
+            environment_name=environment_name,
+            grants=grants,
+            broker=broker,
+            reconnect_metadata=reconnect_metadata,
+        )
+
+    def complete_runner_admission(self, runner: Runner) -> None:
+        if self._reconnect is not None:
+            if not isinstance(runner, _OwnedDockerRunner) or runner._owner is None:
+                raise UnsupportedEgressError("Docker reconnect admission has no owned runner.")
+            runner._owner.require_owned()
+            runner._admission_complete = True
+
+    def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
+        if self._reconnect is None or not isinstance(runner, DockerRunner):
+            return super().reconnect_metadata(runner)
+        return self._reconnect.metadata(runner)
+
+    def validate_reconnect_metadata(self, reconnect_metadata: Mapping[str, Any]) -> dict[str, Any]:
+        if self._reconnect is None:
+            return super().validate_reconnect_metadata(reconnect_metadata)
+        return validate_identity(reconnect_metadata)
 
     async def drain_preparation_cleanup(self) -> None:
         """Retry failed preparation rollback, or join cleanup still in flight.
@@ -394,6 +478,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         grants: Sequence[VirtualCredentialGrant],
         broker: TransparentEgressBroker,
     ) -> EgressBinding:
+        if self._reconnect is not None:
+            return await self._reconnect.prepare(
+                session_id=session_id, grants=grants, broker=broker
+            )
         return await self._prepare(
             session_id=session_id,
             grants=grants,
@@ -408,6 +496,9 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         broker: TransparentEgressBroker,
         certificate_authority: SessionCertificateAuthority | None = None,
         owns_certificate_authority: bool = True,
+        reconnect_network: str | None = None,
+        reconnect_token: str | None = None,
+        reconnect_sidecar: str | None = None,
     ) -> EgressBinding:
         validate_grant_scope(session_id=session_id, grants=grants)
         await self.drain_preparation_cleanup()
@@ -417,17 +508,22 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         ):
             raise UnsupportedEgressError("The exact control server container is unavailable.")
         loop = self._loop or asyncio.get_running_loop()
-        bind_host = (
-            self._proxy_host
-            if self._proxy_host is not None
-            else await self._proxy_bind_host_resolver()
-        )
+        if self._proxy_host is not None:
+            bind_host = self._proxy_host
+        elif self._reconnect is not None:
+            try:
+                async with asyncio.timeout(self._reconnect.timeout_s):
+                    bind_host = await self._proxy_bind_host_resolver()
+            except TimeoutError:
+                raise DockerEgressReconnectError("daemon_unavailable") from None
+        else:
+            bind_host = await self._proxy_bind_host_resolver()
         # Resource names use a random token, not the session_id, so distinct
         # sessions can never collide (which would let one teardown remove
         # another live session's network). The session_id rides in a label.
         token = secrets.token_hex(6)
-        network = f"cayu-egress-net-{token}"
-        sidecar = f"cayu-egress-{token}"
+        network = reconnect_network or f"cayu-egress-net-{reconnect_token or token}"
+        sidecar = reconnect_sidecar or f"cayu-egress-{token}"
         label = f"{_SESSION_LABEL}={session_id}"
         transport_authorization = (
             _create_sidecar_transport_authorization(colocated_control_server=True)
@@ -457,7 +553,13 @@ class DockerEgressAdapter(SandboxEgressAdapter):
 
         try:
             proxy_port = await server.start()
-            await self._run(["network", "create", "--internal", "--label", label, network])
+            ownership_label = (
+                [] if reconnect_token is None else ["--label", f"{OWNER_LABEL}={reconnect_token}"]
+            )
+            if reconnect_network is None:
+                await self._run(
+                    ["network", "create", "--internal", "--label", label, *ownership_label, network]
+                )
             if control_server_container_id is not None:
                 attachment = asyncio.create_task(
                     self._run(
@@ -494,6 +596,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     sidecar,
                     "--label",
                     label,
+                    *ownership_label,
                     "--add-host",
                     "host.docker.internal:host-gateway",
                     "--mount",
@@ -514,7 +617,15 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     "listen",
                 ]
             )
-            await self._run(["network", "connect", network, sidecar])
+            await self._run(
+                [
+                    "network",
+                    "connect",
+                    *([] if reconnect_token is None else ["--alias", PROXY_ALIAS]),
+                    network,
+                    sidecar,
+                ]
+            )
             await self._run(["exec", sidecar, "sh", "-c", _SIDECAR_READY_SCRIPT])
         except BaseException as original:
             _consume_accounted_task_cancellation(original)
@@ -527,6 +638,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     broker,
                     grants,
                     transport_authorization,
+                    skip_docker=reconnect_token is not None,
                     control_server_container_id=control_server_container_id,
                 )
             )
@@ -553,7 +665,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     )
             raise
 
-        proxy_url = f"http://{sidecar}:{_SIDECAR_LISTEN_PORT}"
+        proxy_url = f"http://{PROXY_ALIAS if reconnect_token is not None else sidecar}:{_SIDECAR_LISTEN_PORT}"
         env = {
             "HTTPS_PROXY": proxy_url,
             "https_proxy": proxy_url,
@@ -571,6 +683,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 broker,
                 grants,
                 transport_authorization,
+                skip_docker=reconnect_token is not None,
                 control_server_container_id=control_server_container_id,
             )
 
@@ -602,6 +715,8 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         )
 
     async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
+        if self._reconnect is not None:
+            return await self._reconnect.create_runner(request)
         if request.runner_kind != self.runner_kind:
             raise UnsupportedEgressError(
                 f"Docker egress adapter cannot create runner kind {request.runner_kind!r}."
@@ -630,12 +745,20 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     async def egress_environment_fingerprint(self, runner: Runner) -> str:
         if not isinstance(runner, DockerRunner):
             raise TypeError("Docker egress identity requires a DockerRunner.")
+        if self._reconnect is not None:
+            identity = self._reconnect.metadata(runner)
+            if not isinstance(runner, _OwnedDockerRunner) or runner._owner is None:
+                raise UnsupportedEgressError("Docker reconnect identity has no owned runner.")
+            await self._reconnect.validate_allocation(runner._owner, identity)
+            return _docker_environment_fingerprint(identity["container_id"])
         return _docker_environment_fingerprint(await self._container_id(runner.name))
 
     async def reconcile_authority_cutover(
         self,
         request: EgressAuthorityCutoverRequest,
     ) -> EgressAuthorityCutoverReceipt | None:
+        if self._reconnect is not None:
+            raise UnsupportedEgressError("Reconnect ownership does not support authority adoption.")
         if type(request) is not EgressAuthorityCutoverRequest:
             raise TypeError("Docker egress reconciliation requires EgressAuthorityCutoverRequest.")
         if not isinstance(request.runner, DockerRunner):
@@ -681,6 +804,8 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     ) -> EgressAuthorityCutoverResult:
         """Rotate broker, sidecar, and network while retaining one exact container."""
 
+        if self._reconnect is not None:
+            raise UnsupportedEgressError("Reconnect ownership does not support authority adoption.")
         if type(request) is not EgressAuthorityCutoverRequest:
             raise TypeError("Docker egress cutover requires EgressAuthorityCutoverRequest.")
         if not isinstance(request.runner, DockerRunner):
@@ -873,6 +998,8 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     async def renew_authority(self, request: EgressAuthorityRenewalRequest) -> str:
         """Verify fresh grants on the unchanged container and enforcement path."""
 
+        if self._reconnect is not None:
+            raise UnsupportedEgressError("Reconnect ownership does not support authority adoption.")
         if type(request) is not EgressAuthorityRenewalRequest:
             raise TypeError("Docker egress renewal requires EgressAuthorityRenewalRequest.")
         if not isinstance(request.runner, DockerRunner):
@@ -920,16 +1047,30 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         *,
         outcome: str | None,
     ) -> RunnerFinalizationResult:
+        if self._reconnect is not None and isinstance(runner, DockerRunner):
+            return await self._reconnect.finalize(runner, outcome=outcome)
         del outcome
         if not isinstance(runner, DockerRunner):
             raise TypeError("Docker adapter received a different runner type.")
         await runner.close()
         return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
+    async def finalize_runner_for_binding(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        if self._reconnect is not None:
+            return await self.finalize_runner(runner, outcome=outcome)
+        return await super().finalize_runner_for_binding(runner, outcome=outcome)
+
     async def park_runner_for_authority_adoption(
         self,
         runner: Runner,
     ) -> RunnerFinalizationResult:
+        if self._reconnect is not None:
+            raise UnsupportedEgressError("Reconnect ownership does not support authority adoption.")
         if not isinstance(runner, DockerRunner):
             raise TypeError("Docker adapter received a different runner type.")
         await runner.fence_guest_processes_for_egress_cutover()
@@ -939,6 +1080,9 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         )
 
     async def _run(self, argv: Sequence[str]) -> None:
+        if self._reconnect is not None:
+            await self._reconnect.run(argv)
+            return
         exit_code, _stderr = await self._docker_exec(argv)
         if exit_code != 0:
             raise UnsupportedEgressError(
@@ -967,6 +1111,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         grants: Sequence[VirtualCredentialGrant],
         transport_authorization: _SidecarTransportAuthorization,
         *,
+        skip_docker: bool = False,
         control_server_container_id: str | None = None,
     ) -> None:
         # Revoke before releasing any resource that enforced the grant boundary.
@@ -979,7 +1124,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 await self._disconnect_control_server(network, control_server_container_id)
             except Exception as exc:
                 errors.append(f"control server detach: {type(exc).__name__}")
-        for argv in (["rm", "-f", sidecar], ["network", "rm", network]):
+        for argv in () if skip_docker else (["rm", "-f", sidecar], ["network", "rm", network]):
             try:
                 exit_code, stderr = await self._docker_exec(argv)
                 if exit_code != 0 and not _docker_resource_is_absent(stderr):

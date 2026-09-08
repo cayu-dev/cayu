@@ -52,6 +52,7 @@ from cayu.egress.capabilities import (
 from cayu.egress.credential_kinds import CredentialKind
 from cayu.egress.destinations import ApprovedEgressDestination, EgressProtocol
 from cayu.egress.errors import (
+    DockerEgressReconnectError,
     EgressAuthorityCutoverError,
     EgressAuthorityCutoverNeedsAttention,
     EgressError,
@@ -87,6 +88,7 @@ __all__ = [
     "CapturedResponse",
     "CredentialKind",
     "CredentialMode",
+    "DockerEgressReconnectError",
     "EgressAdapterRegistry",
     "EgressAuthorityBindingIdentity",
     "EgressAuthorityChangeKind",

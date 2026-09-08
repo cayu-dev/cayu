@@ -444,7 +444,7 @@ factory = VirtualEgressEnvironmentFactory(
     adapter=DockerEgressAdapter(
         seccomp_profile="/absolute/path/to/browser_fetch/seccomp_profile.json",
     ),
-    image="cayu-browser-fetch:9-playwright-1.62.0",
+    image="cayu-browser-fetch:10-playwright-1.62.0",
     artifact_store=S3ArtifactStore("production-artifacts"),
 )
 
@@ -905,7 +905,7 @@ Reconnect support is explicit by adapter:
 | --- | --- |
 | Microsandbox | Supported; attested single-owner sandbox plus host-listener and guest-endpoint ports, fresh grants/broker/CA, full preflight. |
 | Lambda MicroVM | Unsupported until a durable external single-owner claim is available; lower-level runner reattach is not sufficient. |
-| Docker | Unsupported; raises `UnsupportedEgressReconnectError`. Rebuild explicitly. |
+| Docker | Opt-in local POSIX ownership directory, exact container/network identity, fresh proxy/CA, repeated preflight; see below. Default configuration remains unsupported. |
 | E2B | Generic reconnect is unsupported; crash-safe creation/recovery instead uses the durable exact-sandbox handoff described below. |
 
 Reconnect capability is distinct from crash-safe creation. New remote
@@ -925,6 +925,107 @@ runner identity. If that checkpoint later returns on resume, the factory raises
 runner. Catch it in trusted application code if an explicit
 Git/artifact/memory reconstruction flow is appropriate; do not label that
 rebuild as a reconnect.
+
+### Docker retained-allocation reconnect
+
+Enable reconnect explicitly on every worker using the same **private host-local**
+state directory and the same factory execution-profile declaration:
+
+```python
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.egress.docker_adapter import DockerEgressAdapter
+
+adapter = DockerEgressAdapter(
+    reconnect_state_dir="/var/lib/cayu/docker-ownership",
+    reconnect_timeout_s=20,
+)
+# Pass adapter and this application-owned version to VirtualEgressEnvironmentFactory.
+profile = ExecutionProfileBehaviorIdentity(
+    name="application-browser", behavior_version="1", implementation_version="1"
+)
+```
+
+Use a directory owned by the worker user, mode `0700`, on a filesystem supporting
+POSIX `flock`, atomic rename and `fsync`. Never mount it into a guest; overlapping
+workspace mounts are rejected. All participating workers must share that directory
+and user on one host. Docker Desktop on macOS and a local Linux Docker daemon with
+a Unix socket are the supported host compositions. SSH/TCP Docker contexts,
+Windows workers, network filesystems, and cross-host ownership are unsupported.
+The adapter validates the effective Docker context before opening authority.
+
+The versioned factory metadata contains the exact 64-character container and
+network IDs, scope, allocation token, image and configuration digests. Names are
+checked against those IDs, never treated as replacement authority. The private
+journal contains no grants, bearer credentials or CA private keys. A public CA
+file is updated in place under a read-only guest bind mount; private CA keys stay
+in the current proxy process. Preserve both factory metadata and the ownership
+directory. Changing the runner image, setup, security profile, workspace mount,
+sidecar image identity or application execution profile requires explicit new
+allocation/adoption instead of claiming continuity.
+
+The existing managed runner's `interrupted` finalization freezes surviving guest
+processes and retains the allocation. This includes the Runtime human-input pause
+boundary. A fresh worker obtains a nonblocking exclusive OS lock, validates the
+exact allocation, freezes existing guest work, removes only the owned old sidecar,
+and creates a fresh proxy, sidecar transport credential, grant registry and CA.
+The guest endpoint keeps its allocation-local network alias. Old proxy credentials
+and grants cannot authenticate to the new authority. Brokered TLS and direct-network
+denial preflights run before final execution admission; surviving processes resume
+only when admitted work first executes. A second worker fails with
+`ownership_conflict`; closed/stale runner handles cannot dispatch or clean up.
+A colocated Docker control-server container is not supported in this local
+reconnect mode. Hot egress-policy authority adoption is also unsupported; reconnect uses the existing exact execution profile.
+
+`DockerEgressReconnectError` (exported from `cayu.egress`, a subclass of
+`EgressReconnectError`) carries a bounded `code`: `allocation_absent`,
+`identity_mismatch`, `configuration_mismatch`, `ownership_conflict`,
+`ownership_uncertain`, `daemon_unavailable`, `fencing_failed`, `state_unavailable`,
+`unsupported_host`, `preflight_failed`, `listener_conflict`, or `disposed`. Confirmed absence is distinguished from daemon
+lookup failure. Reconnect never creates a replacement main container.
+
+Terminal finalization records `disposal_pending` before exact-ID removal. A later
+attempt completes already-authorized disposal rather than reviving it. Teardown
+revokes/drains authority and removes the owned sidecar/network, retaining failures
+for retry. A timeout/cancellation after daemon mutation dispatch keeps the claim
+and a durable uncertainty marker. A later worker pauses the exact container and
+reports `ownership_uncertain`; it does not pretend an unsettled command succeeded.
+Such allocations require operator reconciliation of outstanding daemon work and
+exact-ID disposal. Do not delete permanent lock files or edit a journal to bypass
+uncertainty. The journal's `creating`, `recovering`, `retained`, `disposal_pending`,
+`disposed` and `ownership_uncertain` states describe control-plane settlement;
+they are not permission to attach through `docker exec` outside the factory.
+
+The pinned browser workload v10 refreshes its NSS trust database after CA rotation,
+invalidates page refs and advances control epochs before new operations. Existing
+Runtime browser receipts recover terminal observations without replaying a mutation.
+An application tool round with incomplete dynamic secret scope can still be
+archived by Runtime instead of republished, even when a browser receipt exists;
+reconnect does not override that publication fence or authorize resubmission.
+A fresh observation is required before subsequent actions. Supported fidelity is
+the **same surviving browser process and page identities**, including their live
+state while that process survives. It does not promise open sockets, in-flight
+downloads, arbitrary JavaScript heap snapshots, or profile restoration after process
+loss. Missing/ambiguous browser evidence yields `allocation_lost`,
+`outcome_ambiguous`, or `restoration_required` according to the browser contract.
+DockerRunner/coding-allocation recovery alone does not establish virtual-egress or
+browser continuity. Explicit application rebuild creates a new allocation; browser
+profile restore imports selected profile data into a new browser.
+
+Real-Docker acceptance (requires the pinned v10 image built from
+`examples/browser_fetch/Dockerfile`):
+
+```bash
+CAYU_RUN_DOCKER_RECONNECT=1 PYTHONPATH=src:. \
+  python -m pytest -q tests/egress/test_docker_reconnect_e2e.py
+```
+
+The fixtures use a synthetic upstream and a workspace sentinel. The application
+human-pause test uses SQLite sessions; separate worker deaths before/after a
+browser mutation use the existing durable-operation compare-and-set/receipt
+interface. They count submissions, verify a retained synthetic session cookie,
+and check fresh TLS and old-credential/direct-egress denial,
+and verifies exact allocation cleanup. Skipped real-Docker tests are not evidence
+of host qualification.
 
 ### E2B
 
@@ -1153,7 +1254,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 
 | Runner | Status |
 | --- | --- |
-| `docker` | Egress enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; reconnect unsupported. Container isolation is not a secure sandbox boundary. |
+| `docker` | Egress enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; opt-in local reconnect. Container isolation is not a secure sandbox boundary. |
 | `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure; reconnect supported. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; durable exact-sandbox create/recovery and process-local parked resume are supported. |
 | `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure; virtual-egress factory reconnect unsupported. |

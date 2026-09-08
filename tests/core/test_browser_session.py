@@ -93,7 +93,7 @@ _IDENTITY = BrowserBackendIdentity(
     browser="chromium",
     browser_version="test-chromium",
     worker_protocol="cayu.browser-session.v4",
-    worker_version="9",
+    worker_version="10",
 )
 
 
@@ -961,7 +961,7 @@ class _WireRunner:
             stdout=json.dumps(
                 {
                     "protocol_version": "cayu.browser-session.v4",
-                    "worker_version": "9",
+                    "worker_version": "10",
                     "playwright_version": "1.62.0",
                     "kind": "success",
                     "allocation_disposition": "live",
@@ -985,7 +985,7 @@ class _WireRunner:
                             "browser": "chromium",
                             "browser_version": "test-chromium",
                             "worker_protocol": "cayu.browser-session.v4",
-                            "worker_version": "9",
+                            "worker_version": "10",
                         },
                     },
                     "page_set": {
@@ -1066,7 +1066,7 @@ class _ProfileWireRunner(_WireRunner):
                     stdout=json.dumps(
                         {
                             "protocol_version": "cayu.browser-session.v4",
-                            "worker_version": "9",
+                            "worker_version": "10",
                             "playwright_version": "1.62.0",
                             "kind": "error",
                             "allocation_disposition": "retired",
@@ -1078,7 +1078,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "9",
+                        "worker_version": "10",
                         "playwright_version": "1.62.0",
                         "kind": "profile_restore",
                         "allocation_disposition": "live",
@@ -1091,7 +1091,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "9",
+                        "worker_version": "10",
                         "playwright_version": "1.62.0",
                         "kind": "profile_checkpoint",
                         "allocation_disposition": "live",
@@ -1104,7 +1104,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "9",
+                        "worker_version": "10",
                         "playwright_version": "1.62.0",
                         "kind": "closed",
                         "allocation_disposition": "retired",
@@ -1292,7 +1292,7 @@ def _browser_profile_binding(
         ),
         destination_policy=BrowserProfileDestinationPolicy.build(("https://example.test",)),
         browser_protocol="cayu.browser-session.v4",
-        browser_worker_version="9",
+        browser_worker_version="10",
         store=store,
         key_authority=AESGCMBrowserProfileKeyAuthority(
             authority_id="browser-profile-test-key",
@@ -1700,7 +1700,7 @@ def _interactive_raw_request(operation: str) -> dict[str, Any]:
     raw: dict[str, Any] = {
         "visual_policy": None,
         "protocol_version": "cayu.browser-session.v4",
-        "worker_version": "9",
+        "worker_version": "10",
         "expected_playwright_version": "1.62.0",
         "operation": operation,
         "session_id": "bs_test",
@@ -5044,7 +5044,7 @@ def test_profile_guest_response_protects_page_evidence(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "9",
+                "worker_version": "10",
             },
         }
 
@@ -7647,7 +7647,7 @@ def test_interactive_guest_operation_ledger_deduplicates_without_replay() -> Non
             self.calls += 1
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "9",
+                "worker_version": "10",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"call": self.calls, "operation": request.operation},
@@ -7773,7 +7773,7 @@ def test_interactive_guest_admits_switches_closes_and_tracks_popup_lineage() -> 
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "9",
+                    "worker_version": "10",
                 },
             }
 
@@ -8640,7 +8640,7 @@ def test_interactive_guest_operation_ledger_reserves_cleanup_capacity() -> None:
         async def _execute_locked(self, request):
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "9",
+                "worker_version": "10",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"operation": request.operation},
@@ -9525,7 +9525,7 @@ def test_interactive_guest_ref_limits_independently_retire_allocation(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "9",
+                "worker_version": "10",
             },
         }
 
@@ -9681,10 +9681,12 @@ def test_interactive_guest_blocks_popup_creation_before_page_scripts(
     playwright_module.async_api = playwright_api  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "playwright", playwright_module)
     monkeypatch.setitem(sys.modules, "playwright.async_api", playwright_api)
+    ca_fixture = tmp_path / "ca.pem"
+    ca_fixture.write_bytes(b"fixture public CA")
     monkeypatch.setattr(
         _browser_guest,
         "_proxy_and_ca",
-        lambda: ("http://proxy.test:8080", "/ca.pem"),
+        lambda: ("http://proxy.test:8080", ca_fixture),
     )
     monkeypatch.setattr(_browser_guest, "_sanitize_environment", lambda *args, **kwargs: None)
     monkeypatch.setattr(_browser_guest, "_install_browser_ca", install_ca)
@@ -9822,7 +9824,7 @@ def test_interactive_guest_popup_guard_bounds_one_effect_before_target_admission
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "9",
+                    "worker_version": "10",
                 },
             }
 
@@ -11330,10 +11332,12 @@ def test_interactive_guest_idle_retirement_marker_releases_parent_capacity(
         "version",
         lambda package: _browser_guest.PLAYWRIGHT_VERSION,
     )
+    ca_fixture = tmp_path / "ca.pem"
+    ca_fixture.write_bytes(b"fixture public CA")
     monkeypatch.setattr(
         _browser_guest,
         "_proxy_and_ca",
-        lambda: ("http://proxy.test:8080", "/ca.pem"),
+        lambda: ("http://proxy.test:8080", ca_fixture),
     )
     monkeypatch.setattr(_browser_guest, "_interactive_send", no_response)
     monkeypatch.setattr(_browser_guest, "_INTERACTIVE_ROOT", tmp_path)
@@ -11376,10 +11380,12 @@ def test_interactive_guest_requires_durable_marker_before_reporting_retirement(
         "version",
         lambda package: _browser_guest.PLAYWRIGHT_VERSION,
     )
+    ca_fixture = tmp_path / "ca.pem"
+    ca_fixture.write_bytes(b"fixture public CA")
     monkeypatch.setattr(
         _browser_guest,
         "_proxy_and_ca",
-        lambda: ("http://proxy.test:8080", "/ca.pem"),
+        lambda: ("http://proxy.test:8080", ca_fixture),
     )
     monkeypatch.setattr(_browser_guest, "_interactive_send", retired_response)
     monkeypatch.setattr(_browser_guest, "_INTERACTIVE_ROOT", tmp_path)
@@ -11472,10 +11478,12 @@ def test_interactive_guest_startup_request_consumes_settled_retirement(
         "version",
         lambda package: _browser_guest.PLAYWRIGHT_VERSION,
     )
+    ca_fixture = tmp_path / "ca.pem"
+    ca_fixture.write_bytes(b"fixture public CA")
     monkeypatch.setattr(
         _browser_guest,
         "_proxy_and_ca",
-        lambda: ("http://proxy.test:8080", "/ca.pem"),
+        lambda: ("http://proxy.test:8080", ca_fixture),
     )
     monkeypatch.setattr(_browser_guest, "_interactive_send", no_response)
     monkeypatch.setattr(_browser_guest, "_start_interactive_daemon", retire_during_start)
@@ -11509,10 +11517,12 @@ def test_interactive_guest_settled_retirement_prevents_daemon_restart(
         "version",
         lambda package: _browser_guest.PLAYWRIGHT_VERSION,
     )
+    ca_fixture = tmp_path / "ca.pem"
+    ca_fixture.write_bytes(b"fixture public CA")
     monkeypatch.setattr(
         _browser_guest,
         "_proxy_and_ca",
-        lambda: ("http://proxy.test:8080", "/ca.pem"),
+        lambda: ("http://proxy.test:8080", ca_fixture),
     )
     monkeypatch.setattr(_browser_guest, "_interactive_send", no_response)
     monkeypatch.setattr(_browser_guest, "_start_interactive_daemon", unexpected_start)
@@ -11599,10 +11609,12 @@ def test_interactive_guest_late_startup_retirement_releases_parent_capacity(
         "version",
         lambda package: _browser_guest.PLAYWRIGHT_VERSION,
     )
+    ca_fixture = tmp_path / "ca.pem"
+    ca_fixture.write_bytes(b"fixture public CA")
     monkeypatch.setattr(
         _browser_guest,
         "_proxy_and_ca",
-        lambda: ("http://proxy.test:8080", "/ca.pem"),
+        lambda: ("http://proxy.test:8080", ca_fixture),
     )
     monkeypatch.setattr(_browser_guest, "_interactive_send", no_response)
     monkeypatch.setattr(

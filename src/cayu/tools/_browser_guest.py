@@ -103,7 +103,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "9"
+INTERACTIVE_WORKER_VERSION = "10"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -2466,14 +2466,18 @@ async def _kill_process(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
-async def _install_browser_ca(home: Path, ca_path: Path) -> None:
+async def _install_browser_ca(home: Path, ca_path: Path, *, replace_existing: bool = False) -> None:
     certutil = Path("/usr/bin/certutil")
     if not certutil.is_file() or not os.access(certutil, os.X_OK):
         raise _GuestFailure("incompatible_browser")
     database = home / ".pki" / "nssdb"
-    database.mkdir(parents=True, mode=0o700)
+    database.mkdir(parents=True, mode=0o700, exist_ok=replace_existing)
     commands = (
-        [str(certutil), "-N", "--empty-password", "-d", f"sql:{database}"],
+        (
+            [str(certutil), "-D", "-d", f"sql:{database}", "-n", "Cayu session egress"]
+            if replace_existing
+            else [str(certutil), "-N", "--empty-password", "-d", f"sql:{database}"]
+        ),
         [
             str(certutil),
             "-A",
@@ -4521,6 +4525,7 @@ class _InteractiveDaemon:
                 raise _GuestFailure("cleanup_failed")
             _sanitize_environment(self.home, proxy=proxy, ca_path=ca_path)
             await _install_browser_ca(self.home, ca_path)
+            self._trusted_ca_digest = hashlib.sha256(Path(ca_path).read_bytes()).hexdigest()
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
@@ -4594,6 +4599,31 @@ class _InteractiveDaemon:
         except Exception as exc:
             raise _GuestFailure("incompatible_browser") from exc
 
+    async def _refresh_egress_trust(self) -> None:
+        """Rotate trusted CA after exact-allocation egress recovery, without effect replay."""
+        previous = getattr(self, "_trusted_ca_digest", None)
+        if previous is None:
+            return
+        try:
+            _proxy, ca_path = _proxy_and_ca()
+            current = hashlib.sha256(Path(ca_path).read_bytes()).hexdigest()
+            if current == previous:
+                return
+            if self.home is None:
+                raise _GuestFailure("restoration_required")
+            await _install_browser_ca(self.home, ca_path, replace_existing=True)
+            self._trusted_ca_digest = current
+            # Neither a cached observation nor an old ref authorizes a fresh action
+            # across an authority transfer. A new observe issues the new epoch.
+            for state in self.pages.values():
+                state.control_epoch += 1
+                state.revision = f"br_{secrets.token_hex(16)}"
+                state.clear_refs()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _GuestFailure("restoration_required") from None
+
     async def execute(self, request: _InteractiveRequest) -> dict[str, Any]:
         if request.session_id != self.session_id:
             raise _GuestFailure("incompatible_browser")
@@ -4624,6 +4654,7 @@ class _InteractiveDaemon:
                 return json.loads(json.dumps(existing.response))
             if self.closing or self.close_requested.is_set():
                 raise _GuestFailure("session_closed")
+            await self._refresh_egress_trust()
             await self._ensure_configuration(request)
             if request.reconcile_only:
                 return _interactive_error_payload(
@@ -9026,6 +9057,7 @@ def _interactive_error_payload(
         "policy_denied",
         "redirect_denied",
         "resource_exhausted",
+        "restoration_required",
         "session_closed",
         "timeout",
         "unsafe_reload",

@@ -43,6 +43,30 @@ class EgressReconnectError(EgressError):
     """Base error for a fail-closed virtual-egress reconnect attempt."""
 
 
+class DockerEgressReconnectError(EgressReconnectError):
+    """Bounded Docker failure classification without backend diagnostic text."""
+
+    def __init__(self, code: str) -> None:
+        if code not in {
+            "ownership_conflict",
+            "ownership_uncertain",
+            "allocation_absent",
+            "identity_mismatch",
+            "configuration_mismatch",
+            "daemon_unavailable",
+            "disposal_pending",
+            "disposed",
+            "fencing_failed",
+            "preflight_failed",
+            "state_unavailable",
+            "unsupported_host",
+            "listener_conflict",
+        }:
+            raise ValueError("Unknown Docker reconnect error code.")
+        self.code = code
+        super().__init__(f"Docker virtual-egress reconnect failed: {code}.")
+
+
 class InvalidEgressReconnectMetadataError(EgressReconnectError):
     """Durable reconnect metadata is malformed, stale, or out of scope."""
 

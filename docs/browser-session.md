@@ -21,7 +21,7 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:9-playwright-1.62.0` image, the
+`cayu-browser-fetch:10-playwright-1.62.0` image, the
 `cayu.browser-session.v4` protocol and worker version 9, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
@@ -518,6 +518,15 @@ The same fenced parent record carries the bounded normal-operation count,
 cleanup-operation count, and live browser-session identities. Those ceilings
 therefore do not reset when a fresh Cayu process reconnects, while `close`
 retains its separate bounded cleanup allowance.
+
+Docker virtual-egress continuity is opt-in through
+`DockerEgressAdapter(reconnect_state_dir=...)`, using the pinned worker v10 and the
+same application execution-profile identity. See
+[Docker retained-allocation reconnect](virtual-egress.md#docker-retained-allocation-reconnect)
+for local-host ownership, fencing, CA rotation and the real process-loss tests.
+Fresh CA trust invalidates previous page refs/control epochs; obtain a fresh
+observation before subsequent actions. This does not add profile restoration or
+mutation replay.
 
 A fresh Cayu process may reconnect only to the exact still-live allocation
 identified by that durable receipt. It reconstructs the exact bounded surviving
