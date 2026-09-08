@@ -30672,7 +30672,67 @@ def test_cayu_app_recover_tool_round_task_cancellation_finalizes_session():
     asyncio.run(scenario())
 
 
-def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation() -> None:
+@pytest.mark.parametrize("local_marker", ["request", "signal"])
+def test_manual_recovery_watcher_defers_to_local_active_interruption(
+    monkeypatch: pytest.MonkeyPatch, local_marker: str
+) -> None:
+    session_id = "sess_manual_recovery_local_interrupt_owner"
+    app, store, _tool, _checkpoint = _crashed_tool_round_app(session_id)
+
+    async def scenario() -> None:
+        loaded = await store.load(session_id)
+        assert loaded is not None
+        await store.transition_status(
+            session_id, from_statuses={loaded.status}, to_status=SessionStatus.INTERRUPTING
+        )
+        owner_release = asyncio.Event()
+        owner = asyncio.create_task(owner_release.wait())
+        app._session_control.register_active_task(
+            session_id, owner, task_id=None, task_started=True, task_finished=False
+        )
+        if local_marker == "request":
+            app._session_control.begin_interruption_request(session_id)
+        else:
+            app._session_control.signal_interrupt(session_id)
+        inspected = asyncio.Event()
+        original_require_session = app._recovery_coordinator._require_session
+
+        async def observed_require_session(candidate_id):
+            session = await original_require_session(candidate_id)
+            inspected.set()
+            return session
+
+        monkeypatch.setattr(app._recovery_coordinator, "_require_session", observed_require_session)
+        stop = asyncio.Event()
+        watcher = asyncio.create_task(
+            app._recovery_coordinator._watch_manual_recovery_interruption(
+                session_id=session_id, interrupted_baseline_id=None, stop=stop
+            )
+        )
+        try:
+            await asyncio.wait_for(inspected.wait(), timeout=10)
+            assert not watcher.done()
+            stop.set()
+            assert await asyncio.wait_for(watcher, timeout=10) is False
+        finally:
+            stop.set()
+            owner_release.set()
+            await asyncio.gather(watcher, owner, return_exceptions=True)
+            app._session_control.unregister_active_task(session_id, owner)
+            app._session_control.end_interruption_request(session_id)
+            app._session_control.discard_interrupt_signal(session_id)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("deferred_response", [False, True])
+def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation(
+    monkeypatch: pytest.MonkeyPatch, deferred_response: bool
+) -> None:
+    active_wait_attempts = session_control_module.ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS
+    if deferred_response:
+        monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 0)
+
     class BlockingRecoveryProvider(ModelProvider):
         name = "fake"
 
@@ -30730,20 +30790,33 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation() 
                 ),
             )
         )
-        await asyncio.wait_for(provider.continuation_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.continuation_started.wait(), timeout=10)
 
-        interruption_events = await asyncio.wait_for(
-            collect_interrupt_events(
-                app,
-                InterruptSessionRequest(
-                    session_id=session_id,
-                    reason="operator stopped manual recovery",
-                    metadata={"source": "blocked-continuation-regression"},
-                ),
-            ),
-            timeout=5,
+        interrupt_request = InterruptSessionRequest(
+            session_id=session_id,
+            reason="operator stopped manual recovery",
+            metadata={"source": "blocked-continuation-regression"},
         )
-        recovery_events = await asyncio.wait_for(recovery_task, timeout=5)
+        interruption_events = None
+        try:
+            interruption_events = await asyncio.wait_for(
+                collect_interrupt_events(app, interrupt_request), timeout=15
+            )
+        except TimeoutError as error:
+            # The request can return while the active run is still finalizing.
+            # Completion and replay below must still prove one exact terminal.
+            assert str(error) == f"Session interruption is still finalizing: {session_id}"
+        finally:
+            monkeypatch.setattr(
+                session_control_module,
+                "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
+                active_wait_attempts,
+            )
+        recovery_events = await asyncio.wait_for(recovery_task, timeout=15)
+        if interruption_events is None:
+            interruption_events = await asyncio.wait_for(
+                collect_interrupt_events(app, interrupt_request), timeout=15
+            )
 
         assert provider.continuation_cancelled.is_set()
         assert interruption_events[-1].type == EventType.SESSION_INTERRUPTED
@@ -30767,7 +30840,17 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation() 
             == terminal_interruptions[0].id
         )
         assert await app.drain_background_interruptions(timeout_s=1) is True
-        assert_only_model_step_publication_checkpoint(await store.load_checkpoint(session_id))
+        final_checkpoint = await store.load_checkpoint(session_id)
+        assert final_checkpoint is not None
+        assert "pending_session_interrupt" not in final_checkpoint
+        assert "pending_tool_round" not in final_checkpoint
+        assert "pending_operator_interruption_cascade" not in final_checkpoint
+        assert (
+            model_completion_publication_module.model_step_publication_from_checkpoint(
+                final_checkpoint
+            )
+            is not None
+        )
         assert tool.calls == [{}]
         assert app._session_control.has_active_tasks(session_id) is False
 

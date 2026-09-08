@@ -12164,7 +12164,7 @@ class RecoveryCoordinator:
             async def stop_recovery_worker() -> None:
                 nonlocal recovery_transition_fenced, recovery_worker_quiescent
                 try:
-                    if not recovery_task.done():
+                    if not recovery_task.done() and not recovery_task.cancelling():
                         recovery_task.cancel()
                     await asyncio.gather(recovery_task, return_exceptions=True)
                 finally:
@@ -18243,9 +18243,16 @@ class RecoveryCoordinator:
         """Observe another worker's durable stop request while delivery is paused."""
         while not stop.is_set():
             session = await self._require_session(session_id)
-            if session.status == SessionStatus.INTERRUPTING:
+            local_run_handles_interrupt = bool(self._session_control.active_runs(session_id)) and (
+                self._session_control.is_interruption_request_active(session_id)
+                or self._session_control.interrupt_signalled(session_id)
+            )
+            # Local operator dispatch owns cancellation of the active run. The
+            # durable watcher must not race it with a second cancellation while
+            # that run is publishing its terminal evidence.
+            if session.status == SessionStatus.INTERRUPTING and not local_run_handles_interrupt:
                 return True
-            if session.status == SessionStatus.INTERRUPTED:
+            if session.status == SessionStatus.INTERRUPTED and not local_run_handles_interrupt:
                 latest_interrupted = await self._session_control.latest_interrupted_event(
                     session_id
                 )

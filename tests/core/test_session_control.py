@@ -234,6 +234,51 @@ def test_control_task_registry_cancels_without_creating_run_delivery_state() -> 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("control_owner", [False, True])
+def test_repeated_interruption_preserves_active_owner_cleanup(control_owner: bool) -> None:
+    control = SessionControl[object](session_store=InMemorySessionStore())
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleanup_completed = asyncio.Event()
+
+        async def owner() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                cleanup_completed.set()
+
+        task = asyncio.create_task(owner())
+        if control_owner:
+            control.register_active_control_task("sess_repeat_interrupt", task)
+        else:
+            control.register_active_task(
+                "sess_repeat_interrupt", task, task_id=None, task_started=True, task_finished=False
+            )
+        try:
+            await asyncio.wait_for(started.wait(), timeout=10)
+            assert control.cancel_active_runs("sess_repeat_interrupt") is True
+            await asyncio.wait_for(cleanup_started.wait(), timeout=10)
+            assert control.cancel_active_runs("sess_repeat_interrupt") is True
+            assert task.cancelling() == 1
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert cleanup_completed.is_set()
+        finally:
+            release_cleanup.set()
+            await asyncio.gather(task, return_exceptions=True)
+            control.unregister_active_task("sess_repeat_interrupt", task)
+            control.unregister_active_control_task("sess_repeat_interrupt", task)
+
+    asyncio.run(scenario())
+
+
 def test_active_run_cancellation_precedes_control_supervisor_cancellation() -> None:
     control = SessionControl[object](session_store=InMemorySessionStore())
 
