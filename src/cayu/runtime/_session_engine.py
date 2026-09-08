@@ -8116,6 +8116,16 @@ class SessionEngine:
             raise SessionRuntimePublicationConflict(
                 "Interrupted invocation interaction has no durable identity."
             )
+        run_operation = _session_run_operation_from_checkpoint(checkpoint)
+        if run_operation is not None and run_operation.run_epoch != session.run_epoch:
+            raise SessionRunFenced(
+                "Interruption terminal decision lost its queued run-operation epoch."
+            )
+        if run_operation is not None:
+            terminal_payload = {
+                **terminal_payload,
+                _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY: run_operation.operation_id,
+            }
         observed_at = self._clock()
         decision = build_invocation_terminal_decision(
             outcome=InvocationTerminalOutcome.INTERRUPTED,
@@ -8141,14 +8151,18 @@ class SessionEngine:
             predecessor_interaction_event_id=(
                 latest.id if latest.type in INTERACTION_TERMINAL_EVENT_TYPES else None
             ),
-            terminal_event_id=invocation_terminal_event_id(
-                outcome=InvocationTerminalOutcome.INTERRUPTED,
-                session_id=session.id,
-                session_instance_id=session.instance_id,
-                run_epoch=session.run_epoch,
-                interaction_id=latest.interaction_id,
-                source_id=interruption_request_id,
-                event_kind="session",
+            terminal_event_id=(
+                run_operation.terminal_event_id
+                if run_operation is not None and run_operation.terminal_event_id is not None
+                else invocation_terminal_event_id(
+                    outcome=InvocationTerminalOutcome.INTERRUPTED,
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    run_epoch=session.run_epoch,
+                    interaction_id=latest.interaction_id,
+                    source_id=interruption_request_id,
+                    event_kind="session",
+                )
             ),
             observed_at=observed_at,
             terminal_payload=terminal_payload,
@@ -8167,6 +8181,7 @@ class SessionEngine:
                 or current_session.run_epoch != session.run_epoch
                 or current_session.status is not SessionStatus.INTERRUPTING
                 or current_profile != active_profile
+                or _session_run_operation_from_checkpoint(current_checkpoint) != run_operation
             ):
                 raise SessionRunFenced(
                     "Interrupted invocation changed before terminal decision election."

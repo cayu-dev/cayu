@@ -62,6 +62,9 @@ from cayu.runtime._message_redaction import redact_untrusted_message_for_boundar
 from cayu.runtime._task_store_operation_boundary import (
     task_store_cancellation_reconciliation_capability_is_complete,
 )
+from cayu.runtime._terminal_evidence import (
+    queued_dispatch_terminal_event_id as _queued_dispatch_terminal_event_id,
+)
 from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
@@ -3218,14 +3221,6 @@ def _queued_dispatch_operation_id(
     if exact_fork_source_state_sha256 is not None:
         material["exact_fork_source_state_sha256"] = exact_fork_source_state_sha256
     return sha256(canonical_durable_json_bytes(material, "queued_dispatch.operation")).hexdigest()
-
-
-def _queued_dispatch_terminal_event_id(operation_id: str) -> str:
-    if len(operation_id) != 64 or any(
-        character not in "0123456789abcdef" for character in operation_id
-    ):
-        raise ValueError("Queued dispatch operation_id must be a lowercase SHA-256 digest.")
-    return f"cayu-queued-dispatch-terminal-{operation_id}"
 
 
 def _new_queued_dispatch_envelope(

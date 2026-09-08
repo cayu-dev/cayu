@@ -17,6 +17,10 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
+from cayu.runtime._terminal_evidence import (
+    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    queued_dispatch_terminal_event_id,
+)
 from cayu.runtime.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -170,6 +174,14 @@ class InvocationTerminalDecision(BaseModel):
                 source_id=self.interruption_request_id,
                 event_kind="session",
             )
+            if self.terminal_event_id != expected_terminal_event_id:
+                queued_operation_id = self.terminal_payload.get(
+                    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
+                )
+                if type(queued_operation_id) is str:
+                    expected_terminal_event_id = queued_dispatch_terminal_event_id(
+                        queued_operation_id
+                    )
         else:
             source_id = self.model_recovery_id or self.runtime_task_failure_id
             assert source_id is not None

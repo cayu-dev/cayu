@@ -367,6 +367,34 @@ def test_valid_terminal_decision_controls_survive_short_secret_collisions(
         )
 
 
+def test_interrupted_terminal_decision_rejects_another_queued_operation_identity() -> None:
+    event_kwargs = {
+        "outcome": InvocationTerminalOutcome.INTERRUPTED,
+        "session_id": "queued-terminal-decision",
+        "session_instance_id": "queued-terminal-instance",
+        "run_epoch": 1,
+        "interaction_id": "queued-terminal-interaction",
+        "source_id": "queued-terminal-interruption",
+    }
+    with pytest.raises(ValueError, match="event identities conflict"):
+        build_invocation_terminal_decision(
+            outcome=InvocationTerminalOutcome.INTERRUPTED,
+            session_id=event_kwargs["session_id"],
+            session_instance_id=event_kwargs["session_instance_id"],
+            run_epoch=1,
+            profile_interaction_id=event_kwargs["interaction_id"],
+            interaction_id=event_kwargs["interaction_id"],
+            execution_profile_fingerprint="1" * 64,
+            interaction_event_id=invocation_terminal_event_id(
+                **event_kwargs, event_kind="interaction"
+            ),
+            terminal_event_id="cayu-queued-dispatch-terminal-" + "b" * 64,
+            observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            terminal_payload={"session_run_operation_id": "a" * 64},
+            interruption_request_id=event_kwargs["source_id"],
+        )
+
+
 def test_terminal_decision_payload_remains_subject_to_secret_rejection() -> None:
     session_id = "sess-terminal-decision-secret-payload"
     session_instance_id = "session-instance-terminal-decision-secret-payload"

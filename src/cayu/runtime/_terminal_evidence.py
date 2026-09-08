@@ -27,6 +27,14 @@ TERMINAL_EVIDENCE_EVENT_TYPES = (
 )
 
 
+def queued_dispatch_terminal_event_id(operation_id: str) -> str:
+    if len(operation_id) != 64 or any(
+        character not in "0123456789abcdef" for character in operation_id
+    ):
+        raise ValueError("Queued dispatch operation_id must be a lowercase SHA-256 digest.")
+    return f"cayu-queued-dispatch-terminal-{operation_id}"
+
+
 @dataclass(frozen=True, slots=True)
 class CurrentTerminalEvidence:
     """The bounded events belonging to the latest durable terminal boundary."""
