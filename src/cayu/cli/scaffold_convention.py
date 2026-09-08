@@ -55,6 +55,8 @@ def build_app(
     module never constructs the application or connects to an external service.
     """
 
+    if not __ARTIFACTS_ENABLED__ and artifact_store is not None:
+        raise ValueError("artifact_store requires the artifacts capability")
     knowledge_scope = build_knowledge_scope()
     stores = build_stores(
         session_store=session_store,
@@ -376,6 +378,12 @@ def build_stores(
 ) -> ApplicationStores:
     """Build SQLite stores unless a caller injects hermetic test stores."""
 
+    if not __TASKS_ENABLED__ and task_store is not None:
+        raise ValueError("task_store requires the tasks capability")
+    if not __KNOWLEDGE_ENABLED__ and knowledge_scope is not None:
+        raise ValueError("knowledge_scope requires the knowledge capability")
+    if knowledge_scope is None and knowledge_store is not None:
+        raise ValueError("knowledge_store requires the knowledge capability")
     return ApplicationStores(
         session_store=(
             session_store
@@ -441,6 +449,12 @@ def build_stores(
     """Build lazy Postgres stores without connecting during import or inspection."""
 
     conninfo = configured_database_url() or _INSPECTION_DSN
+    if not __TASKS_ENABLED__ and task_store is not None:
+        raise ValueError("task_store requires the tasks capability")
+    if not __KNOWLEDGE_ENABLED__ and knowledge_scope is not None:
+        raise ValueError("knowledge_scope requires the knowledge capability")
+    if knowledge_scope is None and knowledge_store is not None:
+        raise ValueError("knowledge_store requires the knowledge capability")
     return ApplicationStores(
         session_store=(
             session_store
@@ -537,7 +551,7 @@ def build_agent_tools() -> tuple[Tool, ...]:
         tools.extend(
             (
                 ListKnowledgeTool(),
-                SearchKnowledgeTool(),
+                SearchKnowledgeTool(default_namespace=KNOWLEDGE_NAMESPACE),
                 ReadKnowledgeTool(),
                 RememberKnowledgeTool(
                     spec=RememberKnowledgeTool.spec.model_copy(
@@ -810,7 +824,11 @@ def build_local_environment(
 ) -> Environment | None:
     """Construct local collaborators without granting runner, network, or vault authority."""
 
+    if not __ARTIFACTS_ENABLED__ and artifact_store is not None:
+        raise ValueError("artifact_store requires the artifacts capability")
     selected_artifacts = artifact_store
+    if not __KNOWLEDGE_ENABLED__ and (knowledge_store is not None or knowledge_scope is not None):
+        raise ValueError("knowledge collaborators require the knowledge capability")
     if selected_artifacts is None and __ARTIFACTS_ENABLED__:
         selected_artifacts = LocalArtifactStore(
             _PROJECT_ROOT / "data" / "artifacts",
@@ -847,7 +865,7 @@ from app import build_app
 
 def test_factory_returns_fresh_apps_and_preserves_injected_stores() -> None:
     sessions = InMemorySessionStore()
-    tasks = InMemoryTaskStore()
+    tasks = InMemoryTaskStore() if __TASKS_ENABLED__ else None
 __TEST_KNOWLEDGE_SETUP__    first = build_app(
         provider=ScriptedModelProvider([]),
         session_store=sessions,
@@ -856,7 +874,7 @@ __TEST_KNOWLEDGE_FIRST_ARGUMENT__    )
     second = build_app(
         provider=ScriptedModelProvider([]),
         session_store=InMemorySessionStore(),
-        task_store=InMemoryTaskStore(),
+        task_store=InMemoryTaskStore() if __TASKS_ENABLED__ else None,
 __TEST_KNOWLEDGE_SECOND_ARGUMENT__    )
 
     assert first is not second
@@ -940,7 +958,7 @@ def test_active_scoped_knowledge_affects_a_later_run_with_exposure_evidence() ->
         app = build_app(
             provider=provider,
             session_store=sessions,
-            task_store=InMemoryTaskStore(),
+            task_store=InMemoryTaskStore() if __TASKS_ENABLED__ else None,
             knowledge_store=knowledge,
         )
 
@@ -1008,7 +1026,7 @@ def test_manifest_exposes_real_collaborators_without_runner_or_network_authority
     app = build_app(
         provider=ScriptedModelProvider([]),
         session_store=InMemorySessionStore(),
-        task_store=InMemoryTaskStore(),
+        task_store=InMemoryTaskStore() if __TASKS_ENABLED__ else None,
         knowledge_store=InMemoryKnowledgeStore(),
     )
     manifest = app.describe()
@@ -1045,7 +1063,7 @@ def test_human_input_and_approval_pause_with_recoverable_durable_state() -> None
         input_app = build_app(
             provider=input_provider,
             session_store=InMemorySessionStore(),
-            task_store=InMemoryTaskStore(),
+            task_store=InMemoryTaskStore() if __TASKS_ENABLED__ else None,
             knowledge_store=InMemoryKnowledgeStore(),
         )
         input_events = [

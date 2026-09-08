@@ -3472,10 +3472,36 @@ def project_files(
                 else "Session, task, and artifact state is stored below that protected "
                 "`.cayu` boundary. No knowledge store or knowledge tools are configured."
             )
+        if plan.preset == "coding" and not {"tasks", "artifacts"} <= set(plan.capabilities):
+            states = ["session"] + [
+                item for item in ("tasks", "knowledge") if item in plan.capabilities
+            ]
+            coding_state_storage = (
+                ", ".join(states).capitalize()
+                + " state uses the configured "
+                + (
+                    "Postgres stores. "
+                    if plan.database == "postgres"
+                    else "protected `.cayu` SQLite stores. "
+                )
+                + (
+                    "Artifacts use protected `.cayu` storage. "
+                    if "artifacts" in plan.capabilities
+                    else "Artifacts are not configured. "
+                )
+                + (
+                    "No knowledge store or knowledge tools are configured."
+                    if not knowledge_selected
+                    else "Use knowledge tools through their scoped boundary."
+                )
+            )
         replacements = {
             "__PROJECT_NAME__": name,
             "__PRESET_OVERVIEW__": (
                 "A maintained two-agent coding composition for a trusted Git repository. Its primary\nagent and bounded reviewer use generated repository tools, policy, knowledge,\ndelegation, and human-input seams that are part of this preset rather than optional\nadditions to a model-only starter."
+                if plan.preset == "coding"
+                and {"delegation", "knowledge", "human-input"} <= set(plan.capabilities)
+                else "A maintained coding composition for a trusted Git repository. Its explicit\nconstructors expose only the capabilities selected in the scaffold profile."
                 if plan.preset == "coding"
                 else "A Cayu application with the standard capability layout. Its registered agent\nidentity is `__AGENT_NAME__`. The scaffold profile records its selected capabilities.".replace(
                     "__AGENT_NAME__", resolved_agent_name
@@ -3483,7 +3509,7 @@ def project_files(
             ),
             "__AGENT_OWNERSHIP__": (
                 "This preset registers a primary coding agent and a bounded reviewer. Extend the\nprimary through the canonical generated regions in `agents/agent.py` and\n`agents/registration.py`. Keep the reviewer tool-free unless a reviewed composition\nchange intentionally expands its role.\nDo not create echo, pass-through, or placeholder tools."
-                if plan.preset == "coding"
+                if plan.preset == "coding" and "delegation" in plan.capabilities
                 else "The registered agent identity is `__AGENT_NAME__`.\n\nEdit the existing agent, test, and eval to implement the user's first requested\njob. Do not retain the starter and add a second agent. Tools are registered in\n`agents/registration.py`; change their policies deliberately. Do not create echo,\npass-through, or placeholder tools.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
@@ -3550,6 +3576,11 @@ def project_files(
                 )
             )
     files["pyproject.toml"] += scaffold_contract(plan)
+    if "tasks" not in plan.capabilities:
+        for relative in ("tests/test_agent.py", "evals/agent.py"):
+            files[relative] = files[relative].replace(
+                "task_store=InMemoryTaskStore(),", "task_store=None,"
+            )
     files["README.md"] += application_guidance(plan)
     files["AGENTS.md"] += application_guidance(plan)
     if "evals" not in plan.capabilities:

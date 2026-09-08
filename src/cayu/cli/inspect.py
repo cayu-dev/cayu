@@ -7,6 +7,7 @@ from typing import Any
 
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import ProjectError, build_project_app, project_context, resolve_project
+from cayu.cli.scaffold_check import check_scaffold_capabilities
 from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION, AppManifest
 
 
@@ -63,6 +64,27 @@ def _run_inspect(args: argparse.Namespace) -> int:
         else:
             print(f"error: {_project_error_message(exc)}", file=sys.stderr)
         return 2
+
+    diagnostics = check_scaffold_capabilities(project.root, manifest)
+    if diagnostics:
+        if args.output_format == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema_version": APP_MANIFEST_SCHEMA_VERSION,
+                        "error": {
+                            "code": diagnostics[0].code,
+                            "message": "Declared capabilities disagree with the constructed application.",
+                        },
+                        "diagnostics": [item.model_dump(mode="json") for item in diagnostics],
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            for item in diagnostics:
+                print(f"{item.code}: {item.path}: {item.message}", file=sys.stderr)
+        return 1
 
     filtered, error = _filter_manifest(manifest, args)
     if error is not None:

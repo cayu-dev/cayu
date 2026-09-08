@@ -350,7 +350,7 @@ _PRIMARY_TOOL_POLICY_IDENTITY = ExecutionProfileBehaviorIdentity(
 def _coding_environment_identity(
     *,
     root: Path,
-    artifact_store: ArtifactStore,
+    artifact_store: ArtifactStore | None,
     knowledge_store: KnowledgeStore | None,
     scope: KnowledgeAccessScope | None,
     generated_stores: bool,
@@ -359,7 +359,7 @@ def _coding_environment_identity(
 
     if not generated_stores:
         return None
-    if type(artifact_store) is not LocalArtifactStore:
+    if artifact_store is not None and type(artifact_store) is not LocalArtifactStore:
         return None
     if (
         knowledge_store is not None
@@ -1172,12 +1172,14 @@ def _primary_tool_policy() -> ParameterConstrainedToolPolicy:
         "write_file": _path_rules(required=True),
         "edit_file": _path_rules(required=True),
         "delete_file": _path_rules(required=True),
-        "subagent": (
+    }
+    if __CODING_DELEGATION_ENABLED__:
+        rules["subagent"] = (
             RequiredAllowlistRule("agent", values=[_REVIEWER_ALIAS]),
             RequiredFieldRule("task"),
-        ),
-        "ask_user": (RequiredFieldRule("question"),),
-    }
+        )
+    if __CODING_HUMAN_INPUT_ENABLED__:
+        rules["ask_user"] = (RequiredFieldRule("question"),)
     if _KNOWLEDGE_ENABLED:
         rules["remember_knowledge"] = (RequiredFieldRule("text"),)
     return ParameterConstrainedToolPolicy(
@@ -1247,6 +1249,8 @@ def build_coding_app(
 ) -> CayuApp:
     """Build one fresh, process-scoped coding composition."""
 
+    if not __CODING_ARTIFACTS_ENABLED__ and artifact_store is not None:
+        raise ValueError("artifact_store requires the artifacts capability")
     LocalWorkspace.require_path_operations_supported()
     root = configured_workspace_root(workspace_root)
     scope = _knowledge_scope()
@@ -1274,7 +1278,11 @@ def build_coding_app(
     selected_artifact_store = (
         artifact_store
         if artifact_store is not None
-        else LocalArtifactStore(_STATE_ROOT / "artifacts", store_id="coding-artifacts")
+        else (
+            LocalArtifactStore(_STATE_ROOT / "artifacts", store_id="coding-artifacts")
+            if __CODING_ARTIFACTS_ENABLED__
+            else None
+        )
     )
     environment_identity = _coding_environment_identity(
         root=root,
@@ -1287,8 +1295,10 @@ def build_coding_app(
         ),
     )
 
+    runtime = build_runtime_options()
     app = CayuApp(
-        config=build_runtime_options().config,
+        config=runtime.config,
+        enable_logging=runtime.enable_logging,
         session_store=selected_session_store,
         task_store=selected_task_store,
         knowledge_store=selected_knowledge_store,
@@ -1315,7 +1325,6 @@ def build_coding_app(
         ),
         default=True,
     )
-    background_registry = BackgroundSubagentTaskRegistry()
     tools = [
         ListFilesTool(),
         SearchTextTool(
@@ -1328,8 +1337,9 @@ def build_coding_app(
         EditFileTool(),
         DeleteFileTool(),
         GitChangesTool(),
-        ListArtifactsTool(),
     ]
+    if __CODING_ARTIFACTS_ENABLED__:
+        tools.append(ListArtifactsTool())
     if _KNOWLEDGE_ENABLED:
         tools.extend(
             (
@@ -1339,41 +1349,46 @@ def build_coding_app(
                 RememberKnowledgeTool(),
             )
         )
-    tools.extend(
-        (
-            SubagentTool(
-                app,
-                agents={
-                    _REVIEWER_ALIAS: SubagentSpec(
-                        agent_name=reviewer_agent.name,
-                        description="Review a bounded change and return concrete findings.",
-                        mode=SubagentExecutionMode.BACKGROUND,
-                        max_steps=REVIEWER_MAX_STEPS,
-                        result_max_chars=4_000,
-                        limits=RunLimits(
-                            max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
-                            max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
-                        ),
-                    )
-                },
-                background_registry=background_registry,
-                execution_profile_identity=_subagent_tool_identity(
-                    reviewer_agent,
-                    reviewer_execution_profile_identity,
-                    generated_session_store=generated_session_store,
+    if __CODING_DELEGATION_ENABLED__:
+        background_registry = BackgroundSubagentTaskRegistry()
+        tools.extend(
+            (
+                SubagentTool(
+                    app,
+                    agents={
+                        _REVIEWER_ALIAS: SubagentSpec(
+                            agent_name=reviewer_agent.name,
+                            description="Review a bounded change and return concrete findings.",
+                            mode=SubagentExecutionMode.BACKGROUND,
+                            max_steps=REVIEWER_MAX_STEPS,
+                            result_max_chars=4_000,
+                            limits=RunLimits(
+                                max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
+                                max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
+                            ),
+                        )
+                    },
+                    background_registry=background_registry,
+                    execution_profile_identity=_subagent_tool_identity(
+                        reviewer_agent,
+                        reviewer_execution_profile_identity,
+                        generated_session_store=generated_session_store,
+                    ),
                 ),
-            ),
-            SubagentResultTool(
-                app.session_store,
-                background_registry=background_registry,
-                default_timeout_s=30,
-                execution_profile_identity=(
-                    _SUBAGENT_RESULT_TOOL_IDENTITY if generated_session_store else None
+                SubagentResultTool(
+                    app.session_store,
+                    background_registry=background_registry,
+                    default_timeout_s=30,
+                    execution_profile_identity=(
+                        _SUBAGENT_RESULT_TOOL_IDENTITY
+                        if generated_session_store
+                        else None
+                    ),
                 ),
-            ),
-            UserInputTool(),
+            )
         )
-    )
+    if __CODING_HUMAN_INPUT_ENABLED__:
+        tools.append(UserInputTool())
     register_coding_agents(
         app,
         primary_agent=primary_agent,
@@ -1396,9 +1411,7 @@ work. Use edit_file for one small existing-file change, write_file or delete_fil
 for one explicit file, and apply_patch for a coherent bounded multi-file change
 or move. Treat partial, ambiguous, or cancelled patch outcomes as a requirement
 to re-read current state.__CODING_KNOWLEDGE_PROMPT__
-Delegate focused review tasks to the reviewer alias in the background and recover
-their result with subagent_result. Use ask_user when a material choice cannot be
-inferred.
+__CODING_DELEGATION_PROMPT____CODING_HUMAN_INPUT_PROMPT__
 """
 
 REVIEWER_SYSTEM_PROMPT = (
@@ -1503,7 +1516,8 @@ def register_coding_agents(
 ) -> None:
     """Register the tool-free reviewer and explicitly governed primary agent."""
 
-    app.register_agent(reviewer_agent, tools=())
+    if __CODING_DELEGATION_ENABLED__:
+        app.register_agent(reviewer_agent, tools=())
     starter_tools = list(tools)
     # <cayu:generated-starter-tools>
     # </cayu:generated-starter-tools>
@@ -1542,11 +1556,7 @@ LOCAL_TOOL_NAMES = (
     "edit_file",
     "delete_file",
     "git_changes",
-    "list_artifacts",
-__CODING_KNOWLEDGE_TOOL_NAMES__    "subagent",
-    "subagent_result",
-    "ask_user",
-)
+__CODING_ARTIFACT_TOOL_NAMES____CODING_KNOWLEDGE_TOOL_NAMES____CODING_DELEGATION_TOOL_NAMES____CODING_HUMAN_INPUT_TOOL_NAMES__)
 DOCKER_TOOL_NAMES = (
     "list_files",
     "search_text",
@@ -1558,11 +1568,7 @@ DOCKER_TOOL_NAMES = (
     "git_changes",
     "run_check",
     "run_command",
-    "list_artifacts",
-__CODING_KNOWLEDGE_TOOL_NAMES__    "subagent",
-    "subagent_result",
-    "ask_user",
-)
+__CODING_ARTIFACT_TOOL_NAMES____CODING_KNOWLEDGE_TOOL_NAMES____CODING_DELEGATION_TOOL_NAMES____CODING_HUMAN_INPUT_TOOL_NAMES__)
 
 
 def require_coding_tool_inventory(
@@ -1702,7 +1708,7 @@ GENERATED_STORE_PROFILE = "sqlite"
 @dataclass(frozen=True, slots=True)
 class CodingStores:
     session_store: SessionStore
-    task_store: TaskStore
+    task_store: TaskStore | None
     knowledge_store: KnowledgeStore | None
     generated_session_store: bool
     generated_knowledge_store: bool
@@ -1718,6 +1724,12 @@ def build_coding_stores(
 ) -> CodingStores:
     """Construct one coherent SQLite-backed coding store profile."""
 
+    if not __CODING_TASKS_ENABLED__ and task_store is not None:
+        raise ValueError("task_store requires the tasks capability")
+    if not __CODING_KNOWLEDGE_ENABLED__ and scope is not None:
+        raise ValueError("scope requires the knowledge capability")
+    if scope is None and knowledge_store is not None:
+        raise ValueError("knowledge_store requires the knowledge capability")
     database = state_root / "cayu.db"
     return CodingStores(
         session_store=(
@@ -1729,7 +1741,9 @@ def build_coding_stores(
             )
         ),
         task_store=(
-            task_store if task_store is not None else SQLiteTaskStore(database)
+            task_store
+            if task_store is not None
+            else (SQLiteTaskStore(database) if __CODING_TASKS_ENABLED__ else None)
         ),
         knowledge_store=(
             knowledge_store
@@ -1774,7 +1788,7 @@ _INSPECTION_DSN = "postgresql://cayu-unconfigured@127.0.0.1/cayu"
 @dataclass(frozen=True, slots=True)
 class CodingStores:
     session_store: SessionStore
-    task_store: TaskStore
+    task_store: TaskStore | None
     knowledge_store: KnowledgeStore | None
     generated_session_store: bool
     generated_knowledge_store: bool
@@ -1791,6 +1805,12 @@ def build_coding_stores(
     """Construct lazy Postgres stores without connecting during import or inspect."""
 
     del state_root
+    if not __CODING_TASKS_ENABLED__ and task_store is not None:
+        raise ValueError("task_store requires the tasks capability")
+    if not __CODING_KNOWLEDGE_ENABLED__ and scope is not None:
+        raise ValueError("scope requires the knowledge capability")
+    if scope is None and knowledge_store is not None:
+        raise ValueError("knowledge_store requires the knowledge capability")
     conninfo = configured_database_url() or _INSPECTION_DSN
     return CodingStores(
         session_store=(
@@ -1802,7 +1822,9 @@ def build_coding_stores(
             )
         ),
         task_store=(
-            task_store if task_store is not None else PostgresTaskStore(conninfo)
+            task_store
+            if task_store is not None
+            else (PostgresTaskStore(conninfo) if __CODING_TASKS_ENABLED__ else None)
         ),
         knowledge_store=(
             knowledge_store
@@ -1853,8 +1875,8 @@ This project opts in to Cayu's explicit coding starter. The implementation lives
 in its canonical homes: `tools/coding.py`, `policies/coding.py`,
 `environments/coding.py`, `operations/coding.py`, `knowledge/coding.py`,
 `prompts/coding.py`, and `agents/registration.py`. Together these modules register bounded repository
-file tools, Git review, local artifacts, __CODING_DATABASE_SUMMARY__, a background
-reviewer subagent with result recovery, and human input. These are existing Cayu APIs;
+file tools and Git review, with __CODING_DATABASE_SUMMARY__. Optional features selected for this profile are
+__CODING_SELECTED_SUMMARY__. These are existing Cayu APIs;
 there is no hidden agent kind, registry, permission grant, or post-start mutation.
 The composition selects implementations only. `AllRegisteredToolsExposurePolicy`
 separately controls which registered tools are model-visible, while the ordinary
@@ -1880,7 +1902,7 @@ it forwards only Cayu's minimal operational allow-list
 Path-addressed mutations are confined to the selected workspace by the workspace
 adapter and explicit parameter policy.__CODING_KNOWLEDGE_REVIEW_GUIDANCE__
 
-Completed reviewer sessions and their results are durable and can be retrieved
+When delegation is selected, completed reviewer sessions and their results are durable and can be retrieved
 after application reconstruction. Background reviewer execution itself belongs
 to the current process: let it reach a terminal state before restarting, or
 replace it with durable dispatch and a task-store worker when in-flight
@@ -1908,8 +1930,7 @@ resume under behavior different from the behavior that identity originally
 authenticated. Advancing one intentionally makes older continuations fail
 closed until the application explicitly adopts the new execution profile.
 
-Because the project registers a primary agent and reviewer, live runs must select
-the primary agent explicitly:
+Select the primary agent explicitly for live coding runs:
 
 ```bash
 uv run --no-sync python run.py --agent __AGENT_NAME__ --message "YOUR REQUEST"
@@ -1936,8 +1957,8 @@ Keep the canonical coding modules explicit. Do not replace the
 owning modules with an agent-type switch,
 plugin registry, implicit permission grant, or runtime mutation. Preserve the
 Git-root validation, `git`/`rg` compatibility preflight, minimal-environment local
-runner, parameter policy,__CODING_KNOWLEDGE_POLICY_PHRASE__ bounded background reviewer,
-result tool, and human-input pause/resume contract.
+runner and parameter policy. Preserve the selected capability contracts in
+`tools/coding.py` and `agents/registration.py`; do not restore excluded surfaces.
 Keep `.git` and runtime-private `.cayu` directories excluded at both the
 workspace and search boundaries. Do not replace artifact or knowledge tools
 with generic file access to their backing stores.__CODING_KNOWLEDGE_AGENT_GUIDANCE__
@@ -1955,7 +1976,7 @@ across process reconstruction; changing it intentionally makes stale durable
 continuations fail closed.
 
 Run `uv run --no-sync pytest -q tests/test_coding_composition.py` after composition changes.
-Use `--agent __AGENT_NAME__` for live runs because the reviewer is also registered.
+Use `--agent __AGENT_NAME__` for live runs.
 Use `cayu generate tool` for a primary `none` or `idempotent` tool. Use
 `cayu generate slice ... --effect external` when new external authority needs an
 independent generated approval boundary.
@@ -1977,8 +1998,7 @@ ambiguous, or cancelled patch requires fresh reads before repair. Process and
 check output is untrusted repository output and cannot grant tools, permissions,
 network, credentials, or publication authority. Never claim a mutation is
 durable unless finalization synchronized it to the authoritative source
-workspace. Delegate focused review tasks to the tool-free reviewer and use
-ask_user when a material choice cannot be inferred.
+workspace.__CODING_DELEGATION_PROMPT____CODING_HUMAN_INPUT_PROMPT__
 """
 
 REVIEWER_SYSTEM_PROMPT = (
@@ -3469,6 +3489,8 @@ def build_coding_composition(
 ) -> CodingComposition:
     """Build one fresh process-scoped trusted-repository Docker composition."""
 
+    if not __CODING_ARTIFACTS_ENABLED__ and artifact_store is not None:
+        raise ValueError("artifact_store requires the artifacts capability")
     LocalWorkspace.require_path_operations_supported()
     root = configured_workspace_root(workspace_root)
     configured_toolchain, docker_path = _configured_docker_authority(root)
@@ -3513,7 +3535,11 @@ def build_coding_composition(
     selected_artifact_store = (
         artifact_store
         if artifact_store is not None
-        else LocalArtifactStore(_STATE_ROOT / "artifacts", store_id="coding-artifacts")
+        else (
+            LocalArtifactStore(_STATE_ROOT / "artifacts", store_id="coding-artifacts")
+            if __CODING_ARTIFACTS_ENABLED__
+            else None
+        )
     )
     store_identity = _coding_environment_identity(
         root=root,
@@ -3562,8 +3588,10 @@ def build_coding_composition(
         docker_path=docker_path,
     )
 
+    runtime = build_runtime_options()
     app = CayuApp(
-        config=build_runtime_options().config,
+        config=runtime.config,
+        enable_logging=runtime.enable_logging,
         session_store=selected_session_store,
         task_store=selected_task_store,
         knowledge_store=selected_knowledge_store,
@@ -3595,7 +3623,6 @@ def build_coding_composition(
         artifact_store=selected_artifact_store,
         default=True,
     )
-    background_registry = BackgroundSubagentTaskRegistry()
     tools = [
         ListFilesTool(),
         SearchTextTool(
@@ -3610,8 +3637,9 @@ def build_coding_composition(
         GitChangesTool(),
         check_tool,
         command_tool,
-        ListArtifactsTool(),
     ]
+    if __CODING_ARTIFACTS_ENABLED__:
+        tools.append(ListArtifactsTool())
     if _KNOWLEDGE_ENABLED:
         tools.extend(
             (
@@ -3621,41 +3649,46 @@ def build_coding_composition(
                 RememberKnowledgeTool(),
             )
         )
-    tools.extend(
-        (
-            SubagentTool(
-                app,
-                agents={
-                    _REVIEWER_ALIAS: SubagentSpec(
-                        agent_name=reviewer_agent.name,
-                        description="Review a bounded change and return concrete findings.",
-                        mode=SubagentExecutionMode.BACKGROUND,
-                        max_steps=REVIEWER_MAX_STEPS,
-                        result_max_chars=4_000,
-                        limits=RunLimits(
-                            max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
-                            max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
-                        ),
-                    )
-                },
-                background_registry=background_registry,
-                execution_profile_identity=_subagent_tool_identity(
-                    reviewer_agent,
-                    reviewer_execution_profile_identity,
-                    generated_session_store=generated_session_store,
+    if __CODING_DELEGATION_ENABLED__:
+        background_registry = BackgroundSubagentTaskRegistry()
+        tools.extend(
+            (
+                SubagentTool(
+                    app,
+                    agents={
+                        _REVIEWER_ALIAS: SubagentSpec(
+                            agent_name=reviewer_agent.name,
+                            description="Review a bounded change and return concrete findings.",
+                            mode=SubagentExecutionMode.BACKGROUND,
+                            max_steps=REVIEWER_MAX_STEPS,
+                            result_max_chars=4_000,
+                            limits=RunLimits(
+                                max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
+                                max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
+                            ),
+                        )
+                    },
+                    background_registry=background_registry,
+                    execution_profile_identity=_subagent_tool_identity(
+                        reviewer_agent,
+                        reviewer_execution_profile_identity,
+                        generated_session_store=generated_session_store,
+                    ),
                 ),
-            ),
-            SubagentResultTool(
-                app.session_store,
-                background_registry=background_registry,
-                default_timeout_s=30,
-                execution_profile_identity=(
-                    _SUBAGENT_RESULT_TOOL_IDENTITY if generated_session_store else None
+                SubagentResultTool(
+                    app.session_store,
+                    background_registry=background_registry,
+                    default_timeout_s=30,
+                    execution_profile_identity=(
+                        _SUBAGENT_RESULT_TOOL_IDENTITY
+                        if generated_session_store
+                        else None
+                    ),
                 ),
-            ),
-            UserInputTool(),
+            )
         )
-    )
+    if __CODING_HUMAN_INPUT_ENABLED__:
+        tools.append(UserInputTool())
     register_coding_agents(
         app,
         primary_agent=primary_agent,
@@ -3761,7 +3794,7 @@ limits. The required `test` check executes the complete `tests/` tree, including
 the maintained composition proof and application-owned regressions beside it.
 It does not expose a shell, arbitrary executable or argv, `ExecCommandTool`,
 PTY, installer, network, publication, commit, push, or credential tool. Named
-required checks remain independent from diagnostic commands. The reviewer remains
+required checks remain independent from diagnostic commands. When configured, the reviewer remains
 tool-free. Tool exposure, parameter policy, exact command policy, environment
 admission, and execution-profile adoption are independent enforced gates.
 
@@ -4858,17 +4891,19 @@ def test_reduced_coding_profile_matches_the_declared_capabilities(
     app = build_app(
         provider=provider,
         session_store=InMemorySessionStore(),
-        task_store=InMemoryTaskStore(),
+        task_store=InMemoryTaskStore() if __CODING_TASKS_ENABLED__ else None,
         workspace_root=workspace,
     )
 
     manifest = app.describe()
-    assert manifest.stores.knowledge is None
-    assert manifest.environments[0].knowledge_store is None
+    assert (manifest.stores.knowledge is not None) is __CODING_KNOWLEDGE_ENABLED__
+    assert (manifest.stores.task is not None) is __CODING_TASKS_ENABLED__
+    assert (manifest.environments[0].artifact_store is not None) is __CODING_ARTIFACTS_ENABLED__
     primary = next(
         agent for agent in manifest.agents if agent.name == "__AGENT_NAME__"
     )
-    assert _KNOWLEDGE_TOOL_NAMES.isdisjoint(tool.name for tool in primary.tools)
+    from tools.coding import LOCAL_TOOL_NAMES
+    assert {tool.name for tool in primary.tools} == set(LOCAL_TOOL_NAMES)
 
     outcome = asyncio.run(
         run_to_completion(
@@ -4884,24 +4919,42 @@ def test_reduced_coding_profile_matches_the_declared_capabilities(
 '''
 
 
-_REDUCED_DOCKER_SMOKE_TEST_PY = '''"""Credential-free proof for a reduced Docker coding profile."""
+_REDUCED_DOCKER_SMOKE_TEST_PY = '''"""Credential-free construction proof; does not claim live Docker execution."""
 
+import subprocess
+
+from cayu import DockerImageIdentity, InMemorySessionStore, InMemoryTaskStore
+from app import build_app
 from operations import coding as composition
 from tools.coding import DOCKER_TOOL_NAMES
 
-_KNOWLEDGE_TOOL_NAMES = {
-    "list_knowledge",
-    "search_knowledge",
-    "read_knowledge",
-    "remember_knowledge",
-}
 
-
-def test_reduced_docker_profile_matches_the_declared_capabilities() -> None:
-    assert composition._KNOWLEDGE_ENABLED is False
-    assert _KNOWLEDGE_TOOL_NAMES.isdisjoint(DOCKER_TOOL_NAMES)
+def test_reduced_docker_profile_matches_the_declared_capabilities(
+    tmp_path, monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    monkeypatch.setattr(composition, "_STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
+    monkeypatch.setattr(composition, "_configured_docker_authority", lambda root: (
+        DockerImageIdentity(
+            reference="generated:test", content_digest="sha256:" + "a" * 64,
+        ),
+        "/usr/bin/docker",
+    ))
+    app = build_app(
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore() if __CODING_TASKS_ENABLED__ else None,
+        workspace_root=workspace,
+    )
+    manifest = app.describe()
+    assert (manifest.stores.knowledge is not None) is __CODING_KNOWLEDGE_ENABLED__
+    assert (manifest.stores.task is not None) is __CODING_TASKS_ENABLED__
+    assert len(manifest.agents) == (2 if __CODING_DELEGATION_ENABLED__ else 1)
+    primary = next(agent for agent in manifest.agents if agent.name == "__AGENT_NAME__")
+    assert {tool.name for tool in primary.tools} == set(DOCKER_TOOL_NAMES)
 '''
-
 
 _SMOKE_TEST_PY = r'''"""Credential-free smoke proof for the maintained coding composition."""
 
@@ -5979,8 +6032,42 @@ def coding_project_files(
 
     selected = frozenset(plan.capabilities)
     coding_profile = "-".join(sorted(selected)) or "minimal"
+    full_profile = {"knowledge", "tasks", "delegation", "human-input", "artifacts"} <= selected
 
     def coding_render(template: str) -> str:
+        for capability in ("artifacts", "tasks", "delegation", "human-input"):
+            template = template.replace(
+                "__CODING_" + capability.upper().replace("-", "_") + "_ENABLED__",
+                repr(capability in selected),
+            )
+        optional_tools = {
+            "ARTIFACT": ("artifacts", ("list_artifacts",)),
+            "DELEGATION": ("delegation", ("subagent", "subagent_result")),
+            "HUMAN_INPUT": ("human-input", ("ask_user",)),
+        }
+        for token, (capability, names) in optional_tools.items():
+            template = template.replace(
+                "__CODING_" + token + "_TOOL_NAMES__",
+                "".join(f'    "{name}",\n' for name in names) if capability in selected else "",
+            )
+        template = (
+            template.replace(
+                "__CODING_SELECTED_SUMMARY__",
+                ", ".join(sorted(selected)) or "none",
+            )
+            .replace(
+                "__CODING_DELEGATION_PROMPT__",
+                " Delegate focused reviews to the reviewer alias and recover results with subagent_result."
+                if "delegation" in selected
+                else "",
+            )
+            .replace(
+                "__CODING_HUMAN_INPUT_PROMPT__",
+                " Use ask_user when a material choice cannot be inferred."
+                if "human-input" in selected
+                else "",
+            )
+        )
         configured = (
             template.replace(
                 "__CODING_KNOWLEDGE_ENABLED__",
@@ -6043,7 +6130,7 @@ def coding_project_files(
     coding_files = {
         "app.py": _coding_app_source(files["app.py"]),
         "configuration/settings.py": (files["configuration/settings.py"] + _CODING_SETTINGS_APPEND),
-        "configuration/coding_storage.py": coding_storage,
+        "configuration/coding_storage.py": coding_render(coding_storage),
         "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
         "environments/coding.py": _CODING_ENVIRONMENT_PY,
         "operations/coding.py": coding_render(_COMPOSITION_PY),
@@ -6054,9 +6141,9 @@ def coding_project_files(
         "prompts/coding.py": coding_render(_CODING_PROMPTS_PY),
         "agents/agent.py": coding_render(_PRIMARY_AGENT_PY),
         "agents/reviewer.py": coding_render(_REVIEWER_AGENT_PY),
-        "agents/registration.py": _CODING_AGENT_REGISTRATION_PY,
+        "agents/registration.py": coding_render(_CODING_AGENT_REGISTRATION_PY),
         "tests/test_coding_composition.py": coding_render(
-            _SMOKE_TEST_PY if "knowledge" in selected else _REDUCED_SMOKE_TEST_PY
+            _SMOKE_TEST_PY if full_profile else _REDUCED_SMOKE_TEST_PY
         ),
         "README.md": files["README.md"] + coding_render(_README_APPEND),
         "AGENTS.md": files["AGENTS.md"] + coding_render(_AGENTS_APPEND),
@@ -6087,9 +6174,7 @@ def coding_project_files(
                 "prompts/coding.py": coding_render(_DOCKER_CODING_PROMPTS_PY),
                 "agents/agent.py": coding_render(_DOCKER_PRIMARY_AGENT_PY),
                 "tests/test_coding_composition.py": coding_render(
-                    _DOCKER_SMOKE_TEST_PY
-                    if "knowledge" in selected
-                    else _REDUCED_DOCKER_SMOKE_TEST_PY
+                    _DOCKER_SMOKE_TEST_PY if full_profile else _REDUCED_DOCKER_SMOKE_TEST_PY
                 ),
                 "tests/test_project.py": _DOCKER_PROJECT_TEST_PY,
             }

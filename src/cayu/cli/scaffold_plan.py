@@ -141,6 +141,7 @@ PRESETS: tuple[PresetSpec, ...] = (
         name="coding",
         summary="Maintained trusted-repository coding composition.",
         default_capabilities=(
+            "artifacts",
             "knowledge",
             "tasks",
             "delegation",
@@ -562,6 +563,16 @@ def normalize_application_plan(
                     "capability_dependency_conflict",
                     f"capability {selected!r} requires excluded capability {name_value!r}",
                 )
+
+    required = {"tasks"} if preset == "service" else set()
+    if preset == "coding" and execution == "docker":
+        required.add("artifacts")
+    missing = sorted(required - capabilities)
+    if missing:
+        raise ScaffoldPlanError(
+            "capability_required",
+            f"preset {preset!r} with execution {execution!r} requires: " + ", ".join(missing),
+        )
 
     for name_value in sorted(capabilities):
         spec = capability_spec(name_value)

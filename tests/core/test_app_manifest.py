@@ -10,10 +10,12 @@ from pydantic import SecretStr, ValidationError
 from cayu import (
     AgentAuthoringState,
     AgentSpec,
+    AllowlistRule,
     AppManifest,
     ArtifactExternalizingToolResultPolicy,
     CayuApp,
     CayuConfig,
+    DenyPatternRule,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
@@ -26,13 +28,17 @@ from cayu import (
     LocalWorkspace,
     OpenAIWebSearch,
     OperationsConfig,
+    ParameterConstrainedToolPolicy,
     ProcessCommandPolicy,
     RecoveryCleanupPolicy,
     RequestFootprintConfig,
+    RequiredAllowlistRule,
+    RequiredFieldRule,
     ScriptedModelProvider,
     SecretRedactor,
     Tool,
     ToolEffect,
+    ToolPolicyDecision,
     ToolResult,
     ToolSpec,
 )
@@ -53,6 +59,103 @@ class _SchemaTool(Tool):
 
     async def run(self, ctx, args):
         return ToolResult(content="ok")
+
+
+@pytest.mark.parametrize("decision", (ToolPolicyDecision.DENY, ToolPolicyDecision.REQUIRE_APPROVAL))
+@pytest.mark.parametrize("custom", (False, True))
+def test_manifest_parameter_policy_decision_is_concrete_static_evidence(decision, custom):
+    class CustomPolicy(ParameterConstrainedToolPolicy):
+        pass
+
+    policy_type = CustomPolicy if custom else ParameterConstrainedToolPolicy
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="assistant", model="schema-only"),
+        tools=[_SchemaTool()],
+        tool_policy=policy_type({"schema_tool": (RequiredFieldRule("token"),)}, decision=decision),
+    )
+    manifest = app.describe()
+    tool = manifest.agents[0].tools[0]
+    assert tool.parameter_policy_decision == (None if custom else decision.value)
+    assert tool.policy_coverage == ("unknown" if custom else "conditional")
+    reconstructed = AppManifest.model_validate_json(manifest.model_dump_json())
+    assert (
+        reconstructed.agents[0].tools[0].parameter_policy_decision == tool.parameter_policy_decision
+    )
+
+
+@pytest.mark.parametrize("required", (False, True))
+@pytest.mark.parametrize("catch_all", (False, True))
+@pytest.mark.parametrize("decision", (ToolPolicyDecision.DENY, ToolPolicyDecision.REQUIRE_APPROVAL))
+def test_manifest_catch_all_coverage_requires_actual_pattern_and_required_argument(
+    required, catch_all, decision
+):
+    tool = _SchemaTool(
+        ToolSpec(
+            name="schema_tool",
+            input_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"] if required else [],
+            },
+        )
+    )
+    rule = DenyPatternRule("text", patterns=(r"(?s).*" if catch_all else "forbidden",))
+    # Public descriptions cannot substitute for the compiled runtime predicate.
+    if not catch_all:
+        rule.patterns = (r"(?s).*",)
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="assistant", model="schema-only"),
+        tools=[tool],
+        tool_policy=ParameterConstrainedToolPolicy({"schema_tool": (rule,)}, decision=decision),
+    )
+    manifest = app.describe()
+    expected = "conditional"
+    if required and catch_all:
+        expected = "denied" if decision == ToolPolicyDecision.DENY else "approval_required"
+    assert manifest.agents[0].tools[0].policy_coverage == expected
+
+
+@pytest.mark.parametrize("before", (False, True))
+@pytest.mark.parametrize(
+    "kind", ("required", "allowlist", "required_allowlist", "pattern", "custom")
+)
+def test_manifest_catch_all_rule_sequences_keep_custom_rules_conservative(before, kind):
+    class CustomRule(RequiredFieldRule):
+        pass
+
+    extras = {
+        "required": RequiredFieldRule("text"),
+        "allowlist": AllowlistRule("text", values=("allowed",)),
+        "required_allowlist": RequiredAllowlistRule("text", values=("allowed",)),
+        "pattern": DenyPatternRule("text", patterns=("forbidden",)),
+        "custom": CustomRule("text"),
+    }
+    catch_all = DenyPatternRule("text", patterns=(r"(?s).*",))
+    extra = extras[kind]
+    rules = (extra, catch_all) if before else (catch_all, extra)
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="assistant", model="schema-only"),
+        tools=[
+            _SchemaTool(
+                ToolSpec(
+                    name="schema_tool",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                )
+            )
+        ],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"schema_tool": rules}, decision=ToolPolicyDecision.REQUIRE_APPROVAL
+        ),
+    )
+    coverage = app.describe().agents[0].tools[0].policy_coverage
+    assert coverage == ("conditional" if kind == "custom" else "approval_required")
 
 
 class _PathSchemaTool(Tool):
@@ -561,6 +664,25 @@ def test_agent_execution_requirements_are_typed_and_fingerprinted() -> None:
     assert trusted_manifest.agents[0].execution_requirements == ExecutionRequirements.trusted()
     assert isolated_manifest.agents[0].execution_requirements == (ExecutionRequirements.untrusted())
     assert trusted_manifest.fingerprint != isolated_manifest.fingerprint
+
+
+def test_manifest_redacts_executable_paths_without_invalidating_typed_sets() -> None:
+    app = CayuApp(enable_logging=False)
+    requirements = ExecutionRequirements.trusted(
+        required_executables=("/private/first/python", "/private/second/pytest", "git"),
+    )
+    app.register_agent(AgentSpec(name="worker", model="model"), execution_requirements=requirements)
+    manifest = app.describe()
+    executables = manifest.agents[0].execution_requirements.required_executables
+    assert len(executables) == 3
+    assert executables == tuple(sorted(set(executables)))
+    assert "/private" not in manifest.model_dump_json()
+    assert type(manifest).model_validate_json(manifest.model_dump_json()) == manifest
+    assert requirements.required_executables == (
+        "/private/first/python",
+        "/private/second/pytest",
+        "git",
+    )
 
 
 def test_manifest_reports_command_policy_posture_without_policy_internals() -> None:

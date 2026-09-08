@@ -215,9 +215,10 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
         "remember_knowledge",
         "search_knowledge",
     }
-    assert next(
-        tool for tool in agent.tools if tool.name == "remember_knowledge"
-    ).policy_coverage == ("conditional")
+    assert (
+        next(tool for tool in agent.tools if tool.name == "remember_knowledge").policy_coverage
+        == "approval_required"
+    )
     environment = manifest.environments[0]
     assert environment.artifact_store == "LocalArtifactStore"
     assert environment.knowledge_store == "InMemoryKnowledgeStore"

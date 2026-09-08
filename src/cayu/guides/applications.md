@@ -111,6 +111,22 @@ adapters; `--with` and `--without` change only package-shipped selectable
 capabilities. Extension-only concerns retain their canonical homes but cannot be
 claimed active through a flag. Invalid combinations fail before target creation.
 
+Service profiles require `tasks`; Docker coding profiles require `artifacts` for
+their durable product results. Excluding either produces `CAPABILITY_REQUIRED`
+before writing files. Coding includes artifacts in its declared defaults; local
+coding can exclude artifacts, tasks, delegation, and human input independently.
+An excluded store cannot be restored through a generated factory's injection seam.
+
+For a normalized declared profile, `inspect` and `check` report
+`SCAFFOLD_CAPABILITY_DRIFT` when constructed stores or built-in tool families
+disagree with the capability selection. For agent starters with
+knowledge, this also compares the starter's proposal-policy decision and concrete
+catch-all coverage with `approvals`; independent extension approval policies do not imply that the
+starter capability is enabled. These are structural diagnostics, not
+proof of provider access or arbitrary custom policy behavior. The default agent's
+`search_knowledge` uses its configured project/agent namespace when the caller
+omits the namespace; normal knowledge access and active-entry filters still apply.
+
 `NAME` is always the project directory's basename and `--dir` is always its
 existing parent. To inspect a maintained variant while changing an existing
 project, create a disposable reference instead of passing a path as `NAME` or

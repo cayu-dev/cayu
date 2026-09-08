@@ -37,11 +37,16 @@ from cayu.runtime.request_footprints import (
 from cayu.runtime.tool_catalogue import ToolExecutionContract
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
+    AllowlistRule,
     AlwaysRequireApprovalToolPolicy,
+    DenyPatternRule,
     ParameterConstrainedToolPolicy,
+    RequiredAllowlistRule,
+    RequiredFieldRule,
     StaticToolPolicy,
     TaintAwareToolPolicy,
     ToolPolicy,
+    ToolPolicyDecision,
 )
 from cayu.runtime.tool_result_projection import (
     ArtifactExternalizingToolResultPolicy,
@@ -110,18 +115,38 @@ def _thaw_json_value(value: object) -> object:
     return value
 
 
-def _normalize_manifest_unstable_values(value: object) -> object:
+def _normalize_manifest_unstable_values(
+    value: object,
+    *,
+    path: tuple[str, ...] = (),
+) -> object:
     if type(value) is str:
         return _normalize_manifest_string(value)
     if type(value) is list:
-        return [_normalize_manifest_unstable_values(item) for item in value]
+        normalized = [
+            _normalize_manifest_unstable_values(item, path=(*path, "*")) for item in value
+        ]
+        if path in {
+            ("agents", "*", "execution_requirements", "required_executables"),
+            ("agents", "*", "tools", "*", "named_checks", "*", "required_executables"),
+        } and all(type(item) is str for item in normalized):
+            # These typed sets require sorted unique members. Redaction may
+            # collapse distinct paths; retain their cardinality using the same
+            # collision-safe labels as manifest object keys, never raw paths.
+            return sorted(
+                collision_safe_json_object(
+                    [(cast("str", item), None) for item in normalized],
+                    preserve_input_order=False,
+                )
+            )
+        return normalized
     if type(value) is dict:
         items: list[tuple[str, object]] = []
         for key, item in value.items():
             if type(key) is not str:
                 raise AssertionError("Manifest JSON object keys must be strings.")
             normalized_key = _normalize_manifest_string(key)
-            normalized_item = _normalize_manifest_unstable_values(item)
+            normalized_item = _normalize_manifest_unstable_values(item, path=(*path, key))
             items.append((normalized_key, normalized_item))
         return collision_safe_json_object(items, preserve_input_order=False)
     return value
@@ -227,6 +252,8 @@ class ToolManifest(_ManifestModel):
     hard_deadline_seconds: float | None = Field(default=None, gt=0, le=24 * 60 * 60)
     input_schema: FrozenJsonObject = Field(default_factory=lambda: MappingProxyType({}))
     policy_coverage: Literal["allowed", "denied", "approval_required", "conditional", "unknown"]
+    # Static configured decision, not a claim that every argument violates a rule.
+    parameter_policy_decision: Literal["deny", "require_approval"] | None = None
     command_policy: str | None = None
     named_checks: tuple[NamedCheckManifest, ...] = ()
     registration_provenance: RegistrationProvenance
@@ -703,7 +730,8 @@ def _describe_tool(
         adapter_configuration_sha256=execution_contract.adapter_configuration_sha256,
         hard_deadline_seconds=execution_contract.hard_deadline_seconds,
         input_schema=app.redact_json(tool.schema),
-        policy_coverage=_tool_policy_coverage(tool_policy, tool_name),
+        policy_coverage=_tool_policy_coverage(tool_policy, tool_name, tool.schema),
+        parameter_policy_decision=_parameter_policy_decision(tool_policy, tool_name),
         command_policy=_command_policy_name(tool.tool),
         named_checks=_named_check_manifests(tool.tool),
         registration_provenance=registration_provenance,
@@ -875,9 +903,26 @@ def _optional_type_name(value: object | None) -> str | None:
     return None if value is None else _type_name(value)
 
 
+def _parameter_policy_decision(
+    policy: ToolPolicy, tool_name: str
+) -> Literal["deny", "require_approval"] | None:
+    # Do not project built-in semantics onto an overriding extension subclass.
+    if (
+        type(policy) is ParameterConstrainedToolPolicy
+        and type(policy.decision) is ToolPolicyDecision
+        and policy.rules.get(tool_name)
+    ):
+        if policy.decision == ToolPolicyDecision.DENY:
+            return "deny"
+        if policy.decision == ToolPolicyDecision.REQUIRE_APPROVAL:
+            return "require_approval"
+    return None
+
+
 def _tool_policy_coverage(
     policy: ToolPolicy,
     tool_name: str,
+    schema: Mapping[str, object],
 ) -> Literal["allowed", "denied", "approval_required", "conditional", "unknown"]:
     # These descriptions are static facts about Cayu's concrete built-ins. A
     # subclass can override authorize(), so treating it as its parent would
@@ -893,6 +938,44 @@ def _tool_policy_coverage(
             return "denied"
         return "allowed"
     if type(policy) is ParameterConstrainedToolPolicy:
+        rules = policy.rules.get(tool_name, ())
+        # Recognize only the maintained catch-all boundary, not arbitrary regex
+        # or custom-rule semantics. Use the compiled pattern and path actually
+        # consumed by check(), rather than their descriptive public attributes.
+        # Every concrete built-in violation returns the same policy decision;
+        # preceding validation cannot turn a later catch-all into an allow.
+        # Custom rules may override check(), so do not infer their semantics.
+        known_rule_types = (
+            RequiredFieldRule,
+            AllowlistRule,
+            RequiredAllowlistRule,
+            DenyPatternRule,
+        )
+        if type(rules) is not tuple or any(type(rule) not in known_rule_types for rule in rules):
+            return "conditional" if tool_name in policy.rules else "allowed"
+        for rule in rules:
+            if type(rule) is not DenyPatternRule:
+                continue
+            path = rule._path
+            patterns = rule._compiled_patterns
+            required = schema.get("required")
+            if (
+                type(path) is tuple
+                and len(path) == 1
+                and type(path[0]) is str
+                and isinstance(required, (list, tuple))
+                and path[0] in required
+                and type(patterns) is tuple
+                and any(
+                    type(pattern) is re.Pattern and pattern.pattern == r"(?s).*"
+                    for pattern in patterns
+                )
+            ):
+                decision = _parameter_policy_decision(policy, tool_name)
+                if decision == "require_approval":
+                    return "approval_required"
+                if decision == "deny":
+                    return "denied"
         return "conditional" if tool_name in policy.rules else "allowed"
     if type(policy) is TaintAwareToolPolicy:
         return "conditional" if policy.protected_labels_for_tool(tool_name) else "allowed"

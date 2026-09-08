@@ -857,7 +857,7 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
                     'capabilities = ["approvals", "artifacts", "evals", '
                     '"human-input", "knowledge", "memory", "observability", '
                     '"recovery", "tasks"]',
-                    'capabilities = ["delegation", "evals", "human-input", "knowledge", "tasks"]',
+                    'capabilities = ["artifacts", "delegation", "evals", "human-input", "knowledge", "tasks"]',
                 ),
             ),
             "execution",

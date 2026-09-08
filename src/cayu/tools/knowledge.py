@@ -452,6 +452,7 @@ class SearchKnowledgeTool(Tool):
         return {
             "allow_score_override": self._allow_score_override,
             "auto_min_score": self._auto_min_score,
+            "default_namespace": self._default_namespace,
         }
 
     def __init__(
@@ -460,8 +461,17 @@ class SearchKnowledgeTool(Tool):
         *,
         allow_score_override: bool = False,
         auto_min_score: float | None = DEFAULT_AUTO_SEMANTIC_MIN_SCORE,
+        default_namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE,
     ) -> None:
         super().__init__(spec=spec)
+        self._default_namespace = require_clean_nonblank(default_namespace, "default_namespace")
+        schema = self.spec.input_schema
+        namespace_schema = schema.get("properties", {}).get("namespace")
+        if isinstance(namespace_schema, dict):
+            namespace_schema["description"] = (
+                f"Optional knowledge namespace. Defaults to `{self._default_namespace}`."
+            )
+            self.spec = self.spec.model_copy(update={"input_schema": schema})
         self._allow_score_override = allow_score_override
         self._auto_min_score = _validate_optional_unit_float(
             auto_min_score,
@@ -504,7 +514,7 @@ class SearchKnowledgeTool(Tool):
                 all_terms=_optional_string_list(args, "all") or [],
                 none_terms=_optional_string_list(args, "none") or [],
                 phrases=_optional_string_list(args, "phrases") or [],
-                namespace=_optional_arg_string(args, "namespace") or "default",
+                namespace=_optional_arg_string(args, "namespace") or self._default_namespace,
                 labels=_optional_labels(args, "labels"),
                 kinds=_optional_string_list(args, "kinds"),
                 visibilities=_optional_visibilities(args, "visibilities"),

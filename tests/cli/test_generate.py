@@ -413,6 +413,11 @@ def test_coding_preset_generated_external_tool_keeps_approval_boundary(
     diagnostics = json.loads(capsys.readouterr().out)["diagnostics"]
     assert [item["code"] for item in diagnostics] == ["AGENT_GENERATED_TRACER_BULLET_UNFINISHED"]
 
+    assert main(["inspect", "--json"]) == 0
+    manifest = json.loads(capsys.readouterr().out)
+    extension = next(agent for agent in manifest["agents"] if agent["name"] == "publisher_action")
+    assert extension["tools"][0]["policy_coverage"] == "approval_required"
+
 
 def test_coding_generator_fails_closed_when_app_swaps_primary_and_reviewer(
     tmp_path: Path,

@@ -16168,6 +16168,10 @@ export type ToolManifest = {
      */
     parallel_safe: boolean;
     /**
+     * Parameter Policy Decision
+     */
+    parameter_policy_decision?: 'deny' | 'require_approval' | null;
+    /**
      * Policy Coverage
      */
     policy_coverage: 'allowed' | 'denied' | 'approval_required' | 'conditional' | 'unknown';

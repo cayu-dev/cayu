@@ -234,6 +234,26 @@ def test_search_knowledge_requires_configured_store() -> None:
     assert result.structured == {"error": "missing_knowledge_store"}
 
 
+def test_search_namespace_configuration_is_instance_owned_and_profiled() -> None:
+    original = SearchKnowledgeTool.spec.model_dump()
+    first = SearchKnowledgeTool(default_namespace="project:first")
+    second = SearchKnowledgeTool(default_namespace="project:second")
+    default = SearchKnowledgeTool()
+    assert "project:first" in first.spec.input_schema["properties"]["namespace"]["description"]
+    assert "project:second" in second.spec.input_schema["properties"]["namespace"]["description"]
+    assert (
+        "project:first" not in default.spec.input_schema["properties"]["namespace"]["description"]
+    )
+    assert SearchKnowledgeTool.spec.model_dump() == original
+    assert first._execution_profile_material() != second._execution_profile_material()
+
+
+@pytest.mark.parametrize("namespace", (None, True, 1, "", " ", " padded "))
+def test_search_rejects_invalid_configured_namespace(namespace) -> None:
+    with pytest.raises((TypeError, ValueError), match="default_namespace"):
+        SearchKnowledgeTool(default_namespace=namespace)
+
+
 def test_search_knowledge_returns_ranked_hits_with_filters() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)

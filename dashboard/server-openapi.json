@@ -31909,6 +31909,21 @@
             "title": "Parallel Safe",
             "type": "boolean"
           },
+          "parameter_policy_decision": {
+            "anyOf": [
+              {
+                "enum": [
+                  "deny",
+                  "require_approval"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Policy Decision"
+          },
           "policy_coverage": {
             "enum": [
               "allowed",

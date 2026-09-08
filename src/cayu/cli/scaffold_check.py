@@ -131,7 +131,143 @@ def check_declared_scaffold(
     diagnostics = list(source_diagnostics)
     if declared:
         diagnostics.extend(_check_registration_provenance(manifest))
+        diagnostics.extend(check_scaffold_capabilities(root, manifest))
     return _filter(tuple(diagnostics), tags=tags, deploy_only=deploy_only)
+
+
+def check_scaffold_capabilities(
+    root: Path,
+    manifest: AppManifest,
+) -> tuple[ProjectDiagnostic, ...]:
+    """Compare declared capabilities with the constructed, read-only graph.
+
+    This is structural evidence, not authorization or live verification. Freeform
+    projects have no scaffold contract to compare. Only a normalized plan can
+    supply expected capability evidence.
+    """
+
+    try:
+        document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return ()
+    contract = _scaffold_contract(document)
+    if contract is None or contract.get("convention") != 1:
+        return ()
+    try:
+        plan = _normalized_declared_plan(contract)
+    except ScaffoldPlanError as exc:
+        return (_invalid_scaffold_contract(exc),)
+    selected = frozenset(plan.capabilities)
+    diagnostics: list[ProjectDiagnostic] = []
+
+    def compare(capability: str, surface: str, observed: bool) -> None:
+        expected = capability in selected
+        if observed == expected:
+            return
+        diagnostics.append(
+            _diagnostic(
+                code="SCAFFOLD_CAPABILITY_DRIFT",
+                path=surface,
+                message=f"Declared {capability} capability disagrees with the constructed application.",
+                hint="Update the owning constructors and the normalized scaffold plan together.",
+                parameters={"capability": capability, "expected": expected, "observed": observed},
+                severity=DiagnosticSeverity.ERROR,
+            )
+        )
+
+    compare("tasks", "stores.task", manifest.stores.task is not None)
+    compare("knowledge", "stores.knowledge", manifest.stores.knowledge is not None)
+    compare(
+        "artifacts",
+        "environments.artifact_store",
+        any(env.artifact_store is not None for env in manifest.environments),
+    )
+    if "knowledge" not in selected and any(
+        env.knowledge_store is not None for env in manifest.environments
+    ):
+        compare("knowledge", "environments.knowledge_store", True)
+    compare(
+        "memory",
+        "agents.context_policy",
+        any(agent.context_policy == "AutomaticRecallContextPolicy" for agent in manifest.agents),
+    )
+    compare("observability", "runtime.event_sinks", bool(manifest.runtime.event_sinks))
+    # Approval coverage can belong to an independently generated external-tool
+    # slice. It does not prove that the starter's approvals capability was
+    # restored; preserve that supported extension boundary.
+    if plan.preset == "agent" and "knowledge" in selected:
+        expected_decision = "require_approval" if "approvals" in selected else "deny"
+        starter_name = _starter_agent_name(root)
+        starter = next((agent for agent in manifest.agents if agent.name == starter_name), None)
+        proposal = (
+            next((tool for tool in starter.tools if tool.name == "remember_knowledge"), None)
+            if starter is not None
+            else None
+        )
+        observed_decision = proposal.parameter_policy_decision if proposal is not None else None
+        expected_coverage = "approval_required" if "approvals" in selected else "denied"
+        if (
+            observed_decision != expected_decision
+            or proposal is None
+            or proposal.policy_coverage != expected_coverage
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    code="SCAFFOLD_CAPABILITY_DRIFT",
+                    path="agents.starter.tools.remember_knowledge.parameter_policy_decision",
+                    message="Declared approvals capability disagrees with the starter proposal policy.",
+                    hint="Update the starter policy and normalized scaffold plan together.",
+                    parameters={
+                        "capability": "approvals",
+                        "expected": expected_decision,
+                        "observed": observed_decision,
+                        "coverage": proposal.policy_coverage if proposal is not None else "unknown",
+                    },
+                    severity=DiagnosticSeverity.ERROR,
+                )
+            )
+    families = {
+        "knowledge": {"list_knowledge", "search_knowledge", "read_knowledge", "remember_knowledge"},
+        "artifacts": {"list_artifacts"},
+        "delegation": {"subagent", "subagent_result"},
+        "human-input": {"ask_user"},
+    }
+    inventories = [{tool.name for tool in agent.tools} for agent in manifest.agents]
+    for capability, names in families.items():
+        # A selected family must be usable by one agent; unrelated sibling
+        # registrations cannot collectively satisfy its construction contract.
+        observed = (
+            any(names <= inventory for inventory in inventories)
+            if capability in selected
+            else any(names & inventory for inventory in inventories)
+        )
+        compare(capability, "agents.tools." + capability, observed)
+    return tuple(diagnostics)
+
+
+def _starter_agent_name(root: Path) -> str | None:
+    """Read the maintained starter declaration without importing or executing it."""
+    try:
+        tree = ast.parse((root / "agents/agent.py").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError):
+        return None
+    declarations = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "AGENT" for target in targets):
+            declarations.append(node.value)
+    if len(declarations) != 1 or not isinstance(declarations[0], ast.Call):
+        return None
+    for keyword in declarations[0].keywords:
+        if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+            value = keyword.value.value
+            return value if type(value) is str else None
+    return None
 
 
 def _source_diagnostics(
@@ -171,16 +307,7 @@ def _source_diagnostics(
     try:
         plan = _normalized_declared_plan(contract)
     except ScaffoldPlanError as exc:
-        diagnostics.append(
-            _diagnostic(
-                code="SCAFFOLD_CONTRACT_INVALID",
-                path="pyproject.toml:[tool.cayu.scaffold]",
-                message=f"The declared scaffold plan is invalid ({exc.code}).",
-                hint="Restore the normalized plan emitted by `cayu new --dry-run --json`.",
-                parameters={"reason": exc.code},
-                severity=DiagnosticSeverity.ERROR,
-            )
-        )
+        diagnostics.append(_invalid_scaffold_contract(exc))
         return tuple(diagnostics), None
 
     required = tuple(
@@ -212,6 +339,17 @@ def _source_diagnostics(
     diagnostics.extend(_check_composition_root(root))
     diagnostics.extend(_check_import_inertness(root))
     return tuple(diagnostics), True
+
+
+def _invalid_scaffold_contract(exc: ScaffoldPlanError) -> ProjectDiagnostic:
+    return _diagnostic(
+        code="SCAFFOLD_CONTRACT_INVALID",
+        path="pyproject.toml:[tool.cayu.scaffold]",
+        message=f"The declared scaffold plan is invalid ({exc.code}).",
+        hint="Restore the normalized plan emitted by `cayu new --dry-run --json`.",
+        parameters={"reason": exc.code},
+        severity=DiagnosticSeverity.ERROR,
+    )
 
 
 def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan:
