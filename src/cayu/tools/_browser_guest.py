@@ -2289,9 +2289,12 @@ async def _cleanup_temporary_profile_owner(
     timed_out = False
     returncode: int | None = None
     try:
+        # Reserve part of the same deadline for SIGKILL delivery and reaping.
+        # Spending it all on graceful exit leaves only an immediate poll after
+        # kill(), which can report failure while the child is still exiting.
         returncode = await _wait_temporary_profile_owner(
             owner.process,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=timeout_seconds * 0.75,
         )
         timed_out = returncode is None
         if timed_out:
