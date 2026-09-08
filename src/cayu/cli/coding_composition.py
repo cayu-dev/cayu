@@ -3210,14 +3210,14 @@ def _python_toolchain_profile(
             DockerCodingCommandAuthority(
                 selector="test",
                 revision="1",
-                description="Run the credential-free generated Python tests.",
+                description="Run the application-owned project check target in Docker.",
                 exposure="named_check",
                 executable=f"{_CHECK_EXECUTABLE_ROOT}/pytest",
                 fixed_arguments=(
                     "-q",
                     "-p",
                     "no:cacheprovider",
-                    "tests",
+                    "tests/test_project.py",
                 ),
                 max_arguments=0,
                 timeout_seconds=300,
@@ -3790,6 +3790,11 @@ uv run --no-sync cayu check --json
 uv run --no-sync pytest -q tests/test_coding_composition.py
 ```
 
+The Docker `test` check runs `tests/test_project.py`, the application-owned
+check target. Add workload tests there or extend the declared test paths. Run
+the host-side composition tests separately; they construct the Docker controller
+and use the image receipt that is deliberately excluded from the guest workspace.
+
 The trusted build may use network access to resolve only the reviewed pinned
 inputs and frozen lock. It captures Docker's build-produced immutable image ID,
 probes that exact ID, then records it with the platform, profile revision, and
@@ -4179,7 +4184,7 @@ def test_generated_docker_composition_is_finite_trusted_and_factory_backed(
     assert all(check.command.kind == "process" for check in run_check.checks)
     assert all(check.command.shell is None for check in run_check.checks)
     test_check = next(check for check in run_check.checks if check.name == "test")
-    assert tuple(test_check.command.argv or ())[-1] == "tests"
+    assert tuple(test_check.command.argv or ())[-1] == "tests/test_project.py"
     run_command = primary.tools["run_command"].tool
     assert isinstance(run_command, RunCommandTool)
     assert tuple(selector.selector for selector in run_command.selectors) == (

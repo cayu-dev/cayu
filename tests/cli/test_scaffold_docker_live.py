@@ -10,10 +10,13 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
+from email.parser import BytesParser
 from pathlib import Path
 from typing import NoReturn
 
 import pytest
+from packaging.requirements import Requirement
 
 from cayu import (
     DockerCodingEnvironmentFactory,
@@ -101,10 +104,45 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
     wheel_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(wheel, wheel_target)
     wheel_digest = "sha256:" + hashlib.sha256(wheel_target.read_bytes()).hexdigest()
+    # The candidate wheel can add base dependencies before that same version
+    # reaches PyPI. Lock its dependency requirements alongside the generated
+    # project's requirements before the image overlays the wheel with --no-deps.
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_paths = [
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        ]
+        assert len(metadata_paths) == 1
+        metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
+    requirements = [
+        value
+        for value in metadata.get_all("Requires-Dist", [])
+        if "extra" not in str(Requirement(value).marker or "")
+    ]
+    project_file = project / "pyproject.toml"
+    project_text = project_file.read_text(encoding="utf-8")
+    project_text = project_text.replace(
+        "dependencies = [",
+        "dependencies = [\n" + "".join(f"  {json.dumps(value)},\n" for value in requirements),
+        1,
+    )
+    project_file.write_text(project_text, encoding="utf-8")
     image = (
         "cayu-generated-coding-test:"
         + hashlib.sha256(str(project).encode("utf-8")).hexdigest()[:16]
     )
+
+    def remove_image() -> None:
+        subprocess.run(
+            [docker, "image", "rm", image],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+        )
+
+    request.addfinalizer(remove_image)
+
     (project / "docker-coding-build.json").write_text(
         json.dumps(
             {
@@ -154,18 +192,6 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
         not item["path"].startswith(".cayu/") for item in image_configuration["dependency_inputs"]
     )
     assert image_configuration["trusted_build_context_sha256"].startswith("sha256:")
-
-    def remove_image() -> None:
-        subprocess.run(
-            [docker, "image", "rm", image],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=30,
-        )
-
-    request.addfinalizer(remove_image)
 
     spec = importlib.util.spec_from_file_location("live_generated_app", project / "app.py")
     assert spec is not None and spec.loader is not None
@@ -235,6 +261,7 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
             environment_name=environment_request.environment_name,
             idempotency_key="generated-live-docker-tools",
             workspace=bound.workspace,
+            workspace_id=bound.workspace.id,
             runner=environment.runner,
         )
         try:
@@ -287,6 +314,7 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
             assert passed.structured["status"] == "passed", {
                 "stdout": passed.structured["stdout"],
                 "stderr": passed.structured["stderr"],
+                "result": passed.structured,
             }
             written = await WriteFileTool().run(
                 context,

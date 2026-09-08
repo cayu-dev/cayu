@@ -138,6 +138,7 @@ version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "jsonschema" },
     { name = "pydantic" },
@@ -242,6 +243,7 @@ requires-dist = [
     { name = "boto3", extras = ["crt"], marker = "extra == 'all'", specifier = ">=1.43.44,<2" },
     { name = "boto3", extras = ["crt"], marker = "extra == 'aws'", specifier = ">=1.43.44,<2" },
     { name = "certifi", specifier = ">=2024.0" },
+    { name = "cryptography", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'all'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'dev'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'egress'", specifier = ">=42" },

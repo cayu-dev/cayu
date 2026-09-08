@@ -699,7 +699,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         "-q",
         "-p",
         "no:cacheprovider",
-        "tests",
+        "tests/test_project.py",
     )
 
     generated_environment = dict(os.environ)
