@@ -4678,11 +4678,12 @@ class ToolRoundExecutor:
         workspace_capture_failure_detail: str | None = None
         workspace_capture_payload: dict[str, str] = {}
 
-        def consume_post_tool_cancellation(
+        async def consume_post_tool_cancellation(
             cancellation: asyncio.CancelledError,
         ) -> asyncio.CancelledError | None:
             nonlocal post_tool_cancellation_requests_consumed
             current_task = asyncio.current_task()
+            await _receive_restored_post_tool_cancellation()
             requests_before = 0 if current_task is None else current_task.cancelling()
             observed = consume_pending_task_cancellation(cancellation)
             if current_task is not None:
@@ -4799,7 +4800,7 @@ class ToolRoundExecutor:
                     except (KeyboardInterrupt, SystemExit, GeneratorExit):
                         raise
                     except asyncio.CancelledError as exc:
-                        observed_cancellation = consume_post_tool_cancellation(exc)
+                        observed_cancellation = await consume_post_tool_cancellation(exc)
                         if observed_cancellation is None:
                             raise
                         publication_failure = exception_cause(observed_cancellation)
@@ -5195,7 +5196,7 @@ class ToolRoundExecutor:
                     "workspace_mutation_capture_detail_code": workspace_capture_failure_detail,
                 }
             except asyncio.CancelledError as exc:
-                post_tool_cancellation = consume_post_tool_cancellation(exc)
+                post_tool_cancellation = await consume_post_tool_cancellation(exc)
                 if post_tool_cancellation is not None:
                     invocation_secrets.initialize_cancellation_evidence(post_tool_cancellation)
                     invocation_secrets.set_cancellation_redactor(
@@ -7803,6 +7804,7 @@ class ToolRoundRun:
         except asyncio.CancelledError as exc:
             if publication_coordinator is not None:
                 publication_coordinator.seal_capacity()
+            await _receive_restored_post_tool_cancellation()
             current_task = asyncio.current_task()
             minimum_cancellation_requests = 0 if current_task is None else current_task.cancelling()
             try:
@@ -9141,6 +9143,20 @@ def _raise_preserved_post_tool_cancellation(
         restore_cancellation_requests=restore_cancellation_requests,
         cause=cause,
     )
+
+
+async def _receive_restored_post_tool_cancellation() -> None:
+    """Observe restored control before publishing the durable tool outcome."""
+
+    current_task = asyncio.current_task()
+    if current_task is None or not current_task.cancelling():
+        return
+    # Observation and tool helpers restore requests before raising their owned
+    # cancellation. On Python 3.11/3.12, uncancel() cannot rescind the queued
+    # injection. Receive it before another publication await, while retaining
+    # the original exception, its evidence, and every task cancellation count.
+    with suppress(asyncio.CancelledError):
+        await asyncio.sleep(0)
 
 
 def _raise_restored_post_tool_cancellation(
