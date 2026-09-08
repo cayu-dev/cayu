@@ -1007,6 +1007,81 @@ def test_docker_coding_binding_closes_runner_before_releasing_immutable_input(
     assert store.inspect()[0].reference_count == 0
 
 
+def test_removed_target_fails_publication_but_allows_disposal_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_root, target_root = tmp_path / "source", tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "answer.txt").write_text("original")
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def remove(_docker_path, arguments, **_kwargs):
+        assert arguments == ["rm", "-f", _CONTAINER_ID]
+        return ExecResult(exit_code=0)
+
+    monkeypatch.setattr("cayu.runners.docker._run_docker", remove)
+
+    async def scenario() -> None:
+        bound = await binding.bind(source, runner, session_id="removed-target")
+        (target_root / "answer.txt").write_text("unpublished")
+        await runner.kill()
+        assert runner.container_removed
+        with pytest.raises(RuntimeError, match="removed before source publication"):
+            await binding.finalize(bound, outcome="completed")
+        assert (source_root / "answer.txt").read_text() == "original"
+        assert binding.abandon(bound) is False
+        assert await binding.finalize(bound, outcome="completed") is None
+        assert (source_root / "answer.txt").read_text() == "original"
+        assert binding.abandon(bound) is True
+        assert not binding._coding_finalize_states
+        assert not binding._coding_authorities
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("exit_code,timed_out", [(1, False), (0, True), (0, False)])
+def test_container_removed_requires_positive_removal(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, timed_out: bool
+) -> None:
+    runner = DockerRunner("owned", _container_id=_CONTAINER_ID)
+
+    async def remove(_docker_path, arguments, **_kwargs):
+        assert arguments == ["rm", "-f", _CONTAINER_ID]
+        return ExecResult(exit_code=exit_code, timed_out=timed_out)
+
+    monkeypatch.setattr("cayu.runners.docker._run_docker", remove)
+
+    async def scenario() -> None:
+        assert not runner.container_removed
+        if exit_code or timed_out:
+            with pytest.raises(RuntimeError, match="docker rm failed"):
+                await runner.kill()
+            assert not runner.container_removed
+        else:
+            await runner.kill()
+            assert runner.container_removed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["stop", "none"])
+def test_closed_runner_does_not_imply_container_removal(
+    monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    runner = DockerRunner("owned", _container_id=_CONTAINER_ID, close_action=action)
+
+    async def stop(_docker_path, arguments, **_kwargs):
+        assert arguments == ["stop", _CONTAINER_ID]
+        return ExecResult(exit_code=0)
+
+    monkeypatch.setattr("cayu.runners.docker._run_docker", stop)
+    asyncio.run(runner.close())
+    assert runner.is_closed
+    assert not runner.container_removed
+
+
 def test_docker_coding_binding_retries_release_after_runner_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

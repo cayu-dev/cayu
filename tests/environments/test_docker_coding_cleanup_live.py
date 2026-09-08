@@ -47,6 +47,7 @@ pytestmark = pytest.mark.process
         "ignored_failure",
         "copyback_failure",
         "missing_disposal_hook",
+        "timeout",
     ],
 )
 def test_terminal_docker_cleanup_drain_matches_exact_physical_census(
@@ -117,7 +118,7 @@ def test_terminal_docker_cleanup_drain_matches_exact_physical_census(
             binding = result.environment.binding
             assert isinstance(binding, DockerCodingWorkspaceBinding)
             binding.sync_back = (
-                "always" if mode in ("ignored_failure", "copyback_failure") else "never"
+                "always" if mode in ("ignored_failure", "copyback_failure", "timeout") else "never"
             )
             results.append(result)
             inspection = json.loads(
@@ -162,6 +163,23 @@ def test_terminal_docker_cleanup_drain_matches_exact_physical_census(
             )
 
         async def stream(self, request):
+            if mode == "timeout":
+                runner = results[-1].environment.runner
+                assert isinstance(runner, DockerRunner)
+                result = await runner.exec(
+                    ExecCommand.process(
+                        "python3",
+                        "-c",
+                        "from pathlib import Path; import subprocess,time; "
+                        "Path('code.py').write_text('unpublished'); "
+                        "subprocess.Popen(['python3','-c','import time; time.sleep(60)']); "
+                        "print('started',flush=True); time.sleep(60)",
+                    ),
+                    timeout_s=3,
+                )
+                assert result.timed_out
+                assert "started" in result.stdout
+                assert runner.is_closed and runner.container_removed
             if mode in ("scratch", "ignored_failure"):
                 runner = results[-1].environment.runner
                 assert runner is not None
@@ -232,7 +250,16 @@ def test_terminal_docker_cleanup_drain_matches_exact_physical_census(
             assert len(results) == 1
             container_id = results[0].metadata["container_id"]
             event_types = {str(event.type) for event in events}
-            if mode in (
+            if mode == "timeout":
+                assert "session.failed" in event_types
+                assert "session.completed" not in event_types
+                assert "environment.binding.finalize_failed" in event_types
+                assert not exists(container_id)
+                failure = next(event for event in events if str(event.type) == "session.failed")
+                assert failure.payload.get("workspace_output_committed") is False, dict(
+                    failure.payload
+                )
+            elif mode in (
                 "close_failure",
                 "close_cancel",
                 "ignored_failure",

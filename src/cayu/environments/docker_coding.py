@@ -663,6 +663,16 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         if cleanup_state is None:
             authority = self._bind_authority(bound)
             self._defer_finalize_release(bound)
+            if runner.is_closed and runner.container_removed:
+                # Timeout/cancellation can destroy the target before copy-back.
+                # Fail this publication attempt, but retain a disposal-only retry
+                # so the runtime can retire cleanup after persisting the failure.
+                # A retry must never fabricate a source publication snapshot.
+                with self._coding_authority_lock:
+                    self._coding_finalize_states[state_key] = _DockerCodingFinalizeState(
+                        snapshot=None,
+                    )
+                raise RuntimeError("Docker coding workspace was removed before source publication.")
             final_git_evidence = (
                 None
                 if authority.source is None

@@ -143,6 +143,14 @@ the runner, ordinary workspace mutations copy back, and exact profile/image/depe
 identities remain in receipts. The test removes its ephemeral containers and image
 tags on settlement.
 
+If timeout or cancellation removes the owned container before workspace
+publication, finalization fails explicitly and the session cannot claim committed
+output. After that failure is durable, a disposal-only retry can release immutable
+input references and the run fence without reading the destroyed workspace or
+inventing a publication snapshot. Call `drain_environment_cleanups()` before closing
+the session store to settle retained cleanup. A stopped, detached, or merely fenced
+runner is not evidence of container removal; its recoverable target remains owned.
+
 
 ## Writable home and tool caches
 

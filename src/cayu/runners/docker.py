@@ -1019,6 +1019,15 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
 
         return self.container_id or self.name
 
+    @property
+    def container_removed(self) -> bool:
+        """Whether this owner has positively completed removal of its container.
+
+        Closed execution alone is insufficient: stopping or detaching a runner
+        does not prove that its workspace has been destroyed.
+        """
+        return self._container_removed
+
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return portable configuration when no deployment-local grants are present."""
 
@@ -1088,6 +1097,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         _runtime_evidence: _DockerRuntimeEvidence | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
+        self._container_removed = False
         self.default_cwd = _validate_guest_cwd(default_cwd)
         self.close_action = _validate_close_action(close_action)
         self.docker_path = _require_docker(docker_path)
@@ -2404,6 +2414,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             raise RuntimeError(
                 f"docker rm failed for the owned container (exit {result.exit_code}): {detail}"
             )
+        self._container_removed = True
 
     async def _stop_container(self) -> None:
         result = await _run_docker(
