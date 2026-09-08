@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import sha256
 from math import isfinite
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid5
 
 from cayu._coding_product_authority import (
@@ -32,6 +32,7 @@ from cayu._task_wait import (
     CapturedAwaitableOutcome,
     await_shielded_task_outcome,
     capture_awaitable_outcome,
+    restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
@@ -45,6 +46,7 @@ from cayu._workspace_mutation import (
     WorkspaceMutationSettlementError,
     workspace_mutation_task_settlement_probe,
 )
+from cayu.capabilities import CapabilityState
 from cayu.core.events import (
     Event,
     EventType,
@@ -64,8 +66,10 @@ from cayu.environments import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     ExecutionAdmissionCandidate,
+    ExecutionAdmissionDecision,
     ExecutionAdmissionError,
-    ExecutionRequirements,
+    ExecutionCapabilityEvidence,
+    ExecutionEnvironmentAuthority,
     WorkspaceBinding,
     WorkspaceInstructions,
     WorkspaceSnapshot,
@@ -75,6 +79,11 @@ from cayu.environments import (
     load_workspace_instructions,
 )
 from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
+from cayu.environments.admission import (
+    ExecutionExecutableEvidenceState,
+    _copy_execution_admission_candidate,
+    _structured_execution_refusal,
+)
 from cayu.environments.bindings import (
     SyncBinding,
     _EnvironmentLifecycleBindAttempt,
@@ -96,6 +105,9 @@ from cayu.environments.lifecycle import (
     EnvironmentLifecyclePhase,
     EnvironmentLifecycleProgress,
     EnvironmentLifecycleProgressStatus,
+    EnvironmentLifecycleTransition,
+    EnvironmentLifecycleTransitionOutcome,
+    EnvironmentLifecycleTransitionPhase,
     RuntimeEnvironmentLifecycleProgressReporter,
     _reset_environment_lifecycle_progress_reporter,
     _set_environment_lifecycle_progress_reporter,
@@ -145,6 +157,11 @@ from cayu.runtime._environment_allocation import (
 )
 from cayu.runtime._environment_allocation import (
     require_bounded_reconnect_metadata as _require_bounded_reconnect_metadata,
+)
+from cayu.runtime._environment_exposure import (
+    await_environment_exposure_settlement,
+    expose_registered_environment,
+    refresh_and_require_environment_exposed,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import (
@@ -238,6 +255,46 @@ _ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_BATCH_SIZE = 5000
 _ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_LIMIT = (
     len(EnvironmentLifecycleOperation) * MAX_ENVIRONMENT_PROGRESS_EVENTS
 )
+
+
+def _transition_evidence_fields(
+    evidence: ExecutionCapabilityEvidence | None,
+) -> tuple[
+    str | None,
+    tuple[CapabilityState, ...],
+    tuple[ExecutionExecutableEvidenceState, ...],
+    datetime | None,
+]:
+    if evidence is None:
+        return None, (), (), None
+    states = tuple(sorted({claim.state for claim in evidence.claims}))
+    executable_states = tuple(
+        sorted(
+            {
+                executable.state
+                for executable in (
+                    ()
+                    if evidence.tool_requirements is None
+                    else evidence.tool_requirements.executables
+                )
+            }
+        )
+    )
+    expirations = [
+        value
+        for value in (
+            *(claim.valid_until for claim in evidence.claims),
+            *(
+                ()
+                if evidence.tool_requirements is None
+                else (
+                    executable.valid_until for executable in evidence.tool_requirements.executables
+                )
+            ),
+        )
+        if value is not None
+    ]
+    return evidence.schema_version, states, executable_states, min(expirations, default=None)
 
 
 async def _await_with_environment_lifecycle_reporter(
@@ -473,13 +530,17 @@ def _retain_cleanup_invocation_context(
     if type(invocation_context) is not InvocationContext:
         raise TypeError("invocation_context must be an InvocationContext.")
     current = owner.invocation_context
+    predecessor = owner.cleanup_predecessor_context
     if (
-        invocation_context is owner.cleanup_predecessor_context
+        predecessor is not None
+        and invocation_context.registered_environment is predecessor.registered_environment
         and invocation_context.registered_environment is not owner.registered_environment
     ):
         # Setup may advance to a bound or released environment before raising.
-        # Its unwinding caller still holds this exact frozen predecessor. Carry
-        # only that known context forward, then revalidate all invocation authority.
+        # Its unwinding caller and the cleanup owner can hold independently
+        # derived authenticated contexts for the same exact predecessor
+        # environment. Carry only that identity-matched environment forward,
+        # then revalidate all remaining invocation authority below.
         invocation_context = invocation_context.with_registered_environment(
             owner.registered_environment,
             validated_profile=invocation_context.profile,
@@ -545,9 +606,29 @@ def _advance_cleanup_environment(
     if context is not None:
         if owner.cleanup_predecessor_context is None:
             owner.cleanup_predecessor_context = context
-        context = context.with_registered_environment(
+        context_source = context
+        if (
+            context.registered_environment is not None
+            and context.registered_environment.environment_exposure is not None
+            and registered_environment.environment_exposure is None
+        ):
+            # Ordinary invocation transfers cannot revoke exposure authority.
+            # Cleanup may do so only by returning to the exact authenticated
+            # predecessor retained before exposure was minted, then advancing
+            # that context to the released owner representation.
+            predecessor = owner.cleanup_predecessor_context
+            if (
+                predecessor is None
+                or predecessor.registered_environment is None
+                or predecessor.registered_environment.environment_exposure is not None
+            ):
+                raise RuntimeError(
+                    "Environment cleanup cannot revoke exposure without its predecessor."
+                )
+            context_source = predecessor
+        context = context_source.with_registered_environment(
             registered_environment,
-            validated_profile=context.profile,
+            validated_profile=context_source.profile,
         )
     owner.registered_environment = registered_environment
     owner.invocation_context = context
@@ -596,6 +677,435 @@ class EnvironmentLifecycle:
         self._final_workspace_observation_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS
         )
+
+    async def _emit_transition(
+        self,
+        *,
+        session: Session,
+        agent_name: str | None,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity | None,
+        phase: EnvironmentLifecycleTransitionPhase,
+        outcome: EnvironmentLifecycleTransitionOutcome,
+        candidate: str,
+        events: list[Event],
+        ownership: Literal["runtime", "factory", "binding", "deferred"] = "runtime",
+        evidence: ExecutionCapabilityEvidence | None = None,
+        decision: ExecutionAdmissionDecision | None = None,
+        release_action: EnvironmentFactoryReleaseAction | None = None,
+    ) -> Event:
+        if decision is not None:
+            if decision.candidate != candidate:
+                raise ValueError("Lifecycle transition changed its selected candidate.")
+            evidence = decision.evidence
+        (
+            evidence_schema,
+            evidence_states,
+            executable_evidence_states,
+            evidence_valid_until,
+        ) = _transition_evidence_fields(evidence)
+        refusals = () if decision is None else decision.refusals
+        transition = EnvironmentLifecycleTransition(
+            phase=phase,
+            outcome=outcome,
+            candidate=candidate,
+            binding_generation_id=registered_environment.binding_generation_id,
+            evidence_schema=evidence_schema,
+            evidence_states=evidence_states,
+            executable_evidence_states=executable_evidence_states,
+            evidence_valid_until=evidence_valid_until,
+            refusal_codes=tuple(sorted({refusal.code for refusal in refusals})),
+            refusal_capabilities=tuple(
+                sorted(
+                    {refusal.capability for refusal in refusals if refusal.capability is not None}
+                )
+            ),
+            refusal_executable_sha256=tuple(
+                sorted(
+                    {
+                        "sha256:" + sha256(refusal.executable.encode("utf-8")).hexdigest()
+                        for refusal in refusals
+                        if refusal.executable is not None
+                    }
+                )
+            ),
+            ownership=ownership,
+            release_action=None if release_action is None else release_action.value,
+        )
+        transition_event = _event_with_binding_generation_authority(
+            event_with_execution_profile_authority(
+                Event(
+                    type=EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
+                    session_id=session.id,
+                    agent_name=agent_name,
+                    environment_name=registered_environment.spec.name,
+                    payload=transition.to_payload(),
+                ),
+                execution_profile,
+            )
+        )
+        persisted = await self._event_writer.emit(transition_event)
+        events.append(persisted)
+        return persisted
+
+    async def _emit_release_transition(
+        self,
+        *,
+        session_id: str,
+        agent_name: str | None,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity | None,
+        events: list[Event],
+        action: EnvironmentFactoryReleaseAction,
+        outcome: EnvironmentLifecycleTransitionOutcome,
+        retained: bool,
+        ownership: Literal["runtime", "factory", "binding", "deferred"] = "factory",
+    ) -> Event:
+        candidate = registered_environment.execution_candidate or registered_environment.spec.name
+        transition = EnvironmentLifecycleTransition(
+            phase=EnvironmentLifecycleTransitionPhase.RELEASE,
+            outcome=outcome,
+            candidate=candidate,
+            binding_generation_id=registered_environment.binding_generation_id,
+            ownership="deferred" if retained else ownership,
+            release_action=action.value,
+        )
+        event = _event_with_binding_generation_authority(
+            event_with_execution_profile_authority(
+                Event(
+                    type=EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    environment_name=registered_environment.spec.name,
+                    payload=transition.to_payload(),
+                ),
+                execution_profile,
+            )
+        )
+        persisted = await self._event_writer.emit(event)
+        events.append(persisted)
+        return persisted
+
+    async def _collect_final_admission_decision(
+        self,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+    ) -> tuple[ExecutionAdmissionDecision, tuple[asyncio.Task[None], ...]]:
+        selected_candidate = registered_environment.execution_candidate
+        if selected_candidate is None:
+            raise RuntimeError("Environment lifecycle lost its selected execution candidate.")
+        runner = registered_environment.environment.runner
+        final_candidate: ExecutionAdmissionCandidate | None = None
+        final_candidate_malformed = False
+        collection_settlement_tasks: tuple[asyncio.Task[None], ...] = ()
+        if runner is not None and registered_environment.execution_candidate_declared:
+            try:
+                collected = await environment_operation_boundary.await_environment_operation(
+                    runner.collect_execution_admission_candidate,
+                    operation_name="Final environment admission evidence collection",
+                    redactor=self._secret_redactor,
+                )
+            except Exception as error:
+                # A collector may fail closed while an opaque live probe still
+                # owns an authenticated settlement task. Preserve that owner on
+                # the eventual structured refusal so teardown cannot race the
+                # probe or release lifecycle capacity before it quiesces.
+                collection_settlement_tasks = environment_factory_cleanup_settlement_tasks(error)
+                collected = None
+            if collected is not None:
+                final_candidate = _copy_execution_admission_candidate(collected)
+                final_candidate_malformed = final_candidate is None
+
+        effective_requirements = registered_agent.execution_requirements
+        if final_candidate is None:
+            if registered_environment.execution_candidate_declared:
+                return (
+                    _structured_execution_refusal(
+                        candidate=selected_candidate,
+                        requirements=effective_requirements,
+                        evidence=None,
+                        code=(
+                            "malformed_evidence"
+                            if final_candidate_malformed
+                            else "missing_final_evidence"
+                        ),
+                    ),
+                    collection_settlement_tasks,
+                )
+            return (
+                evaluate_execution_admission(
+                    candidate=selected_candidate,
+                    requirements=effective_requirements,
+                    evidence=None,
+                    stage="pre_exposure",
+                ),
+                collection_settlement_tasks,
+            )
+        if runner is None:
+            raise AssertionError("Final environment evidence exists without a runner.")
+        selected_authority = registered_environment.execution_environment_authority
+        if selected_authority is not None:
+            try:
+                final_authority = runner.execution_environment_authority()
+            except BaseException as exc:
+                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
+                return (
+                    _structured_execution_refusal(
+                        candidate=selected_candidate,
+                        requirements=effective_requirements,
+                        evidence=final_candidate.evidence,
+                        code="environment_authority_mismatch",
+                    ),
+                    collection_settlement_tasks,
+                )
+            if (
+                type(final_authority) is not ExecutionEnvironmentAuthority
+                or final_authority is not selected_authority
+            ):
+                return (
+                    _structured_execution_refusal(
+                        candidate=selected_candidate,
+                        requirements=effective_requirements,
+                        evidence=final_candidate.evidence,
+                        code="environment_authority_mismatch",
+                    ),
+                    collection_settlement_tasks,
+                )
+        return (
+            evaluate_execution_admission(
+                candidate=selected_candidate,
+                requirements=effective_requirements,
+                evidence=final_candidate.evidence,
+                stage="pre_exposure",
+            ),
+            collection_settlement_tasks,
+        )
+
+    async def _select_and_preflight_environment(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity | None,
+        events: list[Event],
+        factory_candidate: ExecutionAdmissionCandidate | None,
+    ) -> runtime_records.RegisteredEnvironment:
+        candidate_supplied = factory_candidate is not None
+        candidate = (
+            None
+            if factory_candidate is None
+            else _copy_execution_admission_candidate(factory_candidate)
+        )
+        candidate_declared = candidate is not None
+        candidate_malformed = candidate_supplied and candidate is None
+        if candidate is None and registered_environment.factory is None:
+            runner = registered_environment.environment.runner
+            supplied = None if runner is None else runner.execution_admission_candidate()
+            candidate_supplied = supplied is not None
+            candidate = None if supplied is None else _copy_execution_admission_candidate(supplied)
+            candidate_declared = candidate is not None
+            candidate_malformed = candidate_supplied and candidate is None
+        candidate_name = (
+            registered_environment.spec.name if candidate is None else candidate.candidate
+        )
+        candidate_evidence = None if candidate is None else candidate.evidence
+        selected_authority = None
+        authority_malformed = False
+        factory = registered_environment.factory
+        if factory is not None:
+            try:
+                selected_authority = factory.execution_environment_authority()
+            except Exception:
+                authority_malformed = True
+            else:
+                authority_malformed = (
+                    selected_authority is not None
+                    and type(selected_authority) is not ExecutionEnvironmentAuthority
+                )
+            if authority_malformed:
+                selected_authority = None
+        selected = replace(
+            registered_environment,
+            execution_candidate=candidate_name,
+            execution_candidate_declared=candidate_declared,
+            execution_environment_authority=selected_authority,
+            environment_exposure=None,
+        )
+        await self._emit_transition(
+            session=session,
+            agent_name=registered_agent.spec.name,
+            registered_environment=selected,
+            execution_profile=execution_profile,
+            phase=EnvironmentLifecycleTransitionPhase.SELECTED,
+            outcome=EnvironmentLifecycleTransitionOutcome.OBSERVED,
+            candidate=candidate_name,
+            events=events,
+            evidence=candidate_evidence,
+        )
+        effective_requirements = registered_agent.execution_requirements
+        if candidate_malformed:
+            decision = _structured_execution_refusal(
+                candidate=candidate_name,
+                requirements=effective_requirements,
+                evidence=None,
+                code="malformed_evidence",
+                stage="pre_create",
+            )
+        elif authority_malformed:
+            decision = _structured_execution_refusal(
+                candidate=candidate_name,
+                requirements=effective_requirements,
+                evidence=candidate_evidence,
+                code="environment_authority_mismatch",
+                stage="pre_create",
+            )
+        else:
+            decision = evaluate_execution_admission(
+                candidate=candidate_name,
+                requirements=effective_requirements,
+                evidence=candidate_evidence if candidate_declared else None,
+                stage="pre_create",
+            )
+        await self._emit_transition(
+            session=session,
+            agent_name=registered_agent.spec.name,
+            registered_environment=selected,
+            execution_profile=execution_profile,
+            phase=EnvironmentLifecycleTransitionPhase.PREFLIGHT,
+            outcome=(
+                EnvironmentLifecycleTransitionOutcome.ACCEPTED
+                if decision.status == "admitted"
+                else EnvironmentLifecycleTransitionOutcome.REFUSED
+            ),
+            candidate=candidate_name,
+            events=events,
+            decision=decision,
+        )
+        decision.require_admitted()
+        return selected
+
+    async def _admit_and_expose_environment(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
+        events: list[Event],
+    ) -> runtime_records.RegisteredEnvironment:
+        candidate = registered_environment.execution_candidate
+        if candidate is None:
+            raise RuntimeError("Environment lifecycle lost its selected execution candidate.")
+
+        observed, collection_settlement_tasks = await self._collect_final_admission_decision(
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+        )
+        collection_settlement_task = combine_environment_factory_cleanup_settlement_tasks(
+            collection_settlement_tasks,
+            task_name="cayu-final-admission-evidence-settlement",
+            failure_message="Final admission evidence probes failed to settle.",
+        )
+        try:
+            await self._emit_transition(
+                session=session,
+                agent_name=registered_agent.spec.name,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                phase=EnvironmentLifecycleTransitionPhase.FINAL_EVIDENCE,
+                outcome=EnvironmentLifecycleTransitionOutcome.OBSERVED,
+                candidate=candidate,
+                events=events,
+                evidence=observed.evidence,
+            )
+            if observed.status == "refused":
+                await self._emit_transition(
+                    session=session,
+                    agent_name=registered_agent.spec.name,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    phase=EnvironmentLifecycleTransitionPhase.ADMISSION,
+                    outcome=EnvironmentLifecycleTransitionOutcome.REFUSED,
+                    candidate=candidate,
+                    events=events,
+                    decision=observed,
+                )
+        except BaseException as publication_error:
+            if collection_settlement_task is not None:
+                attach_environment_factory_cleanup_settlement_task(
+                    publication_error,
+                    collection_settlement_task,
+                )
+            raise
+        if observed.status == "refused":
+            refusal_error = ExecutionAdmissionError(observed)
+            if collection_settlement_task is not None:
+                attach_environment_factory_cleanup_settlement_task(
+                    refusal_error,
+                    collection_settlement_task,
+                )
+            raise refusal_error
+
+        # Final-evidence publication is asynchronous. Re-evaluate the same
+        # observation after it (without refreshing its TTL), then mint exposure
+        # synchronously so expiring evidence cannot cross an unchecked boundary.
+        decision = evaluate_execution_admission(
+            candidate=observed.candidate,
+            requirements=observed.requirements,
+            evidence=observed.evidence,
+            stage="pre_exposure",
+        )
+        if decision.status == "refused":
+            await self._emit_transition(
+                session=session,
+                agent_name=registered_agent.spec.name,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                phase=EnvironmentLifecycleTransitionPhase.ADMISSION,
+                outcome=EnvironmentLifecycleTransitionOutcome.REFUSED,
+                candidate=candidate,
+                events=events,
+                decision=decision,
+            )
+            decision.require_admitted()
+        exposed = expose_registered_environment(
+            registered_environment,
+            session=session,
+            invocation_context=invocation_context,
+            registered_agent=registered_agent,
+            execution_profile=execution_profile,
+            decision=decision,
+        )
+        setup_owner = self._active_environment_setups.get(session.id)
+        if setup_owner is not None:
+            _advance_cleanup_environment(setup_owner, exposed)
+        await self._emit_transition(
+            session=session,
+            agent_name=registered_agent.spec.name,
+            registered_environment=exposed,
+            execution_profile=execution_profile,
+            phase=EnvironmentLifecycleTransitionPhase.ADMISSION,
+            outcome=EnvironmentLifecycleTransitionOutcome.ADMITTED,
+            candidate=candidate,
+            events=events,
+            decision=decision,
+        )
+        await self._emit_transition(
+            session=session,
+            agent_name=registered_agent.spec.name,
+            registered_environment=exposed,
+            execution_profile=execution_profile,
+            phase=EnvironmentLifecycleTransitionPhase.EXPOSURE,
+            outcome=EnvironmentLifecycleTransitionOutcome.EXPOSED,
+            candidate=candidate,
+            events=events,
+            decision=decision,
+        )
+        return exposed
 
     def _progress_reporter(
         self,
@@ -1628,12 +2138,49 @@ class EnvironmentLifecycle:
             or execution_profile is not invocation_context.profile
         ):
             raise RuntimeError("Environment factory resolution lost frozen invocation authority.")
-        if registered_environment is None or registered_environment.factory is None:
+        if registered_environment is None:
             if started_event is not None:
                 raise AssertionError("Factory start event exists without a registered factory.")
             return EnvironmentFactoryResolutionResult(
-                registered_environment=registered_environment,
+                registered_environment=None,
                 events=[],
+            )
+        if registered_environment.factory is None:
+            if started_event is not None:
+                raise AssertionError("Factory start event exists without a registered factory.")
+            # A factory result is materialized as a concrete (factory-less)
+            # registration before the session enters its ordinary run path.
+            # Keep the candidate selected before allocation instead of
+            # manufacturing a second post-allocation selection/preflight.
+            # A concrete registration keeps the selection made before its
+            # allocation.  An already-exposed registration can reach this
+            # entrance only through the exact live invocation context checked
+            # above (for example, after an approved tool continues into its
+            # next model step), so it must not manufacture a second lifecycle.
+            if registered_environment.execution_candidate is not None:
+                return EnvironmentFactoryResolutionResult(
+                    registered_environment=registered_environment,
+                    events=[],
+                )
+            events: list[Event] = []
+            try:
+                selected = await self._select_and_preflight_environment(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    events=events,
+                    factory_candidate=None,
+                )
+            except Exception as exc:
+                return EnvironmentFactoryResolutionResult(
+                    registered_environment=registered_environment,
+                    events=events,
+                    error=exc,
+                )
+            return EnvironmentFactoryResolutionResult(
+                registered_environment=selected,
+                events=events,
             )
         if started_event is None:
             raise AssertionError("Registered environment factory was not started.")
@@ -1643,6 +2190,7 @@ class EnvironmentLifecycle:
         ):
             raise TypeError("adopted_factory_result must be an EnvironmentFactoryResult.")
 
+        factory_registration = registered_environment
         factory = registered_environment.factory
         environment_name = registered_environment.spec.name
         base_payload = _environment_factory_base_payload(
@@ -1816,24 +2364,14 @@ class EnvironmentLifecycle:
                 execution_requirements=registered_agent.execution_requirements,
             )
             admission_candidate = factory.execution_admission_candidate(request)
-            if admission_candidate is not None and not isinstance(
-                admission_candidate,
-                ExecutionAdmissionCandidate,
-            ):
-                raise TypeError(
-                    "EnvironmentFactory.execution_admission_candidate must return "
-                    "ExecutionAdmissionCandidate or None."
-                )
-            evaluate_execution_admission(
-                candidate=(
-                    environment_name
-                    if admission_candidate is None
-                    else admission_candidate.candidate
-                ),
-                requirements=request.execution_requirements,
-                evidence=None if admission_candidate is None else admission_candidate.evidence,
-                stage="pre_create",
-            ).require_admitted()
+            registered_environment = await self._select_and_preflight_environment(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                events=events,
+                factory_candidate=admission_candidate,
+            )
             await _report_environment_lifecycle(
                 progress_reporter,
                 EnvironmentLifecyclePhase.OWNERSHIP_ADMISSION,
@@ -1913,15 +2451,6 @@ class EnvironmentLifecycle:
                     "Environment factory returned a different environment name: "
                     f"{environment.spec.name!r} != {environment_name!r}"
                 )
-            if environment.runner is not None or environment.binding is None:
-                self._require_runner_admitted(
-                    execution_candidate=(
-                        None if admission_candidate is None else admission_candidate.candidate
-                    ),
-                    fallback_candidate=environment_name,
-                    requirements=request.execution_requirements,
-                    runner=environment.runner,
-                )
             reconnect_metadata = copy_json_value(
                 result.reconnect_metadata,
                 "reconnect_metadata",
@@ -1977,6 +2506,24 @@ class EnvironmentLifecycle:
                 )
                 raise
             allocation_checkpointed = True
+            selected_candidate = registered_environment.execution_candidate
+            if selected_candidate is None:
+                raise RuntimeError("Allocated environment lost its selected execution candidate.")
+            await self._emit_transition(
+                session=session,
+                agent_name=registered_agent.spec.name,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                phase=(
+                    EnvironmentLifecycleTransitionPhase.RECONNECTED
+                    if effective_operation is EnvironmentFactoryOperation.RECONNECT
+                    else EnvironmentLifecycleTransitionPhase.ALLOCATED
+                ),
+                outcome=EnvironmentLifecycleTransitionOutcome.COMPLETED,
+                candidate=selected_candidate,
+                events=events,
+                ownership="factory",
+            )
             completed_event = Event(
                 type=EventType.ENVIRONMENT_FACTORY_COMPLETED,
                 session_id=session.id,
@@ -2022,8 +2569,10 @@ class EnvironmentLifecycle:
                 factory_execution_profile_identity=(
                     registered_environment.factory_execution_profile_identity
                 ),
-                execution_candidate=(
-                    None if admission_candidate is None else admission_candidate.candidate
+                execution_candidate=registered_environment.execution_candidate,
+                execution_candidate_declared=(registered_environment.execution_candidate_declared),
+                execution_environment_authority=(
+                    registered_environment.execution_environment_authority
                 ),
                 unclaimed_factory_result=result,
                 live_allocation_fingerprint=(
@@ -2198,7 +2747,7 @@ class EnvironmentLifecycle:
             if fatal_signal is not None or not isinstance(exc, Exception):
                 raise
             return EnvironmentFactoryResolutionResult(
-                registered_environment=registered_environment,
+                registered_environment=factory_registration,
                 events=events,
                 error=exc,
             )
@@ -2766,63 +3315,6 @@ class EnvironmentLifecycle:
             self._release_pending_environment_owner_admission(session.id)
             raise
 
-    def _require_runner_admitted(
-        self,
-        *,
-        execution_candidate: str | None,
-        fallback_candidate: str,
-        requirements: ExecutionRequirements,
-        runner: Runner | None,
-    ) -> None:
-        if execution_candidate is None and not requirements.required_capabilities():
-            return
-        admission_candidate = None if runner is None else runner.execution_admission_candidate()
-        if admission_candidate is not None and not isinstance(
-            admission_candidate,
-            ExecutionAdmissionCandidate,
-        ):
-            raise TypeError(
-                "Runner.execution_admission_candidate must return "
-                "ExecutionAdmissionCandidate or None."
-            )
-        if execution_candidate is not None and admission_candidate is None:
-            missing_evidence = evaluate_execution_admission(
-                candidate=execution_candidate,
-                requirements=requirements,
-                evidence=None,
-                stage="pre_exposure",
-            )
-            if missing_evidence.status == "refused":
-                missing_evidence.require_admitted()
-            raise RuntimeError(
-                f"Execution candidate {execution_candidate!r} supplied pre-create evidence, "
-                "but the final runner supplied no execution admission evidence."
-            )
-        candidate = execution_candidate
-        if candidate is None:
-            candidate = (
-                fallback_candidate if admission_candidate is None else admission_candidate.candidate
-            )
-        evaluate_execution_admission(
-            candidate=candidate,
-            requirements=requirements,
-            evidence=None if admission_candidate is None else admission_candidate.evidence,
-            stage="pre_exposure",
-        ).require_admitted()
-
-    def _require_registered_environment_admitted(
-        self,
-        *,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment,
-    ) -> None:
-        self._require_runner_admitted(
-            execution_candidate=registered_environment.execution_candidate,
-            fallback_candidate=registered_environment.spec.name,
-            requirements=registered_agent.execution_requirements,
-            runner=registered_environment.environment.runner,
-        )
-
     async def _record_retained_cleanup_owner(
         self,
         *,
@@ -2901,13 +3393,20 @@ class EnvironmentLifecycle:
                 ),
             )
         except BaseException as exc:
-            retained = environment_factory_cleanup_settlement_task(original_error) is not None
+            completed_payload = _environment_factory_release_payload(original_error)
+            completed = completed_payload is not None and completed_payload.get("completed") is True
+            retained = (
+                not completed
+                and environment_factory_cleanup_settlement_task(original_error) is not None
+            )
             try:
                 if reporter is None or not reporter.finished:
                     await _finish_environment_lifecycle(
                         reporter,
                         status=(
-                            EnvironmentLifecycleProgressStatus.RETAINED
+                            EnvironmentLifecycleProgressStatus.COMPLETED
+                            if completed
+                            else EnvironmentLifecycleProgressStatus.RETAINED
                             if retained
                             else EnvironmentLifecycleProgressStatus.FAILED
                         ),
@@ -2923,6 +3422,22 @@ class EnvironmentLifecycle:
                         execution_profile=execution_profile,
                         events=events,
                     )
+                await self._emit_release_transition(
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    events=events,
+                    action=action,
+                    outcome=(
+                        EnvironmentLifecycleTransitionOutcome.RELEASED
+                        if completed
+                        else EnvironmentLifecycleTransitionOutcome.DEFERRED
+                        if retained
+                        else EnvironmentLifecycleTransitionOutcome.FAILED
+                    ),
+                    retained=retained,
+                )
             except BaseException as terminal_progress_error:
                 _add_exception_note_safely(
                     exc,
@@ -2937,6 +3452,10 @@ class EnvironmentLifecycle:
                 )
             raise
 
+        # The release callback has reached its positive settlement boundary.
+        # Record that fact before diagnostic publication so a later control
+        # signal cannot make terminal cleanup dispatch the same release again.
+        _attach_environment_factory_release_payload(original_error, payload)
         completed = payload.get("completed") is True
         retained = not completed and (
             action is EnvironmentFactoryReleaseAction.PRESERVE
@@ -2965,10 +3484,50 @@ class EnvironmentLifecycle:
                     execution_profile=execution_profile,
                     events=events,
                 )
+            await self._emit_release_transition(
+                session_id=session_id,
+                agent_name=agent_name,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                events=events,
+                action=action,
+                outcome=(
+                    EnvironmentLifecycleTransitionOutcome.RELEASED
+                    if completed
+                    else EnvironmentLifecycleTransitionOutcome.DEFERRED
+                    if retained
+                    else EnvironmentLifecycleTransitionOutcome.FAILED
+                ),
+                retained=retained,
+            )
         except BaseException as terminal_progress_error:
             if progress_error is None:
                 progress_error = terminal_progress_error
             else:
+                fatal_signal = binding_finalize_fatal_signal(terminal_progress_error)
+                cancellation = (
+                    terminal_progress_error
+                    if isinstance(terminal_progress_error, asyncio.CancelledError)
+                    else binding_finalize_explicit_cancellation(terminal_progress_error)
+                )
+                if fatal_signal is not None or cancellation is not None:
+                    signal = fatal_signal or cancellation
+                    assert signal is not None
+                    _add_exception_note_safely(
+                        signal,
+                        "Environment release terminal publication was interrupted after "
+                        "release-start publication failed.",
+                    )
+                    prior_failures = BaseExceptionGroup(
+                        "Environment binding and release-start publication failed before "
+                        "release terminal publication was interrupted.",
+                        [original_error, progress_error],
+                    )
+                    # Propagate the new control signal itself so Task.cancel()
+                    # retains normal asyncio task-cancellation semantics. The
+                    # exact earlier binding and diagnostic failures remain its
+                    # ordered cause instead of replacing that signal.
+                    raise signal from prior_failures
                 _add_exception_note_safely(
                     progress_error,
                     "Environment release terminal progress publication also failed: "
@@ -2992,6 +3551,7 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment,
         *,
         error: BaseException,
+        action: EnvironmentFactoryReleaseAction = EnvironmentFactoryReleaseAction.PRESERVE,
         session_id: str,
         operation_scope_id: str,
         agent_name: str | None,
@@ -3007,7 +3567,7 @@ class EnvironmentLifecycle:
         # destroy the durable allocation that a later resume will reconnect.
         release_payload = await self._release_factory_result_with_progress(
             result,
-            action=EnvironmentFactoryReleaseAction.PRESERVE,
+            action=action,
             original_error=error,
             session_id=session_id,
             operation_scope_id=operation_scope_id,
@@ -3025,6 +3585,136 @@ class EnvironmentLifecycle:
             ),
             release_payload,
         )
+
+    async def _retire_rejected_unbound_allocation(
+        self,
+        *,
+        session: Session,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        error: BaseException,
+    ) -> bool:
+        """Retire exact reconnect authority only after destructive release succeeds."""
+
+        result = registered_environment.unclaimed_factory_result
+        if result is None:
+            return False
+        environment_name = registered_environment.spec.name
+        expected_reconnect = copy_json_value(
+            result.reconnect_metadata,
+            "reconnect_metadata",
+        )
+        retired_marker = {
+            "reason": "admission_refusal",
+            "reconnect_metadata": expected_reconnect,
+        }
+
+        def retire(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if (
+                current_session.instance_id != session.instance_id
+                or current_session.run_epoch != session.run_epoch
+            ):
+                raise SessionRunFenced("Rejected environment cleanup lost its session generation.")
+            copied = copy_json_value(checkpoint or {}, "checkpoint")
+            retired = copied.get(_RETIRED_ALLOCATION_DISPOSAL_KEY)
+            if retired is None:
+                retired = {}
+            elif type(retired) is not dict:
+                raise ValueError("Retired allocation disposal state must be an object.")
+            existing = retired.get(environment_name)
+            if existing == retired_marker:
+                # The exact transform committed and only its acknowledgement was lost.
+                return copied
+            if existing is not None:
+                raise RuntimeError("Rejected allocation retirement conflicts with its tombstone.")
+            reconnect, owner = _factory_reconnect_state_from_checkpoint(
+                copied,
+                environment_name=environment_name,
+            )
+            if owner != session.id or reconnect != expected_reconnect:
+                raise RuntimeError("Rejected environment cleanup lost exact reconnect authority.")
+            if (
+                self._allocation_coordinator.record_from_checkpoint(
+                    copied,
+                    environment_name=environment_name,
+                )
+                is not None
+                or self._allocation_coordinator.receipt_from_checkpoint(
+                    copied,
+                    environment_name=environment_name,
+                )
+                is not None
+            ):
+                raise RuntimeError(
+                    "Rejected recoverable allocation requires provider-owned reaping."
+                )
+            retired[environment_name] = retired_marker
+            copied[_RETIRED_ALLOCATION_DISPOSAL_KEY] = retired
+            for key in (
+                ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+            ):
+                values = copied.get(key, {})
+                if type(values) is not dict:
+                    raise ValueError(f"{key} checkpoint state must be an object.")
+                values.pop(environment_name, None)
+                if not values:
+                    copied.pop(key, None)
+            return copied
+
+        async def retirement_committed() -> bool:
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            if checkpoint is None:
+                return False
+            retired = checkpoint.get(_RETIRED_ALLOCATION_DISPOSAL_KEY)
+            return type(retired) is dict and retired.get(environment_name) == retired_marker
+
+        try:
+            await self._session_store.transform_checkpoint(session.id, retire)
+        except BaseException as cleanup_error:
+            current_task = asyncio.current_task()
+            caller_cancellation = (
+                cleanup_error
+                if isinstance(cleanup_error, asyncio.CancelledError)
+                and current_task is not None
+                and current_task.cancelling() > 0
+                else None
+            )
+            outcome = await await_shielded_task_outcome(
+                asyncio.create_task(retirement_committed()),
+                cancellation=caller_cancellation,
+            )
+            cancellation = outcome.cancellation or outcome.subsequent_cancellation
+            if outcome.error is not None:
+                _add_exception_note_safely(
+                    error,
+                    "Rejected environment reconnect retirement acknowledgement "
+                    f"could not be reconciled: {type(outcome.error).__name__}.",
+                )
+            elif outcome.result:
+                if cancellation is None:
+                    return True
+            else:
+                _add_exception_note_safely(
+                    error,
+                    "Rejected environment was released but its reconnect authority "
+                    f"could not be retired: {type(cleanup_error).__name__}.",
+                )
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed,
+                cancellation=cancellation,
+            )
+            fatal_signal = binding_finalize_fatal_signal(cleanup_error)
+            if fatal_signal is not None:
+                raise fatal_signal from error
+            if cancellation is not None:
+                raise cancellation from error
+            if not isinstance(cleanup_error, Exception):
+                raise
+            return False
+        return True
 
     async def bind(
         self,
@@ -3046,6 +3736,24 @@ class EnvironmentLifecycle:
             invocation_context=invocation_context,
             completion_finalization_recovery_state=completion_finalization_recovery_state,
         )
+        if (
+            result.error is None
+            and result.registered_environment is not None
+            and result.registered_environment.environment_exposure is not None
+        ):
+            if invocation_context is None or execution_profile is None:
+                raise RuntimeError(
+                    "Environment exposure reuse requires frozen invocation authority."
+                )
+            await refresh_and_require_environment_exposed(
+                result.registered_environment,
+                session=session,
+                invocation_context=invocation_context,
+                registered_agent=registered_agent,
+                execution_profile=execution_profile,
+                redactor=self._secret_redactor,
+            )
+            return result
         if result.error is None and result.registered_environment is not None:
             from cayu.runtime.workspace_checkpoints import ensure_workspace_checkpoint
 
@@ -3053,12 +3761,150 @@ class EnvironmentLifecycle:
                 await ensure_workspace_checkpoint(
                     self._session_store, session, result.registered_environment
                 )
-            except Exception as exc:
-                return EnvironmentBindingResult(
+                candidate = result.registered_environment.execution_candidate
+                if candidate is None:
+                    raise RuntimeError(
+                        "Environment binding completed without a selected execution candidate."
+                    )
+                await self._emit_transition(
+                    session=session,
+                    agent_name=registered_agent.spec.name,
                     registered_environment=result.registered_environment,
+                    execution_profile=execution_profile,
+                    phase=EnvironmentLifecycleTransitionPhase.BOUND,
+                    outcome=EnvironmentLifecycleTransitionOutcome.COMPLETED,
+                    candidate=candidate,
+                    events=result.events,
+                    ownership=(
+                        "binding"
+                        if result.registered_environment.environment.binding is not None
+                        else "runtime"
+                    ),
+                )
+                exposed = await self._admit_and_expose_environment(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=result.registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    events=result.events,
+                )
+            except BaseException as exc:
+                registered_environment = result.registered_environment
+                cleanup_error: BaseException | None = None
+                if (
+                    registered_environment.bound_workspace is None
+                    and registered_environment.unclaimed_factory_result is not None
+                ):
+                    factory_result_owner = registered_environment
+                    release_action = EnvironmentFactoryReleaseAction.PRESERVE
+                    if (
+                        isinstance(exc, Exception)
+                        and registered_environment.environment.binding is None
+                        # A recoverable process-external allocation always
+                        # carries this exact lifecycle fingerprint. Its provider
+                        # reaper, never generic result release, owns deletion.
+                        and registered_environment.live_allocation_fingerprint is None
+                    ):
+                        release_action = EnvironmentFactoryReleaseAction.DISCARD
+                    try:
+                        (
+                            registered_environment,
+                            release_payload,
+                        ) = await self._release_unexposed_factory_environment(
+                            registered_environment,
+                            error=exc,
+                            action=release_action,
+                            session_id=session.id,
+                            operation_scope_id=(
+                                f"{session.instance_id}:{session.run_epoch}"
+                                if invocation_context is None
+                                else (
+                                    f"{invocation_context.binding.interaction_id}:"
+                                    f"{invocation_context.binding.run_epoch}"
+                                )
+                            ),
+                            agent_name=registered_agent.spec.name,
+                            execution_profile=execution_profile,
+                            events=result.events,
+                        )
+                        if (
+                            release_action is EnvironmentFactoryReleaseAction.DISCARD
+                            and release_payload is not None
+                            and release_payload.get("completed") is True
+                        ):
+                            await self._retire_rejected_unbound_allocation(
+                                session=session,
+                                registered_environment=factory_result_owner,
+                                error=exc,
+                            )
+                    except BaseException as release_error:
+                        cleanup_error = release_error
+                    finally:
+                        self._transfer_deferred_factory_cleanup(
+                            session_id=session.id,
+                            error=exc,
+                        )
+                        setup_owner = self._active_environment_setups.get(session.id)
+                        if setup_owner is not None:
+                            cleanup_control_signal = (
+                                None
+                                if cleanup_error is None
+                                else binding_finalize_fatal_signal(cleanup_error)
+                                or binding_finalize_explicit_cancellation(cleanup_error)
+                            )
+                            if isinstance(exc, Exception) and cleanup_control_signal is None:
+                                # The ordinary-error return publishes the
+                                # released environment to its caller, so move
+                                # the private cleanup context to that same
+                                # exact representation.
+                                _advance_cleanup_environment(
+                                    setup_owner,
+                                    registered_environment,
+                                )
+                            # A control-signal unwind still holds the
+                            # predecessor context. In both cases the tombstone,
+                            # not the environment object's result field, proves
+                            # that release already ran.
+                            setup_owner.cleanup_started = True
+                            setup_owner.prebind_release_tombstone = True
+                if cleanup_error is not None:
+                    cleanup_cancellation = binding_finalize_explicit_cancellation(cleanup_error)
+                    if cleanup_cancellation is cleanup_error:
+                        # Preserve the ordinary admission failure as the cause,
+                        # while retaining the standard task-cancellation shape
+                        # expected by asyncio callers.
+                        raise cleanup_cancellation from exc
+                    combined_error = BaseExceptionGroup(
+                        "Environment admission and post-refusal cleanup both failed.",
+                        [exc, cleanup_error],
+                    )
+                    fatal_signal = binding_finalize_fatal_signal(combined_error)
+                    cancellation = binding_finalize_explicit_cancellation(combined_error)
+                    if fatal_signal is not None or cancellation is not None:
+                        raise combined_error from (fatal_signal or cancellation)
+                    exc = combined_error
+                fatal_signal = binding_finalize_fatal_signal(exc)
+                if fatal_signal is not None or not isinstance(exc, Exception):
+                    raise
+                return EnvironmentBindingResult(
+                    registered_environment=registered_environment,
                     events=result.events,
                     error=exc,
                 )
+            adopted = exposed
+            if exposed.unclaimed_factory_result is not None:
+                adopted = replace(exposed, unclaimed_factory_result=None)
+                self._active_environment_setups.pop(session.id, None)
+            elif exposed.preserve_factory_allocation:
+                adopted = replace(exposed, preserve_factory_allocation=False)
+                setup_owner = self._active_environment_setups.get(session.id)
+                if setup_owner is not None:
+                    _advance_cleanup_environment(setup_owner, adopted)
+            result = EnvironmentBindingResult(
+                registered_environment=adopted,
+                events=result.events,
+            )
         return result
 
     async def _bind_workspace(
@@ -3094,85 +3940,19 @@ class EnvironmentLifecycle:
         if registered_environment.bound_workspace is not None:
             if started_event is not None:
                 raise AssertionError("Binding start event exists for an already-bound workspace.")
-            try:
-                self._require_registered_environment_admitted(
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                )
-            except Exception as exc:
-                return EnvironmentBindingResult(
-                    registered_environment=registered_environment,
-                    events=[],
-                    error=exc,
-                )
-            adopted_environment = (
-                registered_environment
-                if registered_environment.unclaimed_factory_result is None
-                else replace(
-                    registered_environment,
-                    unclaimed_factory_result=None,
-                )
-            )
             setup_owner = self._active_environment_setups.get(session.id)
             if setup_owner is not None:
-                _advance_cleanup_environment(setup_owner, adopted_environment)
+                _advance_cleanup_environment(setup_owner, registered_environment)
             return EnvironmentBindingResult(
-                registered_environment=adopted_environment,
+                registered_environment=registered_environment,
                 events=[],
             )
         binding = registered_environment.environment.binding
         if binding is None:
             if started_event is not None:
                 raise AssertionError("Binding start event exists without a workspace binding.")
-            try:
-                self._require_registered_environment_admitted(
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                )
-            except Exception as exc:
-                release_events: list[Event] = []
-                try:
-                    (
-                        registered_environment,
-                        _release_payload,
-                    ) = await self._release_unexposed_factory_environment(
-                        registered_environment,
-                        error=exc,
-                        session_id=session.id,
-                        operation_scope_id=(
-                            f"{session.instance_id}:{session.run_epoch}"
-                            if invocation_context is None
-                            else (
-                                f"{invocation_context.binding.interaction_id}:"
-                                f"{invocation_context.binding.run_epoch}"
-                            )
-                        ),
-                        agent_name=registered_agent.spec.name,
-                        execution_profile=execution_profile,
-                        events=release_events,
-                    )
-                finally:
-                    self._transfer_deferred_factory_cleanup(
-                        session_id=session.id,
-                        error=exc,
-                    )
-                self._active_environment_setups.pop(session.id, None)
-                return EnvironmentBindingResult(
-                    registered_environment=registered_environment,
-                    events=release_events,
-                    error=exc,
-                )
-            adopted_environment = (
-                registered_environment
-                if registered_environment.unclaimed_factory_result is None
-                else replace(
-                    registered_environment,
-                    unclaimed_factory_result=None,
-                )
-            )
-            self._active_environment_setups.pop(session.id, None)
             return EnvironmentBindingResult(
-                registered_environment=adopted_environment,
+                registered_environment=registered_environment,
                 events=[],
             )
         if started_event is None:
@@ -3355,6 +4135,21 @@ class EnvironmentLifecycle:
                     session_id=session.id,
                     error=exc,
                 )
+                completed_release = _environment_factory_release_payload(exc)
+                if (
+                    completed_release is not None
+                    and completed_release.get("completed") is True
+                    and setup_owner is not None
+                ):
+                    _advance_cleanup_environment(
+                        setup_owner,
+                        replace(
+                            registered_environment,
+                            unclaimed_factory_result=None,
+                        ),
+                    )
+                    setup_owner.cleanup_started = True
+                    setup_owner.prebind_release_tombstone = True
                 if session.id in self._deferred_factory_cleanup_tasks and setup_owner is not None:
                     # Main retains this tombstone so terminalization cannot
                     # reuse its stale pre-bind factory result. The deferred
@@ -3446,6 +4241,10 @@ class EnvironmentLifecycle:
             bound_workspace=bound,
             binding_payload=copy_json_value(base_payload, "binding_payload"),
             execution_candidate=registered_environment.execution_candidate,
+            execution_candidate_declared=registered_environment.execution_candidate_declared,
+            execution_environment_authority=(
+                registered_environment.execution_environment_authority
+            ),
             retained_factory_result=(registered_environment.unclaimed_factory_result),
             preserve_factory_allocation=(
                 registered_environment.unclaimed_factory_result is not None
@@ -3492,27 +4291,6 @@ class EnvironmentLifecycle:
                 )
             )
         )
-        try:
-            self._require_registered_environment_admitted(
-                registered_agent=registered_agent,
-                registered_environment=bound_registered_environment,
-            )
-        except Exception as exc:
-            await _finish_environment_lifecycle(
-                progress_reporter,
-                status=EnvironmentLifecycleProgressStatus.FAILED,
-                phase=EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION,
-            )
-            return EnvironmentBindingResult(
-                registered_environment=bound_registered_environment,
-                events=events,
-                error=exc,
-            )
-        adopted_environment = replace(
-            bound_registered_environment,
-            preserve_factory_allocation=False,
-        )
-        _advance_cleanup_environment(setup_owner, adopted_environment)
         await _report_environment_lifecycle(
             progress_reporter,
             EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION,
@@ -3523,7 +4301,7 @@ class EnvironmentLifecycle:
             status=EnvironmentLifecycleProgressStatus.COMPLETED,
         )
         return EnvironmentBindingResult(
-            registered_environment=adopted_environment,
+            registered_environment=bound_registered_environment,
             events=events,
         )
 
@@ -3725,6 +4503,7 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity | None,
     ) -> EnvironmentBindingFinalizeResult:
+        await await_environment_exposure_settlement(registered_environment)
         setup_owner = self._active_environment_setups.get(session.id)
         if execution_profile is None and setup_owner is not None:
             execution_profile = setup_owner.execution_profile
@@ -4174,6 +4953,61 @@ class EnvironmentLifecycle:
                     raise aggregate from diagnostic_error
                 raise exc from diagnostic_error
             events.append(failure_event)
+            release_deferred = bool(
+                setup_owner is not None
+                and (
+                    setup_owner.cleanup_requires_finalize_retry
+                    or setup_owner.cleanup_settlement_deferred
+                )
+            )
+            try:
+                await self._emit_release_transition(
+                    session_id=session.id,
+                    agent_name=event.agent_name,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    events=events,
+                    action=(
+                        EnvironmentFactoryReleaseAction.PRESERVE
+                        if preserve_factory_allocation
+                        else EnvironmentFactoryReleaseAction.DISCARD
+                    ),
+                    outcome=(
+                        EnvironmentLifecycleTransitionOutcome.DEFERRED
+                        if release_deferred
+                        else EnvironmentLifecycleTransitionOutcome.FAILED
+                    ),
+                    retained=release_deferred,
+                    ownership="binding",
+                )
+            except BaseException as release_publication_error:
+                _add_exception_note_safely(
+                    exc,
+                    "Environment release transition publication also failed: "
+                    f"{type(release_publication_error).__name__}.",
+                )
+                fatal_signal = binding_finalize_fatal_signal(release_publication_error)
+                if fatal_signal is not None:
+                    raise fatal_signal from exc
+                cancellation = (
+                    release_publication_error
+                    if isinstance(release_publication_error, asyncio.CancelledError)
+                    else binding_finalize_explicit_cancellation(release_publication_error)
+                )
+                if cancellation is not None:
+                    attach_binding_finalize_safe_payload(
+                        cancellation,
+                        finalize_error_payload,
+                    )
+                    _add_exception_note_safely(
+                        cancellation,
+                        "Environment release transition publication was cancelled "
+                        "after binding finalization failed.",
+                    )
+                    # Keep caller cancellation as the propagated signal so the
+                    # task remains cancelled, while retaining the authoritative
+                    # finalization failure as its exact cause.
+                    raise cancellation from exc
             if not isinstance(exc, Exception):
                 raise
             terminal_payload = copy_json_value(event.payload, "payload")
@@ -4190,6 +5024,26 @@ class EnvironmentLifecycle:
 
         completion_publication_error: BaseException | None = None
         try:
+            retained_allocation = park_for_egress_adoption or preserve_factory_allocation
+            await self._emit_release_transition(
+                session_id=session.id,
+                agent_name=event.agent_name,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                events=events,
+                action=(
+                    EnvironmentFactoryReleaseAction.PRESERVE
+                    if retained_allocation
+                    else EnvironmentFactoryReleaseAction.DISCARD
+                ),
+                outcome=(
+                    EnvironmentLifecycleTransitionOutcome.DEFERRED
+                    if retained_allocation
+                    else EnvironmentLifecycleTransitionOutcome.RELEASED
+                ),
+                retained=retained_allocation,
+                ownership="binding",
+            )
             events.append(
                 await self._event_writer.emit(
                     _event_with_binding_generation_authority(
@@ -6143,17 +6997,76 @@ async def _release_unclaimed_factory_result(
         "action": action.value,
         "callback_provided": result.release is not None,
     }
+    pre_release_settlement = combine_environment_factory_cleanup_settlement_tasks(
+        environment_factory_cleanup_settlement_tasks(original_error),
+        task_name="cayu-environment-pre-release-settlement",
+        failure_message="Environment operations failed to settle before release.",
+    )
+    pre_release_owner = [] if pre_release_settlement is None else [pre_release_settlement]
+
+    async def settle_before_release() -> None:
+        if not pre_release_owner:
+            return
+        await asyncio.shield(pre_release_owner[0])
+
     if result.release is not None:
         release = result.release
 
-        async def run_release() -> None:
-            await environment_operation_boundary.await_environment_operation(
-                lambda: release(action),
-                operation_name="Environment factory release",
-                redactor=resolved_redactor,
-            )
+        def retry_release_attempt() -> asyncio.Task[None]:
+            if not pre_release_owner:
+                raise RuntimeError("Environment release has no prerequisite settlement owner.")
+            current = pre_release_owner[0]
+            if current.done():
+                try:
+                    current.result()
+                except BaseException:
+                    replacement = retry_environment_factory_cleanup_settlement_task(current)
+                    if replacement is current:
+                        raise RuntimeError(
+                            "Environment prerequisite settlement is not retryable."
+                        ) from None
+                    pre_release_owner[0] = replacement
+            return start_release_attempt()
 
-        release_attempt = asyncio.create_task(run_release())
+        def start_release_attempt() -> asyncio.Task[None]:
+            state = {"release_dispatched": False}
+
+            async def run_release() -> None:
+                await settle_before_release()
+                state["release_dispatched"] = True
+                await environment_operation_boundary.await_environment_operation(
+                    lambda: release(action),
+                    operation_name="Environment factory release",
+                    redactor=resolved_redactor,
+                )
+
+            attempt = asyncio.create_task(run_release())
+
+            def retain_prerequisite_retry(completed: asyncio.Task[None]) -> None:
+                if state["release_dispatched"] or not pre_release_owner:
+                    return
+                try:
+                    completed.result()
+                except BaseException:
+                    prerequisite = pre_release_owner[0]
+                    can_retry = not prerequisite.done()
+                    if prerequisite.done():
+                        try:
+                            prerequisite.result()
+                        except BaseException:
+                            can_retry = environment_factory_cleanup_retry_available(prerequisite)
+                        else:
+                            can_retry = True
+                    if can_retry:
+                        register_environment_factory_cleanup_retry(
+                            completed,
+                            retry_release_attempt,
+                        )
+
+            attempt.add_done_callback(retain_prerequisite_retry)
+            return attempt
+
+        release_attempt = start_release_attempt()
         factory_cleanup_quiescent = False
 
         def retire_after_factory_quiescence() -> None:
@@ -6163,16 +7076,24 @@ async def _release_unclaimed_factory_result(
                 on_quiescent()
 
         def retry_release_settlement() -> asyncio.Task[None]:
-            for task in _environment_factory_release_retryable_handoffs(release_attempt):
-                retry_environment_factory_cleanup_settlement_task(task)
-            return start_release_settlement()
+            nonlocal release_attempt
+            replacement = retry_environment_factory_cleanup_settlement_task(release_attempt)
+            if replacement is not release_attempt:
+                release_attempt = replacement
+            else:
+                for task in _environment_factory_release_retryable_handoffs(release_attempt):
+                    retry_environment_factory_cleanup_settlement_task(task)
+            return start_release_settlement(release_attempt)
 
-        def retain_successor_retry(settlement: asyncio.Task[None]) -> None:
+        def retain_successor_retry(
+            settlement: asyncio.Task[None],
+            owned_release_attempt: asyncio.Task[None],
+        ) -> None:
             try:
                 settlement.result()
             except BaseException:
                 try:
-                    release_attempt.result()
+                    owned_release_attempt.result()
                 except BaseException:
                     release_succeeded = False
                 else:
@@ -6180,33 +7101,43 @@ async def _release_unclaimed_factory_result(
                 if (
                     factory_cleanup_quiescent
                     or release_succeeded
-                    or _environment_factory_release_retryable_handoffs(release_attempt)
+                    or environment_factory_cleanup_retry_available(owned_release_attempt)
+                    or _environment_factory_release_retryable_handoffs(owned_release_attempt)
                 ):
                     register_environment_factory_cleanup_retry(
                         settlement,
                         retry_release_settlement,
                     )
 
-        def start_release_settlement() -> asyncio.Task[None]:
+        def start_release_settlement(
+            owned_release_attempt: asyncio.Task[None],
+        ) -> asyncio.Task[None]:
             async def settle_release() -> None:
                 await _settle_environment_factory_release(
-                    release_attempt,
+                    owned_release_attempt,
                     on_quiescent=retire_after_factory_quiescence,
                 )
 
             settlement = asyncio.create_task(settle_release())
-            settlement.add_done_callback(retain_successor_retry)
+            settlement.add_done_callback(
+                lambda completed: retain_successor_retry(completed, owned_release_attempt)
+            )
             return settlement
 
-        release_task = release_attempt if on_quiescent is None else start_release_settlement()
+        release_requires_settlement = on_quiescent is not None or bool(pre_release_owner)
+        release_task = (
+            start_release_settlement(release_attempt)
+            if release_requires_settlement
+            else release_attempt
+        )
         try:
-            cancelled = await _await_bounded_environment_factory_release(
+            cancellation = await _await_bounded_environment_factory_release(
                 release_task,
                 timeout_s=result.release_timeout_s,
-                timeout_handoff_task=(release_task if on_quiescent is not None else None),
+                timeout_handoff_task=(release_task if release_requires_settlement else None),
             )
         except BaseException as cleanup_error:
-            if on_quiescent is not None:
+            if release_requires_settlement:
                 # The complete release settlement remains the reservation owner whether it
                 # failed immediately or is still running after a timeout.
                 attach_environment_factory_cleanup_settlement_task(
@@ -6260,8 +7191,13 @@ async def _release_unclaimed_factory_result(
                 ) from cleanup_error
         else:
             payload["completed"] = True
-            if cancelled:
-                raise asyncio.CancelledError()
+            if cancellation is not None:
+                # Release settlement is authoritative even though caller
+                # cancellation must still propagate. Checkpoint it on the
+                # original failure before the outer publication layer sees the
+                # control signal and before terminal cleanup can redispatch.
+                _attach_environment_factory_release_payload(original_error, payload)
+                raise cancellation
         return payload
     if action is EnvironmentFactoryReleaseAction.PRESERVE:
         payload.update(
@@ -6293,46 +7229,99 @@ async def _release_unclaimed_factory_result(
 
     cleanup_errors: list[tuple[str, Exception]] = []
 
-    async def run_fallback_release() -> None:
-        runner = result.environment.runner
-        if runner is not None:
+    def retry_fallback_release() -> asyncio.Task[None]:
+        if not pre_release_owner:
+            raise RuntimeError("Environment fallback release has no prerequisite owner.")
+        current = pre_release_owner[0]
+        if current.done():
             try:
-                await environment_operation_boundary.await_environment_operation(
-                    runner.close,
-                    operation_name="Environment runner fallback release",
-                    redactor=resolved_redactor,
-                )
-            except Exception as cleanup_error:
-                cleanup_errors.append(("runner", cleanup_error))
+                current.result()
+            except BaseException:
+                replacement = retry_environment_factory_cleanup_settlement_task(current)
+                if replacement is current:
+                    raise RuntimeError(
+                        "Environment fallback prerequisite is not retryable."
+                    ) from None
+                pre_release_owner[0] = replacement
+        return start_fallback_release()
 
-        binding = result.environment.binding
-        close = getattr(binding, "close", None)
-        if callable(close):
+    def start_fallback_release() -> asyncio.Task[None]:
+        state = {"release_dispatched": False}
+
+        async def run_fallback_release() -> None:
+            await settle_before_release()
+            state["release_dispatched"] = True
+            runner = result.environment.runner
+            if runner is not None:
+                try:
+                    await environment_operation_boundary.await_environment_operation(
+                        runner.close,
+                        operation_name="Environment runner fallback release",
+                        redactor=resolved_redactor,
+                    )
+                except Exception as cleanup_error:
+                    cleanup_errors.append(("runner", cleanup_error))
+
+            binding = result.environment.binding
+            close = getattr(binding, "close", None)
+            if callable(close):
+                try:
+
+                    async def close_binding() -> None:
+                        close_result = close()
+                        if inspect.isawaitable(close_result):
+                            await close_result
+
+                    await environment_operation_boundary.await_environment_operation(
+                        close_binding,
+                        operation_name="Environment binding fallback release",
+                        redactor=resolved_redactor,
+                    )
+                except Exception as cleanup_error:
+                    cleanup_errors.append(("binding", cleanup_error))
+            if not cleanup_errors and on_quiescent is not None:
+                on_quiescent()
+
+        task = asyncio.create_task(run_fallback_release())
+
+        def retain_prerequisite_retry(completed: asyncio.Task[None]) -> None:
+            if state["release_dispatched"] or not pre_release_owner:
+                return
             try:
+                completed.result()
+            except BaseException:
+                prerequisite = pre_release_owner[0]
+                can_retry = not prerequisite.done()
+                if prerequisite.done():
+                    try:
+                        prerequisite.result()
+                    except BaseException:
+                        can_retry = environment_factory_cleanup_retry_available(prerequisite)
+                    else:
+                        can_retry = True
+                if can_retry:
+                    register_environment_factory_cleanup_retry(
+                        completed,
+                        retry_fallback_release,
+                    )
 
-                async def close_binding() -> None:
-                    close_result = close()
-                    if inspect.isawaitable(close_result):
-                        await close_result
+        task.add_done_callback(retain_prerequisite_retry)
+        return task
 
-                await environment_operation_boundary.await_environment_operation(
-                    close_binding,
-                    operation_name="Environment binding fallback release",
-                    redactor=resolved_redactor,
-                )
-            except Exception as cleanup_error:
-                cleanup_errors.append(("binding", cleanup_error))
-        if not cleanup_errors and on_quiescent is not None:
-            on_quiescent()
-
-    fallback_task = asyncio.create_task(run_fallback_release())
+    fallback_task = start_fallback_release()
     try:
-        cancelled = await _await_bounded_environment_factory_release(
+        cancellation = await _await_bounded_environment_factory_release(
             fallback_task,
             timeout_s=result.release_timeout_s,
+            timeout_handoff_task=(fallback_task if pre_release_owner else None),
         )
     except BaseException as cleanup_error:
-        if (
+        if pre_release_owner:
+            attach_environment_factory_cleanup_settlement_task(
+                original_error,
+                fallback_task,
+            )
+        elif (
             settlement_task := environment_factory_cleanup_settlement_task(cleanup_error)
         ) is not None:
             attach_environment_factory_cleanup_settlement_task(
@@ -6363,8 +7352,6 @@ async def _release_unclaimed_factory_result(
             )
             raise cancellation from cleanup_error
         return payload
-    if cancelled:
-        raise asyncio.CancelledError()
     payload["completed"] = not cleanup_errors
     if cleanup_errors:
         diagnostics = [
@@ -6383,6 +7370,10 @@ async def _release_unclaimed_factory_result(
             original_error,
             f"Environment factory fallback release incomplete after {action.value}: {details}.",
         )
+    if cancellation is not None:
+        if payload["completed"] is True:
+            _attach_environment_factory_release_payload(original_error, payload)
+        raise cancellation
     return payload
 
 
@@ -6400,10 +7391,10 @@ async def _await_bounded_environment_factory_release(
     *,
     timeout_s: float,
     timeout_handoff_task: asyncio.Task[None] | None = None,
-) -> bool:
+) -> asyncio.CancelledError | None:
     """Finish a factory release despite cancellation, within its declared bound."""
 
-    cancelled = False
+    cancellation: asyncio.CancelledError | None = None
     deadline = asyncio.get_running_loop().time() + timeout_s
     while not task.done():
         remaining = deadline - asyncio.get_running_loop().time()
@@ -6418,10 +7409,11 @@ async def _await_bounded_environment_factory_release(
             raise error
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             if task.done():
                 task.result()
-            cancelled = True
+            if cancellation is None:
+                cancellation = exc
         except TimeoutError as exc:
             if task.done():
                 task.result()
@@ -6435,7 +7427,7 @@ async def _await_bounded_environment_factory_release(
             )
             raise error from exc
     task.result()
-    return cancelled
+    return cancellation
 
 
 def _environment_factory_cleanup_handoffs(

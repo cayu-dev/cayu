@@ -1071,8 +1071,13 @@ class Runner(ABC):
     async def refresh_execution_admission(self) -> None:
         """Re-probe live admission evidence when supported by this runner.
 
-        The default makes no new claim. Callers must still validate the returned
-        candidate; requesting renewal never authorizes execution by itself.
+        The default makes no new claim. A supporting implementation may renew
+        only the exact runner represented by its current admission candidate;
+        it must not replace the environment, immutable image, or toolchain
+        identity. It must also settle every dispatched probe, or transfer an
+        authenticated settlement owner, before returning or raising. Callers
+        must re-read and validate the complete candidate after this hook;
+        requesting renewal never authorizes execution by itself.
         """
 
         return None
@@ -1086,6 +1091,19 @@ class Runner(ABC):
         """
 
         return None
+
+    async def collect_execution_admission_candidate(
+        self,
+    ) -> ExecutionAdmissionCandidate | None:
+        """Collect final evidence after lifecycle-owned mutating setup completes.
+
+        The default adapts existing side-effect-free snapshot implementations.
+        Runners whose evidence depends on live external state override this hook
+        and complete or positively transfer settlement ownership for every
+        dispatched probe before returning or raising for any reason.
+        """
+
+        return self.execution_admission_candidate()
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:

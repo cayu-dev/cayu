@@ -94,6 +94,7 @@ from cayu.core.messages import (
 )
 from cayu.core.thinking import ThinkingConfig, thinking_config_payload
 from cayu.deadlines import current_execution_deadline
+from cayu.environments.admission import ExecutionAdmissionError
 from cayu.memory_evidence import (
     ContextExposure,
     ContextExposureEvidenceKind,
@@ -176,6 +177,10 @@ from cayu.runtime._child_session_notifications import (
 )
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._diagnostics import exception_diagnostic
+from cayu.runtime._environment_exposure import (
+    refresh_and_require_environment_exposed,
+    require_environment_exposed,
+)
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._memory_evidence import (
@@ -273,6 +278,7 @@ from cayu.runtime.context import (
     _AutomaticCompactionRecoveryAction,
     _AutomaticCompactionRunner,
     _compaction_completion_publisher_scope,
+    _compaction_environment_admission_scope,
     _compaction_model_attempt_identity_scope,
     _context_recall_telemetry_publisher_scope,
     _context_secret_redactor_scope,
@@ -2449,10 +2455,12 @@ async def _admitted_model_provider_events(
     provider: ModelProvider,
     request: ModelRequest,
     admission: ProviderStreamDeadlineAdmission,
+    refresh_live_model_semantics: Callable[[], Awaitable[None]],
     cleanup_observer: _LocalHttpCleanupObserver | None = None,
 ) -> AsyncGenerator[ModelStreamEvent, None]:
     """Transfer one pre-dispatch deadline admission into the provider stream."""
 
+    await refresh_live_model_semantics()
     current_execution_deadline().require_admission("model")
     events = provider.runtime_stream(request)
     iterator = aiter(events)
@@ -5877,6 +5885,7 @@ class ModelStepExecutor:
         ],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         validate_live_model_semantics: Callable[[], None],
+        refresh_live_model_semantics: Callable[[], Awaitable[None]],
         record_model_attempt_identity: Callable[[ModelAttemptIdentity], None],
         billing_identity: BillingIdentity | None = None,
         structured_output: StructuredOutputSpec | None = None,
@@ -6045,7 +6054,7 @@ class ModelStepExecutor:
             # Reservation/retry preparation can yield. Recheck before request
             # footprint, pressure, token-count, and provider-start evidence are
             # attributed to the frozen invocation profile.
-            validate_live_model_semantics()
+            await refresh_live_model_semantics()
             # Never hand the retry template to provider-controlled code. Each
             # attempt gets a fully detached, revalidated request so provider
             # mutation cannot corrupt a later attempt.
@@ -6114,7 +6123,7 @@ class ModelStepExecutor:
                 # fence used by the model call before handing them recalled
                 # context, then reuse that exact dispatch below.
                 deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
-                validate_live_model_semantics()
+                await refresh_live_model_semantics()
                 try:
                     pre_count_completion_dispatch = await prepare_model_completion_dispatch(
                         attempt_model_request,
@@ -6137,7 +6146,7 @@ class ModelStepExecutor:
                 max_attempts=retry_policy.max_attempts,
                 model_attempt_identity=model_attempt_identity,
                 execution_profile=execution_profile,
-                validate_live_model_semantics=validate_live_model_semantics,
+                refresh_live_model_semantics=refresh_live_model_semantics,
             )
             if context_count_event is not None:
                 yield context_count_event, None
@@ -6201,6 +6210,7 @@ class ModelStepExecutor:
                 record_model_completion=record_model_completion,
                 before_provider_dispatch=before_provider_dispatch,
                 validate_live_model_semantics=validate_live_model_semantics,
+                refresh_live_model_semantics=refresh_live_model_semantics,
                 billing_identity=billing_identity,
                 structured_output=structured_output,
                 context_pressure_estimate=request_context_pressure,
@@ -6532,7 +6542,7 @@ class ModelStepExecutor:
         attempt: int,
         max_attempts: int,
         model_attempt_identity: ModelAttemptIdentity,
-        validate_live_model_semantics: Callable[[], None],
+        refresh_live_model_semantics: Callable[[], Awaitable[None]],
         execution_profile: ExecutionProfileIdentity | None = None,
     ) -> tuple[_ContextCountObservation | None, Event | None]:
         if self._context_counting.mode == ContextCountingMode.OFF:
@@ -6551,7 +6561,7 @@ class ModelStepExecutor:
         # Event publication above the caller can yield to application code.
         # Recheck at the exact remote counter seam and keep an authority
         # mismatch outside the optional-counter failure projection below.
-        validate_live_model_semantics()
+        await refresh_live_model_semantics()
         try:
             provider_result = await provider.count_input_tokens(count_request)
             provider_result = copy_input_token_count_result(provider_result)
@@ -6647,6 +6657,7 @@ class ModelStepExecutor:
         record_model_completion: Callable[[Event], Event],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         validate_live_model_semantics: Callable[[], None],
+        refresh_live_model_semantics: Callable[[], Awaitable[None]],
         billing_identity: BillingIdentity | None,
         structured_output: StructuredOutputSpec | None,
         context_pressure_estimate: ContextPressureEstimate | None,
@@ -6712,7 +6723,7 @@ class ModelStepExecutor:
         # Request analysis invokes provider-owned projection hooks.  A mutable
         # built-in adapter must still match the profile admitted for this
         # invocation before any of those semantics are consulted.
-        validate_live_model_semantics()
+        await refresh_live_model_semantics()
         context_pressure_estimate = copy_context_pressure_estimate(context_pressure_estimate)
         if context_pressure_estimate is None:
             context_pressure_estimate = analyze_request_context_pressure(
@@ -6982,7 +6993,11 @@ class ModelStepExecutor:
                     cleanup_observer = _LocalHttpCleanupObserver(publish_http_cleanup)
                 provider_events = _owned_model_provider_events(
                     lambda: _admitted_model_provider_events(
-                        provider, model_request, deadline_admission, cleanup_observer
+                        provider,
+                        model_request,
+                        deadline_admission,
+                        refresh_live_model_semantics,
+                        cleanup_observer,
                     ),
                     cancellation_baseline=provider_cancellation_baseline,
                     max_concurrent_streams=deadline_admission.max_concurrent_streams,
@@ -7052,23 +7067,25 @@ class ModelStepExecutor:
                     )
 
                 async def start_provider_operation() -> ProviderOperationConnection:
+                    nonlocal background_dispatch_invoked
+
                     # Durable staging and event publication above can yield to
                     # application code. Recheck at the last pre-dispatch seam.
-                    validate_live_model_semantics()
+                    await refresh_live_model_semantics()
                     await consume_child_session_notifications()
+                    await refresh_live_model_semantics()
+                    start_request = ProviderOperationStartRequest(
+                        request=model_request,
+                        idempotency_key=start_id,
+                    )
                     token = bind_provider_deadline_admission(deadline_admission)
                     try:
-                        return await provider_operation_adapter.start(
-                            ProviderOperationStartRequest(
-                                request=model_request,
-                                idempotency_key=start_id,
-                            )
-                        )
+                        background_dispatch_invoked = True
+                        return await provider_operation_adapter.start(start_request)
                     finally:
                         reset_provider_deadline_admission(token)
 
                 start_task = asyncio.create_task(start_provider_operation())
-                background_dispatch_invoked = True
 
                 def operation_event_for(
                     operation_state: ProviderOperationState,
@@ -7271,6 +7288,8 @@ class ModelStepExecutor:
                     if start_outcome.cancellation is not None:
                         raise_start_cancellation(start_error)
                     if not isinstance(start_error, Exception):
+                        raise start_error
+                    if not background_dispatch_invoked:
                         raise start_error
                     if isinstance(start_error, ModelStreamDeadlineError):
                         # Preserve the typed error for the common provider-error
@@ -8408,6 +8427,16 @@ class ModelStepExecutor:
                     error_type=type(deadline_error).__name__,
                     cause=deadline_error,
                 )
+            elif provider_failure is not None and isinstance(exc, ExecutionAdmissionError):
+                # Admission is runtime-owned control, not provider output. Keep
+                # its exact settlement handoff and structured decision through
+                # MODEL_ERROR publication and terminal environment cleanup.
+                provider_failure = replace(
+                    provider_failure,
+                    message=str(exc),
+                    error_type=type(exc).__name__,
+                    cause=exc,
+                )
             if provider_failure is not None:
                 if isinstance(provider_failure.cause, ModelContextOverflowError):
                     provider_control_failure = provider_failure.cause
@@ -8427,6 +8456,11 @@ class ModelStepExecutor:
                             "error": provider_failure.message,
                             "error_type": provider_failure.error_type,
                             **(
+                                {"execution_admission": exc.decision.model_dump(mode="json")}
+                                if isinstance(exc, ExecutionAdmissionError)
+                                else {}
+                            ),
+                            **(
                                 provider_failure.cause.error_payload_fields()
                                 if isinstance(provider_failure.cause, ModelProviderError)
                                 else {}
@@ -8438,7 +8472,9 @@ class ModelStepExecutor:
                             model_completion_publisher is not None and model_completed
                         ),
                         provider_effect_observed=provider_effect_observed,
-                        automatic_retry_disabled=deadline_failure,
+                        automatic_retry_disabled=(
+                            deadline_failure or isinstance(exc, ExecutionAdmissionError)
+                        ),
                     )
             elif durable_error is not None:
                 if invalid_provider_error:
@@ -8900,7 +8936,41 @@ class ModelStepRun:
         ):
             raise ValueError("Model-step execution lost frozen invocation authority.")
         self._invocation_context = invocation_context
-        self._validate_live_model_semantics = validate_live_model_semantics
+
+        def validate_live_execution_semantics() -> None:
+            validate_live_model_semantics()
+            if self._registered_environment is None:
+                return
+            if self._invocation_context is None or self._execution_profile is None:
+                raise RuntimeError(
+                    "Environment-backed model execution requires frozen exposure authority."
+                )
+            require_environment_exposed(
+                self._registered_environment,
+                session=self._session,
+                invocation_context=self._invocation_context,
+                registered_agent=self._registered_agent,
+                execution_profile=self._execution_profile,
+            )
+
+        async def refresh_live_execution_semantics() -> None:
+            validate_live_execution_semantics()
+            if self._registered_environment is None:
+                return
+            assert self._invocation_context is not None
+            assert self._execution_profile is not None
+            await refresh_and_require_environment_exposed(
+                self._registered_environment,
+                session=self._session,
+                invocation_context=self._invocation_context,
+                registered_agent=self._registered_agent,
+                execution_profile=self._execution_profile,
+                redactor=self._executor._secret_redactor,
+            )
+            validate_live_execution_semantics()
+
+        self._validate_live_model_semantics = validate_live_execution_semantics
+        self._refresh_live_model_semantics = refresh_live_execution_semantics
         capability_ceiling = tool_capability_ceiling_from_session_metadata(
             self._session.metadata,
         )
@@ -9311,6 +9381,11 @@ class ModelStepRun:
         request_variant: RequestVariant = RequestVariant.INITIAL,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         if self._registered_environment is not None:
+            if self._invocation_context is None or self._execution_profile is None:
+                raise RuntimeError(
+                    "Environment-backed model execution requires frozen exposure authority."
+                )
+            await self._refresh_live_model_semantics()
             from cayu.runtime.workspace_checkpoints import ensure_workspace_checkpoint
 
             await ensure_workspace_checkpoint(
@@ -9779,7 +9854,7 @@ class ModelStepRun:
         request_variant = RequestVariant(request_variant)
         initial_model_attempt_identity = model_step_identity.new_attempt()
         controller = self._executor._run_limit_controller
-        self._validate_live_model_semantics()
+        await self._refresh_live_model_semantics()
         try:
             billing_identity = await resolve_request_billing_identity(
                 self._provider,
@@ -10559,6 +10634,7 @@ class ModelStepRun:
                 prepare_provider_dispatch=prepare_provider_dispatch,
                 before_provider_dispatch=before_provider_dispatch,
                 validate_live_model_semantics=self._validate_live_model_semantics,
+                refresh_live_model_semantics=self._refresh_live_model_semantics,
                 record_model_attempt_identity=record_model_attempt_identity,
                 billing_identity=billing_identity,
                 structured_output=self._structured_output,
@@ -12923,7 +12999,7 @@ class ModelStepRun:
             # Context-policy execution can await arbitrary application code.
             # Reject changed provider semantics at the final remote count seam.
             try:
-                self._validate_live_model_semantics()
+                await self._refresh_live_model_semantics()
             except Exception as authority_error:
                 raise _ContextCountAuthorityError(authority_error) from None
             result = await self._provider.count_input_tokens(request)
@@ -13064,7 +13140,7 @@ class ModelStepRun:
             if deferred_failure is not None:
                 return deferred_failure
             try:
-                self._validate_live_model_semantics()
+                await self._refresh_live_model_semantics()
             except BaseException as authority_failure:
                 # The durable stage receipt has already crossed the last local
                 # provider fence. Fail closed without entering provider code.
@@ -13212,7 +13288,7 @@ class ModelStepRun:
             """Identify a built-in dispatch reached through an opaque wrapper."""
 
             del actual_model, actual_usage_dialect
-            self._validate_live_model_semantics()
+            await self._refresh_live_model_semantics()
             model_attempt_identity = compaction_identity_ledger.begin_dispatch()
             deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
             try:
@@ -13246,7 +13322,7 @@ class ModelStepRun:
                     raise
                 if deferred_dispatch_failure is not None:
                     raise deferred_dispatch_failure
-                self._validate_live_model_semantics()
+                await self._refresh_live_model_semantics()
                 lifecycle.provider_dispatch_disposition = (
                     _AutomaticCompactionDispatchDisposition.UNKNOWN
                 )
@@ -13326,7 +13402,10 @@ class ModelStepRun:
                     "for deterministic execution."
                 ) from exc
             if not has_accounting_limits:
-                with _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch):
+                with (
+                    _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch),
+                    _compaction_environment_admission_scope(self._refresh_live_model_semantics),
+                ):
                     return await execute_with_post_dispatch_failure_disposition()
             raise RuntimeError(
                 "Automatic provider-backed compaction under run or budget limits requires the "
@@ -13342,7 +13421,10 @@ class ModelStepRun:
                     "Provider-backed compaction cannot declare a deterministic budget "
                     "identity under run or cost limits."
                 )
-            with _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch):
+            with (
+                _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch),
+                _compaction_environment_admission_scope(self._refresh_live_model_semantics),
+            ):
                 return await execute_with_post_dispatch_failure_disposition()
         if type(identity) is not tuple or len(identity) != 2:
             raise TypeError(
@@ -13411,7 +13493,7 @@ class ModelStepRun:
             dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
         ) -> tuple[str, dict[str, Any]]:
             del actual_usage_dialect
-            self._validate_live_model_semantics()
+            await self._refresh_live_model_semantics()
             actual_pricing_provider_name = require_durable_clean_nonblank(
                 actual_pricing_provider_name,
                 "compactor_provider_name",
@@ -13434,7 +13516,7 @@ class ModelStepRun:
             try:
 
                 async def identified_dispatch() -> tuple[str, dict[str, Any]]:
-                    self._validate_live_model_semantics()
+                    await self._refresh_live_model_semantics()
                     if deadline_admission is None:
                         raise RuntimeError("Compaction deadline admission was not prepared.")
                     lifecycle.provider_dispatch_disposition = (
@@ -13538,7 +13620,7 @@ class ModelStepRun:
                 budget_events.extend(limit_evaluation.events)
                 deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
                 if not limits:
-                    self._validate_live_model_semantics()
+                    await self._refresh_live_model_semantics()
                     await record_compaction_footprint(
                         provider=provider,
                         provider_name=actual_provider_name,
@@ -13753,7 +13835,10 @@ class ModelStepRun:
                     deadline_admission.close()
                 compaction_identity_ledger.end_dispatch(model_attempt_identity)
 
-        with _automatic_compaction_dispatch_runner_scope(run_provider_dispatch):
+        with (
+            _automatic_compaction_dispatch_runner_scope(run_provider_dispatch),
+            _compaction_environment_admission_scope(self._refresh_live_model_semantics),
+        ):
             return await execute_with_post_dispatch_failure_disposition()
 
 

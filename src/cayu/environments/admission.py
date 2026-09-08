@@ -52,6 +52,8 @@ ExecutionAdmissionRefusalCode = Literal[
     "future_evidence",
     "overlong_evidence",
     "contradictory_evidence",
+    "environment_authority_mismatch",
+    "missing_final_evidence",
 ]
 ExecutionExecutableEvidenceState = Literal[
     "declared",
@@ -326,6 +328,20 @@ class ExecutionAdmissionCandidate(BaseModel):
         return self
 
 
+def _copy_execution_admission_candidate(
+    value: object,
+) -> ExecutionAdmissionCandidate | None:
+    """Defensively reconstruct extension evidence without diagnostic rendering."""
+
+    if type(value) is not ExecutionAdmissionCandidate:
+        return None
+    try:
+        payload = value.model_dump(mode="python", by_alias=True, warnings=False)
+        return ExecutionAdmissionCandidate.model_validate(payload)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 class ExecutionEnvironmentAuthority(BaseModel):
     """Opaque identity for one exact environment security boundary.
 
@@ -518,6 +534,32 @@ class ExecutionAdmissionDecision(BaseModel):
         if self.status == "refused":
             raise ExecutionAdmissionError(self)
         return self
+
+
+def _structured_execution_refusal(
+    *,
+    candidate: str,
+    requirements: ExecutionRequirements,
+    evidence: ExecutionCapabilityEvidence | None,
+    code: ExecutionAdmissionRefusalCode,
+    stage: ExecutionAdmissionStage = "pre_exposure",
+) -> ExecutionAdmissionDecision:
+    """Build one bounded refusal without retaining extension-owned diagnostics."""
+
+    return ExecutionAdmissionDecision(
+        status="refused",
+        stage=stage,
+        candidate=candidate,
+        requirements=requirements,
+        evidence_schema=None if evidence is None else evidence.schema_version,
+        evidence=evidence,
+        refusals=(
+            ExecutionAdmissionRefusal(
+                code=code,
+                observed_state="mismatched",
+            ),
+        ),
+    )
 
 
 class ExecutionAdmissionError(RuntimeError):

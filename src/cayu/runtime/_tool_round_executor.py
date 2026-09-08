@@ -116,6 +116,10 @@ from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.runtime._checkpoint_redaction import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
+from cayu.runtime._environment_exposure import (
+    refresh_and_require_environment_exposed,
+    require_environment_exposed,
+)
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._event_writer import RuntimeEventWriter, prepare_runtime_event
 from cayu.runtime._interruption_coordinator import (
@@ -3365,6 +3369,17 @@ class ToolRoundExecutor:
         tool_round_id = tool_round_identity.tool_round_id
         environment_name = _environment_name(registered_environment)
         if registered_environment is not None:
+            if invocation_context is None or execution_profile is None:
+                raise RuntimeError(
+                    "Environment-backed tool execution requires frozen exposure authority."
+                )
+            require_environment_exposed(
+                registered_environment,
+                session=session,
+                invocation_context=invocation_context,
+                registered_agent=registered_agent,
+                execution_profile=execution_profile,
+            )
             await ensure_workspace_checkpoint(self._session_store, session, registered_environment)
         registered_tool = registered_agent.executable_tool(tool_call.name)
         if rejoin_targeted_invocation:
@@ -5235,6 +5250,21 @@ class ToolRoundExecutor:
                 set_exception_cause(interrupt, failure)
 
         try:
+
+            async def require_live_environment_exposure() -> None:
+                if registered_environment is None:
+                    return
+                assert invocation_context is not None
+                assert execution_profile is not None
+                await refresh_and_require_environment_exposed(
+                    registered_environment,
+                    session=session,
+                    invocation_context=invocation_context,
+                    registered_agent=registered_agent,
+                    execution_profile=execution_profile,
+                    redactor=invocation_secret_scope.redactor,
+                )
+
             execution_outcome = await tool_execution.run_tool(
                 tool=registered_tool.tool,
                 effect=registered_tool.effect,
@@ -5245,6 +5275,7 @@ class ToolRoundExecutor:
                 registered_execution_contract=registered_tool.execution_contract,
                 finalize_publication=invocation_secret_scope.seal_for_publication,
                 timeout_seconds=self._tool_timeout_seconds,
+                before_dispatch=require_live_environment_exposure,
             )
         except BaseExceptionGroup as exc:
             if any(

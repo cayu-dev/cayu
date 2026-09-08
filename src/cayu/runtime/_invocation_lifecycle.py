@@ -608,12 +608,36 @@ class InvocationContext:
     ) -> None:
         """Accept only binding or owned-result settlement, never handle substitution."""
 
+        if current.execution_candidate is None and replacement.execution_candidate is not None:
+            if (
+                replacement.factory is not current.factory
+                or replacement.environment is not current.environment
+                or replacement.bound_workspace is not current.bound_workspace
+                or replacement.binding_payload is not current.binding_payload
+                or replacement.unclaimed_factory_result is not current.unclaimed_factory_result
+                or replacement.retained_factory_result is not current.retained_factory_result
+                or replacement.preserve_factory_allocation != current.preserve_factory_allocation
+                or replacement.live_allocation_fingerprint != current.live_allocation_fingerprint
+                or replacement.binding_generation_id != current.binding_generation_id
+                or replacement.workspace_mutation_fence is not current.workspace_mutation_fence
+                or replacement.environment_exposure is not None
+            ):
+                raise ValueError("Invocation context received an invalid environment selection.")
+            return
+
         if (
             replacement.factory is not None
             or replacement.binding_generation_id != current.binding_generation_id
             or replacement.workspace_mutation_fence is not current.workspace_mutation_fence
             or replacement.execution_candidate != current.execution_candidate
+            or replacement.execution_candidate_declared != current.execution_candidate_declared
+            or replacement.execution_environment_authority
+            is not current.execution_environment_authority
             or replacement.live_allocation_fingerprint != current.live_allocation_fingerprint
+            or (
+                current.environment_exposure is not None
+                and replacement.environment_exposure is not current.environment_exposure
+            )
         ):
             raise ValueError("Invocation context cannot replace its resolved environment.")
 

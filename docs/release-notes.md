@@ -30,6 +30,14 @@ deployments must use one consistent public-authority alias keyring.
 
 ### What this candidate validates
 
+- Environment selection, side-effect-free preflight, allocation/reconnect,
+  binding, exact final evidence, admission, and exposure now flow through one
+  runtime-owned lifecycle. Typed transition events expose bounded audit state,
+  while private exposure authority and dispatch-time freshness checks prevent
+  direct factories, reconstructed state, or expired evidence from authorizing
+  model and tool execution. The runtime can renew expired live evidence for the
+  exact admitted runner without allowing identity drift, and fences cleanup
+  behind any authenticated renewal probe still settling.
 - Evals can execute an application-owned `WorkflowBase` as a typed target, bind
   projected output to the current durable completion attempt, and score its
   complete child/tool/usage closure through direct suites, portable corpora, CLI,

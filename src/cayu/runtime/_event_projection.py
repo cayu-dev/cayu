@@ -2238,12 +2238,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.MODEL_ERROR] = _policy(
         *model_failure_keys,
+        "execution_admission",
         "provider_operation_progress",
         "reason",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         internal_keys={"provider_operation_progress"},
         exact_internal_keys={"provider_operation_progress"},
+        untrusted_container_keys={"execution_admission"},
     )
     policies[EventType.MODEL_RETRY] = _policy(
         *model_failure_keys,
@@ -3609,6 +3611,21 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         EventType.ENVIRONMENT_FACTORY_FAILED,
     ):
         policies[event_type] = factory_policy
+    policies[EventType.ENVIRONMENT_LIFECYCLE_TRANSITION] = _observed_policy(
+        "binding_generation_id candidate evidence_schema evidence_states evidence_valid_until "
+        "executable_evidence_states execution_profile_fingerprint outcome ownership phase "
+        "refusal_capabilities refusal_codes refusal_executable_sha256 release_action "
+        "schema_version",
+        authority_keys={"binding_generation_id", "execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        untrusted_container_keys={
+            "evidence_states",
+            "executable_evidence_states",
+            "refusal_capabilities",
+            "refusal_codes",
+            "refusal_executable_sha256",
+        },
+    )
 
     hook_policy = _observed_policy(
         "actions durable_value_error_code durable_value_error_path error error_type execution_profile_fingerprint hook_index "

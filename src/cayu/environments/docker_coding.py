@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,9 +36,9 @@ from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
+    ExecutionEnvironmentAuthority,
     ExecutionExecutableEvidence,
     ExecutionToolRequirementEvidence,
-    evaluate_execution_admission,
 )
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import (
@@ -853,13 +854,22 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
-            behavior_version="13",
+            behavior_version="14",
             implementation_version=self._configuration_fingerprint,
+        )
+        self._execution_environment_authority = ExecutionEnvironmentAuthority(
+            identity=f"docker_coding_{uuid4().hex}",
+            profile_identity=self._configuration_fingerprint,
         )
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
         return self._profile_identity
+
+    def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
+        """Return the exact authority every runner from this factory preserves."""
+
+        return self._execution_environment_authority
 
     @property
     def immutable_input_capability(self) -> ImmutableInputAdapterCapability:
@@ -1160,12 +1170,6 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 )
             }
         )
-        evaluate_execution_admission(
-            candidate="docker",
-            requirements=effective_requirements,
-            evidence=self._configured_candidate().evidence,
-            stage="pre_create",
-        ).require_admitted()
         verify_local_docker_coding_toolchain_dependencies(
             self.toolchain_profile,
             self.source_workspace.root,
@@ -1244,10 +1248,20 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             exact_container_id = runner.container_id
             if exact_container_id is None:
                 raise RuntimeError("Docker coding runner lost its exact container identity.")
+            await _run_toolchain_admission_probes(
+                runner,
+                self.toolchain_profile,
+            )
+            # The factory records the runner's already-collected construction
+            # evidence for diagnostics only.  The common runtime lifecycle
+            # performs the authoritative live refresh after binding/setup.
             final_candidate = runner.execution_admission_candidate()
+            if final_candidate is None:
+                raise RuntimeError("Docker coding runner omitted final environment evidence.")
             final_evidence = final_candidate.evidence
             if (
-                final_evidence.environment_fingerprint is None
+                final_candidate.candidate != "docker"
+                or final_evidence.environment_fingerprint is None
                 or final_evidence.image_fingerprint != self.image_identity.fingerprint
                 or final_evidence.toolchain_profile_fingerprint
                 != self.toolchain_profile.fingerprint
@@ -1266,18 +1280,6 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 raise RuntimeError(
                     "Docker coding runner did not produce exact final environment evidence."
                 )
-            final_decision = evaluate_execution_admission(
-                candidate=final_candidate.candidate,
-                requirements=effective_requirements,
-                evidence=final_evidence,
-                stage="pre_exposure",
-            ).require_admitted()
-            if final_decision.evidence is None:
-                raise RuntimeError("Docker coding admission returned no final evidence.")
-            await _run_toolchain_admission_probes(
-                runner,
-                self.toolchain_profile,
-            )
             workspace = RunnerWorkspace(
                 runner,
                 cwd=None,
@@ -1295,7 +1297,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 target_workspace=workspace,
                 immutable_input_attachments=attachments,
             )
-            evidence_metadata = final_decision.evidence.to_metadata()
+            evidence_metadata = final_evidence.to_metadata()
             metadata = {
                 "kind": "docker_coding",
                 "container_id": exact_container_id,
@@ -1445,6 +1447,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
                 immutable_input_mounts=immutable_mounts,
                 allocation_identity=allocation_identity,
+                _execution_environment_authority=(self._execution_environment_authority),
             )
         except Exception:
             recovered_id = await DockerRunner.resolve_container_id(
@@ -1482,6 +1485,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             required_executables=self.required_executables,
             toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
             immutable_input_mounts=immutable_mounts,
+            _execution_environment_authority=(self._execution_environment_authority),
         )
 
     async def _reconcile_interrupted_immutable_cleanup(

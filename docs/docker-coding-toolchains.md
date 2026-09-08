@@ -67,17 +67,20 @@ runtime policy, or pass an existing policy as `base_policy`. Authorities marked
 remain quarantined; policy evidence publishes digests and bounded selector/profile
 metadata.
 
-The factory verifies source dependency hashes before allocating Docker. It then
-admits the exact final image, no-network restrictions, executable evidence,
-platform, and bounded profile probes. Checks and commands repeat image,
-executable, evidence-expiry, and dependency admission before dispatch. If live
-evidence expires, the strict Docker runner re-inspects the same container ID and
-repeats live restriction, immutable-input, and executable probes before issuing
-fresh evidence. Concurrent renewals share one probe pass; fresh evidence needs no
-additional Docker calls. Renewal preserves image, toolchain profile, and
-environment identity, and never extends an old observation's lifetime.
-Invocation-scoped renewal detaches private probe failures and preserves genuine
-caller cancellation even when a runner suppresses or fabricates cancellation.
+The factory verifies source dependency hashes before allocating Docker, builds
+the restricted container, and reports exact image, no-network, executable,
+platform, and bounded profile evidence. The common lifecycle admits that
+evidence only after binding and repeats admission at each actual provider or
+tool dispatch. If live evidence expires, it asks the
+strict Docker runner to re-inspect the same container ID and repeat live
+restriction, immutable-input, and executable probes before it evaluates the
+fresh candidate. Named checks and structured commands repeat that validation
+defensively; those downstream checks do not authorize an unexposed runner.
+Concurrent renewals share one probe pass; fresh evidence needs no additional
+Docker calls. Renewal preserves image, toolchain profile, and environment
+identity, and never extends an old observation's lifetime. Invocation-scoped
+renewal detaches private probe failures and preserves genuine caller
+cancellation even when a runner suppresses or fabricates cancellation.
 Missing renewal support, failed probes, configuration drift, and evidence that
 expires during renewal still fail closed. A task that changes a declared manifest
 or lockfile still receives a stale-toolchain result before execution: prepare and

@@ -63,13 +63,13 @@ from cayu.environments import (
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentSpec,
-    ExecutionAdmissionError,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionEvidenceOverride,
     ExecutionRequirements,
     SyncBinding,
     SyncTargetWorkspacePlan,
+    evaluate_execution_admission,
 )
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.environments.factory import (
@@ -795,6 +795,48 @@ def _virtual_factory(**kwargs: Any) -> VirtualEgressEnvironmentFactory:
     }
     defaults.update(kwargs)
     return VirtualEgressEnvironmentFactory(**defaults)
+
+
+class _AdmissionRecordingProvider(ModelProvider):
+    name = "admission-test"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+async def _run_virtual_factory_lifecycle(
+    factory: VirtualEgressEnvironmentFactory,
+    *,
+    session_id: str,
+    requirements: ExecutionRequirements,
+) -> tuple[list[Event], _AdmissionRecordingProvider, CayuApp]:
+    provider = _AdmissionRecordingProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment_factory(
+        EnvironmentSpec(name="egress-env"),
+        factory,
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        execution_requirements=requirements,
+    )
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            )
+        )
+    ]
+    return events, provider, app
 
 
 def _egress_binding(
@@ -1573,50 +1615,49 @@ def test_factory_does_not_fallback_to_docker_for_an_unavailable_microvm() -> Non
     assert docker_adapter.prepare_calls == []
 
 
-def test_factory_refuses_untrusted_execution_before_adapter_resources() -> None:
+def test_runtime_refuses_untrusted_egress_before_adapter_resources() -> None:
     adapter = _RecordingAdapter("custom-runner")
 
-    async def run() -> None:
-        factory = _virtual_factory(adapter=adapter)
-        with pytest.raises(ExecutionAdmissionError) as raised:
-            await factory.create(
-                EnvironmentFactoryRequest(
-                    session_id="sess_admission",
-                    agent_name="agent",
-                    environment_name="egress-env",
-                    execution_requirements=ExecutionRequirements.untrusted(),
-                )
-            )
-        assert {refusal.capability for refusal in raised.value.decision.refusals} == set(
-            ExecutionRequirements.untrusted().required_capabilities()
+    events, provider, _app = asyncio.run(
+        _run_virtual_factory_lifecycle(
+            _virtual_factory(adapter=adapter),
+            session_id="sess_admission",
+            requirements=ExecutionRequirements.untrusted(),
         )
-
-    asyncio.run(run())
+    )
 
     assert adapter.prepare_calls == []
+    assert provider.requests == []
+    failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    assert {
+        refusal["capability"] for refusal in failed.payload["execution_admission"]["refusals"]
+    } == set(ExecutionRequirements.untrusted().required_capabilities())
 
 
 def test_builtin_docker_is_explicitly_unsupported_for_untrusted_execution() -> None:
-    async def run() -> None:
-        factory = _virtual_factory(runner_kind="docker")
-        with pytest.raises(ExecutionAdmissionError) as raised:
-            await factory.create(
-                EnvironmentFactoryRequest(
-                    session_id="sess_untrusted_docker",
-                    agent_name="agent",
-                    environment_name="egress-env",
-                    execution_requirements=ExecutionRequirements.untrusted(),
-                )
-            )
-        refusal = next(
-            item
-            for item in raised.value.decision.refusals
-            if item.capability == "untrusted_code_isolation"
-        )
-        assert refusal.code == "unsupported_capability"
-        assert refusal.reason_code == "container_isolation_unsupported"
+    factory = _virtual_factory(runner_kind="docker")
+    request = EnvironmentFactoryRequest(
+        session_id="sess_untrusted_docker",
+        agent_name="agent",
+        environment_name="egress-env",
+        execution_requirements=ExecutionRequirements.untrusted(),
+    )
 
-    asyncio.run(run())
+    async def candidate_from_running_loop():  # type: ignore[no-untyped-def]
+        return factory.execution_admission_candidate(request)
+
+    candidate = asyncio.run(candidate_from_running_loop())
+    decision = evaluate_execution_admission(
+        candidate=candidate.candidate,
+        requirements=request.execution_requirements,
+        evidence=candidate.evidence,
+        stage="pre_create",
+    )
+    refusal = next(
+        item for item in decision.refusals if item.capability == "untrusted_code_isolation"
+    )
+    assert refusal.code == "unsupported_capability"
+    assert refusal.reason_code == "container_isolation_unsupported"
 
 
 def test_factory_does_not_accept_caller_assertions_in_place_of_adapter_evidence() -> None:
@@ -1629,7 +1670,7 @@ def test_factory_does_not_accept_caller_assertions_in_place_of_adapter_evidence(
         )
 
 
-def test_factory_refuses_weakened_runtime_evidence_and_cleans_up_before_exposure() -> None:
+def test_runtime_refuses_weakened_egress_evidence_and_cleans_up_before_exposure() -> None:
     class _RuntimeEvidenceAdapter(_RecordingAdapter):
         def execution_capability_evidence(
             self,
@@ -1642,22 +1683,20 @@ def test_factory_refuses_weakened_runtime_evidence_and_cleans_up_before_exposure
 
     adapter = _RuntimeEvidenceAdapter("hosted-runner")
 
-    async def run() -> None:
-        factory = _virtual_factory(adapter=adapter)
-        with pytest.raises(ExecutionAdmissionError) as raised:
-            await factory.create(
-                EnvironmentFactoryRequest(
-                    session_id="sess_runtime_admission",
-                    agent_name="agent",
-                    environment_name="egress-env",
-                    execution_requirements=ExecutionRequirements.untrusted(),
-                )
-            )
-        assert raised.value.decision.stage == "pre_exposure"
-        assert raised.value.decision.refusals[0].capability == "deny_by_default_network"
+    events, provider, _app = asyncio.run(
+        _run_virtual_factory_lifecycle(
+            _virtual_factory(adapter=adapter),
+            session_id="sess_runtime_admission",
+            requirements=ExecutionRequirements.untrusted(),
+        )
+    )
 
-    asyncio.run(run())
-
+    assert provider.requests == []
+    failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    assert failed.payload["execution_admission"]["stage"] == "pre_exposure"
+    assert failed.payload["execution_admission"]["refusals"][0]["capability"] == (
+        "deny_by_default_network"
+    )
     assert len(adapter.prepare_calls) == 1
     assert adapter.torn_down == 1
     runner = adapter.captured["inner_runner"]
@@ -1691,7 +1730,9 @@ def test_factory_admits_live_network_with_available_isolation_and_lifecycle_evid
     assert claims["untrusted_code_isolation"] == "available"
 
 
-def test_factory_rechecks_live_evidence_after_async_setup_before_return() -> None:
+def test_runtime_rechecks_live_evidence_after_async_setup_before_exposure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _ExpiringEvidenceAdapter(_RecordingAdapter):
         def __init__(self) -> None:
             super().__init__("hosted-runner")
@@ -1713,23 +1754,47 @@ def test_factory_rechecks_live_evidence_after_async_setup_before_return() -> Non
 
     adapter = _ExpiringEvidenceAdapter()
 
-    async def emitter(event: Event) -> Event:
-        await asyncio.sleep(0.06)
-        return event
-
     async def run() -> None:
-        with pytest.raises(ExecutionAdmissionError) as raised:
-            await _virtual_factory(adapter=adapter, event_emitter=emitter).create(
-                EnvironmentFactoryRequest(
+        factory = _virtual_factory(adapter=adapter)
+        provider = _AdmissionRecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress-env"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            execution_requirements=_live_network_execution_requirements(),
+        )
+        original_emit = app._event_writer.emit
+
+        async def delayed_emit(event: Event) -> Event:
+            if (
+                event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
+                and event.payload.get("phase") == "final_evidence"
+            ):
+                await asyncio.sleep(0.06)
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", delayed_emit)
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
                     session_id="sess_expired_before_return",
-                    agent_name="agent",
-                    environment_name="egress-env",
-                    execution_requirements=_live_network_execution_requirements(),
+                    messages=[Message.text("user", "run")],
                 )
             )
-        assert [(item.capability, item.code) for item in raised.value.decision.refusals] == [
-            ("deny_by_default_network", "stale_evidence")
         ]
+        assert provider.requests == []
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        assert [
+            (item["capability"], item["code"])
+            for item in failed.payload["execution_admission"]["refusals"]
+        ] == [("deny_by_default_network", "stale_evidence")]
 
     asyncio.run(run())
 
@@ -1744,25 +1809,24 @@ def test_factory_rechecks_live_evidence_after_async_setup_before_return() -> Non
         ("stale", "stale_evidence"),
     ],
 )
-def test_factory_refuses_weakened_or_stale_capability_override(
+def test_runtime_refuses_weakened_or_stale_capability_override(
     network_state: str,
     expected_code: str,
 ) -> None:
     adapter = _MixedAssuranceAdapter(network_state)
 
     async def run() -> None:
-        with pytest.raises(ExecutionAdmissionError) as raised:
-            await _virtual_factory(adapter=adapter).create(
-                EnvironmentFactoryRequest(
-                    session_id=f"sess_mixed_{network_state}",
-                    agent_name="agent",
-                    environment_name="egress-env",
-                    execution_requirements=_live_network_execution_requirements(),
-                )
-            )
-        assert [(item.capability, item.code) for item in raised.value.decision.refusals] == [
-            ("deny_by_default_network", expected_code)
-        ]
+        events, provider, _app = await _run_virtual_factory_lifecycle(
+            _virtual_factory(adapter=adapter),
+            session_id=f"sess_mixed_{network_state}",
+            requirements=_live_network_execution_requirements(),
+        )
+        assert provider.requests == []
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        assert [
+            (item["capability"], item["code"])
+            for item in failed.payload["execution_admission"]["refusals"]
+        ] == [("deny_by_default_network", expected_code)]
 
     asyncio.run(run())
 

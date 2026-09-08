@@ -1558,6 +1558,7 @@ def _without_request_evidence(events: list[Event]) -> list[Event]:
     request_evidence_types = {
         EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.TOOL_EXPOSURE_RECORDED,
+        EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
     }
     return [event for event in events if event.type not in request_evidence_types]
 
@@ -5184,7 +5185,9 @@ def test_environment_factory_completion_payload_is_isolated_from_started_event()
     started, remaining = asyncio.run(run())
 
     assert started.type == EventType.ENVIRONMENT_FACTORY_STARTED
-    completed = remaining[0]
+    completed = next(
+        event for event in remaining if event.type is EventType.ENVIRONMENT_FACTORY_COMPLETED
+    )
     assert completed.type == EventType.ENVIRONMENT_FACTORY_COMPLETED
     assert completed.payload["factory_type"] == "RecordingEnvironmentFactory"
     assert "consumer_only" not in completed.payload
@@ -6486,8 +6489,10 @@ def test_cancellation_waits_for_factory_fallback_release_then_propagates(tmp_pat
             self.close_started = asyncio.Event()
             self.finish_close = asyncio.Event()
             self.close_completed = asyncio.Event()
+            self.close_calls = 0
 
         async def close(self) -> None:
+            self.close_calls += 1
             self.close_started.set()
             await self.finish_close.wait()
             self.close_completed.set()
@@ -6524,12 +6529,16 @@ def test_cancellation_waits_for_factory_fallback_release_then_propagates(tmp_pat
             )
         )
         await asyncio.wait_for(runner.close_started.wait(), timeout=10)
-        run_task.cancel()
+        run_task.cancel("cancel during factory fallback release")
+        assert run_task.cancelling() == 1
         await asyncio.sleep(0)
         assert run_task.done() is False
         runner.finish_close.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as raised:
             await run_task
+        assert raised.value.args == ("cancel during factory fallback release",)
+        assert run_task.cancelled() is True
+        assert runner.close_calls == 1
         assert runner.close_completed.is_set()
 
     asyncio.run(run())
@@ -7702,7 +7711,12 @@ def test_environment_binding_completion_payload_is_isolated_from_started_event()
         )
         interaction_started = await anext(stream)
         assert interaction_started.type == EventType.INTERACTION_STARTED
-        started = await anext(stream)
+        started = None
+        async for event in stream:
+            if event.type is EventType.ENVIRONMENT_BINDING_STARTED:
+                started = event
+                break
+        assert started is not None
         started.payload["binding_type"] = "consumer-spoof"
         started.payload["consumer_only"] = True
         remaining = [event async for event in stream]
@@ -7711,7 +7725,9 @@ def test_environment_binding_completion_payload_is_isolated_from_started_event()
     started, remaining = asyncio.run(run())
 
     assert started.type == EventType.ENVIRONMENT_BINDING_STARTED
-    completed = remaining[0]
+    completed = next(
+        event for event in remaining if event.type is EventType.ENVIRONMENT_BINDING_COMPLETED
+    )
     assert completed.type == EventType.ENVIRONMENT_BINDING_COMPLETED
     assert completed.payload["binding_type"] == "RecordingWorkspaceBinding"
     assert "consumer_only" not in completed.payload

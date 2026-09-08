@@ -90,7 +90,6 @@ from cayu.egress.destinations import normalize_egress_hostname, validate_approve
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionEnvironmentAuthority,
-    evaluate_execution_admission,
 )
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import (
@@ -1028,13 +1027,6 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             adapter,
             allocation=allocation,
         )
-        admission_evidence = adapter.execution_capability_evidence()
-        evaluate_execution_admission(
-            candidate=runner_kind,
-            requirements=request.execution_requirements,
-            evidence=admission_evidence,
-            stage="pre_create",
-        ).require_admitted()
         raw_configuration = adapter.configuration_metadata()
         if type(raw_configuration) is not dict:
             raise TypeError("Egress adapter configuration_metadata must return a dict.")
@@ -1161,16 +1153,6 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     runner_request,
                     allow_create=allow_create,
                 )
-            runtime_admission_evidence = adapter.execution_capability_evidence(runner)
-            runtime_admission = evaluate_execution_admission(
-                candidate=runner_kind,
-                requirements=request.execution_requirements,
-                evidence=runtime_admission_evidence,
-                stage="pre_exposure",
-            ).require_admitted()
-            if runtime_admission.evidence is None:
-                raise RuntimeError("Admitted execution evidence is missing.")
-            execution_capability_metadata = runtime_admission.evidence.to_metadata()
             if adapter.supports_reconnect:
                 adapter_reconnect_metadata = adapter.validate_reconnect_metadata(
                     adapter.reconnect_metadata(runner)
@@ -1258,15 +1240,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             final_admission_candidate = managed_runner.execution_admission_candidate()
             if final_admission_candidate is None:
                 raise RuntimeError("Managed egress runner omitted execution admission evidence.")
-            final_admission = evaluate_execution_admission(
-                candidate=runner_kind,
-                requirements=request.execution_requirements,
-                evidence=final_admission_candidate.evidence,
-                stage="pre_exposure",
-            ).require_admitted()
-            if final_admission.evidence is None:
-                raise RuntimeError("Admitted execution evidence is missing.")
-            execution_capability_metadata = final_admission.evidence.to_metadata()
+            if final_admission_candidate.candidate != runner_kind:
+                raise RuntimeError("Managed egress runner changed its selected candidate.")
+            execution_capability_metadata = final_admission_candidate.evidence.to_metadata()
 
             environment_metadata: dict[str, Any] = {
                 "kind": runner_kind,

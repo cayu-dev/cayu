@@ -2596,6 +2596,10 @@ _AUTOMATIC_COMPACTION_DISPATCH_RUNNER: ContextVar[_AutomaticCompactionDispatchRu
         default=None,
     )
 )
+_COMPACTION_ENVIRONMENT_ADMISSION: ContextVar[Callable[[], Awaitable[None]] | None] = ContextVar(
+    "compaction_environment_admission",
+    default=None,
+)
 _COMPACTION_MODEL_ATTEMPT_IDENTITY: ContextVar[ModelAttemptIdentity | None] = ContextVar(
     "compaction_model_attempt_identity",
     default=None,
@@ -2641,6 +2645,19 @@ def _automatic_compaction_dispatch_runner_scope(
         yield
     finally:
         _AUTOMATIC_COMPACTION_DISPATCH_RUNNER.reset(token)
+
+
+@contextmanager
+def _compaction_environment_admission_scope(
+    admission: Callable[[], Awaitable[None]] | None,
+) -> Iterator[None]:
+    """Bind the runtime-owned environment gate across compactor-owned hooks."""
+
+    token = _COMPACTION_ENVIRONMENT_ADMISSION.set(admission)
+    try:
+        yield
+    finally:
+        _COMPACTION_ENVIRONMENT_ADMISSION.reset(token)
 
 
 @contextmanager
@@ -4526,6 +4543,9 @@ async def _run_compaction_model(
     billing_cancellation: asyncio.CancelledError | None = None
     billing_failure: ModelProviderError | None = None
     try:
+        environment_admission = _COMPACTION_ENVIRONMENT_ADMISSION.get()
+        if environment_admission is not None:
+            await environment_admission()
         billing_identity = await resolve_request_billing_identity(
             provider,
             _detach_compaction_model_request(request_template),

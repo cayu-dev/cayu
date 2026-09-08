@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import posixpath
@@ -11,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import BinaryIO, Literal, cast
+from typing import TYPE_CHECKING, BinaryIO, Literal, cast
 from uuid import uuid4
 
 from cayu._validation import (
@@ -34,10 +35,16 @@ from cayu.runners._cleanup import (
     validate_runner_cleanup_policy,
 )
 from cayu.runners._creation_cleanup import (
+    CreationLease,
+    acquire_creation_lease,
+    drain_acquisition_restorations,
     drain_creation_cleanups,
+    register_acquisition_restoration_retry,
     require_creation_cleanup_settled,
+    retry_acquisition_settlement,
     settle_creation_cleanup,
 )
+from cayu.runners._diagnostics import runner_failure_fields
 from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_allowlist
 from cayu.runners._secrets import (
     merge_secret_env_values,
@@ -78,6 +85,9 @@ from cayu.runners.workloads import (
     PINNED_BROWSER_FETCH_WORKLOAD,
     PINNED_BROWSER_SESSION_WORKLOAD,
 )
+
+if TYPE_CHECKING:
+    from cayu.environments.admission import ExecutionEnvironmentAuthority
 from cayu.vaults import (
     SecretEnv,
     SecretRedactor,
@@ -591,45 +601,38 @@ async def _probe_strict_container(
     restrictions: DockerWorkloadRestrictions,
     required_executables: tuple[str, ...],
     docker_cli_env_allowlist: Sequence[str],
+    supervise_guest: bool = True,
 ) -> tuple[tuple[str, bool], ...]:
-    identity = await _run_docker(
+    identity = await _run_docker_admission_probe(
         docker_path,
-        ["exec", container_id, "sh", "-c", 'printf \'%s:%s\' "$(id -u)" "$(id -g)"'],
+        container_id,
+        script='printf \'%s:%s\' "$(id -u)" "$(id -g)"',
         docker_cli_env_allowlist=docker_cli_env_allowlist,
-        timeout_s=30,
+        supervise_guest=supervise_guest,
     )
     if identity.exit_code != 0 or identity.timed_out or identity.stdout != restrictions.user:
         raise DockerRuntimeConfigurationError("nonroot_runtime_identity_drift")
-    home_probe = await _run_docker(
+    home_probe = await _run_docker_admission_probe(
         docker_path,
-        [
-            "exec",
-            container_id,
-            "sh",
-            "-c",
+        container_id,
+        script=(
             'for path do test -d "$path" && test ! -L "$path" && test -w "$path" && '
-            '(cd -P "$path" && test "$PWD" = "$path") || exit 1; done',
-            "cayu-home-probe",
-            *restrictions.home_environment.values(),
-        ],
+            '(cd -P "$path" && test "$PWD" = "$path") || exit 1; done'
+        ),
+        argv=("cayu-home-probe", *restrictions.home_environment.values()),
         docker_cli_env_allowlist=docker_cli_env_allowlist,
-        timeout_s=30,
+        supervise_guest=supervise_guest,
     )
     if home_probe.exit_code != 0 or home_probe.timed_out:
         raise DockerRuntimeConfigurationError("writable_home_unavailable")
     availability: list[tuple[str, bool]] = []
     for executable in required_executables:
-        result = await _run_docker(
+        result = await _run_docker_admission_probe(
             docker_path,
-            [
-                "exec",
-                container_id,
-                "sh",
-                "-c",
-                f"command -v {shlex.quote(executable)} >/dev/null 2>&1",
-            ],
+            container_id,
+            script=f"command -v {shlex.quote(executable)} >/dev/null 2>&1",
             docker_cli_env_allowlist=docker_cli_env_allowlist,
-            timeout_s=30,
+            supervise_guest=supervise_guest,
         )
         availability.append((executable, result.exit_code == 0 and not result.timed_out))
     return tuple(availability)
@@ -641,27 +644,22 @@ async def _probe_immutable_input_mounts(
     mounts: tuple[DockerImmutableInputMount, ...],
     *,
     docker_cli_env_allowlist: Sequence[str],
+    supervise_guest: bool = True,
 ) -> None:
     """Prove the daemon rejects a root write instead of trusting mount syntax."""
 
     for mount in mounts:
         probe_name = f".cayu-read-only-probe-{uuid4().hex}"
-        result = await _run_docker(
+        result = await _run_docker_admission_probe(
             docker_path,
-            [
-                "exec",
-                "-u",
-                "root",
-                container_id,
-                "sh",
-                "-c",
-                'probe="$1/$2"; if (: >"$probe") 2>/dev/null; then rm -f -- "$probe"; exit 73; fi',
-                "cayu-immutable-input-probe",
-                mount.target_path,
-                probe_name,
-            ],
+            container_id,
+            user="root",
+            script=(
+                'probe="$1/$2"; if (: >"$probe") 2>/dev/null; then rm -f -- "$probe"; exit 73; fi'
+            ),
+            argv=("cayu-immutable-input-probe", mount.target_path, probe_name),
             docker_cli_env_allowlist=docker_cli_env_allowlist,
-            timeout_s=30,
+            supervise_guest=supervise_guest,
         )
         if result.timed_out or result.exit_code != 0:
             raise DockerRuntimeConfigurationError(
@@ -943,11 +941,20 @@ class _DockerCommandHandle:
         name: str,
         pid_file: str,
         docker_cli_env_allowlist: Sequence[str],
+        user: str | None = None,
     ) -> None:
         self.docker_path = docker_path
         self.name = name
         self.pid_file = pid_file
         self.docker_cli_env_allowlist = tuple(docker_cli_env_allowlist)
+        self.user = user
+
+    def _exec_argv(self, script: str) -> list[str]:
+        argv = ["exec"]
+        if self.user is not None:
+            argv.extend(("-u", self.user))
+        argv.extend((self.name, "sh", "-c", script))
+        return argv
 
     async def has_started(self) -> bool:
         # This unpredictable per-command record is written by the guest
@@ -955,16 +962,12 @@ class _DockerCommandHandle:
         # an exited supervisor is sufficient for the explicit `none` opt-out.
         result = await _run_docker(
             self.docker_path,
-            [
-                "exec",
-                self.name,
-                "sh",
-                "-c",
+            self._exec_argv(
                 f"read pid group < {shlex.quote(self.pid_file)} 2>/dev/null || exit 1; "
                 "case \"$pid\" in ''|*[!0-9]*) exit 1 ;; esac; "
                 'case "$group" in 0|1|2) ;; *) exit 1 ;; esac; '
-                'test "$pid" -gt 1',
-            ],
+                'test "$pid" -gt 1'
+            ),
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         return result.exit_code == 0 and not result.timed_out
@@ -973,15 +976,281 @@ class _DockerCommandHandle:
         for _ in range(RUNNER_COMMAND_KILL_ATTEMPTS):
             result = await _run_docker(
                 self.docker_path,
-                ["exec", self.name, "sh", "-c", _kill_supervised_command_script(self.pid_file)],
+                self._exec_argv(_kill_supervised_command_script(self.pid_file)),
                 docker_cli_env_allowlist=self.docker_cli_env_allowlist,
             )
-            if result.exit_code == 0:
+            if result.exit_code == 0 and not result.timed_out:
                 return True
         # Absence cannot distinguish a completed command from an accepted exec
         # whose supervisor has not started yet. Only acknowledged cleanup may
         # authorize reuse; otherwise the caller must poison the runner.
         return False
+
+
+def _docker_admission_probe_completion(
+    result: ExecResult,
+    *,
+    completion_token: str,
+) -> ExecResult | None:
+    """Recover the guest exit status only from an exact completed wrapper."""
+
+    if result.timed_out or result.cancelled or result.exit_code != 0 or result.stderr_truncated:
+        return None
+    marker = re.search(
+        rf"\n{re.escape(completion_token)}:([0-9]{{1,3}})\n\Z",
+        result.stderr,
+    )
+    if marker is None:
+        return None
+    guest_exit_code = int(marker.group(1))
+    if guest_exit_code > 255:
+        return None
+    marker_bytes = len(marker.group(0).encode("utf-8"))
+    return result.model_copy(
+        update={
+            "stderr": result.stderr[: marker.start()],
+            "stderr_bytes": (
+                None if result.stderr_bytes is None else max(0, result.stderr_bytes - marker_bytes)
+            ),
+            "exit_code": guest_exit_code,
+        }
+    )
+
+
+def _docker_probe_command_settled(
+    task: asyncio.Task[ExecResult],
+    *,
+    completion_token: str,
+) -> bool:
+    """Return positive guest settlement, never host-transport absence."""
+
+    if not task.done() or task.cancelled():
+        return False
+    try:
+        result = task.result()
+    except BaseException:
+        return False
+    return (
+        _docker_admission_probe_completion(
+            result,
+            completion_token=completion_token,
+        )
+        is not None
+    )
+
+
+def _defer_docker_probe_settlement(
+    *,
+    container_id: str,
+    command_task: asyncio.Task[ExecResult],
+    handle: _DockerCommandHandle,
+    acquisition: CreationLease,
+    completion_token: str,
+) -> asyncio.Task[None]:
+    """Retain one exact container fence until a dispatched probe is quiescent."""
+
+    from cayu.environments.factory import register_environment_factory_cleanup_retry
+
+    state = {"guest_quiescent": False}
+
+    async def settle() -> None:
+        if state["guest_quiescent"]:
+            return
+        if _docker_probe_command_settled(
+            command_task,
+            completion_token=completion_token,
+        ):
+            state["guest_quiescent"] = True
+            return
+        cleanup = await cleanup_runner_command_with_diagnostic(
+            handle,
+            handle=handle,
+            adapter="docker",
+            timeout_s=DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+            policy="command",
+        )
+        if cleanup.artifact.get("status") != "completed":
+            # The command can finish normally while the kill acknowledgement
+            # races its already-removed pid file. That positive command result
+            # is also sufficient proof that no guest probe remains.
+            if _docker_probe_command_settled(
+                command_task,
+                completion_token=completion_token,
+            ):
+                state["guest_quiescent"] = True
+                return
+            raise DockerContainerOwnershipError(
+                "Docker admission probe cleanup did not confirm guest quiescence."
+            )
+        # Checkpoint positive guest settlement before touching the host CLI
+        # waiter. If this settlement task is itself cancelled while consuming
+        # that waiter, an exact retry must not discard the acknowledged fact
+        # and attempt to rediscover it from an already-removed pid file.
+        state["guest_quiescent"] = True
+        # Guest termination is positively acknowledged. Stop retaining the
+        # now-irrelevant host CLI waiter and consume its terminal outcome.
+        if not command_task.done():
+            command_task.cancel()
+        with contextlib.suppress(BaseException):
+            await command_task
+
+    task = asyncio.create_task(
+        settle(),
+        name=f"cayu-docker-admission-probe-settlement-{container_id[:12]}",
+    )
+    register_acquisition_restoration_retry(task, settle)
+    acquisition.retain_until(task)
+
+    def retry() -> asyncio.Task[None]:
+        current_task = acquisition.settlement_task or task
+        if current_task is not task and not current_task.done():
+            return current_task
+        if current_task is not task and not current_task.cancelled():
+            try:
+                current_task.result()
+            except BaseException:
+                pass
+            else:
+                return current_task
+        replacement = retry_acquisition_settlement(
+            current_task,
+            settle,
+            name=f"cayu-docker-admission-probe-restoration-{container_id[:12]}",
+        )
+        register_acquisition_restoration_retry(replacement, settle)
+        return replacement
+
+    register_environment_factory_cleanup_retry(task, retry)
+    return task
+
+
+def _attach_docker_probe_settlement(
+    error: BaseException,
+    task: asyncio.Task[None],
+) -> None:
+    from cayu.environments.factory import attach_environment_factory_cleanup_settlement_task
+
+    attach_environment_factory_cleanup_settlement_task(error, task)
+
+
+async def _run_docker_admission_probe(
+    docker_path: str,
+    container_id: str,
+    *,
+    script: str,
+    argv: tuple[str, ...] = (),
+    user: str | None = None,
+    docker_cli_env_allowlist: Sequence[str],
+    supervise_guest: bool,
+) -> ExecResult:
+    """Run a probe with guest supervision and exact retained settlement."""
+
+    docker_args = ["exec"]
+    if user is not None:
+        docker_args.extend(("-u", user))
+    docker_args.extend((container_id, "sh", "-c"))
+    if not supervise_guest:
+        return await _run_docker(
+            docker_path,
+            [*docker_args, script, *argv],
+            docker_cli_env_allowlist=docker_cli_env_allowlist,
+            timeout_s=30,
+        )
+
+    acquisition = acquire_creation_lease("docker", container_id)
+    pid_file = f"/tmp/.cayu-admission-probe-{uuid4().hex}.pid"
+    completion_token = f"cayu-admission-probe-complete-{uuid4().hex}"
+    probe_command = " ".join(shlex.quote(value) for value in ("sh", "-c", script, *argv))
+    # The outer supervisor always exits successfully after recording the inner
+    # status. A nonzero Docker CLI result therefore cannot be mistaken for a
+    # guest exit status, and a missing exact receipt remains ambiguous.
+    command_script = (
+        f"{probe_command}; status=$?; "
+        f"printf '\\n%s:%s\\n' {shlex.quote(completion_token)} \"$status\" >&2; "
+        "exit 0"
+    )
+    handle = _DockerCommandHandle(
+        docker_path=docker_path,
+        name=container_id,
+        pid_file=pid_file,
+        docker_cli_env_allowlist=docker_cli_env_allowlist,
+        user=user,
+    )
+    try:
+        command_task = asyncio.create_task(
+            _run_docker(
+                docker_path,
+                [
+                    *docker_args,
+                    _supervised_command_script(command_script, pid_file),
+                    *argv,
+                ],
+                docker_cli_env_allowlist=docker_cli_env_allowlist,
+                timeout_s=30,
+            ),
+            name=f"cayu-docker-admission-probe-{container_id[:12]}",
+        )
+    except BaseException:
+        acquisition.release()
+        raise
+    try:
+        result = await asyncio.shield(command_task)
+    except asyncio.CancelledError as cancellation:
+        settlement = _defer_docker_probe_settlement(
+            container_id=container_id,
+            command_task=command_task,
+            handle=handle,
+            acquisition=acquisition,
+            completion_token=completion_token,
+        )
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            _attach_docker_probe_settlement(cancellation, settlement)
+            raise
+        error = RuntimeError("Docker admission probe was cancelled without caller cancellation.")
+        _attach_docker_probe_settlement(error, settlement)
+        raise error from cancellation
+    except BaseException as error:
+        if runner_failure_fields(error).get("execution_phase") == "launch":
+            acquisition.release()
+            raise
+        settlement = _defer_docker_probe_settlement(
+            container_id=container_id,
+            command_task=command_task,
+            handle=handle,
+            acquisition=acquisition,
+            completion_token=completion_token,
+        )
+        _attach_docker_probe_settlement(error, settlement)
+        raise
+    if result.timed_out:
+        error = DockerRuntimeConfigurationError("admission_probe_timed_out")
+        settlement = _defer_docker_probe_settlement(
+            container_id=container_id,
+            command_task=command_task,
+            handle=handle,
+            acquisition=acquisition,
+            completion_token=completion_token,
+        )
+        _attach_docker_probe_settlement(error, settlement)
+        raise error
+    completed_result = _docker_admission_probe_completion(
+        result,
+        completion_token=completion_token,
+    )
+    if completed_result is None:
+        error = DockerRuntimeConfigurationError("admission_probe_completion_unverified")
+        settlement = _defer_docker_probe_settlement(
+            container_id=container_id,
+            command_task=command_task,
+            handle=handle,
+            acquisition=acquisition,
+            completion_token=completion_token,
+        )
+        _attach_docker_probe_settlement(error, settlement)
+        raise error
+    acquisition.release()
+    return completed_result
 
 
 class DockerRunner(Runner, RunnerBinaryStreamCapability):
@@ -1095,8 +1364,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         image: str | None = None,
         _container_id: str | None = None,
         _runtime_evidence: _DockerRuntimeEvidence | None = None,
-        _admission_seccomp_profile: str | None = None,
-        _admission_immutable_input_mounts: tuple[DockerImmutableInputMount, ...] = (),
+        _strict_seccomp_profile: str | None = None,
+        _strict_immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
+        _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self._container_removed = False
@@ -1110,9 +1380,21 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         ):
             raise TypeError("_runtime_evidence must be Docker runtime evidence or None.")
         self._runtime_evidence = _runtime_evidence
-        self._admission_seccomp_profile = _admission_seccomp_profile
-        self._admission_immutable_input_mounts = _admission_immutable_input_mounts
+        self._strict_seccomp_profile = validate_docker_seccomp_profile(_strict_seccomp_profile)
+        self._strict_immutable_input_mounts = _normalize_immutable_input_mounts(
+            _strict_immutable_input_mounts,
+            restrictions=None if _runtime_evidence is None else _runtime_evidence.restrictions,
+        )
         self._admission_refresh_lock = asyncio.Lock()
+        if _execution_environment_authority is not None:
+            from cayu.environments.admission import ExecutionEnvironmentAuthority
+
+            if type(_execution_environment_authority) is not ExecutionEnvironmentAuthority:
+                raise TypeError(
+                    "_execution_environment_authority must be an "
+                    "ExecutionEnvironmentAuthority or None."
+                )
+            vars(self)["_cayu_execution_environment_authority"] = _execution_environment_authority
         if _container_id is not None and (
             type(_container_id) is not str
             or _DOCKER_CONTAINER_ID_PATTERN.fullmatch(_container_id) is None
@@ -1260,6 +1542,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         toolchain_profile_fingerprint: str | None = None,
         immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
         allocation_identity: str | None = None,
+        _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -1564,6 +1847,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     owned_container_id,
                     immutable_mounts,
                     docker_cli_env_allowlist=docker_cli_allowlist,
+                    supervise_guest=False,
                 )
                 executable_availability = await _probe_strict_container(
                     docker,
@@ -1571,6 +1855,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     restrictions=owned_restrictions,
                     required_executables=executable_requirements,
                     docker_cli_env_allowlist=docker_cli_allowlist,
+                    supervise_guest=False,
                 )
                 observed_at = datetime.now(UTC)
                 runtime_evidence = _DockerRuntimeEvidence(
@@ -1637,8 +1922,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             docker_cli_env_allowlist=docker_cli_allowlist,
             _container_id=owned_container_id,
             _runtime_evidence=runtime_evidence,
-            _admission_seccomp_profile=seccomp_profile,
-            _admission_immutable_input_mounts=immutable_mounts,
+            _strict_seccomp_profile=seccomp_profile,
+            _strict_immutable_input_mounts=immutable_mounts,
+            _execution_environment_authority=_execution_environment_authority,
         )
 
     @classmethod
@@ -1656,6 +1942,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         required_executables: Sequence[str] = (),
         toolchain_profile_fingerprint: str | None = None,
         immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
+        _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
     ) -> DockerRunner:
         """Reattach to one exact strict container after re-verifying live evidence."""
 
@@ -1758,8 +2045,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             timeout_cleanup="sandbox",
             _container_id=container_id,
             _runtime_evidence=runtime_evidence,
-            _admission_seccomp_profile=seccomp_profile,
-            _admission_immutable_input_mounts=immutable_mounts,
+            _strict_seccomp_profile=seccomp_profile,
+            _strict_immutable_input_mounts=immutable_mounts,
+            _execution_environment_authority=_execution_environment_authority,
         )
 
     async def refresh_execution_admission(self) -> None:
@@ -1772,11 +2060,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 return
             if (
                 self.container_id != evidence.container_id
-                or _seccomp_profile_fingerprint(self._admission_seccomp_profile)
+                or _seccomp_profile_fingerprint(self._strict_seccomp_profile)
                 != evidence.seccomp_profile_sha256
                 or tuple(
                     (mount.projection_fingerprint, mount.target_path)
-                    for mount in self._admission_immutable_input_mounts
+                    for mount in self._strict_immutable_input_mounts
                 )
                 != evidence.immutable_input_mounts
             ):
@@ -1796,15 +2084,15 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 restrictions=evidence.restrictions,
                 network_mode=evidence.network_mode,
                 runtime=evidence.runtime,
-                seccomp_profile=self._admission_seccomp_profile,
-                immutable_input_mounts=self._admission_immutable_input_mounts,
+                seccomp_profile=self._strict_seccomp_profile,
+                immutable_input_mounts=self._strict_immutable_input_mounts,
             )
             if (image_id, image_reference) != (evidence.image_id, evidence.image_reference):
                 raise DockerRuntimeConfigurationError("image_identity_drift")
             await _probe_immutable_input_mounts(
                 self.docker_path,
                 evidence.container_id,
-                self._admission_immutable_input_mounts,
+                self._strict_immutable_input_mounts,
                 docker_cli_env_allowlist=self.docker_cli_env_allowlist,
             )
             availability = await _probe_strict_container(
@@ -1821,6 +2109,62 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 valid_until=observed_at + timedelta(seconds=300),
                 executable_availability=availability,
             )
+
+    async def collect_execution_admission_candidate(self):
+        """Re-observe the exact strict container after lifecycle-owned setup."""
+
+        evidence = self._runtime_evidence
+        if evidence is None:
+            return self.execution_admission_candidate()
+        container_id = self.container_id
+        if container_id is None:
+            raise DockerRuntimeConfigurationError("container_identity_missing")
+        require_creation_cleanup_settled("docker", container_id)
+        if _seccomp_profile_fingerprint(self._strict_seccomp_profile) != (
+            evidence.seccomp_profile_sha256
+        ):
+            raise DockerRuntimeConfigurationError("seccomp_profile_drift")
+        # Timestamp the start, not the end, of the complete observation. The
+        # sequential live probes must not make an old inspection appear fresh.
+        observed_at = datetime.now(UTC)
+        inspection = await _inspect_strict_container(
+            self.docker_path,
+            container_id,
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+        )
+        image_id, image_reference = _verify_strict_container_inspection(
+            inspection,
+            container_id=container_id,
+            image_identity=evidence.image_identity,
+            restrictions=evidence.restrictions,
+            network_mode=evidence.network_mode,
+            runtime=evidence.runtime,
+            seccomp_profile=self._strict_seccomp_profile,
+            immutable_input_mounts=self._strict_immutable_input_mounts,
+        )
+        await _probe_immutable_input_mounts(
+            self.docker_path,
+            container_id,
+            self._strict_immutable_input_mounts,
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+        )
+        executable_availability = await _probe_strict_container(
+            self.docker_path,
+            container_id,
+            restrictions=evidence.restrictions,
+            required_executables=evidence.required_executables,
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+        )
+        self._runtime_evidence = replace(
+            evidence,
+            image_id=image_id,
+            image_reference=image_reference,
+            executable_availability=executable_availability,
+            observed_at=observed_at,
+            valid_until=observed_at + timedelta(seconds=300),
+        )
+        require_creation_cleanup_settled("docker", container_id)
+        return self.execution_admission_candidate()
 
     def execution_capability_evidence(self):
         """Describe Docker honestly and bind strict evidence to the exact container."""
@@ -2424,6 +2768,13 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
     ) -> int:
         """Join or retry retained constructor rollback without reallocating."""
         return await drain_creation_cleanups("docker", timeout_s=timeout_s)
+
+    @classmethod
+    async def drain_failed_attachments(
+        cls, *, timeout_s: float = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS
+    ) -> int:
+        """Retry exact retained admission-probe cleanup without reconnecting."""
+        return await drain_acquisition_restorations("docker", timeout_s=timeout_s)
 
     async def close(self) -> None:
         action = self.close_action

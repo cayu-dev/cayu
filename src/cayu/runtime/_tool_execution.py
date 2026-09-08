@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -17,6 +17,7 @@ from cayu._validation import (
 from cayu.core.isolated_tools import ProcessIsolatedTool
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
 from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
+from cayu.environments.admission import ExecutionAdmissionError
 from cayu.runners import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._durable_subagents import (
@@ -375,11 +376,14 @@ async def run_tool(
     registered_execution_contract: dict[str, Any] | None = None,
     finalize_publication: Callable[[], InvocationPublicationSnapshot] | None = None,
     timeout_seconds: float | None = None,
+    before_dispatch: Callable[[], Awaitable[None]] | None = None,
 ) -> ToolExecutionOutcome:
     """Execute one tool and seal its evolving secret scope before publication."""
 
     if finalize_publication is not None and not callable(finalize_publication):
         raise TypeError("finalize_publication must be callable or None.")
+    if before_dispatch is not None and not callable(before_dispatch):
+        raise TypeError("before_dispatch must be callable or None.")
     try:
         outcome = await _run_tool(
             tool=tool,
@@ -390,6 +394,7 @@ async def run_tool(
             registered_schema=registered_schema,
             registered_execution_contract=registered_execution_contract,
             timeout_seconds=timeout_seconds,
+            before_dispatch=before_dispatch,
         )
     except BaseException:
         if finalize_publication is not None:
@@ -423,6 +428,7 @@ async def _run_tool(
     registered_schema: dict[str, Any] | None,
     registered_execution_contract: dict[str, Any] | None,
     timeout_seconds: float | None,
+    before_dispatch: Callable[[], Awaitable[None]] | None,
 ) -> ToolExecutionOutcome:
     timer: _ToolTimeoutOwner | None = None
     grouped_failure: BaseExceptionGroup | None = None
@@ -435,6 +441,8 @@ async def _run_tool(
     try:
 
         async def invoke_registered_tool() -> ToolResult:
+            if before_dispatch is not None:
+                await before_dispatch()
             current_execution_deadline().require_admission("tool")
             if type(tool) is not ProcessIsolatedTool:
                 return await tool.run(ctx, arguments)
@@ -673,6 +681,11 @@ async def _run_tool(
             redactor=active_redactor,
         )
         return _execution_outcome(result, controls)
+    except ExecutionAdmissionError:
+        # This is a runtime-owned authorization refusal at the final dispatch
+        # seam, not an extension failure that may be returned to the model as
+        # an ordinary tool error.
+        raise
     except Exception as exc:
         committed_cancellation = durable_subagent_committed_cancellation_outcome(exc)
         unsettled_cancellation = durable_subagent_unsettled_cancellation_outcome(exc)

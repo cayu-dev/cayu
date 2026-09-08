@@ -309,26 +309,61 @@ class HostedFactory(EnvironmentFactory):
 
 
 class HostedRunner(Runner):
-    def execution_admission_candidate(self):
+    async def collect_execution_admission_candidate(self):
         return ExecutionAdmissionCandidate(
             candidate="acme-sandbox",
-            evidence=self._runtime_evidence,
+            evidence=await self._observe_exact_runtime_evidence(),
         )
 ```
 
 Both evidence objects are `ExecutionCapabilityEvidence` whose `subject` is the
 same candidate string. The pre-create hook must be side-effect free: it may
 publish integration declarations, but it must not allocate a sandbox or claim
-that a live resource was observed. The final runner hook should return quickly
-and may publish integration-validated availability or bounded live observations.
-Cayu can call it again after asynchronous setup or binding, so evidence with a
-validity window must still be fresh at that point.
+that a live resource was observed. The final runner hook may perform bounded
+asynchronous inspection of the exact runner, but it must preserve caller
+cancellation and either settle every dispatched inspection or transfer an
+authenticated settlement owner before any return or exception. Cayu sequences
+unexposed release behind a transferred owner. Runners whose evidence is already
+immutable can instead implement
+the synchronous `execution_admission_candidate()` hook; the default async
+collector delegates to it. Cayu calls the async collector after
+allocation/reconnect, binding, and setup, so evidence with a validity window
+must still be fresh then and at the later dispatch boundary.
+
+A runner may implement `refresh_execution_admission()` to renew only expired
+live observations for that exact admitted runner. The common runtime invokes
+this hook under its private exposure authority immediately before an actual
+provider, provider-backed token-count, or tool dispatch, then re-reads the
+side-effect-free admission candidate. The renewed candidate must retain the
+same schema, environment fingerprint, immutable-image fingerprint, toolchain
+profile fingerprint, candidate, environment authority, and binding generation.
+It cannot allocate or select a replacement or mint authorization itself.
+Unsupported renewal, failed inspection, identity drift, and evidence that is
+still stale fail closed. A renewal implementation must settle every dispatched
+probe or transfer an authenticated settlement owner on every return and raise
+path; the runtime fences later dispatch and final binding cleanup behind that
+owner.
 
 If a binding replaces the factory's runner, the replacement must report the
 same admitted candidate. Missing evidence, a changed candidate, insufficient
 claims, and expired live observations fail closed before the runner is exposed
 to the agent. Cayu evaluates only the selected candidate; admission never
 chooses a provider or silently falls back to another environment.
+
+Factories and runners do not authorize themselves. Only the runtime-owned
+`EnvironmentLifecycle` can mint the private exposure marker accepted by
+runtime model and tool dispatch before downstream provider, runner, workspace,
+or tool effects. Runner- or tool-specific admission checks remain defensive
+validation and cannot create that marker. Every new or reconstructed
+environment used by a run, resume, recovery, or fork traverses the same
+selected → preflight → final-evidence → admitted → exposed gate. A same-process
+continuation may reuse only its exact process-local exposure authority and
+still repeats the dispatch-time structural and freshness check. Factory-backed
+environments additionally record allocation or reconnection, and environments
+with setup binding record the bound phase.
+The durable `environment.lifecycle.transition` events describe those bounded
+milestones and unexposed-result release outcomes without publishing commands,
+reconnect metadata, credentials, or executable names.
 
 See [Execution admission](runtime-contracts.md#execution-admission) for the
 complete capability vocabulary, evidence states, live-proof bounds, structured

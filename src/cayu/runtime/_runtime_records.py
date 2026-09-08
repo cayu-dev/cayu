@@ -16,11 +16,13 @@ from cayu.environments import (
     EnvironmentFactory,
     EnvironmentFactoryResult,
     EnvironmentSpec,
+    ExecutionEnvironmentAuthority,
     ExecutionRequirements,
 )
 from cayu.providers import ModelProvider, UsageDialect
 from cayu.providers.hosted import OpenAIWebSearch
 from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
+from cayu.runtime._environment_exposure import _EnvironmentExposure
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
@@ -156,6 +158,17 @@ class RegisteredEnvironment:
     bound_workspace: BoundWorkspace | None = None
     binding_payload: dict[str, Any] | None = None
     execution_candidate: str | None = None
+    execution_candidate_declared: bool = False
+    execution_environment_authority: ExecutionEnvironmentAuthority | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    environment_exposure: _EnvironmentExposure | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     unclaimed_factory_result: EnvironmentFactoryResult | None = None
     # A successfully bound virtual-egress result remains the exact live owner
     # that can be parked at an invocation boundary for governed adoption.

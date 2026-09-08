@@ -23,9 +23,12 @@ from pydantic import (
 )
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER, require_durable_clean_nonblank
+from cayu.capabilities import CapabilityIdentity, CapabilityState
 from cayu.core.events import Event, EventType
+from cayu.environments.admission import ExecutionExecutableEvidenceState
 
 ENVIRONMENT_LIFECYCLE_PROGRESS_SCHEMA_VERSION = 1
+ENVIRONMENT_LIFECYCLE_TRANSITION_SCHEMA_VERSION = 1
 DEFAULT_ENVIRONMENT_LIFECYCLE_TIMEOUT_SECONDS = 3600.0
 DEFAULT_ENVIRONMENT_PHASE_TIMEOUT_SECONDS = 900.0
 DEFAULT_ENVIRONMENT_PROGRESS_MIN_INTERVAL_SECONDS = 0.25
@@ -73,6 +76,208 @@ class EnvironmentLifecycleProgressStatus(StrEnum):
     FAILED = "failed"
     DEADLINE_EXCEEDED = "deadline_exceeded"
     RETAINED = "retained"
+
+
+class EnvironmentLifecycleTransitionPhase(StrEnum):
+    """Security-relevant milestones in the runtime-owned exposure transaction."""
+
+    SELECTED = "selected"
+    PREFLIGHT = "preflight"
+    ALLOCATED = "allocated"
+    RECONNECTED = "reconnected"
+    BOUND = "bound"
+    FINAL_EVIDENCE = "final_evidence"
+    ADMISSION = "admission"
+    EXPOSURE = "exposure"
+    RELEASE = "release"
+
+
+class EnvironmentLifecycleTransitionOutcome(StrEnum):
+    """Bounded outcomes for a security-relevant lifecycle milestone."""
+
+    OBSERVED = "observed"
+    ACCEPTED = "accepted"
+    REFUSED = "refused"
+    COMPLETED = "completed"
+    ADMITTED = "admitted"
+    EXPOSED = "exposed"
+    RELEASED = "released"
+    DEFERRED = "deferred"
+    FAILED = "failed"
+
+
+class EnvironmentLifecycleTransition(BaseModel):
+    """One bounded, content-free durable exposure or release observation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = ENVIRONMENT_LIFECYCLE_TRANSITION_SCHEMA_VERSION
+    phase: EnvironmentLifecycleTransitionPhase
+    outcome: EnvironmentLifecycleTransitionOutcome
+    candidate: CapabilityIdentity
+    binding_generation_id: str = Field(min_length=1, max_length=128)
+    evidence_schema: str | None = Field(default=None, min_length=1, max_length=96)
+    evidence_states: tuple[CapabilityState, ...] = Field(default_factory=tuple, max_length=64)
+    executable_evidence_states: tuple[ExecutionExecutableEvidenceState, ...] = Field(
+        default_factory=tuple,
+        max_length=64,
+    )
+    evidence_valid_until: datetime | None = None
+    refusal_codes: tuple[CapabilityIdentity, ...] = Field(default_factory=tuple, max_length=64)
+    refusal_capabilities: tuple[CapabilityIdentity, ...] = Field(
+        default_factory=tuple,
+        max_length=64,
+    )
+    refusal_executable_sha256: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+    ownership: Literal["runtime", "factory", "binding", "deferred"]
+    release_action: Literal["discard", "preserve"] | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != ENVIRONMENT_LIFECYCLE_TRANSITION_SCHEMA_VERSION:
+            raise ValueError("schema_version must be the exact integer 1.")
+        return value
+
+    @field_validator("binding_generation_id")
+    @classmethod
+    def validate_binding_generation_id(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "binding_generation_id")
+
+    @field_validator("evidence_schema")
+    @classmethod
+    def validate_evidence_schema(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "evidence_schema")
+
+    @field_validator("evidence_valid_until", mode="before")
+    @classmethod
+    def validate_evidence_valid_until_type(cls, value: object) -> object:
+        if value is not None and type(value) not in {str, datetime}:
+            raise ValueError("evidence_valid_until must be an ISO datetime string or datetime.")
+        return value
+
+    @field_validator("refusal_codes", "refusal_capabilities")
+    @classmethod
+    def validate_sorted_unique_tokens(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
+        if tuple(sorted(set(value))) != value:
+            raise ValueError(f"{info.field_name} must be unique and sorted.")
+        return value
+
+    @field_validator("evidence_states", "executable_evidence_states")
+    @classmethod
+    def validate_sorted_unique_states(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
+        if tuple(sorted(set(value))) != value:
+            raise ValueError(f"{info.field_name} must be unique and sorted.")
+        return value
+
+    @field_validator("refusal_executable_sha256")
+    @classmethod
+    def validate_executable_digests(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("refusal_executable_sha256 must be unique and sorted.")
+        if any(
+            type(item) is not str
+            or len(item) != 71
+            or not item.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in item[7:])
+            for item in value
+        ):
+            raise ValueError("refusal_executable_sha256 must contain SHA-256 identities.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_transition(self) -> EnvironmentLifecycleTransition:
+        allowed_outcomes = {
+            EnvironmentLifecycleTransitionPhase.SELECTED: {
+                EnvironmentLifecycleTransitionOutcome.OBSERVED,
+            },
+            EnvironmentLifecycleTransitionPhase.PREFLIGHT: {
+                EnvironmentLifecycleTransitionOutcome.ACCEPTED,
+                EnvironmentLifecycleTransitionOutcome.REFUSED,
+            },
+            EnvironmentLifecycleTransitionPhase.ALLOCATED: {
+                EnvironmentLifecycleTransitionOutcome.COMPLETED,
+            },
+            EnvironmentLifecycleTransitionPhase.RECONNECTED: {
+                EnvironmentLifecycleTransitionOutcome.COMPLETED,
+            },
+            EnvironmentLifecycleTransitionPhase.BOUND: {
+                EnvironmentLifecycleTransitionOutcome.COMPLETED,
+            },
+            EnvironmentLifecycleTransitionPhase.FINAL_EVIDENCE: {
+                EnvironmentLifecycleTransitionOutcome.OBSERVED,
+            },
+            EnvironmentLifecycleTransitionPhase.ADMISSION: {
+                EnvironmentLifecycleTransitionOutcome.ADMITTED,
+                EnvironmentLifecycleTransitionOutcome.REFUSED,
+            },
+            EnvironmentLifecycleTransitionPhase.EXPOSURE: {
+                EnvironmentLifecycleTransitionOutcome.EXPOSED,
+            },
+            EnvironmentLifecycleTransitionPhase.RELEASE: {
+                EnvironmentLifecycleTransitionOutcome.RELEASED,
+                EnvironmentLifecycleTransitionOutcome.DEFERRED,
+                EnvironmentLifecycleTransitionOutcome.FAILED,
+            },
+        }
+        if self.outcome not in allowed_outcomes[self.phase]:
+            raise ValueError(
+                f"Lifecycle phase {self.phase.value!r} cannot have outcome {self.outcome.value!r}."
+            )
+        if self.evidence_schema is None and (
+            self.evidence_states
+            or self.executable_evidence_states
+            or self.evidence_valid_until is not None
+        ):
+            raise ValueError("Lifecycle evidence summaries require an evidence_schema.")
+        if self.evidence_valid_until is not None and (
+            self.evidence_valid_until.tzinfo is None
+            or self.evidence_valid_until.utcoffset() is None
+        ):
+            raise ValueError("evidence_valid_until must include a timezone.")
+        refusal = self.outcome is EnvironmentLifecycleTransitionOutcome.REFUSED
+        refusal_details = bool(
+            self.refusal_codes or self.refusal_capabilities or self.refusal_executable_sha256
+        )
+        if refusal != bool(self.refusal_codes) or refusal != refusal_details:
+            raise ValueError(
+                "Refused transitions require refusal details, and only refusals carry them."
+            )
+        if self.phase is EnvironmentLifecycleTransitionPhase.RELEASE:
+            if self.release_action is None:
+                raise ValueError("Release transitions require release_action.")
+            if (self.outcome is EnvironmentLifecycleTransitionOutcome.DEFERRED) != (
+                self.ownership == "deferred"
+            ):
+                raise ValueError("Only deferred release outcomes may have deferred ownership.")
+        elif self.release_action is not None:
+            raise ValueError("Only release transitions may carry release_action.")
+        elif self.ownership == "deferred":
+            raise ValueError("Only release transitions may have deferred ownership.")
+        return self
+
+    def to_payload(self) -> dict[str, object]:
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+def environment_lifecycle_transition_from_event(event: Event) -> EnvironmentLifecycleTransition:
+    """Validate one durable lifecycle transition event."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    if event.type != EventType.ENVIRONMENT_LIFECYCLE_TRANSITION:
+        raise ValueError("Event is not an environment lifecycle transition.")
+    payload = dict(event.payload)
+    execution_profile_fingerprint = payload.pop("execution_profile_fingerprint", None)
+    if execution_profile_fingerprint is not None and (
+        type(execution_profile_fingerprint) is not str
+        or len(execution_profile_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in execution_profile_fingerprint)
+    ):
+        raise ValueError("Environment lifecycle execution profile authority is invalid.")
+    return EnvironmentLifecycleTransition.model_validate(payload)
 
 
 class EnvironmentLifecycleDeadlineExceeded(TimeoutError):
@@ -627,6 +832,7 @@ __all__ = [
     "DEFAULT_ENVIRONMENT_PROGRESS_MIN_INTERVAL_SECONDS",
     "DEFAULT_MAX_ENVIRONMENT_PROGRESS_EVENTS",
     "ENVIRONMENT_LIFECYCLE_PROGRESS_SCHEMA_VERSION",
+    "ENVIRONMENT_LIFECYCLE_TRANSITION_SCHEMA_VERSION",
     "MAX_ENVIRONMENT_PROGRESS_COUNTER",
     "EnvironmentLifecycleDeadlineExceeded",
     "EnvironmentLifecycleOperation",
@@ -635,7 +841,11 @@ __all__ = [
     "EnvironmentLifecycleProgress",
     "EnvironmentLifecycleProgressReporter",
     "EnvironmentLifecycleProgressStatus",
+    "EnvironmentLifecycleTransition",
+    "EnvironmentLifecycleTransitionOutcome",
+    "EnvironmentLifecycleTransitionPhase",
     "copy_environment_lifecycle_policy",
     "current_environment_lifecycle_progress_reporter",
     "environment_lifecycle_progress_from_event",
+    "environment_lifecycle_transition_from_event",
 ]

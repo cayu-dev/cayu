@@ -17,9 +17,13 @@ from cayu.environments.lifecycle import (
     EnvironmentLifecyclePolicy,
     EnvironmentLifecycleProgress,
     EnvironmentLifecycleProgressStatus,
+    EnvironmentLifecycleTransition,
+    EnvironmentLifecycleTransitionOutcome,
+    EnvironmentLifecycleTransitionPhase,
     RuntimeEnvironmentLifecycleProgressReporter,
     copy_environment_lifecycle_policy,
     environment_lifecycle_progress_from_event,
+    environment_lifecycle_transition_from_event,
 )
 
 
@@ -352,5 +356,115 @@ def test_environment_lifecycle_event_parser_uses_typed_public_projection() -> No
     assert environment_lifecycle_progress_from_event(event) == progress
     with pytest.raises(ValueError, match="not environment lifecycle progress"):
         environment_lifecycle_progress_from_event(
+            Event(type=EventType.SESSION_STARTED, session_id="session-1")
+        )
+
+
+def test_environment_lifecycle_transition_parser_enforces_content_free_schema() -> None:
+    transition = EnvironmentLifecycleTransition(
+        phase=EnvironmentLifecycleTransitionPhase.FINAL_EVIDENCE,
+        outcome=EnvironmentLifecycleTransitionOutcome.OBSERVED,
+        candidate="docker",
+        binding_generation_id="wbind_exact",
+        evidence_schema="cayu.execution_capabilities.v1",
+        evidence_states=("live_verified",),
+        executable_evidence_states=("live_verified", "unavailable"),
+        evidence_valid_until=datetime(2026, 1, 2, tzinfo=UTC),
+        ownership="runtime",
+    )
+    event = Event(
+        type=EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
+        session_id="session-1",
+        payload=transition.to_payload(),
+    )
+
+    assert environment_lifecycle_transition_from_event(event) == transition
+    assert "executable" not in transition.to_payload()
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        EnvironmentLifecycleTransition.model_validate(
+            {**transition.to_payload(), "executable": "private-tool-name"}
+        )
+    with pytest.raises(ValidationError, match="Refused transitions require"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "phase": "preflight",
+                "outcome": "refused",
+            }
+        )
+    with pytest.raises(ValidationError, match="cannot have outcome"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "outcome": "exposed",
+            }
+        )
+    with pytest.raises(ValidationError, match="evidence summaries require"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "evidence_schema": None,
+            }
+        )
+    with pytest.raises(ValidationError, match="unique and sorted"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "evidence_states": ["live_verified", "live_verified"],
+            }
+        )
+    with pytest.raises(ValidationError, match="exact integer 1"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "schema_version": True,
+            }
+        )
+    with pytest.raises(ValidationError, match="evidence_schema"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "evidence_schema": "\n",
+            }
+        )
+    with pytest.raises(ValidationError, match="ISO datetime string"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "evidence_valid_until": 1_700_000_000,
+            }
+        )
+    with pytest.raises(ValidationError, match="only refusals carry"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "refusal_capabilities": ["confirmed_cleanup"],
+            }
+        )
+    with pytest.raises(ValidationError, match="deferred ownership"):
+        EnvironmentLifecycleTransition.model_validate(
+            {
+                **transition.to_payload(),
+                "phase": "release",
+                "outcome": "deferred",
+                "release_action": "preserve",
+            }
+        )
+    with pytest.raises(
+        ValueError,
+        match="execution profile authority is invalid",
+    ):
+        environment_lifecycle_transition_from_event(
+            event.model_copy(
+                update={
+                    "payload": {
+                        **event.payload,
+                        "execution_profile_fingerprint": "not-a-fingerprint",
+                    }
+                }
+            )
+        )
+    with pytest.raises(ValueError, match="not an environment lifecycle transition"):
+        environment_lifecycle_transition_from_event(
             Event(type=EventType.SESSION_STARTED, session_id="session-1")
         )

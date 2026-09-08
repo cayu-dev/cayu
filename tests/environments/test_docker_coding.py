@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,8 @@ from tests.docker_toolchain import docker_toolchain_profile
 
 import cayu.environments.docker_coding as docker_coding_module
 from cayu import (
+    AgentSpec,
+    CayuApp,
     DockerCodingCommandAuthority,
     DockerCodingDependencyInput,
     DockerCodingEnvironmentFactory,
@@ -31,12 +34,16 @@ from cayu import (
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
+    EnvironmentSpec,
+    EventType,
     ExecCommand,
-    ExecutionAdmissionError,
     ExecutionRequirements,
     ImmutableInputProjectionCapability,
     ImmutableInputStore,
     LocalRunner,
+    Message,
+    NoWorkspaceBinding,
+    RunRequest,
     SyncBinding,
     SyncBindingSourceConflictError,
     evaluate_execution_admission,
@@ -46,6 +53,7 @@ from cayu._coding_product_authority import (
     CODING_PRODUCT_SOURCE_AUTHORITY_METADATA_KEY,
     CodingProductSourceCopyAuthority,
 )
+from cayu.providers import ModelProvider, ModelRequest
 from cayu.runners.base import ExecResult
 from cayu.runners.docker import (
     DockerContainerOwnershipError,
@@ -61,6 +69,29 @@ from cayu.workspaces.revisions import (
 _CONTAINER_ID = "a" * 64
 _IMAGE_ID = "sha256:" + ("b" * 64)
 _IMAGE_REFERENCE = "cayu/coding@sha256:" + ("c" * 64)
+_PROBE_COMPLETION_TOKEN = re.compile(r"cayu-admission-probe-complete-[0-9a-f]{32}")
+
+
+def _completed_admission_probe_result(
+    docker_args: list[str],
+    result: ExecResult,
+) -> ExecResult:
+    token = next(
+        (
+            match.group(0)
+            for value in docker_args
+            if (match := _PROBE_COMPLETION_TOKEN.search(value)) is not None
+        ),
+        None,
+    )
+    if token is None or result.timed_out:
+        return result
+    return result.model_copy(
+        update={
+            "stderr": f"{result.stderr}\n{token}:{result.exit_code}\n",
+            "exit_code": 0,
+        }
+    )
 
 
 class _TestAllocationContext(EnvironmentAllocationContext):
@@ -668,7 +699,8 @@ def test_exact_container_owner_is_used_for_cancellation_cleanup(
     assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
 
 
-def test_docker_coding_factory_rejects_untrusted_before_docker_allocation(
+def test_runtime_rejects_untrusted_docker_coding_before_docker_allocation(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     factory = DockerCodingEnvironmentFactory(
@@ -691,12 +723,47 @@ def test_docker_coding_factory_rejects_untrusted_before_docker_allocation(
     )
     assert decision.status == "refused"
     assert any(refusal.capability == "untrusted_code_isolation" for refusal in decision.refusals)
-    with pytest.raises(ExecutionAdmissionError) as caught:
-        asyncio.run(factory.create(request))
-    assert any(
-        refusal.capability == "untrusted_code_isolation"
-        for refusal in caught.value.decision.refusals
-    )
+
+    async def unexpected_subprocess(*args: Any, **kwargs: Any) -> ExecResult:
+        del args, kwargs
+        raise AssertionError("Pre-create refusal reached Docker allocation.")
+
+    class UnreachedProvider(ModelProvider):
+        name = "unreached"
+
+        async def stream(self, request: ModelRequest):  # type: ignore[no-untyped-def]
+            del request
+            raise AssertionError("Pre-create refusal reached provider dispatch.")
+            yield
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", unexpected_subprocess)
+
+    async def run() -> list[Any]:
+        app = CayuApp(enable_logging=False)
+        app.register_provider(UnreachedProvider(), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="coding"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            execution_requirements=ExecutionRequirements.untrusted(),
+        )
+        return [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="docker-preflight-refusal",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        ]
+
+    events = asyncio.run(run())
+    failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    assert failed.payload["error_type"] == "ExecutionAdmissionError"
 
 
 def test_docker_coding_factory_publicly_constructs_request_bound_binding(
@@ -1295,8 +1362,11 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
                 )
             )
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
-        return ExecResult()
+            return _completed_admission_probe_result(
+                docker_args,
+                ExecResult(stdout=restrictions.user),
+            )
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
@@ -1376,10 +1446,13 @@ def test_docker_coding_same_create_request_recovers_one_named_container(
         if docker_args[0] == "inspect":
             return ExecResult(stdout=json.dumps(_inspection(restrictions)))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
+            return _completed_admission_probe_result(
+                docker_args,
+                ExecResult(stdout=restrictions.user),
+            )
         if docker_args[:2] == ["rm", "-f"]:
             container_exists = False
-        return ExecResult()
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
@@ -1443,10 +1516,13 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
             inspection["Config"]["Labels"] = container_labels
             return ExecResult(stdout=json.dumps(inspection))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
+            return _completed_admission_probe_result(
+                docker_args,
+                ExecResult(stdout=restrictions.user),
+            )
         if docker_args[:2] == ["rm", "-f"]:
             container_exists = False
-        return ExecResult()
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
@@ -1565,7 +1641,7 @@ def test_docker_coding_reconnect_releases_interrupted_finalize_reference(
     assert ImmutableInputStore(store.root).inspect()[0].reference_count == 0
 
 
-def test_docker_coding_factory_structurally_refuses_a_missing_final_executable(
+def test_runtime_structurally_refuses_a_missing_final_docker_executable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1583,30 +1659,100 @@ def test_docker_coding_factory_structurally_refuses_a_missing_final_executable(
         if docker_args[0] == "inspect":
             return ExecResult(stdout=json.dumps(_inspection(restrictions)))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
+            return _completed_admission_probe_result(
+                docker_args,
+                ExecResult(stdout=restrictions.user),
+            )
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "command -v git" in docker_args[-1]:
-            return ExecResult(exit_code=127)
-        return ExecResult()
+            return _completed_admission_probe_result(
+                docker_args,
+                ExecResult(exit_code=127),
+            )
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
-    factory = DockerCodingEnvironmentFactory(
+
+    class ClosingNoWorkspaceBinding(NoWorkspaceBinding):
+        async def finalize(self, bound, **kwargs):  # type: ignore[no-untyped-def]
+            del kwargs
+            if bound.runner is not None:
+                await bound.runner.close()
+            return None
+
+    class RuntimeTestDockerCodingFactory(DockerCodingEnvironmentFactory):
+        def allocation_scope(self, request):  # type: ignore[no-untyped-def]
+            del request
+            return None
+
+        def create_workspace_binding(
+            self,
+            request,
+            *,
+            target_workspace,
+            immutable_input_attachments=(),
+        ):  # type: ignore[no-untyped-def]
+            del request, target_workspace, immutable_input_attachments
+            return ClosingNoWorkspaceBinding()
+
+    factory = RuntimeTestDockerCodingFactory(
         source_workspace=LocalWorkspace(tmp_path),
         toolchain_profile=docker_toolchain_profile(
             image_identity=_image_identity(), restrictions=restrictions
         ),
         docker_path="/usr/bin/docker",
     )
-    request = EnvironmentFactoryRequest(
-        session_id="missing-tool",
-        agent_name="agent",
-        environment_name="coding",
+
+    class UnreachedProvider(ModelProvider):
+        name = "unreached"
+
+        async def stream(self, request: ModelRequest):  # type: ignore[no-untyped-def]
+            del request
+            raise AssertionError("Missing executable reached provider dispatch.")
+            yield
+
+    async def run() -> list[Any]:
+        app = CayuApp(enable_logging=False)
+        app.register_provider(UnreachedProvider(), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="coding"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            execution_requirements=ExecutionRequirements.trusted(
+                required_executables=factory.required_executables,
+            ),
+        )
+        return [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="missing-tool",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        ]
+
+    events = asyncio.run(run())
+    failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    refusal = next(
+        item
+        for item in failed.payload["execution_admission"]["refusals"]
+        if item["executable"] == "git"
     )
-
-    with pytest.raises(ExecutionAdmissionError) as caught:
-        asyncio.run(factory.create(request))
-
-    refusal = next(item for item in caught.value.decision.refusals if item.executable == "git")
-    assert refusal.code == "unsupported_capability"
+    assert refusal["code"] == "unsupported_capability"
+    transition = next(
+        event
+        for event in events
+        if event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
+        and event.payload["phase"] == "admission"
+    )
+    assert transition.payload["refusal_executable_sha256"] == [
+        "sha256:" + sha256(b"git").hexdigest()
+    ]
+    assert "git" not in repr(transition.payload)
     assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
 
 
@@ -2494,13 +2640,20 @@ def test_strict_reconnect_rejects_home_contract_drift(monkeypatch, change):
         inspection["Config"]["Env"].append("HOME=/")
 
     async def fake_run_subprocess(command, **kwargs):
+        docker_args = command.argv[1:]
         if command.argv[1] == "inspect":
             return ExecResult(stdout=json.dumps(inspection))
         if "id -u" in command.argv[-1]:
-            return ExecResult(stdout=restrictions.user)
+            return _completed_admission_probe_result(
+                docker_args,
+                ExecResult(stdout=restrictions.user),
+            )
         if "cayu-home-probe" in command.argv:
-            return ExecResult(exit_code=1)
-        return ExecResult()
+            return _completed_admission_probe_result(
+                docker_args,
+                ExecResult(exit_code=1),
+            )
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     with pytest.raises(DockerRuntimeConfigurationError, match="home"):
@@ -2799,10 +2952,13 @@ def test_docker_immutable_allocation_retry_and_concurrent_reconstruction(
             inspection["Config"]["Labels"] = container_labels
             return ExecResult(stdout=json.dumps(inspection))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
+            return _completed_admission_probe_result(
+                docker_args,
+                ExecResult(stdout=restrictions.user),
+            )
         if docker_args[:2] == ["rm", "-f"]:
             container_exists = False
-        return ExecResult()
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
