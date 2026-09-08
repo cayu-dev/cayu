@@ -4671,7 +4671,7 @@ def test_app_retries_factory_release_during_bind_cancellation() -> None:
             ]
 
         run_task = asyncio.create_task(run_app())
-        await asyncio.wait_for(bind_started.wait(), timeout=1)
+        await asyncio.wait_for(bind_started.wait(), timeout=10)
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await run_task

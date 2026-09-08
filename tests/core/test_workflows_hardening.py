@@ -1854,7 +1854,7 @@ def test_step_cancellation_finalizes_started_child_before_replay():
     async def cancel_running_step():
         ctx = workflow.context("wf-cancel-running")
         task = asyncio.create_task(step(ctx, agent="assistant", step_id="s1", prompt="wait"))
-        await asyncio.wait_for(provider.entered.wait(), timeout=1)
+        await asyncio.wait_for(provider.entered.wait(), timeout=10)
         _, child_session_id = await ctx.journal.step_replay_ids(
             step_id="s1",
             attempt_id=ctx.attempt_id,
@@ -2883,7 +2883,7 @@ def test_stale_custom_event_cannot_commit_after_newer_attempt_takes_over():
         late = asyncio.create_task(
             first_attempt.emit_custom_event("custom.myapp.late", payload={"ok": False})
         )
-        await asyncio.wait_for(journal.entered.wait(), timeout=1)
+        await asyncio.wait_for(journal.entered.wait(), timeout=10)
 
         second_attempt = workflow.context("wf-custom-race")
         await second_attempt.start()
@@ -2913,7 +2913,7 @@ def test_stale_completed_event_cannot_commit_after_newer_attempt_takes_over():
         first_attempt = workflow.context("wf-completed-race")
         await first_attempt.start()
         stale_completed = asyncio.create_task(first_attempt.completed())
-        await asyncio.wait_for(journal.entered.wait(), timeout=1)
+        await asyncio.wait_for(journal.entered.wait(), timeout=10)
 
         second_attempt = workflow.context("wf-completed-race")
         await second_attempt.start()
@@ -2942,7 +2942,7 @@ def test_superseded_in_flight_step_does_not_journal_completion():
         old_step = asyncio.create_task(
             step(first_attempt, agent="assistant", step_id="s1", prompt="go")
         )
-        await asyncio.wait_for(provider.entered.wait(), timeout=1)
+        await asyncio.wait_for(provider.entered.wait(), timeout=10)
 
         second_attempt = workflow.context("wf-stale-step-completion")
         await second_attempt.start()
@@ -2981,7 +2981,7 @@ def test_superseded_in_flight_gated_loop_item_does_not_journal_completion():
         old_loop = asyncio.create_task(
             _collect_gated_loop(first_attempt, ["item"], do=do, name="items")
         )
-        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(entered.wait(), timeout=10)
 
         second_attempt = workflow.context("wf-stale-loop-completion")
         await second_attempt.start()

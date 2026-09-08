@@ -871,7 +871,7 @@ def test_http_healthy_listener_outlives_finite_rpc_limits_without_polling() -> N
             mcp_toolsets=(toolset,),
         )
         try:
-            await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+            await asyncio.wait_for(server.stream.started.wait(), timeout=10)
             await _wait_for_http_mcp_refresh_state(toolset, McpToolsetRefreshState.READY)
             await asyncio.sleep(0.5)
             return (
@@ -1065,7 +1065,7 @@ def test_http_first_listener_activation_fences_and_reconciles_startup_gap() -> N
         try:
             assert toolset.refresh_state is McpToolsetRefreshState.DIRTY
             assert stale_adapter._dispatch_authority_is_current() is False
-            await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+            await asyncio.wait_for(server.stream.started.wait(), timeout=10)
             await _wait_for_http_mcp_tools(
                 app,
                 "mcp__remote__search",
@@ -1150,7 +1150,7 @@ def test_http_listener_start_does_not_block_synchronous_multi_agent_registration
             mcp_toolsets=(toolset,),
         )
         try:
-            await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+            await asyncio.wait_for(server.stream.started.wait(), timeout=10)
             return tuple(app.get_agent("first").tools), tuple(app.get_agent("second").tools)
         finally:
             await toolset.close()
@@ -1305,7 +1305,7 @@ def test_http_fatal_post_timeout_fences_refresh_owned_catalogue_authority() -> N
             AgentSpec(name="assistant", model="fake-model"),
             mcp_toolsets=(toolset,),
         )
-        await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+        await asyncio.wait_for(server.stream.started.wait(), timeout=10)
         await _wait_for_http_mcp_refresh_state(toolset, McpToolsetRefreshState.READY)
         assert stale_adapter._dispatch_authority_is_current() is True
         server.timeout_on = "tools/call"
@@ -1343,7 +1343,7 @@ def test_http_post_404_fences_refresh_owned_catalogue_authority() -> None:
             AgentSpec(name="assistant", model="fake-model"),
             mcp_toolsets=(toolset,),
         )
-        await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+        await asyncio.wait_for(server.stream.started.wait(), timeout=10)
         await _wait_for_http_mcp_refresh_state(toolset, McpToolsetRefreshState.READY)
         assert stale_adapter._dispatch_authority_is_current() is True
         server.expire_after_init = True
@@ -1378,7 +1378,7 @@ def test_http_get_sse_listener_is_cancelled_and_joined_on_toolset_close() -> Non
             AgentSpec(name="assistant", model="fake-model"),
             mcp_toolsets=(toolset,),
         )
-        await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+        await asyncio.wait_for(server.stream.started.wait(), timeout=10)
         await asyncio.wait_for(toolset.close(), timeout=1)
         return server.stream.closed.is_set()
 

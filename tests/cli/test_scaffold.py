@@ -715,7 +715,9 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
             sys.executable,
             "-m",
             "pytest",
-            "-q",
+            "-v",
+            "-o",
+            "faulthandler_timeout=60",
             "tests/test_architecture.py",
             "tests/test_coding_composition.py",
         ],
@@ -724,7 +726,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         check=False,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
     )
     assert generated_suite.returncode == 0, generated_suite.stdout + generated_suite.stderr
 

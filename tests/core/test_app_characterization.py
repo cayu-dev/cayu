@@ -404,6 +404,7 @@ def test_g2a_user_input_pause_then_resume() -> None:
         EventType.SESSION_RESUMED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
         EventType.TOOL_EXPOSURE_RECORDED,
         EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,

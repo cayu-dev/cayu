@@ -577,6 +577,12 @@ export type ApiEnvironmentSummary = {
     workspace_branch_capabilities: ApiWorkspaceBranchCapabilities;
     workspace_branch_lifecycle: ApiWorkspaceBranchLifecycle;
     /**
+     * Workspace Checkpoint Policy
+     */
+    workspace_checkpoint_policy?: {
+        [key: string]: unknown;
+    } | null;
+    /**
      * Workspace Id
      */
     workspace_id: string | null;
@@ -719,6 +725,12 @@ export type ApiInteractionSummary = {
      * Provider Names
      */
     provider_names?: Array<string>;
+    /**
+     * Queued Interaction Profile Handoff
+     */
+    queued_interaction_profile_handoff?: {
+        [key: string]: string | number;
+    } | null;
     /**
      * Result Transcript End
      */
@@ -2972,6 +2984,14 @@ export type CausalBudgetCostSummary = {
      */
     line_items?: Array<CostLineItem>;
     /**
+     * Missing Pricing Model Steps
+     */
+    missing_pricing_model_steps?: number;
+    /**
+     * Missing Usage Model Steps
+     */
+    missing_usage_model_steps?: number;
+    /**
      * Model Steps
      */
     model_steps: number;
@@ -2999,6 +3019,10 @@ export type CausalBudgetCostSummary = {
      * Unpriced Model Steps
      */
     unpriced_model_steps: number;
+    /**
+     * Unsupported Pricing Model Steps
+     */
+    unsupported_pricing_model_steps?: number;
 };
 
 /**
@@ -3388,6 +3412,10 @@ export type ComparisonCostLineItemInput = {
      */
     uncached_input_tokens: number;
     /**
+     * Unpriced Reason
+     */
+    unpriced_reason?: 'missing_usage' | 'missing_pricing' | 'unsupported_pricing' | null;
+    /**
      * Web Search Calls
      */
     web_search_calls?: number;
@@ -3517,6 +3545,10 @@ export type ComparisonCostLineItemOutput = {
      */
     uncached_input_tokens: number;
     /**
+     * Unpriced Reason
+     */
+    unpriced_reason?: 'missing_usage' | 'missing_pricing' | 'unsupported_pricing' | null;
+    /**
      * Web Search Calls
      */
     web_search_calls?: number;
@@ -3564,6 +3596,24 @@ export type ComparisonPricingProvenance = {
      * Url
      */
     url: string;
+};
+
+/**
+ * ConfigurationFieldProvenanceManifest
+ */
+export type ConfigurationFieldProvenanceManifest = {
+    /**
+     * Owner
+     */
+    owner: string;
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Source
+     */
+    source: 'framework' | 'application' | 'explicit';
 };
 
 /**
@@ -4187,6 +4237,10 @@ export type CostLineItem = {
      */
     uncached_input_tokens: number;
     /**
+     * Unpriced Reason
+     */
+    unpriced_reason?: 'missing_usage' | 'missing_pricing' | 'unsupported_pricing' | null;
+    /**
      * Web Search Calls
      */
     web_search_calls?: number;
@@ -4633,6 +4687,12 @@ export type EnvironmentManifest = {
     workspace_branch_lifecycle: {
         [key: string]: unknown;
     };
+    /**
+     * Workspace Checkpoint Policy
+     */
+    workspace_checkpoint_policy?: {
+        [key: string]: unknown;
+    } | null;
 };
 
 /**
@@ -6574,6 +6634,26 @@ export type EvalRunCostBudgetOutput = {
 export type EvalRunFailureCode = 'target_unavailable' | 'corpus_unavailable' | 'execution_failed' | 'worker_interrupted';
 
 /**
+ * EvalRunFailureDiagnostic
+ *
+ * Safe causal evidence bound to the containing run and fenced terminal claim.
+ */
+export type EvalRunFailureDiagnostic = {
+    /**
+     * Provider Protocol Reason
+     */
+    provider_protocol_reason?: string | null;
+    reason: EvalRunFailureReason;
+};
+
+/**
+ * EvalRunFailureReason
+ *
+ * Closed causal vocabulary; values never come from exception messages.
+ */
+export type EvalRunFailureReason = 'corpus_load_failed' | 'corpus_missing' | 'target_registration_missing' | 'target_preflight_failed' | 'execution_profile_missing' | 'execution_profile_changed' | 'target_identity_failed' | 'target_identity_changed' | 'corpus_compilation_failed' | 'execution_failed' | 'execution_profile_rejected' | 'provider_protocol_failed' | 'execution_cancelled' | 'result_publication_failed';
+
+/**
  * EvalRunInvocation
  *
  * Durable, authority-free execution contractions and trusted caller provenance.
@@ -6677,6 +6757,7 @@ export type EvalRunRecord = {
      */
     created_at: string;
     failure_code?: EvalRunFailureCode | null;
+    failure_diagnostic?: EvalRunFailureDiagnostic | null;
     /**
      * Finished At
      */
@@ -8084,7 +8165,7 @@ export type EvalToolJsonObservationMismatchV1 = {
  *
  * Stable, non-secret reason for one fresh trial's terminal outcome.
  */
-export type EvalTrialDiagnosticCode = 'passed' | 'assertion_failed' | 'assertion_evidence_unavailable' | 'terminal_evidence_unavailable' | 'interrupted_evidence_unavailable' | 'child_evidence_unavailable' | 'external_target_unavailable' | 'external_target_cancelled' | 'external_target_unknown' | 'external_target_incomplete' | 'external_target_identity_mismatch' | 'external_target_failed' | 'execution_failed' | 'session_failed' | 'terminal_evidence_failed' | 'evidence_preparation_failed' | 'assertion_evaluation_failed' | 'case_timeout';
+export type EvalTrialDiagnosticCode = 'passed' | 'assertion_failed' | 'assertion_evidence_unavailable' | 'terminal_evidence_unavailable' | 'interrupted_evidence_unavailable' | 'child_evidence_unavailable' | 'external_target_unavailable' | 'external_target_cancelled' | 'external_target_unknown' | 'external_target_incomplete' | 'external_target_identity_mismatch' | 'external_target_failed' | 'workflow_target_failed' | 'workflow_execution_failed' | 'workflow_completion_missing' | 'workflow_completion_conflict' | 'workflow_attempt_superseded' | 'workflow_projector_failed' | 'workflow_output_invalid' | 'workflow_capture_failed' | 'workflow_quiescence_failed' | 'execution_failed' | 'session_failed' | 'terminal_evidence_failed' | 'evidence_preparation_failed' | 'assertion_evaluation_failed' | 'case_timeout';
 
 /**
  * EvalTrialOutputPreviewV1
@@ -8385,6 +8466,7 @@ export type EvaluationTargetIdentity = {
      * Target Key
      */
     target_key: string;
+    workflow?: WorkflowEvalTargetIdentityV1 | null;
 };
 
 /**
@@ -8715,6 +8797,10 @@ export type FinalOutputContainsAssertionSpec = {
  * FinalOutputEqualsAssertionSpec
  */
 export type FinalOutputEqualsAssertionSpec = {
+    /**
+     * Comparison
+     */
+    comparison?: 'text' | 'json';
     /**
      * Description
      */
@@ -9617,6 +9703,10 @@ export type MemoryExperimentTrialEvidence = {
     case_revision: string;
     execution: MemoryInterventionExecutionRecord;
     intervention_binding?: MemoryInterventionTrialBinding | null;
+    /**
+     * Intervention Binding Omitted
+     */
+    intervention_binding_omitted?: boolean;
     memory_overhead?: MemoryPreparationOverheadEvidence | null;
     /**
      * Published Result Revision
@@ -10726,6 +10816,10 @@ export type MemoryTrialReportRow = {
     intervention_attribution_fingerprint?: string | null;
     intervention_binding?: MemoryInterventionTrialBinding | null;
     /**
+     * Intervention Binding Omitted
+     */
+    intervention_binding_omitted?: boolean;
+    /**
      * Intervention Spec Fingerprint
      */
     intervention_spec_fingerprint: string;
@@ -11029,6 +11123,135 @@ export type OpaqueExternalCaseRefV1 = {
      * Revision
      */
     revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * OperationOutcomeCounts
+ */
+export type OperationOutcomeCounts = {
+    /**
+     * Command Cancelled
+     */
+    command_cancelled?: number;
+    /**
+     * Command Nonzero Exit
+     */
+    command_nonzero_exit?: number;
+    /**
+     * Command Not Reported
+     */
+    command_not_reported?: number;
+    /**
+     * Command Timed Out
+     */
+    command_timed_out?: number;
+    /**
+     * Command Zero Exit
+     */
+    command_zero_exit?: number;
+    /**
+     * Http Error
+     */
+    http_error?: number;
+    /**
+     * Http Not Reported
+     */
+    http_not_reported?: number;
+    /**
+     * Http Response
+     */
+    http_response?: number;
+    /**
+     * Invocation Blocked
+     */
+    invocation_blocked?: number;
+    /**
+     * Invocation Cancelled
+     */
+    invocation_cancelled?: number;
+    /**
+     * Invocation Completed
+     */
+    invocation_completed?: number;
+    /**
+     * Invocation Failed
+     */
+    invocation_failed?: number;
+    /**
+     * Invocation Not Reported
+     */
+    invocation_not_reported?: number;
+};
+
+/**
+ * OperationOutcomeEvidence
+ *
+ * Content-free reference to one observation in the original event stream.
+ */
+export type OperationOutcomeEvidence = {
+    /**
+     * Cancelled
+     */
+    cancelled?: boolean | null;
+    /**
+     * Dimension
+     */
+    dimension: 'invocation' | 'command' | 'http';
+    /**
+     * Event Id
+     */
+    event_id: string;
+    /**
+     * Execution Id
+     */
+    execution_id?: string | null;
+    /**
+     * Exit Code
+     */
+    exit_code?: number | null;
+    /**
+     * Http Status Code
+     */
+    http_status_code?: number | null;
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+    /**
+     * State
+     */
+    state: 'completed' | 'failed' | 'blocked' | 'cancelled' | 'not_reported' | 'zero_exit' | 'nonzero_exit' | 'timed_out' | 'response' | 'http_error';
+    /**
+     * Timed Out
+     */
+    timed_out?: boolean | null;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id?: string | null;
+};
+
+/**
+ * OperationOutcomeSummary
+ */
+export type OperationOutcomeSummary = {
+    counts?: OperationOutcomeCounts;
+    /**
+     * Evidence
+     */
+    evidence?: Array<OperationOutcomeEvidence>;
+    /**
+     * Evidence State
+     */
+    evidence_state?: 'not_reported' | 'observed' | 'incomplete';
+    /**
+     * Omitted Evidence Count
+     */
+    omitted_evidence_count?: number;
     /**
      * Schema Version
      */
@@ -12428,6 +12651,8 @@ export type PublishedEvalTrialResult = {
      * Assertions
      */
     assertions: Array<PublishedAssertionResult>;
+    capture_bounds?: SessionTrajectoryBounds | null;
+    capture_diagnostic?: WorkflowCaptureDiagnostic | null;
     code: EvalTrialDiagnosticCode;
     /**
      * Duration Ms
@@ -12437,11 +12662,16 @@ export type PublishedEvalTrialResult = {
      * Evidence Complete
      */
     evidence_complete: boolean;
+    /**
+     * Execution Status
+     */
+    execution_status?: 'completed' | null;
     memory_attribution: EvalMemoryAttributionEvidenceV1;
     /**
      * Message
      */
     message: string;
+    operation_outcomes?: OperationOutcomeSummary | null;
     output: EvalTrialOutputPreviewV1;
     /**
      * Score
@@ -12480,6 +12710,10 @@ export type PublishedFinalOutputContainsDetail = {
  * PublishedFinalOutputEqualsDetail
  */
 export type PublishedFinalOutputEqualsDetail = {
+    /**
+     * Comparison
+     */
+    comparison?: 'text' | 'json';
     /**
      * Kind
      */
@@ -12691,7 +12925,7 @@ export type PublishedModelJudgeDetail = {
     /**
      * Candidate Route Relation
      */
-    candidate_route_relation: 'independent_model' | 'same_model';
+    candidate_route_relation: 'independent_model' | 'same_model' | 'unknown';
     cost?: PublishedModelJudgeCostV1 | null;
     /**
      * Diagnostic
@@ -12910,7 +13144,7 @@ export type PublishedStructuredModelJudgeDetail = {
     /**
      * Candidate Route Relation
      */
-    candidate_route_relation: 'independent_model' | 'same_model';
+    candidate_route_relation: 'independent_model' | 'same_model' | 'unknown';
     cost?: PublishedStructuredJudgeCostV1 | null;
     /**
      * Criteria
@@ -13195,7 +13429,7 @@ export type RecallItemAdmission = 'admitted' | 'offered';
 /**
  * RecallItemSelectionReason
  */
-export type RecallItemSelectionReason = 'calibrated_strong_match' | 'calibrated_plausible_match' | 'duplicate_strong_reference' | 'strong_match_not_focused' | 'strong_match_offered_by_mode' | 'explicit_application_selection';
+export type RecallItemSelectionReason = 'calibrated_strong_match' | 'calibrated_plausible_match' | 'duplicate_strong_reference' | 'strong_match_not_focused' | 'strong_match_offered_by_mode' | 'explicit_application_selection' | 'newly_relevant';
 
 /**
  * RecoveryCleanupPolicyManifest
@@ -13576,6 +13810,24 @@ export type RuntimeBuildProvenanceOrigin = 'wheel_record' | 'oci_image_digest' |
 export type RuntimeBuildProvenanceStrength = 'structural' | 'application_versioned' | 'unavailable';
 
 /**
+ * RuntimeConfigurationManifest
+ *
+ * Redacted values and ownership for supported application tunables.
+ */
+export type RuntimeConfigurationManifest = {
+    /**
+     * Provenance
+     */
+    provenance: Array<ConfigurationFieldProvenanceManifest>;
+    /**
+     * Values
+     */
+    values: {
+        [key: string]: unknown;
+    };
+};
+
+/**
  * RuntimeManifest
  */
 export type RuntimeManifest = {
@@ -13583,6 +13835,7 @@ export type RuntimeManifest = {
      * Budget Policy
      */
     budget_policy: string | null;
+    configuration: RuntimeConfigurationManifest;
     /**
      * Context Counting
      */
@@ -14267,7 +14520,7 @@ export type SessionCostBody = {
 /**
  * SessionCostSummary
  *
- * Estimated session cost derived from durable completion and resource evidence.
+ * Detailed cost inspection, retaining one line item per completed step.
  */
 export type SessionCostSummary = {
     /**
@@ -14278,6 +14531,14 @@ export type SessionCostSummary = {
      * Line Items
      */
     line_items?: Array<CostLineItem>;
+    /**
+     * Missing Pricing Model Steps
+     */
+    missing_pricing_model_steps?: number;
+    /**
+     * Missing Usage Model Steps
+     */
+    missing_usage_model_steps?: number;
     /**
      * Model Steps
      */
@@ -14298,6 +14559,10 @@ export type SessionCostSummary = {
      * Unpriced Model Steps
      */
     unpriced_model_steps: number;
+    /**
+     * Unsupported Pricing Model Steps
+     */
+    unsupported_pricing_model_steps?: number;
 };
 
 /**
@@ -14510,6 +14775,46 @@ export type SessionTopologyResponse = {
      */
     unique_node_count: number;
 };
+
+/**
+ * SessionTrajectoryBounds
+ *
+ * Global retained-evidence limits for one production-session trajectory.
+ */
+export type SessionTrajectoryBounds = {
+    /**
+     * Max Depth
+     */
+    max_depth?: number;
+    /**
+     * Max Events
+     */
+    max_events?: number;
+    /**
+     * Max Record Bytes
+     */
+    max_record_bytes?: number;
+    /**
+     * Max Sessions
+     */
+    max_sessions?: number;
+    /**
+     * Max Total Bytes
+     */
+    max_total_bytes?: number;
+    /**
+     * Max Transcript Records
+     */
+    max_transcript_records?: number;
+    memory_attribution_bounds?: MemoryAttributionBounds;
+};
+
+/**
+ * SessionTrajectoryErrorCode
+ *
+ * Stable reason a durable session tree cannot become exact eval evidence.
+ */
+export type SessionTrajectoryErrorCode = 'deadline_exceeded' | 'store_unsupported' | 'evidence_read_failed' | 'terminal_evidence_rejected' | 'descendant_enumeration_failed' | 'origin_evidence_rejected' | 'parent_contradiction' | 'cycle_detected' | 'session_limit_exceeded' | 'depth_limit_exceeded' | 'closure_changed' | 'evidence_inconsistent';
 
 /**
  * SessionTranscriptResponse
@@ -15173,6 +15478,13 @@ export type TaskStatusCounts = {
      */
     running: string;
 };
+
+/**
+ * TerminalSessionEvidenceErrorCode
+ *
+ * Stable reason why a terminal-session snapshot cannot be returned.
+ */
+export type TerminalSessionEvidenceErrorCode = 'session_not_found' | 'session_not_terminal' | 'session_interrupted' | 'initial_transcript_incomplete' | 'terminal_event_missing' | 'terminal_event_conflict' | 'terminal_event_duplicate' | 'terminal_publication_marker_invalid' | 'terminal_publication_marker_conflict' | 'evidence_inconsistent' | 'event_limit_exceeded' | 'transcript_limit_exceeded' | 'record_bytes_exceeded' | 'total_bytes_exceeded' | 'transport_bytes_exceeded';
 
 /**
  * TextPart
@@ -16532,6 +16844,10 @@ export type UsageUnpricedReason = {
      * Reason
      */
     reason: string;
+    /**
+     * Unpriced Reason
+     */
+    unpriced_reason?: 'missing_usage' | 'missing_pricing' | 'unsupported_pricing' | null;
 };
 
 /**
@@ -16787,6 +17103,102 @@ export type WebSearchSource = {
      * Url
      */
     url: string;
+};
+
+/**
+ * WorkflowCaptureDiagnostic
+ *
+ * Payload-free bounded-read rejection; observed is a witness, never a total.
+ */
+export type WorkflowCaptureDiagnostic = {
+    bounds: SessionTrajectoryBounds;
+    code: SessionTrajectoryErrorCode;
+    /**
+     * Consumed Bytes
+     */
+    consumed_bytes?: number;
+    /**
+     * Consumed Events
+     */
+    consumed_events?: number;
+    /**
+     * Consumed Transcript Records
+     */
+    consumed_transcript_records?: number;
+    /**
+     * Limit
+     */
+    limit?: number | null;
+    /**
+     * Observed Lower Bound
+     */
+    observed_lower_bound?: number | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Stage
+     */
+    stage?: 'execution' | 'terminal_load' | 'result_projection' | 'child_capture' | 'probe_capture' | 'capture_revalidation' | 'assertion' | 'post_scoring_revalidation';
+    terminal_code?: TerminalSessionEvidenceErrorCode | null;
+};
+
+/**
+ * WorkflowEvalInstanceScope
+ *
+ * How a target constructs application/workflow state for concrete trials.
+ */
+export type WorkflowEvalInstanceScope = 'shared' | 'per_trial';
+
+/**
+ * WorkflowEvalTargetIdentityV1
+ *
+ * Portable behavior identity for a trusted workflow-root eval target.
+ */
+export type WorkflowEvalTargetIdentityV1 = {
+    /**
+     * Application Context Revision
+     */
+    application_context_revision: string;
+    capture_bounds?: SessionTrajectoryBounds | null;
+    /**
+     * Close Timeout Seconds
+     */
+    close_timeout_seconds: number;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    /**
+     * Execution Scope Revision
+     */
+    execution_scope_revision: string;
+    /**
+     * Implementation Revision
+     */
+    implementation_revision: string;
+    instance_scope: WorkflowEvalInstanceScope;
+    /**
+     * Result Projector Revision
+     */
+    result_projector_revision: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Workflow Name
+     */
+    workflow_name: string;
+    /**
+     * Workflow Spec Revision
+     */
+    workflow_spec_revision: string;
 };
 
 /**
@@ -17135,7 +17547,7 @@ export type GetCausalBudgetSummaryApiCausalBudgetsCausalBudgetIdSummaryPostData 
 
 export type GetCausalBudgetSummaryApiCausalBudgetsCausalBudgetIdSummaryPostErrors = {
     /**
-     * The causal-budget summary exceeds its session, event-count, event-input-byte, or serialized response safety bound.
+     * The causal-budget summary exceeds its session or serialized response safety bound.
      */
     413: ApiErrorResponse;
     /**
@@ -17143,7 +17555,7 @@ export type GetCausalBudgetSummaryApiCausalBudgetsCausalBudgetIdSummaryPostError
      */
     422: HttpValidationError;
     /**
-     * The configured session store cannot enforce byte-bounded event reads for this legacy summary.
+     * The configured session store cannot enforce bounded accounting reads.
      */
     501: ApiErrorResponse;
 };

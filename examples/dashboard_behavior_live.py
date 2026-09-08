@@ -80,6 +80,7 @@ from cayu.runtime import (
 from cayu.runtime import (
     _execution_profile_admission as execution_profile_admission,
 )
+from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.server import (
     BasicAuth,
     DashboardConfig,
@@ -713,7 +714,7 @@ async def _seed_app() -> tuple[
         app,
         provider_name=PROVIDER_NAME,
         model=MODEL_NAME,
-        max_steps=20,
+        max_steps=DEFAULT_MAX_STEPS,
     )
     await store.create(
         RunRequest(
@@ -725,7 +726,7 @@ async def _seed_app() -> tuple[
                 "cayu:dashboard_fixture": {"marker": "runtime-dashboard-marker"},
             },
             messages=[Message.text("user", "Show the dashboard contract session.")],
-            max_steps=20,
+            max_steps=DEFAULT_MAX_STEPS,
             tool_capability_ceiling=contract_tool_capability_ceiling,
         ),
         identity=contract_session_identity,
@@ -886,7 +887,7 @@ async def _seed_app() -> tuple[
                 environment_name=environment_name,
                 labels=labels or {},
                 messages=[Message.text("user", prompt)],
-                max_steps=20,
+                max_steps=DEFAULT_MAX_STEPS,
                 tool_capability_ceiling=contract_tool_capability_ceiling,
             ),
             identity=contract_session_identity,
@@ -920,7 +921,7 @@ async def _seed_app() -> tuple[
                 agent_name=AGENT_NAME,
                 session_id=session_id,
                 messages=[Message.text("user", "Wait for a dashboard interruption.")],
-                max_steps=20,
+                max_steps=DEFAULT_MAX_STEPS,
                 tool_capability_ceiling=contract_tool_capability_ceiling,
             ),
             identity=contract_session_identity,

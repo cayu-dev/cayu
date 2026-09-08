@@ -1,0 +1,45 @@
+name: Full-scale qualification
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: "17 10 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    name: Qualification ${{ matrix.shard }}/8 (Python 3.14)
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      CAYU_REQUIRE_POSTGRES: "1"
+      CAYU_REQUIRE_DOCKER_RUNNER: "1"
+      CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT: "1"
+      CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Run full-scale evidence and capacity checks
+        run: >-
+          python3 scripts/run_ci.py --lane specialist
+          --specialist-lane "qualification-${{ matrix.shard }}"
+      - name: Upload completed qualification phases and failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-durations-qualification-${{ matrix.shard }}
+          path: .ci-test-reports.jsonl
+          include-hidden-files: true
+          if-no-files-found: error

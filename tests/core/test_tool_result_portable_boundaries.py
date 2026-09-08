@@ -1085,7 +1085,15 @@ def test_cayu_app_does_not_redispatch_after_valid_completion_billing_hook_fails(
     assert completed.payload["usage_metrics"]["output_tokens"] == 4
     assert completed.payload["compaction_outcome"] == "completion_observation_failed"
     failed = next(event for event in events if event.type == EventType.CONTEXT_COMPACTION_FAILED)
+    assert type(failed.payload["elapsed_ms"]) is int
+    assert failed.payload["elapsed_ms"] >= 0
     assert failed.payload == {
+        "phase": "provider_dispatch",
+        "reason": "internal_failed",
+        "retryable": False,
+        "provider_dispatch_disposition": "unknown",
+        "recovery_action": "reconcile_completion",
+        "elapsed_ms": failed.payload["elapsed_ms"],
         "bounded_input": True,
         "checkpoint": "context_compaction",
         "chunk_count": 1,
@@ -2148,7 +2156,7 @@ def test_external_invalid_tool_output_is_durable_before_blocking_after_hook() ->
                 ),
             )
         )
-        await asyncio.wait_for(hook.started.wait(), timeout=5)
+        await asyncio.wait_for(hook.started.wait(), timeout=10)
 
         stored_while_hook_blocked = await store.load_events(session_id)
         stored_types = [event.type for event in stored_while_hook_blocked]

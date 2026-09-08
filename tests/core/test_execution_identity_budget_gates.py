@@ -1025,7 +1025,7 @@ def test_concurrent_reservation_collision_does_not_release_the_winner(
                 ),
             )
         )
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         ledger.release_second_result.set()
         loser_events = await asyncio.wait_for(loser_task, timeout=5)
         assert ledger.first_reservation_id is not None

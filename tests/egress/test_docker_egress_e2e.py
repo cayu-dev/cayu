@@ -465,4 +465,12 @@ def test_credentialless_factory_crosses_real_docker_boundary_without_fake_secret
         }
     ]
     assert request_events
-    assert all(event.payload["authorization_kind"] == "credentialless" for event in request_events)
+    assert any(
+        event.type is credentialless_factory_results["authorized"] for event in request_events
+    )
+    for event in request_events:
+        if event.payload["method"] == "CONNECT":
+            assert event.type is credentialless_factory_results["denied"]
+            assert event.payload["authorization_kind"] == "transport"
+        else:
+            assert event.payload["authorization_kind"] == "credentialless"

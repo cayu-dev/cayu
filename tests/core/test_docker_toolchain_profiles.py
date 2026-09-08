@@ -147,7 +147,7 @@ def test_selector_required_flags_and_path_values_are_closed() -> None:
     ) == ("--quiet", "--manifest-path", "crates/core/Cargo.toml")
     with pytest.raises(ValueError, match="required flag"):
         authority.validate_model_arguments(("--manifest-path", "crates/core/Cargo.toml"))
-    with pytest.raises(ValueError, match="outside its admitted scope"):
+    with pytest.raises(ValueError, match="within the selector's admitted path scope"):
         authority.validate_model_arguments(("--quiet", "--manifest-path", "vendor/core/Cargo.toml"))
 
 

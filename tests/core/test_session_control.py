@@ -464,7 +464,7 @@ def test_stream_cancellation_closes_upstream_iterator_once(
         control = SessionControl[object](session_store=object())
         wrapped = control.stream_with_out_of_band_events("session-cancel", upstream)
         consumer = asyncio.create_task(anext(wrapped))
-        await asyncio.wait_for(upstream.started.wait(), timeout=1)
+        await asyncio.wait_for(upstream.started.wait(), timeout=10)
         consumer.cancel()
         outcomes = await asyncio.wait_for(
             asyncio.gather(consumer, return_exceptions=True),

@@ -77,6 +77,18 @@ def _assert_internal_post_dispatch_compaction_failure(
     assert type(failed.payload["elapsed_ms"]) is int
     compaction_failure = {**expected, "elapsed_ms": failed.payload["elapsed_ms"]}
     assert terminal.payload["compaction_failure"] == compaction_failure
+    assert terminal.payload["failure_evidence"] == {
+        "classification": "failure",
+        "deadline": None,
+        "deadline_phase": None,
+        "exception_types": ["DurableValueError", "ContextBuildError"],
+        "truncated": False,
+        "secondary_failures": False,
+        "session_id": terminal.session_id,
+        "run_epoch": 1,
+        "terminal_event_id": None,
+        "settlement": "unknown",
+    }
     return compaction_failure
 
 
@@ -505,6 +517,7 @@ def test_cayu_app_does_not_redispatch_compaction_when_derived_usage_overflows():
         "durable_value_error_code": "integer_out_of_range",
         "durable_value_error_path": "$",
         "compaction_failure": compaction_failure,
+        "failure_evidence": events[-1].payload["failure_evidence"],
     }
 
 
@@ -1479,6 +1492,7 @@ def test_cayu_app_rejects_non_portable_compaction_error_before_retry_or_publicat
         "durable_value_error_code": "nul_character",
         "durable_value_error_path": "$/#0",
         "compaction_failure": compaction_failure,
+        "failure_evidence": terminal.payload["failure_evidence"],
     }
     rendered = json.dumps(
         [event.model_dump(mode="json") for event in events],
@@ -1640,6 +1654,7 @@ def test_cayu_app_does_not_publish_forged_compaction_durable_value_diagnostics(
         "durable_value_error_code": "invalid_json_type",
         "durable_value_error_path": "$",
         "compaction_failure": compaction_failure,
+        "failure_evidence": terminal.payload["failure_evidence"],
     }
     rendered = json.dumps([event.model_dump(mode="json") for event in events])
     assert "workload-secret" not in rendered

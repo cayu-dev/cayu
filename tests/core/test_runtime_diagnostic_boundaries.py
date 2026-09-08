@@ -197,6 +197,7 @@ async def _run_binding_finalize_failure(
 def _run_linked_task_failure(error: Exception) -> tuple[list[Event], object, object]:
     class FailingSessionStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
+        terminal_interaction_publication_version = 1
 
         def __init__(self) -> None:
             super().__init__()
@@ -265,6 +266,18 @@ def _assert_linked_runtime_task_failure(
     assert marker["failure_id"] == identity.failure_id
     assert marker["session_failure_payload"] == {
         **expected_session_diagnostic,
+        "failure_evidence": {
+            "classification": "failure",
+            "deadline": None,
+            "deadline_phase": None,
+            "exception_types": ["RuntimeError"],
+            "truncated": False,
+            "secondary_failures": False,
+            "session_id": session.id,
+            "run_epoch": 1,
+            "terminal_event_id": None,
+            "settlement": "unknown",
+        },
         "runtime_task_failure_id": identity.failure_id,
     }
     assert marker["turn_completed_payload"]["status"] == "failed"

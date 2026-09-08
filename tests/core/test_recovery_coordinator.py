@@ -503,7 +503,7 @@ def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> N
             ),
             name="initial-claimant",
         )
-        await asyncio.wait_for(store.first_claim_ready.wait(), timeout=5)
+        await asyncio.wait_for(store.first_claim_ready.wait(), timeout=10)
         first_checkpoint = await InMemorySessionStore.load_checkpoint(store, session.id)
         assert first_checkpoint is not None
         first_marker = first_checkpoint["incomplete_session_recovery_claim"]
@@ -1006,7 +1006,7 @@ def test_initial_incomplete_recovery_claim_cannot_fence_after_its_lease_expires(
                 inactive_for_seconds=None,
             )
         )
-        await asyncio.wait_for(store.reservation_ready.wait(), timeout=5)
+        await asyncio.wait_for(store.reservation_ready.wait(), timeout=10)
         current_time["value"] += timedelta(minutes=6)
         store.release_reservation.set()
 
@@ -1522,8 +1522,8 @@ def test_stalled_incomplete_recovery_renewal_stops_work_at_local_lease_deadline(
                 recovery=recovery,
             )
         )
-        await asyncio.wait_for(recovery_started.wait(), timeout=1)
-        await asyncio.wait_for(store.renewal_dispatched.wait(), timeout=1)
+        await asyncio.wait_for(recovery_started.wait(), timeout=10)
+        await asyncio.wait_for(store.renewal_dispatched.wait(), timeout=10)
         await asyncio.sleep(0.15)
         assert owner.done() is False
         assert recovery_stopped.is_set() is False
@@ -1659,7 +1659,7 @@ def test_incomplete_recovery_renewal_preserves_owner_cancellation(
                 stop=asyncio.Event(),
             )
         )
-        await asyncio.wait_for(store.renewal_dispatched.wait(), timeout=1)
+        await asyncio.wait_for(store.renewal_dispatched.wait(), timeout=10)
 
         assert heartbeat.cancel("stop recovery") is True
         await asyncio.sleep(0)

@@ -14,6 +14,44 @@ _REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR = "CAYU_REQUIRE_CURRENT_TEST_DURATIONS"
 _POSTGRES_CONTAINER_IMAGE = "pgvector/pgvector:pg16"
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _MAX_UNKNOWN_DURATION_FRACTION = 0.05
+_CI_REPORT_PATH: Path | None = None
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    global _CI_REPORT_PATH
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not config.getoption("splits", None):
+        return
+    owner = os.environ.setdefault("CAYU_CI_REPORT_OWNER_PID", str(os.getpid()))
+    if owner != str(os.getpid()):
+        return
+    _CI_REPORT_PATH = Path(config.rootpath) / ".ci-test-reports.jsonl"
+    _CI_REPORT_PATH.write_text("", encoding="utf-8")
+
+
+def _append_ci_report(record: dict[str, object]) -> None:
+    if _CI_REPORT_PATH is not None:
+        with _CI_REPORT_PATH.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def pytest_runtest_logstart(nodeid: str, location: tuple[str, int | None, str]) -> None:
+    _append_ci_report({"nodeid": nodeid, "phase": "start"})
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if _CI_REPORT_PATH is None:
+        return
+    record: dict[str, object] = {
+        "nodeid": report.nodeid,
+        "phase": report.when,
+        "duration": report.duration,
+        "outcome": report.outcome,
+    }
+    if report.failed:
+        failure = report.longreprtext
+        record["failure"] = failure[:16384]
+        record["failure_truncated"] = len(failure) > 16384
+    _append_ci_report(record)
 
 
 class ProviderCredentialCanaries:
@@ -204,13 +242,15 @@ def pytest_collection_modifyitems(
     """Keep every Postgres consumer in its isolated CI lane."""
 
     for item in items:
+        if item.nodeid.startswith("tests/qualification/"):
+            item.add_marker(pytest.mark.qualification)
         if _requests_postgres(item):
             item.add_marker(pytest.mark.postgres)
     _require_current_test_durations(config, items)
 
 
 @pytest.fixture(scope="session")
-def postgres_dsn() -> str:
+def _postgres_server_dsn() -> str:
     """Session-scoped Postgres DSN for the store parity tests.
 
     Resolution order:
@@ -249,3 +289,29 @@ def postgres_dsn() -> str:
         yield dsn
     finally:
         container.stop()
+
+
+@pytest.fixture(scope="module")
+def postgres_dsn(_postgres_server_dsn: str) -> str:
+    """Give each test module its own database on the shared disposable server.
+
+    Module-specific schema revisions and alias keyrings must not become the
+    deployment configuration observed by another module. An externally supplied
+    test DSN therefore needs permission to create disposable databases.
+    """
+    from uuid import uuid4
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    database = f"cayu_test_{uuid4().hex}"
+    with psycopg.connect(_postgres_server_dsn, autocommit=True) as connection:
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    try:
+        yield make_conninfo(_postgres_server_dsn, dbname=database)
+    finally:
+        with psycopg.connect(_postgres_server_dsn, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database))
+            )

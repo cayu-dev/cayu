@@ -1528,6 +1528,7 @@ async def test_anthropic_provider_stream_emits_typed_api_error_payload() -> None
         "error": "AnthropicAPIError: Anthropic provider failed",
         "error_type": "AnthropicAPIError",
         "provider": "anthropic",
+        "model_provider_error": True,
         "status_code": 429,
         "provider_error_type": "rate_limit_error",
         "retryable": True,

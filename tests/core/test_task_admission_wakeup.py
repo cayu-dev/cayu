@@ -31,6 +31,7 @@ class _ObservedInMemoryTaskStore(InMemoryTaskStore):
         super().__init__()
         self.empty_claim = asyncio.Event()
         self.claim_calls = 0
+        self.empty_claim_gate: tuple[asyncio.Event, asyncio.Event] | None = None
 
     async def claim_task(
         self,
@@ -47,6 +48,10 @@ class _ObservedInMemoryTaskStore(InMemoryTaskStore):
         )
         if claimed is None:
             self.empty_claim.set()
+            if self.empty_claim_gate is not None:
+                entered, release = self.empty_claim_gate
+                entered.set()
+                await release.wait()
         return claimed
 
 
@@ -57,6 +62,7 @@ class _ObservedSQLiteTaskStore(SQLiteTaskStore):
         super().__init__(path)
         self.empty_claim = asyncio.Event()
         self.claim_calls = 0
+        self.empty_claim_gate: tuple[asyncio.Event, asyncio.Event] | None = None
 
     async def claim_task(
         self,
@@ -73,6 +79,10 @@ class _ObservedSQLiteTaskStore(SQLiteTaskStore):
         )
         if claimed is None:
             self.empty_claim.set()
+            if self.empty_claim_gate is not None:
+                entered, release = self.empty_claim_gate
+                entered.set()
+                await release.wait()
         return claimed
 
 
@@ -168,6 +178,7 @@ async def test_matching_admission_wakes_idle_task_worker_before_long_poll() -> N
 
 
 @pytest.mark.anyio
+@pytest.mark.qualification
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 async def test_hundred_idle_task_workers_meet_economics_budget(
     store_kind: str,
@@ -220,7 +231,16 @@ async def test_hundred_idle_task_workers_meet_economics_budget(
         assert 2 <= store.claim_calls <= 10
         assert idle_cpu_s <= 0.10
 
-        await producer.create_task(TaskCreate(task_id="pooled-job", type="job"))
+        # Publish while the active poller owns a proven empty result. This makes
+        # hint consumption deterministic without changing the idle economics phase.
+        empty_poll = asyncio.Event()
+        release_poll = asyncio.Event()
+        store.empty_claim_gate = (empty_poll, release_poll)
+        try:
+            await asyncio.wait_for(empty_poll.wait(), timeout=10)
+            await producer.create_task(TaskCreate(task_id="pooled-job", type="job"))
+        finally:
+            release_poll.set()
         await asyncio.wait_for(handled.wait(), timeout=0.5)
     finally:
         stop.set()

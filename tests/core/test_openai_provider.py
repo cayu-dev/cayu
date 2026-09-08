@@ -8283,7 +8283,9 @@ def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
     assert transport.source.closed
     assert transport.source.tail_reads == 0
     assert EventType.MODEL_RETRY not in {event.type for event in events}
-    assert EventType.MODEL_ERROR not in {event.type for event in events}
+    assert sum(event.type is EventType.MODEL_ERROR for event in events) == (
+        1 if failure_kind == "cleanup" else 0
+    )
     model_completions = [
         event for event in durable_events if event.type == EventType.MODEL_COMPLETED
     ]

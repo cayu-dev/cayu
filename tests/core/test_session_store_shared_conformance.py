@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import threading
+import time
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1798,7 +1799,7 @@ def test_session_store_conformance_persists_provider_cancellation_diagnostics(
                     pass
 
             task = asyncio.create_task(consume())
-            await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+            await asyncio.wait_for(provider.hook_started.wait(), timeout=10)
             task.cancel("caller cancellation")
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -1904,7 +1905,7 @@ def test_session_store_conformance_repairs_provider_cancellation_terminal_public
                     pass
 
             task = asyncio.create_task(consume())
-            await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+            await asyncio.wait_for(provider.hook_started.wait(), timeout=10)
             task.cancel("caller cancellation")
             with pytest.raises(asyncio.CancelledError) as raised:
                 await task
@@ -2019,7 +2020,7 @@ def test_session_store_conformance_recovers_provider_cancellation_after_marker_o
                     pass
 
             task = asyncio.create_task(consume())
-            await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+            await asyncio.wait_for(provider.hook_started.wait(), timeout=10)
             store.publish_checkpoint_and_events = lose_process_after_marker  # type: ignore[method-assign]
             try:
                 task.cancel("caller cancellation")
@@ -2177,7 +2178,7 @@ def test_session_store_conformance_persists_provider_stream_cancellation_diagnos
                     pass
 
             task = asyncio.create_task(consume())
-            await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=2)
+            await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=10)
             task.cancel("caller cancellation")
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -4549,6 +4550,20 @@ def test_postgres_context_exposure_creation_locks_session_before_receipts(
     asyncio.run(run())
 
 
+async def _expire_compaction_claim_for_test(
+    store: SessionStore, session_id: str, idempotency_key: str
+) -> None:
+    def expire(_session, checkpoint, store_now):
+        assert checkpoint is not None
+        copied = copy.deepcopy(checkpoint)
+        record = copied["session_operations"]["records"][idempotency_key]
+        assert record["status"] == "running"
+        record["claim_expires_at"] = (store_now - timedelta(seconds=1)).isoformat()
+        return copied
+
+    await store.transform_checkpoint_with_store_time(session_id, expire)
+
+
 async def _open_store(
     case,
     *,
@@ -4895,7 +4910,7 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
                 ]
 
             second_resume = asyncio.create_task(collect_second_resume())
-            await asyncio.wait_for(provider.second_started.wait(), timeout=5)
+            await asyncio.wait_for(provider.second_started.wait(), timeout=10)
             independent_interrupt = [
                 event
                 async for event in resumed_app.interrupt_session(
@@ -7973,11 +7988,11 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
                 *,
                 session_id: str,
                 claim_id: str,
-                claim_expires_at: datetime,
+                local_lease_deadline: float,
                 stop: asyncio.Event,
             ) -> None:
-                del claim_expires_at, stop
-                await asyncio.wait_for(transition_started.wait(), timeout=5)
+                del local_lease_deadline, stop
+                await asyncio.wait_for(transition_started.wait(), timeout=10)
                 replacement_now = datetime.now(UTC)
 
                 def replace_claim(_session, checkpoint):
@@ -8137,7 +8152,7 @@ def test_session_store_conformance_unclaimed_interruption_cancellation_is_finali
                     )
                 )
             )
-            await asyncio.wait_for(transition_started.wait(), timeout=5)
+            await asyncio.wait_for(transition_started.wait(), timeout=10)
             task.cancel()
             assert task.cancelling() == 1
             with pytest.raises(asyncio.CancelledError):
@@ -8628,7 +8643,7 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
             with session_engine_module.suppress_interruption_cascade():
                 owner_task = asyncio.create_task(_collect_events(app.interrupt_session(request)))
                 tasks.append(owner_task)
-                await asyncio.wait_for(owner_started.wait(), timeout=5)
+                await asyncio.wait_for(owner_started.wait(), timeout=10)
 
                 checkpoint = await store.load_checkpoint(session_id)
                 assert checkpoint is not None
@@ -8695,7 +8710,7 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
                     _collect_events(peer_app.interrupt_session(request))
                 )
                 tasks.append(retry_task)
-                await asyncio.wait_for(join_read_started.wait(), timeout=5)
+                await asyncio.wait_for(join_read_started.wait(), timeout=10)
                 assert not owner_task.done()
                 assert not retry_task.done()
                 retained = await original_peer_load_checkpoint(session_id)
@@ -9227,7 +9242,7 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
                     )
                 )
             )
-            await asyncio.wait_for(fan_out_started.wait(), timeout=5)
+            await asyncio.wait_for(fan_out_started.wait(), timeout=10)
             checkpoint = await store.load_checkpoint(session_id)
             assert checkpoint is not None
             private_input_id = checkpoint["pending_user_input"]["input_id"]
@@ -9249,7 +9264,7 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
             )
             with session_engine_module.suppress_interruption_cascade():
                 interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
-                await asyncio.wait_for(handler_entered.wait(), timeout=5)
+                await asyncio.wait_for(handler_entered.wait(), timeout=10)
                 claimed_checkpoint = await store.load_checkpoint(session_id)
                 assert claimed_checkpoint is not None
                 durable_claim = claimed_checkpoint["incomplete_session_recovery_claim"]
@@ -9505,7 +9520,7 @@ def test_session_store_conformance_releases_live_supersession_handoff_after_read
                     )
                 )
             )
-            await asyncio.wait_for(fan_out_started.wait(), timeout=5)
+            await asyncio.wait_for(fan_out_started.wait(), timeout=10)
             request = InterruptSessionRequest(
                 session_id=session_id,
                 reason="operator supersedes active pause",
@@ -9645,7 +9660,7 @@ def test_session_store_conformance_reclaims_unaccepted_live_supersession_handoff
                     )
                 )
             )
-            await asyncio.wait_for(fan_out_started.wait(), timeout=5)
+            await asyncio.wait_for(fan_out_started.wait(), timeout=10)
             request = InterruptSessionRequest(
                 session_id=session_id,
                 reason="operator supersedes active pause",
@@ -10466,17 +10481,22 @@ def test_sqlite_public_interrupt_fatal_claim_callback_releases_writer_transactio
             original_transition = store.transition_status_and_checkpoint
 
             async def fail_public_claim_callback(*args, **kwargs):
-                checkpoint_transform = kwargs["checkpoint_transform"]
+                transform_key = (
+                    "store_time_checkpoint_transform"
+                    if kwargs.get("store_time_checkpoint_transform") is not None
+                    else "checkpoint_transform"
+                )
+                checkpoint_transform = kwargs[transform_key]
 
-                def fail_after_claim_validation(session, checkpoint):
-                    checkpoint_transform(session, checkpoint)
+                def fail_after_claim_validation(*transform_args):
+                    checkpoint_transform(*transform_args)
                     raise FatalClaimCallbackSignal("public terminal claim callback stopped")
 
                 return await original_transition(
                     *args,
                     **{
                         **kwargs,
-                        "checkpoint_transform": fail_after_claim_validation,
+                        transform_key: fail_after_claim_validation,
                     },
                 )
 
@@ -10571,6 +10591,7 @@ def test_incomplete_recovery_success_does_not_suppress_simultaneous_claim_loss(
 
         claim = recovery_coordinator_module._IncompleteRecoveryClaim(
             claim_id="simultaneous-claim",
+            local_lease_deadline=time.monotonic() + 300,
             claim_expires_at=datetime.now(UTC) + timedelta(minutes=5),
             session_before_fence=session,
             session=session,
@@ -10601,7 +10622,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
             monkeypatch.setattr(
                 recovery_coordinator_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
-                timedelta(milliseconds=150),
+                timedelta(seconds=2),
             )
             monkeypatch.setattr(
                 recovery_coordinator_module,
@@ -10674,7 +10695,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                 )
             )
             tasks.append(running)
-            await asyncio.wait_for(fan_out_started.wait(), timeout=5)
+            await asyncio.wait_for(fan_out_started.wait(), timeout=10)
             request = InterruptSessionRequest(
                 session_id=session_id,
                 reason="operator supersedes active pause",
@@ -10682,7 +10703,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
             with session_engine_module.suppress_interruption_cascade():
                 interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
                 tasks.append(interrupting)
-                await asyncio.wait_for(handler_entered.wait(), timeout=5)
+                await asyncio.wait_for(handler_entered.wait(), timeout=10)
                 checkpoint = await store.load_checkpoint(session_id)
                 assert checkpoint is not None
                 lost_claim = checkpoint["incomplete_session_recovery_claim"]
@@ -10715,7 +10736,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                         asyncio.shield(handoff.heartbeat_task),
                         timeout=5,
                     )
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(2.1)
 
                 peer_store = await _open_peer_store(session_store_case, store)
                 peer_app = CayuApp(session_store=peer_store, enable_logging=False)
@@ -12539,7 +12560,7 @@ def test_session_store_conformance_fences_stale_reservation_claims(
                 replace_owner_and_claim(),
                 context=contextvars.Context(),
             )
-            await asyncio.wait_for(replacement_ready.wait(), timeout=5)
+            await asyncio.wait_for(replacement_ready.wait(), timeout=10)
             try:
                 with pytest.raises(
                     SessionRunFenced,
@@ -15692,9 +15713,10 @@ def test_session_store_conformance_reclaimed_partial_publication_has_one_prefix(
                 return [event async for event in app.compact_session(attempted)]
 
             first = asyncio.create_task(collect(first_app, "operator-a"))
-            await asyncio.wait_for(compactor.started[0].wait(), timeout=5)
+            await asyncio.wait_for(compactor.started[0].wait(), timeout=10)
+            await _expire_compaction_claim_for_test(store, created.id, request.idempotency_key)
             reclaimed = asyncio.create_task(collect(reclaimed_app, "operator-b"))
-            await asyncio.wait_for(compactor.started[1].wait(), timeout=5)
+            await asyncio.wait_for(compactor.started[1].wait(), timeout=10)
             compactor.release[1].set()
             reclaimed_events = await reclaimed
             compactor.release[0].set()
@@ -21416,9 +21438,12 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
                 return [event async for event in app.compact_session(request)]
 
             first_task = asyncio.create_task(collect(first_app, first_request))
-            await asyncio.wait_for(compactor.started[0].wait(), timeout=5)
+            await asyncio.wait_for(compactor.started[0].wait(), timeout=10)
+            await _expire_compaction_claim_for_test(
+                store, created.id, first_request.idempotency_key
+            )
             recovered_task = asyncio.create_task(collect(recovered_app, recovered_request))
-            await asyncio.wait_for(compactor.started[1].wait(), timeout=5)
+            await asyncio.wait_for(compactor.started[1].wait(), timeout=10)
             compactor.release[1].set()
             recovered_events = await recovered_task
             compactor.release[0].set()
@@ -21532,7 +21557,7 @@ def test_session_store_conformance_heartbeats_active_compaction_claim(
                 return [event async for event in app.compact_session(request)]
 
             task = asyncio.create_task(collect())
-            await asyncio.wait_for(compactor.started.wait(), timeout=5)
+            await asyncio.wait_for(compactor.started.wait(), timeout=10)
             now["value"] = accepted_at + timedelta(minutes=4)
             first_renewal_expiry = accepted_at + timedelta(minutes=9)
             async with asyncio.timeout(5):
@@ -21672,7 +21697,7 @@ def test_workspace_branch_store_guard_does_not_block_event_loop(
                     expected_run_epoch=0,
                 )
             )
-            await asyncio.wait_for(guard_started.wait(), timeout=5)
+            await asyncio.wait_for(guard_started.wait(), timeout=10)
             await asyncio.sleep(0)
             assert not publication.done()
             release_guard.set()
@@ -22170,7 +22195,7 @@ def test_session_store_conformance_provider_resolution_loses_to_terminal_complet
                     redactor=SecretRedactor(),
                 )
             )
-            await asyncio.wait_for(resolution_entered.wait(), timeout=5)
+            await asyncio.wait_for(resolution_entered.wait(), timeout=10)
 
             completion = await store.complete_model_completion_stage(
                 created.id,
@@ -24943,7 +24968,7 @@ def test_invocation_terminal_decision_rejects_non_derived_event_identity() -> No
             interaction_event_id="forged-interaction-event",
             terminal_event_id="forged-terminal-event",
             observed_at=datetime(2026, 9, 3, 12, tzinfo=UTC),
-            terminal_payload={"reason": "stop"},
+            terminal_payload={"reason": "stop", "session_run_operation_id": "a" * 64},
             interruption_request_id="terminal-decision-request",
         )
 

@@ -513,7 +513,7 @@ async def test_retained_deletion_retry_does_not_inherit_discovery_timeout(config
             await E2BRunner.from_existing("late-visible", e2b_module=Module)
         assert connections == []
         assert await E2BRunner.drain_failed_creations(timeout_s=0.01) == 1
-        await asyncio.wait_for(retry_started.wait(), 1)
+        await asyncio.wait_for(retry_started.wait(), 10)
         assert await E2BRunner.drain_failed_creations(timeout_s=0.01) == 1
         assert len(calls) == 2
         assert await E2BRunner.drain_failed_creations(timeout_s=1) == 0

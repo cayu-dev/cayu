@@ -3342,6 +3342,7 @@ def test_sqlite_revision_73_adds_empty_subscription_storage_without_inference(
             "cayu_agent_recall_subscription_revisions",
         ):
             connection.execute(f"DROP TABLE {table}")
+        connection.execute("ALTER TABLE cayu_eval_runs DROP COLUMN failure_diagnostic_json")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 73")
         connection.execute("PRAGMA user_version = 72")
         connection.commit()

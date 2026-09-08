@@ -427,7 +427,7 @@ def test_every_contracted_session_binding_path_publishes_authority(binding_path:
                     session_id=session_id,
                     session_invocation=session_invocation,
                     worker_id="index-worker",
-                    lease_expires_at=pending.lease_expires_at,
+                    lease_expires_at=claimed.lease_expires_at,
                 )
 
         assert task.session_id == session_id

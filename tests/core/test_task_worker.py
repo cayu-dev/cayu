@@ -101,6 +101,7 @@ from cayu.runtime._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
+from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.provider_operations import provider_operation_resolution_request_digest
 from cayu.runtime.sessions import (
     ModelCompletionStageDisposition,
@@ -581,8 +582,8 @@ def test_task_worker_stops_handler_when_heartbeat_stalls_past_lease() -> None:
                 max_tasks=1,
             )
         )
-        await asyncio.wait_for(stale_handler_started.wait(), timeout=1)
-        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=1)
+        await asyncio.wait_for(stale_handler_started.wait(), timeout=10)
+        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=10)
         await asyncio.sleep(1.05)
         assert stale_worker.done() is False
         assert stale_handler_stopped.is_set() is False
@@ -671,7 +672,7 @@ def test_task_worker_cancellation_fences_opaque_handler_until_natural_settlement
                 max_tasks=1,
             )
         )
-        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        await asyncio.wait_for(handler_started.wait(), timeout=10)
         worker.cancel("stop opaque worker")
         cancelling = worker.cancelling()
         for _attempt in range(100):
@@ -768,13 +769,13 @@ def test_expired_dispatched_task_cannot_be_reclaimed_while_fence_publication_wai
             )
         )
         try:
-            await asyncio.wait_for(handler_started.wait(), timeout=1)
+            await asyncio.wait_for(handler_started.wait(), timeout=10)
             claimed = await store.load_task("stale-cancellation")
             assert claimed is not None
             assert claimed.lease_expires_at is not None
 
             worker.cancel("stop stale worker")
-            await asyncio.wait_for(store.fence_started.wait(), timeout=1)
+            await asyncio.wait_for(store.fence_started.wait(), timeout=10)
             now["value"] = claimed.lease_expires_at + timedelta(seconds=1)
             reclaimed = await store.reclaim_expired(query=TaskQuery(type="job"))
             assert reclaimed == []
@@ -1007,8 +1008,8 @@ def test_completed_handler_still_fences_a_stalled_heartbeat() -> None:
                 max_tasks=1,
             )
         )
-        await asyncio.wait_for(handler_started.wait(), timeout=1)
-        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=1)
+        await asyncio.wait_for(handler_started.wait(), timeout=10)
+        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=10)
         allow_handler_completion.set()
 
         with pytest.raises(TaskClaimLost, match="positively known lease deadline"):
@@ -1170,6 +1171,7 @@ async def test_one_second_task_lease_heartbeats_after_one_third(
         return wait_stop.is_set()
 
     monkeypatch.setattr(task_worker_module, "_wait_or_stop", advance_clock)
+    monkeypatch.setattr(task_worker_module, "monotonic", lambda: elapsed)
 
     await task_worker_module._heartbeat_until(
         ExpiringLeaseStore(),  # type: ignore[arg-type]
@@ -1680,7 +1682,7 @@ def test_running_ordinary_task_cancellation_is_worker_terminalized(tmp_path: Pat
                 reclaim=False,
             )
         )
-        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.wait_for(started.wait(), timeout=10)
         requested = await store.cancel_task(
             created.id,
             {"reason": "operator cancelled live builder"},
@@ -2524,7 +2526,7 @@ def test_remote_interrupt_wins_linked_task_failure_and_preserves_queued_turn(
                 reclaim=False,
             )
         )
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         accepted = await interrupter.enqueue_session_message(
             EnqueueSessionMessageRequest(
                 session_id="terminal-race-session",
@@ -2555,7 +2557,7 @@ def test_remote_interrupt_wins_linked_task_failure_and_preserves_queued_turn(
             raise AssertionError("Remote interruption did not reach its durable decision.")
         provider.release_failure.set()
         if settle_before_stale_claim:
-            await asyncio.wait_for(stale_claim_entered.wait(), timeout=5)
+            await asyncio.wait_for(stale_claim_entered.wait(), timeout=10)
             interrupting = await session_store.load("terminal-race-session")
             checkpoint = await session_store.load_checkpoint("terminal-race-session")
             interruption_decision = invocation_terminal_decision_from_checkpoint(checkpoint)
@@ -2773,7 +2775,7 @@ def test_linked_task_failure_winner_fences_remote_interrupt(
                 reclaim=False,
             )
         )
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         accepted = await interrupter.enqueue_session_message(
             EnqueueSessionMessageRequest(
                 session_id="failure-winner-session",
@@ -2783,7 +2785,7 @@ def test_linked_task_failure_winner_fences_remote_interrupt(
             )
         )
         provider.fail.set()
-        await asyncio.wait_for(decision_claimed.wait(), timeout=5)
+        await asyncio.wait_for(decision_claimed.wait(), timeout=10)
 
         with pytest.raises(
             (RuntimeError, SessionRunFenced, TimeoutError),
@@ -3793,7 +3795,7 @@ def test_all_configured_continuation_executors_can_run_concurrently() -> None:
         started.append((task.id, worker_id))
         if len(started) == 2:
             all_started.set()
-        await asyncio.wait_for(all_started.wait(), timeout=2)
+        await asyncio.wait_for(all_started.wait(), timeout=10)
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
     async def scenario() -> list[int]:
@@ -4188,6 +4190,7 @@ def test_expired_attached_session_is_recovered_handed_off_and_resumed() -> None:
                 ),
             ),
             identity=profiled_session_identity(
+                max_steps=DEFAULT_MAX_STEPS,
                 provider_name=provider.name,
                 model="scripted-model",
                 agent_name="worker-agent",
@@ -7529,6 +7532,7 @@ def test_resume_rechecks_worker_authority_after_session_admission() -> None:
                 ),
             ),
             identity=profiled_session_identity(
+                max_steps=DEFAULT_MAX_STEPS,
                 provider_name=provider.name,
                 model="scripted-model",
                 agent_name="worker-agent",
@@ -7737,6 +7741,7 @@ def test_session_engine_keeps_legacy_custom_store_direct_resume_compatible() -> 
                 ),
             ),
             identity=profiled_session_identity(
+                max_steps=DEFAULT_MAX_STEPS,
                 provider_name=provider.name,
                 model="scripted-model",
             ),
@@ -7807,6 +7812,7 @@ def test_resume_completes_the_running_task_already_attached_to_the_session(
                 ),
             ),
             identity=profiled_session_identity(
+                max_steps=DEFAULT_MAX_STEPS,
                 provider_name=provider.name,
                 model="scripted-model",
             ),

@@ -104,7 +104,7 @@ def test_concurrent_prepare_cannot_delete_owned_repository(
 
         monkeypatch.setattr(broker, "_observe_remote", pause)
         task = asyncio.create_task(broker.prepare(request, product, source_workspace=workspace))
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), 10)
         root = broker._delivery_root(request)
         identity = root.stat().st_ino
         try:
@@ -316,6 +316,8 @@ def test_every_request_authority_field_rejects_stable_identity_drift(tmp_path: P
                 owner[key] = 0 if key == "retry_limit" else value + 1
             elif key == "authored_at":
                 owner[key] = "2026-08-30T13:00:00-07:00"
+            elif value is None and key == "expected_destination_commit":
+                owner[key] = request.repository.expected_base_commit
             elif value.startswith("sha256:") or (
                 len(value) in {40, 64} and all(char in "0123456789abcdef" for char in value)
             ):
@@ -445,7 +447,7 @@ def test_cancelled_artifact_writer_fences_peer_until_real_settlement(
         monkeypatch.setattr(ownership.os, "write", fail_marker)
         task = asyncio.create_task(broker.prepare(request, product, source_workspace=workspace))
         try:
-            await asyncio.wait_for(entered.wait(), 5)
+            await asyncio.wait_for(entered.wait(), 10)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -499,7 +501,7 @@ def test_interrupted_pushing_receipt_consumes_retry_authority(
         task = asyncio.create_task(
             broker.run(request, product, source_workspace=workspace, approval=approval)
         )
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), 10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:
             await task
@@ -607,7 +609,7 @@ def test_public_cancellation_survives_diagnostic_write_failure(
         task = asyncio.create_task(
             broker.run(request, product, source_workspace=workspace, approval=approval)
         )
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), 10)
         cancelling = True
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:

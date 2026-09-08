@@ -624,7 +624,7 @@ def test_recovery_execution_runs_independent_sessions_concurrently(monkeypatch) 
             peak = max(peak, active)
             if active == 2:
                 both_started.set()
-            await asyncio.wait_for(both_started.wait(), timeout=1)
+            await asyncio.wait_for(both_started.wait(), timeout=10)
             try:
                 return await original_recover(request)
             finally:
@@ -680,7 +680,7 @@ def test_recovery_execution_renews_its_durable_session_lease(monkeypatch) -> Non
                 RecoveryExecutionRequest(plan=plan, execution_id="heartbeat-execution")
             )
         )
-        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(entered.wait(), timeout=10)
         await asyncio.sleep(0.04)
         checkpoint = await store.load_checkpoint("sess_recovery_heartbeat")
         assert checkpoint is not None

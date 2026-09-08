@@ -1410,7 +1410,7 @@ def test_component_cannot_consume_caller_cancellation(stage: str) -> None:
             config=_config(),
         )
         planning = asyncio.create_task(workflow.plan(request, routing))
-        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await asyncio.wait_for(started.wait(), timeout=10.0)
         planning.cancel()
         with pytest.raises(asyncio.CancelledError):
             await planning

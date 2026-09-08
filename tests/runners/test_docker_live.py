@@ -190,6 +190,14 @@ def test_100_real_docker_runners_share_one_immutable_input(tmp_path: Path) -> No
     docker_path = _docker_path_or_skip()
     image = os.environ.get("CAYU_DOCKER_LIVE_IMAGE", "alpine:3.20")
     try:
+        if "CAYU_DOCKER_LIVE_IMAGE" not in os.environ:
+            subprocess.run(
+                [docker_path, "pull", image],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
         image_id = subprocess.run(
             [docker_path, "image", "inspect", "--format", "{{.Id}}", image],
             check=True,

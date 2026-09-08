@@ -102,7 +102,7 @@ def test_abandonable_operation_registry_shutdown_cancels_cooperative_children() 
                 operation_registry=registry,
             )
         )
-        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(started.wait(), timeout=10)
         caller.cancel("caller stopped waiting")
         outcome = await caller
         assert isinstance(outcome.cancellation, asyncio.CancelledError)

@@ -1695,16 +1695,20 @@ async def test_whitespace_stream_has_chunk_independent_semantic_bound(
     monkeypatch: pytest.MonkeyPatch, whitespace: str, chunks: int, adapter: str, initial_text: str
 ) -> None:
     loop = asyncio.get_running_loop()
-    now = loop.time()
+    # Integral fake time keeps repeated one-second advances exact across clock boundaries.
+    now = float(int(loop.time()))
     started = now
     monkeypatch.setattr(loop, "time", lambda: now)
     accepted: list[str] = []
     expected: list[str] = []
+    consumed = asyncio.Event()
 
     async def deltas() -> AsyncIterator[str]:
         nonlocal now
         if initial_text:
             yield initial_text
+            await consumed.wait()
+            consumed.clear()
         for _ in range(5):
             now += 1
             text = whitespace * 256
@@ -1714,6 +1718,9 @@ async def test_whitespace_stream_has_chunk_independent_semantic_bound(
                 if now - started < 4:
                     expected.append(delta)
                 yield delta
+                # Advance simulated time only after this chunk reaches the consumer.
+                await consumed.wait()
+                consumed.clear()
 
     async def events() -> AsyncIterator[ModelStreamEvent]:
         async for delta in deltas():
@@ -1739,6 +1746,7 @@ async def test_whitespace_stream_has_chunk_independent_semantic_bound(
         async for event in provider.runtime_stream(_request()):
             if event.type is ModelStreamEventType.TEXT_DELTA:
                 accepted.append(event.delta or "")
+                consumed.set()
 
     assert accepted == ([initial_text] if initial_text else []) + expected
     evidence = captured.value.deadline_evidence

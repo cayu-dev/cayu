@@ -62,11 +62,8 @@ def test_generated_postgres_profile_uses_real_postgres_for_every_active_store(
             assert isinstance(application.session_store, PostgresSessionStore)
             assert isinstance(application.task_store, PostgresTaskStore)
             active_stores = [application.session_store, application.task_store]
-            if preset == "coding":
-                assert isinstance(application.knowledge_store, PostgresKnowledgeStore)
-                active_stores.append(application.knowledge_store)
-            else:
-                assert application.knowledge_store is None
+            assert isinstance(application.knowledge_store, PostgresKnowledgeStore)
+            active_stores.append(application.knowledge_store)
 
             try:
                 for store in active_stores:

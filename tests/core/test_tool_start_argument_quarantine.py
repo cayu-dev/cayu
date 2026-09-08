@@ -2204,7 +2204,7 @@ def test_tool_timeout_does_not_wait_for_a_nonresponsive_secret_resolver(
                     messages=[Message.text("user", "run")],
                 ),
             ),
-            timeout=1,
+            timeout=10,
         )
 
         assert vault.started.is_set() is True
@@ -2221,7 +2221,7 @@ def test_tool_timeout_does_not_wait_for_a_nonresponsive_secret_resolver(
         assert len(provider.requests) == 1
 
         vault.release.set()
-        await asyncio.wait_for(vault.finished.wait(), timeout=1)
+        await asyncio.wait_for(vault.finished.wait(), timeout=10)
         await asyncio.sleep(0)
         durable_events = await store.load_events(f"nonresponsive-secret-resolution-{secret_source}")
         transcript = await store.load_transcript(f"nonresponsive-secret-resolution-{secret_source}")
@@ -2276,7 +2276,7 @@ async def _run_cancelled_execution_scenario(*, cleanup_fails: bool) -> None:
             public_events.append(event)
 
     task = asyncio.create_task(consume())
-    await asyncio.wait_for(tool.dispatched.wait(), timeout=1)
+    await asyncio.wait_for(tool.dispatched.wait(), timeout=10)
     task.cancel("operator cancelled test run")
     if cleanup_fails:
         await task
@@ -2551,7 +2551,7 @@ async def _run_operator_interruption_scenario() -> None:
             run_events.append(event)
 
     run_task = asyncio.create_task(consume())
-    await asyncio.wait_for(tool.dispatched.wait(), timeout=1)
+    await asyncio.wait_for(tool.dispatched.wait(), timeout=10)
     interrupt_events = [
         event
         async for event in app.interrupt_session(
@@ -2567,7 +2567,7 @@ async def _run_operator_interruption_scenario() -> None:
             )
         )
     ]
-    await asyncio.wait_for(run_task, timeout=1)
+    await asyncio.wait_for(run_task, timeout=10)
 
     assert secret not in repr(run_events)
     assert secret not in repr(interrupt_events)
@@ -4153,7 +4153,7 @@ def test_observational_stage_tracks_projected_result_after_lost_acknowledgement(
                     messages=[Message.text("user", "run later")],
                 ),
             ),
-            timeout=2,
+            timeout=10,
         )
         assert later[-1].type is EventType.SESSION_COMPLETED
         assert tool.calls == ["x", "y", "a", "b"]

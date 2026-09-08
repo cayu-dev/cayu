@@ -396,6 +396,9 @@ async def run_claims(app,stop):
             task=await store.claim_task(worker,TaskQuery(type='cpu-work'),lease_seconds=30)
             if task is None:break
             with Path(f'claim-{task.id}.json').open('x') as f:json.dump({'pid':os.getpid()},f)
+            async with asyncio.timeout(20):
+                while len(list(Path('.').glob('claim-*.json'))) < 2:
+                    await asyncio.sleep(.01)
             await asyncio.sleep(.03)
             await store.complete_task(task.id,{'done':True},worker_id=worker,
                 lease_expires_at=task.lease_expires_at)

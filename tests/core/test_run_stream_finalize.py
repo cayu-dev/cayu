@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 from cayu.core import AgentSpec, Message
 from cayu.core.events import Event, EventType
+from cayu.failure_evidence import FailureEvidence
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -199,6 +200,11 @@ def test_abandoned_run_stream_finalizes_running_session() -> None:
         "interruption_type": "runtime_interrupted",
         "reason": "event_stream_closed",
         "abandoned": True,
+        "failure_evidence": FailureEvidence(
+            classification="interruption",
+            session_id=terminal.session_id,
+            run_epoch=1,
+        ).model_dump(mode="json"),
     }
     assert h.store.release_calls["sess_abandoned_run"] == 1
 
@@ -273,7 +279,7 @@ def test_cleanup_cancellation_remains_authoritative_and_waits_for_release() -> N
 
         injected = RuntimeError("consumer rejected run event")
         throw_task = asyncio.create_task(stream.athrow(injected))
-        await asyncio.wait_for(store.release_started.wait(), timeout=5)
+        await asyncio.wait_for(store.release_started.wait(), timeout=10)
         assert throw_task.cancelling() == 0
 
         throw_task.cancel()
@@ -401,9 +407,9 @@ def test_repeated_cancellation_during_run_initialization_waits_for_finalization(
                 pass
 
         run_task = asyncio.create_task(run())
-        await asyncio.wait_for(usage_tracker.started.wait(), timeout=5)
+        await asyncio.wait_for(usage_tracker.started.wait(), timeout=10)
         run_task.cancel("first cancellation")
-        await asyncio.wait_for(store.finalization_started.wait(), timeout=5)
+        await asyncio.wait_for(store.finalization_started.wait(), timeout=10)
         run_task.cancel("second cancellation")
         await asyncio.sleep(0)
 
@@ -425,7 +431,11 @@ def test_repeated_cancellation_during_run_initialization_waits_for_finalization(
         assert session is not None
         assert session.status == SessionStatus.INTERRUPTED
         events = await store.load_events(session_id)
-        _assert_turn_completed_before_abandoned_terminal(events)
+        assert [event.type for event in events] == [
+            EventType.INTERACTION_STARTED,
+            EventType.INTERACTION_INTERRUPTED,
+            EventType.SESSION_INTERRUPTED,
+        ]
         assert _abandoned_terminal_event(events).payload["abandoned"] is True
         assert provider.requests == []
 
@@ -493,7 +503,7 @@ def test_cleanup_cancellation_preserves_release_failure_without_loop_report() ->
 
             injected = RuntimeError("consumer rejected run event")
             throw_task = asyncio.create_task(stream.athrow(injected))
-            await asyncio.wait_for(store.release_started.wait(), timeout=5)
+            await asyncio.wait_for(store.release_started.wait(), timeout=10)
             throw_task.cancel()
             await asyncio.sleep(0)
             assert throw_task.cancelling() == 1

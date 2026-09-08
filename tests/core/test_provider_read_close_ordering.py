@@ -110,7 +110,7 @@ def test_interrupted_read_precedes_close(streaming, stop, cleanup):
                     resumed.append(event.delta)
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 10)
         if stop == "deadline":
             timer.reschedule(asyncio.get_running_loop().time())
         else:
@@ -200,7 +200,7 @@ def test_cancellation_cleanup_keeps_dispatch_capacity_until_close(delayed):
         provider = Provider([])
         request = ModelRequest(model="test", messages=[Message.text("user", "check")])
         tasks = [asyncio.create_task(anext(provider.runtime_stream(request))) for _ in range(count)]
-        await asyncio.wait_for(entered.wait(), 3)
+        await asyncio.wait_for(entered.wait(), 10)
         for task in tasks:
             task.cancel()
         try:

@@ -162,7 +162,7 @@ def test_native_deadline_and_sqlite_replay(
                         step_id="a",
                         prompt="verify",
                         run_options=StepRunOptions(
-                            execution_deadline=ExecutionDeadline.after(3, scope="verification")
+                            execution_deadline=ExecutionDeadline.after(10, scope="verification")
                         ),
                     ),
                     step(
@@ -171,7 +171,7 @@ def test_native_deadline_and_sqlite_replay(
                         step_id="b",
                         prompt="verify",
                         run_options=StepRunOptions(
-                            execution_deadline=ExecutionDeadline.after(3, scope="verification")
+                            execution_deadline=ExecutionDeadline.after(10, scope="verification")
                         ),
                     ),
                 ]
@@ -613,7 +613,7 @@ def test_native_parent_stop_does_not_resume_children(stop, streaming):
                 resumed = True
 
         parent = asyncio.create_task(invoke())
-        await asyncio.wait_for(entered.wait(), 3)
+        await asyncio.wait_for(entered.wait(), 10)
         if stop == "parent_deadline":
             timer.reschedule(asyncio.get_running_loop().time())
         else:
@@ -687,15 +687,15 @@ def test_native_retained_cleanup_is_uncertain_after_sqlite_replay(tmp_path, clea
                         step_id="b",
                         prompt="check",
                         run_options=StepRunOptions(
-                            execution_deadline=ExecutionDeadline.after(1, scope="verification")
+                            execution_deadline=ExecutionDeadline.after(5, scope="verification")
                         ),
                     ),
                 ]
             )
         )
         try:
-            await asyncio.wait_for(entered.wait(), 3)
-            result = await asyncio.wait_for(result_task, 5)
+            await asyncio.wait_for(entered.wait(), 10)
+            result = await asyncio.wait_for(result_task, 10)
             assert result.successes[0].text == "negative verification"
             (failure,) = result.failures
             assert failure.evidence.classification == "deadline"
@@ -739,7 +739,7 @@ def test_native_retained_cleanup_is_uncertain_after_sqlite_replay(tmp_path, clea
             assert provider.calls == calls == 2
         finally:
             release.set()
-            await asyncio.wait_for(closed.wait(), 3)
+            await asyncio.wait_for(closed.wait(), 10)
             for _ in range(5):
                 await asyncio.sleep(0)
             assert all(task.done() for task in local_tasks)

@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ci-test-reports.jsonl
 .coverage
 .ruff_cache/
 .mypy_cache/

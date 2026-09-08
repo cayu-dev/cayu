@@ -49,6 +49,10 @@ def _configure_alias_environment(monkeypatch, byte: int) -> str:
 def _rewind_schema_revision(path, revision: int) -> None:
     connection = sqlite3.connect(path)
     try:
+        if revision < 80:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(cayu_eval_runs)")}
+            if "failure_diagnostic_json" in columns:
+                connection.execute("ALTER TABLE cayu_eval_runs DROP COLUMN failure_diagnostic_json")
         connection.execute(
             "DELETE FROM cayu_schema_migrations WHERE revision > ?",
             (revision,),
@@ -487,8 +491,7 @@ def test_storage_migrate_invalid_output_fails_before_sqlite_publication(
                 "--sqlite",
                 str(db),
                 "--waive-backup",
-                "--acknowledge-breaking",
-                "79",
+                *_breaking_acknowledgements_after(78),
                 "--output",
                 str(tmp_path / "missing" / "receipt.json"),
             ]
@@ -528,8 +531,7 @@ def test_storage_migrate_rejects_output_that_aliases_retained_backup(
                 str(db),
                 "--backup",
                 str(backup_and_output),
-                "--acknowledge-breaking",
-                "79",
+                *_breaking_acknowledgements_after(78),
                 "--output",
                 str(backup_and_output),
             ]
@@ -574,8 +576,7 @@ def test_storage_migrate_reuses_authenticated_backup_after_publication_failure(
         str(db),
         "--backup",
         str(backup),
-        "--acknowledge-breaking",
-        "79",
+        *_breaking_acknowledgements_after(78),
     ]
     monkeypatch.setattr(storage_cli.os, "replace", fail_publication)
     assert main(arguments) == 1
@@ -591,7 +592,7 @@ def test_storage_migrate_reuses_authenticated_backup_after_publication_failure(
     recovered = json.loads(capsys.readouterr().out)["migration_receipt"]
     assert recovered["receipt_sha256"] == persisted["receipt_sha256"]
     assert recovered["input_revision"] == 78
-    assert recovered["output_revision"] == 79
+    assert recovered["output_revision"] == schema.LATEST_REVISION
     assert backup.exists()
     assert not pending_receipt.exists()
 
@@ -631,8 +632,7 @@ def test_storage_migrate_refuses_to_overwrite_same_revision_writes_on_retry(
         str(db),
         "--backup",
         str(backup),
-        "--acknowledge-breaking",
-        "79",
+        *_breaking_acknowledgements_after(78),
     ]
     monkeypatch.setattr(storage_cli.os, "replace", fail_publication)
     assert main(arguments) == 1
@@ -683,8 +683,7 @@ def test_storage_migrate_rejects_symbolic_link_target(
                 "--sqlite",
                 str(link),
                 "--waive-backup",
-                "--acknowledge-breaking",
-                "79",
+                *_breaking_acknowledgements_after(78),
             ]
         )
         == 1
@@ -715,7 +714,11 @@ def test_storage_migrate_serializes_receipt_recovery_with_publication(
         backup=None,
         backup_sha256=None,
         waive_backup=True,
-        acknowledge_breaking=[79],
+        acknowledge_breaking=[
+            item.revision
+            for item in schema.pending(78)
+            if item.kind is schema.RevisionKind.BREAKING
+        ],
         reset_empty_recall_state=False,
         output=str(output),
         output_format="json",
@@ -771,7 +774,12 @@ def test_storage_migrate_serializes_receipt_recovery_with_publication(
     assert 0 in outcomes
     failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
     assert len(failures) == 1
-    assert "exact pending path (unexpected 79)" in str(failures[0])
+    unexpected = ", ".join(
+        str(item.revision)
+        for item in schema.pending(78)
+        if item.kind is schema.RevisionKind.BREAKING
+    )
+    assert f"exact pending path (unexpected {unexpected})" in str(failures[0])
     assert not pending_receipt.exists()
     assert not Path(f"{db}.cayu-migration-receipt.json").exists()
 
@@ -803,8 +811,7 @@ def test_storage_migrate_recovers_receipt_after_sqlite_publication(
         "--sqlite",
         str(db),
         "--waive-backup",
-        "--acknowledge-breaking",
-        "79",
+        *_breaking_acknowledgements_after(78),
     ]
     assert main(arguments) == 1
     error = json.loads(capsys.readouterr().out)["error"]
@@ -814,7 +821,10 @@ def test_storage_migrate_recovers_receipt_after_sqlite_publication(
     receipt = json.loads(durable_receipt.read_text(encoding="utf-8"))
     connection = sqlite3.connect(db)
     try:
-        assert storage_cli.sqlite_support.read_schema_state(connection).revision == 79
+        assert (
+            storage_cli.sqlite_support.read_schema_state(connection).revision
+            == schema.LATEST_REVISION
+        )
     finally:
         connection.close()
 
@@ -857,8 +867,7 @@ def test_storage_migrate_recovers_pending_receipt_after_sqlite_publication(
         "--sqlite",
         str(db),
         "--waive-backup",
-        "--acknowledge-breaking",
-        "79",
+        *_breaking_acknowledgements_after(78),
     ]
     assert main(arguments) == 1
     error = json.loads(capsys.readouterr().out)["error"]
@@ -870,7 +879,7 @@ def test_storage_migrate_recovers_pending_receipt_after_sqlite_publication(
     assert main(arguments) == 0
     recovered = json.loads(capsys.readouterr().out)["migration_receipt"]
     assert recovered["input_revision"] == 78
-    assert recovered["output_revision"] == 79
+    assert recovered["output_revision"] == schema.LATEST_REVISION
     assert not pending_receipt.exists()
     assert not durable_receipt.exists()
 

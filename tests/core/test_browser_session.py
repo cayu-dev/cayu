@@ -3763,7 +3763,7 @@ def test_issue_1275_upload_dispatch_failure_through_guest_daemon(
         daemon.pages[state.page_id] = state
         await _configure_interactive_daemon_for_test(daemon, request)
         task = asyncio.create_task(daemon.execute(request))
-        await asyncio.wait_for(entered.wait(), timeout=2)
+        await asyncio.wait_for(entered.wait(), timeout=10)
         assert selected[0]["buffer"] == b"x"
         assert state.revision is None
         if outcome == "cancellation":

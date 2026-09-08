@@ -1003,7 +1003,7 @@ def test_in_memory_side_effect_deadlines_start_after_lock_acquisition(monkeypatc
         store = await _session_store("writer_lock_relative_deadlines")
         event = Event(type="custom.locked", session_id="writer_lock_relative_deadlines")
         await store.append_event(event.session_id, event)
-        monkeypatch.setattr("cayu.runtime.sessions.datetime", StoreClock)
+        monkeypatch.setattr(store, "_ownership_clock", lambda: StoreClock.current)
 
         await store._lock.acquire()
         claim_task = asyncio.create_task(

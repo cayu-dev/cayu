@@ -81,6 +81,7 @@ if os.environ.get("CAYU_REQUIRE_DOCKER_EGRESS") == "1" and not _DOCKER_AVAILABLE
 
 pytestmark = [
     pytest.mark.process,
+    pytest.mark.browser_docker,
     pytest.mark.skipif(
         not _DOCKER_AVAILABLE,
         reason="Docker daemon not available for browser-fetch E2E.",
@@ -722,7 +723,7 @@ async def _drive_browser_fetch() -> dict[str, Any]:
                 "operation_id": "interactive-challenge-1",
             },
         )
-        assert interactive_challenge.is_error is False
+        assert interactive_challenge.is_error is True
         interactive_challenge_close = await browser_session_tool.run(
             interactive_context,
             {
@@ -1274,13 +1275,16 @@ def test_browser_classifies_challenge_before_its_body_can_execute(
     assert challenge.structured["access"]["source"] == "browser_response"
 
     interactive = browser_fetch_results["interactive_challenge"]
-    assert interactive.is_error is False
-    assert interactive.structured["access_state"] == "blocked"
-    assert interactive.structured["snapshot"] == ""
-    assert interactive.structured["url"] == "https://docs.browser.test/"
-    assert interactive.structured["access"]["outcome"] == "bot_challenge"
-    assert interactive.structured["access"]["source"] == "browser_response"
-    assert browser_fetch_results["interactive_challenge_close"].structured["closed"] is True
+    assert interactive.is_error is True
+    assert interactive.structured["error"] == "access_blocked"
+    assert interactive.structured["execution"]["dispatch"] == "completed"
+    assert interactive.structured["execution"]["observation"] == "not_published"
+    assert "snapshot" not in interactive.structured
+    assert "url" not in interactive.structured
+    assert interactive.structured["allocation_disposition"] == "retired"
+    close = browser_fetch_results["interactive_challenge_close"]
+    assert close.is_error is True
+    assert close.structured["error"] == "unknown_session"
 
     requests = browser_fetch_results["requests"]
     assert ("docs.browser.test", "/challenge") in requests

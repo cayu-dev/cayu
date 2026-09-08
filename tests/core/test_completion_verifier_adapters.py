@@ -1333,7 +1333,7 @@ def test_preforked_app_mints_process_local_execution_owners_and_dispatches_once(
     second = process_context.Process(target=run_worker, args=("second",))
     first.start()
     try:
-        assert claim_started.wait(timeout=5)
+        assert claim_started.wait(timeout=10)
         second.start()
         second.join(timeout=3)
         second_blocked_on_duplicate_dispatch = second.is_alive()
@@ -4129,7 +4129,7 @@ def test_capacity_exhaustion_precedes_claim_and_is_secret_safe(
             )
             for index, proposal_id in enumerate(proposal_ids[:64], start=1)
         ]
-        await asyncio.wait_for(verifier.all_started.wait(), timeout=5)
+        await asyncio.wait_for(verifier.all_started.wait(), timeout=10)
         with pytest.raises(CompletionVerifierExecutionError, match="capacity is exhausted") as exc:
             await app.verify_completion_proposal(_execution_request(proposal_ids[64], suffix="65"))
         assert await store.load_completion_verification_claim(proposal_ids[64]) is None

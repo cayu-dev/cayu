@@ -76,6 +76,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/guides/providers.md",
         "cayu/guides/references.md",
         "cayu/guides/structured-output.md",
+        "cayu/guides/thinking.md",
         "cayu/guides/tool-effects.md",
         _WHEEL_DASHBOARD_SOURCE,
         *{f"cayu/server/dashboard/{name}" for name in compiled_dashboard},

@@ -529,8 +529,7 @@ async def test_provider_preserves_completed_before_stream_cleanup_failure(
     assert source.closed
     assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
     assert events[0].payload["usage"] is not None
-    expected_provider = "openai" if provider_name == "openai_subscription" else provider_name
-    assert exc_info.value.provider == expected_provider
+    assert exc_info.value.provider == provider_name
     assert exc_info.value.error_type == "ProviderStreamCleanupError"
     assert exc_info.value.retryable is False
 

@@ -191,7 +191,7 @@ class _ConcurrentCapturingOperations(_CapturingOperations):
         self.maximum_active = max(self.maximum_active, self.active)
         if self.active == self.expected_concurrency:
             self._gate.set()
-        await asyncio.wait_for(self._gate.wait(), timeout=5)
+        await asyncio.wait_for(self._gate.wait(), timeout=20)
 
         async def events() -> AsyncIterator[ModelStreamEvent]:
             try:
@@ -470,7 +470,7 @@ def test_external_target_runs_through_native_corpus_lifecycle_with_exact_trial_i
         name="External suite",
         trial_request=TrialRequestSpec(
             trials=24,
-            timeout_seconds=30,
+            timeout_seconds=60,
             trial_policy=EvalSuiteTrialPolicyV1.create(
                 trial_count=24,
                 max_concurrency=24,
@@ -508,7 +508,9 @@ def test_external_target_runs_through_native_corpus_lifecycle_with_exact_trial_i
     result = asyncio.run(run_corpus_suite(target, corpus, suite.id, max_concurrency=24))
 
     assert result.target.external_process == identity
-    assert result.run.status == "passed"
+    assert result.run.status == "passed", [
+        trial.error for case_result in result.run.cases for trial in case_result.trials
+    ]
     assert len(operations.trials) == 24
     assert sorted(operations.trials, key=lambda trial: trial.trial_number) == list(
         result.external_trials

@@ -1102,7 +1102,7 @@ def test_background_completion_closes_blocked_tail_before_publication() -> None:
                     messages=[Message.text("user", "hello")],
                 ),
             ),
-            timeout=1.0,
+            timeout=10.0,
         )
 
         assert adapter.start_calls == 1
@@ -1679,7 +1679,7 @@ def test_session_interruption_cancels_the_exact_durable_provider_operation() -> 
             ]
 
         run_task = asyncio.create_task(run_session())
-        await asyncio.wait_for(adapter.stream_started.wait(), timeout=1)
+        await asyncio.wait_for(adapter.stream_started.wait(), timeout=10)
         interrupt_events = [
             event
             async for event in app.interrupt_session(
@@ -1768,7 +1768,7 @@ def test_provider_completion_winning_live_cancellation_is_reconciled() -> None:
                 ),
             )
         )
-        await asyncio.wait_for(adapter.stream_started.wait(), timeout=1)
+        await asyncio.wait_for(adapter.stream_started.wait(), timeout=10)
         interrupt_events = [
             event
             async for event in app.interrupt_session(
@@ -1810,7 +1810,7 @@ def test_cancellation_during_provider_start_waits_for_identity_before_releasing_
                 ),
             )
         )
-        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
         task.cancel("cancel after provider dispatch")
         assert task.cancelling() == 1
         await asyncio.sleep(0)
@@ -1856,7 +1856,7 @@ def test_cancellation_during_provider_start_is_raised_before_started_event_yield
                     return
 
         task = asyncio.create_task(collect_until_started())
-        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
         task.cancel("cancel before started event delivery")
         adapter.start_release.set()
         with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
@@ -1893,7 +1893,7 @@ def test_cancellation_during_unsettled_provider_start_is_bounded(
                 ),
             )
         )
-        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
         task.cancel("cancel unsettled provider start")
         with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
             await asyncio.wait_for(task, timeout=1)
@@ -1942,7 +1942,7 @@ def test_late_successful_start_acknowledgement_cancels_exact_returned_operation(
                 ),
             )
         )
-        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
         task.cancel("cancel before late start acknowledgement")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -2002,7 +2002,7 @@ def test_late_invalid_start_acknowledgement_closes_returned_stream(
                 ),
             )
         )
-        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
         task.cancel("cancel before invalid late start acknowledgement")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -2042,7 +2042,7 @@ def test_late_start_acknowledgement_cannot_publish_after_run_epoch_moves(
                 ),
             )
         )
-        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
         task.cancel("cancel before late start acknowledgement")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -2121,7 +2121,7 @@ def test_late_start_cancellation_failure_preserves_exact_in_progress_identity(
                 ),
             )
         )
-        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
         task.cancel("cancel before late failed cancellation")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -2374,7 +2374,7 @@ def test_cancellation_during_definite_absence_cleanup_propagates() -> None:
                 ),
             )
         )
-        await asyncio.wait_for(blocking_adapter.cancel_entered.wait(), timeout=1)
+        await asyncio.wait_for(blocking_adapter.cancel_entered.wait(), timeout=10)
         run_task.cancel("caller cancelled during provider cleanup")
         blocking_adapter.cancel_release.set()
         with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):

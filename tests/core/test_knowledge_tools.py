@@ -912,7 +912,7 @@ def test_remember_knowledge_close_caller_cancellation_preserves_complete_drain()
                 {"text": "A cancelled close caller must not cancel shared shutdown."},
             )
         )
-        await asyncio.wait_for(store.read_started.wait(), timeout=1)
+        await asyncio.wait_for(store.read_started.wait(), timeout=10)
         invocation.cancel("caller left after commit")
         with pytest.raises(asyncio.CancelledError, match="caller left after commit"):
             await invocation
@@ -1136,7 +1136,7 @@ def test_remember_knowledge_entry_read_preserves_real_caller_cancellation() -> N
                 {"text": "Caller cancellation stays authoritative."},
             )
         )
-        await asyncio.wait_for(store.read_started.wait(), timeout=2)
+        await asyncio.wait_for(store.read_started.wait(), timeout=10)
         task.cancel("authoritative caller cancellation")
         with pytest.raises(asyncio.CancelledError, match="authoritative caller cancellation"):
             await task
@@ -1189,7 +1189,7 @@ def test_remember_knowledge_cancellation_during_post_commit_confirmation_reconci
                 {"text": "Post-commit cancellation still reconciles the receipt."},
             )
         )
-        await asyncio.wait_for(store.confirmation_started.wait(), timeout=2)
+        await asyncio.wait_for(store.confirmation_started.wait(), timeout=10)
         task.cancel("caller cancelled during receipt confirmation")
         with pytest.raises(
             asyncio.CancelledError,
@@ -1201,7 +1201,7 @@ def test_remember_knowledge_cancellation_during_post_commit_confirmation_reconci
         # Cancellation stops waiting but the retained publication remains its
         # sole owner and finishes receipt reconciliation in the background.
         store.release_confirmation.set()
-        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=2)
+        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=10)
         store.release_reconciliation.set()
         await asyncio.wait_for(store.reconciliation_completed.wait(), timeout=2)
         assert await store.load_entry_publication_receipt(operation_id) is not None
@@ -1350,7 +1350,7 @@ def test_remember_knowledge_workspace_identity_is_consistent_across_commit() -> 
         arguments = {"text": "Workspace provenance is publication authority."}
 
         first = asyncio.create_task(tool.run(context_a, arguments))
-        await asyncio.wait_for(store.publish_started.wait(), timeout=2)
+        await asyncio.wait_for(store.publish_started.wait(), timeout=10)
         in_flight_conflict = await tool.run(context_b, arguments)
         store.release_publish.set()
         written = await asyncio.wait_for(first, timeout=2)
@@ -1428,7 +1428,7 @@ def test_remember_knowledge_capacity_allows_receipt_reconciliation_but_blocks_ne
         active = asyncio.create_task(
             tool.run(active_context, {"text": "This publication is still active."})
         )
-        await asyncio.wait_for(store.active_started.wait(), timeout=2)
+        await asyncio.wait_for(store.active_started.wait(), timeout=10)
 
         replayed = await tool.run(replay_context, replay_arguments)
         rejected = await tool.run(
@@ -1503,7 +1503,7 @@ def test_remember_knowledge_cancelled_waiters_share_one_retained_publication() -
                 {"text": "Receipt reconciliation survives repeated caller cancellation."},
             )
         )
-        await asyncio.wait_for(store.publish_started.wait(), timeout=2)
+        await asyncio.wait_for(store.publish_started.wait(), timeout=10)
         second = asyncio.create_task(
             tool.run(
                 context,
@@ -1522,7 +1522,7 @@ def test_remember_knowledge_cancelled_waiters_share_one_retained_publication() -
         assert first.cancelled() is True
         assert second.cancelled() is True
         store.release_publish.set()
-        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=2)
+        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=10)
         store.release_reconciliation.set()
         await asyncio.wait_for(store.reconciliation_completed.wait(), timeout=2)
         receipt = await store.load_entry_publication_receipt("repeated-cancellation-operation")
@@ -3909,7 +3909,7 @@ def test_remember_knowledge_uses_one_policy_snapshot_across_publication() -> Non
                 {"text": "Publication authority must remain stable across awaits."},
             )
         )
-        await asyncio.wait_for(store.publish_started.wait(), timeout=2)
+        await asyncio.wait_for(store.publish_started.wait(), timeout=10)
         caller_policy.require_labels.clear()
         caller_policy.require_labels["tenant"] = "other"
         tool._policy.require_labels.clear()

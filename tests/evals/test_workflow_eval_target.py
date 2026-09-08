@@ -1075,7 +1075,7 @@ def test_cancelling_workflow_eval_closes_owned_execution() -> None:
                 _suite(FinalOutputContains("unreachable")),
             )
         )
-        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(started.wait(), timeout=10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -1115,7 +1115,7 @@ def test_cancelling_result_projection_closes_owned_execution_without_output() ->
                 _suite(FinalOutputContains("unreachable")),
             )
         )
-        await asyncio.wait_for(projection_started.wait(), timeout=1)
+        await asyncio.wait_for(projection_started.wait(), timeout=10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

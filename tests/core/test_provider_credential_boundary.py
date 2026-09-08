@@ -347,7 +347,8 @@ async def test_explicit_cleanup_owner_preserves_real_cancellation_after_deadline
 
     task = asyncio.create_task(consume())
     try:
-        await asyncio.wait_for(close_started.wait(), timeout=0.5)
+        async with asyncio.timeout(0.5):
+            await close_started.wait()
         task.cancel("caller cancelled deadline cleanup")
 
         with pytest.raises(asyncio.CancelledError) as exc_info:

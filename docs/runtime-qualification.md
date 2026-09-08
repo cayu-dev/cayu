@@ -1,6 +1,6 @@
 # Runtime stability qualification
 
-Issue #1286's registered local suite runs deterministic Runtime contract and capacity
+The registered local suite runs deterministic Runtime contract and capacity
 fixtures against an **installed Cayu wheel**. It is release qualification, not an
 agent-quality benchmark. The repository supplies the versioned fixture registry;
 fixtures and their private fault harness are not installed as Runtime APIs.
@@ -19,7 +19,7 @@ python scripts/run_runtime_qualification.py \
 The runner copies repository fixtures to a temporary directory **without `src`**,
 clears inherited Python and pytest path/options overrides, and verifies the imported
 package against installed distribution metadata. Each scenario checks the same
-Runtime build fingerprint from #1251. Editable source imports are rejected. An
+Runtime build fingerprint. Editable source imports are rejected. An
 unavailable identity remains explicitly unavailable. The report also binds the
 registry manifest digest and fixture-content digest; use the matching checkout to interpret hashed test IDs.
 
@@ -74,7 +74,7 @@ The SQLite report does not claim PostgreSQL qualification.
 `--scenario NAME` and `--repeat 1` support focused diagnosis. Focused reports are
 marked `scope: focused`; they are not full qualification evidence. A release should
 retain both full profile reports and the PostgreSQL result when that backend is
-supported. There is no claim of live-provider capability conformance; #247 owns it.
+supported. There is no claim of live-provider capability conformance.
 
 ## Coverage and interpretation
 
@@ -86,10 +86,10 @@ trajectories rather than redefining Runtime orchestration in a second harness:
   a barrier proves simultaneous execution. The dynamic trajectory repeatedly uses a
   discovered tool reference. The separate long-loop and 12-large-result compaction
   fixtures check request bounds and atomic call/result grouping.
-- #1028's actual `SessionOperationFaultHarness` supplies pre-transform, pre-commit,
+- The `SessionOperationFaultHarness` supplies pre-transform, pre-commit,
   commit-then-raise and barrier schedules. SQLite and PostgreSQL retain their real
   transactional implementation.
-- #496's completed-session contract replay proves no-effect replay. It does not
+- The completed-session contract replay proves no-effect replay. It does not
   convert interrupted or unsupported trajectories into completed replay evidence.
 - Provider-native history/redaction, attachment retention, semantic and absolute
   deadlines, reconnect state, invalid completions and ambiguous dispatch recovery

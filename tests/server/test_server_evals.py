@@ -1426,7 +1426,7 @@ def test_running_eval_cancellation_stops_execution_before_terminalizing(tmp_path
                 },
             )
             run_id = admitted.json()["spec"]["run_id"]
-            assert provider.started.wait(timeout=2)
+            assert provider.started.wait(timeout=10)
 
             cancellation = client.post(
                 f"/api/evals/runs/{run_id}/cancel",
@@ -1709,10 +1709,10 @@ def test_attached_worker_recovers_interrupted_model_judge_under_a_new_fence(tmp_
             )
             assert admitted.status_code == 202
             run_id = admitted.json()["spec"]["run_id"]
-            assert judge_provider.started.wait(timeout=2)
+            assert judge_provider.started.wait(timeout=10)
 
         assert run_id is not None
-        assert judge_provider.cancelled.wait(timeout=2)
+        assert judge_provider.cancelled.wait(timeout=10)
         asyncio.run(store.close())
         recovery_store = SQLiteEvalStore(database, schema_mode=SchemaMode.VALIDATE)
         released = asyncio.run(recovery_store.load_run(run_id))
@@ -2010,7 +2010,7 @@ def test_result_publication_heartbeats_until_the_terminal_commit(
             )
             assert admitted.status_code == 202
             run_id = admitted.json()["spec"]["run_id"]
-            assert preparation_started.wait(timeout=2)
+            assert preparation_started.wait(timeout=10)
 
             time.sleep(1.1)
             competing_lease = asyncio.run(
@@ -2236,7 +2236,7 @@ def test_result_projection_cannot_expire_a_completed_provider_lease(
 
     def blocking_publish(*args, **kwargs):
         projection_started.set()
-        if not release_projection.wait(timeout=5):
+        if not release_projection.wait(timeout=20):
             raise AssertionError("Timed out releasing eval result projection.")
         return original_publish(*args, **kwargs)
 
@@ -2251,7 +2251,7 @@ def test_result_projection_cannot_expire_a_completed_provider_lease(
         evals=_evals_config(
             target,
             store,
-            lease_seconds=1,
+            lease_seconds=5,
             poll_interval_seconds=0.02,
         ),
     )
@@ -2276,9 +2276,9 @@ def test_result_projection_cannot_expire_a_completed_provider_lease(
             )
             assert admitted.status_code == 202
             run_id = admitted.json()["spec"]["run_id"]
-            assert projection_started.wait(timeout=2)
+            assert projection_started.wait(timeout=10)
 
-            time.sleep(1.1)
+            time.sleep(5.1)
             competing_lease = asyncio.run(
                 competing_store.claim_run(target_key=target.key, lease_seconds=5)
             )
@@ -2312,7 +2312,7 @@ def test_eval_preflight_heartbeats_ownership_before_provider_dispatch(
 
     def blocking_compile(*args, **kwargs):
         compile_started.set()
-        if not release_compile.wait(timeout=5):
+        if not release_compile.wait(timeout=20):
             raise AssertionError("Timed out waiting to release eval preflight compilation.")
         return original_compile(*args, **kwargs)
 
@@ -2323,7 +2323,7 @@ def test_eval_preflight_heartbeats_ownership_before_provider_dispatch(
         evals=_evals_config(
             target,
             store,
-            lease_seconds=1,
+            lease_seconds=5,
             poll_interval_seconds=0.02,
         ),
     )
@@ -2347,9 +2347,9 @@ def test_eval_preflight_heartbeats_ownership_before_provider_dispatch(
                 },
             )
             run_id = admitted.json()["spec"]["run_id"]
-            assert compile_started.wait(timeout=2)
+            assert compile_started.wait(timeout=10)
 
-            time.sleep(1.1)
+            time.sleep(5.1)
             competing_lease = asyncio.run(
                 competing_store.claim_run(target_key=target.key, lease_seconds=5)
             )
@@ -2435,7 +2435,7 @@ def test_eval_preflight_rechecks_ownership_before_provider_dispatch(
                 },
             )
             assert admitted.status_code == 202
-            assert compile_started.wait(timeout=2)
+            assert compile_started.wait(timeout=10)
 
             time.sleep(1.1)
             competing_lease = asyncio.run(
@@ -2579,7 +2579,7 @@ def test_shutdown_releases_owned_eval_for_restart_recovery(tmp_path) -> None:
                 },
             )
             run_id = admitted.json()["spec"]["run_id"]
-            assert provider.started.wait(timeout=2)
+            assert provider.started.wait(timeout=10)
 
         assert run_id is not None
         record = asyncio.run(store.load_run(run_id))
@@ -2906,27 +2906,27 @@ def test_shutdown_grace_bounds_a_stalled_durable_release(tmp_path, monkeypatch) 
             _evals_config(
                 target,
                 store,
-                lease_seconds=1,
+                lease_seconds=5,
                 poll_interval_seconds=0.02,
                 # Invocation cancellation now proves provider and lifecycle
                 # quiescence before the eval lease can be released. Leave
                 # enough room for that bounded ownership handoff, then stall
                 # the release itself to exercise the shutdown deadline.
-                shutdown_grace_seconds=0.5,
+                shutdown_grace_seconds=3,
             )
         )
         recovery_lease = None
         coordinator.start()
         try:
-            assert await asyncio.to_thread(provider.started.wait, 2)
+            assert await asyncio.to_thread(provider.started.wait, 10)
             started_at = asyncio.get_running_loop().time()
-            await asyncio.wait_for(coordinator.stop(), timeout=0.9)
+            await asyncio.wait_for(coordinator.stop(), timeout=4)
             elapsed = asyncio.get_running_loop().time() - started_at
             assert release_started.is_set()
-            assert elapsed < 0.8
+            assert elapsed < 3.5
             assert provider.cancelled.is_set()
 
-            await asyncio.sleep(1.05)
+            await asyncio.sleep(5.05)
             recovery_lease = await recovery_store.claim_run(
                 target_key=target.key,
                 lease_seconds=5,

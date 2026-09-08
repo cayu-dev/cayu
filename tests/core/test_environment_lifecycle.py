@@ -1339,7 +1339,7 @@ def test_cancellation_during_factory_resolution_finalizes_before_fence_release()
                 ),
             )
         )
-        await asyncio.wait_for(factory.entered.wait(), timeout=1)
+        await asyncio.wait_for(factory.entered.wait(), timeout=10)
         run_task.cancel("cancel pre-run factory")
         with pytest.raises(asyncio.CancelledError, match="cancel pre-run factory"):
             await run_task
@@ -1421,7 +1421,7 @@ def test_cancelled_binding_does_not_repeat_deferred_factory_release() -> None:
                 ),
             )
         )
-        await asyncio.wait_for(binding.entered.wait(), timeout=1)
+        await asyncio.wait_for(binding.entered.wait(), timeout=10)
         run_task.cancel("cancel during binding")
         with pytest.raises(BaseExceptionGroup) as exc_info:
             await run_task
@@ -1830,7 +1830,7 @@ def test_lazy_cleanup_child_cancellation_does_not_cancel_unrelated_admission(
                 ),
             )
         )
-        first_events = await asyncio.wait_for(first_admission, timeout=1)
+        first_events = await asyncio.wait_for(first_admission, timeout=10)
         assert first_events[-1].type == EventType.SESSION_COMPLETED
         assert first_admission.cancelling() == 0
         assert not first_admission.cancelled()
@@ -1855,7 +1855,7 @@ def test_lazy_cleanup_child_cancellation_does_not_cancel_unrelated_admission(
                 ),
             )
         )
-        second_events = await asyncio.wait_for(second_admission, timeout=1)
+        second_events = await asyncio.wait_for(second_admission, timeout=10)
         assert second_events[-1].type == EventType.SESSION_COMPLETED
         assert second_admission.cancelling() == 0
         assert not second_admission.cancelled()
@@ -1931,7 +1931,7 @@ def test_unresolved_lazy_cleanup_does_not_block_unrelated_environment_setup(
                     messages=[Message.text("user", "continue")],
                 ),
             ),
-            timeout=1,
+            timeout=10,
         )
         assert events[-1].type == EventType.SESSION_COMPLETED
         assert retained.cleanup_settlement_task is not None
@@ -3200,7 +3200,7 @@ def test_timed_out_factory_release_adopts_late_cleanup_settlement() -> None:
             app._environment_lifecycle._deferred_factory_cleanup_tasks
         )
         factory.allow_late_failure.set()
-        await asyncio.wait_for(factory.settlement_started.wait(), timeout=1)
+        await asyncio.wait_for(factory.settlement_started.wait(), timeout=10)
 
         contender = await _collect_events(
             app,

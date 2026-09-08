@@ -39,10 +39,14 @@ _SPECIALIST_TEST_ENV = {
     **_GENERAL_TEST_ENV,
     "CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT": "1",
 }
+_GENERAL_SHARDS = 32
 _SPECIALIST_LANES = {
-    "stress-process": ("stress or process", 1, 1),
-    "postgres-conformance-1": ("postgres and not (stress or process)", 2, 1),
-    "postgres-conformance-2": ("postgres and not (stress or process)", 2, 2),
+    "browser-docker": ("browser_docker", 1, 1),
+    **{f"qualification-{group}": ("stress or qualification", 8, group) for group in range(1, 9)},
+    **{
+        f"postgres-conformance-{group}": ("postgres and not (stress or qualification)", 8, group)
+        for group in range(1, 9)
+    },
 }
 _SQLITE_PYTHON_VERSIONS = ("3.11", "3.12", "3.13", "3.14")
 _MINIMUM_NODE_VERSION = (22, 18, 0)
@@ -86,11 +90,24 @@ class VerificationScope:
     sqlite_cancellation: bool
 
 
+_PACKAGE_VERIFICATION_GROUPS = (
+    "core",
+    "server",
+    "dashboard",
+    "authoring",
+    "coding",
+    "docker",
+    "service",
+)
+_PACKAGE_GROUPS = ("build", *_PACKAGE_VERIFICATION_GROUPS)
+
+
 @dataclass(frozen=True)
 class PackageStep:
     name: str
     command: str
     publishing_only: bool
+    groups: tuple[str, ...] = _PACKAGE_VERIFICATION_GROUPS
 
 
 @dataclass(frozen=True)
@@ -365,11 +382,19 @@ def _load_package_steps(manifest_path: Path) -> list[PackageStep]:
             raise RuntimeError(
                 f"package CI step {name!r} has invalid publishing value {raw_publishing!r}"
             )
+        raw_groups = next(
+            (value for line in segment if (value := _manifest_scalar(line, "groups")) is not None),
+            "",
+        )
+        groups = tuple(value.strip() for value in raw_groups.split(",") if value.strip())
+        if not groups or set(groups) - set(_PACKAGE_GROUPS):
+            raise RuntimeError(f"package CI step {name!r} requires valid groups")
         steps.append(
             PackageStep(
                 name=name,
                 command=command,
                 publishing_only=raw_publishing == "true",
+                groups=groups,
             )
         )
 
@@ -524,9 +549,8 @@ def _run_docker_prerequisite(runner: LocalCiRunner) -> None:
 
 def _sync_python_test_environment(runner: LocalCiRunner, *, browser: bool) -> None:
     runner.run("Install Python 3.14", ("uv", "python", "install", "3.14"))
-    extras = ["--extra", "dev", "--extra", "server"]
-    if browser:
-        extras.extend(("--extra", "browser"))
+    # General example contract tests import Playwright without launching a browser.
+    extras = ["--extra", "dev", "--extra", "server", "--extra", "browser"]
     runner.run(
         "Sync Python 3.14 test environment" + (" with browser support" if browser else ""),
         (
@@ -541,10 +565,10 @@ def _sync_python_test_environment(runner: LocalCiRunner, *, browser: bool) -> No
 
 
 def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
-    if shard not in range(1, 7):
-        raise ValueError("general shard must be between 1 and 6")
+    if shard not in range(1, _GENERAL_SHARDS + 1):
+        raise ValueError(f"general shard must be between 1 and {_GENERAL_SHARDS}")
     runner.run(
-        f"Python 3.14 general shard {shard}/6",
+        f"Python 3.14 general shard {shard}/{_GENERAL_SHARDS}",
         (
             "uv",
             "run",
@@ -552,13 +576,17 @@ def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
             "pytest",
             "-q",
             "-m",
-            "not (stress or process or postgres)",
+            "not (stress or qualification or postgres or browser_docker)",
             "--splits",
-            "6",
+            str(_GENERAL_SHARDS),
             "--group",
             str(shard),
             "--splitting-algorithm",
             "least_duration",
+            "-n",
+            "2",
+            "--dist",
+            "loadfile",
             "--durations=20",
         ),
         env=_GENERAL_TEST_ENV,
@@ -594,6 +622,11 @@ def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
             str(group),
             "--splitting-algorithm",
             "least_duration",
+            "-n",
+            # Capacity fixtures already create their own concurrent workers.
+            "1" if lane.startswith("qualification-") else "2",
+            "--dist",
+            "loadfile",
             "--durations=20",
         ),
         env=_SPECIALIST_TEST_ENV,
@@ -601,16 +634,16 @@ def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
 
 
 def _run_general_shards(runner: LocalCiRunner, *, jobs: int) -> None:
-    if jobs not in range(1, 7):
-        raise ValueError("local general-shard jobs must be between 1 and 6")
+    if jobs not in range(1, _GENERAL_SHARDS + 1):
+        raise ValueError(f"local general-shard jobs must be between 1 and {_GENERAL_SHARDS}")
     if runner.dry_run or jobs == 1:
-        for shard in range(1, 7):
+        for shard in range(1, _GENERAL_SHARDS + 1):
             _run_general_shard(runner, shard)
         return
 
     shard_runners = {
         shard: LocalCiRunner(root=runner.root, dry_run=False, keep_going=False)
-        for shard in range(1, 7)
+        for shard in range(1, _GENERAL_SHARDS + 1)
     }
     failures: list[str] = []
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="cayu-ci-shard") as executor:
@@ -757,6 +790,8 @@ def _run_release_artifacts(
     temporary_root: Path,
     *,
     publishing: bool,
+    group: str | None = None,
+    artifacts: Path | None = None,
 ) -> None:
     # macOS exposes /tmp and /var as symlinks. Package security checks reject
     # traversing either alias, so pass their canonical /private/... destination.
@@ -772,6 +807,24 @@ def _run_release_artifacts(
         )
     if not runner.dry_run and shutil.which("rg") is None:
         raise RuntimeError("release checks require rg on PATH")
+
+    if group not in (None, *_PACKAGE_GROUPS):
+        raise ValueError("unknown package group")
+    if group in _PACKAGE_VERIFICATION_GROUPS:
+        if artifacts is None:
+            raise ValueError("package verification groups require --package-artifacts")
+        if not runner.dry_run:
+            archives = list(artifacts.iterdir())
+            if (
+                len(archives) != 2
+                or any(not path.is_file() or path.is_symlink() for path in archives)
+                or sum(path.name.endswith(".whl") for path in archives) != 1
+                or sum(path.name.endswith(".tar.gz") for path in archives) != 1
+            ):
+                raise ValueError("package artifacts require exactly one wheel and source archive")
+            shutil.copytree(artifacts, runner.root / "dist" / "first")
+    elif artifacts is not None:
+        raise ValueError("package artifacts are only accepted by verification groups")
 
     github_ref = "refs/heads/local-pr"
     github_ref_name = "local-pr"
@@ -801,10 +854,14 @@ def _run_release_artifacts(
         "PATH": os.environ["PATH"],
     }
     steps = _load_package_steps(runner.root / "scripts/package_ci_steps.yml")
-    preserve_distribution = publishing and os.environ.get("GITHUB_ACTIONS") == "true"
+    preserve_distribution = group == "build" or (
+        publishing and os.environ.get("GITHUB_ACTIONS") == "true"
+    )
     try:
         _prepare_package_environment(runner)
         for step in steps:
+            if group is not None and group not in step.groups:
+                continue
             command = step.command
             if platform.system() != "Linux":
                 command = command.replace(
@@ -882,7 +939,7 @@ def _write_proof(
         f"`{open_file_limits[0]}` before runner setup; `{open_file_limits[1]}` during tests",
         f"- Started: `{started_at.isoformat()}`",
         f"- Finished: `{finished_at.isoformat()}`",
-        f"- Execution: GitHub's six general Python shards run with `{jobs}` local "
+        f"- Execution: GitHub's {_GENERAL_SHARDS} general Python shards run with `{jobs}` local "
         "worker(s); specialist lanes remain serial; this does not claim the Ubuntu "
         "runner or its separate-machine topology",
         "- Command counts: "
@@ -956,12 +1013,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         ),
         help="run one canonical lane (used by GitHub Actions)",
     )
-    parser.add_argument("--shard", type=int, help="general lane shard, from 1 through 6")
+    parser.add_argument(
+        "--shard", type=int, help=f"general lane shard, from 1 through {_GENERAL_SHARDS}"
+    )
     parser.add_argument(
         "--specialist-lane",
         choices=tuple(_SPECIALIST_LANES),
         help="specialist lane identity",
     )
+    parser.add_argument("--package-group", choices=_PACKAGE_GROUPS)
+    parser.add_argument("--package-artifacts", type=Path)
     parser.add_argument(
         "--python-version",
         choices=_SQLITE_PYTHON_VERSIONS,
@@ -996,7 +1057,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--jobs",
         type=int,
-        choices=range(1, 7),
+        choices=range(1, _GENERAL_SHARDS + 1),
         default=2,
         help="concurrent local general shards (default: 2; specialist lanes stay serial)",
     )
@@ -1031,7 +1092,7 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
                 raise ValueError("--lane specialist requires --specialist-lane")
             _run_docker_prerequisite(runner)
             _sync_python_test_environment(runner, browser=True)
-            if args.specialist_lane == "stress-process":
+            if args.specialist_lane.startswith("qualification-"):
                 _install_playwright_chromium(runner)
             _run_specialist_lane(runner, args.specialist_lane)
         elif args.lane == "sqlite-cancellation":
@@ -1049,6 +1110,8 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
                     runner,
                     Path(temporary),
                     publishing=args.publishing,
+                    group=args.package_group,
+                    artifacts=args.package_artifacts,
                 )
         else:  # pragma: no cover - argparse owns the closed choice set
             raise ValueError(f"unknown CI lane: {args.lane}")

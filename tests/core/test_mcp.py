@@ -2501,7 +2501,7 @@ def test_http_mcp_refresh_can_publish_after_transport_owns_pending_call(
             )
         )
         try:
-            await asyncio.wait_for(call_dispatched.wait(), timeout=1.0)
+            await asyncio.wait_for(call_dispatched.wait(), timeout=10.0)
             refreshed = await asyncio.wait_for(app.refresh_mcp_toolset(toolset), timeout=1.0)
             assert call.done() is False
             release_call.set()

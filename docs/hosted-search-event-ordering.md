@@ -1,6 +1,6 @@
 # Hosted-search event ordering investigation
 
-Issue #1495 remains an investigation. Its historical
+The hosted-search ordering investigation remains an investigation. Its historical
 `web_search_lifecycle_arrived_before_output_item_added` diagnostic proves only
 that the native adapter had no pending search at the received output index.
 It cannot identify the original wire order or assign responsibility to a provider,

@@ -42,6 +42,7 @@ class _StopAfterDurableTrials(RuntimeError):
     pass
 
 
+@pytest.mark.qualification
 def test_reference_campaign_runs_real_paired_trials_and_recovers_in_fresh_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -229,6 +230,7 @@ def test_reference_campaign_runs_real_paired_trials_and_recovers_in_fresh_proces
     )
 
 
+@pytest.mark.qualification
 def test_reference_campaign_recovers_an_interrupted_trial_without_survivor_filtering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

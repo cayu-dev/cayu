@@ -149,9 +149,11 @@ pythonpath = ["src", "."]
 markers = [
   "postgres: tests requiring a disposable Postgres database or sharing its schema",
   "process: real subprocess or container boundary coverage",
+  "browser_docker: shared real-browser fixture run together in its own CI lane",
   "postgres_recovery: real process-death coverage requiring the Postgres lane",
   "sigkill_recovery: real process-death recovery coverage run in its own lane",
   "stress: deterministic concurrency and fault-injection coverage",
+  "qualification: full-scale evidence, capacity, and end-to-end acceptance checks",
 ]
 
 [tool.ruff]

@@ -397,6 +397,7 @@ class _SecretBearingSessionCreationResult(InMemorySessionStore):
 
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, secret: str) -> None:
         super().__init__()
@@ -428,6 +429,7 @@ class _SecretBearingCheckpointResult(InMemorySessionStore):
 
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, secret: str) -> None:
         super().__init__()
@@ -445,6 +447,7 @@ class _MalformedReceiptIdentityCheckpointResult(InMemorySessionStore):
 
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, secret: str) -> None:
         super().__init__()
@@ -467,6 +470,7 @@ class _FailWorkAttemptDeferredInputRead(InMemorySessionStore):
 
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, secret: str) -> None:
         super().__init__()
@@ -499,6 +503,7 @@ class _LeaseAdvancingWorkAttemptSessionStore(InMemorySessionStore):
 
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, now: list[datetime]) -> None:
         super().__init__()
@@ -667,6 +672,7 @@ class _IneligibleWorkAttemptTransitionStore(InMemoryTaskStore):
 class _BlockFirstWorkAttemptSessionCreation(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -701,6 +707,7 @@ class _BlockFirstWorkAttemptSessionCreation(InMemorySessionStore):
 class _BlockFirstWorkAttemptRecoveryTransition(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -723,6 +730,7 @@ class _BlockFirstWorkAttemptRecoveryTransition(InMemorySessionStore):
 class _BlockFirstWorkAttemptSettlementFenceMixin:
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -775,6 +783,7 @@ class _BlockFirstPostgresWorkAttemptSettlementFence(
 class _BlockNextWorkAttemptCheckpointLoad(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -795,6 +804,7 @@ class _BlockNextWorkAttemptCheckpointLoad(InMemorySessionStore):
 class _FailOnceWorkAttemptRunFenceRelease(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -810,6 +820,7 @@ class _FailOnceWorkAttemptRunFenceRelease(InMemorySessionStore):
 class _BlockFirstWorkAttemptRunFenceRelease(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -828,6 +839,7 @@ class _BlockFirstWorkAttemptRunFenceRelease(InMemorySessionStore):
 class _FailWorkAttemptSettlementFence(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, message: str) -> None:
         super().__init__()
@@ -848,6 +860,7 @@ class _FailWorkAttemptSettlementFence(InMemorySessionStore):
 class _BlockFirstWorkAttemptContinuationAdmission(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -866,6 +879,7 @@ class _BlockFirstWorkAttemptContinuationAdmission(InMemorySessionStore):
 class _CancelFirstWorkAttemptSessionCreation(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, message: str) -> None:
         super().__init__()
@@ -895,6 +909,7 @@ class _CancelFirstWorkAttemptSessionCreation(InMemorySessionStore):
 class _FailCancelledWorkAttemptSessionCreation(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, message: str) -> None:
         super().__init__()
@@ -928,6 +943,7 @@ class _FailCancelledWorkAttemptSessionCreation(InMemorySessionStore):
 class _FailWorkAttemptSessionCreation(InMemorySessionStore):
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, message: str) -> None:
         super().__init__()

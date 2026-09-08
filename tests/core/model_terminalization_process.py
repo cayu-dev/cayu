@@ -24,7 +24,7 @@ from cayu import (
 
 
 async def main():
-    if sys.argv[2].startswith("postgresql://"):
+    if sys.argv[-1] == "postgres":
         from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 

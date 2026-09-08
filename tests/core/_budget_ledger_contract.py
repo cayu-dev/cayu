@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
@@ -360,6 +360,7 @@ async def assert_runtime_publishes_cross_session_ttl_release(
     *,
     clock: MutableClock,
     ttl_seconds: int,
+    expire_reservation: Callable[[str], Awaitable[datetime]] | None = None,
 ) -> None:
     """Prove that one session can publish another session's reaped release."""
 
@@ -392,6 +393,8 @@ async def assert_runtime_publishes_cross_session_ttl_release(
     assert wrapped.lost_reservation_id is not None
 
     clock.value += timedelta(seconds=ttl_seconds + 1)
+    if expire_reservation is not None:
+        await expire_reservation(wrapped.lost_reservation_id)
     async for _event in app.run(
         RunRequest(
             agent_name="assistant",
@@ -647,6 +650,7 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     *,
     clock: MutableClock,
     ttl_seconds: int,
+    expire_reservation: Callable[[str], Awaitable[datetime]] | None = None,
 ) -> None:
     """Exercise the shared dispatch fence and terminal audit-outbox contract."""
 
@@ -694,6 +698,8 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
         )
 
     clock.value += timedelta(seconds=ttl_seconds)
+    if expire_reservation is not None:
+        await expire_reservation(reserved.record.reservation_id)
     blocked = await ledger.reserve(
         limit=limit,
         session_id="sess_crash_safe_blocked",
@@ -777,6 +783,9 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     assert pending.accepted is True
     assert pending.record is not None
     clock.value += timedelta(seconds=ttl_seconds)
+    expired_at = clock.value
+    if expire_reservation is not None:
+        expired_at = await expire_reservation(pending.record.reservation_id)
     replacement = await ledger.reserve(
         limit=limit,
         session_id="sess_crash_safe_replacement",
@@ -793,7 +802,9 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     assert await ledger.list_pending_settlements() == pending_releases
     assert pending_releases[0].settlement_kind == "released"
     assert pending_releases[0].reconciliation.reason == expiration_fallback.expiration_reason
-    assert pending_releases[0].reconciliation.settled_at == clock.value
+    assert replacement.record is not None
+    assert expired_at <= pending_releases[0].reconciliation.settled_at
+    assert pending_releases[0].reconciliation.settled_at <= replacement.record.created_at
 
     audit_limit = limit.model_copy(
         update={"max_estimated_cost": Decimal("2")},
@@ -1022,6 +1033,9 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
             dispatch_id="dispatch:atomic:combined",
         )
     clock.value += timedelta(seconds=ttl_seconds)
+    if expire_reservation is not None:
+        await expire_reservation(first.record.reservation_id)
+        await expire_reservation(second.record.reservation_id)
     trigger_reap = await ledger.reserve(
         limit=atomic_limit,
         session_id="sess_atomic_dispatch_trigger",

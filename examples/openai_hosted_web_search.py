@@ -12,6 +12,7 @@ from cayu import (
     OpenAIProvider,
     OpenAIWebSearch,
     RunRequest,
+    WebSearchSource,
 )
 
 
@@ -58,7 +59,10 @@ async def main() -> None:
                 print("citation", part.title, part.url)
             elif type(part) is HostedToolCallPart and part.action is not None:
                 for source in part.action.sources:
-                    print("source", source.title, source.url)
+                    if isinstance(source, WebSearchSource):
+                        print("source", source.title, source.url)
+                    else:
+                        print("API source", source.name)
 
     usage = await app.get_session_usage(session_id)
     print("input_tokens", usage.usage.input_tokens)

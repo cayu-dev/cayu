@@ -736,6 +736,7 @@ def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
             "targeted_tool_grant_id",
             "targeted_tool_invocation",
             "targeted_tool_rejection",
+            "command_denial_code",
         }
         | {"arguments_state"}
         == event_projection_module._PENDING_TOOL_CALL_FIELD_NAMES

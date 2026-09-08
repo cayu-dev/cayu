@@ -1919,16 +1919,10 @@ def test_in_memory_event_sink_revalidates_constructed_events():
             )
         )
 
+    invalid_event = Event(type=EventType.SESSION_STARTED, session_id="sess_1")
+    object.__setattr__(invalid_event, "payload", BadPayload({"ok": True}))
     with pytest.raises(ValueError, match="JSON-compatible"):
-        asyncio.run(
-            sink.emit(
-                Event.model_construct(
-                    type=EventType.SESSION_STARTED,
-                    session_id="sess_1",
-                    payload=BadPayload({"ok": True}),
-                )
-            )
-        )
+        asyncio.run(sink.emit(invalid_event))
 
 
 def test_event_copy_boundaries_reject_event_subclasses_before_attribute_access():
@@ -3965,7 +3959,7 @@ def test_local_artifact_store_atomic_publish_does_not_replace_empty_target(tmp_p
         session_id="sess_atomic",
     )
 
-    with pytest.raises(FileExistsError):
+    with pytest.raises(artifact_local_module._AbsentLocalArtifactError) as captured:
         artifact_local_module._write_artifact(
             store.root,
             store._root_identity,
@@ -3973,6 +3967,7 @@ def test_local_artifact_store_atomic_publish_does_not_replace_empty_target(tmp_p
             b"atomic",
         )
 
+    assert isinstance(captured.value.__cause__, FileExistsError)
     assert target.is_dir()
     assert list(target.iterdir()) == []
     assert [path.name for path in store.root.iterdir()] == [artifact_id]
@@ -5142,7 +5137,7 @@ def test_local_runner_cleans_up_when_cancelled_during_timeout(tmp_path, monkeypa
                 timeout_s=1,
             )
         )
-        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=10)
         await _wait_for_process_marker(marker)
         task.cancel()
         await asyncio.sleep(0)

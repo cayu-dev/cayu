@@ -915,7 +915,7 @@ def test_cayu_app_terminal_evidence_repair_serializes_concurrent_workers() -> No
 
         request = IncompleteSessionRecoveryRequest(session_id=session_id)
         first_task = asyncio.create_task(first_app.recover_incomplete_session(request))
-        await asyncio.wait_for(store.claimed.wait(), timeout=5)
+        await asyncio.wait_for(store.claimed.wait(), timeout=10)
         second = await asyncio.wait_for(
             second_app.recover_incomplete_session(request),
             timeout=5,

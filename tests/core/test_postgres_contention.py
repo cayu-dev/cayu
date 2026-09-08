@@ -574,6 +574,21 @@ def test_postgres_budget_ledger_preserves_bedrock_identity_across_reopen(
     assert reconciled.billing_identity == completed_identity
 
 
+async def _expire_budget_reservations(dsn: str, reservation_ids: list[str]) -> None:
+    import psycopg
+
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE cayu_budget_reservations "
+                "SET updated_at = clock_timestamp() - INTERVAL '2 seconds' "
+                "WHERE reservation_id = ANY(%s)",
+                (reservation_ids,),
+            )
+            assert cur.rowcount == len(reservation_ids)
+        await conn.commit()
+
+
 def test_postgres_budget_ledger_reaps_only_the_advisory_locked_budget(
     postgres_dsn: str,
 ) -> None:
@@ -596,6 +611,9 @@ def test_postgres_budget_ledger_reaps_only_the_advisory_locked_budget(
             assert first.record is not None
             assert second.record is not None
             clock.value += timedelta(seconds=2)
+            await _expire_budget_reservations(
+                postgres_dsn, [first.record.reservation_id, second.record.reservation_id]
+            )
 
             replacement = await _reserve(ledger, first_limit, "sess_first_replacement")
             untouched = await ledger.release(
@@ -629,8 +647,14 @@ def test_postgres_budget_ledger_concurrent_scoped_reaping_does_not_deadlock(
         first_limit = _reservation_budget_limit("0.25")
         second_limit = _reservation_budget_limit("0.25", key="second")
         try:
-            assert (await _reserve(setup, first_limit, "sess_first_expired")).accepted
-            assert (await _reserve(setup, second_limit, "sess_second_expired")).accepted
+            first_reserved = await _reserve(setup, first_limit, "sess_first_expired")
+            second_reserved = await _reserve(setup, second_limit, "sess_second_expired")
+            assert first_reserved.accepted and first_reserved.record is not None
+            assert second_reserved.accepted and second_reserved.record is not None
+            await _expire_budget_reservations(
+                postgres_dsn,
+                [first_reserved.record.reservation_id, second_reserved.record.reservation_id],
+            )
         finally:
             await setup.close()
 

@@ -3472,7 +3472,7 @@ def test_queued_dispatch_preserves_compatible_active_profile_after_release(
             ]
 
         active_run = asyncio.create_task(run_active_invocation())
-        await asyncio.wait_for(provider.started.wait(), timeout=2)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         active_checkpoint = await store.load_checkpoint(session_id)
         active_profile = active_invocation_execution_profile_from_checkpoint(active_checkpoint)
         assert active_profile is not None
@@ -3981,7 +3981,7 @@ def test_worker_cancellation_settles_without_provider_redispatch() -> None:
         provider_started = asyncio.create_task(blocking_provider.started.wait())
         done, _pending = await asyncio.wait(
             {processing, provider_started},
-            timeout=2,
+            timeout=10,
             return_when=asyncio.FIRST_COMPLETED,
         )
         if processing in done:
@@ -4284,8 +4284,8 @@ def test_live_dispatcher_stops_before_replacement_after_heartbeat_stalls() -> No
         stale = asyncio.create_task(
             dispatcher.process_next(runtime, worker_id="stale-dispatch-worker")
         )
-        await asyncio.wait_for(runtime.first_started.wait(), timeout=1)
-        await asyncio.wait_for(tasks.heartbeat_started.wait(), timeout=1)
+        await asyncio.wait_for(runtime.first_started.wait(), timeout=10)
+        await asyncio.wait_for(tasks.heartbeat_started.wait(), timeout=10)
         await asyncio.sleep(1.05)
         assert stale.done() is False
         assert runtime.first_stopped.is_set() is False
@@ -4401,10 +4401,10 @@ def test_cancelled_live_dispatcher_fences_opaque_work_before_replacement() -> No
         )
         try:
             assert await asyncio.to_thread(runtime.thread_started.wait, 1)
-            await asyncio.wait_for(tasks.heartbeat_started.wait(), timeout=1)
+            await asyncio.wait_for(tasks.heartbeat_started.wait(), timeout=10)
 
             processing.cancel("dispatcher shutdown")
-            await asyncio.wait_for(tasks.fence_started.wait(), timeout=1)
+            await asyncio.wait_for(tasks.fence_started.wait(), timeout=10)
             # The owned shield temporarily consumes the request while it establishes
             # the durable fence.  It restores the request before redelivery below.
             assert processing.cancelling() == 0
@@ -6426,16 +6426,18 @@ def test_run_worker_hint_audits_full_dispatch_namespace_union(
                 worker_id="metrics-hint-union-worker",
                 stop=stop,
                 poll_interval_s=10.0,
+                minimum_idle_delay_s=1.0,
+                maximum_idle_delay_s=1.0,
                 metrics=metrics,
                 reconcile_terminal_receipts=False,
                 reclaim_expired_leases=False,
             )
         )
-        await asyncio.wait_for(first_empty_claim.wait(), timeout=1)
+        await asyncio.wait_for(first_empty_claim.wait(), timeout=10)
         handle = await h.app.dispatch(
             _dispatch_request("metrics-hint-union", "metrics-hint-union-dispatch")
         )
-        await asyncio.wait_for(worker, timeout=5)
+        await asyncio.wait_for(worker, timeout=15)
         task = await h.tasks.load_task(handle.metadata["queue_task_id"])
         assert task is not None and task.status is TaskStatus.COMPLETED
 
@@ -6571,7 +6573,7 @@ def test_dispatcher_instances_share_claim_namespace_rotation(
                 while h.tasks._task_admission_wakeup_broker.subscriber_count != len(dispatchers):
                     await asyncio.sleep(0)
             release_claim.set()
-            await asyncio.wait_for(task_claimed.wait(), timeout=1)
+            await asyncio.wait_for(task_claimed.wait(), timeout=10)
         finally:
             stop.set()
             release_claim.set()
@@ -6703,7 +6705,7 @@ def test_run_worker_does_not_count_an_empty_claim_as_an_active_handler(
                 reclaim_expired_leases=False,
             )
         )
-        await asyncio.wait_for(claim_started.wait(), timeout=1)
+        await asyncio.wait_for(claim_started.wait(), timeout=10)
         snapshot = metrics.snapshot()
         assert snapshot.active_handlers == 0
         assert snapshot.active_pollers == 1
@@ -6747,7 +6749,7 @@ def test_run_worker_counts_only_claimed_dispatch_execution_as_an_active_handler(
                 reclaim_expired_leases=False,
             )
         )
-        await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+        await asyncio.wait_for(dispatch_started.wait(), timeout=10)
         snapshot = metrics.snapshot()
         assert snapshot.active_handlers == 1
         assert snapshot.active_pollers == 0

@@ -126,7 +126,7 @@ def test_guard_failure_retains_durable_capacity_until_whole_close(tmp_path: Path
                 }
             )
         )
-        await asyncio.wait_for(started.wait(), 2)
+        await asyncio.wait_for(started.wait(), 10)
         assert not action.done()
         parent = records[host._DURABLE_BROWSER_PARENT_KEY]
         assert parent["live_session_ids"] == [state["session_id"]]

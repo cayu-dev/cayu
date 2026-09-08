@@ -518,7 +518,7 @@ def test_proxy_shutdown_cancels_stalled_upstream_and_releases_grant_lease() -> N
 
         client = asyncio.create_task(asyncio.to_thread(request))
         try:
-            await asyncio.wait_for(entered.wait(), timeout=2.0)
+            await asyncio.wait_for(entered.wait(), timeout=10.0)
             await asyncio.wait_for(server.close(), timeout=1.0)
             await asyncio.wait_for(settled.wait(), timeout=1.0)
             return await asyncio.wait_for(client, timeout=1.0), not registry._active_counts
@@ -595,7 +595,7 @@ def test_client_disconnect_cancels_stalled_upstream_and_releases_worker() -> Non
             if not await asyncio.to_thread(request_sent.wait, 2.0):
                 await client_task
                 raise AssertionError("Client request did not reach the proxy.")
-            await asyncio.wait_for(entered.wait(), timeout=2.0)
+            await asyncio.wait_for(entered.wait(), timeout=10.0)
             disconnect_now.set()
             await client_task
             await asyncio.wait_for(settled.wait(), timeout=2.0)

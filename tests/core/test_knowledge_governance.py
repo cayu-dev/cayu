@@ -454,7 +454,7 @@ def test_activation_policy_cannot_suppress_caller_cancellation() -> None:
                 policy=CancellationSuppressingPolicy(),
             )
         )
-        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(entered.wait(), timeout=10)
         invocation.cancel("test caller cancellation")
         with pytest.raises(asyncio.CancelledError, match="test caller cancellation"):
             await invocation

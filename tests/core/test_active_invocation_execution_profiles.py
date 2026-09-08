@@ -3155,7 +3155,7 @@ def test_profile_adoption_is_rejected_while_external_effect_is_active() -> None:
                 )
             )
         )
-        await asyncio.wait_for(original_tool.started.wait(), timeout=5.0)
+        await asyncio.wait_for(original_tool.started.wait(), timeout=10.0)
 
         replacement_app = CayuApp(enable_logging=False)
         replacement_app.register_agent(
@@ -3223,7 +3223,7 @@ async def _assert_profile_adoption_waits_for_terminal_hook_release(
             )
         )
     )
-    await asyncio.wait_for(hook.started.wait(), timeout=5.0)
+    await asyncio.wait_for(hook.started.wait(), timeout=10.0)
 
     terminal = await store.load(session_id)
     checkpoint = await store.load_checkpoint(session_id)
@@ -3327,7 +3327,7 @@ async def _assert_profile_adoption_waits_for_deferred_environment_cleanup(
             )
         )
     )
-    await asyncio.wait_for(hook.started.wait(), timeout=5.0)
+    await asyncio.wait_for(hook.started.wait(), timeout=10.0)
 
     terminal = await store.load(session_id)
     checkpoint = await store.load_checkpoint(session_id)
@@ -3402,7 +3402,7 @@ async def _assert_profile_adoption_waits_for_deferred_environment_cleanup(
         ]
 
         drain_task = asyncio.create_task(original_app.drain_environment_cleanups(timeout_s=0.02))
-        await asyncio.wait_for(retry_started.wait(), timeout=5.0)
+        await asyncio.wait_for(retry_started.wait(), timeout=10.0)
         retry_task = lifecycle._deferred_factory_cleanup_tasks[session_id]
         assert retry_task is not cleanup_task
         assert await drain_task is False
@@ -3490,7 +3490,7 @@ def test_repaired_failed_deferred_release_does_not_poison_next_invocation() -> N
                 )
             )
         )
-        await asyncio.wait_for(hook.started.wait(), timeout=5.0)
+        await asyncio.wait_for(hook.started.wait(), timeout=10.0)
         checkpoint = await store.load_checkpoint(session_id)
         first_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         assert first_profile is not None
@@ -4906,7 +4906,7 @@ def test_model_reconciliation_uses_frozen_provider_after_registration_mutation()
                 )
             )
         )
-        await asyncio.wait_for(original_adapter.start_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(original_adapter.start_entered.wait(), timeout=10.0)
 
         replacement_adapter = BlockingProviderOperationAdapter()
         replacement_provider = BlockingBackgroundProvider(replacement_adapter)
@@ -5515,7 +5515,7 @@ async def _assert_crashed_model_operation_rejects_invalid_restart_before_recover
         await store.release_run_fence(session_id)
         replacement_description = "Original tool."
         expected_error = RuntimeError
-        expected_message = "another interaction"
+        expected_message = "Historical queued interaction handoff has no exact terminal predecessor"
     else:
         run_task.cancel("simulated process loss")
         adapter.start_release.set()

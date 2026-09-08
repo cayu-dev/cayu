@@ -1017,6 +1017,18 @@
           "workspace_branch_lifecycle": {
             "$ref": "#/components/schemas/ApiWorkspaceBranchLifecycle"
           },
+          "workspace_checkpoint_policy": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Checkpoint Policy"
+          },
           "workspace_id": {
             "anyOf": [
               {
@@ -1303,6 +1315,27 @@
             },
             "title": "Provider Names",
             "type": "array"
+          },
+          "queued_interaction_profile_handoff": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Queued Interaction Profile Handoff"
           },
           "result_transcript_end": {
             "anyOf": [
@@ -5988,6 +6021,18 @@
             "title": "Line Items",
             "type": "array"
           },
+          "missing_pricing_model_steps": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Missing Pricing Model Steps",
+            "type": "integer"
+          },
+          "missing_usage_model_steps": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Missing Usage Model Steps",
+            "type": "integer"
+          },
           "model_steps": {
             "minimum": 0.0,
             "title": "Model Steps",
@@ -6026,6 +6071,12 @@
           "unpriced_model_steps": {
             "minimum": 0.0,
             "title": "Unpriced Model Steps",
+            "type": "integer"
+          },
+          "unsupported_pricing_model_steps": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Unsupported Pricing Model Steps",
             "type": "integer"
           }
         },
@@ -6822,6 +6873,22 @@
             "title": "Uncached Input Tokens",
             "type": "integer"
           },
+          "unpriced_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "missing_usage",
+                  "missing_pricing",
+                  "unsupported_pricing"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unpriced Reason"
+          },
           "web_search_calls": {
             "default": 0,
             "maximum": 9.223372036854776e+18,
@@ -7112,6 +7179,22 @@
             "title": "Uncached Input Tokens",
             "type": "integer"
           },
+          "unpriced_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "missing_usage",
+                  "missing_pricing",
+                  "unsupported_pricing"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unpriced Reason"
+          },
           "web_search_calls": {
             "default": 0,
             "maximum": 9.223372036854776e+18,
@@ -7199,6 +7282,35 @@
           "as_of"
         ],
         "title": "ComparisonPricingProvenance",
+        "type": "object"
+      },
+      "ConfigurationFieldProvenanceManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "owner": {
+            "title": "Owner",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "framework",
+              "application",
+              "explicit"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "owner",
+          "source"
+        ],
+        "title": "ConfigurationFieldProvenanceManifest",
         "type": "object"
       },
       "ContextExposureEvidenceKind": {
@@ -8451,6 +8563,22 @@
             "title": "Uncached Input Tokens",
             "type": "integer"
           },
+          "unpriced_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "missing_usage",
+                  "missing_pricing",
+                  "unsupported_pricing"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unpriced Reason"
+          },
           "web_search_calls": {
             "default": 0,
             "minimum": 0.0,
@@ -9300,6 +9428,18 @@
             "additionalProperties": true,
             "title": "Workspace Branch Lifecycle",
             "type": "object"
+          },
+          "workspace_checkpoint_policy": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Checkpoint Policy"
           }
         },
         "required": [
@@ -11690,7 +11830,7 @@
         "description": "Complete server-owned limits that HTTP may only narrow.",
         "properties": {
           "max_bootstrap_messages": {
-            "maximum": 16.0,
+            "maximum": 128.0,
             "minimum": 0.0,
             "title": "Max Bootstrap Messages",
             "type": "integer"
@@ -13410,6 +13550,53 @@
         "title": "EvalRunFailureCode",
         "type": "string"
       },
+      "EvalRunFailureDiagnostic": {
+        "additionalProperties": false,
+        "description": "Safe causal evidence bound to the containing run and fenced terminal claim.",
+        "properties": {
+          "provider_protocol_reason": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Protocol Reason"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/EvalRunFailureReason"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "EvalRunFailureDiagnostic",
+        "type": "object"
+      },
+      "EvalRunFailureReason": {
+        "description": "Closed causal vocabulary; values never come from exception messages.",
+        "enum": [
+          "corpus_load_failed",
+          "corpus_missing",
+          "target_registration_missing",
+          "target_preflight_failed",
+          "execution_profile_missing",
+          "execution_profile_changed",
+          "target_identity_failed",
+          "target_identity_changed",
+          "corpus_compilation_failed",
+          "execution_failed",
+          "execution_profile_rejected",
+          "provider_protocol_failed",
+          "execution_cancelled",
+          "result_publication_failed"
+        ],
+        "title": "EvalRunFailureReason",
+        "type": "string"
+      },
       "EvalRunInvocation": {
         "additionalProperties": false,
         "description": "Durable, authority-free execution contractions and trusted caller provenance.\n\nThe HTTP API constructs this value after authentication. It retains only the\nbounded subject/tenant projection needed to mint ordinary runtime invocation\nprovenance after a worker restart; authentication claims never enter EvalStore.\n``None`` bounds inherit the server-owned target request base.",
@@ -13439,7 +13626,7 @@
           "authored_suite_launch_lane": {
             "anyOf": [
               {
-                "maximum": 63.0,
+                "maximum": 99.0,
                 "minimum": 0.0,
                 "type": "integer"
               },
@@ -13657,6 +13844,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/EvalRunFailureCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failure_diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunFailureDiagnostic"
               },
               {
                 "type": "null"
@@ -15632,7 +15829,7 @@
             "type": "array"
           },
           "max_concurrency": {
-            "maximum": 64.0,
+            "maximum": 100.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -15888,7 +16085,7 @@
         "description": "Immutable decision rule for the complete retained trial set of each case.",
         "properties": {
           "max_concurrency": {
-            "maximum": 64.0,
+            "maximum": 100.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -15949,7 +16146,7 @@
         "properties": {
           "max_concurrency": {
             "default": 1,
-            "maximum": 64.0,
+            "maximum": 100.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -16339,6 +16536,15 @@
           "external_target_incomplete",
           "external_target_identity_mismatch",
           "external_target_failed",
+          "workflow_target_failed",
+          "workflow_execution_failed",
+          "workflow_completion_missing",
+          "workflow_completion_conflict",
+          "workflow_attempt_superseded",
+          "workflow_projector_failed",
+          "workflow_output_invalid",
+          "workflow_capture_failed",
+          "workflow_quiescence_failed",
           "execution_failed",
           "session_failed",
           "terminal_evidence_failed",
@@ -16987,6 +17193,16 @@
           "target_key": {
             "title": "Target Key",
             "type": "string"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowEvalTargetIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -17543,6 +17759,15 @@
       "FinalOutputEqualsAssertionSpec": {
         "additionalProperties": false,
         "properties": {
+          "comparison": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "title": "Comparison",
+            "type": "string"
+          },
           "description": {
             "anyOf": [
               {
@@ -19175,6 +19400,11 @@
                 "type": "null"
               }
             ]
+          },
+          "intervention_binding_omitted": {
+            "default": false,
+            "title": "Intervention Binding Omitted",
+            "type": "boolean"
           },
           "memory_overhead": {
             "anyOf": [
@@ -21328,6 +21558,11 @@
               }
             ]
           },
+          "intervention_binding_omitted": {
+            "default": false,
+            "title": "Intervention Binding Omitted",
+            "type": "boolean"
+          },
           "intervention_spec_fingerprint": {
             "title": "Intervention Spec Fingerprint",
             "type": "string"
@@ -21911,6 +22146,271 @@
           "revision"
         ],
         "title": "OpaqueExternalCaseRefV1",
+        "type": "object"
+      },
+      "OperationOutcomeCounts": {
+        "additionalProperties": false,
+        "properties": {
+          "command_cancelled": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Command Cancelled",
+            "type": "integer"
+          },
+          "command_nonzero_exit": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Command Nonzero Exit",
+            "type": "integer"
+          },
+          "command_not_reported": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Command Not Reported",
+            "type": "integer"
+          },
+          "command_timed_out": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Command Timed Out",
+            "type": "integer"
+          },
+          "command_zero_exit": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Command Zero Exit",
+            "type": "integer"
+          },
+          "http_error": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Http Error",
+            "type": "integer"
+          },
+          "http_not_reported": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Http Not Reported",
+            "type": "integer"
+          },
+          "http_response": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Http Response",
+            "type": "integer"
+          },
+          "invocation_blocked": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Invocation Blocked",
+            "type": "integer"
+          },
+          "invocation_cancelled": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Invocation Cancelled",
+            "type": "integer"
+          },
+          "invocation_completed": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Invocation Completed",
+            "type": "integer"
+          },
+          "invocation_failed": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Invocation Failed",
+            "type": "integer"
+          },
+          "invocation_not_reported": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Invocation Not Reported",
+            "type": "integer"
+          }
+        },
+        "title": "OperationOutcomeCounts",
+        "type": "object"
+      },
+      "OperationOutcomeEvidence": {
+        "additionalProperties": false,
+        "description": "Content-free reference to one observation in the original event stream.",
+        "properties": {
+          "cancelled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancelled"
+          },
+          "dimension": {
+            "enum": [
+              "invocation",
+              "command",
+              "http"
+            ],
+            "title": "Dimension",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 1024,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "execution_id": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Id"
+          },
+          "exit_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Code"
+          },
+          "http_status_code": {
+            "anyOf": [
+              {
+                "maximum": 599.0,
+                "minimum": 100.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Http Status Code"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "state": {
+            "enum": [
+              "completed",
+              "failed",
+              "blocked",
+              "cancelled",
+              "not_reported",
+              "zero_exit",
+              "nonzero_exit",
+              "timed_out",
+              "response",
+              "http_error"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "timed_out": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timed Out"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Call Id"
+          }
+        },
+        "required": [
+          "event_id",
+          "dimension",
+          "state"
+        ],
+        "title": "OperationOutcomeEvidence",
+        "type": "object"
+      },
+      "OperationOutcomeSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/OperationOutcomeCounts"
+          },
+          "evidence": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/OperationOutcomeEvidence"
+            },
+            "maxItems": 256,
+            "title": "Evidence",
+            "type": "array"
+          },
+          "evidence_state": {
+            "default": "not_reported",
+            "enum": [
+              "not_reported",
+              "observed",
+              "incomplete"
+            ],
+            "title": "Evidence State",
+            "type": "string"
+          },
+          "omitted_evidence_count": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Omitted Evidence Count",
+            "type": "integer"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "title": "OperationOutcomeSummary",
         "type": "object"
       },
       "OperationalSnapshotRequest": {
@@ -24737,6 +25237,26 @@
             "title": "Assertions",
             "type": "array"
           },
+          "capture_bounds": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionTrajectoryBounds"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "capture_diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowCaptureDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "code": {
             "$ref": "#/components/schemas/EvalTrialDiagnosticCode"
           },
@@ -24750,12 +25270,34 @@
             "title": "Evidence Complete",
             "type": "boolean"
           },
+          "execution_status": {
+            "anyOf": [
+              {
+                "const": "completed",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Status"
+          },
           "memory_attribution": {
             "$ref": "#/components/schemas/EvalMemoryAttributionEvidenceV1"
           },
           "message": {
             "title": "Message",
             "type": "string"
+          },
+          "operation_outcomes": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OperationOutcomeSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "output": {
             "$ref": "#/components/schemas/EvalTrialOutputPreviewV1"
@@ -24848,6 +25390,15 @@
       "PublishedFinalOutputEqualsDetail": {
         "additionalProperties": false,
         "properties": {
+          "comparison": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "title": "Comparison",
+            "type": "string"
+          },
           "kind": {
             "const": "final_output_equals",
             "default": "final_output_equals",
@@ -25271,7 +25822,8 @@
           "candidate_route_relation": {
             "enum": [
               "independent_model",
-              "same_model"
+              "same_model",
+              "unknown"
             ],
             "title": "Candidate Route Relation",
             "type": "string"
@@ -25736,7 +26288,8 @@
           "candidate_route_relation": {
             "enum": [
               "independent_model",
-              "same_model"
+              "same_model",
+              "unknown"
             ],
             "title": "Candidate Route Relation",
             "type": "string"
@@ -26333,7 +26886,8 @@
           "duplicate_strong_reference",
           "strong_match_not_focused",
           "strong_match_offered_by_mode",
-          "explicit_application_selection"
+          "explicit_application_selection",
+          "newly_relevant"
         ],
         "title": "RecallItemSelectionReason",
         "type": "string"
@@ -26504,7 +27058,7 @@
             "$ref": "#/components/schemas/RunLimits"
           },
           "max_steps": {
-            "default": 20,
+            "default": 64,
             "maximum": 256.0,
             "minimum": 1.0,
             "title": "Max Steps",
@@ -26752,7 +27306,7 @@
             "$ref": "#/components/schemas/RunLimits"
           },
           "max_steps": {
-            "default": 20,
+            "default": 64,
             "maximum": 256.0,
             "minimum": 1.0,
             "title": "Max Steps",
@@ -27065,6 +27619,30 @@
         "title": "RuntimeBuildProvenanceStrength",
         "type": "string"
       },
+      "RuntimeConfigurationManifest": {
+        "additionalProperties": false,
+        "description": "Redacted values and ownership for supported application tunables.",
+        "properties": {
+          "provenance": {
+            "items": {
+              "$ref": "#/components/schemas/ConfigurationFieldProvenanceManifest"
+            },
+            "title": "Provenance",
+            "type": "array"
+          },
+          "values": {
+            "additionalProperties": true,
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "required": [
+          "values",
+          "provenance"
+        ],
+        "title": "RuntimeConfigurationManifest",
+        "type": "object"
+      },
       "RuntimeManifest": {
         "additionalProperties": false,
         "properties": {
@@ -27078,6 +27656,9 @@
               }
             ],
             "title": "Budget Policy"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/RuntimeConfigurationManifest"
           },
           "context_counting": {
             "title": "Context Counting",
@@ -27179,6 +27760,7 @@
           }
         },
         "required": [
+          "configuration",
           "dispatcher",
           "retry_policy",
           "budget_policy",
@@ -28334,7 +28916,7 @@
       },
       "SessionCostSummary": {
         "additionalProperties": false,
-        "description": "Estimated session cost derived from durable completion and resource evidence.",
+        "description": "Detailed cost inspection, retaining one line item per completed step.",
         "properties": {
           "currency": {
             "title": "Currency",
@@ -28346,6 +28928,18 @@
             },
             "title": "Line Items",
             "type": "array"
+          },
+          "missing_pricing_model_steps": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Missing Pricing Model Steps",
+            "type": "integer"
+          },
+          "missing_usage_model_steps": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Missing Usage Model Steps",
+            "type": "integer"
           },
           "model_steps": {
             "minimum": 0.0,
@@ -28369,6 +28963,12 @@
           "unpriced_model_steps": {
             "minimum": 0.0,
             "title": "Unpriced Model Steps",
+            "type": "integer"
+          },
+          "unsupported_pricing_model_steps": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Unsupported Pricing Model Steps",
             "type": "integer"
           }
         },
@@ -28785,6 +29385,78 @@
         ],
         "title": "SessionTopologyResponse",
         "type": "object"
+      },
+      "SessionTrajectoryBounds": {
+        "additionalProperties": false,
+        "description": "Global retained-evidence limits for one production-session trajectory.",
+        "properties": {
+          "max_depth": {
+            "default": 32,
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "Max Depth",
+            "type": "integer"
+          },
+          "max_events": {
+            "default": 10000,
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Max Events",
+            "type": "integer"
+          },
+          "max_record_bytes": {
+            "default": 1048576,
+            "maximum": 8388608.0,
+            "minimum": 1.0,
+            "title": "Max Record Bytes",
+            "type": "integer"
+          },
+          "max_sessions": {
+            "default": 100,
+            "maximum": 500.0,
+            "minimum": 1.0,
+            "title": "Max Sessions",
+            "type": "integer"
+          },
+          "max_total_bytes": {
+            "default": 33554432,
+            "maximum": 134217728.0,
+            "minimum": 1.0,
+            "title": "Max Total Bytes",
+            "type": "integer"
+          },
+          "max_transcript_records": {
+            "default": 5000,
+            "maximum": 50000.0,
+            "minimum": 0.0,
+            "title": "Max Transcript Records",
+            "type": "integer"
+          },
+          "memory_attribution_bounds": {
+            "$ref": "#/components/schemas/MemoryAttributionBounds"
+          }
+        },
+        "title": "SessionTrajectoryBounds",
+        "type": "object"
+      },
+      "SessionTrajectoryErrorCode": {
+        "description": "Stable reason a durable session tree cannot become exact eval evidence.",
+        "enum": [
+          "deadline_exceeded",
+          "store_unsupported",
+          "evidence_read_failed",
+          "terminal_evidence_rejected",
+          "descendant_enumeration_failed",
+          "origin_evidence_rejected",
+          "parent_contradiction",
+          "cycle_detected",
+          "session_limit_exceeded",
+          "depth_limit_exceeded",
+          "closure_changed",
+          "evidence_inconsistent"
+        ],
+        "title": "SessionTrajectoryErrorCode",
+        "type": "string"
       },
       "SessionTranscriptResponse": {
         "additionalProperties": false,
@@ -29966,6 +30638,28 @@
         ],
         "title": "TaskStatusCounts",
         "type": "object"
+      },
+      "TerminalSessionEvidenceErrorCode": {
+        "description": "Stable reason why a terminal-session snapshot cannot be returned.",
+        "enum": [
+          "session_not_found",
+          "session_not_terminal",
+          "session_interrupted",
+          "initial_transcript_incomplete",
+          "terminal_event_missing",
+          "terminal_event_conflict",
+          "terminal_event_duplicate",
+          "terminal_publication_marker_invalid",
+          "terminal_publication_marker_conflict",
+          "evidence_inconsistent",
+          "event_limit_exceeded",
+          "transcript_limit_exceeded",
+          "record_bytes_exceeded",
+          "total_bytes_exceeded",
+          "transport_bytes_exceeded"
+        ],
+        "title": "TerminalSessionEvidenceErrorCode",
+        "type": "string"
       },
       "TextPart": {
         "additionalProperties": false,
@@ -32430,6 +33124,22 @@
           "reason": {
             "title": "Reason",
             "type": "string"
+          },
+          "unpriced_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "missing_usage",
+                  "missing_pricing",
+                  "unsupported_pricing"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unpriced Reason"
           }
         },
         "required": [
@@ -32983,6 +33693,182 @@
           "url"
         ],
         "title": "WebSearchSource",
+        "type": "object"
+      },
+      "WorkflowCaptureDiagnostic": {
+        "additionalProperties": false,
+        "description": "Payload-free bounded-read rejection; observed is a witness, never a total.",
+        "properties": {
+          "bounds": {
+            "$ref": "#/components/schemas/SessionTrajectoryBounds"
+          },
+          "code": {
+            "$ref": "#/components/schemas/SessionTrajectoryErrorCode"
+          },
+          "consumed_bytes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Consumed Bytes",
+            "type": "integer"
+          },
+          "consumed_events": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Consumed Events",
+            "type": "integer"
+          },
+          "consumed_transcript_records": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Consumed Transcript Records",
+            "type": "integer"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          },
+          "observed_lower_bound": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Lower Bound"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "stage": {
+            "default": "child_capture",
+            "enum": [
+              "execution",
+              "terminal_load",
+              "result_projection",
+              "child_capture",
+              "probe_capture",
+              "capture_revalidation",
+              "assertion",
+              "post_scoring_revalidation"
+            ],
+            "title": "Stage",
+            "type": "string"
+          },
+          "terminal_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TerminalSessionEvidenceErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "session_id",
+          "bounds"
+        ],
+        "title": "WorkflowCaptureDiagnostic",
+        "type": "object"
+      },
+      "WorkflowEvalInstanceScope": {
+        "description": "How a target constructs application/workflow state for concrete trials.",
+        "enum": [
+          "shared",
+          "per_trial"
+        ],
+        "title": "WorkflowEvalInstanceScope",
+        "type": "string"
+      },
+      "WorkflowEvalTargetIdentityV1": {
+        "additionalProperties": false,
+        "description": "Portable behavior identity for a trusted workflow-root eval target.",
+        "properties": {
+          "application_context_revision": {
+            "title": "Application Context Revision",
+            "type": "string"
+          },
+          "capture_bounds": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionTrajectoryBounds"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "close_timeout_seconds": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 300.0,
+            "title": "Close Timeout Seconds",
+            "type": "number"
+          },
+          "evidence_policy_revision": {
+            "title": "Evidence Policy Revision",
+            "type": "string"
+          },
+          "execution_scope_revision": {
+            "title": "Execution Scope Revision",
+            "type": "string"
+          },
+          "implementation_revision": {
+            "title": "Implementation Revision",
+            "type": "string"
+          },
+          "instance_scope": {
+            "$ref": "#/components/schemas/WorkflowEvalInstanceScope"
+          },
+          "result_projector_revision": {
+            "title": "Result Projector Revision",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "workflow_name": {
+            "title": "Workflow Name",
+            "type": "string"
+          },
+          "workflow_spec_revision": {
+            "title": "Workflow Spec Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "workflow_name",
+          "workflow_spec_revision",
+          "implementation_revision",
+          "result_projector_revision",
+          "execution_scope_revision",
+          "application_context_revision",
+          "evidence_policy_revision",
+          "instance_scope",
+          "close_timeout_seconds"
+        ],
+        "title": "WorkflowEvalTargetIdentityV1",
         "type": "object"
       },
       "WorkspaceFileAssertionSpec": {
@@ -33730,7 +34616,7 @@
                 }
               }
             },
-            "description": "The causal-budget summary exceeds its session, event-count, event-input-byte, or serialized response safety bound."
+            "description": "The causal-budget summary exceeds its session or serialized response safety bound."
           },
           "422": {
             "content": {
@@ -33750,7 +34636,7 @@
                 }
               }
             },
-            "description": "The configured session store cannot enforce byte-bounded event reads for this legacy summary."
+            "description": "The configured session store cannot enforce bounded accounting reads."
           }
         },
         "summary": "Get Causal Budget Summary"

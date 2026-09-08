@@ -1363,7 +1363,7 @@ def test_guest_browser_cleanup_finishes_every_owner_before_republishing_cancella
         supervisor = asyncio.create_task(
             guest._await_browser_cleanup_resisting_cancellation(cleanup_task)
         )
-        await asyncio.wait_for(blocked_stage_started.wait(), timeout=1.0)
+        await asyncio.wait_for(blocked_stage_started.wait(), timeout=10.0)
         supervisor.cancel("caller stopped browser fetch")
         release_blocked_stage.set()
         outcome = await asyncio.wait_for(supervisor, timeout=1.0)
@@ -1420,7 +1420,7 @@ def test_guest_browser_cleanup_timeout_still_attempts_later_owners() -> None:
     asyncio.run(exercise())
 
 
-def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup() -> None:
+def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup(tmp_path: Path) -> None:
     async def exercise() -> None:
         request = guest._Request(
             url="https://example.com/",
@@ -1524,6 +1524,20 @@ def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup() -> N
                 "_proxy_and_ca",
                 return_value=("http://proxy:8080", Path("/tmp/cayu-ca.pem")),
             ),
+            # Profile-process startup is covered separately; this test measures
+            # the remaining browser-cleanup budget after CA installation.
+            patch.object(
+                guest,
+                "_start_temporary_profile_owner",
+                new=AsyncMock(
+                    return_value=guest._TemporaryProfileOwner(
+                        home=tmp_path,
+                        process=Mock(pid=123),
+                        control_fd=456,
+                    )
+                ),
+            ),
+            patch.object(guest, "_cleanup_temporary_profile_owner", new=AsyncMock(return_value=())),
             patch.object(guest, "_sanitize_environment"),
             patch.object(guest, "_install_browser_ca", side_effect=delayed_ca_install),
             patch.object(guest, "_cleanup_browser_resources", side_effect=record_cleanup_budget),

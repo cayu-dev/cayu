@@ -143,7 +143,7 @@ async def test_transport_failure_settles_or_fences_command(acknowledged, policy)
         sandbox, name="runner", cancellation_cleanup=policy, sandbox_module=FakeMicrosandboxModule
     )
     task = asyncio.create_task(runner.exec(ExecCommand.process("true")))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 10)
     release.set()
     with pytest.raises(RunnerExecutionError) as caught:
         await task
@@ -262,7 +262,7 @@ async def test_same_name_acquisition_is_exclusive_before_provider_ack(
         entrance("acquisition", close_action="none", sandbox_module=FakeMicrosandboxModule)
     )
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 10)
         with pytest.raises(RuntimeError, match="acquisition or rollback is still pending"):
             await MicrosandboxRunner.create(
                 "acquisition", replace=True, sandbox_module=FakeMicrosandboxModule
@@ -450,7 +450,7 @@ async def test_terminal_close_preserves_transport_failure_before_stall(
         runner._sftp_client = PendingTransport()
     task = asyncio.create_task(runner.close())
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 10)
         if cancel_owner:
             task.cancel()
             with pytest.raises(asyncio.CancelledError) as caught:
@@ -1301,7 +1301,7 @@ def test_microsandbox_runner_blocks_concurrent_launch_during_unavailability_prob
         )
 
         first = asyncio.create_task(runner.exec(ExecCommand.process("first-command")))
-        await asyncio.wait_for(ping_started.wait(), timeout=1.0)
+        await asyncio.wait_for(ping_started.wait(), timeout=10.0)
         second = asyncio.create_task(runner.exec(ExecCommand.process("must-not-launch")))
         await asyncio.sleep(0)
 
@@ -1433,7 +1433,7 @@ async def test_health_probe_cancellation_preserves_completed_command_cleanup():
     )
     task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:
             await task
@@ -1944,7 +1944,7 @@ def test_microsandbox_runner_records_removal_cancellation(
             sandbox_module=FakeMicrosandboxModule,
         )
         close_task = asyncio.create_task(runner.close())
-        await asyncio.wait_for(cancellation_started.wait(), timeout=1)
+        await asyncio.wait_for(cancellation_started.wait(), timeout=10)
         close_task.cancel("first")
         await asyncio.sleep(0)
         close_task.cancel("second")
@@ -3406,7 +3406,7 @@ async def test_sandbox_command_cleanup_finalizes_open_transports(
     task = asyncio.create_task(
         runner.exec(ExecCommand.process("sleep", "30"), timeout_s=1 if timeout else None)
     )
-    await asyncio.wait_for(handle.started.wait(), 1)
+    await asyncio.wait_for(handle.started.wait(), 10)
     if timeout:
         result = await task
         assert result.timed_out

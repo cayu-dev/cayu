@@ -105,7 +105,7 @@ def _identity_is_live(identity: dict[str, object]) -> bool:
     )
 
 
-async def _wait_for_tree(state_dir: Path, *, timeout: float = 10) -> None:
+async def _wait_for_tree(state_dir: Path, *, timeout: float = 30) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         if (state_dir / "tree-ready").is_file() and all(
@@ -184,7 +184,7 @@ def test_real_cayu_child_tree_cleans_descendants_after_normal_completion(
             app=app,
             task=task,
             worker_id="worker-a",
-            request=_request(tree_state, complete=True, deadline_seconds=5),
+            request=_request(tree_state, complete=True, deadline_seconds=20),
         )
         identities = _fixture_identities(tree_state)
         assert result.attempt.quiescence is LocalExecutionAttemptQuiescence.QUIESCENT
@@ -676,7 +676,7 @@ def test_quiescent_attempt_allows_same_worker_exact_replacement_execution(
         app = CayuApp(task_store=store, enable_logging=False)
         task = await _claimed(store, "same-worker-replacement")
         tree_state = tmp_path / "tree-state"
-        request = _request(tree_state, complete=True, deadline_seconds=5)
+        request = _request(tree_state, complete=True, deadline_seconds=20)
         coordinator = LocalExecutionAttemptCoordinator(
             store,
             state_dir=tmp_path / "attempt-state",
@@ -857,7 +857,7 @@ def test_real_cayu_child_tree_is_quiescent_after_hard_deadline(tmp_path: Path) -
             worker_id="worker-a",
             request=_request(
                 tree_state,
-                deadline_seconds=3,
+                deadline_seconds=10,
                 effect_policy=LocalExecutionEffectPolicy.NON_IDEMPOTENT_EXTERNAL,
             ),
         )

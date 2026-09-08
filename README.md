@@ -137,17 +137,17 @@ Its `build_coding_product_application()` front door produces durable
 `patch_ready_for_delivery` evidence after required checks, source copy-back, Git
 inspection, and configured review gates settle. It performs no commit, push,
 pull-request, CI, or merge effect. See the
-[maintained coding product](docs/coding-product.md).
+[maintained coding product](https://github.com/cayu-dev/cayu/blob/main/docs/coding-product.md).
 
 Add `--with remote-git-delivery` to generate the optional host-side broker seam.
 It prepares the exact patch-ready tree for application approval, then can create
 and push one exact commit to a new configured branch without exposing remote or
 credential authority to the coding agent. See
-[approved remote Git delivery](docs/remote-git-delivery.md).
+[approved remote Git delivery](https://github.com/cayu-dev/cayu/blob/main/docs/remote-git-delivery.md).
 
 Add `--with github-delivery` to include the subsequent host-only PR, exact-head
 checks, review, and provenance-labelled follow-up seam. It implies remote Git
-delivery and does not authorize merge. See [GitHub delivery](docs/github-delivery.md).
+delivery and does not authorize merge. See [GitHub delivery](https://github.com/cayu-dev/cayu/blob/main/docs/github-delivery.md).
 
 The generated repository starts from a clean Git commit, and each new product
 run requires a clean committed Git source baseline. It also requires `git`,
@@ -596,9 +596,9 @@ Start with the document that matches the job:
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
-| Produce a durable checked patch without external delivery | [Maintained coding product](docs/coding-product.md) |
-| Deliver an approved exact patch to a new remote Git branch | [Approved remote Git delivery](docs/remote-git-delivery.md) |
-| Create a bound GitHub PR and observe exact-head checks/reviews | [GitHub delivery](docs/github-delivery.md) |
+| Produce a durable checked patch without external delivery | [Maintained coding product](https://github.com/cayu-dev/cayu/blob/main/docs/coding-product.md) |
+| Deliver an approved exact patch to a new remote Git branch | [Approved remote Git delivery](https://github.com/cayu-dev/cayu/blob/main/docs/remote-git-delivery.md) |
+| Create a bound GitHub PR and observe exact-head checks/reviews | [GitHub delivery](https://github.com/cayu-dev/cayu/blob/main/docs/github-delivery.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
 | Contain a non-cooperative trusted host dependency behind a hard deadline | [Process-isolated host tools](https://github.com/cayu-tech/cayu/blob/main/docs/process-isolated-tools.md) |
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |

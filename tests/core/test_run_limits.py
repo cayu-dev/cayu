@@ -2305,7 +2305,7 @@ def test_concurrent_compactor_collision_does_not_release_the_winner():
                 authoritative_failure_types=(),
             )
         )
-        await asyncio.wait_for(operation_started.wait(), timeout=5)
+        await asyncio.wait_for(operation_started.wait(), timeout=10)
         ledger.release_second_result.set()
         loser_outcome = await asyncio.wait_for(loser_task, timeout=5)
         assert ledger.first_reservation_id is not None

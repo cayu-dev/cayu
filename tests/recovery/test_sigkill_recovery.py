@@ -336,22 +336,15 @@ def test_sigkill_after_durable_approval_request_preserves_resolution(
         recovered = asyncio.run(harness.load_session_state(session_id))
         assert recovered.session is not None
         assert recovered.session.status == SessionStatus.COMPLETED
-        _assert_only_model_step_publication(
-            recovered.checkpoint,
-            settled_terminal_decision=True,
-        )
-        from cayu.runtime._invocation_terminal_decision import (
-            settled_invocation_terminal_decision_from_checkpoint,
-        )
-
-        settled = settled_invocation_terminal_decision_from_checkpoint(recovered.checkpoint)
-        assert settled is not None
-        terminal = next(
-            event for event in recovered.events if event.id == settled.terminal_event_id
-        )
-        assert terminal.type is EventType.SESSION_INTERRUPTED
-        assert all(
-            terminal.payload.get(key) == value for key, value in settled.terminal_payload.items()
+        _assert_only_model_step_publication(recovered.checkpoint)
+        # Recovering a pending approval pauses the interaction until the same
+        # approval is resolved; it must not elect a terminal interaction receipt.
+        assert SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY not in recovered.checkpoint
+        paused = [event for event in recovered.events if event.type is EventType.INTERACTION_PAUSED]
+        assert len(paused) == 1
+        assert paused[0].payload["pending_action_kind"] == "tool_approval"
+        assert not any(
+            event.type is EventType.INTERACTION_INTERRUPTED for event in recovered.events
         )
         assert len(harness.read_marker()) == (1 if decision == "approve" else 0)
 

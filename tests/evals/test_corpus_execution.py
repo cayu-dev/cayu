@@ -1126,7 +1126,7 @@ def test_portable_model_judge_cancellation_propagates_to_external_judge_work():
         execution = asyncio.create_task(
             run_corpus_suite(target, _model_judge_corpus(judge), "refund-regressions")
         )
-        await asyncio.wait_for(judge_provider.started.wait(), timeout=2)
+        await asyncio.wait_for(judge_provider.started.wait(), timeout=10)
         execution.cancel()
         with pytest.raises(asyncio.CancelledError):
             await execution

@@ -226,7 +226,7 @@ def test_long_handler_renews_while_another_app_attempts_takeover(watcher_store_f
         )
         task = asyncio.create_task(app.run_event_watchers([watcher]))
         try:
-            await asyncio.wait_for(started.wait(), timeout=5)
+            await asyncio.wait_for(started.wait(), timeout=10)
             await asyncio.sleep(0.7)
             result = await competitor.run_event_watchers([watcher])
             assert result[0].blocked_by_active_lease
@@ -543,7 +543,7 @@ def test_sqlite_migration_preserves_pending_attempt_and_reopened_receipt(tmp_pat
         await store.close()
         with sqlite3.connect(path) as connection:
             connection.execute("DROP TABLE cayu_event_watcher_settlements")
-            connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 81")
+            connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 81")
         with pytest.raises(Exception, match="requires >= 81"):
             SQLiteEventWatcherStore(path, schema_mode=SchemaMode.VALIDATE)
         store = SQLiteEventWatcherStore(path, schema_mode=SchemaMode.MIGRATE)
@@ -611,7 +611,7 @@ def test_sqlite_renewal_contention_does_not_starve_other_watcher_leases(tmp_path
         )
         contended = None
         try:
-            await asyncio.wait_for(healthy_started.wait(), timeout=3)
+            await asyncio.wait_for(healthy_started.wait(), timeout=10)
             contended = asyncio.create_task(
                 app.run_event_watchers(
                     [

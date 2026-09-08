@@ -3575,7 +3575,7 @@ def project_files(
     files.update(
         {
             "configuration/settings.py": (
-                files["configuration/settings.py"] + _SERVICE_SETTINGS_APPEND
+                files["configuration/settings.py"].rstrip() + _SERVICE_SETTINGS_APPEND
             ),
             "service.py": render(_SERVICE_PY),
             "product_store.py": _PRODUCT_STORE_PY,

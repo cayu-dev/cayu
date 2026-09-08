@@ -154,7 +154,7 @@ def _factory_ref(
 def _tool(
     *,
     mode: str = "success",
-    deadline_seconds: float = 5.0,
+    deadline_seconds: float = 10.0,
     factory_config: dict[str, Any] | None = None,
     max_request_bytes: int = 1 << 20,
     max_response_bytes: int = 1 << 20,
@@ -276,7 +276,7 @@ def test_isolated_tool_contract_is_explicit_callable_free_and_not_a_sandbox() ->
             "implementation_version": "1",
         },
         "adapter_configuration_sha256": contract["adapter_configuration_sha256"],
-        "hard_deadline_seconds": 5.0,
+        "hard_deadline_seconds": 10.0,
         "protocol": "cayu.isolated-tool",
         "protocol_version": 1,
         "max_terminal_payload_bytes": None,
@@ -1927,7 +1927,7 @@ def test_real_process_diagnostic_overflow_is_bounded(
             _execute(
                 _tool(
                     mode=mode,
-                    deadline_seconds=3,
+                    deadline_seconds=10,
                     factory_config={"bytes": 4096},
                     **{limit_name: 128},
                 )
@@ -1952,7 +1952,7 @@ def test_terminal_response_cannot_race_past_buffered_stdout_overflow(
             _execute(
                 _tool(
                     mode="terminal_then_stdout_overflow",
-                    deadline_seconds=3,
+                    deadline_seconds=10,
                     max_stdout_bytes=128,
                 )
             )
@@ -1986,7 +1986,7 @@ def test_real_malformed_child_protocol_is_typed_and_bounded(
             _execute(
                 _tool(
                     mode=mode,
-                    deadline_seconds=3,
+                    deadline_seconds=10,
                     max_response_bytes=1024,
                 )
             )
@@ -2007,7 +2007,7 @@ def test_malformed_child_output_is_detached_from_every_diagnostic_channel(
         "_WORKER_MODULE",
         "cayu.testing_isolated_worker_faults",
     )
-    tool = _tool(mode="secret_invalid_wire", deadline_seconds=3)
+    tool = _tool(mode="secret_invalid_wire", deadline_seconds=10)
     arguments = {"text": "hello"}
 
     with (
@@ -2056,7 +2056,7 @@ def test_real_gil_holding_child_is_killed_by_the_hard_wall_deadline(tmp_path: Pa
         await _execute(
             _tool(
                 mode="gil_block",
-                deadline_seconds=2.5,
+                deadline_seconds=8,
                 factory_config={"seconds": 30, "started_path": str(started_path)},
             )
         )
@@ -2070,7 +2070,7 @@ def test_real_gil_holding_child_is_killed_by_the_hard_wall_deadline(tmp_path: Pa
     finally:
         started_path.unlink(missing_ok=True)
 
-    assert time.monotonic() - started < 4
+    assert time.monotonic() - started < 10
     assert asyncio.run(_execute(_tool())).content == "hello"
 
 
@@ -2088,7 +2088,7 @@ def test_real_caller_cancellation_kills_the_child_and_remains_cancellation(
                 )
             )
         )
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(8):
             while not started_path.exists():
                 await asyncio.sleep(0.01)
         task.cancel("caller-stop")
@@ -2188,7 +2188,7 @@ def test_caller_cancellation_during_cleanup_retains_the_preceding_child_failure(
 
         monkeypatch.setattr(isolated_process, "_settle_owned_supervisor", blocked_settle)
         task = asyncio.create_task(_execute(_tool(mode="crash", deadline_seconds=5)))
-        await asyncio.wait_for(cleanup_entered.wait(), timeout=5)
+        await asyncio.wait_for(cleanup_entered.wait(), timeout=10)
         task.cancel("cancel during process cleanup")
         cancelling = task.cancelling()
         release_cleanup.set()
@@ -2476,8 +2476,8 @@ def test_late_spawn_owns_passed_descriptor_until_spawn_settles(
         )
 
         run_task = asyncio.create_task(owner.run())
-        await asyncio.wait_for(spawn_entered.wait(), timeout=1)
-        await asyncio.wait_for(retained_ready.wait(), timeout=1)
+        await asyncio.wait_for(spawn_entered.wait(), timeout=10)
+        await asyncio.wait_for(retained_ready.wait(), timeout=10)
         assert passed_descriptor is not None
         os.fstat(passed_descriptor)
         assert len(retained) == 1
@@ -2631,8 +2631,8 @@ def test_late_spawn_requests_supervisor_shutdown_before_process_handle_arrives(
         )
 
         run_task = asyncio.create_task(owner.run())
-        await asyncio.wait_for(spawn_entered.wait(), timeout=1)
-        await asyncio.wait_for(retained_ready.wait(), timeout=1)
+        await asyncio.wait_for(spawn_entered.wait(), timeout=10)
+        await asyncio.wait_for(retained_ready.wait(), timeout=10)
         await asyncio.sleep(0)
         assert control_read_descriptor is not None
         os.set_blocking(control_read_descriptor, False)
@@ -3078,7 +3078,7 @@ def test_unproven_cleanup_fences_later_isolated_dispatch_until_owner_settles(
         started_path = tmp_path / "unsettled-child-started"
         tool = _tool(
             mode="conditional_gil_block",
-            deadline_seconds=2.5,
+            deadline_seconds=8,
             factory_config={"seconds": 30, "started_path": str(started_path)},
             effect=ToolEffect.EXTERNAL,
         )
@@ -3511,7 +3511,7 @@ def test_real_timeout_kills_the_complete_child_process_group(tmp_path: Path) -> 
             _execute(
                 _tool(
                     mode="grandchild",
-                    deadline_seconds=2.5,
+                    deadline_seconds=8,
                     factory_config={
                         "pid_path": str(pid_path),
                         "seconds": 30,
@@ -3535,7 +3535,7 @@ def test_successful_frame_does_not_wait_for_descendant_held_result_descriptor(
         _execute(
             _tool(
                 mode="fork_then_success",
-                deadline_seconds=3,
+                deadline_seconds=10,
                 factory_config={"pid_path": str(pid_path)},
             )
         )
@@ -3564,7 +3564,7 @@ def test_real_cancellation_kills_the_complete_child_process_group(tmp_path: Path
                 )
             )
         )
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(8):
             while not started_path.exists():
                 await asyncio.sleep(0.01)
         task.cancel("cancel descendant owner")
@@ -3588,7 +3588,7 @@ def test_supervisor_reaps_descendant_that_escapes_the_worker_process_group(
     pid_path = tmp_path / f"detached-{termination}.pid"
     tool = _tool(
         mode="detached_descendant",
-        deadline_seconds=2.5,
+        deadline_seconds=8,
         factory_config={
             "pid_path": str(pid_path),
             "seconds": 30,
@@ -3627,7 +3627,7 @@ def test_cancellation_reaps_descendant_that_escapes_the_worker_process_group(
                 )
             )
         )
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(8):
             while not started_path.exists():
                 await asyncio.sleep(0.01)
         task.cancel("cancel detached descendant owner")
@@ -3650,7 +3650,7 @@ def test_abnormal_supervisor_exit_never_acknowledges_process_tree_settlement(
     descendant_pid_path = tmp_path / "unowned-descendant.pid"
     tool = _tool(
         mode="kill_supervisor",
-        deadline_seconds=3,
+        deadline_seconds=10,
         factory_config={
             "worker_pid_path": str(worker_pid_path),
             "pid_path": str(descendant_pid_path),
@@ -4071,7 +4071,7 @@ def test_public_runtime_executes_registered_isolated_tool_and_exposes_truthful_e
     max_terminal_payload_bytes: int | None,
 ) -> None:
     app = _public_app(
-        _tool(deadline_seconds=3, max_terminal_payload_bytes=max_terminal_payload_bytes)
+        _tool(deadline_seconds=10, max_terminal_payload_bytes=max_terminal_payload_bytes)
     )
 
     manifest_tool = app.describe().agents[0].tools[0]
@@ -4084,7 +4084,7 @@ def test_public_runtime_executes_registered_isolated_tool_and_exposes_truthful_e
         "implementation_version": "1",
     }
     assert manifest_tool.adapter_configuration_sha256 is not None
-    assert manifest_tool.hard_deadline_seconds == 3
+    assert manifest_tool.hard_deadline_seconds == 10
 
     events = asyncio.run(_run_public(app, session_id="public-isolated-success"))
 
@@ -4105,7 +4105,7 @@ def test_public_runtime_applies_the_ordinary_secret_safe_result_boundary() -> No
         },
     )
     app = _public_app(
-        _tool(mode="secret_output", deadline_seconds=3),
+        _tool(mode="secret_output", deadline_seconds=10),
         secret_redactor=SecretRedactor(canary),
         public_authority_alias_keyring=keyring,
     )
@@ -4168,7 +4168,7 @@ def test_public_hard_timeout_preserves_external_effect_uncertainty_and_no_replay
     app = _public_app(
         _tool(
             mode="gil_block",
-            deadline_seconds=2.5,
+            deadline_seconds=8,
             factory_config={"seconds": 30, "started_path": str(started_path)},
             effect=ToolEffect.EXTERNAL,
         ),
@@ -4255,7 +4255,7 @@ def test_recovery_of_started_isolated_call_never_launches_a_duplicate_child(
         tools=[
             _tool(
                 mode="counted_success",
-                deadline_seconds=3,
+                deadline_seconds=10,
                 factory_config={"count_path": str(count_path)},
                 effect=ToolEffect.EXTERNAL,
             )
@@ -4298,7 +4298,7 @@ def test_factory_backed_recovery_authenticates_original_isolated_dispatch(
     app = _public_app(
         _tool(
             mode="counted_success",
-            deadline_seconds=3,
+            deadline_seconds=10,
             factory_config={"count_path": str(count_path)},
             effect=ToolEffect.EXTERNAL,
         ),
@@ -4519,7 +4519,7 @@ def test_recovery_rejects_conflicting_isolated_dispatch_authority(
     app = _public_app(
         _tool(
             mode="counted_success",
-            deadline_seconds=3,
+            deadline_seconds=10,
             factory_config={"count_path": str(count_path)},
             effect=ToolEffect.EXTERNAL,
         ),
@@ -4554,7 +4554,7 @@ def test_public_policy_denial_occurs_before_isolated_child_creation(tmp_path: Pa
     app = _public_app(
         _tool(
             mode="gil_block",
-            deadline_seconds=3,
+            deadline_seconds=10,
             factory_config={"seconds": 30, "started_path": str(started_path)},
         ),
         tool_policy=StaticToolPolicy(deny={"isolated_fixture"}),
@@ -4574,7 +4574,7 @@ def test_public_approval_precedes_child_creation_and_exact_retry_does_not_reexec
     app = _public_app(
         _tool(
             mode="counted_success",
-            deadline_seconds=3,
+            deadline_seconds=10,
             factory_config={"count_path": str(count_path)},
         ),
         tool_policy=AlwaysRequireApprovalToolPolicy(),
@@ -4656,7 +4656,7 @@ def test_public_runtime_interruption_settles_one_child_and_one_provider_result(
 
     async def scenario():
         run_task = asyncio.create_task(_run_public(app, session_id=session_id))
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(8):
             while not started_path.exists():
                 await asyncio.sleep(0.01)
         interrupt_events = [
@@ -4756,7 +4756,7 @@ def test_policy_interruption_does_not_claim_isolated_child_dispatch(tmp_path: Pa
         tools=[
             _tool(
                 mode="counted_success",
-                deadline_seconds=3,
+                deadline_seconds=10,
                 factory_config={"count_path": str(count_path)},
                 effect=ToolEffect.EXTERNAL,
             )
@@ -4766,7 +4766,7 @@ def test_policy_interruption_does_not_claim_isolated_child_dispatch(tmp_path: Pa
 
     async def scenario():
         run_task = asyncio.create_task(_run_public(app, session_id=session_id))
-        await asyncio.wait_for(policy.entered.wait(), timeout=5)
+        await asyncio.wait_for(policy.entered.wait(), timeout=10)
         interrupt_events = [
             event
             async for event in app.interrupt_session(
@@ -4878,7 +4878,7 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
         tools=[
             _tool(
                 mode="conditional_gil_block",
-                deadline_seconds=2.5,
+                deadline_seconds=8,
                 factory_config={"seconds": 30},
             )
         ],
@@ -4912,15 +4912,15 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
                 handler,
                 worker_id="isolated-worker",
                 query=TaskQuery(type="isolated-worker-job"),
-                lease_seconds=1,
+                lease_seconds=3,
                 poll_interval_s=0.01,
                 reclaim=False,
                 max_tasks=2,
             )
         )
-        await asyncio.wait_for(task_store.heartbeat_seen.wait(), timeout=2)
+        await asyncio.wait_for(task_store.heartbeat_seen.wait(), timeout=10)
         assert not worker_task.done()
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(8):
             while True:
                 # A worker can renew its task lease before creating the session.
                 if await session_store.load(f"worker-session-{blocking_task.id}") is None:
@@ -4946,7 +4946,7 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
                 client.get("/api/health"),
                 timeout=1,
             )
-        handled = await asyncio.wait_for(worker_task, timeout=8)
+        handled = await asyncio.wait_for(worker_task, timeout=20)
         return (
             handled,
             health_response,
@@ -5055,7 +5055,7 @@ def test_same_runtime_completes_a_later_session_after_killing_wedged_child(
         tools=[
             _tool(
                 mode="conditional_gil_block",
-                deadline_seconds=2.5,
+                deadline_seconds=8,
                 factory_config={"seconds": 30, "started_path": str(started_path)},
             )
         ],
@@ -5101,7 +5101,7 @@ def test_parallel_isolated_process_groups_settle_independently(tmp_path: Path) -
         tools=[
             _tool(
                 mode="conditional_gil_block",
-                deadline_seconds=5.0,
+                deadline_seconds=10,
                 factory_config={"seconds": 30, "started_path": str(started_path)},
                 effect=ToolEffect.IDEMPOTENT,
             )

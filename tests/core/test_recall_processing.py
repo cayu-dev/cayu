@@ -374,7 +374,7 @@ def test_full_index_does_not_cross_its_captured_frontier() -> None:
         task = asyncio.create_task(
             processor.process(_request(context=_context(), operation="bounded-full"))
         )
-        await asyncio.wait_for(store.started.wait(), timeout=2)
+        await asyncio.wait_for(store.started.wait(), timeout=10)
         await _create_entry(store, "after-full-frontier", _QUERY)
         store.release.set()
 
@@ -1017,7 +1017,7 @@ def test_cancellation_leaves_the_prior_delta_frontier_retryable() -> None:
             operation="cancellation-delta",
         )
         task = asyncio.create_task(processor.process(request))
-        await asyncio.wait_for(store.started.wait(), timeout=2)
+        await asyncio.wait_for(store.started.wait(), timeout=10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

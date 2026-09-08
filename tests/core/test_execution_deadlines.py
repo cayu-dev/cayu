@@ -382,7 +382,7 @@ def test_inflight_model_cancellation_waits_for_settlement():
                 RunRequest(
                     agent_name="worker",
                     messages=[Message.text("user", "go")],
-                    execution_deadline=ExecutionDeadline.after(0.5),
+                    execution_deadline=ExecutionDeadline.after(3),
                 )
             ):
                 events.append(event)
@@ -450,7 +450,7 @@ def test_no_new_tools_or_models_when_wall_expiry_is_observed(clock):
     asyncio.run(run())
 
 
-def test_inflight_tool_keeps_context_and_cleanup_after_expiry():
+def test_inflight_tool_keeps_context_and_cleanup_after_expiry(clock):
     from cayu import Tool, ToolResult, ToolSpec
 
     seen = []
@@ -470,6 +470,9 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry():
                     current_execution_deadline().expires_at,
                 )
             )
+            # Expire only once tool admission is proven, independent of setup speed.
+            clock.wall += timedelta(seconds=1)
+            clock.mono += 1
             try:
                 await asyncio.Event().wait()
                 return ToolResult(content="unexpected")

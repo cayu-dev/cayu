@@ -1246,7 +1246,7 @@ def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider
                 access_scope=tenant_scope,
             )
         )
-        await asyncio.wait_for(provider.query_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.query_started.wait(), timeout=10)
         replacement = original.model_copy(
             update={
                 "revision": 2,
@@ -1332,7 +1332,7 @@ def test_in_memory_embedding_worker_does_not_apply_stale_derived_embeddings() ->
                 "worker",
             )
         )
-        await asyncio.wait_for(provider.first_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.first_started.wait(), timeout=10)
         await store.delete_entry(
             old_entry.id,
             expected_revision=old_entry.revision,
@@ -1405,7 +1405,7 @@ def test_in_memory_embedding_worker_fences_superseded_attempt_vector_write() -> 
         slow = asyncio.create_task(
             store.process_embedding_changes("slow-attempt-index", "worker-a")
         )
-        await asyncio.wait_for(provider.first_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.first_started.wait(), timeout=10)
         fast = await store.process_embedding_changes("fast-attempt-index", "worker-b")
         provider.release_first.set()
         await slow

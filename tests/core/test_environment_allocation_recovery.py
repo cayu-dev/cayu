@@ -830,7 +830,7 @@ def test_published_allocation_wins_against_concurrent_discard(
                 timeout=1,
             )
             release_recovery.set()
-            await asyncio.wait_for(invalid_result_ready.wait(), timeout=1)
+            await asyncio.wait_for(invalid_result_ready.wait(), timeout=10)
 
             published = await asyncio.wait_for(published_task, timeout=1)
             assert published.error is None

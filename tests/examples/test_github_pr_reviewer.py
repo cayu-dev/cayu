@@ -12,6 +12,7 @@ import asyncio
 import importlib
 import importlib.util
 import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from cayu import (
     PassthroughProxy,
     ScriptedModelProvider,
     Task,
+    TaskStatus,
     ToolContext,
     ToolEffect,
 )
@@ -216,6 +218,9 @@ def test_pr_review_session_identity_includes_head_sha() -> None:
 
     task = Task(
         id="task-1",
+        status=TaskStatus.RUNNING,
+        worker_id="worker-1",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
         type="review_pr",
         assigned_agent_name="pr-reviewer",
         input={

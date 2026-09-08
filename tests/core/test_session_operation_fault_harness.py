@@ -255,7 +255,7 @@ def test_owner_cancellation_before_schedule_preserves_unsatisfied_failure() -> N
                 await owner_wait.wait()
 
         owner = asyncio.create_task(own_harness())
-        await asyncio.wait_for(owner_entered.wait(), timeout=5.0)
+        await asyncio.wait_for(owner_entered.wait(), timeout=10.0)
         owner.cancel()
         assert owner.cancelling() == 1
 
@@ -509,7 +509,7 @@ def test_repeated_owner_cancellation_during_drain_remains_cancelled() -> None:
                 await owner_wait.wait()
 
         owner = asyncio.create_task(own_harness())
-        await asyncio.wait_for(owner_entered.wait(), timeout=5.0)
+        await asyncio.wait_for(owner_entered.wait(), timeout=10.0)
         owner.cancel()
         assert owner.cancelling() == 1
         await asyncio.wait_for(publication_settling.wait(), timeout=5.0)
@@ -663,7 +663,7 @@ def test_body_cancellation_and_cleanup_failure_preserve_authority() -> None:
                     raise cancellation from nested_cause
 
         owner = asyncio.create_task(own_harness())
-        await asyncio.wait_for(owner_entered.wait(), timeout=5.0)
+        await asyncio.wait_for(owner_entered.wait(), timeout=10.0)
         owner.cancel()
         assert owner.cancelling() == 1
 

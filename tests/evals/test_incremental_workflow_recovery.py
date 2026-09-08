@@ -373,6 +373,7 @@ def test_root_read_cancellation_retains_admission_until_worker_settles(tmp_path,
 
 
 @pytest.mark.stress
+@pytest.mark.qualification
 def test_large_workflow_saved_scoring_without_provider_dispatch(tmp_path, monkeypatch):
     from benchmarks.incremental_evidence import insert_sqlite_records
     from tests.evals.test_session_trajectory import _create_running_session, _finish_session

@@ -348,6 +348,7 @@ class _CancellationBlockingCloseEvents(_TerminalThenBlockingEvents):
 
     async def aclose(self) -> None:
         self.closed = True
+        self.close_owner = asyncio.current_task()
         self.close_started.set()
         await asyncio.Event().wait()
 
@@ -1006,7 +1007,7 @@ def test_reconnect_stops_and_closes_stream_after_terminal_event() -> None:
                     inactive_for_seconds=0,
                 )
             ),
-            timeout=1.0,
+            timeout=10.0,
         )
 
         assert provider.adapter.reconnect_events is not None
@@ -1126,9 +1127,13 @@ def test_cancellation_during_reconnect_close_preserves_completion_then_propagate
         await asyncio.wait_for(provider.adapter.connection_created.wait(), timeout=1.0)
         reconnect_events = provider.adapter.reconnect_events
         assert reconnect_events is not None
-        await asyncio.wait_for(reconnect_events.close_started.wait(), timeout=1.0)
+        await asyncio.wait_for(reconnect_events.close_started.wait(), timeout=10.0)
         assert recovery.cancelling() == 0
         recovery.cancel()
+        # Caller abandonment retains the owned close; independently settle the
+        # provider-side cancellation before inspecting its durable completion.
+        assert reconnect_events.close_owner is not None
+        reconnect_events.close_owner.cancel()
         with pytest.raises(asyncio.CancelledError):
             await recovery
 

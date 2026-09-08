@@ -343,7 +343,7 @@ def test_verified_work_durable_store_parity_and_migration_are_documented() -> No
 
     assert "Existing ordinary task rows migrate" in runtime_contract
     assert "Existing ordinary tasks migrate" in release_notes
-    assert "Exact application replay returns its stored canonical snapshot" in runtime_contract
+    assert "Exact receipt replay additionally requires the stored task snapshot" in runtime_contract
     assert "Verification-claim replay is different" in runtime_contract
     assert "An expired exact claim cannot regain verifier authority through replay" in (
         runtime_contract

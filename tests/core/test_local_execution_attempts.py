@@ -59,23 +59,6 @@ class _MutableClock:
         return self.value
 
 
-def _set_store_wall_clock(
-    kind: str,
-    monkeypatch: pytest.MonkeyPatch,
-    value: list[datetime],
-) -> None:
-    class StoreDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            current = value[0]
-            return current if tz is not None else current.replace(tzinfo=None)
-
-    monkeypatch.setattr(
-        "cayu.runtime.tasks.datetime" if kind == "memory" else "cayu.storage.sqlite.datetime",
-        StoreDatetime,
-    )
-
-
 async def _close(store) -> None:
     close = getattr(store, "close", None)
     if close is not None:
@@ -716,19 +699,18 @@ def test_local_attempt_state_transitions_use_the_store_clock(
 def test_future_evidence_clock_cannot_expire_live_local_attempt_authority(
     kind: str,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     wall_now = [datetime(2026, 8, 27, 12, tzinfo=UTC)]
     evidence_now = datetime(2100, 1, 1, tzinfo=UTC)
-    _set_store_wall_clock(kind, monkeypatch, wall_now)
 
     async def scenario() -> None:
         store = (
-            InMemoryTaskStore(clock=lambda: evidence_now)
+            InMemoryTaskStore(clock=lambda: evidence_now, ownership_clock=lambda: wall_now[0])
             if kind == "memory"
             else SQLiteTaskStore(
                 tmp_path / "future-local-attempt-clock.sqlite",
                 clock=lambda: evidence_now,
+                ownership_clock=lambda: wall_now[0],
             )
         )
         try:
@@ -795,19 +777,18 @@ def test_future_evidence_clock_cannot_expire_live_local_attempt_authority(
 def test_past_evidence_clock_cannot_extend_expired_local_attempt_authority(
     kind: str,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     wall_now = [datetime(2026, 8, 27, 12, tzinfo=UTC)]
     evidence_now = datetime(2000, 1, 1, tzinfo=UTC)
-    _set_store_wall_clock(kind, monkeypatch, wall_now)
 
     async def scenario() -> None:
         store = (
-            InMemoryTaskStore(clock=lambda: evidence_now)
+            InMemoryTaskStore(clock=lambda: evidence_now, ownership_clock=lambda: wall_now[0])
             if kind == "memory"
             else SQLiteTaskStore(
                 tmp_path / "past-local-attempt-clock.sqlite",
                 clock=lambda: evidence_now,
+                ownership_clock=lambda: wall_now[0],
             )
         )
         try:

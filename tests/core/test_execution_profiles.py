@@ -6552,7 +6552,7 @@ def test_parking_transfers_exact_allocation_before_redelivering_cancellation() -
                 )
             )
         )
-        await asyncio.wait_for(park_started.wait(), timeout=2)
+        await asyncio.wait_for(park_started.wait(), timeout=10)
         source_task.cancel()
         assert source_task.cancelling() == 1
         park_release.set()

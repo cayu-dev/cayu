@@ -5,6 +5,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import pytest
 
@@ -13,6 +14,12 @@ from cayu.cli import main
 from cayu.core import Event, EventType, Message
 from cayu.runtime import RunRequest, SessionIdentity, SessionStatus, SessionStore
 from cayu.storage.migrations import SchemaMode
+
+
+def _cli_postgres_url(dsn: str) -> str:
+    from psycopg.conninfo import conninfo_to_dict
+
+    return "postgresql:///?" + urlencode(conninfo_to_dict(dsn))
 
 
 def _pricing_evidence(*, model: str) -> dict[str, object]:
@@ -297,7 +304,7 @@ def test_session_commands_have_sqlite_postgres_semantic_parity(
                         "session",
                         *command,
                         "--postgres",
-                        postgres_dsn,
+                        _cli_postgres_url(postgres_dsn),
                         "--json",
                     ]
                 )
@@ -473,7 +480,9 @@ def test_session_tools_conflicting_approval_and_execution_is_unavailable_across_
     asyncio.run(prepare())
     monkeypatch.setattr(session_cli, "_EVENT_QUERY_PAGE_SIZE", 2)
     target = (
-        ["--sqlite", str(sqlite_path)] if postgres_dsn is None else ["--postgres", postgres_dsn]
+        ["--sqlite", str(sqlite_path)]
+        if postgres_dsn is None
+        else ["--postgres", _cli_postgres_url(postgres_dsn)]
     )
 
     try:

@@ -33,6 +33,7 @@ from cayu import (
     Task,
     TaskClaimLost,
     TaskCreate,
+    TaskQuery,
     TaskStatus,
     TaskTerminalizationRequest,
     TaskTerminalKind,
@@ -108,13 +109,13 @@ def test_postgres_admission_separates_scheduling_and_queue_lease_clocks(
         live_task = await store.create_task(
             TaskCreate(
                 task_id=f"postgres-admission-live-clock-task-{suffix}",
-                type="verified-work",
+                type=f"verified-work-{suffix}",
                 available_at=datetime(2099, 1, 1, tzinfo=UTC),
                 work_contract=contract.reference(),
             )
         )
         live_worker = f"postgres-admission-live-clock-worker-{suffix}"
-        live_claim = await store.claim_task(live_worker)
+        live_claim = await store.claim_task(live_worker, TaskQuery(type=live_task.type))
         assert live_claim is not None
         live_session_id = f"postgres-admission-live-clock-session-{suffix}"
         live_request = WorkAttemptAdmissionPrepare(
@@ -159,12 +160,14 @@ def test_postgres_admission_separates_scheduling_and_queue_lease_clocks(
         expired_task = await store.create_task(
             TaskCreate(
                 task_id=f"postgres-admission-expired-clock-task-{suffix}",
-                type="verified-work",
+                type=f"verified-work-{suffix}",
                 work_contract=contract.reference(),
             )
         )
         expired_worker = f"postgres-admission-expired-clock-worker-{suffix}"
-        expired_claim = await store.claim_task(expired_worker, lease_seconds=1)
+        expired_claim = await store.claim_task(
+            expired_worker, TaskQuery(type=expired_task.type), lease_seconds=1
+        )
         assert expired_claim is not None
         await asyncio.sleep(1.1)
         recovered = await store.claim_work_attempt_recovery(
@@ -229,12 +232,14 @@ def test_postgres_admission_rejects_prior_lease_after_same_worker_reclaims_task(
         task = await store.create_task(
             TaskCreate(
                 task_id=f"postgres-same-worker-reclaim-task-{suffix}",
-                type="verified-work",
+                type=f"verified-work-{suffix}",
                 work_contract=contract.reference(),
             )
         )
         worker_id = f"postgres-same-worker-reclaim-worker-{suffix}"
-        first_claim = await store.claim_task(worker_id, lease_seconds=300)
+        first_claim = await store.claim_task(
+            worker_id, TaskQuery(type=task.type), lease_seconds=300
+        )
         assert first_claim is not None
         session_id = f"postgres-same-worker-reclaim-session-{suffix}"
         stale_request = WorkAttemptAdmissionPrepare(
@@ -271,8 +276,13 @@ def test_postgres_admission_rejects_prior_lease_after_same_worker_reclaims_task(
             await connection.commit()
         finally:
             await connection.close()
-        assert [reclaimed.id for reclaimed in await store.reclaim_expired()] == [task.id]
-        successor_claim = await store.claim_task(worker_id, lease_seconds=300)
+        assert [
+            reclaimed.id
+            for reclaimed in await store.reclaim_expired(query=TaskQuery(type=task.type))
+        ] == [task.id]
+        successor_claim = await store.claim_task(
+            worker_id, TaskQuery(type=task.type), lease_seconds=300
+        )
         assert successor_claim is not None
         assert successor_claim.lease_expires_at != first_claim.lease_expires_at
 
@@ -301,12 +311,14 @@ def test_postgres_admission_rechecks_queue_lease_after_session_authority_wait(
             task = await store.create_task(
                 TaskCreate(
                     task_id=f"postgres-admission-lock-clock-task-{suffix}",
-                    type="verified-work",
+                    type=f"verified-work-{suffix}",
                     work_contract=contract.reference(),
                 )
             )
             worker_id = f"postgres-admission-lock-clock-worker-{suffix}"
-            claimed = await store.claim_task(worker_id, lease_seconds=300)
+            claimed = await store.claim_task(
+                worker_id, TaskQuery(type=task.type), lease_seconds=300
+            )
             assert claimed is not None
             session_id = f"postgres-admission-lock-clock-session-{suffix}"
             request = WorkAttemptAdmissionPrepare(
@@ -410,7 +422,7 @@ def test_postgres_cancelled_admission_is_quiescent_before_successor_retry(
             task = await store.create_task(
                 TaskCreate(
                     task_id=f"postgres-cancel-task-{suffix}",
-                    type="verified-work",
+                    type=f"verified-work-{suffix}",
                     work_contract=contract.reference(),
                 )
             )
@@ -517,7 +529,7 @@ def test_postgres_work_attempt_admission_continuation_and_recovery(postgres_dsn)
         task = await first_store.create_task(
             TaskCreate(
                 task_id=task_id,
-                type="verified-work",
+                type=f"verified-work-{suffix}",
                 work_contract=contract.reference(),
             )
         )
@@ -906,7 +918,7 @@ def test_postgres_public_first_crash_recovery_needs_no_direct_store_mutation(
             task = await source_tasks.create_task(
                 TaskCreate(
                     task_id=f"postgres-first-crash-task-{suffix}",
-                    type="verified-work",
+                    type=f"verified-work-{suffix}",
                     work_contract=contract.reference(),
                 )
             )
@@ -1047,7 +1059,7 @@ def test_postgres_session_interaction_identity_conflict_is_typed(postgres_dsn: s
             await first_store.create_task(
                 TaskCreate(
                     task_id=f"postgres-interaction-task-{suffix}-{index}",
-                    type="verified-work",
+                    type=f"verified-work-{suffix}",
                     work_contract=contract.reference(),
                 )
             )
@@ -1114,7 +1126,7 @@ def test_postgres_concurrent_admissions_have_one_unreleased_session_owner(
             await first_store.create_task(
                 TaskCreate(
                     task_id=f"postgres-session-owner-task-{suffix}-{index}",
-                    type="verified-work",
+                    type=f"verified-work-{suffix}",
                     work_contract=contract.reference(),
                 )
             )
@@ -1191,7 +1203,7 @@ def test_postgres_ordinary_fence_and_claim_renewal_have_one_lock_order(
         task = await store.create_task(
             TaskCreate(
                 task_id=f"postgres-lock-order-task-{suffix}",
-                type="verified-work",
+                type=f"verified-work-{suffix}",
                 work_contract=contract.reference(),
             )
         )
@@ -1232,7 +1244,7 @@ def test_postgres_ordinary_fence_and_claim_renewal_have_one_lock_order(
             store.heartbeat(
                 task.id,
                 active.claim.worker_id,
-                lease_expires_at=task.lease_expires_at,
+                lease_expires_at=active.claim.lease_expires_at,
             ),
             name="ordinary-heartbeat",
         )

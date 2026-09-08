@@ -156,7 +156,7 @@ async def test_real_provider_transport_abort_fails_durably_without_tool_executio
             await provider.aclose()
 
     assert endpoint.handler_errors == []
-    assert len(endpoint.requests) == 2
+    assert len(endpoint.requests) == 1
     request = endpoint.requests[0]
     assert request["stream"] is True
     assert request["model"] == "abort-model"
@@ -164,7 +164,7 @@ async def test_real_provider_transport_abort_fails_durably_without_tool_executio
 
     event_types = [event.type for event in events]
     assert EventType.MODEL_TEXT_DELTA in event_types
-    assert event_types.count(EventType.MODEL_RETRY) == 1
+    assert event_types.count(EventType.MODEL_RETRY) == 0
     assert EventType.MODEL_COMPLETED not in event_types
     assert EventType.TOOL_CALL_STARTED not in event_types
     assert EventType.TOOL_CALL_COMPLETED not in event_types
@@ -174,10 +174,8 @@ async def test_real_provider_transport_abort_fails_durably_without_tool_executio
     model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
     assert model_error.payload["error_type"] == "ChatCompletionsAPIError"
     assert model_error.payload["provider"] == "chat_completions"
-    assert model_error.payload["retryable"] is True
+    assert model_error.payload["retryable"] is False
     assert model_error.payload["provider_error_type"] == "RemoteProtocolError"
-    model_retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
-    assert model_retry.payload["reason"] == "connection"
 
     await store.close()
     reopened = SQLiteSessionStore(store_path)

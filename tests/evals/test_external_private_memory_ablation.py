@@ -3400,6 +3400,7 @@ def test_trial_budget_binding_rejects_unapproved_request_changes(
 
 
 @pytest.mark.parametrize("crash_before_resume", [False, True])
+@pytest.mark.qualification
 def test_native_compaction_then_resume_precedes_provider_work_and_recovers(
     tmp_path: Path, crash_before_resume: bool
 ):

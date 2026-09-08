@@ -163,7 +163,7 @@ async def _age_reservation(
     reservation_id: str,
     *,
     seconds: int,
-) -> None:
+) -> datetime:
     import psycopg
 
     async with await psycopg.AsyncConnection.connect(dsn) as conn:
@@ -171,11 +171,15 @@ async def _age_reservation(
             await cur.execute(
                 "UPDATE cayu_budget_reservations "
                 "SET updated_at = clock_timestamp() - (%s * INTERVAL '1 second') "
-                "WHERE reservation_id = %s",
+                "WHERE reservation_id = %s RETURNING clock_timestamp()",
                 (seconds, reservation_id),
             )
             assert cur.rowcount == 1
+            row = await cur.fetchone()
+            assert row is not None
+            aged_at = row[0]
         await conn.commit()
+    return aged_at
 
 
 def _new_ledger(dsn: str, **kwargs):
@@ -291,6 +295,9 @@ def test_postgres_budget_ledger_has_crash_safe_settlement_outbox(postgres_dsn) -
             _reservation_budget_limit(max_cost="0.25"),
             clock=clock,
             ttl_seconds=60,
+            expire_reservation=lambda reservation_id: _age_reservation(
+                postgres_dsn, reservation_id, seconds=61
+            ),
         )
 
     _run(
@@ -333,6 +340,9 @@ def test_postgres_budget_ledger_publishes_cross_session_ttl_release(
             _reservation_budget_limit(max_cost="0.25"),
             clock=clock,
             ttl_seconds=60,
+            expire_reservation=lambda reservation_id: _age_reservation(
+                postgres_dsn, reservation_id, seconds=61
+            ),
         )
 
     _run(

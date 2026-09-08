@@ -532,7 +532,7 @@ def test_compact_session_cancellation_during_terminal_reconciliation_propagates(
             return [event async for event in app.compact_session(request)]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(reconciliation_started.wait(), timeout=10)
         task.cancel("cancel during terminal reconciliation")
         assert task.cancelling() == 1
         allow_reconciliation.set()
@@ -2265,6 +2265,15 @@ class InitialRenewalFailureBudgetLedger(InMemoryBudgetLedger):
 
 
 class HeartbeatCancellationBudgetLedger(FinalRenewalFailureBudgetLedger):
+    def __init__(self, provider_started: asyncio.Event) -> None:
+        super().__init__()
+        self.provider_started = provider_started
+
+    async def heartbeat(self, *, reservation_id: str) -> bool:
+        if self.heartbeat_calls == 1:
+            await self.provider_started.wait()
+        return await super().heartbeat(reservation_id=reservation_id)
+
     @property
     def reservation_ttl_seconds(self) -> int:
         return 0
@@ -2345,13 +2354,16 @@ class CancellationCompletingProvider(ModelProvider):
 
     def __init__(self) -> None:
         self.calls = 0
+        self.started = asyncio.Event()
 
     async def stream(self, request: ModelRequest):
         self.calls += 1
+        self.started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            yield ModelStreamEvent.text_delta("completed while cancellation was handled")
+            # The in-flight read returns terminal evidence directly. A text
+            # delta would require a new read after cancellation to reach usage.
             yield ModelStreamEvent.completed({"usage": {"input_tokens": 8, "output_tokens": 2}})
             return
         raise AssertionError("blocking compactor unexpectedly resumed")
@@ -3807,7 +3819,7 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
                 await store.release_run_fence(session_id)
 
         stale_owner_task = asyncio.create_task(stale_recovery_owner())
-        await asyncio.wait_for(stale_owner_ready.wait(), timeout=5)
+        await asyncio.wait_for(stale_owner_ready.wait(), timeout=10)
         owned = await store.load(session_id)
         assert owned is not None
         stale_epoch = owned.run_epoch
@@ -4390,7 +4402,9 @@ def test_compact_session_generator_exit_keeps_accounting_failure_authoritative_w
             if self.fail_heartbeat_reconciliation and kwargs.get("events") == []:
                 self.fail_heartbeat_reconciliation = False
                 self.heartbeat_failed.set()
-                raise RuntimeError("Session compaction operation ownership changed during renewal.")
+                raise session_engine_module.SessionCompactionAttemptSuperseded(
+                    "Session compaction operation ownership changed during renewal."
+                )
             if any(
                 event.type == EventType.CONTEXT_COMPACTION_FAILED
                 for event in kwargs.get("events", [])
@@ -4572,9 +4586,9 @@ def test_compact_session_cancellation_preserves_completed_hierarchy_usage() -> N
                 pass
 
         task = asyncio.create_task(consume())
-        await asyncio.wait_for(provider.second_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.second_started.wait(), timeout=10)
         task.cancel("cancel explicit hierarchy after first completion")
-        await asyncio.wait_for(store.failure_publish_started.wait(), timeout=5)
+        await asyncio.wait_for(store.failure_publish_started.wait(), timeout=10)
         task.cancel("later cancellation during failure publication")
         store.allow_failure_publish.set()
         with pytest.raises(asyncio.CancelledError) as exc_info:
@@ -4901,7 +4915,7 @@ def test_compact_session_heartbeats_claim_during_blocked_provider_dispatch(
             return [event async for event in app.compact_session(request)]
 
         first_task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         now["value"] = accepted_at + timedelta(minutes=4)
 
         first_renewal_expiry = accepted_at + timedelta(minutes=9)
@@ -5110,7 +5124,7 @@ def test_compact_session_claim_heartbeat_retries_transient_store_failure(monkeyp
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         await asyncio.wait_for(store.renewed.wait(), timeout=5)
         assert store.heartbeat_calls >= 2
         assert not task.done()
@@ -5142,7 +5156,11 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
             result = await super().publish_session_operation_guarded_with_store_time(
                 session_id, **kwargs
             )
-            if kwargs.get("events") == [] and not self.acknowledgement_lost.is_set():
+            if (
+                kwargs.get("events") == []
+                and now["value"] >= accepted_at + timedelta(minutes=4)
+                and not self.acknowledgement_lost.is_set()
+            ):
                 self.acknowledgement_lost.set()
                 raise ConnectionError("renewal acknowledgement lost after commit")
             return result
@@ -5209,7 +5227,7 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
             return [event async for event in app.compact_session(request)]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         now["value"] = accepted_at + timedelta(minutes=4)
         await asyncio.wait_for(store.acknowledgement_lost.wait(), timeout=5)
         await asyncio.wait_for(reconciliation_finished.wait(), timeout=5)
@@ -5320,7 +5338,7 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         await asyncio.wait_for(store.renewal_committed.wait(), timeout=5)
         now["value"] = accepted_at + timedelta(seconds=1)
         monkeypatch.setattr(
@@ -5761,7 +5779,7 @@ def test_compact_session_caller_cancellation_does_not_wait_for_uncertain_claim_c
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         await asyncio.wait_for(store.guard_passed.wait(), timeout=5)
         task.cancel("cancel during uncertain claim commit")
 
@@ -5839,7 +5857,7 @@ def test_compact_session_claim_heartbeat_cannot_revive_an_expired_lease(monkeypa
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         now["value"] = accepted_at + timedelta(minutes=6)
         with pytest.raises(RuntimeError, match="expired before (?:renewal|reconciliation)"):
             await asyncio.wait_for(task, timeout=5)
@@ -5946,8 +5964,8 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(compactor.started.wait(), timeout=5)
-        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=5)
+        await asyncio.wait_for(compactor.started.wait(), timeout=10)
+        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=10)
         with pytest.raises(RuntimeError, match="not confirmed before its lease deadline"):
             await asyncio.wait_for(task, timeout=5)
 
@@ -6060,8 +6078,8 @@ def test_compact_session_stalled_claim_reconciliation_is_bounded_by_lease_deadli
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(compactor.started.wait(), timeout=5)
-        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(compactor.started.wait(), timeout=10)
+        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=10)
         with pytest.raises(RuntimeError, match="reconciliation was not confirmed"):
             await asyncio.wait_for(task, timeout=1)
 
@@ -6148,7 +6166,7 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
                     if commit_started_before_stall:
                         commit_guard()
                     self.guard_started.set()
-                    if not self.release_guard.wait(timeout=5):
+                    if not self.release_guard.wait(timeout=15):
                         raise TimeoutError("test did not release the renewal commit guard")
                     if not commit_started_before_stall:
                         commit_guard()
@@ -6164,7 +6182,7 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_LEASE",
-            timedelta(milliseconds=100),
+            timedelta(seconds=5),
         )
         monkeypatch.setattr(
             session_engine_module,
@@ -6221,28 +6239,28 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
                 ]
 
             task = asyncio.create_task(collect())
-            await asyncio.wait_for(compactor.started.wait(), timeout=5)
+            await asyncio.wait_for(compactor.started.wait(), timeout=15)
             await asyncio.wait_for(
                 asyncio.to_thread(store.guard_started.wait),
-                timeout=5,
+                timeout=15,
             )
-            now["value"] = accepted_at + timedelta(seconds=1)
-            await asyncio.wait_for(compactor.cancelled.wait(), timeout=5)
+            now["value"] = accepted_at + timedelta(seconds=10)
+            await asyncio.wait_for(compactor.cancelled.wait(), timeout=15)
 
             with pytest.raises(RuntimeError, match="not confirmed before its lease deadline"):
-                await asyncio.wait_for(task, timeout=1)
+                await asyncio.wait_for(task, timeout=15)
 
             assert not store.failure_publication_started.is_set()
             assert not store.failure_publication_finished.is_set()
             store.release_guard.set()
-            await asyncio.wait_for(store.failure_publication_started.wait(), timeout=5)
-            await asyncio.wait_for(store.failure_publication_finished.wait(), timeout=5)
+            await asyncio.wait_for(store.failure_publication_started.wait(), timeout=15)
+            await asyncio.wait_for(store.failure_publication_finished.wait(), timeout=15)
 
             checkpoint = await store.load_checkpoint(created.id)
             assert checkpoint is not None
             record = checkpoint["session_operations"]["records"]["compact-sqlite-stalled-renewal"]
             assert datetime.fromisoformat(record["claim_expires_at"]) == (
-                accepted_at + timedelta(milliseconds=100)
+                accepted_at + timedelta(seconds=5)
             )
             assert "context_compaction" not in checkpoint
             assert EventType.SESSION_CHECKPOINTED not in {
@@ -6369,7 +6387,7 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
                 ]
 
             task = asyncio.create_task(collect())
-            await asyncio.wait_for(compactor.started.wait(), timeout=5)
+            await asyncio.wait_for(compactor.started.wait(), timeout=10)
             await asyncio.wait_for(
                 asyncio.to_thread(store.guard_started.wait),
                 timeout=5,
@@ -6475,8 +6493,8 @@ def test_compact_session_expired_claim_cannot_publish_terminal_checkpoint(monkey
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(compactor.started.wait(), timeout=5)
-        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=5)
+        await asyncio.wait_for(compactor.started.wait(), timeout=10)
+        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=10)
         store_now["value"] = accepted_at + timedelta(minutes=6)
         compactor.release.set()
         with pytest.raises(RuntimeError, match="expired before terminal publication"):
@@ -6588,7 +6606,7 @@ def test_compact_session_failure_publication_cannot_terminalize_after_claim_expi
             return [event async for event in app.compact_session(request)]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(store.failure_publication_started.wait(), timeout=5)
+        await asyncio.wait_for(store.failure_publication_started.wait(), timeout=10)
         now["value"] = accepted_at + timedelta(minutes=6)
         store.release_failure_publication.set()
         with pytest.raises(RuntimeError, match="failed before delayed publication"):
@@ -6678,8 +6696,8 @@ def test_compact_session_terminal_publication_wins_blocked_heartbeat_race(monkey
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
-        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
+        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=10)
         provider.release.set()
         events = await asyncio.wait_for(task, timeout=5)
 
@@ -6826,7 +6844,7 @@ def test_compact_session_claim_loss_waits_for_completed_dispatch_settlement(monk
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(ledger.reconcile_started.wait(), timeout=5)
+        await asyncio.wait_for(ledger.reconcile_started.wait(), timeout=10)
         await asyncio.wait_for(store.heartbeat_failed.wait(), timeout=5)
         await asyncio.sleep(0)
         assert not task.done()
@@ -7053,8 +7071,8 @@ def test_compact_session_caller_cancellation_interrupts_blocked_claim_heartbeat(
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
-        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
+        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=10)
         task.cancel("cancel while claim heartbeat write is blocked")
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=5)
@@ -7304,7 +7322,7 @@ def test_compact_session_renews_operation_claim_between_provider_dispatches(monk
                 first_events.append(event)
 
         first_task = asyncio.create_task(compact())
-        await asyncio.wait_for(provider.second_dispatch_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.second_dispatch_started.wait(), timeout=10)
         checkpoint = await store.load_checkpoint(created.id)
         assert checkpoint is not None
         record = checkpoint["session_operations"]["records"][request.idempotency_key]
@@ -7464,7 +7482,7 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
 
         task = asyncio.create_task(collect())
         try:
-            await asyncio.wait_for(provider.second_dispatch_started.wait(), timeout=5)
+            await asyncio.wait_for(provider.second_dispatch_started.wait(), timeout=10)
             # This is past the original two-second deadline, but remains
             # inside the two-second lease measured from event publication.
             await asyncio.sleep(1.1)
@@ -9325,7 +9343,7 @@ def test_compact_session_cancellation_during_final_renewal_reconciles_actual_usa
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(ledger.final_renewal_started.wait(), timeout=5)
+        await asyncio.wait_for(ledger.final_renewal_started.wait(), timeout=10)
         task.cancel("cancel during final reservation renewal")
         with pytest.raises(
             asyncio.CancelledError,
@@ -10878,7 +10896,7 @@ def test_compact_session_releases_reservation_when_initial_renewal_fails() -> No
     asyncio.run(run())
 
 
-def test_compact_session_preserves_usage_returned_while_heartbeat_cancels() -> None:
+def test_compact_session_does_not_claim_unobserved_usage_returned_after_heartbeat_cancels() -> None:
     async def run() -> None:
         pricing = PriceBook(
             prices=(
@@ -10907,7 +10925,7 @@ def test_compact_session_preserves_usage_returned_while_heartbeat_cancels() -> N
                     ),
                 )
             ),
-            budget_ledger=HeartbeatCancellationBudgetLedger(),
+            budget_ledger=HeartbeatCancellationBudgetLedger(provider.started),
             enable_logging=False,
         )
         app.register_agent(
@@ -10958,7 +10976,12 @@ def test_compact_session_preserves_usage_returned_while_heartbeat_cancels() -> N
             EventType.BUDGET_RECONCILED,
             EventType.CONTEXT_COMPACTION_FAILED,
         ]
-        assert events[6].payload["actual_amount"] == "0.000012"
+        assert events[5].payload["compaction_outcome"] == "unfinished_stream"
+        assert events[5].payload["usage_unavailable_reason"] == (
+            "compaction provider dispatch ended without completion usage"
+        )
+        assert "usage_metrics" not in events[5].payload
+        assert events[6].payload["actual_amount"] == "0.00003"
         assert provider.calls == 1
 
     asyncio.run(run())

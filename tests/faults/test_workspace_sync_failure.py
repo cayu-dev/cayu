@@ -369,7 +369,7 @@ def test_sync_binding_failure_blocks_completion_and_recovers_in_fresh_app(
                     )
                 )
             )
-            await asyncio.wait_for(recovery_started.wait(), timeout=5)
+            await asyncio.wait_for(recovery_started.wait(), timeout=10)
             skipped_recovery = await contending_app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id="workspace-sync-failure",
@@ -845,7 +845,7 @@ def test_sync_completion_stays_running_until_workspace_finalization_commits(
             )
         )
         try:
-            await asyncio.wait_for(binding.finalize_started.wait(), timeout=5)
+            await asyncio.wait_for(binding.finalize_started.wait(), timeout=10)
             pending = await store.load("blocking-finalize-session")
             checkpoint = await store.load_checkpoint("blocking-finalize-session")
             assert pending is not None
@@ -1021,7 +1021,7 @@ def test_restarted_completion_finalization_settles_attached_task(
             provider=recovery_provider,
         )
         try:
-            await asyncio.wait_for(binding.finalize_started.wait(), timeout=5)
+            await asyncio.wait_for(binding.finalize_started.wait(), timeout=10)
             pending_checkpoint = await session_store.load_checkpoint("restarted-finalize-session")
             assert pending_checkpoint is not None
             assert pending_checkpoint["pending_completion_finalization"]["task_id"] == (

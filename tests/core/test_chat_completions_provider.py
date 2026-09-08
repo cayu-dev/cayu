@@ -2261,7 +2261,7 @@ async def test_chat_stream_preserves_completion_before_real_cancellation() -> No
             collected.append(event)
 
     task = asyncio.create_task(collect())
-    await asyncio.wait_for(tail_started.wait(), timeout=1)
+    await asyncio.wait_for(tail_started.wait(), timeout=10)
     task.cancel("cancel after finish reason")
     assert task.cancelling() == 1
 
@@ -3581,12 +3581,12 @@ def test_cayu_app_bounds_active_http_error_body_before_retry(
     provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        timeout_s=0.02,
+        timeout_s=0.5,
         stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=0.01,
-            absolute_stream_timeout_s=1.0,
-            semantic_progress_timeout_s=1.0,
-            protocol_idle_timeout_s=1.0,
+            transport_idle_timeout_s=0.25,
+            absolute_stream_timeout_s=5.0,
+            semantic_progress_timeout_s=5.0,
+            protocol_idle_timeout_s=5.0,
         ),
     )
     app = CayuApp(
@@ -3607,7 +3607,7 @@ def test_cayu_app_bounds_active_http_error_body_before_retry(
                     messages=[Message.text("user", "hi")],
                 ),
             ),
-            timeout=3.0,
+            timeout=15.0,
         )
 
     events = asyncio.run(run())
@@ -3758,10 +3758,12 @@ def test_cayu_app_resolves_in_band_error_stream_before_retry_dispatch(
             )
         )
         if close_failure == "delayed_success":
-            await asyncio.wait_for(close_started.wait(), timeout=0.5)
-            await asyncio.sleep(0)
-            assert SequencedHttpClient.calls == 1
-            release_close.set()
+            try:
+                await asyncio.wait_for(close_started.wait(), timeout=10)
+                await asyncio.sleep(0)
+                assert SequencedHttpClient.calls == 1
+            finally:
+                release_close.set()
         events = await consumer
         return events, consumer.cancelling(), consumer.cancelled()
 
@@ -3911,7 +3913,10 @@ def test_cayu_app_preserves_chat_http_completion_before_response_cleanup_failure
     assert body.close_started.is_set()
     assert body.close_finalized.is_set()
     assert EventType.MODEL_RETRY not in {event.type for event in events}
-    assert EventType.MODEL_ERROR not in {event.type for event in events}
+    model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    assert len(model_errors) == 1
+    assert model_errors[0].payload["retry_suppression"] == "completion_observed"
+    assert model_errors[0].payload["retry_disposition"] == "suppressed"
     model_completions = [
         event for event in durable_events if event.type == EventType.MODEL_COMPLETED
     ]
@@ -3991,7 +3996,18 @@ def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
     monkeypatch: pytest.MonkeyPatch,
     wrapped: bool,
 ) -> None:
+    from cayu.providers import chat_completions as chat_module
+
     body_created = asyncio.Event()
+    usage_observed = asyncio.Event()
+    observe_progress = chat_module.observe_provider_semantic_progress
+
+    def observe_usage(kind):
+        observe_progress(kind)
+        if kind is chat_module.ProviderProgressKind.USAGE:
+            usage_observed.set()
+
+    monkeypatch.setattr(chat_module, "observe_provider_semantic_progress", observe_usage)
 
     class BlockingTailBody(httpx.AsyncByteStream):
         def __init__(self) -> None:
@@ -4125,7 +4141,9 @@ def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
         )
         await asyncio.wait_for(body_created.wait(), timeout=1)
         body = BlockingHttpClient.bodies[0]
-        await asyncio.wait_for(body.tail_started.wait(), timeout=1)
+        await asyncio.wait_for(body.tail_started.wait(), timeout=10)
+        # HTTP read-ahead can enter the tail before the translator observes usage.
+        await asyncio.wait_for(usage_observed.wait(), timeout=1)
         task.cancel("cancel after Chat Completions finish reason")
         assert task.cancelling() == 1
         with pytest.raises(

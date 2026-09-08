@@ -1,17 +1,21 @@
 version: 1
 steps:
   - name: Verify immutable release state
+    groups: build
     publishing: true
     run: >-
       uv run --no-project --offline --no-python-downloads --python 3.11
       python scripts/verify_release_state.py
       --notes docs/release-notes.md
   - name: Check deterministic model catalog
+    groups: build
     run: uv run python -m maintenance.model_catalog.check --skip-staleness
   - name: Enforce freshness for release artifacts
+    groups: build
     publishing: true
     run: uv run python -m maintenance.model_catalog.check
   - name: Check tag matches project version
+    groups: build
     publishing: true
     run: |
       uv run --group nightly python - <<'PY'
@@ -35,24 +39,32 @@ steps:
           )
       PY
   - name: Build first release archive
+    groups: build
     run: uv build --out-dir dist/first
   - name: Build second release archive
+    groups: build
     run: uv build --out-dir dist/second
   - name: Check reproducible archives
+    groups: build
     run: |
       cmp dist/first/*.tar.gz dist/second/*.tar.gz
       cmp dist/first/*.whl dist/second/*.whl
   - name: Check release archive contents
+    groups: build
     run: uv run python scripts/check_release_artifacts.py dist/first/*
   - name: Create base release environment
+    groups: core, server, dashboard, authoring, coding, docker, service
     run: uv venv --python 3.11 .release-venv
   - name: Install built wheel
+    groups: core, server, dashboard, authoring, coding, docker, service
     run: uv pip install --python .release-venv/bin/python dist/first/*.whl
   - name: Smoke-test workflow eval surface from the built wheel
+    groups: core
     run: |
       unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
       .release-venv/bin/python scripts/smoke_built_wheel_workflow_eval.py
   - name: Smoke-test artifact settlement surface from the built wheel
+    groups: core
     run: |
       .release-venv/bin/python - <<'PY'
       from datetime import UTC, datetime
@@ -106,8 +118,10 @@ steps:
       assert late.observation is ArtifactWriteSettlementObservation.LATE
       PY
   - name: Smoke-test diagnostic support bundles from the built wheel
+    groups: core
     run: .release-venv/bin/python scripts/smoke_built_wheel_doctor.py
   - name: Check every packaged guide from the built wheel
+    groups: core
     run: |
       .release-venv/bin/python - <<'PY'
       import subprocess
@@ -117,8 +131,10 @@ steps:
           subprocess.run([".release-venv/bin/cayu", "guide", topic], check=True)
       PY
   - name: Create all-extras release environment
+    groups: core
     run: uv venv --python 3.11 .release-all-venv
   - name: Install and import the built wheel with all runtime extras
+    groups: core
     run: |
       wheel="$(realpath dist/first/*.whl)"
       uv pip install --python .release-all-venv/bin/python "cayu[all] @ file://${wheel}"
@@ -134,6 +150,7 @@ steps:
       assert MicrosandboxRunner is not None
       PY
   - name: Check built-wheel Cayu Cloud CLI contract
+    groups: core
     run: |
       .release-venv/bin/cayu cloud --help >/dev/null
       if output="$(.release-venv/bin/cayu cloud env set --secret 2>&1)"; then
@@ -156,25 +173,34 @@ steps:
       }
       PY
   - name: Create server release environment
+    groups: server, dashboard, service
     run: uv venv --python 3.11 .release-server-venv
   - name: Install built wheel with server extra
+    groups: server, dashboard, service
     run: |
       for wheel_path in dist/first/*.whl; do
         uv pip install --python .release-server-venv/bin/python "${wheel_path}[server,browser]"
       done
   - name: Install release Playwright Chromium
+    groups: server, dashboard
     run: .release-server-venv/bin/playwright install --with-deps chromium
   - name: Smoke-test protected cayu serve from the built wheel
+    groups: server
     run: .release-server-venv/bin/python scripts/smoke_built_wheel_serve.py
   - name: Verify the installed-wheel dashboard-to-local eval journey
+    groups: server
     run: |
       unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
       unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
       .release-server-venv/bin/python examples/dashboard_behavior_live.py
-  - name: Verify editable dashboard source from installed release artifacts
+  - name: Install built source distribution
+    groups: core, dashboard
     run: |
       uv venv --python 3.11 .release-sdist-venv
       uv pip install --python .release-sdist-venv/bin/python dist/first/*.tar.gz
+  - name: Verify editable dashboard source from installed release artifacts
+    groups: dashboard
+    run: |
       proof_root="$(mktemp -d "$RUNNER_TEMP/dashboard-source.XXXXXX")"
       .release-venv/bin/cayu dashboard eject "$proof_root/wheel-dashboard"
       .release-sdist-venv/bin/cayu dashboard eject "$proof_root/sdist-dashboard"
@@ -193,6 +219,7 @@ steps:
       "$GITHUB_WORKSPACE/.release-server-venv/bin/python" \
         "$GITHUB_WORKSPACE/scripts/smoke_ejected_dashboard.py" dist
   - name: Check bundled model catalog and price book from the installed wheel
+    groups: core
     run: |
       .release-venv/bin/python - <<'PY'
       import cayu
@@ -214,8 +241,10 @@ steps:
               ) == model
       PY
   - name: Verify installed wheel and source-distribution sidecar exports
+    groups: core
     run: bash scripts/verify_release_sidecar_artifacts.sh
   - name: Check built-wheel authoring contract
+    groups: authoring
     run: |
       uv pip install --python .release-venv/bin/python pytest
       .release-venv/bin/python -m cayu version
@@ -324,6 +353,10 @@ steps:
       check = json.loads(Path("completed-check.json").read_text())
       assert check["diagnostics"] == []
       PY
+  - name: Check built-wheel coding authoring contract
+    groups: coding
+    run: |
+      uv pip install --python .release-venv/bin/python pytest
       coding_root="$(mktemp -d "$RUNNER_TEMP/coding.XXXXXX")"
       "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-coding \
         --preset coding --dir "$coding_root"
@@ -385,7 +418,9 @@ steps:
       "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
       "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run >/dev/null
   - name: Check built-wheel generated Docker coding contract
+    groups: docker
     run: |
+      uv pip install --python .release-venv/bin/python pytest
       wheel="$(realpath dist/first/*.whl)"
       live_test_root="$(mktemp -d "$RUNNER_TEMP/docker-live.XXXXXX")"
       cp tests/cli/test_scaffold_docker_live.py "$live_test_root/"
@@ -397,6 +432,7 @@ steps:
         "$GITHUB_WORKSPACE/.release-venv/bin/python" \
         -m pytest -q test_scaffold_docker_live.py
   - name: Check built-wheel secure public-service contract
+    groups: service
     run: |
       uv pip install --python .release-server-venv/bin/python pytest 'ruff>=0.15.15,<0.16'
       service_root="$(mktemp -d "$RUNNER_TEMP/service.XXXXXX")"
@@ -430,8 +466,10 @@ steps:
       "$GITHUB_WORKSPACE/.release-server-venv/bin/ruff" check .
       "$GITHUB_WORKSPACE/.release-server-venv/bin/ruff" format --check .
   - name: Check optional console command
+    groups: core
     run: .release-venv/bin/cayu console --help
   - name: Check optional console dependency guidance
+    groups: core
     run: |
       if output="$(.release-venv/bin/cayu console cayu.runtime.app:CayuApp 2>&1)"; then
         echo "console unexpectedly started without the console extra"
@@ -439,6 +477,7 @@ steps:
       fi
       test "$output" = 'error: Cayu console requires IPython. Install it with: pip install "cayu[console]"'
   - name: Check installed CLI version
+    groups: core
     run: |
       expected_version="$(.release-venv/bin/python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
       test "$(.release-venv/bin/cayu version)" = "cayu ${expected_version}"

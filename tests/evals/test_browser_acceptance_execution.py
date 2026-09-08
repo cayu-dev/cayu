@@ -854,7 +854,10 @@ def _block_process_scenario_until_killed(
     del upstream_routes, hosts, case_document, seccomp_value, scenario_value, session_id
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     root = Path(root_value)
-    root.joinpath("blocked-child.pid").write_text(str(os.getpid()), encoding="ascii")
+    pid_path = root / "blocked-child.pid"
+    staged_pid = pid_path.with_suffix(".tmp")
+    staged_pid.write_text(str(os.getpid()), encoding="ascii")
+    staged_pid.replace(pid_path)
     while True:
         time.sleep(1)
 
@@ -1983,7 +1986,7 @@ def test_cayu_owned_fault_executor_quiesces_child_before_redelivering_cancellati
         executor._process_worker = _block_process_scenario_until_killed
         task = asyncio.create_task(executor(case, 1, 1, 30))
         pid_path = executor._root / f"{case.case_id}-1-1" / "blocked-child.pid"
-        for _ in range(500):
+        for _ in range(2000):
             if pid_path.is_file():
                 break
             await asyncio.sleep(0.01)
@@ -2679,7 +2682,7 @@ def test_browser_acceptance_serializes_live_owner_and_journal_recovery(
                 receipt_directory=receipt_directory,
             )
         )
-        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.wait_for(entered.wait(), timeout=10)
         second = asyncio.create_task(
             run_browser_acceptance(
                 plan,

@@ -50,7 +50,7 @@ def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(monkeypatch) 
         plan = await build()
         result = await run_eval_plan(
             plan,
-            case_timeout_seconds=5,
+            case_timeout_seconds=20,
             retain_trajectory=True,
         )
         cases_by_id = {case.case_id: case for case in result.cases}

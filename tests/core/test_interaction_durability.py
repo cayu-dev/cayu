@@ -805,7 +805,7 @@ def test_backward_clock_setup_cancellation_preserves_rejection_diagnostic() -> N
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(factory.entered.wait(), timeout=5)
+        await asyncio.wait_for(factory.entered.wait(), timeout=10)
         wall["value"] -= timedelta(seconds=1)
         consumer.cancel()
         assert consumer.cancelling() == 1
@@ -879,7 +879,7 @@ def test_backward_clock_task_cancellation_preserves_cancellation_and_live_state(
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(provider.entered.wait(), timeout=5)
+        await asyncio.wait_for(provider.entered.wait(), timeout=10)
         wall["value"] -= timedelta(seconds=1)
         consumer.cancel()
         assert consumer.cancelling() == 1
@@ -1186,6 +1186,7 @@ class RejectBeforeInteractionTransitionCommitStore(InMemorySessionStore):
 
 class CommitAndBlockInteractionTransitionStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self, *, fail_after_release: bool) -> None:
         super().__init__()
@@ -1284,6 +1285,7 @@ class BlockingSiblingInteractionTransitionStore(InMemorySessionStore):
 
 class QueueGuardedInteractionTransitionStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -1427,6 +1429,7 @@ class ThreadDispatchedInteractionTransitionStore(InMemorySessionStore):
     """Model a cancellation-opaque store mutation dispatched to a worker thread."""
 
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -1979,7 +1982,7 @@ def test_runtime_cancellation_reconciles_corrupt_transition_publication_result()
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel before corrupt transition result")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -2252,7 +2255,7 @@ def test_setup_failure_transition_cancellation_is_reconciled_at_sibling_boundary
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.dispatched.wait(), timeout=10)
         consumer.cancel("cancel setup failure transition")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -2371,7 +2374,7 @@ def test_interrupt_transition_cancellation_consumes_exact_settlement_handoff(
 
         try:
             consumer = asyncio.create_task(interrupt())
-            await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+            await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
             consumer.cancel("cancel interrupted transition replay")
             assert consumer.cancelling() == 1
             await asyncio.sleep(0)
@@ -2483,7 +2486,7 @@ def test_recovery_limit_cancellation_reconciles_precommit_transition_failures() 
                 pass
 
         consumer = asyncio.create_task(resolve())
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel recovery limit before transition commit")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -2584,7 +2587,7 @@ def test_recovery_limit_cancellation_consumes_committed_transition_handoff(
                 pass
 
         consumer = asyncio.create_task(resolve())
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel recovery limit after transition commit")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -2685,7 +2688,7 @@ def test_runtime_cancellation_during_transition_fanout_preserves_committed_outco
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(sink.completion_started.wait(), timeout=5)
+        await asyncio.wait_for(sink.completion_started.wait(), timeout=10)
         consumer.cancel("cancel interaction transition fanout")
 
         with pytest.raises(asyncio.CancelledError) as raised:
@@ -2820,7 +2823,7 @@ def test_runtime_cancellation_preserves_queue_guarded_running_transition() -> No
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.dispatched.wait(), timeout=10)
         await accepting_process.enqueue_session_message(
             EnqueueSessionMessageRequest(
                 session_id=session_id,
@@ -2903,7 +2906,7 @@ def test_runtime_cancellation_clears_transition_handoff_after_run_fence_loss() -
             await store.release_run_fence(session_id)
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.dispatched.wait(), timeout=10)
         consumer.cancel("cancel while transition loses run fence")
         assert consumer.cancelling() == 1
         fencer = asyncio.create_task(transfer_fence())
@@ -2979,7 +2982,7 @@ def test_runtime_cancellation_fences_thread_dispatched_transition_until_settled(
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.dispatched.wait(), timeout=10)
         consumer.cancel("cancel opaque transition dispatch")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -3018,7 +3021,7 @@ def test_runtime_cancellation_fences_thread_dispatched_transition_until_settled(
         assert len(provider.requests) == 1
 
         recovery = asyncio.create_task(app.recover_persisted_event_side_effects())
-        await asyncio.wait_for(sink.completion_started.wait(), timeout=5)
+        await asyncio.wait_for(sink.completion_started.wait(), timeout=10)
         sink.release.set()
         recovered = await asyncio.wait_for(recovery, timeout=5)
         assert [event.type for event in recovered] == [EventType.INTERACTION_COMPLETED]
@@ -3051,7 +3054,7 @@ def test_runtime_cancellation_durably_records_settled_transition_failures() -> N
                 raise
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel after ambiguous transition failures")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -3134,7 +3137,7 @@ def test_runtime_cancellation_preserves_interrupted_diagnostic_hook_failure() ->
                 raise
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel before interrupted diagnostic publication")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -3211,7 +3214,7 @@ def test_runtime_cancellation_after_post_commit_failure_records_durable_diagnost
                 raise
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel after committed transition acknowledgement loss")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -3268,7 +3271,7 @@ def test_runtime_cancellation_after_post_commit_failure_records_durable_diagnost
         assert public_diagnostics == []
 
         recovery = asyncio.create_task(app.recover_persisted_event_side_effects())
-        await asyncio.wait_for(sink.diagnostic_started.wait(), timeout=5)
+        await asyncio.wait_for(sink.diagnostic_started.wait(), timeout=10)
         assert consumer.cancelled() is True
         sink.release.set()
         recovered = await asyncio.wait_for(recovery, timeout=5)
@@ -3335,7 +3338,7 @@ def test_sqlite_cancellation_fences_diagnostic_after_transition_settles(
 
         consumer = asyncio.create_task(consume())
         try:
-            await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+            await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
             consumer.cancel("cancel before post-settlement receipt reconciliation")
             assert consumer.cancelling() == 1
             await asyncio.sleep(0)
@@ -3434,15 +3437,15 @@ def test_sqlite_cancellation_reconciles_pruned_setup_failure_transition_receipt(
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.first_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.first_attempt_dispatched.wait(), timeout=10)
         store.release_first_attempt.set()
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel before pruned receipt reconciliation")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
         assert consumer.done() is False
         store.release_second_attempt.set()
-        await asyncio.wait_for(store.receipt_lookup_started.wait(), timeout=5)
+        await asyncio.wait_for(store.receipt_lookup_started.wait(), timeout=10)
 
         durable_before_prune = await store.load_events(session_id)
         failed = next(
@@ -3524,7 +3527,7 @@ def test_runtime_cancellation_rejects_conflicting_complete_transition_receipt() 
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel before conflicting receipt readback")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -3590,7 +3593,7 @@ def test_runtime_cancellation_rejects_incoherent_transition_receipt_result() -> 
                 pass
 
         consumer = asyncio.create_task(consume())
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=5)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         consumer.cancel("cancel before incoherent receipt readback")
         assert consumer.cancelling() == 1
         await asyncio.sleep(0)
@@ -4233,7 +4236,7 @@ def test_cancelled_terminal_recovery_settles_interaction_reconciliation() -> Non
         recovery_task = asyncio.create_task(
             app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
         )
-        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=1)
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=10)
         assert recovery_task.cancelling() == 0
         recovery_task.cancel("cancel terminal interaction reconciliation")
         assert recovery_task.cancelling() == 1

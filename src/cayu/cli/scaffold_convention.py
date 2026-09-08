@@ -234,7 +234,10 @@ _SETTINGS_PY = '''"""Validated source-controlled defaults and environment overri
 import os
 from pathlib import Path
 
-from cayu import PublicAuthorityAliasCodec, public_authority_alias_codec_from_environment
+from cayu import (
+    PublicAuthorityAliasCodec,
+    public_authority_alias_codec_from_environment,
+)
 
 _PROJECT_ROOT = Path(__file__).parents[1]
 _LOCAL_MEMORY_KEY = _PROJECT_ROOT / "data" / "memory-evidence.key"
@@ -278,14 +281,13 @@ def configured_model() -> str:
     selected = configured_provider_choice()
     if selected == "openrouter":
         return "openrouter-model-unconfigured"
-    return (
-        "provider-model-unconfigured" if selected is None else _DEFAULT_MODELS[selected]
-    )
+    if selected is None:
+        return "provider-model-unconfigured"
+    return _DEFAULT_MODELS[selected]
 
 
 def configured_model_override() -> str:
     return (os.environ.get("CAYU_MODEL") or "").strip()
-
 
 
 def configured_openai_api_key() -> str | None:
@@ -314,9 +316,8 @@ def configured_openrouter_router_metadata_enabled() -> bool:
         return False
     if value.lower() == "enabled":
         return True
-    raise RuntimeError(
-        "OPENROUTER_ROUTER_METADATA must be 'enabled' or 'disabled' when set"
-    )
+    message = "OPENROUTER_ROUTER_METADATA must be 'enabled' or 'disabled' when set"
+    raise RuntimeError(message)
 
 
 def configured_database_url() -> str | None:
@@ -624,6 +625,7 @@ from configuration.settings import (
     configured_memory_evidence_key,
 )
 
+
 @dataclass(frozen=True, slots=True)
 class RuntimeOptions:
     config: CayuConfig
@@ -641,7 +643,6 @@ def build_runtime_options() -> RuntimeOptions:
         knowledge_review_namespace=__KNOWLEDGE_NAMESPACE_LITERAL__,
         request_footprint=_request_footprint_config(),
     )
-
 
 
 def _request_footprint_config() -> RequestFootprintConfig:

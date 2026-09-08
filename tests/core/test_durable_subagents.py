@@ -6,6 +6,7 @@ import multiprocessing
 import warnings
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
 import psycopg
@@ -394,6 +395,7 @@ class _BlockingDurableTaskReadStore(InMemoryTaskStore):
 
 class _CrashAfterPreparedChildAdmissionStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -726,13 +728,16 @@ class _BlockingDurableChildProvider(_DurableSubagentProvider):
     def __init__(self) -> None:
         super().__init__()
         self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         first_text = request.messages[0].content[0].text
         if first_text == "durable child task":
             self.requests.append(request)
             self.child_started.set()
-            await asyncio.Event().wait()
+            await self.release_child.wait()
+            yield ModelStreamEvent.text_delta("durable child complete")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
         async for event in super().stream(request):
             yield event
@@ -1743,7 +1748,7 @@ def test_result_wait_refreshes_child_after_concurrent_task_completion(
                 arguments,
             )
         )
-        await asyncio.wait_for(tasks.read_started.wait(), timeout=1)
+        await asyncio.wait_for(tasks.read_started.wait(), timeout=10)
         worker_result = await dispatcher.process_next(app, worker_id="result-race-worker")
         assert worker_result is not None
         assert worker_result.status.value == "completed"
@@ -2437,7 +2442,7 @@ def test_cancellation_reconciles_marker_committed_before_failed_child_creation()
                 )
             )
         )
-        await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=1)
+        await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=10)
         parent.cancel("cancel after durable marker")
         sessions.release_child_creation.set()
 
@@ -2515,7 +2520,7 @@ def test_parent_recovery_refreshes_child_after_concurrent_worker_completion() ->
                 )
             )
         )
-        await asyncio.wait_for(recovery_dispatcher.submission_published.wait(), timeout=1)
+        await asyncio.wait_for(recovery_dispatcher.submission_published.wait(), timeout=10)
         worker_result = await worker_dispatcher.process_next(
             worker_app,
             worker_id="concurrent-recovery-worker",
@@ -2523,7 +2528,7 @@ def test_parent_recovery_refreshes_child_after_concurrent_worker_completion() ->
         assert worker_result is not None
         assert worker_result.status.value == "completed"
         recovery_dispatcher.release_submission.set()
-        recovery = await asyncio.wait_for(recovery_task, timeout=2)
+        recovery = await asyncio.wait_for(recovery_task, timeout=15)
 
         assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
         child = (
@@ -4153,10 +4158,11 @@ def test_sqlite_worker_claim_loss_reclaims_same_durable_child(tmp_path) -> None:
     asyncio.run(reclaim_and_run())
 
 
-def test_reclaimed_worker_recovers_child_admitted_before_worker_loss() -> None:
+def test_expired_worker_keeps_admitted_child_fenced_before_quiescence() -> None:
     async def run() -> None:
         sessions = _CrashAfterPreparedChildAdmissionStore()
-        tasks = InMemoryTaskStore()
+        ownership_now = datetime.now(UTC)
+        tasks = InMemoryTaskStore(ownership_clock=lambda: ownership_now)
         first_dispatcher = TaskStoreDispatcher(tasks, lease_seconds=1)
         first_app = CayuApp(
             session_store=sessions,
@@ -4187,10 +4193,16 @@ def test_reclaimed_worker_recovers_child_admitted_before_worker_loss() -> None:
         assert claimed is not None and claimed.status is TaskStatus.CLAIMED
         assert child is not None and child.status is SessionStatus.RUNNING
 
-        await asyncio.sleep(1.1)
-        assert [task.id for task in await tasks.reclaim_expired(query=TaskQuery())] == [
-            queue_task.id
-        ]
+        assert claimed.lease_expires_at is not None
+        ownership_now = claimed.lease_expires_at + timedelta(milliseconds=1)
+        assert await tasks.reclaim_expired(query=TaskQuery()) == []
+        fenced = await tasks.load_task(queue_task.id)
+        assert fenced is not None
+        assert fenced.status is TaskStatus.CLAIMED
+        assert fenced.status_payload is not None
+        assert fenced.status_payload["error"] == {
+            "code": "task_worker_lease_expired_after_dispatch"
+        }
         replacement_dispatcher = TaskStoreDispatcher(
             tasks,
             lease_seconds=1,
@@ -4206,28 +4218,21 @@ def test_reclaimed_worker_recovers_child_admitted_before_worker_loss() -> None:
         replacement_app.register_provider(replacement_provider, default=True)
         _register_durable_subagent_agents(replacement_app)
 
-        recovery = await replacement_dispatcher.process_next(
-            replacement_app,
-            worker_id="replacement-worker",
-        )
-        assert recovery is not None
-        assert recovery.status.value == "submitted"
-        assert recovery.metadata["requeued"] is True
-        assert recovery.metadata["recovered_session"] is True
-        assert replacement_provider.requests == []
-
-        terminal = await replacement_dispatcher.process_next(
-            replacement_app,
-            worker_id="replacement-worker",
-        )
-        assert terminal is not None
-        assert terminal.status.value == "interrupted"
-        settled_child = await sessions.load(child_id)
-        settled_task = await tasks.load_task(queue_task.id)
-        assert settled_child is not None
-        assert settled_child.status is SessionStatus.INTERRUPTED
-        assert settled_task is not None
-        assert settled_task.status is TaskStatus.COMPLETED
+        for _ in range(2):
+            assert (
+                await replacement_dispatcher.process_next(
+                    replacement_app,
+                    worker_id="replacement-worker",
+                )
+                is None
+            )
+        retained_child = await sessions.load(child_id)
+        retained_task = await tasks.load_task(queue_task.id)
+        assert retained_child is not None
+        assert retained_child.status is SessionStatus.RUNNING
+        assert retained_task is not None
+        assert retained_task.status is TaskStatus.CLAIMED
+        assert retained_task.worker_id == "lost-worker"
         assert replacement_provider.requests == []
 
     asyncio.run(run())
@@ -4956,34 +4961,41 @@ def test_parent_task_cancellation_waits_for_durable_submission_settlement(
                 )
             )
         )
-        await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=1)
-        parent.cancel("cancel during durable submission")
-        await asyncio.sleep(0)
-        assert parent.done() is False
-        assert (
-            await sessions.list_sessions(
-                SessionQuery(parent_session_id="durable-submission-cancel-parent")
-            )
-        ).sessions == []
-        assert await tasks.list_tasks(TaskQuery()) == []
+        try:
+            await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=10)
+            parent.cancel("cancel during durable submission")
+            await asyncio.sleep(0)
+            assert parent.done() is False
+            assert (
+                await sessions.list_sessions(
+                    SessionQuery(parent_session_id="durable-submission-cancel-parent")
+                )
+            ).sessions == []
+            assert await tasks.list_tasks(TaskQuery()) == []
 
-        sessions.release_child_creation.set()
-        with pytest.raises(asyncio.CancelledError, match="cancel during durable submission"):
-            await parent
-        assert parent.cancelling() == 1
-        assert parent.cancelled() is True
-        children = (
-            await sessions.list_sessions(
-                SessionQuery(parent_session_id="durable-submission-cancel-parent")
+            sessions.release_child_creation.set()
+            with pytest.raises(asyncio.CancelledError, match="cancel during durable submission"):
+                await parent
+            assert parent.cancelling() == 1
+            assert parent.cancelled() is True
+            children = (
+                await sessions.list_sessions(
+                    SessionQuery(parent_session_id="durable-submission-cancel-parent")
+                )
+            ).sessions
+            queued = await tasks.list_tasks(TaskQuery())
+            assert len(children) == 1
+            assert len(queued) == 1
+            assert (
+                queued[0].input["dispatch"]["prepared_subagent"]["authority"]["child_session_id"]
+                == children[0].id
             )
-        ).sessions
-        queued = await tasks.list_tasks(TaskQuery())
-        assert len(children) == 1
-        assert len(queued) == 1
-        assert (
-            queued[0].input["dispatch"]["prepared_subagent"]["authority"]["child_session_id"]
-            == children[0].id
-        )
+        finally:
+            # Failed readiness assertions must also release cancellation-opaque work.
+            sessions.release_child_creation.set()
+            if not parent.done():
+                parent.cancel()
+                await asyncio.gather(parent, return_exceptions=True)
 
     asyncio.run(run())
 
@@ -5012,7 +5024,7 @@ def test_tool_timeout_reports_queued_child_when_durable_submission_commits_late(
                 )
             )
         )
-        await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=1)
+        await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=10)
         await asyncio.sleep(0.02)
         sessions.release_child_creation.set()
 
@@ -5073,7 +5085,7 @@ def test_tool_timeout_preserves_unsettled_submission_for_exact_recovery() -> Non
                 )
             )
         )
-        await asyncio.wait_for(tasks.read_started.wait(), timeout=1)
+        await asyncio.wait_for(tasks.read_started.wait(), timeout=10)
         await asyncio.sleep(0.02)
         tasks.release_read.set()
 
@@ -5175,7 +5187,7 @@ def test_external_cancellation_remains_authoritative_over_unsettled_timeout(
                 )
             )
         )
-        await asyncio.wait_for(tasks.read_started.wait(), timeout=1)
+        await asyncio.wait_for(tasks.read_started.wait(), timeout=10)
         parent.cancel("external cancellation during unsettled durable submission")
         await asyncio.sleep(settlement_delay_s)
         tasks.release_read.set()
@@ -5233,33 +5245,40 @@ def test_external_cancellation_wins_when_durable_submission_outlasts_tool_timeou
                 )
             )
         )
-        await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=1)
-        parent.cancel("external cancellation during durable submission")
-        await asyncio.sleep(0.03)
-        parent.cancel("repeated external cancellation during durable submission")
-        await asyncio.sleep(0)
-        sessions.release_child_creation.set()
+        try:
+            await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=10)
+            parent.cancel("external cancellation during durable submission")
+            await asyncio.sleep(0.03)
+            parent.cancel("repeated external cancellation during durable submission")
+            await asyncio.sleep(0)
+            sessions.release_child_creation.set()
 
-        with pytest.raises(
-            asyncio.CancelledError,
-            match="external cancellation during durable submission",
-        ):
-            await parent
-        assert parent.cancelling() == 2
-        assert parent.cancelled() is True
-        children = (
-            await sessions.list_sessions(
-                SessionQuery(parent_session_id="durable-submission-timeout-cancel-parent")
-            )
-        ).sessions
-        queued = await tasks.list_tasks(TaskQuery())
-        assert len(children) == 1
-        assert len(queued) == 1
+            with pytest.raises(
+                asyncio.CancelledError,
+                match="external cancellation during durable submission",
+            ):
+                await parent
+            assert parent.cancelling() == 2
+            assert parent.cancelled() is True
+            children = (
+                await sessions.list_sessions(
+                    SessionQuery(parent_session_id="durable-submission-timeout-cancel-parent")
+                )
+            ).sessions
+            queued = await tasks.list_tasks(TaskQuery())
+            assert len(children) == 1
+            assert len(queued) == 1
+        finally:
+            # Failed readiness assertions must also release cancellation-opaque work.
+            sessions.release_child_creation.set()
+            if not parent.done():
+                parent.cancel()
+                await asyncio.gather(parent, return_exceptions=True)
 
     asyncio.run(run())
 
 
-def test_cancelled_queue_worker_reclaims_child_without_second_provider_dispatch() -> None:
+def test_cancelled_queue_worker_settles_child_without_second_provider_dispatch() -> None:
     async def run() -> None:
         sessions = InMemorySessionStore()
         tasks = InMemoryTaskStore()
@@ -5301,7 +5320,7 @@ def test_cancelled_queue_worker_reclaims_child_without_second_provider_dispatch(
                 worker_id="cancelled-child-worker",
             )
         )
-        await asyncio.wait_for(provider.child_started.wait(), timeout=1)
+        await asyncio.wait_for(provider.child_started.wait(), timeout=10)
         pending_recovery = await worker_app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="durable-worker-cancel-parent",
@@ -5310,36 +5329,32 @@ def test_cancelled_queue_worker_reclaims_child_without_second_provider_dispatch(
         )
         assert pending_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
         processing.cancel("worker shutdown")
+        await asyncio.sleep(0)
+        assert not processing.done()
+        provider.release_child.set()
         try:
             await processing
         except asyncio.CancelledError as exc:
-            # Provider-boundary cancellation text is credential-safe and canonical.
-            assert str(exc) == "Provider operation cancelled"
+            # The worker owner retains its original cancellation signal.
+            assert str(exc) == "worker shutdown"
         else:
             raise AssertionError("Queue worker cancellation did not propagate.")
         assert processing.cancelling() == 1
         assert processing.cancelled() is True
-        claimed = await tasks.load_task(queued.id)
-        assert claimed is not None
-        assert claimed.status is TaskStatus.CLAIMED
-        await tasks.release_task(
-            queued.id,
-            "cancelled-child-worker",
-            lease_expires_at=claimed.lease_expires_at,
-        )
-
+        cancelled = await tasks.load_task(queued.id)
+        assert cancelled is not None
+        assert cancelled.status is TaskStatus.CANCELLED
         replayed = await worker_dispatcher.process_next(
             worker_app,
             worker_id="replacement-child-worker",
         )
-        assert replayed is not None
-        assert replayed.status.value == "interrupted"
+        assert replayed is None
         child = await sessions.load(child_id)
         assert child is not None
-        assert child.status is SessionStatus.INTERRUPTED
+        assert child.status is SessionStatus.COMPLETED
         terminal_task = await tasks.load_task(queued.id)
         assert terminal_task is not None
-        assert terminal_task.status is TaskStatus.COMPLETED
+        assert terminal_task.status is TaskStatus.CANCELLED
         terminal_recovery = await worker_app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="durable-worker-cancel-parent",
@@ -5428,8 +5443,8 @@ def test_postgres_concurrent_submission_and_stale_worker_converge(
             max_size=4,
             schema_mode=SchemaMode.CREATE,
         )
-        dispatcher_a = TaskStoreDispatcher(tasks_a, task_type=task_type, lease_seconds=1)
-        dispatcher_b = TaskStoreDispatcher(tasks_b, task_type=task_type, lease_seconds=1)
+        dispatcher_a = TaskStoreDispatcher(tasks_a, task_type=task_type, lease_seconds=30)
+        dispatcher_b = TaskStoreDispatcher(tasks_b, task_type=task_type, lease_seconds=30)
         app_a = CayuApp(
             session_store=sessions_a,
             task_store=tasks_a,

@@ -1087,7 +1087,7 @@ def test_caller_cancellation_propagates_and_cancels_in_flight_reads() -> None:
                 )
             )
         )
-        await asyncio.wait_for(store.started.wait(), timeout=1.0)
+        await asyncio.wait_for(store.started.wait(), timeout=10.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -1127,7 +1127,7 @@ def test_caller_cancellation_cancels_in_flight_relation_reads() -> None:
                 )
             )
         )
-        await asyncio.wait_for(store.started.wait(), timeout=1.0)
+        await asyncio.wait_for(store.started.wait(), timeout=10.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

@@ -94,7 +94,7 @@ async def test_constructor_fatal_setup_survives_rollback_cancellation(
 
     task = asyncio.create_task(creation)
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 10)
         task.cancel("cancel during rollback")
         await asyncio.sleep(0)
         assert not task.done()

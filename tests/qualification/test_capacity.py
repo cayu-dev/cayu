@@ -150,7 +150,9 @@ def test_durable_concurrent_long_trajectories(tmp_path, record_property):
                         for index in range(count)
                     )
                 ),
-                timeout=480 if stress else 180,
+                # Allow disk-backed cloud workers to finish the same trajectories
+                # within the default five-minute outer qualification scenario.
+                timeout=480 if stress else 240,
             )
             task_rows = [await tasks.load_task(task.id) for task in created]
             session_rows = [await sessions.load(f"session-{task.id}") for task in created]

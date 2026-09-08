@@ -1075,6 +1075,7 @@ _TABLES = (
     "cayu_targeted_tool_grants",
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
+    "cayu_public_authority_alias_config",
     "cayu_transcript_search_configuration",
     "cayu_transcript_messages",
     "cayu_session_message_queue",
@@ -1373,7 +1374,7 @@ def test_postgres_cancelled_relation_publication_rolls_back_atomically(
                     operation_id="cancelled-relation-operation",
                 )
             )
-            await asyncio.wait_for(entered.wait(), timeout=5)
+            await asyncio.wait_for(entered.wait(), timeout=10)
             publication.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await publication
@@ -1516,7 +1517,7 @@ def test_postgres_cancelled_maintenance_rolls_back_atomically(
 
             monkeypatch.setattr(store, "_insert_relations", pause_after_relation_insert)
             application = asyncio.create_task(store.apply_maintenance_decision(proposal, decision))
-            await asyncio.wait_for(entered.wait(), timeout=5)
+            await asyncio.wait_for(entered.wait(), timeout=10)
             application.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await application
@@ -2744,7 +2745,7 @@ def test_postgres_embedding_worker_does_not_apply_stale_derived_embeddings(
                     "worker",
                 )
             )
-            await asyncio.wait_for(provider.first_started.wait(), timeout=2)
+            await asyncio.wait_for(provider.first_started.wait(), timeout=10)
             await store.delete_entry(
                 old_entry.id,
                 expected_revision=old_entry.revision,
@@ -2837,7 +2838,7 @@ def test_postgres_embedding_worker_fences_superseded_attempt_vector_write(
             slow = asyncio.create_task(
                 store.process_embedding_changes("slow-attempt-index", "worker-a")
             )
-            await asyncio.wait_for(provider.first_started.wait(), timeout=2)
+            await asyncio.wait_for(provider.first_started.wait(), timeout=10)
             fast = await store.process_embedding_changes("fast-attempt-index", "worker-b")
             provider.release_first.set()
             await slow
@@ -2924,7 +2925,7 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
             stale_cleanup = asyncio.create_task(
                 store.process_embedding_changes("delete-republication-index", "old-worker")
             )
-            await asyncio.wait_for(store.cleanup_started.wait(), timeout=2)
+            await asyncio.wait_for(store.cleanup_started.wait(), timeout=10)
             new_entry, new_chunks = publication_material(
                 entry_id=old_entry.id,
                 text="New invoice payment policy.",

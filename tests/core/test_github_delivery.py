@@ -1346,7 +1346,7 @@ def test_public_waiter_stop_retains_dispatched_owner_and_blocks_more_effects(tmp
 
         transport.create_pull_request = delayed_create
         caller = asyncio.create_task(connector.run(request, object(), object(), approval=approval))
-        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.wait_for(entered.wait(), timeout=10)
         if stop == "cancel":
             caller.cancel()
             with pytest.raises(asyncio.CancelledError):

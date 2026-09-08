@@ -613,7 +613,7 @@ def test_scenario_approval_route_is_fresh_fenced_and_actor_attributed(tmp_path) 
             assert launched.status_code == 202
             run_id = launched.json()["spec"]["run_id"]
 
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 current = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
                 assert current.status_code == 200
@@ -656,7 +656,7 @@ def test_scenario_approval_route_is_fresh_fenced_and_actor_attributed(tmp_path) 
             assert recorded_approval["actor_id"] == "scenario-operator"
             assert type(recorded_approval["submitted_at"]) is str
 
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 terminal = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
                 assert terminal.status_code == 200

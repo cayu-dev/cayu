@@ -260,7 +260,9 @@ def test_retained_publication_shutdown_has_a_real_process_bound(
         env=environment,
         capture_output=True,
         text=True,
-        timeout=5,
+        # Allow interpreter and application imports before exercising the
+        # bounded 10 ms / 200 ms shutdown paths in the child.
+        timeout=15,
         check=False,
     )
 
@@ -282,7 +284,7 @@ def test_close_caller_cancellation_does_not_cancel_the_shared_drain() -> None:
             return "published"
 
         invocation = asyncio.create_task(owner.run("operation", "fingerprint", publication))
-        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(started.wait(), timeout=10)
 
         close_caller = asyncio.create_task(owner.aclose(timeout_s=1))
         await asyncio.sleep(0)

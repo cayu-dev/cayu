@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 _SCOPE_DEFINITION_PATHS = {
     ".github/workflows/ci.yml",
+    ".github/workflows/qualification.yml",
     "scripts/package_ci_steps.yml",
     "scripts/run_ci.py",
     "scripts/select_ci_jobs.py",

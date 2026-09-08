@@ -35,6 +35,7 @@ from cayu.providers import (
     VertexProvider,
 )
 from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
+from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.vertex import (
     VERTEX_OAUTH_SCOPE,
     _import_google,
@@ -1339,9 +1340,14 @@ async def test_runtime_does_not_retry_conflicting_buffered_vertex_identity(
 
 def test_vertex_provider_rejects_invalid_transport_idle_timeout() -> None:
     with pytest.raises(ValueError, match="transport_idle_timeout_s"):
-        _provider(FailingTransport(), transport_idle_timeout_s=0)
+        _provider(
+            FailingTransport(), stream_deadlines=ProviderStreamDeadlines(transport_idle_timeout_s=0)
+        )
     with pytest.raises(TypeError, match="transport_idle_timeout_s"):
-        _provider(FailingTransport(), transport_idle_timeout_s="60")
+        _provider(
+            FailingTransport(),
+            stream_deadlines=ProviderStreamDeadlines(transport_idle_timeout_s="60"),
+        )
 
 
 @pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf"), 10**1000])

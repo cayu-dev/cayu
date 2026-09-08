@@ -3881,7 +3881,9 @@ class RecoveryCoordinator:
             if (
                 current_session is not None
                 and current_profile is not None
-                and current_profile != invocation_context.active_profile
+                and current_profile.run_epoch == invocation_context.active_profile.run_epoch
+                and current_profile.interaction_id
+                != invocation_context.active_profile.interaction_id
             ):
                 invocation_context = invocation_context.with_queued_interaction(
                     current_session,

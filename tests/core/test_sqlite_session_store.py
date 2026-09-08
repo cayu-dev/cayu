@@ -3332,6 +3332,9 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (77, 77),
         (78, 78),
         (79, 79),
+        (80, 79),
+        (81, 81),
+        (82, 82),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -4668,7 +4671,7 @@ def test_sqlite_side_effect_deadlines_start_after_write_lock_acquisition(
         )
         event = _make_event(session.id, seq=1, timestamp=StoreClock.current)
         await store.append_event(session.id, event)
-        monkeypatch.setattr("cayu.storage.sqlite.datetime", StoreClock)
+        monkeypatch.setattr(store, "_ownership_clock", lambda: StoreClock.current)
         begin_seen = threading.Event()
         store._connection.set_trace_callback(
             lambda statement: begin_seen.set() if statement == "BEGIN IMMEDIATE" else None

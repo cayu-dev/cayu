@@ -1532,7 +1532,10 @@ def test_bedrock_provider_rejects_nonfinite_stream_deadline(
     value: int | float,
 ) -> None:
     with pytest.raises(ValueError, match=field_name):
-        BedrockProvider(client=FakeBedrockClient([]), **{field_name: value})
+        BedrockProvider(
+            client=FakeBedrockClient([]),
+            stream_deadlines=ProviderStreamDeadlines(**{field_name: value}),
+        )
 
 
 @pytest.mark.parametrize(

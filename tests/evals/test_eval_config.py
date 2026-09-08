@@ -38,7 +38,7 @@ class _ConcurrentProvider(ModelProvider):
         if self.active == self.expected:
             self.ready.set()
         try:
-            await asyncio.wait_for(self.ready.wait(), timeout=5)
+            await asyncio.wait_for(self.ready.wait(), timeout=10)
             yield ModelStreamEvent.text_delta("done")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
         finally:

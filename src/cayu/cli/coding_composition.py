@@ -4993,7 +4993,10 @@ class _CompositionProvider(ModelProvider):
                     "mode": "create",
                 },
             ),
-            ("git_changes", {"mode": "diff", "scope": "unstaged"}),
+            (
+                "git_changes",
+                {"mode": "diff", "scope": "unstaged", "paths": ["smoke_output.txt"]},
+            ),
             ("list_artifacts", {"scope": "session"}),
             ("read_file", {"artifact_id": _ARTIFACT_ID}),
             ("list_knowledge", {"include_entries": True}),

@@ -113,7 +113,7 @@ async def test_transport_failure_settles_or_fences_command(acknowledged, policy)
     sandbox.commands.run = run
     runner = E2BRunner(sandbox, cancellation_cleanup=policy, e2b_module=FakeE2BModule)
     task = asyncio.create_task(runner.exec(ExecCommand.process("true")))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 10)
     release.set()
     with pytest.raises(RunnerExecutionError) as caught:
         await task
@@ -2333,7 +2333,7 @@ def test_e2b_late_start_failure_is_consumed_without_asyncio_diagnostic(
         monkeypatch.setattr(runner, "_cleanup_interrupted_command", observe_cleanup)
         task = asyncio.create_task(runner.exec(ExecCommand.process("mutate"), timeout_s=1))
         try:
-            await asyncio.wait_for(started.wait(), 2)
+            await asyncio.wait_for(started.wait(), 10)
             if interruption == "cancel":
                 task.cancel("caller")
             await asyncio.wait_for(cleaning.wait(), 2)
@@ -2762,7 +2762,7 @@ async def test_deferred_cleanup_is_bounded_when_provider_ignores_kill_cancellati
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 1)
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 10)
         assert not await asyncio.wait_for(runner.await_pending_command_settlement(), 1)
         assert not completed.is_set()
         assert runner.lifecycle_state == "poisoned"

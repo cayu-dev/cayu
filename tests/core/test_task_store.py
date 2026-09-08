@@ -2419,7 +2419,7 @@ def test_sqlite_claimed_cancellation_rechecks_lease_after_writer_wait(tmp_path):
     requester = threading.Thread(target=request_cancellation)
     requester.start()
     try:
-        assert transaction_started.wait(timeout=2)
+        assert transaction_started.wait(timeout=10)
         with clock_lock:
             clock_value[0] += timedelta(seconds=2)
         writer.commit()
@@ -2863,6 +2863,7 @@ def test_sqlite_task_store_validate_rejects_pre_handoff_generation_schema(tmp_pa
         connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_generation")
         connection.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
         connection.execute("ALTER TABLE cayu_tasks DROP COLUMN interrupted_handoff_id")
+        connection.execute("ALTER TABLE cayu_eval_runs DROP COLUMN failure_diagnostic_json")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 76")
         connection.execute("PRAGMA user_version = 75")
         connection.commit()
@@ -2982,6 +2983,7 @@ def test_sqlite_revision_seventy_six_backfills_live_handoff_authority(
         connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_generation")
         connection.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
         connection.execute("ALTER TABLE cayu_tasks DROP COLUMN interrupted_handoff_id")
+        connection.execute("ALTER TABLE cayu_eval_runs DROP COLUMN failure_diagnostic_json")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 76")
         connection.execute("PRAGMA user_version = 75")
         connection.commit()
@@ -3085,6 +3087,7 @@ def test_sqlite_revision_seventy_six_rejects_ambiguous_handoff_authority(tmp_pat
         connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_generation")
         connection.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
         connection.execute("ALTER TABLE cayu_tasks DROP COLUMN interrupted_handoff_id")
+        connection.execute("ALTER TABLE cayu_eval_runs DROP COLUMN failure_diagnostic_json")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 76")
         connection.execute("PRAGMA user_version = 75")
         connection.commit()

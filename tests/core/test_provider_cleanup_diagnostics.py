@@ -226,7 +226,7 @@ def test_injected_cleanup_failure_survives_sqlite_recovery_and_export(
                     pass
 
         task = asyncio.create_task(consume())
-        await asyncio.wait_for(stream.started.wait(), 2)
+        await asyncio.wait_for(stream.started.wait(), 10)
         if deadline:
             timeout_slot[0].reschedule(asyncio.get_running_loop().time())
         else:

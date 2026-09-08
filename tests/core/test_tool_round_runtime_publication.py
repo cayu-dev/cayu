@@ -719,7 +719,7 @@ def test_cross_worker_interrupt_racing_tool_round_publication_finishes_interrupt
                 ),
             )
         )
-        await asyncio.wait_for(store.publication_started.wait(), timeout=5)
+        await asyncio.wait_for(store.publication_started.wait(), timeout=10)
         interrupt_task = asyncio.create_task(
             _collect_interrupt_events(
                 api_app,

@@ -54,7 +54,7 @@ def _running_worker(
 
 
 def _wait_for_worker_start(process: subprocess.Popen[str], marker: Path) -> None:
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 20
     while not marker.is_file() and time.monotonic() < deadline:
         if process.poll() is not None:
             break

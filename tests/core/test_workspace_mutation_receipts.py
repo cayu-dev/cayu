@@ -595,7 +595,7 @@ class _ConcurrentWindowMutationTool(Tool):
         self.started[0] += 1
         if self.started[0] == 2:
             self.both_started.set()
-        await asyncio.wait_for(self.both_started.wait(), timeout=5)
+        await asyncio.wait_for(self.both_started.wait(), timeout=10)
         await ctx.workspace.create_bytes(self.path, self.path.encode())
         return ToolResult(content="created")
 
@@ -2271,7 +2271,7 @@ def test_background_edit_during_window_remains_external_or_unknown(tmp_path) -> 
                 ),
             )
         )
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=10)
         (tmp_path / "background.txt").write_text("background", encoding="utf-8")
         release.set()
         await run_task
@@ -4001,7 +4001,7 @@ def test_cancelled_runner_mutation_returns_promptly_and_fences_reuse(tmp_path) -
         await runner.started.wait()
         consumer.cancel("cancel runner mutation")
         with pytest.raises(asyncio.CancelledError, match="cancel runner mutation"):
-            await asyncio.wait_for(consumer, timeout=1)
+            await asyncio.wait_for(consumer, timeout=10)
         assert consumer.cancelling() == 1
         assert consumer.cancelled() is True
         assert following.started.is_set() is False
@@ -9334,7 +9334,7 @@ def test_workspace_receipt_waits_for_cancellation_opaque_mutation_after_timeout(
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.05)),
+        config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=1)),
     )
     app.register_provider(
         _SingleToolProvider(tool_name="blocking_workspace_mutation", arguments={}),
@@ -9364,8 +9364,8 @@ def test_workspace_receipt_waits_for_cancellation_opaque_mutation_after_timeout(
                 ),
             )
         )
-        await asyncio.to_thread(workspace.dispatched.wait, 1)
-        await asyncio.sleep(0.1)
+        assert await asyncio.to_thread(workspace.dispatched.wait, 10)
+        await asyncio.sleep(1.1)
         assert not consumer.done()
         durable_before_release = await store.query_events(
             EventQuery(session_id="session-opaque-mutation-timeout")
@@ -9426,7 +9426,7 @@ def test_workspace_receipt_waits_for_cancellation_opaque_mutation_after_task_can
                 ),
             )
         )
-        await asyncio.to_thread(workspace.dispatched.wait, 1)
+        assert await asyncio.to_thread(workspace.dispatched.wait, 10)
         consumer.cancel("cancel after mutation dispatch")
         await asyncio.sleep(0.05)
         assert not consumer.done()

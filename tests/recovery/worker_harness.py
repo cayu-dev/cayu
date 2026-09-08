@@ -1226,7 +1226,7 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
             claimed = await task_store.claim_task(
                 "worker-a",
                 TaskQuery(type=task_type),
-                lease_seconds=1,
+                lease_seconds=5,
             )
             if claimed is None or claimed.id != task_id:
                 raise AssertionError("worker-a did not claim the expected task")

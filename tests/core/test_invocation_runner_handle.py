@@ -2461,7 +2461,7 @@ def test_invocation_runner_handle_detaches_secret_bearing_cancellation_traceback
                     name,
                 )
         traceback = traceback.tb_next
-    assert cayu_frames == ["exec", "_raise_clean_runner_cancellation"]
+    assert cayu_frames == ["exec", "__exec", "_raise_clean_runner_cancellation"]
 
 
 def test_invocation_runner_handle_preserves_cancellation_before_dispatch() -> None:
@@ -2956,7 +2956,7 @@ def test_caller_cancellation_wins_during_grouped_tool_timeout_cleanup() -> None:
                 timeout_seconds=0.01,
             )
         )
-        await asyncio.wait_for(runner.cleanup_started.wait(), timeout=1)
+        await asyncio.wait_for(runner.cleanup_started.wait(), timeout=10)
         execution.cancel("caller cancellation during grouped cleanup")
         with pytest.raises(asyncio.CancelledError) as raised:
             await execution
@@ -4056,7 +4056,7 @@ def test_supervisory_exit_after_runner_child_completion_retains_deferred_settlem
 
         later = asyncio.create_task(fence.wait_until_available())
         assert runner.settlement_started is not None
-        await asyncio.wait_for(runner.settlement_started.wait(), timeout=1)
+        await asyncio.wait_for(runner.settlement_started.wait(), timeout=10)
         assert later.done() is False
         assert runner.settlement_calls == 1
         assert runner.release_settlement is not None

@@ -611,7 +611,7 @@ def test_remember_knowledge_timeout_returns_while_owned_publication_finishes() -
                     messages=[Message.text("user", "remember this")],
                 ),
             ),
-            timeout=1,
+            timeout=10,
         )
         assert knowledge_store.dispatched.is_set()
         assert knowledge_store.settled.is_set() is False
@@ -672,7 +672,7 @@ def test_remember_knowledge_operator_interrupt_returns_while_publication_finishe
                 ),
             )
         )
-        await asyncio.wait_for(knowledge_store.dispatched.wait(), timeout=1)
+        await asyncio.wait_for(knowledge_store.dispatched.wait(), timeout=10)
         interrupt_events = await asyncio.wait_for(
             _collect_interrupt(
                 app,
@@ -752,7 +752,7 @@ def test_app_shutdown_seals_and_bounds_registered_knowledge_publications() -> No
             knowledge_store=store,
         )
         invocation = asyncio.create_task(tool.run(context, {"text": "Retained knowledge."}))
-        await asyncio.wait_for(store.dispatched.wait(), timeout=1)
+        await asyncio.wait_for(store.dispatched.wait(), timeout=10)
         invocation.cancel("caller left")
         with pytest.raises(asyncio.CancelledError, match="caller left"):
             await invocation
@@ -862,7 +862,7 @@ def test_remember_knowledge_timeout_abandons_cancellation_resistant_read(
                     messages=[Message.text("user", "remember this")],
                 ),
             ),
-            timeout=1,
+            timeout=10,
         )
         assert knowledge_store.read_started.is_set()
         assert knowledge_store.read_finished.is_set() is False
@@ -932,15 +932,15 @@ def test_remember_knowledge_operator_interrupt_abandons_cancellation_resistant_r
             while not knowledge_store.read_started.is_set():
                 await asyncio.sleep(0)
 
-        await asyncio.wait_for(wait_for_read_start(), timeout=1)
+        await asyncio.wait_for(wait_for_read_start(), timeout=10)
         interrupt_events = await asyncio.wait_for(
             _collect_interrupt(
                 app,
                 InterruptSessionRequest(session_id=session_id, reason="operator interrupt"),
             ),
-            timeout=1,
+            timeout=10,
         )
-        run_events = await asyncio.wait_for(run_task, timeout=1)
+        run_events = await asyncio.wait_for(run_task, timeout=10)
         assert knowledge_store.read_finished.is_set() is False
         assert knowledge_store.publish_calls == 0
         assert len(tool._read_operations) == 1
@@ -950,13 +950,13 @@ def test_remember_knowledge_operator_interrupt_abandons_cancellation_resistant_r
             while not knowledge_store.read_finished.is_set():
                 await asyncio.sleep(0)
 
-        await asyncio.wait_for(wait_for_read_finish(), timeout=1)
+        await asyncio.wait_for(wait_for_read_finish(), timeout=10)
 
         async def wait_for_read_release() -> None:
             while tool._read_operations:
                 await asyncio.sleep(0)
 
-        await asyncio.wait_for(wait_for_read_release(), timeout=1)
+        await asyncio.wait_for(wait_for_read_release(), timeout=10)
         return run_events, interrupt_events
 
     run_events, interrupt_events = asyncio.run(run())

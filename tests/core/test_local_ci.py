@@ -45,7 +45,7 @@ def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> N
     ):
         assert command in workflow
 
-    assert "docker/setup-qemu-action@" in workflow
+    assert '["self-hosted","linux","arm64","gcp-ci"]' in workflow
     package_steps = _load_package_steps(_ROOT / "scripts" / "package_ci_steps.yml")
     immutable = next(
         step for step in package_steps if step.name == "Verify immutable release state"
@@ -58,17 +58,19 @@ def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:
     runner = _dry_runner()
     _run_general_shard(runner, 4)
     assert len(runner.evidence) == 1
-    assert "--splits 6 --group 4" in runner.evidence[0].command
-    assert "not (stress or process or postgres)" in runner.evidence[0].command
+    assert "--splits 32 --group 4" in runner.evidence[0].command
+    assert (
+        "not (stress or qualification or postgres or browser_docker)" in runner.evidence[0].command
+    )
 
     specialist = _dry_runner()
     _run_specialist_lane(specialist, "postgres-conformance-2")
     assert len(specialist.evidence) == 1
-    assert "--splits 2 --group 2" in specialist.evidence[0].command
-    assert "postgres and not (stress or process)" in specialist.evidence[0].command
+    assert "--splits 8 --group 2" in specialist.evidence[0].command
+    assert "postgres and not (stress or qualification)" in specialist.evidence[0].command
 
-    with pytest.raises(ValueError, match="between 1 and 6"):
-        _run_general_shard(_dry_runner(), 7)
+    with pytest.raises(ValueError, match="between 1 and 32"):
+        _run_general_shard(_dry_runner(), 33)
     with pytest.raises(ValueError, match="unknown specialist lane"):
         _run_specialist_lane(_dry_runner(), "unknown")
 
@@ -96,16 +98,9 @@ def test_local_general_shards_use_bounded_parallel_workers(monkeypatch) -> None:
     runner = LocalCiRunner(root=_ROOT, dry_run=False, keep_going=False)
     _run_general_shards(runner, jobs=2)
 
-    assert [item.label for item in runner.evidence] == [
-        "shard 1",
-        "shard 2",
-        "shard 3",
-        "shard 4",
-        "shard 5",
-        "shard 6",
-    ]
-    with pytest.raises(ValueError, match="between 1 and 6"):
-        _run_general_shards(_dry_runner(), jobs=7)
+    assert [item.label for item in runner.evidence] == [f"shard {n}" for n in range(1, 33)]
+    with pytest.raises(ValueError, match="between 1 and 32"):
+        _run_general_shards(_dry_runner(), jobs=33)
 
 
 def test_sqlite_lane_repeats_the_canonical_nodes_three_times() -> None:
@@ -355,3 +350,86 @@ def test_proof_distinguishes_publication_policy_and_skipped_commands(
     assert "Commit tested: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`" in rendered
     assert "`local-proof.md`" in rendered
     assert "`generated-output.txt`" in rendered
+
+
+def test_package_groups_cover_the_serial_plan_without_rebuilding_shared_archives(tmp_path):
+    steps = _load_package_steps(_ROOT / "scripts" / "package_ci_steps.yml")
+    covered = set()
+    for group in _RUNNER["_PACKAGE_GROUPS"]:
+        runner = _dry_runner()
+        _run_release_artifacts(
+            runner,
+            tmp_path / group,
+            publishing=True,
+            group=group,
+            artifacts=None if group == "build" else tmp_path / "archives",
+        )
+        labels = {item.label for item in runner.evidence}
+        selected = {step.name for step in steps if f"Release artifacts: {step.name}" in labels}
+        covered.update(selected)
+        if group != "build":
+            assert "Build first release archive" not in selected
+            assert "Build second release archive" not in selected
+            assert "Install built wheel" in selected
+    assert covered == {step.name for step in steps}
+
+
+def test_package_group_checks_copied_archive_bytes_and_preserves_input(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    wheel = archives / "cayu.whl"
+    source = archives / "cayu.tar.gz"
+    wheel.write_bytes(b"exact wheel bytes")
+    source.write_bytes(b"exact source bytes")
+    checked = []
+
+    class RecordingRunner:
+        dry_run = False
+
+        def __init__(self):
+            self.root = root
+
+        def run(self, label, command, **kwargs):
+            checked.append(label)
+            assert (root / "dist/first/cayu.whl").read_bytes() == wheel.read_bytes()
+            assert (root / "dist/first/cayu.tar.gz").read_bytes() == source.read_bytes()
+
+    monkeypatch.setattr(shutil, "which", lambda command: "/usr/bin/rg")
+    monkeypatch.setitem(
+        _run_release_artifacts.__globals__, "_prepare_package_environment", lambda runner: None
+    )
+    monkeypatch.setitem(
+        _run_release_artifacts.__globals__,
+        "_load_package_steps",
+        lambda path: [PackageStep("Verify bytes", "true", False, ("core",))],
+    )
+    _run_release_artifacts(
+        RecordingRunner(), tmp_path / "scratch", publishing=False, group="core", artifacts=archives
+    )
+    assert checked == ["Release artifacts: Verify bytes"]
+    assert not (root / "dist").exists()
+    assert wheel.read_bytes() == b"exact wheel bytes"
+    assert source.read_bytes() == b"exact source bytes"
+
+
+def test_pr_gate_keeps_process_regressions_and_release_waits_for_qualification():
+    general = _dry_runner()
+    _run_general_shard(general, 1)
+    assert (
+        "not (stress or qualification or postgres or browser_docker)" in general.evidence[0].command
+    )
+    qualification = _dry_runner()
+    _run_specialist_lane(qualification, "qualification-1")
+    assert "stress or qualification" in qualification.evidence[0].command
+    assert "-n 1" in qualification.evidence[0].command
+    assert "-n 2" in general.evidence[0].command
+    workflow = (_ROOT / ".github/workflows/ci.yml").read_text()
+    assert "uses: ./.github/workflows/qualification.yml" in workflow
+    publish = workflow.split("  publish:", 1)[1].split("  github-release:", 1)[0]
+    assert "release-qualification]" in publish
+    nightly = (_ROOT / ".github/workflows/qualification.yml").read_text()
+    assert "workflow_dispatch:" in nightly
+    assert "workflow_call:" in nightly
+    assert "schedule:" in nightly

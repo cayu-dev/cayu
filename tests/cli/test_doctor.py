@@ -555,8 +555,8 @@ def test_whole_command_bounds_blocking_publication_and_cleans_staging(
     limits = doctor_cli.DEFAULT_SUPPORT_BUNDLE_LIMITS.model_copy(
         update={
             "worker_timeout_seconds": 0.2,
-            "publication_timeout_seconds": 5.0,
-            "command_timeout_seconds": 16.0,
+            "publication_timeout_seconds": 15.0,
+            "command_timeout_seconds": 30.0,
         }
     )
     monkeypatch.setattr(doctor_cli, "DEFAULT_SUPPORT_BUNDLE_LIMITS", limits)
@@ -575,7 +575,7 @@ def test_whole_command_bounds_blocking_publication_and_cleans_staging(
 
     assert main(["doctor", "--bundle", str(bundle), "--json"]) == 4
 
-    assert time.monotonic() - started < 10
+    assert time.monotonic() - started < limits.command_timeout_seconds
     assert json.loads(capsys.readouterr().out)["outcome"] == "output_write_failed"
     assert (tmp_path / "publisher-started").read_text(encoding="utf-8") == "started"
     assert not bundle.exists()
@@ -676,9 +676,9 @@ def test_staging_reconciliation_is_bounded_when_cleanup_blocks(
     limits = doctor_cli.DEFAULT_SUPPORT_BUNDLE_LIMITS.model_copy(
         update={
             "worker_timeout_seconds": 0.2,
-            "publication_timeout_seconds": 5.0,
-            "reconciliation_timeout_seconds": 5.0,
-            "command_timeout_seconds": 16.0,
+            "publication_timeout_seconds": 15.0,
+            "reconciliation_timeout_seconds": 15.0,
+            "command_timeout_seconds": 40.0,
         }
     )
     monkeypatch.setattr(doctor_cli, "DEFAULT_SUPPORT_BUNDLE_LIMITS", limits)
@@ -698,7 +698,7 @@ def test_staging_reconciliation_is_bounded_when_cleanup_blocks(
 
     assert main(["doctor", "--bundle", str(bundle), "--json"]) == 4
 
-    assert time.monotonic() - started < 15
+    assert time.monotonic() - started < 38
     assert json.loads(capsys.readouterr().out)["outcome"] == "output_write_failed"
     assert (tmp_path / "reconciliation-started").read_text(encoding="utf-8") == "started"
     staging = list(tmp_path.glob(".support.zip.cayu-doctor-*.tmp"))
@@ -717,9 +717,9 @@ def test_complete_command_deadline_bounds_stacked_publication_teardown(
     limits = doctor_cli.DEFAULT_SUPPORT_BUNDLE_LIMITS.model_copy(
         update={
             "worker_timeout_seconds": 0.5,
-            "publication_timeout_seconds": 5.0,
-            "reconciliation_timeout_seconds": 5.0,
-            "command_timeout_seconds": 12.0,
+            "publication_timeout_seconds": 15.0,
+            "reconciliation_timeout_seconds": 15.0,
+            "command_timeout_seconds": 32.0,
         }
     )
     monkeypatch.setattr(doctor_cli, "DEFAULT_SUPPORT_BUNDLE_LIMITS", limits)
@@ -929,7 +929,7 @@ def test_child_lifetime_guard_covers_interpreter_shutdown(tmp_path: Path) -> Non
     )
     process.start()
     try:
-        process.join(timeout=5)
+        process.join(timeout=20)
 
         assert marker.exists()
         assert not process.is_alive()

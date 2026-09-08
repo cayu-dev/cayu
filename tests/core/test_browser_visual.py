@@ -186,10 +186,10 @@ def test_visual_retirement_survives_outer_popup_owner(termination, cleanup_fails
 
         daemon.close = close
         task = asyncio.create_task(daemon.execute(request))
-        await asyncio.wait_for(dispatched.wait(), 1)
+        await asyncio.wait_for(dispatched.wait(), 10)
         if termination == "cancel":
             task.cancel()
-        await asyncio.wait_for(cleanup_started.wait(), 1)
+        await asyncio.wait_for(cleanup_started.wait(), 10)
         assert not task.done() and daemon.closing
         assert state.visual_action_cleanup_disposition == "uncertain"
         competing = asyncio.create_task(daemon.execute(replace(request, operation_id="competing")))

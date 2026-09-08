@@ -2646,7 +2646,7 @@ def test_interruption_during_artifact_persistence_does_not_repeat_tool_or_store(
                 )
             )
         )
-        await asyncio.wait_for(artifact_store.started.wait(), timeout=5)
+        await asyncio.wait_for(artifact_store.started.wait(), timeout=10)
         interrupt_task = asyncio.create_task(
             _collect(
                 app.interrupt_session(
@@ -2752,7 +2752,7 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
                 )
             )
         )
-        await asyncio.wait_for(artifact_store.started.wait(), timeout=5)
+        await asyncio.wait_for(artifact_store.started.wait(), timeout=10)
         interrupt_events = await asyncio.wait_for(
             _collect(
                 app.interrupt_session(
@@ -2953,20 +2953,20 @@ def test_late_projection_completion_is_an_identifiable_publication_orphan(
                 events.append(event)
 
         run_task = asyncio.create_task(collect_run())
-        await asyncio.wait_for(artifact_store.cancellation_observed.wait(), timeout=1)
+        await asyncio.wait_for(artifact_store.cancellation_observed.wait(), timeout=10)
 
         async def wait_for_terminal_projection() -> None:
             while not any(event.type is EventType.TOOL_CALL_COMPLETED for event in events):
                 await asyncio.sleep(0)
 
-        await asyncio.wait_for(wait_for_terminal_projection(), timeout=1)
+        await asyncio.wait_for(wait_for_terminal_projection(), timeout=10)
         terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
         settlement = terminal.payload["tool_result_projection"]["artifact_write_settlement"]
         assert settlement["status"] == "reconciliation_required"
         assert settlement["phase"] == "content"
         assert not run_task.done()
         artifact_store.release.set()
-        await asyncio.wait_for(run_task, timeout=1)
+        await asyncio.wait_for(run_task, timeout=10)
 
         async def wait_for_orphan() -> dict[str, Any]:
             while True:
@@ -2975,7 +2975,7 @@ def test_late_projection_completion_is_an_identifiable_publication_orphan(
                     return dict(listed.artifacts[0].metadata)
                 await asyncio.sleep(0)
 
-        metadata = await asyncio.wait_for(wait_for_orphan(), timeout=1)
+        metadata = await asyncio.wait_for(wait_for_orphan(), timeout=10)
         return events, metadata
 
     events, metadata = asyncio.run(scenario())

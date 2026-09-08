@@ -3404,18 +3404,22 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
                     relation_name == "cayu_events" or index_name.startswith("idx_cayu_events")
                 ):
                     indexed_event_access.append(node)
-            # Preserve the shared rollups' event-type/time index contract.
+            # Rollups may use the type/time index or the partial accounting
+            # attempt index, which selects the billed event types directly.
             # Session projections may instead use a per-session event index
             # when table statistics favor it, but must retain indexed access and
             # the half-open time and event-type predicates in the selected plan.
             assert indexed_event_access
             if require_type_time_index:
                 assert any(
-                    node.get("Index Name") == "idx_cayu_events_type_timestamp"
-                    and "event_type" in str(node.get("Index Cond", ""))
-                    and "timestamp" in str(node.get("Index Cond", ""))
+                    (
+                        node.get("Index Name") == "idx_cayu_events_type_timestamp"
+                        and "event_type" in str(node.get("Index Cond", ""))
+                        and "timestamp" in str(node.get("Index Cond", ""))
+                    )
+                    or node.get("Index Name") == "idx_cayu_events_cost_attempt"
                     for node in indexed_event_access
-                )
+                ), indexed_event_access
 
             plan_predicates = " ".join(
                 str(node.get(field, ""))

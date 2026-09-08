@@ -258,6 +258,7 @@ def test_turn_usage_tracker_keeps_totals_without_retaining_events(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.qualification
 def test_usage_read_has_fixed_working_set_for_one_hundred_thousand_events(monkeypatch):
     import gc
     import tracemalloc

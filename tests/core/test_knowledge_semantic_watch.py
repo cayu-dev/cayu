@@ -937,7 +937,8 @@ def test_sqlite_revision_78_adds_empty_watch_storage_without_inference(tmp_path)
     asyncio.run(seed())
     with sqlite3.connect(database) as connection:
         connection.execute("DROP TABLE cayu_knowledge_semantic_watch_receipts")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 78")
+        connection.execute("ALTER TABLE cayu_eval_runs DROP COLUMN failure_diagnostic_json")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 78")
         connection.execute("PRAGMA user_version = 77")
         connection.commit()
 
@@ -1111,7 +1112,10 @@ def test_postgres_revision_78_adds_empty_watch_storage_without_inference(
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute("DROP TABLE cayu_knowledge_semantic_watch_receipts")
-                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 78")
+                await cursor.execute(
+                    "ALTER TABLE cayu_eval_runs DROP COLUMN failure_diagnostic_json"
+                )
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 78")
             await connection.commit()
 
         migrated = PostgresKnowledgeStore(

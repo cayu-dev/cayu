@@ -649,7 +649,7 @@ def test_bind_cancellation_releases_unadopted_factory_result_once() -> None:
             execution_requirements=_requirements(),
         )
         run_task = asyncio.create_task(_run(app, "sess_bind_release_cancel"))
-        await asyncio.wait_for(bind_started.wait(), timeout=1)
+        await asyncio.wait_for(bind_started.wait(), timeout=10)
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await run_task
@@ -909,7 +909,7 @@ def test_binding_completion_publication_cancellation_finalizes_adopted_binding(
 
         monkeypatch.setattr(app._event_writer, "emit", block_binding_completion)
         run_task = asyncio.create_task(_run(app, "sess_binding_completion_publication_cancelled"))
-        await asyncio.wait_for(publication_started.wait(), timeout=1)
+        await asyncio.wait_for(publication_started.wait(), timeout=10)
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await run_task

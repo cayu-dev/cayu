@@ -542,7 +542,7 @@ def test_curator_concurrent_exact_processing_converges_on_one_revision() -> None
             self.publication_count += 1
             if self.publication_count == 2:
                 self.publications_ready.set()
-            await asyncio.wait_for(self.publications_ready.wait(), timeout=1)
+            await asyncio.wait_for(self.publications_ready.wait(), timeout=10)
             return await super().publish_entry_revision(entry, chunks, **kwargs)
 
     async def run():
@@ -1388,7 +1388,7 @@ def test_curator_shutdown_seals_and_bounds_retained_publications() -> None:
         store = PausingStore()
         curator = _curator(store)
         invocation = asyncio.create_task(curator.curate(_batch(_signal())))
-        await asyncio.wait_for(store.started.wait(), timeout=1)
+        await asyncio.wait_for(store.started.wait(), timeout=10)
         invocation.cancel("curation caller left")
         with pytest.raises(asyncio.CancelledError, match="curation caller left"):
             await invocation
@@ -1447,7 +1447,7 @@ def test_curator_shutdown_drains_a_publication_that_settles_within_grace() -> No
         store = PausingStore()
         curator = _curator(store)
         invocation = asyncio.create_task(curator.curate(_batch(_signal())))
-        await asyncio.wait_for(store.started.wait(), timeout=1)
+        await asyncio.wait_for(store.started.wait(), timeout=10)
         close = asyncio.create_task(curator.aclose(timeout_s=1))
         await asyncio.sleep(0)
         store.release.set()

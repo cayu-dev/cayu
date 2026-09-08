@@ -1,6 +1,6 @@
 # Function-call event ordering investigation
 
-Issue #1498's historical
+The historical
 `function_call_arguments_done_arrived_before_output_item_added` diagnostic does
 not establish provider, proxy, or Runtime ownership. It establishes only that
 there was no pending function at the received output index. No incident wire
@@ -45,7 +45,7 @@ has accepted the item. Explicit nonterminal statuses remain invalid.
 
 `tests/core/test_openai_function_ordering.py` runs direct native-parser controls
 and byte-chunked SSE through `HttpxOpenAITransport`, Runtime dispatch/retries,
-and SQLite durable event readback. The SSE framing helper is shared with #1495.
+and SQLite durable event readback. The SSE framing helper is shared with the hosted-search ordering tests.
 Let `A(i)` register a function, `d(i)` append arguments, `G(i)` complete
 arguments, `D(i)` complete the output item, and `T` complete the response.
 

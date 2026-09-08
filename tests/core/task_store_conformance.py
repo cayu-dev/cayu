@@ -255,7 +255,7 @@ async def assert_task_claim_lost_conformance(store: TaskStore) -> None:
     assert claimed.worker_id == "worker_a"
     assert claimed.lease_expires_at is not None
 
-    with pytest.raises(TaskClaimLost, match="does not own"):
+    with pytest.raises(TaskClaimLost, match="does not own|no longer owns"):
         await store.attach_task(
             claimed.id,
             session_id="claim_lost_session",
@@ -267,26 +267,26 @@ async def assert_task_claim_lost_conformance(store: TaskStore) -> None:
             worker_id="worker_b",
             lease_expires_at=claimed.lease_expires_at,
         )
-    with pytest.raises(TaskClaimLost, match="does not own"):
+    with pytest.raises(TaskClaimLost, match="does not own|no longer owns"):
         await store.heartbeat(
             claimed.id,
             "worker_b",
             lease_expires_at=claimed.lease_expires_at,
         )
-    with pytest.raises(TaskClaimLost, match="does not own"):
+    with pytest.raises(TaskClaimLost, match="does not own|no longer owns"):
         await store.release_task(
             claimed.id,
             "worker_b",
             lease_expires_at=claimed.lease_expires_at,
         )
-    with pytest.raises(TaskClaimLost, match="does not own"):
+    with pytest.raises(TaskClaimLost, match="does not own|no longer owns"):
         await store.complete_task(
             claimed.id,
             {"ok": True},
             worker_id="worker_b",
             lease_expires_at=claimed.lease_expires_at,
         )
-    with pytest.raises(TaskClaimLost, match="does not own"):
+    with pytest.raises(TaskClaimLost, match="does not own|no longer owns"):
         await store.fail_task(
             claimed.id,
             {"message": "failed"},
@@ -306,7 +306,7 @@ async def assert_task_claim_lost_conformance(store: TaskStore) -> None:
         lease_expires_at=claimed.lease_expires_at,
     )
     assert attached.status is TaskStatus.RUNNING
-    with pytest.raises(TaskClaimLost, match="does not own"):
+    with pytest.raises(TaskClaimLost, match="does not own|no longer owns"):
         await store.attach_task(
             attached.id,
             session_id="claim_lost_replacement_session",
@@ -331,7 +331,7 @@ async def assert_task_claim_lost_conformance(store: TaskStore) -> None:
             lease_expires_at=attached.lease_expires_at,
         )
     assert type(duplicate_attach.value) is ValueError
-    with pytest.raises(TaskClaimLost, match="does not own"):
+    with pytest.raises(TaskClaimLost, match="does not own|no longer owns"):
         await store.release_attached_task_worker(
             attached.id,
             "worker_b",

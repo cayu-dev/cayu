@@ -49,7 +49,9 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
             "test_shards",
             "test_specialists",
             "sqlite-cancellation",
+            "package-build",
             "package",
+            "release-qualification",
             "dashboard",
             "publish",
             "github-release",
@@ -71,7 +73,9 @@ def test_pull_requests_and_main_run_the_core_workers_with_selected_high_value_ga
         "test_shards",
         "test_specialists",
         "sqlite-cancellation",
+        "package-build",
         "package",
+        "release-qualification",
         "dashboard",
         "publish",
         "github-release",
@@ -93,27 +97,31 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     specialists = _job_block(workflow, "test_specialists")
 
     assert "github.event_name == 'pull_request'" not in shards
-    assert "timeout-minutes: 30" in shards
-    assert "shard: [1, 2, 3, 4, 5, 6]" in shards
+    assert "timeout-minutes: 15" in shards
+    assert (
+        "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]"
+        in shards
+    )
     assert 'scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"' in shards
-    assert '"not (stress or process or postgres)"' in runner
+    assert '"not (stress or qualification or postgres or browser_docker)"' in runner
     assert '"--splitting-algorithm",\n            "least_duration"' in runner
-    assert '"--splits",\n            "6"' in runner
+    assert "_GENERAL_SHARDS = 32" in runner
     assert "-n 2" not in runner
     assert "--cov" not in runner
     assert "COVERAGE_FILE" not in runner
-    assert "uses: actions/upload-artifact@" not in shards
+    assert "name: ci-durations-general-${{ matrix.shard }}" in shards
 
     assert "github.event_name == 'pull_request'" not in specialists
-    assert "timeout-minutes: 30" in specialists
-    assert "lane: [stress-process, postgres-conformance-1, postgres-conformance-2]" in specialists
+    assert "timeout-minutes: 15" in specialists
+    assert "stress-process" not in specialists
+    assert "postgres-conformance-8" in specialists
     assert "scripts/run_ci.py --lane specialist" in specialists
     assert '--specialist-lane "${{ matrix.lane }}"' in specialists
-    assert '"stress-process": ("stress or process", 1, 1)' in runner
-    assert runner.count('"postgres and not (stress or process)", 2,') == 2
+    assert '"stress or qualification", 8, group' in runner
+    assert '"postgres and not (stress or qualification)", 8, group' in runner
     assert "--cov" not in specialists
     assert "COVERAGE_FILE" not in specialists
-    assert "uses: actions/upload-artifact@" not in specialists
+    assert "name: ci-durations-${{ matrix.lane }}" in specialists
 
 
 def test_privileged_jobs_share_release_tag_verifier() -> None:
@@ -164,13 +172,13 @@ def test_release_runbook_records_external_security_prerequisites() -> None:
 def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     workflow = _CI_WORKFLOW.read_text()
     package_manifest = _PACKAGE_MANIFEST.read_text()
-    package = _job_block(workflow, "package")
+    package = _job_block(workflow, "package-build")
     publish = _job_block(workflow, "publish")
     github_release = _job_block(workflow, "github-release")
 
     assert package_manifest.count("scripts/smoke_built_wheel_doctor.py") == 1
 
-    assert "timeout-minutes: 40" in package
+    assert "timeout-minutes: 10" in package
 
     assert 'tags: ["v*"]' in workflow
     assert "!cancelled()" in publish
@@ -178,11 +186,11 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "startsWith(github.ref, 'refs/tags/v')" in publish
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
     assert (
-        "needs: [static, test_shards, test_specialists, sqlite-cancellation, package, "
-        "dashboard]" in publish
+        "needs: [static, test_shards, test_specialists, sqlite-cancellation, package-build, package, "
+        "dashboard, release-qualification]" in publish
     )
     assert "if: startsWith(github.ref, 'refs/tags/v')" in github_release
-    assert "needs: [publish, package]" in github_release
+    assert "needs: [publish, package-build]" in github_release
 
     assert "prerelease: ${{ steps.release-package.outputs.prerelease }}" in package
     assert "id: release-package" in package
@@ -192,7 +200,7 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "publishing: true\n    run: |\n      uv run --group nightly" in package_manifest
     upload = package.index("name: Upload release distribution")
     assert package.index("python3 scripts/run_ci.py --lane package") < upload
-    assert "if: startsWith(github.ref, 'refs/tags/v')" in package[upload : upload + 160]
+    assert "if:" not in package[upload:]
     assert "name: release-dist" in package[upload:]
     assert "path: dist/first/" in package[upload:]
 
@@ -201,7 +209,7 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "uv build" not in publish
     assert "pypa/gh-action-pypi-publish@" in publish
 
-    assert "needs.package.outputs.prerelease" in github_release
+    assert "needs.package-build.outputs.prerelease" in github_release
     assert "--verify-tag" in github_release
     assert "--prerelease" in github_release
     assert "--latest=false" in github_release
@@ -219,7 +227,7 @@ def test_github_release_uses_curated_notes_for_the_exact_tag() -> None:
 
 
 def test_release_artifact_job_enforces_tagged_note_immutability() -> None:
-    package = _job_block(_CI_WORKFLOW.read_text(), "package")
+    package = _job_block(_CI_WORKFLOW.read_text(), "package-build")
     package_manifest = _PACKAGE_MANIFEST.read_text()
 
     checkout = package.index("uses: actions/checkout@")
@@ -239,7 +247,7 @@ def test_selected_high_value_jobs_preserve_premerge_and_main_contracts() -> None
     runner = _CI_RUNNER.read_text()
     package_manifest = _PACKAGE_MANIFEST.read_text()
     sqlite = _job_block(workflow, "sqlite-cancellation")
-    package = _job_block(workflow, "package")
+    package = _job_block(workflow, "package-build")
     dashboard = _job_block(workflow, "dashboard")
 
     assert "needs: verification-scope" in sqlite
@@ -255,7 +263,14 @@ def test_selected_high_value_jobs_preserve_premerge_and_main_contracts() -> None
     assert "test_delegated_stream_close_distinguishes_restored_and_late_cancellation" in runner
     sidecar_verifier_command = "bash scripts/verify_release_sidecar_artifacts.sh"
     assert package_manifest.count(sidecar_verifier_command) == 1
-    assert "docker/setup-qemu-action@" in package
+    checks = _job_block(workflow, "package")
+    assert "needs: package-build" in checks
+    assert "group: [core, server, dashboard, authoring, coding, docker, service]" in checks
+    assert "matrix.group == 'core'" in checks
+    assert '["self-hosted","linux","arm64","gcp-ci"]' in checks
+    assert "ubuntu-24.04-arm" in checks
+    assert "name: release-dist" in checks
+    assert "--package-artifacts" in checks
     assert "python3 scripts/run_ci.py --lane package" in package
 
     sidecar_verifier = _SIDECAR_VERIFIER.read_text()

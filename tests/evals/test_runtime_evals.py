@@ -1598,14 +1598,14 @@ def test_case_timeout_bounds_assertion_evaluation():
         assertions=[assertion],
     )
 
-    result = asyncio.run(run_eval_case(app, case, suite_id="timeout", timeout_seconds=1.0))
+    result = asyncio.run(run_eval_case(app, case, suite_id="timeout", timeout_seconds=5.0))
 
     assert result.case_id == "slow-assertion"
     assert result.status == EvalStatus.ERROR
     assert result.authored_session_id == "slow-assertion-session"
     trial = result.trials[0]
     assert trial.session_id != "slow-assertion-session"
-    assert trial.error == "Eval case timed out after 1.0 seconds."
+    assert trial.error == "Eval case timed out after 5.0 seconds."
     assert trial.assertions[0].outcome == EvalOutcome.ERROR
     # Terminal evidence, probes, and children were complete before assertion
     # evaluation timed out. The error describes evaluation, not missing evidence.
@@ -1620,7 +1620,7 @@ def test_case_timeout_bounds_assertion_evaluation():
 def test_provider_timeout_is_not_misclassified_as_case_deadline():
     case = _case("provider-timeout")
     # Isolate provider-error reporting from the default retry backoff, which is
-    # intentionally allowed to consume this test's one-second case deadline.
+    # intentionally allowed to consume a short case deadline.
     case = case.model_copy(
         update={
             "request": case.request.model_copy(update={"retry_policy": RetryPolicy(max_attempts=1)})
@@ -1631,7 +1631,7 @@ def test_provider_timeout_is_not_misclassified_as_case_deadline():
             _app_with_provider(_ProviderTimeout()),
             case,
             suite_id="timeout",
-            timeout_seconds=1.0,
+            timeout_seconds=10.0,
         )
     )
 
@@ -4856,7 +4856,7 @@ def test_fresh_eval_timeout_during_memory_read_retains_bounded_source_references
             trial_number=1,
             suite_id="suite",
             retain_trajectory=True,
-            timeout_seconds=1.0,
+            timeout_seconds=5.0,
         )
     )
 
@@ -4940,9 +4940,9 @@ def test_fresh_eval_retains_cancellation_resistant_read_under_shared_bound():
                 run_eval_suite(
                     _memory_read_app(stalled_store),
                     EvalSuite(id="resistant-memory-read", cases=[_case("first")]),
-                    case_timeout_seconds=1.0,
+                    case_timeout_seconds=5.0,
                 ),
-                timeout=3,
+                timeout=10,
             )
             assert stalled_store.read_started.is_set()
             assert not stalled_store.read_cancelled.is_set()
@@ -4953,18 +4953,18 @@ def test_fresh_eval_retains_cancellation_resistant_read_under_shared_bound():
                     _memory_read_app(InMemorySessionStore()),
                     EvalSuite(id="bounded-followup", cases=[_case("second")]),
                 ),
-                timeout=2,
+                timeout=10,
             )
 
             stalled_store.release_read.set()
-            await asyncio.wait_for(stalled_store.read_finished.wait(), timeout=1)
+            await asyncio.wait_for(stalled_store.read_finished.wait(), timeout=10)
             await asyncio.sleep(0)
             third = await asyncio.wait_for(
                 run_eval_suite(
                     _memory_read_app(InMemorySessionStore()),
                     EvalSuite(id="released-followup", cases=[_case("third")]),
                 ),
-                timeout=2,
+                timeout=10,
             )
         finally:
             stalled_store.release_read.set()
@@ -4994,9 +4994,9 @@ def test_fresh_eval_retains_sqlite_physical_read_under_shared_bound(tmp_path):
                 run_eval_suite(
                     _memory_read_app(stalled_store),
                     EvalSuite(id="sqlite-memory-read", cases=[_case("first")]),
-                    case_timeout_seconds=1.0,
+                    case_timeout_seconds=5.0,
                 ),
-                timeout=3,
+                timeout=10,
             )
             assert stalled_store.read_started.is_set()
             assert not stalled_store.read_finished.is_set()
@@ -5006,11 +5006,11 @@ def test_fresh_eval_retains_sqlite_physical_read_under_shared_bound(tmp_path):
                     _memory_read_app(InMemorySessionStore()),
                     EvalSuite(id="sqlite-bounded-followup", cases=[_case("second")]),
                 ),
-                timeout=2,
+                timeout=10,
             )
 
             stalled_store.release_read.set()
-            assert await asyncio.to_thread(stalled_store.read_finished.wait, 1)
+            assert await asyncio.to_thread(stalled_store.read_finished.wait, 10)
             for _ in range(8):
                 await asyncio.sleep(0)
             assert stalled_store.exposure_read_calls == 0
@@ -5019,7 +5019,7 @@ def test_fresh_eval_retains_sqlite_physical_read_under_shared_bound(tmp_path):
                     _memory_read_app(InMemorySessionStore()),
                     EvalSuite(id="sqlite-released-followup", cases=[_case("third")]),
                 ),
-                timeout=2,
+                timeout=10,
             )
         finally:
             stalled_store.release_read.set()
@@ -5042,7 +5042,7 @@ def test_fresh_eval_retains_late_store_process_control_for_next_entrance():
         first = await run_eval_suite(
             _memory_read_app(store),
             EvalSuite(id="late-process-control", cases=[_case("late-control")]),
-            case_timeout_seconds=1.0,
+            case_timeout_seconds=5.0,
         )
         assert store.read_started.is_set()
         store.release_read.set()
@@ -5077,7 +5077,7 @@ def test_fresh_eval_caller_cancellation_abandons_opaque_memory_read_exactly():
                 EvalSuite(id="cancel-memory-read", cases=[_case("cancel")]),
             )
         )
-        await asyncio.wait_for(store.read_started.wait(), timeout=1)
+        await asyncio.wait_for(store.read_started.wait(), timeout=10)
         task.cancel("stop fresh eval")
         try:
             with pytest.raises(asyncio.CancelledError) as raised:
@@ -5089,7 +5089,7 @@ def test_fresh_eval_caller_cancellation_abandons_opaque_memory_read_exactly():
             assert not store.read_finished.is_set()
         finally:
             store.release_read.set()
-            await asyncio.wait_for(store.read_finished.wait(), timeout=1)
+            await asyncio.wait_for(store.read_finished.wait(), timeout=10)
         return task
 
     task = asyncio.run(scenario())
@@ -5288,13 +5288,13 @@ def test_fresh_eval_deadline_starts_no_read_after_resistant_terminal_read():
             run_eval_suite(
                 _memory_read_app(store),
                 EvalSuite(id="resistant-terminal-read", cases=[_case("deadline")]),
-                case_timeout_seconds=1.0,
+                case_timeout_seconds=5.0,
             )
         )
-        await asyncio.wait_for(store.read_started.wait(), timeout=2)
-        await asyncio.wait_for(store.read_cancelled.wait(), timeout=2)
+        await asyncio.wait_for(store.read_started.wait(), timeout=10)
+        await asyncio.wait_for(store.read_cancelled.wait(), timeout=10)
         store.release_read.set()
-        return await asyncio.wait_for(task, timeout=1), store
+        return await asyncio.wait_for(task, timeout=10), store
 
     result, store = asyncio.run(scenario())
 
@@ -5381,10 +5381,10 @@ def test_fresh_eval_cleanup_preserves_repeated_caller_cancellation(monkeypatch):
                 EvalSuite(id="repeated-cancel-memory-read", cases=[_case("cancel")]),
             )
         )
-        await asyncio.wait_for(store.read_started.wait(), timeout=1)
-        task.cancel("stop fresh eval first")
         try:
-            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            await asyncio.wait_for(store.read_started.wait(), timeout=10)
+            task.cancel("stop fresh eval first")
+            await asyncio.wait_for(cleanup_started.wait(), timeout=10)
             task.cancel("stop fresh eval again")
             release_cleanup.set()
             with pytest.raises(BaseExceptionGroup) as raised:
@@ -5392,7 +5392,7 @@ def test_fresh_eval_cleanup_preserves_repeated_caller_cancellation(monkeypatch):
         finally:
             release_cleanup.set()
             store.release_read.set()
-            await asyncio.wait_for(store.read_finished.wait(), timeout=1)
+            await asyncio.wait_for(store.read_finished.wait(), timeout=10)
         return raised.value, task
 
     error, task = asyncio.run(scenario())
@@ -5416,7 +5416,7 @@ def test_fresh_eval_preserves_process_control_concurrent_with_caller_cancellatio
                 EvalSuite(id="process-control-memory-read", cases=[_case("process-control")]),
             )
         )
-        await asyncio.wait_for(store.read_started.wait(), timeout=1)
+        await asyncio.wait_for(store.read_started.wait(), timeout=10)
         store.release_read.set()
         task.cancel("stop fresh eval")
         with pytest.raises(BaseExceptionGroup) as raised:

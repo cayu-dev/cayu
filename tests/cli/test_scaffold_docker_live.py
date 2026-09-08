@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
@@ -172,15 +173,27 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
         check=True,
         timeout=120,
     )
-    built = subprocess.run(
-        [sys.executable, "build_coding_image.py"],
-        cwd=project,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=300,
-    )
+    build_deadline = time.monotonic() + 300
+    for attempt in range(3):
+        built = subprocess.run(
+            [sys.executable, "build_coding_image.py"],
+            cwd=project,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(0.001, build_deadline - time.monotonic()),
+        )
+        build_output = built.stdout + built.stderr
+        transient_snapshot_failure = (
+            "snapshot.debian.org" in build_output and "503  No healthy backends" in build_output
+        )
+        if built.returncode == 0 or not transient_snapshot_failure or attempt == 2:
+            break
+        # Retry only the observed transient mirror response within one build budget.
+        if time.monotonic() + 1 >= build_deadline:
+            break
+        time.sleep(1)
     assert built.returncode == 0, (built.stdout + built.stderr)[-4000:]
     image_configuration = json.loads(
         (project / "docker-coding-image.json").read_text(encoding="utf-8")

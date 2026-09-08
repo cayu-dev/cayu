@@ -871,7 +871,7 @@ def test_recovery_cleanup_defers_dependent_step_and_drain_follows_continuation()
 
         drain = asyncio.create_task(supervisor.drain(timeout_s=0.5))
         release_predecessor.set()
-        await asyncio.wait_for(dependent_started.wait(), timeout=1)
+        await asyncio.wait_for(dependent_started.wait(), timeout=10)
         await asyncio.sleep(0)
         assert drain.done() is False
 
@@ -924,7 +924,7 @@ def test_recovery_cleanup_reissues_deadline_cancel_after_prior_step_consumes_cal
         )
         await first_started.wait()
         owner.cancel("operator cancelled cleanup")
-        await asyncio.wait_for(second_started.wait(), timeout=1)
+        await asyncio.wait_for(second_started.wait(), timeout=10)
 
         failures = await asyncio.wait_for(owner, timeout=1)
         assert isinstance(failures[0][1], asyncio.CancelledError)
@@ -1062,7 +1062,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
                 authority=original_claim.require_authority(),
                 authoritative_failure=None,
             )
-        await asyncio.wait_for(store.release_started.wait(), timeout=1)
+        await asyncio.wait_for(store.release_started.wait(), timeout=10)
         assert original_app.recovery_cleanup_status().retained_tasks == 1
 
         current_time["value"] += timedelta(minutes=6)

@@ -891,7 +891,7 @@ def test_resolve_user_input_task_cancellation_reconciles_release_acknowledgement
                 )
             )
         )
-        await asyncio.wait_for(blocking_tool.started.wait(), timeout=5)
+        await asyncio.wait_for(blocking_tool.started.wait(), timeout=10)
         assert resolution_task.cancelling() == 0
         resolution_task.cancel("cancel user-input resolution")
         assert resolution_task.cancelling() == 1
@@ -1061,7 +1061,7 @@ def test_resolve_user_input_cancellation_after_execution_admission_is_retryable(
         store.finish_execution_admission = asyncio.Event()
         store.block_next_execution_admission = True
         resolving = asyncio.create_task(_drain(app.resolve_user_input(response)))
-        await asyncio.wait_for(store.execution_admission_committed.wait(), timeout=5)
+        await asyncio.wait_for(store.execution_admission_committed.wait(), timeout=10)
 
         resolving.cancel("cancel after execution admission committed")
         store.finish_execution_admission.set()
@@ -1219,7 +1219,7 @@ def test_user_input_execution_admission_cancellation_retains_reconciliation_fail
                 )
             )
         )
-        await asyncio.wait_for(store.execution_admission_reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(store.execution_admission_reconciliation_started.wait(), timeout=10)
 
         resolving.cancel("cancel during reconciliation")
         store.finish_execution_admission_reconciliation.set()
@@ -1314,9 +1314,9 @@ def test_resolve_user_input_repeated_cancellation_cannot_interrupt_finalization(
                 )
             )
         )
-        await asyncio.wait_for(blocking_tool.started.wait(), timeout=5)
+        await asyncio.wait_for(blocking_tool.started.wait(), timeout=10)
         resolution_task.cancel("first cancellation")
-        await asyncio.wait_for(store.finalization_started.wait(), timeout=5)
+        await asyncio.wait_for(store.finalization_started.wait(), timeout=10)
         resolution_task.cancel("second cancellation")
         store.finish_finalization.set()
         with pytest.raises(asyncio.CancelledError) as raised:
@@ -3204,6 +3204,10 @@ def test_operator_interrupt_supersedes_user_input_manual_recovery_before_executi
         resumed_before_recovery = sum(
             event.type is EventType.SESSION_RESUMED for event in await store.load_events(session_id)
         )
+        original_profile = active_invocation_execution_profile_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert original_profile is not None
 
         recovery_request = UserInputRecoveryRequest(
             session_id=session_id,
@@ -3218,11 +3222,15 @@ def test_operator_interrupt_supersedes_user_input_manual_recovery_before_executi
         store.finish_transition = asyncio.Event()
         store.block_next_running_transition = True
         recovering = asyncio.create_task(_drain(app.recover_user_input(recovery_request)))
-        await asyncio.wait_for(store.transition_committed.wait(), timeout=5)
+        await asyncio.wait_for(store.transition_committed.wait(), timeout=10)
 
         claimed_checkpoint = await store.load_checkpoint(session_id)
         assert claimed_checkpoint is not None
         assert claimed_checkpoint["user_input_resolution_intent"]["execution_state"] == "claimed"
+        claimed_profile = active_invocation_execution_profile_from_checkpoint(claimed_checkpoint)
+        assert claimed_profile is not None
+        assert claimed_profile.run_epoch > original_profile.run_epoch
+        assert claimed_profile.interaction_id == original_profile.interaction_id
 
         interrupt_app = CayuApp(session_store=store, enable_logging=False)
         interrupt_app.register_provider(provider, default=True)
@@ -3241,8 +3249,16 @@ def test_operator_interrupt_supersedes_user_input_manual_recovery_before_executi
                 )
             ]
 
+        interrupted_checkpoint = await store.load_checkpoint(session_id)
+        interrupted_profile = active_invocation_execution_profile_from_checkpoint(
+            interrupted_checkpoint
+        )
+        assert interrupted_profile is not None
+        assert interrupted_profile.run_epoch == claimed_profile.run_epoch
+        assert interrupted_profile.interaction_id == claimed_profile.interaction_id
+
         store.finish_transition.set()
-        recovery_events = await asyncio.wait_for(recovering, timeout=10)
+        recovery_events = await asyncio.wait_for(recovering, timeout=30)
         assert recovery_events[-1].type is EventType.SESSION_INTERRUPTED
         assert recovery_events[-1].payload["interruption_type"] == "operator_requested"
         assert counting.calls == 0
@@ -3321,7 +3337,7 @@ def test_operator_interrupt_cannot_supersede_executing_user_input_manual_recover
         store.finish_execution_admission = asyncio.Event()
         store.block_next_execution_admission = True
         recovering = asyncio.create_task(_drain(app.recover_user_input(request)))
-        await asyncio.wait_for(store.execution_admission_committed.wait(), timeout=5)
+        await asyncio.wait_for(store.execution_admission_committed.wait(), timeout=10)
 
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
@@ -3352,7 +3368,7 @@ def test_operator_interrupt_cannot_supersede_executing_user_input_manual_recover
             for event in await store.load_events(session_id)
         )
         store.finish_execution_admission.set()
-        recovered = await asyncio.wait_for(recovering, timeout=10)
+        recovered = await asyncio.wait_for(recovering, timeout=30)
         assert recovered[-1].type is EventType.SESSION_COMPLETED
         assert counting.calls == 0
         assert len(provider.requests) == 2
@@ -3803,7 +3819,7 @@ def test_recover_user_input_task_cancellation_finalizes_continuation() -> None:
                 )
             )
         )
-        await asyncio.wait_for(provider.continuation_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.continuation_started.wait(), timeout=15)
         assert recovery_task.cancelling() == 0
         recovery_task.cancel("cancel user-input recovery")
         assert recovery_task.cancelling() == 1

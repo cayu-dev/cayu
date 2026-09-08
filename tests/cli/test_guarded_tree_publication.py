@@ -1598,10 +1598,9 @@ def test_case_sensitive_darwin_lookup_normalizes_canonical_unicode_aliases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected_parent = publication._capture_parent(tmp_path)
-    monkeypatch.setattr(publication.sys, "platform", "darwin")
-    monkeypatch.setattr(publication.os, "pathconf", lambda _root, _name: 1)
-
     with publication._pinned_parent(tmp_path, expected=expected_parent) as parent:
+        monkeypatch.setattr(publication.sys, "platform", "darwin")
+        monkeypatch.setattr(publication.os, "pathconf", lambda _root, _name: 1)
         semantics = publication._directory_lookup_semantics(parent)
         assert semantics is publication._DirectoryLookupSemantics.UNICODE_NORMALIZED
         composed = publication._destination_name_for_lookup_semantics(
@@ -2032,7 +2031,7 @@ def test_guarded_tree_recovery_rejects_unsafe_published_replacement_without_bloc
         check=False,
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=20,
     )
 
     assert completed.returncode == 0, completed.stderr

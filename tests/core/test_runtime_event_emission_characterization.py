@@ -187,8 +187,8 @@ def test_sink_mutation_cannot_rewrite_returned_or_later_sink_events() -> None:
     events = asyncio.run(_collect_run(app, "sess_sink_mutation"))
 
     assert events[1].type == EventType.SESSION_STARTED
-    assert events[1].payload == {"agent_name": "assistant"}
-    assert recorder.events[1].payload == {"agent_name": "assistant"}
+    assert events[1].payload == {"agent_name": "assistant", "run_epoch": 1}
+    assert recorder.events[1].payload == {"agent_name": "assistant", "run_epoch": 1}
 
 
 def test_model_completed_is_forwarded_to_budget_store_once() -> None:

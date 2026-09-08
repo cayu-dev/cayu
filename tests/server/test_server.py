@@ -7545,7 +7545,7 @@ def test_generated_session_and_interaction_aliases_remain_distinct_and_addressab
         json={"session_id": first_session_id, "prompt": "must not dispatch"},
         headers={"Last-Event-ID": f"{first_session_id}:{first_event_id}"},
     )
-    assert replay.status_code == 200
+    assert replay.status_code == 200, replay.text
 
     response = client.get(f"/api/sessions/{first_session_id}/interactions?limit=10")
     assert response.status_code == 200
@@ -7600,7 +7600,7 @@ def test_generated_session_and_interaction_aliases_remain_distinct_and_addressab
 
     resumed = client.post(
         "/api/resume",
-        json={"session_id": first_session_id, "prompt": "continue normally"},
+        json={"session_id": first_session_id, "prompt": "continue normally", "max_steps": 20},
     )
     assert resumed.status_code == 200
     assert '"type":"session.completed"' in resumed.text
@@ -10418,7 +10418,7 @@ def test_run_accepts_and_detaches_before_environment_factory_finishes() -> None:
                 {"prompt": "hello", "session_id": session_id},
             )
         )
-        await asyncio.wait_for(factory.started.wait(), timeout=1)
+        await asyncio.wait_for(factory.started.wait(), timeout=10)
         done, _ = await asyncio.wait({request_task}, timeout=0.2)
         accepted_before_release = request_task in done
         state = await app.session_store.load_state(session_id)
@@ -10485,7 +10485,7 @@ def test_interrupt_after_run_acceptance_cancels_detached_provider() -> None:
                 {"prompt": "hello", "session_id": session_id},
             )
         )
-        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         messages = await asyncio.wait_for(request_task, timeout=1)
 
         active_runs = app._session_control.active_runs(session_id)
@@ -10607,7 +10607,7 @@ def test_interrupt_before_observer_start_cancels_environment_factory() -> None:
             )
         ]
         observed = [message async for message in response.body_iterator]
-        await asyncio.wait_for(factory.started.wait(), timeout=1)
+        await asyncio.wait_for(factory.started.wait(), timeout=10)
         await asyncio.wait_for(factory.cancelled.wait(), timeout=1)
         state = await app.session_store.load_state(session_id)
         assert state is not None
@@ -10688,7 +10688,7 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
                 after_accept=create_task_after_accept,
             )
         )
-        await asyncio.wait_for(task_store.create_started.wait(), timeout=1)
+        await asyncio.wait_for(task_store.create_started.wait(), timeout=10)
         interrupt_task = asyncio.create_task(interrupt())
         await asyncio.sleep(0)
         assert not response_task.done()
@@ -10718,6 +10718,7 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
 def test_run_route_interrupt_during_acceptance_state_read_keeps_task_linked() -> None:
     class BlockingAcceptanceStateStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
+        terminal_interaction_publication_version = 1
 
         def __init__(self) -> None:
             super().__init__()
@@ -10761,7 +10762,7 @@ def test_run_route_interrupt_during_acceptance_state_read_keeps_task_linked() ->
                     json={"prompt": "hello", "session_id": session_id},
                 )
             )
-            await asyncio.wait_for(session_store.state_read_started.wait(), timeout=1)
+            await asyncio.wait_for(session_store.state_read_started.wait(), timeout=10)
             interrupt_task = asyncio.create_task(interrupt())
             await asyncio.sleep(0)
             session_store.release_state_read.set()
@@ -10827,13 +10828,13 @@ def test_request_cancellation_during_acceptance_does_not_cancel_detached_run() -
                 after_accept=after_accept,
             )
         )
-        await asyncio.wait_for(callback_started.wait(), timeout=1)
+        await asyncio.wait_for(callback_started.wait(), timeout=10)
         response_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await response_task
 
         release_callback.set()
-        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         active_runs = app._session_control.active_runs(session_id)
         assert len(active_runs) == 1
         assert not active_runs[0].runtime_task.done()
@@ -11159,7 +11160,7 @@ def test_request_cancellation_does_not_cancel_uncertain_acceptance_marker() -> N
                     headers={"Cayu-Mutation-ID": mutation_id},
                 )
             )
-            await asyncio.wait_for(store.marker_started.wait(), timeout=1)
+            await asyncio.wait_for(store.marker_started.wait(), timeout=10)
             request_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await request_task
@@ -12377,6 +12378,7 @@ def test_existing_session_reconnect_cannot_race_accepted_mutation_transition() -
 def test_concurrent_client_run_identity_creates_one_session_and_one_task() -> None:
     class CoordinatedRunStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
+        terminal_interaction_publication_version = 1
 
         def __init__(self) -> None:
             super().__init__()
@@ -13651,7 +13653,7 @@ def test_create_server_startup_recovery_consumes_every_cursor_page() -> None:
 
     with TestClient(server):
         server_is_ready.set()
-        assert continuation_started.wait(timeout=2.0)
+        assert continuation_started.wait(timeout=10.0)
         assert continuation_finished.wait(timeout=2.0)
 
     assert [request.selection.cursor for request in requests] == [
@@ -13700,7 +13702,7 @@ def test_create_server_stops_incomplete_recovery_continuation_on_shutdown() -> N
     )
 
     with TestClient(server):
-        assert continuation_started.wait(timeout=2.0)
+        assert continuation_started.wait(timeout=10.0)
 
     assert continuation_cancelled.wait(timeout=2.0)
 

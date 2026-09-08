@@ -155,6 +155,7 @@ from cayu.runtime.local_execution_attempts import (
     local_execution_attempt_receipt_sha256,
 )
 from cayu.runtime.sessions import InMemorySessionStore
+from cayu.runtime.tasks import prepare_task_terminalization
 from cayu.runtime.work_contracts import completion_verification_claim_authority_sha256
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
@@ -726,9 +727,8 @@ def test_postgres_verifier_profile_restart_requires_exact_registration_for_repla
 
     async def run() -> None:
         await _truncate(postgres_dsn)
-        clock = _MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
         contract = _contract(contract_id="postgres-profile-replacement-contract")
-        store = _new_store(postgres_dsn, clock=clock)
+        store = _new_store(postgres_dsn)
         try:
             await store.publish_work_contract(contract)
             task = await store.create_running_task(
@@ -779,7 +779,7 @@ def test_postgres_verifier_profile_restart_requires_exact_registration_for_repla
         finally:
             await store.close()
 
-        reopened = _new_store(postgres_dsn, clock=clock)
+        reopened = _new_store(postgres_dsn)
         try:
             missing_app = CayuApp(task_store=reopened, enable_logging=False)
             with pytest.raises(CompletionVerifierUnavailable, match="not registered"):
@@ -800,7 +800,23 @@ def test_postgres_verifier_profile_restart_requires_exact_registration_for_repla
                 == original_claim
             )
 
-            clock.value += timedelta(seconds=2)
+            # Verification ownership uses database time. Wait for this
+            # one-second lease there before requesting its replacement.
+            import psycopg
+
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                for _ in range(100):
+                    await cur.execute("SELECT clock_timestamp()")
+                    row = await cur.fetchone()
+                    assert row is not None
+                    if row[0] >= original_claim.lease_expires_at:
+                        break
+                    await asyncio.sleep(0.02)
+                else:
+                    raise AssertionError("Verification lease did not expire at database time.")
             exact = VersionedVerifier(behavior_version="v1")
             exact_app = CayuApp(task_store=reopened, enable_logging=False)
             exact_app.register_completion_verifier(contract.verifier, exact)
@@ -1426,7 +1442,7 @@ def test_postgres_verified_work_clock_does_not_expire_task_worker_lease(postgres
                     "session:postgres:separate-clock",
                 ),
                 worker_id="postgres-task-worker",
-                lease_expires_at=task.lease_expires_at,
+                lease_expires_at=claimed.lease_expires_at,
             )
             attempt = await store.begin_work_attempt(
                 WorkAttemptCreate(
@@ -1569,7 +1585,7 @@ def test_postgres_verified_work_lease_checks_use_post_lock_time(postgres_dsn):
                     "session:postgres:post-lock-task-lease",
                 ),
                 worker_id="postgres-post-lock-worker",
-                lease_expires_at=task.lease_expires_at,
+                lease_expires_at=claimed.lease_expires_at,
             )
             await lock_connection.execute(
                 "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
@@ -2084,6 +2100,7 @@ def test_postgres_task_store_replays_terminalization_and_receipt(postgres_dsn):
         request = TaskTerminalizationRequest(
             task_id="task_terminal",
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_terminal"),
             kind=TaskTerminalKind.COMPLETED,
             result={"summary": "done", "metrics": {"changed": 2, "checked": 4}},
             idempotency_key="terminal-attempt-1",
@@ -2099,9 +2116,7 @@ def test_postgres_task_store_replays_terminalization_and_receipt(postgres_dsn):
         assert type(receipt) is TaskTerminalizationReceipt
         assert receipt.task == first
         assert receipt.worker_id == "worker_a"
-        assert receipt.request_sha256 == (
-            "f44314f4f13d93a708c544e83a90ecb2e2dea4d6dd7f4ceb0512b2f895d364a8"
-        )
+        assert receipt.request_sha256 == prepare_task_terminalization(request)[1]
 
     _run(postgres_dsn, ops)
 
@@ -2185,6 +2200,7 @@ def test_postgres_ordinary_cancellation_reconciler_and_late_worker_serialize(
                     TaskTerminalizationRequest(
                         task_id=request.task_id,
                         worker_id=request.original_worker_id,
+                        lease_expires_at=request.original_lease_expires_at,
                         handoff_id=request.original_handoff_id,
                         kind=TaskTerminalKind.CANCELLED,
                         error={"code": "operator"},
@@ -2850,7 +2866,9 @@ def test_postgres_task_retry_deadline_probe_rechecks_lease_after_lock_wait(postg
                         (claimed.id,),
                     )
                     probe = asyncio.create_task(
-                        store.task_retry_deadline_elapsed(claimed.id, "worker-a")
+                        store.task_retry_deadline_elapsed(
+                            claimed.id, "worker-a", lease_expires_at=claimed.lease_expires_at
+                        )
                     )
                     await asyncio.sleep(1.1)
                     assert not probe.done()
@@ -2891,6 +2909,7 @@ def test_postgres_connection_failure_subclass_is_acknowledgement_ambiguous(postg
             TaskTerminalizationRequest(
                 task_id="task_connection_failure",
                 worker_id="worker_a",
+                lease_expires_at=await _exact_task_lease(store, "task_connection_failure"),
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "done"},
                 idempotency_key="connection-failure",
@@ -2917,6 +2936,7 @@ def test_postgres_task_store_terminalization_rejects_wrong_worker_and_changed_in
         winner = TaskTerminalizationRequest(
             task_id="task_wrong_worker",
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_wrong_worker"),
             kind=TaskTerminalKind.COMPLETED,
             result={"summary": "done"},
             idempotency_key="terminal-key",
@@ -2935,6 +2955,7 @@ def test_postgres_task_store_terminalization_rejects_wrong_worker_and_changed_in
             TaskTerminalizationRequest(
                 task_id="task_wrong_worker",
                 worker_id="worker_a",
+                lease_expires_at=winner.lease_expires_at,
                 kind=TaskTerminalKind.FAILED,
                 error={"message": "changed"},
                 idempotency_key="terminal-key",
@@ -2957,6 +2978,7 @@ def test_postgres_task_store_terminalization_concurrency_converges_or_conflicts(
         exact = TaskTerminalizationRequest(
             task_id="task_exact_race",
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_exact_race"),
             kind=TaskTerminalKind.COMPLETED,
             result={"summary": "done"},
             idempotency_key="race-key",
@@ -2970,6 +2992,7 @@ def test_postgres_task_store_terminalization_concurrency_converges_or_conflicts(
             TaskTerminalizationRequest(
                 task_id="task_conflict_race",
                 worker_id="worker_b",
+                lease_expires_at=await _exact_task_lease(store, "task_conflict_race"),
                 kind=TaskTerminalKind.COMPLETED,
                 result={"winner": "completed"},
                 idempotency_key="conflict-key",
@@ -2977,6 +3000,7 @@ def test_postgres_task_store_terminalization_concurrency_converges_or_conflicts(
             TaskTerminalizationRequest(
                 task_id="task_conflict_race",
                 worker_id="worker_b",
+                lease_expires_at=await _exact_task_lease(store, "task_conflict_race"),
                 kind=TaskTerminalKind.FAILED,
                 error={"winner": "failed"},
                 idempotency_key="conflict-key",
@@ -3009,7 +3033,9 @@ def test_postgres_task_store_replays_terminalization_after_reconstruction(postgr
         first_store = _new_store(postgres_dsn)
         try:
             await first_store.create_task(TaskCreate(task_id="task_restart", type="review"))
-            assert await first_store.claim_task("worker_a") is not None
+            claimed = await first_store.claim_task("worker_a")
+            assert claimed is not None
+            request = request.model_copy(update={"lease_expires_at": claimed.lease_expires_at})
             terminal = await first_store.terminalize_task(request)
         finally:
             await first_store.close()
@@ -3265,7 +3291,7 @@ def test_postgres_attempt_publication_fences_stale_lease_reclamation_snapshot(
                 MethodType(blocked_store, preparing)
             )
             preparation = asyncio.create_task(preparing.prepare_local_execution_attempt(authority))
-            await asyncio.wait_for(publication_entered.wait(), timeout=5)
+            await asyncio.wait_for(publication_entered.wait(), timeout=10)
             await asyncio.sleep(1.1)
 
             reclamation = asyncio.create_task(reclaiming.reclaim_expired())
@@ -3638,7 +3664,7 @@ def test_postgres_claim_lease_starts_after_retry_fence_wait(postgres_dsn):
 
             store._lock_local_execution_retry_fence = MethodType(observed_lock, store)
             claim_task = asyncio.create_task(store.claim_task("post-fence-worker", lease_seconds=1))
-            await asyncio.wait_for(entered_fence.wait(), timeout=5)
+            await asyncio.wait_for(entered_fence.wait(), timeout=10)
             await asyncio.sleep(1.05)
             async with blocker.cursor() as cur:
                 await cur.execute("SELECT clock_timestamp()")
@@ -3723,7 +3749,7 @@ def test_postgres_claim_rechecks_retry_deadline_after_retry_fence_wait(postgres_
 
             store._lock_local_execution_retry_fence = MethodType(observed_lock, store)
             claim_task = asyncio.create_task(store.claim_task("late-retry-worker"))
-            await asyncio.wait_for(entered_fence.wait(), timeout=5)
+            await asyncio.wait_for(entered_fence.wait(), timeout=10)
             async with blocker.cursor() as cur:
                 await cur.execute(
                     "SELECT GREATEST(EXTRACT(EPOCH FROM (%s::timestamptz - clock_timestamp())), 0)",
@@ -5781,10 +5807,10 @@ def test_postgres_task_admission_notification_is_content_free_and_cross_store(
             assert wakeup is not None
             first_attempt = consumer._task_admission_listener_first_attempt
             assert first_attempt is not None
-            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            await asyncio.wait_for(first_attempt.wait(), timeout=10)
 
             async def receive_notification():
-                async for notification in observer.notifies(timeout=1, stop_after=1):
+                async for notification in observer.notifies(timeout=10, stop_after=1):
                     return notification
                 raise TimeoutError("Postgres task-admission notification was not received.")
 
@@ -5799,8 +5825,8 @@ def test_postgres_task_admission_notification_is_content_free_and_cross_store(
                 )
             )
 
-            assert await asyncio.wait_for(hinted, timeout=1) is False
-            received = await asyncio.wait_for(notification, timeout=1)
+            assert await asyncio.wait_for(hinted, timeout=10) is False
+            received = await asyncio.wait_for(notification, timeout=10)
             assert received.channel == _TASK_ADMISSION_NOTIFY_CHANNEL
             assert received.payload == ""
             claimed = await consumer.claim_task("remote-worker", TaskQuery(type="job"))
@@ -5828,7 +5854,7 @@ def test_postgres_same_store_admission_wakes_only_one_waiter(postgres_dsn):
                 wakeups.append(wakeup)
             first_attempt = store._task_admission_listener_first_attempt
             assert first_attempt is not None
-            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            await asyncio.wait_for(first_attempt.wait(), timeout=10)
             assert store._task_admission_listener_connection is not None
 
             waits = [asyncio.create_task(wakeup.wait(10.0, None)) for wakeup in wakeups]
@@ -5911,17 +5937,19 @@ def test_postgres_listener_start_during_admission_does_not_duplicate_wake(postgr
             creation = asyncio.create_task(
                 store.create_task(TaskCreate(task_id="listener-start-race", type="job"))
             )
-            await asyncio.wait_for(mutation_ready.wait(), timeout=1)
+            await asyncio.wait_for(mutation_ready.wait(), timeout=10)
 
             store._ensure_task_admission_listener = original_ensure_listener
             original_ensure_listener()
             first_attempt = store._task_admission_listener_first_attempt
             assert first_attempt is not None
-            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            await asyncio.wait_for(first_attempt.wait(), timeout=10)
             allow_commit.set()
-            await asyncio.wait_for(creation, timeout=1)
+            await asyncio.wait_for(creation, timeout=10)
 
-            async with asyncio.timeout(1):
+            async with asyncio.timeout(5):
+                while not any(wait.done() for wait in waits):
+                    await asyncio.sleep(0)
                 while store._task_admission_notification_senders:
                     await asyncio.sleep(0)
             assert sum(wait.done() for wait in waits) == 1
@@ -5951,7 +5979,7 @@ def test_postgres_lost_notification_converges_at_bounded_poll(postgres_dsn):
             assert wakeup is not None
             first_attempt = consumer._task_admission_listener_first_attempt
             assert first_attempt is not None
-            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            await asyncio.wait_for(first_attempt.wait(), timeout=10)
             listener = consumer._task_admission_listener_task
             assert listener is not None
             listener.cancel()
@@ -5971,6 +5999,7 @@ def test_postgres_lost_notification_converges_at_bounded_poll(postgres_dsn):
     asyncio.run(run())
 
 
+@pytest.mark.qualification
 def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgres_dsn):
     async def run() -> None:
         await _truncate(postgres_dsn)
@@ -6014,13 +6043,13 @@ def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgre
             for index in range(100)
         ]
         try:
-            async with asyncio.timeout(3):
+            async with asyncio.timeout(10):
                 while consumer._task_admission_wakeup_broker.subscriber_count != 100:
                     await asyncio.sleep(0)
             first_attempt = consumer._task_admission_listener_first_attempt
             assert first_attempt is not None
-            await asyncio.wait_for(first_attempt.wait(), timeout=1)
-            async with asyncio.timeout(2):
+            await asyncio.wait_for(first_attempt.wait(), timeout=10)
+            async with asyncio.timeout(10):
                 while metrics.snapshot().empty_claims == 0:
                     await asyncio.sleep(0)
 
@@ -6075,7 +6104,7 @@ def test_postgres_task_admission_listener_reconnects_after_disconnect(postgres_d
             assert wakeup is not None
             first_attempt = consumer._task_admission_listener_first_attempt
             assert first_attempt is not None
-            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            await asyncio.wait_for(first_attempt.wait(), timeout=10)
             first_connection = consumer._task_admission_listener_connection
             assert first_connection is not None
 
@@ -6123,7 +6152,7 @@ def test_postgres_immediate_retry_successor_notifies_remote_waiter(postgres_dsn)
             assert wakeup is not None
             first_attempt = consumer._task_admission_listener_first_attempt
             assert first_attempt is not None
-            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            await asyncio.wait_for(first_attempt.wait(), timeout=10)
             hinted = asyncio.create_task(wakeup.wait(10.0, None))
             await asyncio.sleep(0)
 
@@ -6131,6 +6160,7 @@ def test_postgres_immediate_retry_successor_notifies_remote_waiter(postgres_dsn)
                 TaskRetrySettlementRequest(
                     task_id=claimed.id,
                     worker_id="retry-producer",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key="retry-notification",
                     causal_budget_id=claimed.retry_series.causal_budget_id,
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,

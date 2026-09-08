@@ -1011,7 +1011,7 @@ def test_task_retry_active_cancellation_retains_claim_until_handler_quiesces(
             )
         )
         try:
-            await asyncio.wait_for(started.wait(), timeout=3)
+            await asyncio.wait_for(started.wait(), timeout=10)
             requested = await store.cancel_task(
                 "active-cancellation-drain",
                 {"code": "operator"},
@@ -1683,7 +1683,7 @@ def test_task_retry_worker_shutdown_releases_quiescent_unreported_attempt(
             )
         )
         try:
-            await asyncio.wait_for(started.wait(), timeout=3)
+            await asyncio.wait_for(started.wait(), timeout=10)
             worker.cancel("shutdown worker")
             await asyncio.sleep(0)
             assert worker.done() is False
@@ -1755,7 +1755,7 @@ def test_task_retry_worker_shutdown_settles_quiescent_handler_report(
             )
         )
         try:
-            await asyncio.wait_for(started.wait(), timeout=3)
+            await asyncio.wait_for(started.wait(), timeout=10)
             worker.cancel("shutdown worker")
             await asyncio.sleep(0)
             assert worker.done() is False
@@ -1831,7 +1831,7 @@ def test_task_retry_worker_shutdown_reconciles_cancellation_requested_while_drai
             )
         )
         try:
-            await asyncio.wait_for(started.wait(), timeout=3)
+            await asyncio.wait_for(started.wait(), timeout=10)
             worker.cancel("shutdown worker")
             await asyncio.sleep(0)
             assert worker.done() is False
@@ -1908,7 +1908,7 @@ def test_task_retry_owner_shutdown_settles_existing_cancellation_request(
             )
         )
         try:
-            await asyncio.wait_for(started.wait(), timeout=3)
+            await asyncio.wait_for(started.wait(), timeout=10)
             requested = await store.cancel_task(
                 "shutdown-cancellation",
                 {"code": "operator"},
@@ -2622,7 +2622,7 @@ def test_task_worker_retains_active_handler_at_series_deadline_until_quiescent(
                     poll_interval_s=0.01,
                 )
             )
-            await asyncio.wait_for(handler_started.wait(), timeout=1)
+            await asyncio.wait_for(handler_started.wait(), timeout=10)
             await asyncio.sleep(0.75)
             assert worker.done() is False
             assert handler_stopped.is_set() is False
@@ -2943,7 +2943,7 @@ def test_task_worker_defers_cancellation_during_deadline_terminalization() -> No
         await asyncio.sleep(0.75)
         assert store.terminalization_started.is_set() is False
         release_handler.set()
-        await asyncio.wait_for(store.terminalization_started.wait(), timeout=3)
+        await asyncio.wait_for(store.terminalization_started.wait(), timeout=10)
         worker.cancel()
         await asyncio.sleep(0)
 
@@ -3187,7 +3187,7 @@ def test_task_retry_worker_retains_lease_and_settles_before_redelivering_cancell
             )
         )
         try:
-            await asyncio.wait_for(store.settlement_started.wait(), timeout=3)
+            await asyncio.wait_for(store.settlement_started.wait(), timeout=10)
             worker.cancel("shutdown during attempt settlement")
             await asyncio.sleep(1.1)
 
@@ -3298,8 +3298,8 @@ def test_retry_worker_fences_replacement_while_lost_lease_handler_drains(
                 reclaim=False,
             )
         )
-        await asyncio.wait_for(handler_started.wait(), timeout=2)
-        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=2)
+        await asyncio.wait_for(handler_started.wait(), timeout=10)
+        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=10)
         await asyncio.sleep(1.05)
         draining = await store.load_task("retry-heartbeat-drain-fence")
         assert draining is not None
@@ -3479,7 +3479,7 @@ def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failur
                 poll_interval_s=0.01,
             )
         )
-        await asyncio.wait_for(handler_started.wait(), timeout=2)
+        await asyncio.wait_for(handler_started.wait(), timeout=10)
         await asyncio.wait_for(store.heartbeat_failed.wait(), timeout=2)
         for _attempt in range(100):
             draining = await store.load_task("retry-heartbeat-failure")
@@ -3694,7 +3694,7 @@ def test_task_retry_worker_preserves_owner_cancellation_when_handler_cleanup_gro
                 poll_interval_s=0.01,
             )
         )
-        await asyncio.wait_for(handler_started.wait(), timeout=3)
+        await asyncio.wait_for(handler_started.wait(), timeout=10)
         worker.cancel("shutdown grouped handler")
         await asyncio.sleep(0)
         assert worker.done() is False

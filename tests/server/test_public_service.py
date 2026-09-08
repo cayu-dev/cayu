@@ -900,7 +900,7 @@ def test_result_receipt_is_durable_before_session_completion() -> None:
         )
 
         execution = asyncio.create_task(service.execute_work(reservation.operation.work_id))
-        await asyncio.wait_for(store.receipt_started.wait(), timeout=1)
+        await asyncio.wait_for(store.receipt_started.wait(), timeout=10)
 
         state = await service.cayu_app.session_store.load_state(reservation.operation.session_id)
         assert state is not None
@@ -1412,6 +1412,7 @@ def test_product_continuation_adoption_retry_survives_product_state_changes() ->
     body = {
         "session_id": operation.session_id,
         "prompt": "continue",
+        "max_steps": 20,
         "profile_adoption": {
             "idempotency_key": "continuation-adoption-retry-v1",
             "reason": "Adopt this exact product continuation.",
@@ -3416,7 +3417,7 @@ def test_terminal_settlement_wins_an_in_flight_heartbeat(monkeypatch) -> None:
 
         completed = await asyncio.wait_for(
             service.execute_work("work_settlement_heartbeat"),
-            timeout=2,
+            timeout=15,
         )
 
         assert completed is not None

@@ -17,6 +17,7 @@ from tests.core.completion_verifier_profile_fixtures import (
     prepare_test_completion_verifier_profile,
 )
 from tests.core.task_invocation_fixtures import (
+    stored_session_invocation,
     task_backed_session_invocation,
     unattributed_session_invocation_binding,
 )
@@ -3917,7 +3918,7 @@ def test_ordinary_worker_and_run_entrances_reject_contracted_tasks_before_execut
                 session_id=resume_session_id,
                 work_contract=contract.reference(),
             ),
-            session_invocation=unattributed_session_invocation_binding(session.id),
+            session_invocation=await stored_session_invocation(app.session_store, session.id),
         )
         resume_stream = app.resume(
             ResumeRequest(
@@ -5297,7 +5298,7 @@ def test_approval_continuation_rejects_session_contract_before_effects() -> None
                 session_id=session_id,
                 work_contract=contract.reference(),
             ),
-            session_invocation=unattributed_session_invocation_binding(session_id),
+            session_invocation=await stored_session_invocation(session_store, session_id),
         )
         session_before = await session_store.load(session_id)
         checkpoint_before = await session_store.load_checkpoint(session_id)
@@ -5341,7 +5342,7 @@ def test_approval_continuation_rejects_session_contract_before_effects() -> None
                 decision=ToolApprovalDecision.APPROVE,
             )
         )
-        with pytest.raises(TaskCompletionDecisionRequired, match="verifier-aware"):
+        with pytest.raises(TaskClaimLost, match="does not own.*attached task session"):
             await anext(stream)
 
         assert tool.calls == []
@@ -7987,7 +7988,7 @@ def test_ordinary_execution_rejection_does_not_retain_sensitive_task(
                 metadata={"private": secret},
                 work_contract=contract.reference(),
             ),
-            session_invocation=unattributed_session_invocation_binding(recovery_session_id),
+            session_invocation=await stored_session_invocation(session_store, recovery_session_id),
         )
         app = CayuApp(
             session_store=session_store,

@@ -221,6 +221,7 @@ class _CapabilityProvider(ModelProvider):
 
 class _RecordingOpenAIProvider(OpenAIProvider):
     def __init__(self) -> None:
+        super().__init__(api_key="test-key")
         self.requests: list[ModelRequest] = []
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:

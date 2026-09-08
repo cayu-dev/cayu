@@ -116,7 +116,7 @@ the foundational backends, not to absorb every vendor SDK.
 Prerequisites: [uv](https://docs.astral.sh/uv/) and Python ≥ 3.11 (CI runs 3.14; uv
 installs it on demand). Docker is optional. It is required for container-runner and
 container-egress tests and for the default testcontainers-managed Postgres setup; the
-Postgres tier can instead use a disposable external database.
+Postgres tier can instead use a disposable external server with database-creation permission.
 
 ```bash
 git clone https://github.com/cayu-dev/cayu.git && cd cayu
@@ -139,16 +139,19 @@ It preserves each backend's real transaction boundary and must not be copied int
 production code or the installed testing API.
 
 The parallel command is safe with the default testcontainers-managed Postgres setup,
-where each worker gets an isolated container. When `CAYU_TEST_POSTGRES_DSN` points at one
-shared database, run the suite serially because store tests intentionally clear their
-disposable schema between cases.
+where each worker gets an isolated container. Each test module receives a uniquely
+named database, keeping schema revisions and deployment alias keyrings isolated.
+`CAYU_TEST_POSTGRES_DSN` may point at a shared disposable test server; its role must
+be able to create and drop databases. The fixture removes each module's database
+at teardown.
 
 Postgres tests **skip automatically** when no disposable database is available. Two
 ways to run them:
 
 - Have Docker running — the suite provisions a disposable pgvector Postgres via
   testcontainers.
-- Or point `CAYU_TEST_POSTGRES_DSN` at a **disposable** database (tests drop tables).
+- Or point `CAYU_TEST_POSTGRES_DSN` at a **disposable** test server using a role with
+  database-creation permission.
 
 Docker runner and egress tests require a running Docker daemon and skip automatically
 when it is unavailable.
@@ -196,19 +199,26 @@ before regenerating the source bundle.
 
 ### Pull request verification
 
-Every pull request runs the repository-wide static checks and the complete Python 3.14
-test suite without coverage instrumentation. A small fail-open path selector additionally
+Every pull request runs repository-wide static checks and the Python 3.14 regression
+suite without coverage instrumentation. The PR gate targets approximately ten minutes; test
+jobs allow fifteen minutes and package verification jobs allow ten minutes. A small fail-open path selector additionally
 runs the retained SQLite cancellation, package/sidecar, and dashboard gates whenever their
 contracts can change. `main` runs every retained gate.
-Duration-balanced general tests run across six single-process jobs, while stress and process
-tests share an isolated lane and Postgres conformance runs in two duration-balanced jobs. CI
+Duration-balanced general tests run across 32 jobs, and Postgres conformance
+runs across eight jobs. Each PR shard uses two pytest workers with file-level scheduling
+to preserve module fixture isolation. Ordinary process recovery regressions remain in the PR gate.
+Tests marked `stress` or `qualification`, including full-scale evidence and capacity checks,
+run separately across eight shards in `qualification.yml`, daily and on manual dispatch.
+CI
 rejects a duration snapshot after more than 5% of collected tests lack timings; refresh it
 with the command above before it can materially unbalance the shards.
 
-Release tags rerun every retained gate, add release-only freshness and tag/version checks,
-and may publish the exact artifact validated by that release path.
+Release tags rerun every retained gate and require full-scale qualification, add release-only
+freshness and tag/version checks, and may publish the exact artifact validated by that release
+path. Package verification builds one wheel and source archive, then checks those same archives
+in parallel core, server, dashboard, authoring, coding, Docker, and service jobs.
 
-Run that same retained CI contract locally from a clean tracked checkout:
+Run the complete contract, including full-scale qualification, locally from a clean tracked checkout:
 
 ```bash
 python3 scripts/run_ci.py --base origin/main --head HEAD
@@ -222,7 +232,7 @@ runner revalidates the detached head and tracked tree before issuing successful 
 hosted lanes with two concurrent general-shard workers and writes
 `/tmp/cayu-local-ci-proof-<sha>.md` with commands, results, durations, pass/skip counts, platform,
 and limitations. Use `--all` to retain every optional PR lane regardless of changed paths. Set
-`--jobs 1` for the lowest local resource usage or increase it up to `--jobs 6` on a dedicated
+`--jobs 1` for the lowest local resource usage or increase it up to `--jobs 32` on a dedicated
 machine; specialist, database-conformance, SQLite, dashboard, and package lanes remain serial to
 avoid compounding their resource contention.
 
@@ -301,3 +311,5 @@ Use the issue templates. The short version:
 
 By contributing, you agree that your contributions will be licensed under the
 [Apache License 2.0](LICENSE), the same license that covers the project.
+
+The `browser-docker` specialist runs the shared real-browser fixture once for all of its checks; general shards exclude that marker.

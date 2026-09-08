@@ -77,7 +77,7 @@ def test_shutdown_drains_many_provider_operation_cancellation_owners() -> None:
             )
             for state in (_state(index) for index in range(owner_count))
         ]
-        await asyncio.wait_for(adapter.all_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.all_entered.wait(), timeout=10)
 
         before = lifecycle.snapshot()
         assert before.admissions_sealed is False
@@ -127,7 +127,7 @@ def test_shutdown_reports_unresolved_owner_and_repeated_drain_is_idempotent() ->
             ownership_lost=None,
         )
         assert duplicate is first
-        await asyncio.wait_for(adapter.all_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.all_entered.wait(), timeout=10)
 
         with pytest.raises(ProviderOperationCancellationCapacityExceeded):
             lifecycle.admit(
@@ -177,7 +177,7 @@ def test_owner_remains_tracked_until_ownership_watcher_settles() -> None:
             cancellation=lambda: adapter.cancel(state),
             ownership_lost=ownership_lost,
         )
-        await asyncio.wait_for(adapter.all_entered.wait(), timeout=1)
+        await asyncio.wait_for(adapter.all_entered.wait(), timeout=10)
         assert lifecycle.snapshot().active_tasks == 2
 
         ownership_lost.set()

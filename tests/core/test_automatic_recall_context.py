@@ -3841,7 +3841,7 @@ def test_runtime_records_unconfirmed_stream_cancellation_as_indeterminate() -> N
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=2)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

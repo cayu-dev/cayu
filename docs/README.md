@@ -20,6 +20,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [GitHub delivery](github-delivery.md)
 - [Memory foundation](memory-foundation.md)
 - [Model catalog](model-catalog.md)
+- [Operation outcomes](operation-outcomes.md)
 - [Named checks](named-checks.md)
 - [OpenAI subscription](openai-subscription.md)
 - [Project server](project-server.md)
@@ -32,12 +33,16 @@ authoritative only where a maintained guide points to the implementation or the
 - [Triggering runs](triggering-runs.md)
 - [Virtual egress](virtual-egress.md)
 - [Web fetch](web-fetch.md)
+- [Incremental workflow evidence](incremental-workflow-evidence.md)
+- [Workflow capture and recovery](workflow-eval-recovery.md)
 - Recipes: [business approvals](recipes/business-approvals.md), [GitHub CLI virtual egress](recipes/github-cli-virtual-egress.md), [PR reviewer](recipes/pr-reviewer.md), and [server auth and tenancy](recipes/server-auth-tenancy.md)
 
 ## Operations and verification
 
+- [Diagnostic support bundles](diagnostic-support-bundles.md)
 - [Git command policy](git-command-policy.md)
 - [Nightly verification](nightly-verification.md)
+- [Runtime stability qualification](runtime-qualification.md)
 - [Release notes](release-notes.md)
 - [Releasing](releasing.md)
 - [Session-operation fault harness](session-operation-fault-harness.md)
@@ -45,6 +50,9 @@ authoritative only where a maintained guide points to the implementation or the
 ## Architecture and implemented design records
 
 - [Architecture](architecture.md)
+- [Function-call event ordering investigation](function-call-event-ordering.md)
+- [Hosted-search event ordering investigation](hosted-search-event-ordering.md)
+- [Hosted-search source diagnostics](hosted-search-source-diagnostics.md)
 - [Database storage and migrations ADR](adr/0001-database-storage-and-migrations.md)
 - [AWS Bedrock and Lambda MicroVM implementation record](aws-bedrock-lambda-microvm-implementation-plan.md)
 - [AWS credentials](aws-credentials.md)

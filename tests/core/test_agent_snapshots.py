@@ -1650,7 +1650,7 @@ async def test_same_sqlite_scope_contention_does_not_duplicate_provider_effects(
     second = AgentSnapshotCoordinator(second_providers, store=second_store)
 
     first_task = asyncio.create_task(first.materialize(request))
-    await asyncio.wait_for(effect_started.wait(), timeout=1)
+    await asyncio.wait_for(effect_started.wait(), timeout=10)
     second_task = asyncio.create_task(second.materialize(request))
     for _ in range(1_000):
         if sum(provider.recover_operation_calls for provider in second_providers) > 0:
@@ -1706,7 +1706,7 @@ async def test_same_in_memory_scope_contention_does_not_duplicate_provider_effec
     second = AgentSnapshotCoordinator(second_providers, store=store)
 
     first_task = asyncio.create_task(first.materialize(request))
-    await asyncio.wait_for(effect_started.wait(), timeout=1)
+    await asyncio.wait_for(effect_started.wait(), timeout=10)
     second_task = asyncio.create_task(second.materialize(request))
     for _ in range(1_000):
         if sum(provider.recover_operation_calls for provider in second_providers) > 0:

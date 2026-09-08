@@ -242,15 +242,15 @@ explicit.
 The bundle embeds the exact structured `cayu check` result; it does not copy or
 rename that command's diagnostic codes or severities. For a maintained service,
 it also projects the exact existing
-[`SystemDiagnosticsResponse` from #276](https://github.com/cayu-tech/cayu/issues/276)
+`SystemDiagnosticsResponse`
 using the route-owned capability snapshot and current bounded artifact
 registrations; no request actor is invented. A direct-app project reports that
 collector as `unavailable` with `maintained_service_not_selected`. Discovery
 metadata is never treated as authorization or live readiness.
 
-[AWS preflight #252](https://github.com/cayu-tech/cayu/issues/252) remains the
+AWS preflight remains the
 owner of AWS-specific configuration and permission probes.
-[Live provider verification #470](https://github.com/cayu-tech/cayu/issues/470)
+Live provider verification
 remains the owner of an explicitly requested bounded provider call. `cayu
 doctor` neither runs those probes nor turns their absence into fabricated
 health.

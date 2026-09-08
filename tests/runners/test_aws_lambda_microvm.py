@@ -1594,7 +1594,7 @@ async def test_lambda_microvm_runner_cancels_guest_command_and_preserves_diagnos
     )
 
     task = asyncio.create_task(runner.exec(ExecCommand.bash("sleep 30")))
-    await asyncio.wait_for(transport.get_started.wait(), timeout=1)
+    await asyncio.wait_for(transport.get_started.wait(), timeout=10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as excinfo:
         await task

@@ -1312,7 +1312,7 @@ def test_provider_neutral_thinking_uses_effective_adapter_projection() -> None:
     )
     provider = OpenAIProvider(api_key="test-key")
 
-    def observe(*, effort: str, max_tokens: int) -> RequestFootprint:
+    def observe(*, effort: str, max_tokens: int | None = None) -> RequestFootprint:
         return analyze_request_footprint(
             ModelRequest(
                 model="model-a",
@@ -1321,7 +1321,7 @@ def test_provider_neutral_thinking_uses_effective_adapter_projection() -> None:
                     "thinking": {
                         "enabled": True,
                         "effort": effort,
-                        "max_tokens": max_tokens,
+                        **({} if max_tokens is None else {"max_tokens": max_tokens}),
                     }
                 },
             ),
@@ -1337,17 +1337,13 @@ def test_provider_neutral_thinking_uses_effective_adapter_projection() -> None:
             config=config,
         )
 
-    baseline = observe(effort="high", max_tokens=100)
-    ignored_control_change = observe(effort="high", max_tokens=1_000)
-    provider_visible_change = observe(effort="low", max_tokens=100)
+    baseline = observe(effort="high")
+    provider_visible_change = observe(effort="low")
+    with pytest.raises(ValueError, match="mutually exclusive controls"):
+        observe(effort="high", max_tokens=100)
 
     assert baseline.options.known_categories == ("openai.reasoning",)
     assert baseline.options.unknown_count == 0
-    assert baseline.total == ignored_control_change.total
-    assert baseline.context_pressure == ignored_control_change.context_pressure
-    assert baseline.fingerprints.provider_neutral_request.value == (
-        ignored_control_change.fingerprints.provider_neutral_request.value
-    )
     assert baseline.fingerprints.provider_neutral_request.value != (
         provider_visible_change.fingerprints.provider_neutral_request.value
     )

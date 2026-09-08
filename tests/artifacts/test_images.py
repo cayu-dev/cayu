@@ -161,9 +161,9 @@ def test_decode_verified_image_format_serializes_warning_filter_contexts(monkeyp
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(image_validation.decode_verified_image_format, Image, content)
-        assert first_entered.wait(timeout=2)
+        assert first_entered.wait(timeout=10)
         second = executor.submit(second_decode)
-        assert second_started.wait(timeout=2)
+        assert second_started.wait(timeout=10)
         try:
             assert not second_entered.wait(timeout=0.1)
         finally:

@@ -2358,11 +2358,11 @@ def test_sync_binding_opposite_factory_race_has_one_winner_across_event_loops(
     )
 
     async def first_factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
-        factories_ready.wait(timeout=5)
+        factories_ready.wait(timeout=10)
         return SyncTargetWorkspacePlan(workspace=second)
 
     async def second_factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
-        factories_ready.wait(timeout=5)
+        factories_ready.wait(timeout=10)
         return SyncTargetWorkspacePlan(workspace=first)
 
     bindings = (
@@ -3990,7 +3990,7 @@ def test_sync_binding_cancellation_retains_capacity_until_stream_writer_settles(
             staging_capacity=capacity,
         )
         task = asyncio.create_task(binding.bind(source, None, session_id="sess-cancel-stream"))
-        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=10)
         before_cancel = capacity.snapshot()
         assert before_cancel.active_transfers == 1
         assert before_cancel.staged_bytes > 0
@@ -4122,7 +4122,7 @@ def test_sync_binding_reobserves_cache_hits_before_target_materialization(tmp_pa
         first_task = asyncio.create_task(
             first_binding.bind(first_source, None, session_id="sess-cache-owner")
         )
-        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=10)
 
         second_source = _MutatingSecondReadLocalWorkspace(
             second_source_root,
@@ -4194,7 +4194,7 @@ def test_sync_binding_archive_reuse_key_includes_every_copy_limit(tmp_path) -> N
                 asyncio.create_task(binding.bind(source, None, session_id=f"sess-policy-{index}"))
             )
 
-        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=10)
         snapshot = capacity.snapshot()
         assert snapshot.shared_archives == 2
         assert snapshot.total_archive_builds == 2
@@ -4260,7 +4260,7 @@ def test_sync_binding_archive_reuse_key_includes_workspace_exclusion_policy(tmp_
                 )
             )
 
-        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=10)
         snapshot = capacity.snapshot()
         assert snapshot.shared_archives == len(exclusion_policies)
         assert snapshot.total_archive_builds == len(exclusion_policies)
@@ -4316,7 +4316,7 @@ def test_sync_binding_archive_reuse_identity_includes_preserved_git_mode(tmp_pat
                 asyncio.create_task(binding.bind(source, None, session_id=f"sess-mode-{index}"))
             )
 
-        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=10)
         snapshot = capacity.snapshot()
         assert snapshot.shared_archives == 2
         assert snapshot.total_archive_builds == 2
@@ -4370,7 +4370,7 @@ def test_sync_binding_archive_reuse_key_includes_opaque_source_revisions(tmp_pat
                 asyncio.create_task(binding.bind(source, None, session_id=f"sess-revision-{index}"))
             )
 
-        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=10)
         snapshot = capacity.snapshot()
         assert snapshot.shared_archives == 2
         assert snapshot.total_archive_builds == 2

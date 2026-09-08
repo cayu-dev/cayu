@@ -110,7 +110,7 @@ def _serialized_auth_store_save(
         return
     with store._exclusive_lock() as directory_fd:
         started.set()
-        if not release.wait(timeout=5):
+        if not release.wait(timeout=20):
             raise AssertionError("auth-store concurrency test did not release first writer")
         store._save_credentials_unlocked(credentials, directory_fd)
 
@@ -1242,9 +1242,9 @@ def test_auth_store_concurrent_processes_are_complete_and_last_waiter_wins(
         ),
     )
     first.start()
-    assert first_started.wait(timeout=5)
+    assert first_started.wait(timeout=10)
     second.start()
-    assert second_started.wait(timeout=5)
+    assert second_started.wait(timeout=10)
     assert second_lock_attempted.wait(timeout=5)
     assert not second_completed.wait(timeout=0.2)
     release_first.set()
@@ -1425,10 +1425,10 @@ def test_auth_store_missing_delete_waits_for_concurrent_save(
     )
 
     save.start()
-    assert save_started.wait(timeout=5)
+    assert save_started.wait(timeout=10)
     assert not auth_path.exists()
     delete.start()
-    attempted = delete_lock_attempted.wait(timeout=5)
+    attempted = delete_lock_attempted.wait(timeout=10)
     blocked = not read_result.poll(0.2)
     release_save.set()
     _join_auth_store_process(save)

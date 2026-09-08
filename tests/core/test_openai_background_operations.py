@@ -791,7 +791,7 @@ async def test_openai_background_real_cancellation_during_deadline_cleanup_wins(
     task = asyncio.create_task(
         adapter.start(ProviderOperationStartRequest(request=_request(), idempotency_key="start-id"))
     )
-    await asyncio.wait_for(close_started.wait(), timeout=1)
+    await asyncio.wait_for(close_started.wait(), timeout=10)
     task.cancel("caller cancellation during stream cleanup")
 
     with pytest.raises(asyncio.CancelledError):

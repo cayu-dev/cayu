@@ -307,7 +307,7 @@ def test_fresh_process_opaque_dispatch_and_competing_terminalizers(tmp_path, bac
         request.getfixturevalue("postgres_dsn") if backend == "postgres" else tmp_path / "opaque.db"
     )
     producer = subprocess.run(
-        [sys.executable, str(helper), "produce", str(database)],
+        [sys.executable, str(helper), "produce", str(database), backend],
         capture_output=True,
         text=True,
         check=True,
@@ -315,7 +315,7 @@ def test_fresh_process_opaque_dispatch_and_competing_terminalizers(tmp_path, bac
     )
     request_json = producer.stdout.strip()
     assert json.loads(request_json)["terminalization_only"]
-    args = [sys.executable, str(helper), "recover", str(database), request_json]
+    args = [sys.executable, str(helper), "recover", str(database), request_json, backend]
     workers = [
         subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         for _ in range(2)

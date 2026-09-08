@@ -167,7 +167,7 @@ def test_visual_publication_seals_secret_scope_before_artifact_await(
             assert not entered.is_set()
             assert not (await store.list(session_id=ctx.session_id)).artifacts
         else:
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 10)
             if phase == "static_change":
                 tracker._redactor = SecretRedactor("visual-late-secret-canary")
             else:

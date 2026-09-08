@@ -42,6 +42,7 @@ from cayu.runtime.checkpoints import (
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     decode_runtime_checkpoint,
 )
+from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     ActiveInvocationExecutionProfile,
@@ -323,7 +324,7 @@ def profiled_session_identity(
     thinking: ThinkingConfig | None = None,
     request_budget_limits: tuple[BudgetLimit, ...] = (),
     causal_budget_id: str | None = None,
-    max_steps: int = 16,
+    max_steps: int = DEFAULT_MAX_STEPS,
     limits: RunLimits | None = None,
     retry_policy: RetryPolicy | None = None,
     app: CayuApp | None = None,

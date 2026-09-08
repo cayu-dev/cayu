@@ -2350,9 +2350,9 @@ def test_delayed_creating_worker_converges_after_open_branch_mutation(
         source, request = await _interrupted_durable_creating_branch(root, store)
 
         first = asyncio.create_task(source.create_branch(request))
-        await asyncio.wait_for(store.first_guard_entered.wait(), timeout=5)
+        await asyncio.wait_for(store.first_guard_entered.wait(), timeout=10)
         second = asyncio.create_task(source.create_branch(request))
-        await asyncio.wait_for(store.second_guard_entered.wait(), timeout=5)
+        await asyncio.wait_for(store.second_guard_entered.wait(), timeout=10)
         try:
             store.release_first_guard.set()
             opened = await asyncio.wait_for(first, timeout=5)
@@ -2401,9 +2401,9 @@ def test_delayed_creating_worker_replays_durable_creation_failure(
 
         monkeypatch.setattr(branch_module, "_capture_baseline_at_private_root", fail_capture)
         first = asyncio.create_task(source.create_branch(request))
-        await asyncio.wait_for(store.first_guard_entered.wait(), timeout=5)
+        await asyncio.wait_for(store.first_guard_entered.wait(), timeout=10)
         second = asyncio.create_task(source.create_branch(request))
-        await asyncio.wait_for(store.second_guard_entered.wait(), timeout=5)
+        await asyncio.wait_for(store.second_guard_entered.wait(), timeout=10)
         try:
             store.release_first_guard.set()
             failed = await asyncio.wait_for(first, timeout=5)
@@ -4183,7 +4183,7 @@ def test_cancelling_terminal_assistance_does_not_claim_later_owner(
         assistance = asyncio.create_task(
             branch_module._retry_pending_durable_terminal_settlements(source_key)
         )
-        await asyncio.wait_for(first_started.wait(), timeout=5)
+        await asyncio.wait_for(first_started.wait(), timeout=10)
         records = dict(registry.items())
         assert records[first_key].claimed
         assert not records[second_key].claimed

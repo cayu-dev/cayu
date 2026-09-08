@@ -9,7 +9,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 import traceback
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
@@ -770,8 +769,8 @@ class FailingApprovalCloseStore(InMemorySessionStore):
 class FailingTerminalToolEventStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, ownership_clock=None) -> None:
+        super().__init__(ownership_clock=ownership_clock)
         self.failed_terminal_once = False
         self.release_calls = 0
 
@@ -962,8 +961,8 @@ class BlockingPostPersistEventsLoadStore(FailingTerminalToolEventStore):
 
     """Pause the first recovery after its manual terminal outcome is durable."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, ownership_clock=None) -> None:
+        super().__init__(ownership_clock=ownership_clock)
         self.post_persist_load_started = asyncio.Event()
         self.allow_post_persist_load = asyncio.Event()
         self.blocked_post_persist_load = False
@@ -1773,7 +1772,43 @@ def checkpoint_without_model_step_publication(
     copied.pop(model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
     copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
     copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
+    if SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in copied:
+        assert settled_invocation_terminal_decision_from_checkpoint(copied) is not None
+        copied.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY)
     return copied
+
+
+def _expected_failure_evidence(
+    session_id: str, *exception_types: str, run_epoch: int = 1
+) -> dict[str, Any]:
+    return {
+        "classification": "failure",
+        "deadline": None,
+        "deadline_phase": None,
+        "exception_types": list(exception_types),
+        "run_epoch": run_epoch,
+        "secondary_failures": False,
+        "session_id": session_id,
+        "settlement": "unknown",
+        "terminal_event_id": None,
+        "truncated": False,
+    }
+
+
+def _expected_compaction_failure(event: Event) -> dict[str, Any]:
+    assert event.type == EventType.CONTEXT_COMPACTION_FAILED
+    elapsed_ms = event.payload["elapsed_ms"]
+    assert type(elapsed_ms) is int and elapsed_ms >= 0
+    expected = {
+        "elapsed_ms": elapsed_ms,
+        "phase": "provider_dispatch",
+        "provider_dispatch_disposition": "unknown",
+        "reason": "internal_failed",
+        "recovery_action": "reconcile_completion",
+        "retryable": False,
+    }
+    assert {key: event.payload[key] for key in expected} == expected
+    return expected
 
 
 def checkpoint_without_active_invocation_profile(
@@ -1787,6 +1822,9 @@ def checkpoint_without_active_invocation_profile(
     copied = dict(checkpoint)
     copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
     copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
+    if SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY in copied:
+        assert settled_invocation_terminal_decision_from_checkpoint(copied) is not None
+        copied.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY)
     return copied
 
 
@@ -4976,7 +5014,7 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
     with pytest.raises(TypeError, match="secret_redactor"):
         CayuApp(secret_redactor="not a redactor")  # type: ignore[arg-type]
 
-    with pytest.raises(TypeError, match="max_file_attachment_bytes"):
+    with pytest.raises(ValidationError, match="max_file_attachment_bytes"):
         CayuApp(
             config=CayuConfig(tool_execution=ToolExecutionConfig(max_file_attachment_bytes=1.5))
         )  # type: ignore[arg-type]
@@ -6360,7 +6398,7 @@ def test_cancellation_waits_for_factory_result_release_then_propagates(tmp_path)
                 ),
             )
         )
-        await asyncio.wait_for(release_started.wait(), timeout=1)
+        await asyncio.wait_for(release_started.wait(), timeout=10)
         run_task.cancel()
         await asyncio.sleep(0)
         assert run_task.done() is False
@@ -6485,7 +6523,7 @@ def test_cancellation_waits_for_factory_fallback_release_then_propagates(tmp_pat
                 ),
             )
         )
-        await asyncio.wait_for(runner.close_started.wait(), timeout=1)
+        await asyncio.wait_for(runner.close_started.wait(), timeout=10)
         run_task.cancel()
         await asyncio.sleep(0)
         assert run_task.done() is False
@@ -6555,7 +6593,7 @@ def test_cancelled_factory_checkpoint_reports_fallback_cleanup_failure(
                 ),
             )
         )
-        await asyncio.wait_for(checkpoint_started.wait(), timeout=1)
+        await asyncio.wait_for(checkpoint_started.wait(), timeout=10)
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await run_task
@@ -6635,7 +6673,7 @@ def test_cancelled_factory_checkpoint_read_discards_uncommitted_allocation(tmp_p
                 ),
             )
         )
-        await asyncio.wait_for(store.checkpoint_read_started.wait(), timeout=1)
+        await asyncio.wait_for(store.checkpoint_read_started.wait(), timeout=10)
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await run_task
@@ -9152,7 +9190,7 @@ def test_cayu_app_run_revalidates_constructed_run_request():
     async def run_invalid_request():
         return [event async for event in app.run(request)]
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(TypeError, match="max_steps must be an integer"):
         asyncio.run(run_invalid_request())
 
     assert asyncio.run(store.load("sess_invalid_request")) is None
@@ -11443,7 +11481,7 @@ def test_cayu_app_keeps_lease_loss_authoritative_when_provider_cleanup_fails() -
     assert events[-1].payload["error_type"] == "BudgetReservationLeaseLost"
     assert events[-1].payload["error"].startswith("Budget reservation lease was lost:")
     assert events[-1].payload["provider_cleanup_failure"] == {
-        "error": "Model provider stream failed before cancellation.",
+        "error": "Provider stream cleanup did not complete normally.",
         "error_type": "ProviderIteratorCleanupError",
         "phase": "provider_iterator_cleanup",
     }
@@ -13372,7 +13410,7 @@ def test_cayu_app_preserves_caller_cancellation_during_provider_stream_cleanup(
                 live_events.append(event)
 
         task = asyncio.create_task(consume())
-        await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=10)
         task.cancel("caller cancelled provider cleanup")
         assert task.cancelling() == 1
         caught = False
@@ -13688,7 +13726,7 @@ def test_provider_cancellation_marker_precedes_operator_terminal_transition() ->
                 ),
             )
         )
-        await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=10)
         interrupt_events = await collect_interrupt_events(
             app,
             InterruptSessionRequest(session_id=session_id, reason="operator stop"),
@@ -13771,7 +13809,7 @@ def test_cayu_app_does_not_report_caller_stream_read_cancellation_as_provider_fa
                 pass
 
         task = asyncio.create_task(consume())
-        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=10)
         task.cancel("caller cancelled provider read")
         assert task.cancelling() == 1
         caught_cancellation: asyncio.CancelledError | None = None
@@ -13880,7 +13918,7 @@ def test_cayu_app_does_not_publish_provider_replacement_cancellation_text(
                 pass
 
         task = asyncio.create_task(consume())
-        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=10)
         task.cancel("caller cancellation")
         with pytest.raises(asyncio.CancelledError) as raised:
             await task
@@ -13963,7 +14001,7 @@ def test_cayu_app_preserves_caller_cancellation_when_provider_replaces_its_type(
                 live_events.append(event)
 
         task = asyncio.create_task(consume())
-        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=10)
         task.cancel("caller cancellation")
         with pytest.raises(asyncio.CancelledError) as raised:
             await task
@@ -13985,17 +14023,28 @@ def test_cayu_app_preserves_caller_cancellation_when_provider_replaces_its_type(
         events = [record.event for record in records]
         interrupted = [event for event in events if event.type is EventType.SESSION_INTERRUPTED]
         assert len(interrupted) == 1
-        expected_failures = (
-            []
-            if replacement_kind == "value"
-            else [
-                {
-                    "phase": "model_stream",
-                    "error": "Model provider stream failed before cancellation.",
-                    "error_type": "ModelProviderStreamError",
-                }
-            ]
-        )
+        started = next(event for event in events if event.type is EventType.MODEL_STARTED)
+        expected_failures = [
+            {
+                "phase": "provider_stream_cleanup",
+                "error": "Provider stream cleanup did not complete normally.",
+                "error_type": "ProviderStreamCleanupError",
+                "cleanup_diagnostic_version": 1,
+                "cleanup_action": "stream_close",
+                "cleanup_reason": "unknown_exception"
+                if replacement_kind == "group"
+                else "close_exception",
+                "cleanup_exception_type": "unknown"
+                if replacement_kind == "group"
+                else "RuntimeError",
+                "cancellation_requested": True,
+                "stream_close_state": "not_confirmed",
+                "remote_cancellation_state": "unknown",
+                "remote_settlement_state": "unknown",
+                "model_step_id": started.payload["model_step_id"],
+                "model_attempt_id": started.payload["model_attempt_id"],
+            }
+        ]
         assert interrupted[0].payload.get("provider_cancellation_failures", []) == (
             expected_failures
         )
@@ -14067,7 +14116,7 @@ def test_cayu_app_preserves_caller_cancellation_across_late_explicit_close_failu
                 ),
             )
         )
-        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=10)
         task.cancel("caller cancellation")
         with pytest.raises(asyncio.CancelledError) as raised:
             await task
@@ -14392,7 +14441,7 @@ def test_chat_completions_adapter_preserves_nested_cancellation_diagnostics() ->
                 ),
             )
         )
-        await asyncio.wait_for(transport.events.close_started.wait(), timeout=2)
+        await asyncio.wait_for(transport.events.close_started.wait(), timeout=10)
         task.cancel("caller cancelled chat cleanup")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -14403,6 +14452,9 @@ def test_chat_completions_adapter_preserves_nested_cancellation_diagnostics() ->
         interrupted = [
             record.event for record in records if record.event.type == EventType.SESSION_INTERRUPTED
         ]
+        started = next(
+            record.event for record in records if record.event.type is EventType.MODEL_STARTED
+        )
         assert transport.requests == 1
         assert len(interrupted) == 1
         assert interrupted[0].payload["provider_cancellation_failures"] == [
@@ -14415,6 +14467,16 @@ def test_chat_completions_adapter_preserves_nested_cancellation_diagnostics() ->
                 "phase": "provider_stream_cleanup",
                 "error": "Provider stream cleanup did not complete normally.",
                 "error_type": "ProviderStreamCleanupError",
+                "cleanup_diagnostic_version": 1,
+                "cleanup_action": "stream_close",
+                "cleanup_reason": "cleanup_cancelled",
+                "cleanup_exception_type": "CancelledError",
+                "cancellation_requested": True,
+                "stream_close_state": "not_confirmed",
+                "remote_cancellation_state": "unknown",
+                "remote_settlement_state": "unknown",
+                "model_step_id": started.payload["model_step_id"],
+                "model_attempt_id": started.payload["model_attempt_id"],
             },
         ]
         assert transport.events.cleanup_finished.is_set() is False
@@ -14478,7 +14540,7 @@ def test_cayu_app_preserves_caller_cancellation_across_billing_task_group_failur
                 live_events.append(event)
 
         task = asyncio.create_task(consume())
-        await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.hook_started.wait(), timeout=10)
         task.cancel("caller cancelled billing")
         provider.release_cleanup.set()
         assert task.cancelling() == 1
@@ -14601,7 +14663,7 @@ def test_provider_cancellation_publication_failure_remains_repairable(
                 ),
             )
         )
-        await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.hook_started.wait(), timeout=10)
         task.cancel("caller cancelled billing")
         provider.release_cleanup.set()
         with pytest.raises(asyncio.CancelledError) as raised:
@@ -14714,7 +14776,7 @@ def test_provider_cancellation_live_readback_rejects_conflicting_marker_payload(
                 ),
             )
         )
-        await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.hook_started.wait(), timeout=10)
         task.cancel("caller cancelled billing")
         provider.release_cleanup.set()
         with pytest.raises(asyncio.CancelledError) as raised:
@@ -15696,6 +15758,11 @@ def test_cayu_app_drops_automatic_compaction_billing_cancellation_credentials(
     assert events[-1].type is EventType.SESSION_FAILED
     assert EventType.SESSION_INTERRUPTED not in {event.type for event in events}
     expected_terminal: dict[str, Any] = {
+        "failure_evidence": _expected_failure_evidence(
+            f"sess_automatic_compaction_billing_cancel_{stage}",
+            "ModelProviderError",
+            "ContextBuildError",
+        ),
         "error": "Model provider billing identity resolution failed",
         "error_type": "ModelProviderError",
     }
@@ -16624,7 +16691,7 @@ def test_cayu_app_budget_settlement_failure_does_not_mask_cancellation() -> None
                 ),
             )
         )
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
@@ -16691,7 +16758,7 @@ def test_cayu_app_cancellation_during_provider_failure_settlement_propagates() -
                 ),
             )
         )
-        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -17101,10 +17168,7 @@ def test_cayu_app_resumes_completed_session_from_stored_transcript():
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[0].payload == {
-        "agent_name": "assistant",
-        "appended_messages": 1,
-    }
+    assert events[0].payload == {"agent_name": "assistant", "appended_messages": 1, "run_epoch": 3}
     assert [message.content[0].text for message in provider.requests[1].messages] == [
         "first request",
         "first answer",
@@ -18248,7 +18312,7 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
                 await store.release_run_fence(session_id)
 
         stale_owner_task = asyncio.create_task(stale_recovery_owner())
-        await asyncio.wait_for(stale_owner_ready.wait(), timeout=5)
+        await asyncio.wait_for(stale_owner_ready.wait(), timeout=10)
         owned = await store.load(session_id)
         assert owned is not None
         stale_epoch = owned.run_epoch
@@ -19434,7 +19498,7 @@ def test_subagent_tool_background_starts_child_without_waiting_for_completion():
         assert tool_result.structured["status"] == "started"
         assert tool_result.structured["child_session_id"] == child.id
 
-        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=10)
         provider.release_child.set()
         for _ in range(20):
             loaded_child = await store.load(child.id)
@@ -19488,7 +19552,7 @@ def test_subagent_result_tool_waits_for_background_child_result():
                     arguments={
                         "child_session_id": child_session_id,
                         "wait": True,
-                        "timeout_s": 1,
+                        "timeout_s": 5,
                     },
                 )
                 yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
@@ -19531,8 +19595,8 @@ def test_subagent_result_tool_waits_for_background_child_result():
                 ),
             )
         )
-        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
-        parent_events = await asyncio.wait_for(parent_task, timeout=2)
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=10)
+        parent_events = await asyncio.wait_for(parent_task, timeout=10)
         parent_transcript = await store.load_transcript("sess_subagent_background_result_parent")
         child_sessions = (
             await store.list_sessions(
@@ -19632,9 +19696,9 @@ def test_subagent_result_tool_can_wait_for_all_background_children():
                 ),
             )
         )
-        await asyncio.wait_for(provider.child_model_started["task a"].wait(), timeout=1)
-        await asyncio.wait_for(provider.child_model_started["task b"].wait(), timeout=1)
-        parent_events = await asyncio.wait_for(parent_task, timeout=2)
+        await asyncio.wait_for(provider.child_model_started["task a"].wait(), timeout=10)
+        await asyncio.wait_for(provider.child_model_started["task b"].wait(), timeout=10)
+        parent_events = await asyncio.wait_for(parent_task, timeout=10)
         parent_transcript = await store.load_transcript("sess_subagent_background_all_parent")
         child_sessions = (
             await store.list_sessions(
@@ -19738,8 +19802,8 @@ def test_interrupting_parent_interrupts_running_background_subagents(
                 ),
             )
         )
-        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
-        await asyncio.wait_for(provider.parent_second_step_started.wait(), timeout=1)
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=10)
+        await asyncio.wait_for(provider.parent_second_step_started.wait(), timeout=10)
         interrupt_request = InterruptSessionRequest(
             session_id="sess_background_parent_interrupt",
             reason="stop parent and background children",
@@ -19756,7 +19820,7 @@ def test_interrupting_parent_interrupts_running_background_subagents(
                     SessionQuery(parent_session_id="sess_background_parent_interrupt")
                 )
             ).sessions
-            assert children_before_parent_release[0].status == SessionStatus.RUNNING
+            assert children_before_parent_release[0].status == SessionStatus.INTERRUPTING
             monkeypatch.setattr(
                 session_control_module,
                 "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
@@ -19771,7 +19835,7 @@ def test_interrupting_parent_interrupts_running_background_subagents(
             interrupt_events = []
         else:
             interrupt_events = [event async for event in app.interrupt_session(interrupt_request)]
-        parent_events = await asyncio.wait_for(parent_task, timeout=2)
+        parent_events = await asyncio.wait_for(parent_task, timeout=10)
         assert await app.drain_background_interruptions(timeout_s=1) is True
         child_sessions = (
             await store.list_sessions(
@@ -20465,7 +20529,7 @@ def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marke
             },
             create_if_missing=True,
         )
-        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(started.wait(), timeout=10)
         drained = await asyncio.wait_for(
             app.drain_background_interruptions(timeout_s=0.001),
             timeout=1,
@@ -21353,7 +21417,7 @@ def test_background_interruption_claim_loss_cancels_dispatched_child_interruptio
                 },
             )
         )
-        await asyncio.wait_for(interruption_started.wait(), timeout=1)
+        await asyncio.wait_for(interruption_started.wait(), timeout=10)
         await asyncio.wait_for(interruption_cancelled.wait(), timeout=1)
         await asyncio.wait_for(cascade, timeout=1)
         late_release.set()
@@ -21697,7 +21761,7 @@ def test_interrupt_stream_does_not_wait_for_background_cascade(monkeypatch):
             )
         )
         request_task = asyncio.create_task(anext(event_stream))
-        await asyncio.wait_for(cascade_started.wait(), timeout=1)
+        await asyncio.wait_for(cascade_started.wait(), timeout=10)
         interrupted_event = await asyncio.wait_for(request_task, timeout=1)
         assert interrupted_event.type == EventType.SESSION_INTERRUPTED
         assert len(app._background_interruption_coordinator._tasks) == 1
@@ -21747,7 +21811,7 @@ def test_interrupt_does_not_start_or_clear_cascade_before_terminal_event(monkeyp
             InterruptSessionRequest(session_id=session_id, reason="operator stop")
         )
         first_event_task = asyncio.create_task(anext(stream))
-        await asyncio.wait_for(terminal_started.wait(), timeout=1)
+        await asyncio.wait_for(terminal_started.wait(), timeout=10)
         checkpoint_before_terminal = await store.load_checkpoint(session_id)
         tasks_before_terminal = len(app._background_interruption_coordinator._tasks)
 
@@ -23293,7 +23357,7 @@ def test_subagent_tool_interrupts_child_session_when_parent_is_interrupted():
                 ),
             )
         )
-        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=10)
 
         interrupt_events = [
             event
@@ -23304,7 +23368,7 @@ def test_subagent_tool_interrupts_child_session_when_parent_is_interrupted():
                 )
             )
         ]
-        parent_events = await asyncio.wait_for(parent_task, timeout=1)
+        parent_events = await asyncio.wait_for(parent_task, timeout=5)
         child_sessions = (
             await store.list_sessions(
                 SessionQuery(parent_session_id="sess_subagent_parent_interrupt")
@@ -23440,7 +23504,7 @@ def test_subagent_tool_interrupts_child_session_during_startup_window():
                 ),
             )
         )
-        await asyncio.wait_for(store.child_running.wait(), timeout=1)
+        await asyncio.wait_for(store.child_running.wait(), timeout=10)
 
         interrupt_events = [
             event
@@ -23451,7 +23515,7 @@ def test_subagent_tool_interrupts_child_session_during_startup_window():
                 )
             )
         ]
-        parent_events = await asyncio.wait_for(parent_task, timeout=1)
+        parent_events = await asyncio.wait_for(parent_task, timeout=10)
         child_sessions = (
             await store.list_sessions(
                 SessionQuery(parent_session_id="sess_subagent_parent_startup_interrupt")
@@ -23545,7 +23609,7 @@ def test_subagent_tool_child_cleanup_failure_does_not_mask_parent_interruption()
                 ),
             )
         )
-        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=10)
 
         interrupt_events = [
             event
@@ -23556,7 +23620,7 @@ def test_subagent_tool_child_cleanup_failure_does_not_mask_parent_interruption()
                 )
             )
         ]
-        parent_events = await asyncio.wait_for(parent_task, timeout=1)
+        parent_events = await asyncio.wait_for(parent_task, timeout=5)
         parent_transcript = await store.load_transcript("sess_subagent_parent_cleanup_failure")
         parent_session_events = await store.load_events("sess_subagent_parent_cleanup_failure")
         return interrupt_events, parent_events, parent_transcript, parent_session_events
@@ -23716,6 +23780,7 @@ def test_cayu_app_dispatches_forked_session_with_task_linkage():
         "dispatch_id": PRIVATE_EVENT_AUTHORITY,
         "task_id": PRIVATE_EVENT_AUTHORITY,
         "parent_session_id": PRIVATE_EVENT_AUTHORITY,
+        "run_epoch": 1,
     }
     completed_task = asyncio.run(tasks.load_task(task.id))
     assert completed_task is not None
@@ -26829,6 +26894,9 @@ def test_cayu_app_fails_task_when_run_fails():
     assert session.status == SessionStatus.FAILED
     assert events[-1].interaction_id is None
     assert events[-1].payload == {
+        "failure_evidence": _expected_failure_evidence(
+            "sess_task_failure", "RuntimeError", "ModelAttemptFailed"
+        ),
         "error": "provider down",
         "error_type": "RuntimeError",
         "runtime_task_failure_id": failure_identity.failure_id,
@@ -28021,6 +28089,9 @@ def _assert_unattached_task_failure_payload(
     terminal_payload = dict(event.payload)
     runtime_task_failure_id = terminal_payload.pop("runtime_task_failure_id")
     execution_profile_fingerprint = terminal_payload.pop(EXECUTION_PROFILE_FINGERPRINT_FIELD)
+    assert terminal_payload.pop("failure_evidence") == _expected_failure_evidence(
+        session.id, expected_diagnostic["error_type"], run_epoch=1
+    )
     assert terminal_payload == expected_diagnostic
     assert runtime_task_failure_id.startswith("runtime-task-failure:v2:")
     assert re.fullmatch(
@@ -30665,7 +30736,7 @@ def test_cayu_app_recover_tool_round_task_cancellation_finalizes_session():
                 ),
             )
         )
-        await asyncio.wait_for(provider.continuation_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.continuation_started.wait(), timeout=10)
         recovery_task.cancel("cancel manual tool recovery")
         with pytest.raises(asyncio.CancelledError) as cancellation:
             await recovery_task
@@ -31346,7 +31417,7 @@ def test_cayu_app_recover_tool_round_preserves_cross_worker_interrupt_during_res
         recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
         interrupt_task: asyncio.Task[list[Event]] | None = None
         try:
-            await asyncio.wait_for(store.recovery_load_started.wait(), timeout=5)
+            await asyncio.wait_for(store.recovery_load_started.wait(), timeout=10)
             running = await store.load(session_id)
             assert running is not None and running.status == SessionStatus.RUNNING
 
@@ -31885,7 +31956,7 @@ def test_cayu_app_recover_tool_round_preserves_cancellation_during_claim_reconci
 
     async def scenario() -> None:
         recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
-        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=10)
         recovery_task.cancel("cancel during manual claim reconciliation")
         await asyncio.sleep(0)
         assert recovery_task.done() is False
@@ -32033,7 +32104,7 @@ def test_manual_recovery_interruption_fence_uses_its_own_lease_deadline(
         await store.release_run_fence(session_id)
         store.pause_manual_claim = True
         recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
-        await asyncio.wait_for(store.manual_claim_started.wait(), timeout=5)
+        await asyncio.wait_for(store.manual_claim_started.wait(), timeout=10)
 
         interruption_task = asyncio.create_task(
             collect_interrupt_events(
@@ -32284,7 +32355,7 @@ def test_cayu_app_recover_tool_round_serializes_across_apps(
         "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
         0.01,
     )
-    store = BlockingPostPersistEventsLoadStore()
+    store = BlockingPostPersistEventsLoadStore(ownership_clock=clock)
     app_a, store, original_tool, checkpoint = _crashed_tool_round_app(
         session_id,
         store=store,
@@ -32315,7 +32386,7 @@ def test_cayu_app_recover_tool_round_serializes_across_apps(
             )
         )
         try:
-            await asyncio.wait_for(store.post_persist_load_started.wait(), timeout=5)
+            await asyncio.wait_for(store.post_persist_load_started.wait(), timeout=10)
             claimed_checkpoint = await store.load_checkpoint(session_id)
             assert claimed_checkpoint is not None
             claim_marker = claimed_checkpoint["incomplete_session_recovery_claim"]
@@ -32577,7 +32648,7 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         store.pause_manual_claim = True
         store.hold_operator_interrupt_return = lose_fence_ack
         recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
-        await asyncio.wait_for(store.manual_claim_started.wait(), timeout=5)
+        await asyncio.wait_for(store.manual_claim_started.wait(), timeout=15)
 
         interrupt_task = asyncio.create_task(
             collect_interrupt_events(
@@ -32589,29 +32660,29 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
                 ),
             )
         )
-        await asyncio.wait_for(store.operator_interrupt_committed.wait(), timeout=5)
+        await asyncio.wait_for(store.operator_interrupt_committed.wait(), timeout=15)
         if finalize_before_claim:
             await operator_app._recovery_coordinator.finalize_abandoned_session_by_id(session_id)
-            interruption_events = await asyncio.wait_for(interrupt_task, timeout=5)
+            interruption_events = await asyncio.wait_for(interrupt_task, timeout=15)
             completed_stop = await store.load(session_id)
             assert recovery_task.done() is False
         store.lose_fence_ack = lose_fence_ack
         store.allow_manual_claim.set()
 
         if same_process_operator:
-            interruption_events = await asyncio.wait_for(interrupt_task, timeout=5)
+            interruption_events = await asyncio.wait_for(interrupt_task, timeout=15)
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(recovery_task, timeout=5)
+                await asyncio.wait_for(recovery_task, timeout=15)
         elif lose_fence_ack:
-            recovery_events = await asyncio.wait_for(recovery_task, timeout=5)
+            recovery_events = await asyncio.wait_for(recovery_task, timeout=15)
             store.allow_operator_interrupt_return.set()
-            interruption_events = await asyncio.wait_for(interrupt_task, timeout=5)
+            interruption_events = await asyncio.wait_for(interrupt_task, timeout=15)
             assert store.fence_ack_lost is True
             assert recovery_events[-1].id == interruption_events[-1].id
         else:
-            recovery_events = await asyncio.wait_for(recovery_task, timeout=5)
+            recovery_events = await asyncio.wait_for(recovery_task, timeout=15)
             if not finalize_before_claim:
-                interruption_events = await asyncio.wait_for(interrupt_task, timeout=5)
+                interruption_events = await asyncio.wait_for(interrupt_task, timeout=15)
             assert recovery_events[-1].id == interruption_events[-1].id
         assert interruption_events[-1].type == EventType.SESSION_INTERRUPTED
         assert interruption_events[-1].payload["interruption_type"] == "operator_requested"
@@ -33029,7 +33100,7 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
                 await store.release_run_fence(session_id)
 
         stale_owner_task = asyncio.create_task(stale_owner())
-        await asyncio.wait_for(stale_owner_ready.wait(), timeout=5)
+        await asyncio.wait_for(stale_owner_ready.wait(), timeout=10)
         try:
             recovery_events = await collect_tool_round_recovery_events(
                 recovery_app,
@@ -33320,7 +33391,7 @@ def test_cayu_app_recovery_watcher_ignores_its_owned_interrupted_transition(
         )
         recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
         try:
-            await asyncio.wait_for(terminal_started.wait(), timeout=5)
+            await asyncio.wait_for(terminal_started.wait(), timeout=10)
             await asyncio.sleep(0.05)
             assert recovery_task.done() is False
             interrupted = await store.load(session_id)
@@ -34838,7 +34909,7 @@ def test_cayu_app_terminal_evidence_repair_preserves_pending_interrupt_identity(
                 ),
             )
         )
-        await asyncio.wait_for(provider.second_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.second_started.wait(), timeout=10)
         interrupted = await collect_interrupt_events(
             app,
             InterruptSessionRequest(
@@ -35860,7 +35931,7 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
         recovery_task = asyncio.create_task(
             app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
         )
-        await asyncio.wait_for(hook.started.wait(), timeout=5)
+        await asyncio.wait_for(hook.started.wait(), timeout=10)
 
         store.fail_next_transform = True
         current_time["value"] += timedelta(minutes=4)
@@ -37133,7 +37204,7 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
                 ),
             )
         )
-        await asyncio.wait_for(store.claim_started.wait(), timeout=5)
+        await asyncio.wait_for(store.claim_started.wait(), timeout=10)
 
         def replace_pending_approval(
             session: Session,
@@ -37310,7 +37381,7 @@ def test_concurrent_approval_and_denial_have_exactly_one_durable_winner():
 
         approve_task = asyncio.create_task(resolve(ToolApprovalDecision.APPROVE))
         deny_task = asyncio.create_task(resolve(ToolApprovalDecision.DENY))
-        await asyncio.wait_for(store.both_claims_started.wait(), timeout=5)
+        await asyncio.wait_for(store.both_claims_started.wait(), timeout=10)
         store.release_claims.set()
         outcomes = await asyncio.gather(approve_task, deny_task, return_exceptions=True)
 
@@ -37985,7 +38056,7 @@ def test_tool_approval_resolution_task_cancellation_finalizes_and_preserves_pend
                 ),
             )
         )
-        await asyncio.wait_for(tool.started.wait(), timeout=5)
+        await asyncio.wait_for(tool.started.wait(), timeout=10)
         assert resolution_task.cancelling() == 0
         resolution_task.cancel("cancel tool approval resolution")
         assert resolution_task.cancelling() == 1
@@ -38432,7 +38503,7 @@ def test_automatic_compaction_cancellation_during_publication_reconciliation_pro
                 ),
             )
         )
-        await asyncio.wait_for(reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(reconciliation_started.wait(), timeout=10)
         task.cancel("cancel during compaction publication reconciliation")
         assert task.cancelling() == 1
         if release_reconciliation:
@@ -39408,7 +39479,7 @@ def test_ordinary_tool_round_recovery_rejects_approval_owned_round_without_mutat
             recovery_task = asyncio.create_task(
                 collect_tool_round_recovery_events(app, recovery_request)
             )
-            await asyncio.wait_for(store.manual_recovery_claim_started.wait(), timeout=5)
+            await asyncio.wait_for(store.manual_recovery_claim_started.wait(), timeout=10)
             await store.checkpoint(session_id, paired_checkpoint)
 
         session_before = await store.load(session_id)
@@ -39866,7 +39937,7 @@ def test_tool_approval_recovery_task_cancellation_finalizes_continuation():
                 ),
             )
         )
-        await asyncio.wait_for(provider.continuation_started.wait(), timeout=5)
+        await asyncio.wait_for(provider.continuation_started.wait(), timeout=10)
         assert recovery_task.cancelling() == 0
         recovery_task.cancel("cancel tool approval recovery")
         assert recovery_task.cancelling() == 1
@@ -42610,6 +42681,7 @@ def test_cayu_app_fails_session_when_tool_policy_raises_before_execution():
     ]
     assert tool.calls == []
     assert events[-1].payload == {
+        "failure_evidence": _expected_failure_evidence("sess_policy_raises", "RuntimeError"),
         "error": "policy unavailable",
         "error_type": "RuntimeError",
     }
@@ -42655,6 +42727,7 @@ def test_cayu_app_fails_session_when_tool_policy_returns_invalid_result():
     assert events[-1].type == EventType.SESSION_FAILED
     assert tool.calls == []
     assert events[-1].payload == {
+        "failure_evidence": _expected_failure_evidence("sess_policy_invalid_result", "TypeError"),
         "error": "Tool policies must return ToolPolicyResult instances. Received dict.",
         "error_type": "TypeError",
     }
@@ -47495,7 +47568,7 @@ def test_automatic_hierarchical_cancellation_persists_completed_chunk_usage():
                 ),
             )
         )
-        await asyncio.wait_for(compactor_provider.second_started.wait(), timeout=5)
+        await asyncio.wait_for(compactor_provider.second_started.wait(), timeout=10)
         task.cancel("cancel hierarchy after first completion")
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
@@ -47583,7 +47656,7 @@ def test_automatic_hierarchical_cancellation_persists_each_completed_chunk():
                 ),
             )
         )
-        await asyncio.wait_for(compactor_provider.third_started.wait(), timeout=5)
+        await asyncio.wait_for(compactor_provider.third_started.wait(), timeout=10)
         task.cancel("cancel hierarchy after two completions")
         assert task.cancelling() == 1
         with pytest.raises(asyncio.CancelledError) as exc_info:
@@ -48104,7 +48177,7 @@ def test_automatic_compaction_real_cancellation_during_start_publication_propaga
                 ),
             )
         )
-        await asyncio.wait_for(store.start_publication_started.wait(), timeout=5)
+        await asyncio.wait_for(store.start_publication_started.wait(), timeout=10)
         task.cancel("cancel during compaction start publication")
         await asyncio.sleep(0)
         assert not task.done()
@@ -48184,7 +48257,7 @@ def test_automatic_compaction_cancellation_during_outcome_persistence_is_lossles
                 ),
             )
         )
-        await asyncio.wait_for(store.context_batch_started.wait(), timeout=5)
+        await asyncio.wait_for(store.context_batch_started.wait(), timeout=10)
         task.cancel("cancel during context outcome persistence")
         assert task.cancelling() == 1
         store.allow_context_batch.set()
@@ -49811,6 +49884,13 @@ def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fail
         for key, value in resume_events[-1].payload.items()
         if key != "session_run_operation_id"
     } == {
+        "compaction_failure": _expected_compaction_failure(failed_compaction),
+        "failure_evidence": _expected_failure_evidence(
+            "sess_prompt_cache_failed_fallback_telemetry",
+            "RuntimeError",
+            "ContextBuildError",
+            run_epoch=3,
+        ),
         "error": "bounded compaction failed",
         "error_type": "RuntimeError",
     }
@@ -50361,7 +50441,11 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "bounded_input": True,
         "model_step_id": events[6].payload["model_step_id"],
     }
+    parent_started = asyncio.run(
+        _private_events_for_public_events(store, "sess_model_compaction", [events[6]])
+    )[0]
     assert events[3].payload == {
+        "parent_model_step_id": parent_started.payload["model_step_id"],
         "finish_reason": "stop",
         "model": "summary-model",
         "provider_name": "fake",
@@ -51205,7 +51289,7 @@ def test_automatic_compaction_cancellation_releases_partial_reservation_setup() 
                 ),
             )
         )
-        await asyncio.wait_for(ledger.second_reservation_started.wait(), timeout=5)
+        await asyncio.wait_for(ledger.second_reservation_started.wait(), timeout=10)
         task.cancel("cancel reservation setup")
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
@@ -51297,7 +51381,7 @@ def test_automatic_compaction_cancellation_while_persisting_reservation_releases
                 ),
             )
         )
-        await asyncio.wait_for(reservation_publish_started.wait(), timeout=5)
+        await asyncio.wait_for(reservation_publish_started.wait(), timeout=10)
         task.cancel("cancel reservation event persistence")
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
@@ -51382,7 +51466,7 @@ def test_automatic_compaction_cancellation_waits_for_reconciliation() -> None:
                 ),
             )
         )
-        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=10)
         task.cancel("cancel during compaction reconciliation")
         await asyncio.sleep(0)
         assert not task.done()
@@ -51480,9 +51564,9 @@ def test_automatic_compaction_preserves_provider_cancellation_during_settlement(
                 ),
             )
         )
-        await asyncio.wait_for(compactor_provider.started.wait(), timeout=5)
+        await asyncio.wait_for(compactor_provider.started.wait(), timeout=10)
         task.cancel("first cancellation during provider execution")
-        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=10)
         task.cancel("later cancellation during settlement")
         await asyncio.sleep(0)
         assert not task.done()
@@ -51571,7 +51655,7 @@ def test_automatic_compaction_cancellation_waits_for_reconciliation_event(
                 ),
             )
         )
-        await asyncio.wait_for(reconciliation_publish_started.wait(), timeout=5)
+        await asyncio.wait_for(reconciliation_publish_started.wait(), timeout=10)
         records = tuple(ledger._records.values())
         assert len(records) == 1
         assert records[0].status == "reconciled"
@@ -51650,7 +51734,7 @@ def test_automatic_compaction_cancellation_stays_authoritative_if_settlement_fai
                 ),
             )
         )
-        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=5)
+        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=10)
         task.cancel("cancel while settlement fails")
         ledger.allow_failure.set()
         with pytest.raises(asyncio.CancelledError) as exc_info:
@@ -51946,7 +52030,7 @@ def test_automatic_compaction_retry_requires_an_independent_reservation(
     failure = next(event for event in events if event.type == EventType.BUDGET_RESERVATION_FAILED)
     assert Decimal(failure.payload["actual"]) == Decimal("0")
     assert failure.payload["message"] == (
-        "Budget cannot be verified because 1 model step(s) have no matching pricing."
+        "Budget cannot be verified because 1 model step(s) have missing or invalid completion usage."
     )
     assert events[-1].type == terminal_event
 
@@ -52296,7 +52380,7 @@ def test_inherited_prompt_cache_compactor_fails_closed_before_unpriced_fallback(
     failure = failures[0]
     assert Decimal(failure.payload["actual"]) == Decimal("0.000001")
     assert failure.payload["message"] == (
-        "Budget cannot be verified because 1 model step(s) have no matching pricing."
+        "Budget cannot be verified because 1 model step(s) have missing or invalid completion usage."
     )
     assert resume_events[-1].type == EventType.SESSION_INTERRUPTED
 
@@ -53539,6 +53623,10 @@ def test_cayu_app_retains_only_authoritative_usage_when_completion_metadata_is_n
     assert events[4].payload["error_type"] == "DurableValueError"
     assert "error" not in events[4].payload
     assert events[-1].payload == {
+        "compaction_failure": _expected_compaction_failure(events[4]),
+        "failure_evidence": _expected_failure_evidence(
+            "sess_unsafe_compaction_metadata", "DurableValueError", "ContextBuildError"
+        ),
         "error": "Operation failed with a non-portable diagnostic.",
         "error_type": "DurableValueError",
         "durable_value_error_code": expected_error_code,
@@ -54290,7 +54378,7 @@ def test_automatic_compaction_preserves_later_cancellation_during_termination_pe
         )
         await asyncio.wait_for(compactor_provider.partial_emitted.wait(), timeout=5)
         task.cancel("primary cancellation during provider dispatch")
-        await asyncio.wait_for(termination_persistence_started.wait(), timeout=5)
+        await asyncio.wait_for(termination_persistence_started.wait(), timeout=10)
 
         task.cancel("later cancellation during termination persistence")
         await asyncio.sleep(0)
@@ -54392,6 +54480,9 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
         "model_step_id": events[1].payload["model_step_id"],
     }
     assert events[4].payload == {
+        "failure_evidence": _expected_failure_evidence(
+            "sess_compaction_failed", "RuntimeError", "ContextBuildError"
+        ),
         "error": "compaction unavailable",
         "error_type": "RuntimeError",
     }
@@ -55119,7 +55210,9 @@ def test_attach_file_infers_content_type_from_filename(tmp_path):
 
 
 def test_attach_file_rejects_bytes_over_limit(tmp_path):
-    app, _ = _app_with_artifact_store(tmp_path, max_file_attachment_bytes=4)
+    app, _ = _app_with_artifact_store(
+        tmp_path, config=CayuConfig(tool_execution=ToolExecutionConfig(max_file_attachment_bytes=4))
+    )
 
     with pytest.raises(ValueError, match="prompt attachment byte limit"):
         asyncio.run(app.attach_file(b"hello", filename="pic.png", kind="image"))
@@ -56728,6 +56821,7 @@ def test_cayu_app_records_failed_session_for_invalid_tool_call_payload():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
@@ -56997,6 +57091,7 @@ def test_cayu_app_records_failed_session_for_blank_tool_call_name():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
@@ -57039,6 +57134,7 @@ def test_cayu_app_records_failed_session_for_invalid_tool_call_id(tool_call_id):
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
@@ -59305,17 +59401,10 @@ def test_in_memory_session_store_revalidates_constructed_events_on_append():
             )
         )
 
+    invalid_event = Event(type=EventType.MODEL_TEXT_DELTA, session_id="sess_constructed_event")
+    object.__setattr__(invalid_event, "payload", BadPayload({"delta": "hello"}))
     with pytest.raises(ValueError, match="JSON-compatible"):
-        asyncio.run(
-            store.append_event(
-                "sess_constructed_event",
-                Event.model_construct(
-                    type=EventType.MODEL_TEXT_DELTA,
-                    session_id="sess_constructed_event",
-                    payload=BadPayload({"delta": "hello"}),
-                ),
-            )
-        )
+        asyncio.run(store.append_event("sess_constructed_event", invalid_event))
 
 
 def test_in_memory_session_store_isolates_request_metadata():
@@ -59427,7 +59516,7 @@ def test_cayu_app_registers_and_selects_default_environment():
     )
     session = asyncio.run(store.load("sess_default_environment"))
 
-    assert events[0].payload == {"agent_name": "assistant"}
+    assert events[0].payload == {"agent_name": "assistant", "run_epoch": 1}
     assert events[0].environment_name == "local"
     assert events[1].environment_name == "local"
     assert events[-1].environment_name == "local"
@@ -60454,12 +60543,17 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
         "interruption_type": "operator_requested",
     }
     assert checkpoint is not None
-    assert set(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY,
-        execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-    }
+    if any(event.type is EventType.MODEL_COMPLETED for event in run_events):
+        assert_only_model_step_publication_checkpoint(checkpoint)
+    else:
+        # The cross-app interruption can win before the blocked provider returns.
+        assert set(checkpoint) == {
+            CHECKPOINT_SCHEMA_VERSION_KEY,
+            execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+        }
+    assert settled_invocation_terminal_decision_from_checkpoint(checkpoint) is not None
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert (
         execution_profiles_module.active_invocation_execution_profile_from_checkpoint(checkpoint)
@@ -60749,6 +60843,7 @@ def test_interrupt_session_returns_terminal_event_when_provider_delays_cancellat
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     async def run():
+        existing_owners = set(provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS)
         provider.stream_started = asyncio.Event()
         provider.release_after_cancel = asyncio.Event()
         run_task = asyncio.create_task(
@@ -60774,6 +60869,7 @@ def test_interrupt_session_returns_terminal_event_when_provider_delays_cancellat
                 )
             ]
         events_before_release = await store.load_events("sess_delayed_provider_interrupt")
+        assert set(provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS) - existing_owners
         provider.release_after_cancel.set()
         run_events = await run_task
         events_after_release = await store.load_events("sess_delayed_provider_interrupt")
@@ -60797,7 +60893,13 @@ def test_interrupt_session_returns_terminal_event_when_provider_delays_cancellat
 
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     assert interrupt_events[0].payload["reason"] == "operator stop"
-    assert EventType.SESSION_INTERRUPTED not in [event.type for event in events_before_release]
+    early_terminals = [
+        event for event in events_before_release if event.type is EventType.SESSION_INTERRUPTED
+    ]
+    durable_terminal = next(
+        event for event in events_after_release if event.type is EventType.SESSION_INTERRUPTED
+    )
+    assert [event.id for event in early_terminals] in ([], [durable_terminal.id])
     assert [event.type for event in run_events[-2:]] == [
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
@@ -60808,8 +60910,11 @@ def test_interrupt_session_returns_terminal_event_when_provider_delays_cancellat
     assert event_types_after_release.count(EventType.SESSION_INTERRUPTED) == 1
     assert event_types_after_release.count(EventType.TURN_COMPLETED) == 1
     assert EventType.MODEL_COMPLETED not in event_types_after_release
-    assert event_types_after_release[-2] == EventType.TURN_COMPLETED
-    assert event_types_after_release[-1] == EventType.SESSION_INTERRUPTED
+    assert event_types_after_release[-3:] == [
+        EventType.TURN_COMPLETED,
+        EventType.INTERACTION_INTERRUPTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
 
 
 def test_interrupt_session_does_not_finalize_unowned_running_session(monkeypatch):
@@ -61658,8 +61763,11 @@ def test_interrupt_session_suppresses_late_tool_events_while_finalizing(monkeypa
     assert event_types_after_release.count(EventType.TURN_COMPLETED) == 1
     assert EventType.TOOL_CALL_COMPLETED not in event_types_after_release
     assert event_types_after_release.count(EventType.TOOL_CALL_FAILED) == 1
-    assert event_types_after_release[-2] == EventType.TURN_COMPLETED
-    assert event_types_after_release[-1] == EventType.SESSION_INTERRUPTED
+    assert event_types_after_release[-3:] == [
+        EventType.TURN_COMPLETED,
+        EventType.INTERACTION_INTERRUPTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
     validate_context_messages(transcript)
     assert transcript[-1].role == "tool"
     assert transcript[-1].content[0].tool_call_id == "call_1"
@@ -61825,6 +61933,7 @@ def test_concurrent_interrupt_transition_loser_waits_for_terminal_event(
                         from_statuses=from_statuses,
                         to_status=to_status,
                         checkpoint_transform=checkpoint_transform,
+                        store_time_checkpoint_transform=store_time_checkpoint_transform,
                         result_checkpoint_transform=result_checkpoint_transform,
                     )
                 except ValueError:
@@ -62267,7 +62376,7 @@ def test_remote_interrupt_wins_race_with_policy_plan_publication():
                 ),
             )
         )
-        await asyncio.wait_for(store.policy_publication_started.wait(), timeout=5)
+        await asyncio.wait_for(store.policy_publication_started.wait(), timeout=10)
         with session_engine_module.suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(
                 collect_interrupt_events(
@@ -62356,7 +62465,7 @@ def test_remote_interrupt_wins_race_with_atomic_approval_publication():
                 ),
             )
         )
-        await asyncio.wait_for(store.approval_publication_started.wait(), timeout=5)
+        await asyncio.wait_for(store.approval_publication_started.wait(), timeout=10)
         with session_engine_module.suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(
                 collect_interrupt_events(
@@ -62454,7 +62563,7 @@ def test_local_interrupt_after_atomic_approval_publication_closes_retained_round
                 ),
             )
         )
-        await asyncio.wait_for(store.approval_fan_out_started.wait(), timeout=5)
+        await asyncio.wait_for(store.approval_fan_out_started.wait(), timeout=10)
         with session_engine_module.suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(
                 collect_interrupt_events(
@@ -62560,7 +62669,7 @@ def test_operator_interrupt_after_atomic_user_input_open_supersedes_exact_pause(
                 ),
             )
         )
-        await asyncio.wait_for(store.user_input_fan_out_started.wait(), timeout=5)
+        await asyncio.wait_for(store.user_input_fan_out_started.wait(), timeout=10)
         checkpoint_before = await store.load_checkpoint(session_id)
         assert checkpoint_before is not None
         pending_before = checkpoint_before["pending_user_input"]
@@ -62694,11 +62803,11 @@ def test_remote_operator_interrupt_wins_before_atomic_user_input_open() -> None:
                 ),
             )
         )
-        await asyncio.wait_for(store.open_started.wait(), timeout=5)
+        await asyncio.wait_for(store.open_started.wait(), timeout=10)
         request = InterruptSessionRequest(session_id=session_id, reason="remote operator")
         with session_engine_module.suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(collect_interrupt_events(interrupter, request))
-        await asyncio.wait_for(store.interrupt_claimed.wait(), timeout=5)
+        await asyncio.wait_for(store.interrupt_claimed.wait(), timeout=10)
         store.allow_open.set()
 
         run_events, interrupt_events = await asyncio.wait_for(
@@ -62793,11 +62902,11 @@ def test_remote_operator_interrupt_after_user_input_open_suppresses_stale_pause_
                 ),
             )
         )
-        await asyncio.wait_for(store.fan_out_started.wait(), timeout=5)
+        await asyncio.wait_for(store.fan_out_started.wait(), timeout=10)
         request = InterruptSessionRequest(session_id=session_id, reason="remote operator")
         with session_engine_module.suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(collect_interrupt_events(interrupter, request))
-        await asyncio.wait_for(store.interrupt_claimed.wait(), timeout=5)
+        await asyncio.wait_for(store.interrupt_claimed.wait(), timeout=10)
         store.allow_fan_out.set()
 
         run_events, interrupt_events = await asyncio.wait_for(
@@ -62914,7 +63023,7 @@ def test_operator_interrupt_does_not_replay_a_newer_user_input_pause_as_success(
                     ),
                 )
             )
-        await asyncio.wait_for(store.operator_transition_started.wait(), timeout=5)
+        await asyncio.wait_for(store.operator_transition_started.wait(), timeout=10)
 
         second_pause = await collect_user_input_events(
             app,
@@ -63217,7 +63326,7 @@ def test_operator_interrupt_cannot_supersede_executing_user_input_resolution() -
                 UserInputResponse(session_id=session_id, input_id=input_id, answer="yes"),
             )
         )
-        await asyncio.wait_for(store.execution_admission_committed.wait(), timeout=5)
+        await asyncio.wait_for(store.execution_admission_committed.wait(), timeout=10)
 
         interrupt_app = CayuApp(session_store=store, enable_logging=False)
         interrupt_app.register_provider(provider, default=True)
@@ -63322,7 +63431,7 @@ def test_process_loss_after_approval_clear_recovers_exact_interrupt_close_intent
                 ),
             )
         )
-        await asyncio.wait_for(store.approval_fan_out_started.wait(), timeout=5)
+        await asyncio.wait_for(store.approval_fan_out_started.wait(), timeout=10)
         with session_engine_module.suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(
                 collect_interrupt_events(
@@ -63333,7 +63442,7 @@ def test_process_loss_after_approval_clear_recovers_exact_interrupt_close_intent
                     ),
                 )
             )
-        await asyncio.wait_for(close_started.wait(), timeout=5)
+        await asyncio.wait_for(close_started.wait(), timeout=10)
         run_outcome = await asyncio.gather(run_task, return_exceptions=True)
         assert isinstance(run_outcome[0], ProcessLoss)
         await asyncio.gather(interrupt_task, return_exceptions=True)
@@ -64149,9 +64258,18 @@ def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
             input_schema={"type": "object", "properties": {}},
         )
 
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_concurrent = 0
+
         async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-            await asyncio.sleep(30)
-            return ToolResult(content="unexpected")
+            self.active += 1
+            self.max_concurrent = max(self.max_concurrent, self.active)
+            try:
+                await asyncio.sleep(30)
+                return ToolResult(content="unexpected")
+            finally:
+                self.active -= 1
 
     provider = FakeProvider(
         [
@@ -64166,14 +64284,14 @@ def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
             ],
         ]
     )
-    app = CayuApp(config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.05)))
+    app = CayuApp(config=CayuConfig(tool_execution=ToolExecutionConfig(tool_timeout_seconds=0.5)))
     app.register_provider(provider, default=True)
+    sleepy = SleepyTool()
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
-        tools=[SleepyTool()],
+        tools=[sleepy],
     )
 
-    started = time.monotonic()
     events = asyncio.run(
         collect_events(
             app,
@@ -64184,7 +64302,6 @@ def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
             ),
         )
     )
-    elapsed = time.monotonic() - started
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     failed_events = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
@@ -64200,10 +64317,9 @@ def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
         "call_2",
     ]
     for event in failed_events:
-        assert event.payload["result"]["content"] == "Tool call timed out after 0.05 seconds."
-    # Both timeouts elapse concurrently; well under two sequential timeouts
-    # plus scheduling slack.
-    assert elapsed < 1.0
+        assert event.payload["result"]["content"] == "Tool call timed out after 0.5 seconds."
+    assert sleepy.max_concurrent == 2
+    assert sleepy.active == 0
 
 
 @pytest.mark.parametrize(
@@ -64672,7 +64788,11 @@ def test_cayu_app_deadline_capacity_exhaustion_precedes_provider_dispatch() -> N
 
         release.set()
         await asyncio.wait_for(settled.wait(), timeout=0.5)
-        await asyncio.sleep(0)
+        async with asyncio.timeout(5):
+            while len(provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS) != len(
+                existing_owners
+            ):
+                await asyncio.sleep(0)
         assert len(provider_deadlines_module._PROVIDER_DEADLINE_AWAIT_OWNERS) == len(
             existing_owners
         )

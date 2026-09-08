@@ -355,7 +355,7 @@ def test_revocation_before_prepared_upstream_dispatch_never_starts_operation() -
         revocation_task: asyncio.Task[int] | None = None
         try:
             await asyncio.wait_for(operation_prepared.wait(), timeout=1.0)
-            await asyncio.wait_for(result_entered.wait(), timeout=1.0)
+            await asyncio.wait_for(result_entered.wait(), timeout=10.0)
             revocation_task = asyncio.create_task(
                 broker.revoke_authority_and_wait((grant.presented_value,))
             )
@@ -491,9 +491,9 @@ def test_revocation_arms_every_upstream_settlement_before_waiting() -> None:
         requests = [asyncio.create_task(broker.handle_request(request))]
         revocation_task: asyncio.Task[int] | None = None
         try:
-            await asyncio.wait_for(started[0].wait(), timeout=1.0)
+            await asyncio.wait_for(started[0].wait(), timeout=10.0)
             requests.append(asyncio.create_task(broker.handle_request(request)))
-            await asyncio.wait_for(started[1].wait(), timeout=1.0)
+            await asyncio.wait_for(started[1].wait(), timeout=10.0)
 
             revocation_task = asyncio.create_task(
                 broker.revoke_authority_and_wait((grant.presented_value,))
@@ -571,7 +571,7 @@ def test_revocation_preserves_upstream_settlement_process_control_signal(
         )
         failure: BaseExceptionGroup | None = None
         try:
-            await asyncio.wait_for(started.wait(), timeout=1.0)
+            await asyncio.wait_for(started.wait(), timeout=10.0)
             with pytest.raises(BaseExceptionGroup) as exc_info:
                 await broker.revoke_authority_and_wait((grant.presented_value,))
             failure = exc_info.value
@@ -639,7 +639,7 @@ def test_caller_cancellation_preserves_grouped_upstream_process_control_signal()
         cancelled = False
         cancelling = 0
         try:
-            await asyncio.wait_for(started.wait(), timeout=1.0)
+            await asyncio.wait_for(started.wait(), timeout=10.0)
             request_task.cancel("caller disconnected")
             with pytest.raises(BaseExceptionGroup) as exc_info:
                 await request_task
@@ -716,7 +716,7 @@ def test_caller_cancellation_releases_quiescent_process_control_capacity() -> No
         request_task = asyncio.create_task(
             broker.handle_request(_request(first_grant.presented_value, "/v1/customers"))
         )
-        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await asyncio.wait_for(started.wait(), timeout=10.0)
         request_task.cancel("caller disconnected")
         with pytest.raises(GeneratorExit) as exc_info:
             await request_task

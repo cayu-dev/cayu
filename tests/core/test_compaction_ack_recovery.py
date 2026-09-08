@@ -220,7 +220,7 @@ def test_cancellation_during_reconciliation_remains_authoritative(
 
             async with _fault(store, boundary):
                 task = asyncio.create_task(collect())
-                await asyncio.wait_for(entered.wait(), 5)
+                await asyncio.wait_for(entered.wait(), 10)
                 task.cancel("cancel acknowledgement recovery")
                 release.set()
                 with pytest.raises(asyncio.CancelledError, match="cancel acknowledgement recovery"):
