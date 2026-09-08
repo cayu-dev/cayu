@@ -13,7 +13,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from cayu.build_provenance import current_runtime_build_provenance
 from cayu.evals import EvalPlan, EvalRun, EvalSuite, eval_run_to_json
+from cayu.evals._inspection_documents import write_process_document as _write_json
+from cayu.evals._process_progress import ProcessEvalProgress
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.models import aggregate_eval_score, aggregate_eval_status
 from cayu.evals.runner import run_eval_suite, run_workflow_eval_suite
@@ -28,24 +31,6 @@ from cayu.runtime._process_workers import (
 
 _MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 _METADATA_KEY = "cayu_process_execution"
-
-
-def _write_json(path: Path, value: object) -> None:
-    data = json.dumps(value, sort_keys=True, allow_nan=False).encode()
-    if len(data) > _MAX_DOCUMENT_BYTES:
-        raise ValueError("Process eval document exceeds its 64 MiB bound.")
-    temporary = path.with_suffix(path.suffix + ".pending")
-    with temporary.open("xb") as stream:
-        os.chmod(temporary, 0o600)
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-    descriptor = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _read_json(path: Path):
@@ -154,8 +139,13 @@ async def run_process_eval(
     launch_id = str(uuid4())
     started_at = datetime.now(UTC)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "launch_id": launch_id,
+        "started_at": started_at.isoformat(),
+        "supervisor_pid": os.getpid(),
+        "automatic_replay": False,
+        "python_version": sys.version.split()[0],
+        "runtime_build_provenance": current_runtime_build_provenance().model_dump(mode="json"),
         "target": target,
         "processes": count,
         "max_concurrency": max_concurrency,
@@ -164,6 +154,7 @@ async def run_process_eval(
         "shutdown_grace_seconds": shutdown_grace_seconds,
     }
     _write_json(directory / "launch.json", manifest)
+    print(f"Eval process launch {launch_id}: {directory}", file=sys.stderr, flush=True)
     commands = [
         ProcessWorkerCommand(
             argv=(sys.executable, "-m", "cayu.cli._eval_processes", str(directory), str(index)),
@@ -341,26 +332,34 @@ async def _worker(directory: Path, index: int) -> None:
             trial_count=1,
             max_concurrency=launch["max_concurrency"],
         )
-        if plan.workflow_target is not None:
-            result = await run_workflow_eval_suite(
-                plan.workflow_target,
-                suite,
-                max_concurrency=capacity,
-                case_timeout_seconds=launch["case_timeout_seconds"],
-                trial_policy=policy,
-            )
-        else:
-            assert plan.app is not None
-            result = await run_eval_suite(
-                plan.app,
-                suite,
-                max_concurrency=capacity,
-                case_timeout_seconds=launch["case_timeout_seconds"],
-                trial_policy=policy,
-            )
-        if await _plan_identity(plan) != identity:
-            raise RuntimeError("Process eval target changed during execution.")
-        _write_json(directory / f"result-{index}.json", json.loads(eval_run_to_json(result)))
+        progress = ProcessEvalProgress(
+            directory,
+            launch_id=launch["launch_id"],
+            index=index,
+            fingerprint=identity["fingerprint"],
+            case_ids=tuple(assigned),
+        )
+        with progress.activate():
+            if plan.workflow_target is not None:
+                result = await run_workflow_eval_suite(
+                    plan.workflow_target,
+                    suite,
+                    max_concurrency=capacity,
+                    case_timeout_seconds=launch["case_timeout_seconds"],
+                    trial_policy=policy,
+                )
+            else:
+                assert plan.app is not None
+                result = await run_eval_suite(
+                    plan.app,
+                    suite,
+                    max_concurrency=capacity,
+                    case_timeout_seconds=launch["case_timeout_seconds"],
+                    trial_policy=policy,
+                )
+            if await _plan_identity(plan) != identity:
+                raise RuntimeError("Process eval target changed during execution.")
+            _write_json(directory / f"result-{index}.json", json.loads(eval_run_to_json(result)))
     finally:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):

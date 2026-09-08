@@ -459,6 +459,14 @@ from cayu.evals.models import (
 )
 from cayu.evals.portable_assertions import compile_assertion_spec
 from cayu.evals.portable_evaluation import evaluate_assertion_spec, evaluate_assertion_specs
+from cayu.evals.process_inspection import (
+    EvalProcessCaseInspectionV1,
+    EvalProcessInspectionV1,
+    EvalProcessWorkerInspectionV1,
+    EvalSessionReferenceV1,
+    export_process_eval_run,
+    inspect_process_eval_run,
+)
 from cayu.evals.promotion import (
     CAPTURED_EVALUATION_CANDIDATE_MAX_BYTES,
     CAPTURED_EVALUATION_CANDIDATE_SCHEMA_VERSION,
@@ -705,6 +713,12 @@ from cayu.evals.scenario_preflight import (
     ScenarioSecretLaunchBindingV2,
     materialize_eval_scenario_artifact_fixture,
     preflight_eval_scenario,
+)
+from cayu.evals.session_inspection import (
+    EvalDiagnosticV1,
+    EvalSessionInspectionV1,
+    EvalSessionObservationV1,
+    inspect_eval_sessions,
 )
 from cayu.evals.store import (
     EVAL_RUN_INVOCATION_MAX_BYTES,
@@ -1139,6 +1153,7 @@ __all__ = [
     "EvalCorpusDocument",
     "EvalCorpusInspectionV1",
     "EvalCorpusSuiteInspectionV1",
+    "EvalDiagnosticV1",
     "EvalExecutionCandidateIdentityV1",
     "EvalExecutionCapacity",
     "EvalExecutionProfileBindingV1",
@@ -1170,7 +1185,10 @@ __all__ = [
     "EvalMemorySourceReferenceV1",
     "EvalOutcome",
     "EvalPlan",
+    "EvalProcessCaseInspectionV1",
     "EvalProcessEventKind",
+    "EvalProcessInspectionV1",
+    "EvalProcessWorkerInspectionV1",
     "EvalResultAssertionIdentityV1",
     "EvalResultCaseProjectionV1",
     "EvalResultConflict",
@@ -1226,6 +1244,9 @@ __all__ = [
     "EvalScenarioTrialPhase",
     "EvalScenarioTrialProgress",
     "EvalSelectedCaseV1",
+    "EvalSessionInspectionV1",
+    "EvalSessionObservationV1",
+    "EvalSessionReferenceV1",
     "EvalSimpleInputStimulusV1",
     "EvalStatus",
     "EvalStore",
@@ -1582,6 +1603,7 @@ __all__ = [
     "evaluate_assertions",
     "evaluation_target_identity",
     "export_captured_evaluation_corpus",
+    "export_process_eval_run",
     "export_promotion_corpus",
     "external_body_content_revision",
     "external_body_file_revision",
@@ -1595,6 +1617,8 @@ __all__ = [
     "inspect_browser_acceptance_runtime_identity",
     "inspect_eval_corpus",
     "inspect_eval_scenario",
+    "inspect_eval_sessions",
+    "inspect_process_eval_run",
     "live_authenticated_browser_acceptance_manifest",
     "live_public_browser_acceptance_manifest",
     "load_causal_memory_reference_corpus",

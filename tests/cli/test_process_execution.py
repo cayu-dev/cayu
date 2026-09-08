@@ -494,6 +494,14 @@ Provider.stream=crash_stream
     assert (tmp_path / "workers/incomplete.json").exists()
     assert len(list(tmp_path.glob("factory-*.json"))) == 2
     _assert_dead([int(p.stem.split("-")[1]) for p in tmp_path.glob("factory-*.json")])
+    import asyncio
+
+    from cayu import inspect_process_eval_run
+
+    snapshot = asyncio.run(inspect_process_eval_run(tmp_path / "workers"))
+    assert snapshot.phase == "incomplete"
+    assert snapshot.result_status is None
+    assert snapshot.automatic_replay is False
 
 
 def test_process_workflow_eval_keeps_native_child_evidence(tmp_path):
@@ -551,6 +559,114 @@ def build_eval():
         trial = case["trials"][0]
         assert trial["evidence_complete"] is True
         assert trial["execution_status"] == "completed"
+    for index in range(2):
+        progress = json.loads((tmp_path / f"workers/progress-{index}.json").read_text())
+        observation = progress["trials"][0]
+        assert observation["state"] == "finished"
+        assert (
+            observation["session"]["session_id"]
+            == result["cases"][index]["trials"][0]["session_id"]
+        )
+
+
+def test_process_eval_status_observes_active_sqlite_cases_without_loading_target(tmp_path):
+    import asyncio
+
+    from cayu import inspect_process_eval_run
+
+    _project(
+        tmp_path,
+        """
+from cayu import SQLiteSessionStore
+def build_app():
+    Path(f"factory-{os.getpid()}.json").write_text('{}')
+    app=CayuApp(enable_logging=False,session_store=SQLiteSessionStore(Path(f"store-{os.getpid()}.db")))
+    app.register_provider(Provider(),default=True)
+    app.register_agent(AgentSpec(name="agent",model="test"),tools=[])
+    return app
+_original_stream=Provider.stream
+async def gated_stream(self,request):
+    if os.environ['CAYU_WORKER_INDEX']=='1':
+        Path('waiting').touch()
+        while not Path('release').exists():await asyncio.sleep(.02)
+    async for event in _original_stream(self,request):yield event
+Provider.stream=gated_stream
+""",
+    )
+    process = _start(
+        tmp_path,
+        "eval",
+        "run",
+        "--processes",
+        "2",
+        "--max-concurrency",
+        "2",
+        "--process-directory",
+        "workers",
+        "--output",
+        "result.json",
+    )
+    try:
+        deadline = time.monotonic() + 40
+        while not (
+            (tmp_path / "waiting").exists() and (tmp_path / "workers/result-0.json").exists()
+        ):
+            assert process.poll() is None, process.communicate()
+            if time.monotonic() >= deadline:
+                pytest.fail("workers did not reach the controlled partial-run boundary")
+            time.sleep(0.02)
+        factories = tuple(sorted(path.name for path in tmp_path.glob("factory-*.json")))
+        snapshot = asyncio.run(
+            inspect_process_eval_run(tmp_path / "workers", include_sessions=True)
+        )
+        assert snapshot.phase == "admitted"
+        assert snapshot.counts["results_recorded"] == 2
+        assert snapshot.result_status is None
+        assert snapshot.owner_liveness == "not_checked"
+        assert snapshot.runtime_build_provenance is not None
+        active = next(case for case in snapshot.cases if case.case_id == "case-1")
+        assert active.observed_state == "started"
+        assert active.session is not None and active.session.sqlite_path is not None
+        assert active.session_inspection is not None
+        assert active.session_inspection.sessions[0].status == "running"
+        assert active.session_inspection.sessions[0].activity == "recent"
+        assert tuple(sorted(path.name for path in tmp_path.glob("factory-*.json"))) == factories
+    finally:
+        (tmp_path / "release").touch()
+        stdout, stderr = _finished(process, 60)
+    assert process.returncode == 0, (stdout, stderr)
+    snapshot = asyncio.run(inspect_process_eval_run(tmp_path / "workers"))
+    assert snapshot.phase == "completed"
+    assert snapshot.counts["passed"] == 4
+    assert snapshot.counts["trials_observed_finished"] == 4
+
+
+def test_process_progress_write_failure_does_not_change_scientific_result(tmp_path):
+    _project(
+        tmp_path,
+        """
+from cayu.evals import _process_progress
+def unavailable(*args,**kwargs):raise OSError('injected observation failure')
+_process_progress.write_process_document=unavailable
+""",
+    )
+    process = _start(
+        tmp_path,
+        "eval",
+        "run",
+        "--processes",
+        "2",
+        "--max-concurrency",
+        "2",
+        "--process-directory",
+        "workers",
+        "--output",
+        "result.json",
+    )
+    stdout, stderr = _finished(process, 60)
+    assert process.returncode == 0, (stdout, stderr)
+    assert json.loads((tmp_path / "result.json").read_text())["status"] == "passed"
+    assert not list((tmp_path / "workers").glob("progress-*.json"))
 
 
 @pytest.mark.parametrize("leader_crashes", [True, False])

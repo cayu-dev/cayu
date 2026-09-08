@@ -38,6 +38,11 @@ from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedErro
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
+from cayu.evals._process_progress import (
+    observe_eval_session,
+    observe_eval_trial,
+    observe_eval_trial_result,
+)
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY, EvalExecutionCapacity
 from cayu.evals.capture_policy import (
@@ -1185,26 +1190,29 @@ async def _run_suite_cases(
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
 ]:
     async def execute_trial(case: EvalCase, trial_number: int):
-        return await _run_case_once_with_public_projection(
-            app,
-            case,
-            trial_number=trial_number,
-            suite_id=suite.id,
-            retain_trajectory=retain_trajectory,
-            retain_final_output=retain_final_output,
-            timeout_seconds=case_timeout_seconds,
-            public_output_preview_bytes=public_output_preview_bytes,
-            memory_attribution_bounds=memory_attribution_bounds,
-            memory_attribution_source_limit=memory_attribution_source_limit,
-            memory_attribution_max_bytes=memory_attribution_max_bytes,
-            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
-            run_stream=run_stream,
-            trial_request_transform=trial_request_transform,
-            run_id=run_id,
-            workflow_target=workflow_target,
-            workflow_instance_tracker=workflow_instance_tracker,
-            workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
-        )
+        with observe_eval_trial(case.id, trial_number):
+            result = await _run_case_once_with_public_projection(
+                app,
+                case,
+                trial_number=trial_number,
+                suite_id=suite.id,
+                retain_trajectory=retain_trajectory,
+                retain_final_output=retain_final_output,
+                timeout_seconds=case_timeout_seconds,
+                public_output_preview_bytes=public_output_preview_bytes,
+                memory_attribution_bounds=memory_attribution_bounds,
+                memory_attribution_source_limit=memory_attribution_source_limit,
+                memory_attribution_max_bytes=memory_attribution_max_bytes,
+                memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+                run_stream=run_stream,
+                trial_request_transform=trial_request_transform,
+                run_id=run_id,
+                workflow_target=workflow_target,
+                workflow_instance_tracker=workflow_instance_tracker,
+                workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
+            )
+            observe_eval_trial_result(result[0])
+            return result
 
     return await _schedule_suite_trials(
         suite,
@@ -1786,6 +1794,7 @@ async def _run_workflow_case_once_with_public_projection(
             execution = built
             workflow_instance_tracker.observe(execution)
             runtime_app = execution.app
+            observe_eval_session(runtime_app.session_store, root_session_id)
             if runtime_app.describe().fingerprint != app_manifest.fingerprint:
                 raise WorkflowEvalFailure(
                     WorkflowEvalFailureCode.TARGET_FAILED,
@@ -2374,6 +2383,8 @@ async def _run_case_once_with_public_projection(
         if type(transformed) is not RunRequest:
             raise TypeError("trial_request_transform must return an exact RunRequest.")
         trial_request = copy_run_request(transformed)
+    if trial_request.session_id is not None:
+        observe_eval_session(app.session_store, trial_request.session_id)
     emitted_root_events: list[RunnerObservedEventIdentity] = []
     emitted_root_events_truncated = False
     observed_session_id: str | None = None

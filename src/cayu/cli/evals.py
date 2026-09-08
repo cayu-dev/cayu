@@ -124,6 +124,48 @@ def add_eval_parser(subparsers: Any) -> None:
         help="Limit each direct-suite case to SECONDS; corpus timeouts are declared in JSON.",
     )
 
+    for command in ("status", "failures"):
+        inspection = inner.add_parser(
+            command,
+            help=(
+                "Inspect process-run progress."
+                if command == "status"
+                else "Inspect recorded case failures and session diagnostics."
+            ),
+            description=(
+                "Read native process receipts without importing the target or starting work. "
+                "Session observations use explicit read-only store links. "
+                "Admission and recent events do not prove worker liveness."
+            ),
+        )
+        inspection.add_argument("directory", metavar="PROCESS_DIRECTORY")
+        inspection.add_argument(
+            "--sessions",
+            action=argparse.BooleanOptionalAction,
+            default=command == "failures",
+            help="Include bounded live session observations (default: enabled for failures).",
+        )
+        inspection.add_argument(
+            "--session-evidence",
+            metavar="FILE",
+            help="Explicit launch- and case-bound session locators for an older run.",
+        )
+        inspection.add_argument("--max-sessions", type=int, default=100)
+        inspection.add_argument("--max-diagnostics", type=int, default=20)
+        inspection.add_argument("--case", dest="case_id", metavar="CASE_ID")
+        add_output_options(inspection, formats=("json", "table"), default="table")
+
+    export = inner.add_parser(
+        "export",
+        help="Export validated process receipts and results to a new private ZIP.",
+        description=(
+            "Export exact inspected receipt and result bytes with hashes. "
+            "This does not snapshot session stores or include application files and logs."
+        ),
+    )
+    export.add_argument("directory", metavar="PROCESS_DIRECTORY")
+    export.add_argument("--output", "-o", required=True, metavar="NEW_ZIP")
+
     report = inner.add_parser(
         "report",
         help="Render a JSON or HTML report from eval results.",
@@ -211,6 +253,14 @@ def run_eval_command(args: argparse.Namespace) -> int:
     try:
         if args.eval_command == "run":
             return asyncio.run(_run(args))
+        if args.eval_command in {"status", "failures"}:
+            return asyncio.run(_inspect_process(args))
+        if args.eval_command == "export":
+            from cayu.evals.process_inspection import export_process_eval_run
+
+            snapshot = export_process_eval_run(args.directory, args.output)
+            print(f"Exported {snapshot.launch_id} ({snapshot.phase}) to {args.output}")
+            return 0
         if args.eval_command == "report":
             return _report(args)
         if args.eval_command == "memory-report":
@@ -238,6 +288,129 @@ def run_eval_command(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
         return 2
     return 2
+
+
+async def _inspect_process(args: argparse.Namespace) -> int:
+    from cayu.evals.process_inspection import inspect_process_eval_run
+
+    if args.output is not None and Path(args.output).resolve().is_relative_to(
+        Path(args.directory).resolve()
+    ):
+        raise ValueError("Inspection output must be outside the process receipt directory.")
+    _reject_output_path_aliases(
+        outputs=(("--output", args.output),),
+        protected=(("--session-evidence", args.session_evidence),),
+    )
+    snapshot = await inspect_process_eval_run(
+        args.directory,
+        include_sessions=args.sessions,
+        session_evidence=args.session_evidence,
+        max_sessions=args.max_sessions,
+        max_diagnostics=args.max_diagnostics,
+        case_id=args.case_id,
+    )
+    if args.output is not None:
+        # Include all bindings before case/failure filtering, even when live
+        # session reads are disabled. SQLite sidecars are durable evidence too.
+        protected_paths = set()
+        for case in snapshot.cases:
+            if case.session is None or case.session.sqlite_path is None:
+                continue
+            database = Path(case.session.sqlite_path)
+            for path in (database, database.resolve()):
+                protected_paths.update(
+                    str(path) + suffix for suffix in ("", "-wal", "-shm", "-journal")
+                )
+        receipt_names = {"launch.json", "start.json", "completed.json", "incomplete.json"}
+        receipt_names.update(
+            f"{kind}-{worker.index}.json"
+            for worker in snapshot.workers
+            for kind in ("ready", "progress", "result")
+        )
+        protected_paths.update(str(Path(args.directory) / name) for name in receipt_names)
+        _reject_output_path_aliases(
+            outputs=(("--output", args.output),),
+            protected=tuple(("inspection source", path) for path in sorted(protected_paths)),
+        )
+    selected = snapshot.cases
+    if args.case_id is not None:
+        selected = tuple(case for case in selected if case.case_id == args.case_id)
+        if not selected:
+            raise ValueError("Requested case is not in the admitted process run.")
+    if args.eval_command == "failures":
+        selected = tuple(
+            case
+            for case in selected
+            if case.result_status in {EvalStatus.FAILED, EvalStatus.ERROR, EvalStatus.UNAVAILABLE}
+            or case.observed_trial_status
+            in {EvalStatus.FAILED, EvalStatus.ERROR, EvalStatus.UNAVAILABLE}
+            or case.observed_state == "interrupted"
+            or (case.session_inspection is not None and case.session_inspection.diagnostics)
+            or case.limitations
+            or (case.session_inspection is not None and case.session_inspection.limitations)
+        )
+    snapshot = snapshot.model_copy(update={"cases": selected})
+    if args.output_format == "json":
+        content = snapshot.model_dump_json(indent=2) + "\n"
+    else:
+        lines = [
+            f"Launch: {snapshot.launch_id}",
+            f"Phase: {snapshot.phase}; owner liveness: not checked; automatic replay: no",
+            f"Workers: {len(snapshot.workers)}; case concurrency: {snapshot.max_concurrency}",
+            f"Recorded results: {snapshot.counts['results_recorded']}/{snapshot.counts['assigned']}; "
+            f"passed: {snapshot.counts.get('passed', 0)}; failed: {snapshot.counts.get('failed', 0)}; "
+            f"errors: {snapshot.counts.get('error', 0)}; unavailable: {snapshot.counts.get('unavailable', 0)}",
+        ]
+        if snapshot.incomplete_exception_type:
+            lines.append(f"Incomplete: {snapshot.incomplete_exception_type}")
+        for case in selected:
+            status = "not recorded" if case.result_status is None else case.result_status.value
+            lines.append(
+                f"{_inspection_text(case.case_id)}: result={status}; observation={case.observed_state}; worker={case.worker_index}"
+            )
+            if case.observed_error:
+                lines.append(
+                    f"  Observed error (provisional): {_inspection_text(case.observed_error)}"
+                )
+            if case.observed_exception_type:
+                lines.append(
+                    f"  Observed exception (provisional): {_inspection_text(case.observed_exception_type)}"
+                )
+            if case.error:
+                lines.append(f"  Error: {_inspection_text(case.error)}")
+            if case.unavailable_reason:
+                lines.append(f"  Unavailable: {_inspection_text(case.unavailable_reason)}")
+            for assertion in case.assertion_failures:
+                lines.append(
+                    f"  {_inspection_text(assertion['name'])}: {assertion['outcome']}; {_inspection_text(assertion['message'] or '')}"
+                )
+            if case.session_inspection is not None:
+                for session in case.session_inspection.sessions:
+                    if session.activity != "terminal":
+                        lines.append(
+                            f"  {_inspection_text(session.agent)}: {session.status}, activity={session.activity}, pending={session.pending_action_count}, settlement_reported={session.manual_settlement_reported}"
+                        )
+                if args.eval_command == "failures":
+                    for diagnostic in case.session_inspection.diagnostics:
+                        lines.append(
+                            f"  {diagnostic.event_type} [{_inspection_text(diagnostic.session_id)}#{diagnostic.sequence}] {_inspection_text(diagnostic.code or '')} {_inspection_text(diagnostic.message or '')}"
+                        )
+                for limitation in case.session_inspection.limitations:
+                    lines.append(f"  Limitation: {limitation}")
+            for limitation in case.limitations:
+                lines.append(f"  Limitation: {limitation}")
+        for limitation in snapshot.limitations:
+            lines.append(f"Limitation: {limitation}")
+        if args.eval_command == "failures" and not selected:
+            lines.append("No failures found in the inspected evidence.")
+        content = "\n".join(lines) + "\n"
+    _write_or_print(content, args.output)
+    return 0
+
+
+def _inspection_text(value: str) -> str:
+    # Event excerpts are data, never terminal control sequences.
+    return "".join(character if character.isprintable() else " " for character in value)[:512]
 
 
 async def _run(args: argparse.Namespace) -> int:

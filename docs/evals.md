@@ -84,6 +84,105 @@ directory and application stores for investigation. Admission waits at most
 termination. This is process supervision, not a sandbox or crash-resumable eval
 queue. For general claimed work, see [project workers](project-workers.md).
 
+### Inspect a process run
+
+Use the process directory from the launch command. Inspection does not import
+the evaluation target or dispatch work:
+
+```bash
+cayu eval status .cayu/evals/campaign-001 --sessions
+cayu eval failures .cayu/evals/campaign-001 --case case-17 --json
+cayu eval export .cayu/evals/campaign-001 --output campaign-001.zip
+```
+
+`status` reports admission, worker assignments, recorded case results, and
+provisional per-trial progress. New launches retain the supervisor PID, start
+time, Python version, and Runtime build provenance, and print the launch ID
+and process directory to stderr before dispatch. `--sessions` also reads
+the exact trial root and a bounded descendant set through `SessionStore` APIs;
+it shows agent/stage sessions, event activity, pending actions, and recent
+diagnostics. It is enabled by default for `failures`, and can be disabled with
+`--no-sessions`. `--max-sessions` (default 100) and `--max-diagnostics` (default
+20) bound the whole command's session/diagnostic output. `--case` selects one
+admitted case for detailed inspection. Counts always describe the whole run.
+
+The process phases are `preparing`, `admitted`, `completed`, and `incomplete`.
+`admitted` means the dispatch barrier was recorded; it does **not** claim that
+the supervisor is still alive. Inspection never treats a PID on another host,
+a persisted `running` session, or an old heartbeat as live ownership. Session
+activity is classified separately as recent, stale, terminal, or clock-skewed.
+Completion is accepted only when the terminal marker and every worker result
+match the launch, exact assignments, suite, metadata, and trial policy. A worker
+publishes its result after its whole assigned batch finishes, so result-file
+count is not completed-case count. A finished trial observation is provisional
+until that worker's final identity check and result publication succeed.
+Progress error messages and interruption exception types remain available as
+`observed_error` and `observed_exception_type`, labeled provisional in table
+output. They do not establish an admitted result. Inspection output cannot
+overwrite a linked SQLite database, its sidecars, or a native receipt, including
+through a symbolic link or hard link. This protection also applies with
+`--no-sessions` and when selecting a different case.
+
+`failures` distinguishes scored case failures and evaluator errors from tool
+errors and provider retries that may be recoverable. Event diagnostics include
+case/session identity, durable sequence, event/tool identity, an error code,
+and a bounded message; they do not copy tool arguments or whole event payloads.
+Missing, oversized, unsupported, and truncated evidence is reported as a
+limitation. A manual-settlement observation is diagnostic information, not
+authorization to retry, release ownership, or repair the session.
+
+New process workers automatically record local SQLite session locators when
+they observe the exact built-in store. In-memory and other stores have no
+automatic portable locator. Applications with another backend can use the
+backend-neutral `inspect_eval_sessions(store, root_session_id)` API directly.
+The CLI opens recorded SQLite sources in read-only validation mode, without
+creating missing databases or migrating a schema. Live store reads and receipt
+reads are independent observations, not one global transactional snapshot.
+
+Older launch directories remain inspectable, with unknown progress explicitly
+reported. An operator who already has exact session identities can supply a
+binding file with `--session-evidence FILE --sessions`:
+
+```json
+{
+  "schema_version": 1,
+  "launch_id": "the-launch-id-from-launch.json",
+  "cases": [
+    {
+      "case_id": "case-17",
+      "session_id": "the-exact-trial-root",
+      "sqlite_path": "/absolute/path/to/sessions.sqlite3"
+    }
+  ]
+}
+```
+
+The binding must match the launch and admitted case set, and cannot override
+a conflicting recorded locator. Its association is marked as operator-supplied;
+an old launch without a recorded locator cannot independently prove that mapping.
+Cayu does not guess application directory
+layouts or search unrelated stores for matching names.
+
+`export` creates a new private ZIP containing the exact validated admission,
+progress, terminal, and worker-result bytes, an `inspection.json` observation,
+and an `export.json` manifest with byte counts and SHA-256 hashes. Incomplete
+runs can be exported without being promoted to completed results. Only known
+receipt names are included: logs, pending writes, session databases,
+credentials, and application attachments are not swept into the archive.
+Preserve application stores separately when full trajectories are needed.
+Exports reject symlink receipts and refuse to overwrite an existing destination.
+Receipt reads are bounded to 64 MiB per file and 256 MiB total, with at most
+256 workers and 10,000 admitted cases.
+
+The corresponding public SDK entry points are `inspect_process_eval_run`,
+`inspect_eval_sessions`, and `export_process_eval_run`, returning versioned
+`EvalProcessInspectionV1` and `EvalSessionInspectionV1` observations. Existing
+`cayu session show`, `events`, `tools`, and `transcript` commands provide deeper
+inspection of a returned session ID. VM provisioning, cloud shutdown policies,
+benchmark case selection, and application-specific qualification remain outside
+the process runner. Stop a foreground evaluation through its owning process;
+starting `cayu eval run` again creates a new launch and never resumes the old one.
+
 ### Single-process SDK example
 
 ```python

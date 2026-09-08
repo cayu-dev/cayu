@@ -5,6 +5,25 @@ want to understand. Cayu can score the evidence already captured, save it as a
 baseline, and—when the session can be reconstructed under current published
 authority—run a controlled fresh scenario through the same evaluator.
 
+## Check a native process evaluation
+
+For a run launched with `cayu eval run --processes ...`, use its recorded
+`--process-directory`:
+
+```bash
+cayu eval status .cayu/evals/run-001 --sessions
+cayu eval failures .cayu/evals/run-001 --json
+cayu eval export .cayu/evals/run-001 --output run-001-receipts.zip
+```
+
+These commands inspect retained receipts and explicit read-only session links
+without loading the target. Recorded results, provisional trial progress, and
+recent session activity are separate facts. An admitted launch or a persisted
+`running` session does not prove a live owner. Missing or truncated evidence is
+reported explicitly; export never resumes work or promotes an incomplete run.
+Use `--case CASE_ID` to focus failure inspection. The ZIP contains native
+receipts and worker results; preserve application session stores separately.
+
 ## Evaluate a retained session
 
 Open the session in Control Plane and choose **Evaluate**.
