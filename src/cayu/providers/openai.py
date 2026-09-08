@@ -3813,11 +3813,6 @@ def _normalized_web_search_call(
             action,
             path=f"output[{item_index}].action",
         )
-    if status == "completed" and "action" not in normalized:
-        raise OpenAIProtocolError(
-            f"OpenAI web_search_call item {item_index} completed without action evidence.",
-            reason_code="web_search_call_item_completed_without_action_evidence",
-        )
     return normalized
 
 
@@ -6057,22 +6052,22 @@ def _openai_neutral_assistant_items(
         if type(part) is HostedToolCallPart:
             if part.status == "completed":
                 flush_text()
-                if part.action is None:  # pragma: no cover - model validation owns this
-                    raise OpenAIProtocolError(
-                        "Completed hosted search replay requires action evidence.",
-                        reason_code="completed_hosted_search_replay_requires_action_evidence",
-                    )
-                action = part.action.model_dump(mode="json", exclude_none=True)
-                if not action.get("queries"):
-                    action.pop("queries", None)
-                if not action.get("sources"):
-                    action.pop("sources", None)
+                action = (
+                    part.action.model_dump(mode="json", exclude_none=True)
+                    if part.action is not None
+                    else None
+                )
+                if action is not None:
+                    if not action.get("queries"):
+                        action.pop("queries", None)
+                    if not action.get("sources"):
+                        action.pop("sources", None)
                 items.append(
                     {
                         "type": "web_search_call",
                         "id": part.call_id,
                         "status": "completed",
-                        "action": action,
+                        **({"action": action} if action is not None else {}),
                     }
                 )
             continue

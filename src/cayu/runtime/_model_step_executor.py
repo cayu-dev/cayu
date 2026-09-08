@@ -14998,8 +14998,6 @@ def _validated_hosted_tool_call_payload(payload: dict[str, Any]) -> dict[str, An
     action = copied.get("action")
     if action is not None:
         copied["action"] = WebSearchAction.model_validate(action).model_dump(mode="json")
-    if status == "completed" and action is None:
-        raise ValueError("Completed web search calls require terminal action evidence.")
     return copied
 
 

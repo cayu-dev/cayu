@@ -8520,6 +8520,13 @@ identity even when OpenAI reuses another response field. Only a completed
 or transport-ambiguous calls remain terminal evidence and cannot become a
 pending Cayu tool round.
 
+A provider-declared completed web-search call may omit or null its action.
+It remains completed, counted once, and replayable with its original call ID;
+the transcript stores `action=None` and replay omits the action field. This
+means metadata is unavailable, not that any particular operation, query, source,
+or screenshot occurred. No action or source count is synthesized. Supplied
+actions still require a supported discriminator and valid structure.
+
 Terminal action evidence follows the provider's optional fields: an `open_page`
 URL may be omitted or null, and a `search` may omit both query fields or report
 an empty `queries` list. Missing details remain absent evidence through

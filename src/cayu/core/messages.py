@@ -343,6 +343,7 @@ class HostedToolCallPart(BaseModel):
     hosted_tool: Literal["web_search"] = "web_search"
     call_id: str = Field(max_length=512)
     status: Literal["completed", "incomplete", "failed", "outcome_unknown"]
+    # Completion is provider-declared; None means action metadata is unavailable.
     action: WebSearchAction | None = None
     provider_name: str = Field(max_length=128)
     model: str = Field(max_length=512)
@@ -365,12 +366,6 @@ class HostedToolCallPart(BaseModel):
         if value is None:
             return None
         return WebSearchAction.model_validate(value)
-
-    @model_validator(mode="after")
-    def validate_terminal_action(self) -> HostedToolCallPart:
-        if self.status == "completed" and self.action is None:
-            raise ValueError("Completed hosted tool calls require terminal action evidence.")
-        return self
 
 
 class CitationProvenance(BaseModel):
