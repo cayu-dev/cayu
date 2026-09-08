@@ -641,7 +641,17 @@ class ProviderStreamDeadlineController:
                 # iterator. Bundled parsers may also preserve a terminal frame;
                 # opaque reads never gain permission to resume caller work.
                 try:
-                    await asyncio.sleep(0)
+                    # Nested HTTP shutdown can take more than one loop turn.
+                    # Only an already accepted bundled terminal gets the same
+                    # bounded settlement grace used by semantic expiry.
+                    if (
+                        semantic_cleanup_grace_s
+                        and terminal_was_observed
+                        and accept_cancelled_result is not None
+                    ):
+                        await asyncio.wait((operation,), timeout=semantic_cleanup_grace_s)
+                    else:
+                        await asyncio.sleep(0)
                 except BaseException:
                     self._await_ownership.retain(operation)
                     if interrupted and on_interrupted is not None:

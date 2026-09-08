@@ -1393,25 +1393,26 @@ async def test_downstream_pause_does_not_rewrite_last_progress_time() -> None:
         yield ModelStreamEvent.text_delta("one")
         await asyncio.Event().wait()
 
+    # Allow governed stream setup before testing the downstream pause itself.
     provider = _DeadlineProvider(
         events(),
         ProviderStreamDeadlines(
             transport_idle_timeout_s=1,
             protocol_idle_timeout_s=1,
-            semantic_progress_timeout_s=0.01,
+            semantic_progress_timeout_s=0.1,
             absolute_stream_timeout_s=1,
         ),
     )
     stream = provider.runtime_stream(_request())
 
     assert (await anext(stream)).delta == "one"
-    await asyncio.sleep(0.03)
+    await asyncio.sleep(0.15)
     with pytest.raises(ModelStreamDeadlineError) as captured:
         await anext(stream)
 
     evidence = captured.value.deadline_evidence
     assert evidence.last_progress_elapsed_s is not None
-    assert evidence.elapsed_s - evidence.last_progress_elapsed_s >= 0.03
+    assert evidence.elapsed_s - evidence.last_progress_elapsed_s >= 0.15
 
 
 @pytest.mark.anyio
@@ -1868,5 +1869,47 @@ async def test_whitespace_evidence_rejects_non_boolean_payload(invalid: object) 
         assert type(restored) is ModelProviderError
         assert restored.error_code == "invalid_provider_stream_deadline_evidence"
         assert restored.retryable is False
+    finally:
+        controller.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("observed,validated", [(True, True), (False, True), (True, False)])
+async def test_caller_cancel_settles_only_preaccepted_bundled_terminal(observed, validated) -> None:
+    controller = ProviderStreamDeadlineController(ProviderStreamDeadlines())
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    terminal = ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def read():
+        if observed:
+            controller.observe_semantic(ProviderProgressKind.TERMINAL)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Model nested transport shutdown requiring multiple scheduling turns.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            closed.set()
+            return terminal
+
+    task = asyncio.create_task(
+        controller.wait_for(
+            read(),
+            kinds=(ProviderDeadlineKind.SEMANTIC_IDLE,),
+            semantic_cleanup_grace_s=0.1,
+            accept_cancelled_result=(lambda event: event is terminal) if validated else None,
+        )
+    )
+    try:
+        await started.wait()
+        task.cancel("original caller cancellation")
+        if observed and validated:
+            assert await task is terminal
+            assert closed.is_set()
+        else:
+            with pytest.raises(asyncio.CancelledError, match="original caller cancellation"):
+                await task
     finally:
         controller.close()
