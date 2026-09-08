@@ -11532,18 +11532,25 @@ class RecoveryCoordinator:
                 and current_profile is not None
                 and current_profile.interaction_id == execution_profile_snapshot.interaction_id
                 and current_profile.profile == execution_profile_snapshot.profile
-                and active_invocation_execution_profile_is_released(
+                and active_invocation_execution_profile_matches_session_epoch(
                     current_profile,
                     session_id=current_session.id,
                     run_epoch=current_session.run_epoch,
                 )
             ):
                 require_matching_pending_call(current_checkpoint)
-                terminal_event = await self._session_control.latest_interrupted_event(
-                    current_session.id
+                # Typed release may retain the profile at the current epoch.
+                # Replay completed terminal evidence without taking a new fence:
+                # doing so would invent a second interruption for this stop.
+                inspection = await self._inspect_terminal_evidence(
+                    session=current_session,
+                    checkpoint=current_checkpoint,
                 )
+                terminal_event = inspection.event
                 if (
                     terminal_event is not None
+                    and inspection.run_operation is None
+                    and _incomplete_recovery_claim_from_checkpoint(current_checkpoint) is None
                     and terminal_event.payload.get("interruption_type")
                     == _INTERRUPTION_TYPE_OPERATOR_REQUESTED
                 ):

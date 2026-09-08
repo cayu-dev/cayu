@@ -310,6 +310,9 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
+from cayu.runtime._invocation_terminal_decision import (
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.runtime._model_errors import (
     _BillingIdentityResolutionCancelled,
     detach_billing_identity_cancellation_group,
@@ -1737,11 +1740,14 @@ def assert_only_model_step_publication_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> None:
     assert checkpoint is not None
-    assert set(checkpoint) == {
+    settled = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
+    optional_keys = (
+        {SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY} if settled is not None else set()
+    )
+    assert set(checkpoint) - optional_keys == {
         CHECKPOINT_SCHEMA_VERSION_KEY,
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-        SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
         model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
@@ -32376,6 +32382,20 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
             self.lose_fence_ack = False
             self.fence_ack_lost = False
 
+        async def reserve_stalled_run_recovery(
+            self, session_id, *, statuses, inactive_for_seconds, checkpoint_transform
+        ):
+            if self.pause_manual_claim:
+                self.pause_manual_claim = False
+                self.manual_claim_started.set()
+                await self.allow_manual_claim.wait()
+            return await super().reserve_stalled_run_recovery(
+                session_id,
+                statuses=statuses,
+                inactive_for_seconds=inactive_for_seconds,
+                checkpoint_transform=checkpoint_transform,
+            )
+
         async def transition_status_and_checkpoint(
             self,
             session_id: str,
@@ -32386,9 +32406,6 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
             store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
-            if self.pause_manual_claim and to_status == SessionStatus.RUNNING:
-                self.manual_claim_started.set()
-                await self.allow_manual_claim.wait()
             session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
@@ -32480,6 +32497,7 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         if finalize_before_claim:
             await operator_app._recovery_coordinator.finalize_abandoned_session_by_id(session_id)
             interruption_events = await asyncio.wait_for(interrupt_task, timeout=5)
+            completed_stop = await store.load(session_id)
             assert recovery_task.done() is False
         store.lose_fence_ack = lose_fence_ack
         store.allow_manual_claim.set()
@@ -32508,6 +32526,9 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
 
         interrupted = await store.load(session_id)
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
+        if finalize_before_claim:
+            assert completed_stop is not None
+            assert interrupted.run_epoch == completed_stop.run_epoch
         interrupted_checkpoint = await store.load_checkpoint(session_id)
         assert interrupted_checkpoint is not None
         assert interrupted_checkpoint["pending_tool_round"]["tool_round_id"] == request.round_id
