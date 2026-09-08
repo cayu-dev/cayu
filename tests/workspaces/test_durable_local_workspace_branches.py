@@ -1181,8 +1181,10 @@ def test_durable_branch_never_reenters_binding_authority_provider(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("source_mode", [0o644, 0o755])
 def test_fresh_owner_recovers_open_branch_and_private_changes(
     tmp_path: Path,
+    source_mode: int,
 ) -> None:
     async def scenario() -> None:
         database = tmp_path / "branches.sqlite3"
@@ -1191,6 +1193,7 @@ def test_fresh_owner_recovers_open_branch_and_private_changes(
         root = tmp_path / "workspace"
         root.mkdir()
         (root / "kept.txt").write_bytes(b"before")
+        (root / "kept.txt").chmod(source_mode)
         (root / "deleted.txt").write_bytes(b"delete")
         _source, branch, _request = await _durable_branch(root, store)
         await branch.write_bytes("kept.txt", b"after")
@@ -1208,6 +1211,31 @@ def test_fresh_owner_recovers_open_branch_and_private_changes(
         with pytest.raises(FileNotFoundError):
             await recovered.branch.read_bytes("deleted.txt")
         assert (await recovered.branch.changes()).digest == (await branch.changes()).digest
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("damage", ["missing", "invalid", "flipped"])
+def test_recovery_rejects_damaged_baseline_mode_evidence(tmp_path: Path, damage: str) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "branches.sqlite3"
+        store = SQLiteSessionStore(database)
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        (root / "script").write_bytes(b"executable")
+        (root / "script").chmod(0o755)
+        _source, branch, _request = await _durable_branch(root, store)
+        modes = branch._private_root / ".cayu-baseline-modes"
+        if damage == "missing":
+            modes.unlink()
+        else:
+            modes.write_bytes(b"\x02" if damage == "invalid" else b"\x00")
+        fresh = _workspace(root, SQLiteSessionStore(database))
+        recovered = await fresh.recover_branch(_recovery_request())
+        assert recovered.state is WorkspaceBranchDurableState.AMBIGUOUS
+        assert recovered.branch is None
+        assert (root / "script").read_bytes() == b"executable"
 
     asyncio.run(scenario())
 
@@ -5811,3 +5839,69 @@ def test_durable_workspace_branch_store_conformance(
             tmp_path / "conformance",
         )
     )
+
+
+def test_legacy_private_baseline_requires_exact_content_revision(tmp_path: Path) -> None:
+    from cayu.workspaces import _local_branch as branch_module
+
+    async def scenario() -> None:
+        store = SQLiteSessionStore(tmp_path / "legacy.sqlite3")
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        (root / "script").write_bytes(b"legacy content")
+        source, branch, _request = await _durable_branch(root, store)
+        record = branch._durable.record
+        files, _ = branch_module._scan_private_tree(
+            branch._private_root / "baseline",
+            record.limits,
+            max_total_bytes=record.limits.max_baseline_bytes,
+            total_limit_detail_code="baseline_byte_limit_exceeded",
+        )
+        legacy_revision = branch_module._revision_for_files(files, include_git_modes=False)
+        legacy = record.model_copy(update={"baseline_revision": legacy_revision})
+        (branch._private_root / ".cayu-baseline-modes").unlink()
+        restored = branch_module._captured_from_private_root(source, legacy, branch._private_root)
+        assert (
+            branch_module._revision_for_files(restored.files, include_git_modes=False)
+            == legacy_revision
+        )
+        with pytest.raises(WorkspaceBranchFencedError, match="baseline evidence is corrupt"):
+            branch_module._captured_from_private_root(source, record, branch._private_root)
+        (branch._private_root / "baseline" / "script").write_bytes(b"tampered")
+        with pytest.raises(WorkspaceBranchFencedError, match="baseline evidence is corrupt"):
+            branch_module._captured_from_private_root(source, legacy, branch._private_root)
+        await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_mode_only_source_change_does_not_rewrite_recovered_baseline(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "modes.sqlite3"
+        store = SQLiteSessionStore(database)
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        script = root / "script"
+        script.write_bytes(b"original executable")
+        script.chmod(0o755)
+        source, branch, request = await _durable_branch(root, store)
+        script.chmod(0o644)
+        changed = await observe_deterministic_workspace(
+            source, observer="mode-only-change", limits=WorkspaceRevisionObservationLimits()
+        )
+        assert changed.revision != request.baseline.revision
+        fresh_store = SQLiteSessionStore(database)
+        fresh = _workspace(root, fresh_store)
+        recovered = await fresh.recover_branch(_recovery_request())
+        assert recovered.state is WorkspaceBranchDurableState.OPEN
+        assert recovered.branch is not None
+        assert (await recovered.branch.changes()).baseline_revision == request.baseline.revision
+        assert recovered.branch._baseline["script"].mode & 0o111
+        assert not script.stat().st_mode & 0o111
+        assert not (branch._private_root / "baseline" / "script").stat().st_mode & 0o111
+        await fresh_store.close()
+        await store.close()
+
+    asyncio.run(scenario())

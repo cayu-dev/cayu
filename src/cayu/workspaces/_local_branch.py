@@ -341,6 +341,7 @@ _RESOURCE_ERRNOS = frozenset(
 )
 _PRIVATE_FILE_MODE = 0o600
 _PRIVATE_ROOT_OWNER_FILE = ".cayu-owner"
+_PRIVATE_BASELINE_MODES_FILE = ".cayu-baseline-modes"
 _PRIVATE_CLEANUP_CLAIM_PREFIX = "cayu.local-workspace-branch-cleanup.v1"
 _PRIVATE_CLEANUP_CLAIM_MAX_BYTES = 1024
 _PRIVATE_DIRECTORY_OPEN_FLAGS = (
@@ -2000,7 +2001,16 @@ def _captured_from_private_root(
         max_total_bytes=record.limits.max_baseline_bytes,
         total_limit_detail_code="baseline_byte_limit_exceeded",
     )
-    if _revision_for_files(baseline) != record.baseline_revision:
+    try:
+        baseline = _restore_baseline_git_modes(private_root, baseline)
+    except FileNotFoundError:
+        # Records created before mode-aware observations used the content-only
+        # revision. Accept that exact identity; a missing new mode file cannot
+        # validate against a mode-aware revision.
+        baseline_revision = _revision_for_files(baseline, include_git_modes=False)
+    else:
+        baseline_revision = _revision_for_files(baseline)
+    if baseline_revision != record.baseline_revision:
         raise WorkspaceBranchFencedError("Durable branch baseline evidence is corrupt.")
     overlay, _overlay_directories = _scan_private_tree(
         overlay_root,
@@ -2442,6 +2452,7 @@ def _workspace_revision_from_record(
             kind="file",
             present=True,
             content_sha256=identity.sha256,
+            worktree_mode="100755" if identity.mode & 0o111 else "100644",
         )
         for path, identity in sorted(captured.files.items())
     )
@@ -3605,6 +3616,15 @@ def _capture_baseline(
                         ),
                     )
                 raise _CreationConflict(conflicts)
+            if private_root_owner is not None:
+                # Private copies stay 0600. Persist executable identity separately
+                # before publishing the captured root so crash recovery can verify
+                # the same canonical revision as the original observation.
+                write_regular(
+                    private_root,
+                    _PRIVATE_BASELINE_MODES_FILE,
+                    bytes(bool(identity.mode & 0o111) for _, identity in sorted(files.items())),
+                )
             captured = _CapturedBaseline(
                 private_root=private_root,
                 private_root_owner=private_root_owner,
@@ -3875,9 +3895,41 @@ def _copy_one_regular(
         os.close(descriptor)
 
 
-def _revision_for_files(files: dict[str, _FileIdentity]) -> str:
+def _restore_baseline_git_modes(
+    private_root: Path,
+    files: dict[str, _FileIdentity],
+) -> dict[str, _FileIdentity]:
+    try:
+        with open_regular_for_read(private_root, _PRIVATE_BASELINE_MODES_FILE) as (file, size):
+            if size != len(files):
+                raise WorkspaceBranchFencedError("Durable branch baseline modes are corrupt.")
+            modes = file.read(len(files) + 1)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable branch baseline modes are unavailable."
+        ) from error
+    if len(modes) != len(files) or any(mode not in (0, 1) for mode in modes):
+        raise WorkspaceBranchFencedError("Durable branch baseline modes are corrupt.")
+    return {
+        path: replace(identity, mode=0o755 if executable else 0o644)
+        for (path, identity), executable in zip(sorted(files.items()), modes, strict=True)
+    }
+
+
+def _revision_for_files(files: dict[str, _FileIdentity], *, include_git_modes: bool = True) -> str:
     manifest: list[dict[str, object]] = [
-        {"path": path, "sha256": identity.sha256, "bytes": identity.bytes}
+        {
+            "path": path,
+            "sha256": identity.sha256,
+            "bytes": identity.bytes,
+            **(
+                {"git_mode": "100755" if identity.mode & 0o111 else "100644"}
+                if include_git_modes
+                else {}
+            ),
+        }
         for path, identity in sorted(files.items())
     ]
     return _deterministic_workspace_manifest_revision(
