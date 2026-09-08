@@ -12,8 +12,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextlib import nullcontext, suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import aclosing, nullcontext, suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -500,7 +500,7 @@ class InterruptedToolRoundRequest:
 
 
 LimitEventStream = Callable[[ToolRoundLimitRequest], AsyncIterator[Event]]
-InterruptedRoundEventStream = Callable[[InterruptedToolRoundRequest], AsyncIterator[Event]]
+InterruptedRoundEventStream = Callable[[InterruptedToolRoundRequest], AsyncGenerator[Event, None]]
 DeferredTerminalStager = Callable[
     [
         Event,
@@ -3352,7 +3352,7 @@ class ToolRoundExecutor:
             | None
         ) = None,
         rejoin_targeted_invocation: bool = False,
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or invocation_context.registered_agent is not registered_agent
@@ -7227,7 +7227,7 @@ class ToolRoundRun:
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_round_identity: ToolRoundIdentity,
         model_step: int | None = None,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
         model_attempt_identity = ModelAttemptIdentity(
             model_step_id=tool_round_identity.model_step_id,
@@ -7285,14 +7285,16 @@ class ToolRoundRun:
             )
             await executor._session_control.raise_if_interrupted(session.id)
         except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
-            async for event in self.close_after_interrupt(
+            stream = self.close_after_interrupt(
                 exc,
                 messages=messages,
                 tool_calls=tool_calls,
                 tool_outcomes=tool_outcomes,
                 tool_round_identity=tool_round_identity,
-            ):
-                yield event
+            )
+            async with aclosing(stream) as owned_stream:
+                async for event in owned_stream:
+                    yield event
             raise
 
         planned_round: tool_round_recovery.PendingToolRound | None = None
@@ -7315,14 +7317,16 @@ class ToolRoundRun:
                     await executor._session_control.raise_if_interrupted(session.id)
                     raise
             except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
-                async for event in self.close_after_interrupt(
+                stream = self.close_after_interrupt(
                     exc,
                     messages=messages,
                     tool_calls=tool_calls,
                     tool_outcomes=tool_outcomes,
                     tool_round_identity=tool_round_identity,
-                ):
-                    yield event
+                )
+                async with aclosing(stream) as owned_stream:
+                    async for event in owned_stream:
+                        yield event
                 raise
 
         limit_evaluation = await self._limit_gate.evaluate_limits(
@@ -7368,15 +7372,17 @@ class ToolRoundRun:
                 for approval_event in approval_events:
                     yield approval_event
             except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
-                async for event in self.close_after_interrupt(
+                stream = self.close_after_interrupt(
                     exc,
                     messages=messages,
                     tool_calls=tool_calls,
                     tool_outcomes=tool_outcomes,
                     tool_round_identity=tool_round_identity,
                     clear_pending_approval=True,
-                ):
-                    yield event
+                )
+                async with aclosing(stream) as owned_stream:
+                    async for event in owned_stream:
+                        yield event
                 raise
             raise ToolApprovalRequired(approval)
 
@@ -7815,14 +7821,17 @@ class ToolRoundRun:
                             else None
                         ),
                     )
-                async for event, outcome in call_stream:
-                    yield event
-                    if event.type == EventType.TOOL_CALL_STARTED or (
-                        event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES
-                    ):
-                        durable_lifecycle_events.append(copy_event(event))
-                    if outcome is not None:
-                        tool_outcomes.append(outcome)
+                # Keep closure in the owning task: an extra cancellation
+                # checkpoint here would disturb restored post-tool cancellation.
+                async with aclosing(call_stream) as owned_stream:
+                    async for event, outcome in owned_stream:
+                        yield event
+                        if event.type == EventType.TOOL_CALL_STARTED or (
+                            event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES
+                        ):
+                            durable_lifecycle_events.append(copy_event(event))
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
                 if self.stopped_for_limit:
                     break
             if self.stopped_for_limit:
@@ -7892,14 +7901,16 @@ class ToolRoundRun:
             try:
                 async for event in publish_staged_terminals_before_interrupt():
                     yield event
-                async for event in self.close_after_interrupt(
+                stream = self.close_after_interrupt(
                     interrupt,
                     messages=messages,
                     tool_calls=tool_calls,
                     tool_outcomes=tool_outcomes,
                     tool_round_identity=tool_round_identity,
-                ):
-                    yield event
+                )
+                async with aclosing(stream) as owned_stream:
+                    async for event in owned_stream:
+                        yield event
             except BaseException as closure_error:
                 restore_cancellation_requests = (
                     _consume_current_task_cancellation_requests(closure_error)
@@ -7928,14 +7939,16 @@ class ToolRoundRun:
             try:
                 async for event in publish_staged_terminals_before_interrupt():
                     yield event
-                async for event in self.close_after_interrupt(
+                stream = self.close_after_interrupt(
                     exc,
                     messages=messages,
                     tool_calls=tool_calls,
                     tool_outcomes=tool_outcomes,
                     tool_round_identity=tool_round_identity,
-                ):
-                    yield event
+                )
+                async with aclosing(stream) as owned_stream:
+                    async for event in owned_stream:
+                        yield event
             except BaseException as closure_error:
                 restore_cancellation_requests = (
                     _consume_current_task_cancellation_requests(closure_error)
@@ -7958,14 +7971,16 @@ class ToolRoundRun:
                 publication_coordinator.seal_capacity()
             async for event in publish_staged_terminals_before_interrupt():
                 yield event
-            async for event in self.close_after_interrupt(
+            stream = self.close_after_interrupt(
                 exc,
                 messages=messages,
                 tool_calls=tool_calls,
                 tool_outcomes=tool_outcomes,
                 tool_round_identity=tool_round_identity,
-            ):
-                yield event
+            )
+            async with aclosing(stream) as owned_stream:
+                async for event in owned_stream:
+                    yield event
             raise
         except Exception:
             if publication_coordinator is not None:
@@ -8062,7 +8077,7 @@ class ToolRoundRun:
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         tool_round_identity: ToolRoundIdentity,
         clear_pending_approval: bool = False,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         cancellation_artifacts: list[dict[str, Any]] | None = None
         cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None
         cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
@@ -8130,8 +8145,10 @@ class ToolRoundRun:
             execution_profile=self._execution_profile,
             invocation_context=self._invocation_context,
         )
-        async for event in self._executor._close_interrupted_round(request):
-            yield event
+        stream = self._executor._close_interrupted_round(request)
+        async with aclosing(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
 
     def _tool_round_segments(
         self,
@@ -8181,7 +8198,7 @@ class ToolRoundRun:
             | None
         ) = None,
         publish_staged_terminals: Callable[[], AsyncIterator[Event]] | None = None,
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
         if round_tool_calls is None:
             round_tool_calls = tool_calls
         model_attempt_identity = ModelAttemptIdentity(
@@ -8206,7 +8223,7 @@ class ToolRoundRun:
             if limit_evaluation.decision is not None:
                 self.stopped_for_limit = True
                 return
-            async for event, outcome in self._executor.execute_tool_call(
+            stream = self._executor.execute_tool_call(
                 session=self._session,
                 registered_agent=self._registered_agent,
                 registered_environment=self._registered_environment,
@@ -8231,8 +8248,10 @@ class ToolRoundRun:
                 deferred_terminal_capture_recorder=deferred_terminal_capture_recorder,
                 resolved_redactor_observer=resolved_redactor_observer,
                 publication_snapshot_observer=publication_snapshot_observer,
-            ):
-                yield event, outcome
+            )
+            async with aclosing(stream) as owned_stream:
+                async for event, outcome in owned_stream:
+                    yield event, outcome
             await self._executor._session_control.raise_if_interrupted(self._session.id)
 
     async def _run_tool_calls_parallel(
@@ -8260,7 +8279,7 @@ class ToolRoundRun:
             ]
             | None
         ) = None,
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
         semaphore = asyncio.Semaphore(self._executor._max_parallel_tool_calls)
         buffers: list[list[tuple[Event, runtime_records.ToolCallOutcome | None]]] = [
             [] for _ in tool_calls
@@ -8271,7 +8290,7 @@ class ToolRoundRun:
             async with semaphore:
                 await self._executor._session_control.raise_if_interrupted(self._session.id)
                 try:
-                    async for item in self._executor.execute_tool_call(
+                    stream = self._executor.execute_tool_call(
                         session=self._session,
                         registered_agent=self._registered_agent,
                         registered_environment=self._registered_environment,
@@ -8298,8 +8317,10 @@ class ToolRoundRun:
                         deferred_terminal_capture_recorder=deferred_terminal_capture_recorder,
                         resolved_redactor_observer=resolved_redactor_observer,
                         publication_snapshot_observer=publication_snapshot_observer,
-                    ):
-                        buffers[index].append(item)
+                    )
+                    async with aclosing(stream) as owned_stream:
+                        async for item in owned_stream:
+                            buffers[index].append(item)
                 except asyncio.CancelledError as exc:
                     child_cancellations[index] = exc
                     raise

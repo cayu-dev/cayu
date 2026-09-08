@@ -7721,7 +7721,7 @@ class CayuApp:
     async def _close_tool_round_after_interrupt(
         self,
         request: InterruptedToolRoundRequest,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         stream = self._session_engine._close_tool_round_after_interrupt(request=request)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

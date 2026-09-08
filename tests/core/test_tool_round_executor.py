@@ -1352,3 +1352,134 @@ def test_tool_round_budget_gate_retains_the_originating_model_attempt() -> None:
     reached = next(event for event in events if event.type == EventType.BUDGET_LIMIT_REACHED)
     assert reached.payload["model_step_id"] == identity.model_step_id
     assert reached.payload["model_attempt_id"] == identity.model_attempt_id
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_closing_interrupted_round_observes_nested_stream_teardown(monkeypatch, grouped):
+    app, store, _ = _app_with_completed_session("sess_owned_round_close")
+
+    async def scenario():
+        session = await rebind_test_invocation(store, "sess_owned_round_close")
+        runner = await _tool_round_run(app, session, limits=RunLimits())
+        tool_calls = [_tool_call()]
+        checkpoint, _ = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
+        started = asyncio.Event()
+        closed = []
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+
+        async def interrupted_calls(**kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                if grouped:
+                    raise sanitize_runner_failure_group(
+                        BaseExceptionGroup("interrupted calls", [cancellation]),
+                        caller_cancelled=True,
+                    ) from None
+                raise
+            finally:
+                closed.append("calls")
+            if False:
+                yield
+
+        async def interruption_events(*args, **kwargs):
+            try:
+                yield Event(type=EventType.TOOL_CALL_FAILED, session_id=session.id)
+            finally:
+                await asyncio.sleep(0)
+                closed.append("interruption")
+
+        monkeypatch.setattr(runner, "_run_tool_calls_sequential", interrupted_calls)
+        monkeypatch.setattr(runner, "close_after_interrupt", interruption_events)
+        stream = runner.run(
+            messages=await store.load_transcript(session.id),
+            tool_calls=tool_calls,
+            tool_round_identity=_tool_round_identity(),
+        )
+
+        async def consume():
+            async for event in stream:
+                if event.type == EventType.TOOL_CALL_FAILED:
+                    with pytest.raises(BaseExceptionGroup) as failure:
+                        await stream.aclose()
+                    leaves = list(iter_exception_tree(failure.value))
+                    assert any(isinstance(e, asyncio.CancelledError) for e in leaves)
+                    assert any(isinstance(e, GeneratorExit) for e in leaves)
+                    assert closed == ["calls", "interruption"]
+                    return
+            raise AssertionError("No interruption event was published.")
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        await asyncio.wait_for(task, timeout=5)
+        await loop.shutdown_asyncgens()
+        await asyncio.sleep(0)
+        assert loop_errors == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stop_event", [EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED])
+def test_outer_close_finishes_nested_tool_stream_before_return(monkeypatch, stop_event):
+    from contextlib import aclosing
+
+    from cayu import ScriptedModelProvider
+
+    async def scenario():
+        app = CayuApp(enable_logging=False)
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(id="call", name="echo", arguments={}),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        )
+        calls = []
+        closed = []
+
+        class Echo(Tool):
+            spec = ToolSpec(name="echo", description="Echo", input_schema={"type": "object"})
+
+            async def run(self, ctx, args):
+                calls.append("echo")
+                return ToolResult(content="done")
+
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker", model="scripted-model"), tools=[Echo()])
+        execute = app._tool_round_executor.execute_tool_call
+
+        async def tracked_execute(**kwargs):
+            try:
+                async with aclosing(execute(**kwargs)) as inner:
+                    async for item in inner:
+                        yield item
+            finally:
+                await asyncio.sleep(0)
+                closed.append("tool stream")
+
+        monkeypatch.setattr(app._tool_round_executor, "execute_tool_call", tracked_execute)
+        stream = app.run(RunRequest(agent_name="worker", messages=[Message.text("user", "go")]))
+        async for event in stream:
+            if event.type == stop_event:
+                await stream.aclose()
+                assert closed == ["tool stream"]
+                assert calls == ([] if stop_event == EventType.TOOL_CALL_STARTED else ["echo"])
+                return
+        raise AssertionError("Expected tool event was not published.")
+
+    asyncio.run(scenario())

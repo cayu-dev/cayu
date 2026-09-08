@@ -90,6 +90,7 @@ from cayu.deadlines import (
     current_execution_deadline,
     deadline_stream,
     effective_deadline,
+    expired_execution_deadline,
     resumed_execution_deadline,
 )
 from cayu.egress.authority import EgressAuthorityChangeKind, EgressAuthorityTransitionState
@@ -23120,13 +23121,23 @@ class SessionEngine:
 
                 if tool_round_identity is None:
                     raise RuntimeError("Ordinary tool calls require a tool-round identity.")
-                async for event in tool_round_runner.run(
+                # The round may yield interruption evidence after cancellation.
+                # Observe its close before session cleanup releases the run fence;
+                # otherwise async-generator finalization can orphan its failure.
+                round_stream = tool_round_runner.run(
                     messages=messages,
                     tool_calls=tool_calls,
                     tool_round_identity=tool_round_identity,
                     model_step=step,
-                ):
-                    yield event
+                )
+                async with contextlib.aclosing(round_stream) as owned_round_stream:
+                    async for event in owned_round_stream:
+                        # The deadline stream cannot publish after its timer expires.
+                        # Drain the round's interruption evidence until it re-raises
+                        # cancellation instead of suspending it at a yield that the
+                        # deadline owner must immediately close with GeneratorExit.
+                        if expired_execution_deadline() is None:
+                            yield event
                 close_new_pending_round_on_interrupt = False
                 if tool_round_runner.user_input_pause_superseded:
                     # A remote operator-interruption transaction already removed

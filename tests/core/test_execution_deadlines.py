@@ -450,8 +450,14 @@ def test_no_new_tools_or_models_when_wall_expiry_is_observed(clock):
     asyncio.run(run())
 
 
-def test_inflight_tool_keeps_context_and_cleanup_after_expiry(clock):
-    from cayu import Tool, ToolResult, ToolSpec
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("entrypoint", ["run", "workflow_step"])
+@pytest.mark.parametrize("tool_count", [1, 2])
+def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
+    clock, tmp_path, store_kind, entrypoint, tool_count
+):
+    from cayu import CayuConfig, Tool, ToolExecutionConfig, ToolResult, ToolSpec
+    from cayu.workflows import StepError
 
     seen = []
 
@@ -470,9 +476,10 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(clock):
                     current_execution_deadline().expires_at,
                 )
             )
-            # Expire only once tool admission is proven, independent of setup speed.
-            clock.wall += timedelta(seconds=1)
-            clock.mono += 1
+            # Expire only once every tool is admitted, including parallel children.
+            if len(seen) == tool_count:
+                clock.wall += timedelta(seconds=1)
+                clock.mono += 1
             try:
                 await asyncio.Event().wait()
                 return ToolResult(content="unexpected")
@@ -481,11 +488,30 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(clock):
                 seen.append(("settled", ctx.execution_deadline.remaining_seconds()))
 
     async def run():
-        app = CayuApp(enable_logging=False)
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        store = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "deadline.sqlite3")
+        )
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            config=CayuConfig(
+                tool_execution=ToolExecutionConfig(max_parallel_tool_calls=tool_count)
+            ),
+        )
         provider = ScriptedModelProvider(
             [
                 [
-                    ModelStreamEvent.tool_call(id="call", name="blocking", arguments={}),
+                    *[
+                        ModelStreamEvent.tool_call(
+                            id=f"call-{index}", name="blocking", arguments={}
+                        )
+                        for index in range(tool_count)
+                    ],
                     ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
                 ]
             ]
@@ -494,20 +520,54 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(clock):
         app.register_agent(AgentSpec(name="worker", model="scripted-model"), tools=[BlockingTool()])
         boundary = ExecutionDeadline.after(1)
         events = []
-        with pytest.raises(TimeoutError):
-            async for event in app.run(
-                RunRequest(
-                    agent_name="worker",
-                    messages=[Message.text("user", "go")],
-                    execution_deadline=boundary,
+        if entrypoint == "run":
+            with pytest.raises(TimeoutError) as failure:
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="worker",
+                        messages=[Message.text("user", "go")],
+                        execution_deadline=boundary,
+                    )
+                ):
+                    events.append(event)
+            timeout = failure.value
+            session_id = events[0].session_id
+        else:
+            with pytest.raises(StepError) as step_failure:
+                await step(
+                    FinalizeWorkflow(app).context("deadline-parent"),
+                    agent="worker",
+                    step_id="timed-out-tool",
+                    prompt="go",
+                    run_options=StepRunOptions(execution_deadline=boundary),
                 )
-            ):
-                events.append(event)
-        assert seen == [("entered", boundary.expires_at, boundary.expires_at), ("settled", 0.0)]
-        persisted = await app.session_store.load_events(events[0].session_id)
+            timeout = step_failure.value.__cause__
+            assert isinstance(timeout, TimeoutError)
+            assert step_failure.value.evidence.classification == "deadline"
+            assert step_failure.value.evidence.deadline_phase == "in_flight"
+            session_id = step_failure.value.session_id
+            assert session_id is not None
+        assert (
+            seen
+            == [("entered", boundary.expires_at, boundary.expires_at)] * tool_count
+            + [("settled", 0.0)] * tool_count
+        )
+        persisted = await app.session_store.load_events(session_id)
         assert any(e.type == EventType.SESSION_INTERRUPTED for e in persisted)
         assert not any(e.type == EventType.SESSION_COMPLETED for e in persisted)
         assert len(provider.requests) == 1
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert "pending_tool_round" not in checkpoint
+        assert "pending_session_interrupt" not in checkpoint
+        terminals = [e for e in persisted if e.type == EventType.TOOL_CALL_FAILED]
+        assert len(terminals) == tool_count
+        assert not any(e.type == EventType.TOOL_CALL_COMPLETED for e in persisted)
+        assert timeout.execution_deadline["remaining_seconds"] == 0.0
+        assert isinstance(timeout.__cause__, asyncio.CancelledError)
+        await loop.shutdown_asyncgens()
+        await asyncio.sleep(0)
+        assert loop_errors == []
 
     asyncio.run(run())
 
