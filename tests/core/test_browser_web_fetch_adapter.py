@@ -1793,7 +1793,7 @@ def test_guest_temporary_profile_helper_rejects_paths_outside_its_root(
     assert evidence.read_text(encoding="utf-8") == "retain"
 
 
-def test_guest_standalone_loads_only_its_shipped_visual_sibling(tmp_path: Path) -> None:
+def test_guest_standalone_loads_only_its_shipped_siblings(tmp_path: Path) -> None:
     shipped = tmp_path / "shipped"
     shipped.mkdir()
     source = Path(guest.__file__).resolve()
@@ -1802,9 +1802,18 @@ def test_guest_standalone_loads_only_its_shipped_visual_sibling(tmp_path: Path) 
     shutil.copyfile(
         source.with_name("_browser_visual_guest.py"), shipped / "_browser_visual_guest.py"
     )
+    shutil.copyfile(
+        source.with_name("_browser_control_guest.py"), shipped / "_browser_control_guest.py"
+    )
+    shutil.copyfile(
+        source.with_name("_browser_control_transport.py"), shipped / "_browser_control_transport.py"
+    )
     unrelated = tmp_path / "unrelated"
     unrelated.mkdir()
     (unrelated / "_browser_visual_guest.py").write_text(
+        'raise RuntimeError("untrusted module imported")\n', encoding="utf-8"
+    )
+    (unrelated / "_browser_control_guest.py").write_text(
         'raise RuntimeError("untrusted module imported")\n', encoding="utf-8"
     )
     protected = tmp_path / "protected"

@@ -28,6 +28,135 @@ is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
 host Playwright, host HTTP, another provider, a CLI, or MCP.
 
+## Private operator view and login handoff
+
+Browser operator control is an explicit application and server opt-in. It uses
+the admitted browser allocation; it does not launch a second browser or expose
+CDP, arbitrary JavaScript, selectors, shell commands, clipboard access, or a
+general remote desktop. Existing destination, popup, egress, resource and
+permission restrictions still apply.
+
+Configure `CayuApp(browser_control=BrowserControlConfig(...))` with an
+application-owned `BrowserControlPolicy` and a browser-reachable `wss://` guest
+endpoint. Configure the server separately with `BrowserControlServerConfig`;
+see [protected transport setup](server-configuration.md#browser-operator-transport).
+Enabling only authentication, session inspection, or model screenshot permission
+does not enable operator access.
+
+The policy implements a stable, versioned, non-secret `identity` and an async
+`decide(request)` returning `BrowserControlPolicyResult(allowed=...)`. Denial is
+the default. Each request supplies the authenticated principal, exact browser
+identity, operator session, action, record revision, control epoch and state.
+The application must check access to that session and allocation for the requested
+action; a matching `tenant` string alone is not proof of ownership. The action
+set is `view`, `takeover`, `renew`, `handback`, `checkpoint`, `sensitive_entry`,
+`text_input`, and `key_input`. Decisions do not receive page content or typed
+credentials and are not reusable grants for later control generations.
+
+### Operator workflow
+
+In the session dashboard's private browser operator panel:
+
+1. Discover the admitted browser and its current pages. Viewing is separately
+   authorized and may be unavailable for a protected profile or sensitive page.
+   Native private viewing currently supports the active page only; requesting a
+   background or stale page is refused without capturing another page or closing
+   shared browser control.
+2. Choose checkpoint consent for the next takeover: undecided, deny, or allow
+   configured profile checkpointing. This does not create a profile store.
+3. Request exclusive takeover. A committed request blocks new model browser
+   dispatch, but input is not granted until the native browser's existing work
+   has settled. Refresh control state to observe the result.
+4. Before entering login or MFA text, select **Prepare sensitive entry** while
+   any private viewer remains connected. The transition waits for native capture
+   settlement and acknowledgement that outstanding viewer frames were purged.
+   Closing a viewer is not a substitute for that acknowledgement.
+   The dashboard's **Close private view** and viewer replacement perform a bounded
+   purge acknowledgement before closing; abrupt disconnection remains fail-closed.
+5. Use the private text field and the limited native keys: Tab, Shift+Tab, Enter,
+   Escape and Backspace. Refresh page discovery after an input changes authority.
+   Do not send credentials as ordinary tool arguments, chat messages or metadata.
+6. Return control to the agent. Handback settles pending input, advances control
+   authority and invalidates old page targets. The agent must obtain a fresh
+   protected observation before taking another browser action.
+
+The operator panel displays the application's declared intervention purpose and
+expected origins separately from page observations. These come from
+`BrowserControlConfig.purpose`, not page content or operator input, and are bound
+to the browser-control allocation identity. They do not override egress policy.
+
+Page discovery displays the selected browser session, environment and allocation
+fingerprint, plus origin-only observations for the discovered pages. Paths, query
+strings, fragments and page titles are not part of these location observations.
+An origin that cannot be safely represented is shown as unavailable or withheld.
+These are observations, not application instructions, proof of successful login,
+or permission to deliver input. While the selected panel is visible and idle,
+origin observations refresh every two seconds for up to five minutes. A failed
+read or expired refresh lifetime clears the observations and asks for explicit
+discovery. Automatic observation does not refresh action targets: refresh page
+discovery after navigation before requesting input or takeover authority.
+
+Acquisition and handback control publications include bounded origin-only page
+snapshots from their native boundaries, tied to the request and control epoch.
+The guest omits origins containing known browser-private values; the host also
+applies workload-secret protection, including the sealed browser-tool invocation
+scopes retained by that allocation's bootstrap owner, before durable publication. Receipt replay
+retains the original boundary snapshot rather than substituting a later page
+location. These snapshots do not contain page titles, paths or entered values,
+and do not establish that login succeeded.
+
+Takeover has a finite lease and request maximum. Renewal extends only the current
+live lease within that maximum; it does not start an unlimited new grant. A lost
+input acknowledgement must not be retried as a new input: the original input may
+already have reached the page. Disconnect, expired authority, worker loss and
+uncertain cleanup do not automatically restore agent control. Refreshing the UI
+does not clear a durable `control_uncertain` state or prove browser quiescence.
+
+Disconnect cleanup can fence an exact takeover, renewal, sensitive-entry or
+handback request committed while the guest owner was idle, or the exact fresh-
+observation publication it had not yet observed. This only settles teardown;
+it does not grant input, renew authority or treat transport loss as native
+quiescence. Unrelated control generations are never adopted during cleanup.
+
+### Privacy and profile consent
+
+Operator frames and input use private, bounded, transient WebSocket channels,
+not model attachments, artifacts, ordinary runner output or tool-result payloads.
+This is separate from `BrowserVisualPolicy`: permission to view privately does
+not authorize publishing screenshots to the model. Authenticated-profile and
+sensitive-entry capture restrictions continue to apply, including after login
+inside an initially temporary profile. Sensitive entry prevents prohibited
+capture rather than attempting to redact pixels afterward.
+
+Allowing checkpoint consent permits only the application's configured encrypted
+profile checkpoint policy after handback and a fresh observation. Deny or
+undecided does not authorize saving newly entered state. Consent does not enable
+disabled checkpointing, change its destination, or prove that login succeeded.
+See the [profile configuration below](#application-owned-browser-profiles) for the
+separate application-owned profile setup.
+
+### Local login/MFA acceptance
+
+The opt-in designated-account test uses a disposable HTTPS password/TOTP service,
+native Chromium, the protected Cayu server and the compiled operator dashboard.
+It needs no external account or model API key. With the browser test dependencies,
+Chromium and dashboard build already available, run from the repository root:
+
+```bash
+CAYU_BROWSER_CONTROL_LIVE=1 \
+CAYU_BROWSER_CONTROL_CHROMIUM=/absolute/path/to/chromium \
+CAYU_BROWSER_DASHBOARD_BUILD="$PWD/dashboard/dist" \
+python -m pytest tests/server/test_browser_operator_mfa_live.py -q
+```
+
+Both Memory and SQLite cases exercise private password entry, rejected and
+accepted TOTP entry, handback, and authenticated fresh observation. They check
+generated credentials against model requests, durable events/checkpoints,
+SQLite files, captured logs/warnings/stdout/stderr and artifact output. The model
+and allocation adapter are test doubles; remote egress, profile-checkpoint
+consent and worker-loss proofs remain separate tests. This journey does not save
+an authenticated browser profile.
+
 ## Revision-bound visual controls
 
 Prefer the accessibility snapshot and semantic refs for ordinary controls. Use

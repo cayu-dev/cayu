@@ -1396,7 +1396,10 @@ def _durable_context(
     fail_after_state: str | None = None,
     secret_redactor: SecretRedactor | None = None,
     secret_tracker: Any | None = None,
+    browser_control_epoch: Any | None = None,
 ) -> ToolContext:
+    from cayu.core.tools import _RuntimeBrowserAllocationAuthority
+
     ctx = _context(tmp_path, artifact_store=artifact_store).model_copy(
         update={
             "idempotency_key": f"tool-key-{tool_call_id}",
@@ -1440,6 +1443,12 @@ def _durable_context(
         assert type(redacted) is dict
         return redacted
 
+    async def control_admission(browser_session_id, operation):
+        from cayu.core.tools import _RuntimeBrowserControlAdmission
+
+        value = await browser_control_epoch(browser_session_id, operation)
+        return _RuntimeBrowserControlAdmission(value) if type(value) is int else value
+
     _bind_runtime_tool_invocation_authority(
         ctx,
         parent_task_id=None,
@@ -1458,6 +1467,20 @@ def _durable_context(
         seal_durable_output=seal_durable_output,
         secret_publication_sealer=(
             secret_tracker.seal_for_publication if secret_tracker is not None else lambda: None
+        ),
+        browser_control_admission=control_admission if browser_control_epoch is not None else None,
+        browser_allocation=(
+            _RuntimeBrowserAllocationAuthority(
+                session_id=ctx.session_id,
+                session_instance_id="test-incarnation",
+                run_epoch=1,
+                interaction_id="test-interaction",
+                execution_profile_fingerprint=execution_profile_fingerprint,
+                environment_name=ctx.environment_name or "browser",
+                allocation_fingerprint=allocation_fingerprint or "a" * 64,
+            )
+            if browser_control_epoch is not None
+            else None
         ),
     )
     return ctx
@@ -2827,10 +2850,15 @@ def test_upload_aggregate_limit_counts_individually_admissible_files(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("operator_control", [False, True])
 def test_issue_1275_upload_replay_is_content_bound_and_durable_evidence_is_byte_free(
     tmp_path: Path,
+    operator_control: bool,
 ) -> None:
     async def scenario() -> None:
+        async def control_epoch(browser_session_id: str, operation: str) -> int:
+            return 3
+
         store = _MutableReadArtifactStore(
             tmp_path / "upload-store",
             store_id="browser-artifacts",
@@ -2857,6 +2885,7 @@ def test_issue_1275_upload_replay_is_content_bound_and_durable_evidence_is_byte_
                 records=records,
                 artifact_store=store,
                 tool_call_id="navigate-content-bound-call",
+                browser_control_epoch=control_epoch if operator_control else None,
             ),
             navigate_args,
         )
@@ -2872,6 +2901,7 @@ def test_issue_1275_upload_replay_is_content_bound_and_durable_evidence_is_byte_
             records=records,
             artifact_store=store,
             tool_call_id="upload-content-bound-call",
+            browser_control_epoch=control_epoch if operator_control else None,
         )
 
         first = await tool.run(upload_ctx, upload_args)
@@ -2900,6 +2930,11 @@ def test_issue_1275_upload_replay_is_content_bound_and_durable_evidence_is_byte_
             if record.get("record_type") == "cayu.browser-operation"
             and record.get("upload_artifacts") is not None
         )
+        if operator_control:
+            assert upload_record["invocation_control_epoch"] == 3
+            assert backend.calls[-1]["invocation_control_epoch"] == 3
+        else:
+            assert "invocation_control_epoch" not in upload_record
         assert upload_record["upload_artifacts"] == [
             {
                 "artifact_id": artifact_id,
@@ -8657,6 +8692,13 @@ def test_interactive_guest_profile_ledger_reserves_restore_plus_every_checkpoint
             assert kwargs["storage_state"] == {"cookies": [], "origins": []}
             return _Context()
 
+        def on(self, event: str, callback: Any) -> None:
+            assert event == "disconnected"
+            assert callable(callback)
+
+        def is_connected(self) -> bool:
+            return True
+
     async def scenario() -> None:
         limits = _interactive_limits(max_operations=1)
         daemon = _browser_guest._InteractiveDaemon("bs_test")
@@ -9565,6 +9607,13 @@ def test_interactive_guest_blocks_popup_creation_before_page_scripts(
         async def new_context(self, **kwargs: Any) -> _Context:
             assert kwargs["service_workers"] == "block"
             return self.context
+
+        def on(self, event: str, callback: Any) -> None:
+            assert event == "disconnected"
+            assert callable(callback)
+
+        def is_connected(self) -> bool:
+            return True
 
         async def close(self) -> None:
             return None
@@ -12430,8 +12479,10 @@ def test_issue_1275_operations_recover_without_redispatch_at_each_durable_bounda
         )
         assert operation_record["state"] == durable_boundary
         if expected_error is None:
-            assert interrupted.structured["error"] == "outcome_ambiguous"
+            # Exact terminal readback reconciles the lost acknowledgement immediately.
+            assert interrupted.is_error is False
             assert recovered.is_error is False
+            assert interrupted == recovered
             if operation in {"scroll", "upload"}:
                 assert recovered.structured["operation_evidence"]["operation"] == operation
         else:
@@ -12583,7 +12634,10 @@ def test_browser_session_lost_terminal_acknowledgement_replays_exact_receipt(
             records=records,
         )
 
-        assert acknowledgement_lost.structured["error"] == "outcome_ambiguous"
+        # Complete publication readback settles the lost acknowledgement
+        # immediately, without waiting for a fresh worker or repeating input.
+        assert acknowledgement_lost.is_error is False
+        assert acknowledgement_lost == recovered
         assert recovered.is_error is False
         assert recovered.structured["session_id"] == backend.calls[0]["session_id"]
         assert len(backend.calls) == 1

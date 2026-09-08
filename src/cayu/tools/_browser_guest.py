@@ -38,6 +38,19 @@ from typing import TYPE_CHECKING, Any, Literal, Never, cast
 from urllib.parse import urljoin, urlsplit
 
 if TYPE_CHECKING or __package__:
+    from ._browser_control_guest import (
+        GuestCaptureDenied,
+        GuestControlAllocationLost,
+        GuestControlChannel,
+        GuestControlFailure,
+        GuestControlFence,
+        GuestFrameOwner,
+    )
+    from ._browser_control_transport import (
+        control_connection_closed_normally,
+        open_guest_control_channel,
+        validate_control_endpoint,
+    )
     from ._browser_visual_guest import (
         VISUAL_FAILURE_CODES,
         VisualGuestFailure,
@@ -59,12 +72,39 @@ else:
     VisualGuestFailure = _visual_module.VisualGuestFailure
     VisualPageOwner = _visual_module.VisualPageOwner
     visual_policy_from_json = _visual_module.visual_policy_from_json
+    _control_spec = importlib.util.spec_from_file_location(
+        "_browser_control_guest", Path(__file__).resolve().with_name("_browser_control_guest.py")
+    )
+    if _control_spec is None or _control_spec.loader is None:
+        raise ImportError("The browser control guest module is unavailable.")
+    _control_module = importlib.util.module_from_spec(_control_spec)
+    sys.modules[_control_spec.name] = _control_module
+    _control_spec.loader.exec_module(_control_module)
+    GuestControlFailure = _control_module.GuestControlFailure
+    GuestControlAllocationLost = _control_module.GuestControlAllocationLost
+    GuestCaptureDenied = _control_module.GuestCaptureDenied
+    GuestControlFence = _control_module.GuestControlFence
+    GuestFrameOwner = _control_module.GuestFrameOwner
+    GuestControlChannel = _control_module.GuestControlChannel
+    _transport_spec = importlib.util.spec_from_file_location(
+        "_browser_control_transport",
+        Path(__file__).resolve().with_name("_browser_control_transport.py"),
+    )
+    if _transport_spec is None or _transport_spec.loader is None:
+        raise ImportError("The browser control transport module is unavailable.")
+    _transport_module = importlib.util.module_from_spec(_transport_spec)
+    sys.modules[_transport_spec.name] = _transport_module
+    _transport_spec.loader.exec_module(_transport_module)
+    open_guest_control_channel = _transport_module.open_guest_control_channel
+    validate_control_endpoint = _transport_module.validate_control_endpoint
+    control_connection_closed_normally = _transport_module.control_connection_closed_normally
 
 PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
 INTERACTIVE_WORKER_VERSION = "9"
+CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -766,6 +806,7 @@ class _InteractiveRequest:
     x: float | None = None
     y: float | None = None
     reconcile_only: bool = False
+    invocation_control_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1153,6 +1194,7 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
     }
     allowed = set(expected[operation])
     allowed.add("reconcile_only")
+    allowed.add("invocation_control_epoch")
     if operation == "screenshot":
         allowed.add("full_page")
     if "browser_profile" in raw:
@@ -1583,6 +1625,11 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             != tuple(item.artifact_id for item in upload_files)
         ):
             raise _GuestFailure("artifact_refused")
+    invocation_control_epoch = raw.get("invocation_control_epoch")
+    if "invocation_control_epoch" in raw and (
+        type(invocation_control_epoch) is not int or not 1 <= invocation_control_epoch <= 2**53 - 1
+    ):
+        raise _GuestFailure("incompatible_browser")
     return _InteractiveRequest(
         operation=operation,
         session_id=session_id,
@@ -1614,6 +1661,7 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         profile_capture_limit=profile_capture_limit,
         profile_timeout_seconds=profile_timeout_seconds,
         reconcile_only=reconcile_only,
+        invocation_control_epoch=invocation_control_epoch,
         visual_policy=visual_policy,
         visual_revision=visual_revision,
         visual_ref=visual_ref,
@@ -1936,6 +1984,54 @@ def _interactive_upload_filename(value: Any, *, maximum: int) -> str:
     if len(encoded) > maximum:
         raise _GuestFailure("artifact_refused")
     return value
+
+
+def _bounded_live_browser_private_values(state: Any, *, maximum_bytes: int) -> tuple[str, ...]:
+    """Read-only anti-reflection inventory, never profile restore/checkpoint authority.
+
+    A live temporary context may contain ordinary HTTP or domain cookies that
+    are deliberately not eligible for durable profile import. Only names and
+    values are read here; no origin/domain grants or transferable state emerge.
+    """
+    if type(state) is not dict:
+        raise _GuestFailure("policy_denied")
+    cookies, origins = state.get("cookies"), state.get("origins")
+    if (
+        type(cookies) is not list
+        or type(origins) is not list
+        or len(cookies) > _INTERACTIVE_MAX_PROFILE_COOKIES
+        or len(origins) > _INTERACTIVE_MAX_PROFILE_ORIGINS
+    ):
+        raise _GuestFailure("policy_denied")
+    entries = list(cookies)
+    storage_count = 0
+    for origin in origins:
+        if type(origin) is not dict or type(origin.get("localStorage")) is not list:
+            raise _GuestFailure("policy_denied")
+        storage = origin["localStorage"]
+        storage_count += len(storage)
+        if storage_count > _INTERACTIVE_MAX_PROFILE_STORAGE_ENTRIES:
+            raise _GuestFailure("policy_denied")
+        entries.extend(storage)
+    values = []
+    used = 0
+    for entry in entries:
+        if type(entry) is not dict:
+            raise _GuestFailure("policy_denied")
+        owned_entry = cast("dict[str, Any]", entry)
+        for field_name, limit in (
+            ("name", _INTERACTIVE_MAX_PROFILE_NAME_BYTES),
+            ("value", _INTERACTIVE_MAX_PROFILE_VALUE_BYTES),
+        ):
+            value = _interactive_profile_text(owned_entry.get(field_name), maximum_bytes=limit)
+            used += len(value.encode("utf-8"))
+            if used > maximum_bytes:
+                raise _GuestFailure("resource_exhausted")
+            if value:
+                values.append(value)
+    return _bounded_interactive_profile_private_values(
+        (), tuple(values), maximum_bytes=maximum_bytes
+    )
 
 
 def _interactive_identifier(value: Any) -> str:
@@ -4249,6 +4345,50 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
     raise _GuestFailure("browser_unavailable")
 
 
+def _private_control_bootstrap(raw: Any) -> tuple[str, dict[str, str]]:
+    if (
+        type(raw) is not dict
+        or set(raw) != {"protocol_version", "session_id", "endpoint", "credential", "scope_sha256"}
+        or raw["protocol_version"] != CONTROL_BOOTSTRAP_PROTOCOL
+    ):
+        raise _GuestFailure("incompatible_browser")
+    try:
+        session_id = _interactive_identifier(raw["session_id"])
+        endpoint = validate_control_endpoint(raw["endpoint"])
+        credential = raw["credential"]
+        scope = raw["scope_sha256"]
+        if type(credential) is not str or re.fullmatch(r"[0-9a-f]{64}", credential) is None:
+            raise GuestControlFailure()
+        GuestControlFence._digest(scope)
+    except (ValueError, TypeError, GuestControlFailure):
+        raise _GuestFailure("incompatible_browser") from None
+    return session_id, {"endpoint": endpoint, "credential": credential, "scope_sha256": scope}
+
+
+async def _run_private_control_bootstrap(raw: Any) -> dict[str, Any]:
+    session_id, material = _private_control_bootstrap(raw)
+    # Bootstrap can attach only to an existing daemon. It must never create or
+    # revive a browser allocation after loss or replay a spent capability.
+    response = await _interactive_send(
+        _interactive_socket_path(session_id),
+        {
+            "protocol_version": CONTROL_BOOTSTRAP_PROTOCOL,
+            "session_id": session_id,
+            **material,
+        },
+    )
+    material.clear()
+    if (
+        type(response) is not dict
+        or set(response) != {"schema_version", "bootstrap_accepted"}
+        or type(response["schema_version"]) is not int
+        or response["schema_version"] != 1
+        or response["bootstrap_accepted"] is not True
+    ):
+        raise _GuestFailure("browser_unavailable")
+    return {"schema_version": 1, "bootstrap_accepted": True}
+
+
 async def _interactive_send(socket_path: Path, raw: Any) -> dict[str, Any] | None:
     try:
         reader, writer = await asyncio.wait_for(
@@ -4310,6 +4450,13 @@ async def _start_interactive_daemon(session_id: str, socket_path: Path) -> None:
 class _InteractiveDaemon:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
+        self._operator_channel_id: str | None = None
+        self._operator_input_task: asyncio.Task[tuple[BaseException, ...]] | None = None
+        self.operator_frames = GuestFrameOwner()
+        self._operator_bootstrap_task: asyncio.Task[tuple[BaseException, ...]] | None = None
+        self._operator_connection: Any = None
+        self._operator_frame_count = 0
+        self._operator_frame_started = float("-inf")
         self.playwright: Any = None
         self.browser: Any = None
         self.context: Any = None
@@ -4343,6 +4490,7 @@ class _InteractiveDaemon:
         self.popup_cleanup_task: asyncio.Task[bool] | None = None
         self.popup_candidate_observed = asyncio.Event()
         self.visual_worker_instance = "vw_" + secrets.token_hex(16)
+        self.control = GuestControlFence(worker_instance=self.visual_worker_instance)
         self.total_visual_captures = 0
         self.configuration_visual_policy: dict[str, Any] | None = None
         self.popup_effect_opener_page_id: str | None = None
@@ -4433,6 +4581,13 @@ class _InteractiveDaemon:
                 device_scale_factor=1,
                 **({"storage_state": storage_state} if storage_state is not None else {}),
             )
+            # A live transport to this daemon is not evidence that its browser
+            # allocation still exists. Fence native/model actions immediately;
+            # the next channel exchange carries the mismatch to the host owner.
+            self.browser.on("disconnected", self.control.uncertain)
+            if not self.browser.is_connected():
+                self.control.uncertain()
+                raise _GuestFailure("browser_crash")
         except _GuestFailure:
             await self.close()
             raise
@@ -4443,6 +4598,18 @@ class _InteractiveDaemon:
         if request.session_id != self.session_id:
             raise _GuestFailure("incompatible_browser")
         async with self.lock:
+            if self._operator_bootstrap_task is not None and self.control.binding_sha256 is None:
+                raise _GuestFailure("policy_denied", allocation_disposition="live")
+            try:
+                self.control.check_model(request.invocation_control_epoch, request.operation)
+            except GuestControlFailure as exc:
+                raise _GuestFailure("policy_denied", allocation_disposition="live") from exc
+            if (
+                self.control.capture_restricted
+                and self.profile_output_values is None
+                and request.operation != "close"
+            ):
+                raise _GuestFailure("policy_denied", allocation_disposition="live")
             fingerprint = _interactive_operation_fingerprint(request)
             existing = self.operations.get(request.operation_id)
             if existing is None:
@@ -4495,6 +4662,7 @@ class _InteractiveDaemon:
                     else _interactive_error_payload(exc)
                 )
             except Exception as exc:
+                self.control.uncertain()
                 failure = _interactive_playwright_error(request.operation, exc)
                 response = (
                     await self._retire_failed_allocation(failure, request)
@@ -4532,7 +4700,709 @@ class _InteractiveDaemon:
                 size_bytes=len(encoded),
             )
             self.operation_ledger_bytes += len(encoded)
-            return response
+            if (
+                request.operation == "observe"
+                and retained.get("kind") == "success"
+                and type(retained.get("observation")) is dict
+                and type(retained["observation"].get("revision")) is str
+                and (
+                    not self.control.capture_restricted
+                    or retained.get("profile_output_protected") is True
+                )
+            ):
+                self.control.fresh_observation_required = False
+            return retained
+
+    async def bootstrap_operator_channel(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Private bootstrap only; no ordinary operation record stores the bearer."""
+        if type(raw) is not dict or set(raw) != {"endpoint", "credential", "scope_sha256"}:
+            raise GuestControlFailure()
+        endpoint = validate_control_endpoint(raw["endpoint"])
+        credential = raw["credential"]
+        scope = raw["scope_sha256"]
+        if type(credential) is not str or re.fullmatch(r"[0-9a-f]{64}", credential) is None:
+            raise GuestControlFailure()
+        GuestControlFence._digest(scope)
+        async with self.lock:
+            if (
+                self.closing
+                or self.close_requested.is_set()
+                or self._operator_bootstrap_task is not None
+            ):
+                raise GuestControlFailure()
+
+            async def connect_and_own(token: str) -> tuple[BaseException, ...]:
+                try:
+                    connection = await open_guest_control_channel(
+                        endpoint=endpoint, credential=token
+                    )
+                    token = ""
+                    self._operator_connection = connection
+                    if self.closing:
+                        await asyncio.shield(self._operator_transport_close())
+                        return ()
+                    await GuestControlChannel(self, scope_sha256=scope).run(connection)
+                    return ()
+                except BaseException as failure:
+                    self.operator_frames.suspend()
+                    self.control.uncertain()
+                    if self.closing and control_connection_closed_normally(failure):
+                        return ()
+                    return (failure,)
+                finally:
+                    token = ""
+
+            self._operator_bootstrap_task = asyncio.create_task(
+                connect_and_own(credential), name="cayu-private-browser-channel"
+            )
+        credential = ""
+        # Acceptance means only that a finite channel owner exists, not that the
+        # server has acknowledged a fence or granted operator input.
+        return {"schema_version": 1, "bootstrap_accepted": True}
+
+    def _operator_transport_close(self) -> asyncio.Task[Any]:
+        task = self.session_cleanup_tasks.get("operator-transport")
+        if task is None:
+            if self._operator_connection is None:
+                raise GuestControlFailure()
+            task = asyncio.create_task(self._operator_connection.close())
+            self.session_cleanup_tasks["operator-transport"] = task
+        return task
+
+    async def bind_operator_control(self, binding_sha256: str) -> dict[str, Any]:
+        """Private control-channel handshake, never an ordinary JSON operation."""
+
+        async with self.lock:
+            if self.closing or self.close_requested.is_set() or self.context is None:
+                raise GuestControlFailure()
+            self.control.bind(binding_sha256)
+            return self._operator_control_evidence()
+
+    def claim_operator_channel(self, channel_id: str) -> None:
+        if (
+            self.closing
+            or self.close_requested.is_set()
+            or getattr(self, "_operator_channel_id", None) is not None
+        ):
+            raise GuestControlFailure()
+        self._operator_channel_id = channel_id
+
+    def release_operator_channel(self, channel_id: str) -> None:
+        if getattr(self, "_operator_channel_id", None) != channel_id:
+            raise GuestControlFailure()
+        self._operator_channel_id = None
+
+    async def operator_text_input(
+        self,
+        *,
+        request_id: str,
+        epoch: int,
+        sequence: int,
+        page_id: str,
+        page_epoch: int,
+        text: str,
+    ) -> dict[str, Any]:
+        return await self._operator_input(
+            request_id=request_id,
+            epoch=epoch,
+            sequence=sequence,
+            page_id=page_id,
+            page_epoch=page_epoch,
+            text=text,
+            key=None,
+        )
+
+    async def operator_key_input(
+        self,
+        *,
+        request_id: str,
+        epoch: int,
+        sequence: int,
+        page_id: str,
+        page_epoch: int,
+        key: str,
+    ) -> dict[str, Any]:
+        return await self._operator_input(
+            request_id=request_id,
+            epoch=epoch,
+            sequence=sequence,
+            page_id=page_id,
+            page_epoch=page_epoch,
+            text=None,
+            key=key,
+        )
+
+    async def _operator_input(
+        self,
+        *,
+        request_id: str,
+        epoch: int,
+        sequence: int,
+        page_id: str,
+        page_epoch: int,
+        text: str | None,
+        key: str | None,
+    ) -> dict[str, Any]:
+        """Private transient text delivery; never a tool argument or receipt payload.
+
+        Capture must already be settled by the sensitive-entry owner. Retain the
+        native task after cancellation/timeout; coroutine cancellation does not
+        establish that Chromium stopped processing an input operation.
+        """
+        keys = {
+            "tab": "Tab",
+            "backtab": "Shift+Tab",
+            "enter": "Enter",
+            "escape": "Escape",
+            "backspace": "Backspace",
+        }
+        if type(page_id) is not str or type(page_epoch) is not int:
+            raise GuestControlFailure()
+        if key is not None:
+            if text is not None or type(key) is not str or key not in keys:
+                raise GuestControlFailure()
+        elif (
+            type(text) is not str
+            or not 1 <= len(text) <= 4096
+            or any(0xD800 <= ord(char) <= 0xDFFF or char == "\x00" for char in text)
+        ):
+            raise GuestControlFailure()
+        async with self.lock:
+            self.control.check_operator(request_id=request_id, epoch=epoch)
+            state = self.pages.get(page_id)
+            limits = self.configuration_limits
+            if (
+                self._operator_channel_id is None
+                or not self.control.sensitive_entry
+                or not self.operator_frames.paused
+                or self.operator_frames.task is not None
+                or state is None
+                or state.lifecycle != "active"
+                or self.active_page_id != page_id
+                or state.control_epoch != page_epoch
+                or state.limit_exceeded
+                or state.denied_code is not None
+                or limits is None
+                or self.total_operations >= limits.max_operations
+                or state.operation_count >= limits.max_operations_per_page
+                or (self._operator_input_task is not None and not self._operator_input_task.done())
+            ):
+                raise GuestControlFailure()
+            if text is not None:
+                self._protect_operator_private_values((text,))
+            self.control.begin_input(request_id=request_id, epoch=epoch, sequence=sequence)
+            self.total_operations += 1
+            state.operation_count += 1
+            state.clear_refs()
+            if state.visual_owner is not None:
+                state.visual_owner.invalidate()
+
+            # Playwright insert_text only inserts text at current browser focus;
+            # it does not interpret key chords, selectors, scripts, or commands.
+            async def deliver() -> tuple[BaseException, ...]:
+                try:
+                    if key is None:
+                        await state.page.keyboard.insert_text(text)
+                    else:
+                        await state.page.keyboard.press(keys[key])
+                except BaseException as failure:
+                    return (failure,)
+                return ()
+
+            native = asyncio.create_task(deliver(), name="cayu-private-operator-input")
+            self._operator_input_task = native
+            try:
+                _, pending = await asyncio.wait(
+                    {native}, timeout=min(5.0, limits.max_wait_ms / 1000)
+                )
+                if pending:
+                    raise GuestControlFailure()
+                failures = native.result()
+                if failures:
+                    failure = failures[0]
+                    if isinstance(failure, asyncio.CancelledError):
+                        error = GuestControlFailure()
+                        error.__cause__ = failure
+                        raise error
+                    raise failure
+                self.control.settle_input(sequence)
+                self._operator_input_task = None
+            except BaseException:
+                self.control.uncertain()
+                raise
+            return self._operator_control_evidence()
+
+    def _protect_operator_private_values(self, values: tuple[str, ...]) -> None:
+        limit = self.profile_plaintext_limit or _INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES
+        protected = _bounded_interactive_profile_private_values(
+            self.profile_output_values or (), values, maximum_bytes=limit
+        )
+        self.profile_output_values = protected
+        self.profile_plaintext_limit = limit
+        if self.profile_timeout_seconds is None:
+            self.profile_timeout_seconds = 5.0
+
+    async def enter_operator_sensitive_entry(
+        self, *, request_id: str, epoch: int
+    ) -> dict[str, Any]:
+        self.control.check_operator(request_id=request_id, epoch=epoch)
+        # Stop new capture before waiting for the lifecycle lock or old frames.
+        self.operator_frames.suspend()
+        try:
+            async with self.lock:
+                await self.operator_frames.pause()
+                self.control.check_operator(request_id=request_id, epoch=epoch)
+                self._protect_operator_private_values(())
+                self.control.sensitive_entry = True
+                self.control.capture_restricted = True
+                return {
+                    **self._operator_control_evidence(),
+                    "capture_generation": self.operator_frames.generation,
+                    "sensitive_entry": True,
+                    "capture_restricted": True,
+                }
+        except BaseException:
+            self.control.uncertain()
+            raise
+
+    async def capture_operator_frame(
+        self,
+        *,
+        view_id: str,
+        epoch: int,
+        page_id: str,
+        page_epoch: int,
+        send: Callable[[int, dict[str, Any], bytes], Awaitable[None]],
+    ) -> None:
+        """Capture only the bounded viewport into a private transport callback.
+
+        No artifact, tool result, model visual target, title, or URL is produced.
+        Viewing uses its own short application-authorized grant, not takeover or
+        BrowserVisualPolicy. Sensitive entry excludes capture independently.
+        """
+        async with self.lock:
+            self.control.check_view(view_id=view_id, epoch=epoch)
+            # Pace before admitting a capture owner. Native page callbacks can
+            # change page authority during this wait, so all admission checks
+            # below use the post-wait state. A stale page remains a local refusal.
+            delay = 0.5 - (time.monotonic() - self._operator_frame_started)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self.control.check_view(view_id=view_id, epoch=epoch)
+            if self.profile_output_values is not None:
+                raise GuestCaptureDenied()
+            state = self.pages.get(self.active_page_id or "")
+            if (
+                type(page_id) is not str
+                or type(page_epoch) is not int
+                or state is None
+                or state.page_id != page_id
+                or state.control_epoch != page_epoch
+            ):
+                # Background/stale view requests grant no authority to capture
+                # the active page instead. Return the settled pixel-free refusal.
+                raise GuestCaptureDenied()
+            if (
+                self._operator_channel_id is None
+                or self.closing
+                or self.close_requested.is_set()
+                or state is None
+                or state.lifecycle != "active"
+                or not state.configured
+                or state.limit_exceeded
+                or state.denied_code is not None
+            ):
+                raise GuestControlFailure()
+            viewport = state.page.viewport_size
+            if (
+                type(viewport) is not dict
+                or set(viewport) != {"width", "height"}
+                or type(viewport["width"]) is not int
+                or type(viewport["height"]) is not int
+                or not 1 <= viewport["width"] <= 1920
+                or not 1 <= viewport["height"] <= 1080
+            ):
+                raise GuestControlFailure()
+            width, height = viewport["width"], viewport["height"]
+            page_epoch = state.control_epoch
+            if self._operator_frame_count >= 7200:
+                raise GuestControlFailure()
+
+            def guard() -> None:
+                self.control.check_view(view_id=view_id, epoch=epoch)
+                if (
+                    self.active_page_id != state.page_id
+                    or self.operator_frames.paused
+                    or self.profile_output_values is not None
+                    or state.lifecycle != "active"
+                    or state.control_epoch != page_epoch
+                    or state.limit_exceeded
+                    or state.denied_code is not None
+                    or self.closing
+                ):
+                    raise GuestControlFailure()
+
+            async def capture() -> bytes:
+                self._operator_frame_started = time.monotonic()
+                self._operator_frame_count += 1
+                frame = await state.page.screenshot(
+                    type="png",
+                    full_page=False,
+                    caret="initial",
+                    timeout=5000,
+                    clip={"x": 0, "y": 0, "width": width, "height": height},
+                )
+                if type(frame) is not bytes or _png_header_dimensions(frame) != (width, height):
+                    raise GuestControlFailure()
+                return frame
+
+            async def deliver(generation: int, frame: bytes) -> None:
+                await send(
+                    generation,
+                    {
+                        "page_id": state.page_id,
+                        "page_epoch": page_epoch,
+                        "control_epoch": epoch,
+                        "width": width,
+                        "height": height,
+                        "content_type": "image/png",
+                    },
+                    frame,
+                )
+
+            await self.operator_frames.capture_one(capture=capture, send=deliver, guard=guard)
+
+    async def grant_operator_view(
+        self, *, binding_sha256: str, view_id: str, epoch: int, until_ms: int
+    ) -> dict[str, Any]:
+        async with self.lock:
+            if self._operator_channel_id is None:
+                raise GuestControlFailure()
+            self.control.grant_view(
+                binding_sha256=binding_sha256, view_id=view_id, epoch=epoch, until_ms=until_ms
+            )
+            self.operator_frames.resume()
+            return {
+                **self._operator_control_evidence(),
+                "view_id": view_id,
+                "generation": self.operator_frames.generation,
+            }
+
+    async def operator_page_descriptors(self, *, epoch: int) -> dict[str, Any]:
+        """Content-free page authority, serialized with model/page mutations."""
+        async with self.lock:
+            self.control.expire()
+            if self.browser is not None and self.browser.is_connected() is False:
+                self.control.uncertain()
+                raise GuestControlAllocationLost()
+            if (
+                self._operator_channel_id is None
+                or self.control.binding_sha256 is None
+                or type(epoch) is not int
+                or epoch != self.control.epoch
+                or self.control.state
+                not in {"agent_controlled", "takeover_requested", "operator_controlled"}
+            ):
+                raise GuestControlFailure()
+            private_values = await self._refresh_profile_output_values()
+            observed_pages = tuple(
+                page for page in self.pages.values() if page.lifecycle in {"active", "background"}
+            )
+            pages = [
+                {
+                    "page_id": page.page_id,
+                    "revision": self._operator_page_revision(page),
+                    "control_epoch": page.control_epoch,
+                }
+                for page in observed_pages
+            ]
+            if any(
+                page.lifecycle not in {"active", "background", "closed", "crashed"}
+                for page in self.pages.values()
+            ):
+                raise GuestControlFailure()
+            return {
+                **self._operator_control_evidence(),
+                "active_page_id": self.active_page_id,
+                "pages": pages,
+                "locations": [
+                    {
+                        "page": page,
+                        "origin": self._operator_page_origin(
+                            getattr(state.page, "url", None), private_values
+                        ),
+                    }
+                    for page, state in zip(pages, observed_pages, strict=True)
+                ],
+            }
+
+    @staticmethod
+    def _operator_page_revision(page: _InteractivePage) -> str:
+        # Navigation invalidates model observations. Operator census must still
+        # name the exact native page generation without restoring model refs or
+        # claiming that a protected model observation has occurred.
+        if page.revision is not None:
+            return page.revision
+        return f"bo_unobserved_{page.navigation_epoch}_{page.control_epoch}"
+
+    async def _operator_boundary_locations(self) -> list[dict[str, Any]]:
+        # Caller holds the lifecycle lock after settling native action owners.
+        private_values = await self._refresh_profile_output_values()
+        if any(
+            page.lifecycle not in {"active", "background", "closed", "crashed"}
+            for page in self.pages.values()
+        ):
+            raise GuestControlFailure()
+        pages = sorted(
+            (page for page in self.pages.values() if page.lifecycle in {"active", "background"}),
+            key=lambda page: page.page_id,
+        )
+        if len(pages) > 16:
+            raise GuestControlFailure()
+        return [
+            {
+                "page": {
+                    "page_id": page.page_id,
+                    "revision": self._operator_page_revision(page),
+                    "control_epoch": page.control_epoch,
+                },
+                "origin": self._operator_page_origin(
+                    getattr(page.page, "url", None), private_values
+                ),
+            }
+            for page in pages
+        ]
+
+    @staticmethod
+    def _operator_page_origin(url: object, private_values: tuple[str, ...]) -> str | None:
+        if (
+            type(url) is not str
+            or len(url) > _MAX_URL_LENGTH
+            or any(ord(char) <= 32 or 0xD800 <= ord(char) <= 0xDFFF for char in url)
+        ):
+            return None
+        origin = _interactive_origin(url)
+        if origin is None:
+            return None
+        origin = origin.removesuffix("/")
+        if len(origin) > 2048 or any(value in origin for value in private_values):
+            return None
+        return origin
+
+    def _operator_control_evidence(self) -> dict[str, Any]:
+        return {
+            "worker_instance": self.visual_worker_instance,
+            "binding_sha256": self.control.binding_sha256,
+            "control_epoch": self.control.epoch,
+            "state": self.control.state,
+            "settled_sequence": self.control.settled_sequence,
+            "pending_sequence": self.control.pending_sequence,
+            "fresh_observation_required": self.control.fresh_observation_required,
+        }
+
+    async def acquire_operator_control(
+        self,
+        *,
+        binding_sha256: str,
+        request_id: str,
+        request_sha256: str,
+        expected_epoch: int,
+        expires_at_ms: int,
+        maximum_until_ms: int,
+        lease_until_ms: int,
+        pages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        # Own the expected page tuple before waiting for model/cleanup owners.
+        # A page changed by that work cannot inherit the operator's old consent.
+        if type(pages) is not list or len(pages) > 32:
+            raise GuestControlFailure()
+        expected_pages: dict[str, tuple[str, int]] = {}
+        for page in pages:
+            if (
+                type(page) is not dict
+                or set(page) != {"page_id", "revision", "control_epoch"}
+                or type(page["page_id"]) is not str
+                or not page["page_id"]
+                or type(page["revision"]) is not str
+                or not page["revision"]
+                or type(page["control_epoch"]) is not int
+                or not 1 <= page["control_epoch"] < 2**53
+                or page["page_id"] in expected_pages
+            ):
+                raise GuestControlFailure()
+            expected_pages[page["page_id"]] = (page["revision"], page["control_epoch"])
+        del pages
+
+        def acquisition_evidence() -> dict[str, Any]:
+            if self.control.acquisition_audit_json is None:
+                raise GuestControlFailure()
+            return {
+                **self._operator_control_evidence(),
+                "request_id": self.control.request_id,
+                "request_sha256": self.control.request_sha256,
+                "lease_until_ms": self.control.lease_wall_ms,
+                "audit": json.loads(self.control.acquisition_audit_json),
+            }
+
+        self.control.request(
+            binding_sha256=binding_sha256,
+            request_id=request_id,
+            request_sha256=request_sha256,
+            expected_epoch=expected_epoch,
+            expires_at_ms=expires_at_ms,
+            maximum_until_ms=maximum_until_ms,
+        )
+        if self.control.state != "takeover_requested":
+            return acquisition_evidence()
+        try:
+            async with asyncio.timeout(self.control.request_remaining_seconds()), self.lock:
+                if self.control.state != "takeover_requested":
+                    return acquisition_evidence()
+                await self._settle_operator_control_owners()
+                locations = await self._operator_boundary_locations()
+                live_pages = {
+                    page.page_id: (self._operator_page_revision(page), page.control_epoch)
+                    for page in self.pages.values()
+                    if page.lifecycle not in {"closed", "crashed"}
+                }
+                if live_pages != expected_pages or any(
+                    page.lifecycle not in {"active", "background", "closed", "crashed"}
+                    for page in self.pages.values()
+                ):
+                    raise GuestControlFailure()
+                self.control.grant(request_id=request_id, lease_until_ms=lease_until_ms)
+                self.control.acquisition_audit_json = json.dumps(
+                    {
+                        "request_id": request_id,
+                        "phase": "acquired",
+                        "control_epoch": self.control.epoch,
+                        "locations": locations,
+                    }
+                )
+                return acquisition_evidence()
+        except BaseException:
+            self.control.uncertain()
+            raise
+
+    async def handback_operator_control(self, *, request_id: str, epoch: int) -> dict[str, Any]:
+        def handback_evidence() -> dict[str, Any]:
+            if self.control.handback_audit_json is None:
+                raise GuestControlFailure()
+            return {
+                **self._operator_control_evidence(),
+                "audit": json.loads(self.control.handback_audit_json),
+            }
+
+        if not self.control.begin_handback(request_id=request_id, epoch=epoch):
+            return handback_evidence()
+        try:
+            async with asyncio.timeout(5.0), self.lock:
+                if self.control.state == "agent_controlled":
+                    return handback_evidence()
+                await self._settle_operator_control_owners()
+                for state in self.pages.values():
+                    state.clear_refs()
+                    state.revision = None
+                    state.last_observation_revision = None
+                    state.control_epoch += 1
+                    if state.visual_owner is not None:
+                        state.visual_owner.invalidate()
+                locations = await self._operator_boundary_locations()
+                self.control.finish_handback()
+                self.control.handback_audit_json = json.dumps(
+                    {
+                        "request_id": request_id,
+                        "phase": "handed_back",
+                        "control_epoch": self.control.epoch,
+                        "locations": locations,
+                    }
+                )
+                self.last_activity = asyncio.get_running_loop().time()
+                return handback_evidence()
+        except BaseException:
+            self.control.uncertain()
+            raise
+
+    def _operator_control_tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        """Census the actual native action, restoration and retirement owners."""
+
+        if self.closing or self.close_requested.is_set() or self.context is None:
+            raise GuestControlFailure()
+        owners: list[asyncio.Task[Any]] = []
+        if self.operator_frames.task is not None:
+            owners.append(self.operator_frames.task)
+        if self._operator_input_task is not None:
+            owners.append(self._operator_input_task)
+        if self.popup_cleanup_task is not None:
+            owners.append(self.popup_cleanup_task)
+        for task in self.session_cleanup_tasks.values():
+            if task not in owners:
+                owners.append(task)
+        for state in self.pages.values():
+            if state.lifecycle in {"provisional", "closing", "uncertain"} or (
+                state.observation_cleanup_disposition == "uncertain"
+                or state.visual_action_cleanup_disposition == "uncertain"
+            ):
+                raise GuestControlFailure()
+            for task in (
+                state.cleanup_task,
+                state.limit_abort_task,
+                state.unexpected_download_task,
+                state.observation_cleanup_task,
+                None if state.visual_owner is None else state.visual_owner.action_task,
+                None if state.visual_owner is None else state.visual_owner.disarm_task,
+            ):
+                if task is not None and task not in owners:
+                    owners.append(task)
+        return tuple(owners)
+
+    async def _settle_operator_control_owners(self) -> None:
+        """Join owners, including work registered while an earlier owner settles."""
+
+        deadline = asyncio.get_running_loop().time() + 5.0
+        owners: list[asyncio.Task[Any]] = []
+        while True:
+            for task in self._operator_control_tasks():
+                if task not in owners:
+                    owners.append(task)
+            if len(owners) > 4096:
+                raise GuestControlFailure()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise GuestControlFailure()
+            if owners:
+                _, pending = await asyncio.wait(owners, timeout=remaining)
+                if pending:
+                    raise GuestControlFailure()
+            # Existing popup settlement also gives already-enqueued callbacks
+            # one scheduling turn. Recheck both owner membership and lifecycle
+            # evidence after that turn; a newly registered owner cannot be lost.
+            await asyncio.sleep(0)
+            if all(task in owners for task in self._operator_control_tasks()):
+                break
+        if owners:
+            failures: list[BaseException] = []
+            for owner in owners:
+                try:
+                    result = owner.result()
+                except asyncio.CancelledError as cancellation:
+                    failure = RuntimeError(
+                        "Browser cleanup was cancelled without proving quiescence."
+                    )
+                    failure.__cause__ = cancellation
+                    failures.append(failure)
+                except BaseException as failure:
+                    failures.append(failure)
+                else:
+                    if result is False:
+                        failures.append(GuestControlFailure())
+                    elif isinstance(result, tuple) and result:
+                        if all(isinstance(item, BaseException) for item in result):
+                            failures.extend(result)
+                        else:
+                            failures.append(GuestControlFailure())
+            if failures:
+                raise BaseExceptionGroup("Browser control cleanup did not settle.", failures)
 
     async def _ensure_configuration(self, request: _InteractiveRequest) -> None:
         if self.context is None:
@@ -6692,31 +7562,32 @@ class _InteractiveDaemon:
             profile_output_protected=self.profile_output_values is not None,
         )
 
-    async def _protect_profile_observation(
-        self,
-        observation: dict[str, Any],
-    ) -> tuple[dict[str, Any], bool]:
-        """Omit current or historical profile values before guest publication."""
-
+    async def _refresh_profile_output_values(self) -> tuple[str, ...]:
+        """Refresh the existing bounded private-value owner before any projection."""
         prior_values = self.profile_output_values
         if prior_values is None:
-            return observation, False
+            return ()
         if (
             self.context is None
             or self.profile_plaintext_limit is None
             or self.profile_timeout_seconds is None
-            or self.profile_allowed_origins is None
+            or (self.profile_allowed_origins is None and not self.control.capture_restricted)
         ):
             raise _GuestFailure("policy_denied")
         try:
             async with asyncio.timeout(self.profile_timeout_seconds):
                 current_state = await self.context.storage_state(indexed_db=False)
-            current_state = _validate_interactive_profile_state(
-                current_state,
-                maximum_bytes=self.profile_plaintext_limit,
-                allowed_origins=self.profile_allowed_origins,
-            )
-            current_values = _interactive_profile_private_values(current_state)
+            if self.profile_allowed_origins is None:
+                current_values = _bounded_live_browser_private_values(
+                    current_state, maximum_bytes=self.profile_plaintext_limit
+                )
+            else:
+                current_state = _validate_interactive_profile_state(
+                    current_state,
+                    maximum_bytes=self.profile_plaintext_limit,
+                    allowed_origins=self.profile_allowed_origins,
+                )
+                current_values = _interactive_profile_private_values(current_state)
         except _GuestFailure:
             raise
         except BaseException as exc:
@@ -6729,6 +7600,16 @@ class _InteractiveDaemon:
             maximum_bytes=self.profile_plaintext_limit,
         )
         self.profile_output_values = protected_values
+        return protected_values
+
+    async def _protect_profile_observation(
+        self,
+        observation: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Omit current or historical profile values before guest publication."""
+        if self.profile_output_values is None:
+            return observation, False
+        protected_values = await self._refresh_profile_output_values()
         protected = json.loads(json.dumps(observation, ensure_ascii=False))
         url = protected.get("url")
         if type(url) is not str:
@@ -6952,6 +7833,9 @@ class _InteractiveDaemon:
         }
 
     async def close(self, *, timeout_seconds: float = 5.0) -> bool:
+        self.closing = True
+        self.operator_frames.suspend()
+        self.control.uncertain()
         deadline = asyncio.get_running_loop().time() + max(0.001, timeout_seconds)
 
         async def settle_owned_task(
@@ -6982,6 +7866,8 @@ class _InteractiveDaemon:
 
         async def settle_all() -> tuple[BaseException, ...]:
             errors: list[BaseException] = []
+            if self._operator_connection is not None:
+                self._operator_transport_close()
             popup_cleanup = self.popup_cleanup_task
             if popup_cleanup is not None:
                 _, failures = await settle_owned_task(
@@ -7063,6 +7949,45 @@ class _InteractiveDaemon:
                 elif task.done():
                     self.session_cleanup_tasks.pop(attribute, None)
 
+            bootstrap = self._operator_bootstrap_task
+            if bootstrap is not None:
+                settled, failures = await settle_owned_task(bootstrap, label="operator-channel")
+                errors.extend(failures)
+                if settled:
+                    # Invocation completion can normally close the channel before
+                    # native shutdown starts. Keep that disconnect fenced until
+                    # context/browser closure proves quiescence; its historical
+                    # normal-close signal must not then poison every close retry.
+                    # An exact pre-dispatch allocation-loss refusal is likewise
+                    # historical once native shutdown succeeds. Keep the original
+                    # in bootstrap.result(); do not forgive cleanup failures,
+                    # chained failures, abnormal transport errors or aggregates.
+                    errors.extend(
+                        failure
+                        for failure in bootstrap.result()
+                        if not (
+                            self.context is None
+                            and self.browser is None
+                            and (
+                                control_connection_closed_normally(failure)
+                                or (
+                                    type(failure) is GuestControlAllocationLost
+                                    and failure.__cause__ is None
+                                    and failure.__context__ is None
+                                )
+                            )
+                        )
+                    )
+            transport_close = self.session_cleanup_tasks.get("operator-transport")
+            if transport_close is not None:
+                settled, failures = await settle_owned_task(
+                    transport_close, label="operator-transport"
+                )
+                errors.extend(failures)
+                if settled:
+                    self._operator_connection = None
+                    self.session_cleanup_tasks.pop("operator-transport", None)
+
             # Close the browser first: a CDP acknowledgement can be permanently
             # stalled while its input is still queued. Waiting for it must not
             # spend the time reserved for stopping that browser.
@@ -7127,6 +8052,7 @@ class _InteractiveDaemon:
         )
         cleanup_ok = not outcome.errors
         if cleanup_ok:
+            self.control.state = "closed"
             self.pages.clear()
             self.active_page_id = None
         if outcome.cancellation is not None:
@@ -8237,13 +9163,18 @@ async def _interactive_daemon_main(session_id: str) -> int:
                 if len(raw_line) > _INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES:
                     raise _GuestFailure("incompatible_browser")
                 raw = json.loads(raw_line.decode("utf-8"))
-                request = _interactive_request_from_json(raw)
-                if request.page_id is not None and request.operation == "navigate":
-                    # Store the Cayu-owned allocation identity only in private
-                    # daemon state; it never becomes a Playwright selector.
-                    response = await daemon.execute(request)
+                if type(raw) is dict and raw.get("protocol_version") == CONTROL_BOOTSTRAP_PROTOCOL:
+                    target, material = _private_control_bootstrap(raw)
+                    raw.clear()
+                    raw_line = b""
+                    if target != daemon.session_id:
+                        raise _GuestFailure("incompatible_browser")
+                    try:
+                        response = await daemon.bootstrap_operator_channel(material)
+                    finally:
+                        material.clear()
                 else:
-                    response = await daemon.execute(request)
+                    response = await daemon.execute(_interactive_request_from_json(raw))
             except _GuestFailure as exc:
                 response = _interactive_error_payload(exc)
             except (json.JSONDecodeError, UnicodeError, asyncio.LimitOverrunError):
@@ -8318,6 +9249,7 @@ async def _wait_for_interactive_shutdown(daemon: _InteractiveDaemon) -> None:
                 daemon.last_activity
                 + daemon.idle_timeout_seconds
                 - asyncio.get_running_loop().time(),
+                daemon.control.retirement_deferral_seconds(),
             )
             background_remaining = (
                 tuple(
@@ -8377,6 +9309,15 @@ def main() -> int:
                 raise _GuestFailure("incompatible_browser")
             raw_request = json.loads(raw_stdin.decode("utf-8"))
             if (
+                type(raw_request) is dict
+                and raw_request.get("protocol_version") == CONTROL_BOOTSTRAP_PROTOCOL
+            ):
+                try:
+                    result = asyncio.run(_run_private_control_bootstrap(raw_request))
+                finally:
+                    raw_request.clear()
+                    raw_stdin = b""
+            elif (
                 type(raw_request) is dict
                 and raw_request.get("protocol_version") == INTERACTIVE_PROTOCOL_VERSION
             ):

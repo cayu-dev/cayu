@@ -24,7 +24,7 @@ USER root
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-RUN python -m pip install --no-cache-dir "playwright==1.62.0" \
+RUN python -m pip install --no-cache-dir "playwright==1.62.0" "websockets==17.0.1" \
     && python -m playwright install --with-deps chromium-headless-shell \
     && apt-get update \
     && apt-get install --yes --no-install-recommends libnss3-tools \
@@ -45,6 +45,8 @@ RUN shell_path="$(find /ms-playwright/chromium_headless_shell-* -type f \( -name
 
 COPY --chown=root:root src/cayu/tools/_browser_guest.py /opt/cayu-browser/worker.py
 COPY --chown=root:root src/cayu/tools/_browser_visual_guest.py /opt/cayu-browser/_browser_visual_guest.py
+COPY --chown=root:root src/cayu/tools/_browser_control_guest.py /opt/cayu-browser/_browser_control_guest.py
+COPY --chown=root:root src/cayu/tools/_browser_control_transport.py /opt/cayu-browser/_browser_control_transport.py
 
 RUN chmod 0555 /opt/cayu-browser/worker.py \
     && python -m py_compile /opt/cayu-browser/worker.py \

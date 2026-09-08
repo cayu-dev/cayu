@@ -140,6 +140,7 @@ _OPTIONAL_DISTRIBUTIONS = (
     "pypdf",
     "sse-starlette",
     "uvicorn",
+    "websockets",
 )
 _SQLITE_SCHEMA_STORE_IDENTITIES = frozenset(
     {

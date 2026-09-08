@@ -57,6 +57,119 @@ server = create_server(
 It selects `OpenAccess`, enables generated documentation, and allows the local
 Vite origin. `deployment_name="development"` alone does none of those things.
 
+## Browser operator transport
+
+Browser operator control requires both an application policy and authenticated
+server configuration. With an already configured application policy, auth
+dependency and dedicated signing key, the wiring is:
+
+```python
+from cayu import BrowserControlConfig, BrowserOperatorPurpose, CayuApp
+from cayu.server import BrowserControlServerConfig, ServerConfig, create_server
+
+cayu_app = CayuApp(
+    browser_control=BrowserControlConfig(
+        policy=application_browser_policy,
+        guest_endpoint="wss://control.example/api/browser-control/guest",
+        purpose=BrowserOperatorPurpose(
+            code="manual_login", expected_origins=("https://accounts.example",)
+        ),
+    ),
+)
+# Register the application's providers, agents and admitted browser environment.
+server = create_server(
+    cayu_app,
+    config=ServerConfig.protected(
+        require_operator,
+        browser_control=BrowserControlServerConfig(
+            operator_origin="https://control.example",
+            signing_key=browser_control_signing_key,
+        ),
+    ),
+)
+```
+
+`application_browser_policy`, `require_operator`, and
+`browser_control_signing_key` are application-supplied values, not built-in
+allow-all defaults. The signing key is a dedicated 32-byte secret. Obtain it
+through the application's secret configuration; do not put it in a URL or
+dashboard configuration. Policy requirements and handoff steps are described in
+[browser sessions](browser-session.md#private-operator-view-and-login-handoff).
+
+`purpose` declares the application's intervention code and nonempty, sorted,
+unique set of canonical HTTPS expected origins. It is copied into the exact
+browser-control allocation identity; changing it cannot authorize an existing
+allocation under the new declaration. The dashboard displays this declaration
+separately from observed page locations. It neither grants destination access nor
+proves that the current page matches an expected origin or that login succeeded.
+
+The example uses the default `/api` mount. Adapt the guest endpoint when changing
+that mount. `operator_origin` is one exact HTTPS origin, with no trailing slash,
+path, query or credentials. The guest endpoint must use WSS, be reachable from
+the admitted browser environment, and present a certificate trusted by that
+environment. There is no plaintext or disabled-certificate-verification fallback.
+The protected server and guest need the private WebSocket transport dependency.
+
+### Colocated Docker control server
+
+An internal-only Docker browser network cannot reach an ordinary host WSS
+listener directly. For a containerized Cayu application, configure its Docker
+egress adapter with `control_server_container_id=<full 64-character container ID>`.
+The ID must identify the container running that application and its in-process
+egress broker, not a proxy or a second independent Cayu application. Container
+names and shortened IDs are rejected.
+
+For each allocation, the adapter attaches that exact container to the new private
+network with the alias `cayu-control`. Configure the guest endpoint as
+`wss://cayu-control:<TLS-port>/api/browser-control/guest`. The broker sidecar uses
+the same alias; the application broker listens on container interfaces without
+publishing its port to the host. The control server is application-owned: binding
+cleanup detaches its network endpoint but does not stop or delete the server.
+Cancellation during attachment waits for the command outcome before rollback;
+unconfirmed detachment leaves binding cleanup retryable. This does not add Docker
+allocation reconnection or process-loss recovery capabilities.
+
+If preparation fails before returning a binding, the adapter retains the exact
+rollback owner. Keep the adapter alive and call
+`await adapter.drain_preparation_cleanup()` during application cleanup; retry if
+it raises. Subsequent preparation also drains these owners before allocating
+more resources. A timeout retains the running cleanup task rather than starting
+overlapping teardown, and successful late completion retires the owner.
+
+Deployment prerequisites:
+
+- Provision a certificate for `cayu-control` whose issuing CA is trusted by the
+  guest. For a private CA, install its public root in the guest's trust store;
+  do not disable TLS verification or copy the server private key into the guest.
+- Run the protected HTTPS/WSS listener on a container-reachable interface. Publish
+  only the intended protected operator port, bound to host loopback for local use.
+  Do not publish the broker port or enable packet forwarding/general proxying.
+- The application container needs its normal Docker management access. Never
+  give the browser container the Docker socket or control-server filesystem.
+- Docker bind-mount sources are resolved by the Docker daemon, not inside the
+  application container. Provide a private, writable shared staging directory
+  mounted at the same absolute path on host and application, and set `TMPDIR`
+  there so the existing broker authorization and CA mounts resolve correctly.
+  Apply the same path discipline to workspace and seccomp configuration files.
+
+The default adapter configuration still uses the host broker topology. This
+option changes control-plane reachability, not approved browser destinations,
+credential grants, or browser-control permissions.
+
+Forward WebSocket upgrades and the exact HTTPS/WSS scheme through any trusted
+reverse proxy. Do not enable capture of authorization headers, WebSocket
+subprotocols or frame/input bodies in proxies, tracing or access diagnostics.
+Guest bootstrap credentials and single-use operator transport tickets belong to
+the private transport, not query parameters or ordinary API payload logging.
+
+Guest channels, bootstrap capabilities and operator tickets have in-process
+owners. Route the application's browser traffic to its owning server process;
+an arbitrary load-balanced worker cannot reconstruct these transient owners from
+the session store. Restart does not replay input or automatically restore control.
+Open-access server configuration cannot enable this surface. A configured API
+alone also does not authorize viewing: every browser action still requires an
+explicit application policy decision for its exact authority.
+
 ## Independent policy groups
 
 `ServerConfig` owns these explicit axes:

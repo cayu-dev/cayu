@@ -42,6 +42,7 @@ from cayu.artifacts.attachments import file_attachment
 from cayu.browser_profiles import (
     BROWSER_PROFILE_MAX_PLAINTEXT_BYTES,
     BrowserProfileBinding,
+    BrowserProfileCheckpointConsentDenied,
     BrowserProfileCheckpointPolicy,
     BrowserProfileDestinationPolicy,
     BrowserProfileLimits,
@@ -938,6 +939,7 @@ class _LiveSession:
     pages: dict[str, _PageAuthority] = field(default_factory=dict)
     active_page_id: str | None = None
     page_set: BrowserPageSetState | None = None
+    operator_page_operations: tuple[tuple[str, int], ...] = ()
     allocation_authority: _LiveAllocationAuthority | None = None
     closed: bool = False
     profile_material: BrowserProfileRestoreMaterial | None = field(
@@ -1269,6 +1271,83 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
             max_page_creations_per_operation=self.max_page_creations_per_operation,
         )
 
+    async def bootstrap_control(
+        self,
+        ctx: ToolContext,
+        *,
+        browser_session_id: str,
+        endpoint: str,
+        credential: str,
+        scope_sha256: str,
+    ) -> None:
+        """Private control startup, with the same runner/workload admission as execution."""
+        from ._browser_control_transport import validate_control_endpoint
+
+        endpoint = validate_control_endpoint(endpoint)
+        if (
+            type(credential) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", credential) is None
+            or type(scope_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", scope_sha256) is None
+            or type(browser_session_id) is not str
+            or not 1 <= len(browser_session_id) <= _MAX_BROWSER_ID_LENGTH
+            or any(ord(character) < 33 or ord(character) > 126 for character in browser_session_id)
+        ):
+            raise RuntimeError("Browser control bootstrap is invalid.")
+        # Reuse exact admission, including factory/environment/workload binding.
+        # This content-free preparation is never sent as an ordinary operation.
+        prepared = self._prepare_dispatch(
+            ctx, {"operation": "control_bootstrap", "session_id": browser_session_id}
+        )
+        if isinstance(prepared, BrowserBackendResponse):
+            raise RuntimeError("Browser control runner authority is unavailable.")
+        runner = prepared[0]
+        private_exec = getattr(runner, "_exec_private_browser_control", None)
+        if not callable(private_exec):
+            raise RuntimeError("Browser control requires private runner transport.")
+        payload = json.dumps(
+            {
+                "protocol_version": "cayu.browser-control-bootstrap.v1",
+                "session_id": browser_session_id,
+                "endpoint": endpoint,
+                "credential": credential,
+                "scope_sha256": scope_sha256,
+            },
+            separators=(",", ":"),
+        )
+        operation = private_exec(
+            _browser_worker_command(DEFAULT_BROWSER_FETCH_WORKER_COMMAND),
+            timeout_s=15,
+            stdin=payload,
+            output_limit_bytes=1024,
+        )
+        del payload, credential, prepared, private_exec, runner, ctx
+        execution = await operation
+        if (
+            execution.timed_out
+            or execution.cancelled
+            or execution.exit_code != 0
+            or execution.stdout_truncated
+            or len(execution.stdout) > 1024
+        ):
+            raise RuntimeError("Browser control bootstrap acknowledgement is unavailable.")
+        accepted = False
+        try:
+            reply = json.loads(execution.stdout)
+            accepted = (
+                type(reply) is dict
+                and set(reply) == {"schema_version", "bootstrap_accepted"}
+                and type(reply["schema_version"]) is int
+                and reply["schema_version"] == 1
+                and reply["bootstrap_accepted"] is True
+            )
+        except (ValueError, TypeError):
+            pass
+        finally:
+            execution = None
+        if not accepted:
+            raise RuntimeError("Browser control bootstrap acknowledgement is invalid.")
+
     async def restore_profile(
         self,
         ctx: ToolContext,
@@ -1372,12 +1451,20 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         operation_id: str,
         limits: BrowserProfileLimits,
         current_policy: BrowserProfileDestinationPolicy,
+        invocation_control_epoch: int | None = None,
     ) -> BrowserProfileStateV1:
-        request = {
+        request: dict[str, Any] = {
             "operation": "profile_checkpoint",
             "session_id": browser_session_id,
             "operation_id": operation_id,
         }
+        if invocation_control_epoch is not None:
+            if (
+                type(invocation_control_epoch) is not int
+                or not 1 <= invocation_control_epoch < 2**53
+            ):
+                raise BrowserProfileUnavailable("Browser profile control epoch is invalid.")
+            request["invocation_control_epoch"] = invocation_control_epoch
         prepared = self._prepare_dispatch(
             ctx,
             request,
@@ -1486,6 +1573,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
                 ),
             }
         wire_request = dict(request)
+        wire_request.pop("_operator_page_operations", None)
         durable_uploads = wire_request.pop("upload_artifacts", None)
         private_uploads = wire_request.pop("_upload_payloads", ())
         if private_uploads and include_upload_content:
@@ -2430,12 +2518,31 @@ class BrowserSessionTool(Tool):
         parent_state.active_calls += 1
         try:
             async with lock:
-                return await self._run_locked(
+                result = await self._run_locked(
                     ctx,
                     parent_state,
                     request,
                     durable_authority=durable_authority,
                 )
+                if (
+                    durable_authority is not None
+                    and durable_authority.bootstrap_browser_control is not None
+                    and not result.is_error
+                    and isinstance(result.structured, Mapping)
+                    and result.structured.get("allocation_disposition") == "live"
+                ):
+                    browser_session_id = result.structured.get("session_id")
+                    live = (
+                        parent_state.sessions.get(browser_session_id)
+                        if type(browser_session_id) is str
+                        else None
+                    )
+                    if live is not None and not live.closed and not live.ambiguous_lineage:
+                        # The normal operation (including receipt publication and
+                        # profile checkpointing) has settled. Replays may join the
+                        # same bootstrap owner but never redispatch browser input.
+                        await durable_authority.bootstrap_browser_control(browser_session_id)
+                return result
         finally:
             parent_state.active_calls -= 1
 
@@ -2907,6 +3014,7 @@ class BrowserSessionTool(Tool):
                 fingerprint=fingerprint,
             )
         )
+        retained_ambiguous: ToolResult | None = None
         if operation_id is not None:
             retained = parent_state.operations.get(operation_id)
             if retained is None:
@@ -2920,9 +3028,17 @@ class BrowserSessionTool(Tool):
                 )
                 if authority_failure is not None:
                     return _error_result(authority_failure, dispatch="not_started")
-                if retained.fingerprint == fingerprint:
+                if retained.fingerprint != fingerprint:
+                    return _error_result("operation_conflict", dispatch="not_started")
+                if (
+                    durable_authority is not None
+                    and type(durable_authority.environment_allocation_fingerprint) is str
+                    and isinstance(retained.result.structured, Mapping)
+                    and retained.result.structured.get("error") == "outcome_ambiguous"
+                ):
+                    retained_ambiguous = retained.result
+                else:
                     return self._visual_replay_result(ctx, request, retained.result)
-                return _error_result("operation_conflict", dispatch="not_started")
         operation_records = (
             parent_state.session_cleanup_operations
             if request["operation"] == "close"
@@ -3008,9 +3124,16 @@ class BrowserSessionTool(Tool):
                     return _error_result("authority_expired", dispatch="not_started")
                 dispatched_request["session_id"] = recorded_session_id
                 dispatched_request["page_id"] = recorded_page_id
-                if (
-                    request["operation"] != "navigate"
-                    and recorded_session_id not in parent_state.sessions
+                if "invocation_control_epoch" in recorded_request:
+                    dispatched_request["invocation_control_epoch"] = recorded_request[
+                        "invocation_control_epoch"
+                    ]
+                    dispatched_request["_operator_page_operations"] = _operator_accounting_snapshot(
+                        recorded_request.get("operator_page_operations", ())
+                    )
+                if request["operation"] != "navigate" and (
+                    recorded_session_id not in parent_state.sessions
+                    or retained_ambiguous is not None
                 ):
                     restored = await self._restore_durable_session(
                         ctx,
@@ -3035,6 +3158,11 @@ class BrowserSessionTool(Tool):
                     fallback=replay,
                 )
             durable_session_key = _durable_browser_session_key(dispatched_request["session_id"])
+
+        if retained_ambiguous is not None:
+            # Lost durable evidence is never permission to repeat an operation
+            # whose local owner already observed dispatch.
+            return self._visual_replay_result(ctx, request, retained_ambiguous)
 
         if request["operation"] != "navigate" and request["session_id"] not in (
             parent_state.sessions
@@ -3095,6 +3223,18 @@ class BrowserSessionTool(Tool):
             if secret_snapshot.redactor.has_values:
                 return _error_result("policy_denied", dispatch="not_started")
 
+        if (
+            durable_authority is not None
+            and durable_authority.browser_control_admission is not None
+        ):
+            admission = await durable_authority.browser_control_admission(
+                dispatched_request["session_id"], request["operation"]
+            )
+            if admission is not None:
+                dispatched_request["invocation_control_epoch"] = admission.control_epoch
+                dispatched_request["_operator_page_operations"] = _operator_accounting_snapshot(
+                    admission.operator_page_operations
+                )
         backend_request = dict(dispatched_request)
         if prepared_uploads:
             backend_request["_upload_payloads"] = prepared_uploads
@@ -3176,7 +3316,7 @@ class BrowserSessionTool(Tool):
                     ) or _failure_contains_process_control(failure):
                         raise
                     checkpointed = False
-                if not checkpointed:
+                if checkpointed is False:
                     return _error_result(
                         "profile_checkpoint_failed",
                         dispatch="not_started",
@@ -3622,6 +3762,9 @@ class BrowserSessionTool(Tool):
                 parent_state=parent_state,
                 expected_parent=durable_parent_dispatched,
                 durable_parent_state=durable_parent_state,
+                observation_confirmed=response.observation is not None,
+                observation_protected=response.profile_output_protected,
+                close_confirmed=response.closed,
             )
             # Publication reconstructs the public session from sealed evidence.
             # Any subsequent checkpoint must retain its retry owner on that
@@ -3835,6 +3978,9 @@ class BrowserSessionTool(Tool):
             parent_state=parent_state,
             expected_parent=raw_parent,
             durable_parent_state=durable_parent_state,
+            observation_confirmed=response.observation is not None,
+            observation_protected=response.profile_output_protected,
+            close_confirmed=response.closed,
         )
         if type(operation_id) is str:
             operation_records[operation_id] = _OperationRecord(
@@ -3877,8 +4023,8 @@ class BrowserSessionTool(Tool):
         session: _LiveSession,
         *,
         trigger_operation_id: str | None = None,
-    ) -> bool:
-        """Checkpoint one positively settled revision without exposing profile state."""
+    ) -> bool | None:
+        """Checkpoint settled state; None skips new capture without blocking close."""
 
         binding = self.browser_profile
         material = session.profile_material
@@ -3904,6 +4050,16 @@ class BrowserSessionTool(Tool):
         session.pending_profile_checkpoint_id = None
         if existing is not None:
             return existing.outcome is BrowserProfileTerminalOutcome.SUCCEEDED
+        control_epoch = None
+        authority = _runtime_tool_invocation_authority(ctx)
+        if authority is not None and authority.browser_control_admission is not None:
+            try:
+                admission = await authority.browser_control_admission(
+                    material.preparation.request.browser_session_id, "profile_checkpoint"
+                )
+                control_epoch = None if admission is None else admission.control_epoch
+            except BrowserProfileCheckpointConsentDenied:
+                return None
         await binding.renew_writer(material)
         plan = await binding.reserve_checkpoint(
             material=material,
@@ -3923,6 +4079,7 @@ class BrowserSessionTool(Tool):
                 operation_id=checkpoint_operation_id,
                 limits=binding.limits,
                 current_policy=binding.current_policy,
+                invocation_control_epoch=control_epoch,
             )
             session.pending_profile_checkpoint_id = checkpoint_operation_id
             await binding.publish_checkpoint(plan, state)
@@ -4114,6 +4271,22 @@ class BrowserSessionTool(Tool):
             return _error_result(failure, dispatch="not_started")
         if restored is None:  # pragma: no cover - paired result invariant
             return _error_result("restoration_required", dispatch="not_started")
+        retained = parent_state.sessions.get(browser_session_id)
+        if retained is not None:
+            if (
+                _live_browser_allocation_failure(
+                    retained.allocation_authority, restored.allocation_authority
+                )
+                is not None
+            ):
+                return _error_result("authority_expired", dispatch="not_started")
+            # Receipt projection may have advanced local page counters before
+            # publication failed. Restore the authenticated durable baseline,
+            # but keep the existing private writer and checkpoint retry owner.
+            restored.profile_material = retained.profile_material
+            restored.pending_profile_checkpoint_id = retained.pending_profile_checkpoint_id
+            parent_state.sessions[browser_session_id] = restored
+            return None
         if self.browser_profile is not None:
             if not await self._resume_browser_profile_writer(
                 ctx,
@@ -4150,6 +4323,9 @@ class BrowserSessionTool(Tool):
         parent_state: _ParentBrowserState,
         expected_parent: dict[str, Any],
         durable_parent_state: _DurableBrowserParentState,
+        observation_confirmed: bool = False,
+        observation_protected: bool = False,
+        close_confirmed: bool = False,
     ) -> ToolResult:
         operation_id = request.get("operation_id")
         if type(operation_id) is not str:
@@ -4167,6 +4343,12 @@ class BrowserSessionTool(Tool):
             state="terminal",
             result=result,
         )
+        if request["operation"] == "observe" and observation_confirmed and not result.is_error:
+            terminal["observation_confirmed"] = True
+            terminal["observation_protected"] = observation_protected
+        if request["operation"] == "close" and close_confirmed and not result.is_error:
+            terminal["close_confirmed"] = True
+        publication_attempted = False
         try:
             session_id = request["session_id"]
             live = parent_state.sessions.get(session_id)
@@ -4234,6 +4416,7 @@ class BrowserSessionTool(Tool):
                 max_operations=self.max_operations,
                 max_page_cleanup_operations=self.max_page_cleanup_operations,
             )
+            publication_attempted = True
             await authority.compare_and_set_durable_operation(
                 _DURABLE_BROWSER_PARENT_KEY,
                 expected_parent,
@@ -4243,22 +4426,41 @@ class BrowserSessionTool(Tool):
                     _durable_browser_session_key(session_id): session_record,
                 },
             )
-            if sealed_live is not None:
-                if live is not None:
-                    # Durable publication rebuilds the public page/session
-                    # authority from sealed JSON.  The active profile writer
-                    # is an in-process capability and must remain attached to
-                    # that exact authenticated allocation; it is never
-                    # serialized into the durable session record.
-                    sealed_live.profile_material = live.profile_material
-                    sealed_live.pending_profile_checkpoint_id = live.pending_profile_checkpoint_id
-                parent_state.sessions[session_id] = sealed_live
         except Exception:
-            return _error_result(
-                "outcome_ambiguous",
-                dispatch="acknowledgement_lost",
-                allocation_disposition=allocation_disposition or "uncertain",
-            )
+            reconciled = False
+            if publication_attempted:
+                try:
+                    # Authenticate the complete atomic publication, not only
+                    # an operation ID or a terminal status. Readback cannot
+                    # authorize another guest dispatch.
+                    reconciled = all(
+                        [
+                            canonical_durable_json_bytes(
+                                await authority.load_durable_operation(key), "browser_readback"
+                            )
+                            == canonical_durable_json_bytes(expected, "browser_expected")
+                            for key, expected in (
+                                (_DURABLE_BROWSER_PARENT_KEY, terminal_parent),
+                                (operation_key, terminal),
+                                (_durable_browser_session_key(session_id), session_record),
+                            )
+                        ]
+                    )
+                except Exception:
+                    reconciled = False
+            if not reconciled:
+                return _error_result(
+                    "outcome_ambiguous",
+                    dispatch="acknowledgement_lost",
+                    allocation_disposition=allocation_disposition or "uncertain",
+                )
+        if sealed_live is not None:
+            if live is not None:
+                # Keep the private writer owner through successful publication
+                # and exact acknowledgement-loss reconciliation alike.
+                sealed_live.profile_material = live.profile_material
+                sealed_live.pending_profile_checkpoint_id = live.pending_profile_checkpoint_id
+            parent_state.sessions[session_id] = sealed_live
         return result
 
     async def _project_response(
@@ -4292,6 +4494,28 @@ class BrowserSessionTool(Tool):
             if type(session_id) is not str or parent_state.sessions.get(session_id) is None
             else parent_state.sessions[session_id].page_set
         )
+        prior_session = (
+            None if type(session_id) is not str else parent_state.sessions.get(session_id)
+        )
+        try:
+            accounting = _operator_accounting_snapshot(request.get("_operator_page_operations", ()))
+            prior_accounting = (
+                {} if prior_session is None else dict(prior_session.operator_page_operations)
+            )
+            counts = dict(accounting)
+            if any(counts.get(page_id, 0) < count for page_id, count in prior_accounting.items()):
+                raise ValueError("Browser operator accounting regressed.")
+            operator_deltas = {
+                page_id: count - prior_accounting.get(page_id, 0)
+                for page_id, count in counts.items()
+            }
+        except (TypeError, ValueError):
+            return _error_result(
+                "authority_expired",
+                dispatch="completed",
+                request=request,
+                allocation_disposition="uncertain",
+            )
         if response.allocation_disposition == "uncertain":
             _invalidate_session_refs(parent_state, request)
         if page_set is not None and not _browser_page_set_transition_is_valid(
@@ -4304,6 +4528,7 @@ class BrowserSessionTool(Tool):
             successful=response.failure is None,
             multi_page=self.multi_page,
             popup_policy=self.popup_policy,
+            operator_operation_deltas=operator_deltas,
         ):
             _invalidate_session_refs(parent_state, request)
             return _error_result(
@@ -4321,6 +4546,7 @@ class BrowserSessionTool(Tool):
             )
         if page_set is not None:
             _apply_backend_page_set(parent_state, page_set, response.observation)
+            parent_state.sessions[page_set.session_id].operator_page_operations = accounting
         if response.failure is not None:
             code = response.failure.code
             if code == "session_closed" and response.allocation_disposition == "retired":
@@ -4864,6 +5090,27 @@ def _browser_page_set_within_limits(
     )
 
 
+def _operator_accounting_snapshot(value: object) -> tuple[tuple[str, int], ...]:
+    """Own bounded runtime/store material without serializing unvalidated values."""
+    if not isinstance(value, (tuple, list)) or type(value) not in {tuple, list}:
+        raise ValueError("Browser operator accounting is invalid.")
+    if len(value) > MAX_BROWSER_SESSION_MAX_TOTAL_PAGE_CREATIONS:
+        raise ValueError("Browser operator accounting is invalid.")
+    owned = []
+    for item in value:
+        if not isinstance(item, (tuple, list)) or type(item) not in {tuple, list} or len(item) != 2:
+            raise ValueError("Browser operator accounting is invalid.")
+        page_id, count = item
+        if type(page_id) is not str or type(count) is not int or not 1 <= count < 2**53:
+            raise ValueError("Browser operator accounting is invalid.")
+        _bounded_identifier(page_id, "operator page", maximum=_MAX_BROWSER_ID_LENGTH)
+        owned.append((page_id, count))
+    keys = tuple(page_id for page_id, _ in owned)
+    if keys != tuple(sorted(set(keys))) or sum(count for _, count in owned) >= 2**53:
+        raise ValueError("Browser operator accounting is invalid.")
+    return tuple(owned)
+
+
 def _browser_page_set_transition_is_valid(
     previous: BrowserPageSetState | None,
     current: BrowserPageSetState,
@@ -4875,10 +5122,20 @@ def _browser_page_set_transition_is_valid(
     successful: bool,
     multi_page: bool,
     popup_policy: BrowserPopupPolicy,
+    operator_operation_deltas: Mapping[str, int] | None = None,
 ) -> bool:
     """Authenticate one complete page-set transition from backend-owned evidence."""
 
     current_pages = {page.page_id: page for page in current.pages}
+    operator_deltas = {} if operator_operation_deltas is None else dict(operator_operation_deltas)
+    if any(
+        page_id not in current_pages or type(count) is not int or count < 0
+        for page_id, count in operator_deltas.items()
+    ):
+        return False
+    operator_total = sum(operator_deltas.values())
+    if previous is None and operator_total:
+        return False
     created = set(delta.created_page_ids)
     admitted = set(delta.admitted_page_ids)
     closed = set(delta.closed_page_ids)
@@ -5017,7 +5274,7 @@ def _browser_page_set_transition_is_valid(
             return False
         if (
             current.total_page_creations < previous.total_page_creations
-            or current.total_operations < previous.total_operations
+            or current.total_operations < previous.total_operations + operator_total
             or current.total_observations < previous.total_observations
             or current.total_refs < previous.total_refs
             or current.total_requests < previous.total_requests
@@ -5032,7 +5289,7 @@ def _browser_page_set_transition_is_valid(
                 or page.opener_page_id != prior.opener_page_id
                 or page.creating_operation_id_sha256 != prior.creating_operation_id_sha256
                 or page.control_epoch < prior.control_epoch
-                or page.operation_count < prior.operation_count
+                or page.operation_count < prior.operation_count + operator_deltas.get(page_id, 0)
                 or page.observation_count < prior.observation_count
                 or page.ref_count < prior.ref_count
                 or page.request_count < prior.request_count
@@ -5066,12 +5323,13 @@ def _browser_page_set_transition_is_valid(
                     or page.operation_count
                     != (0 if prior is None else prior.operation_count)
                     + expected_operation_increment
+                    + operator_deltas.get(page_id, 0)
                     or page.artifact_count
                     != (0 if prior is None else prior.artifact_count) + expected_artifact_increment
                 ):
                     return False
             if (
-                current.total_operations != previous.total_operations + 1
+                current.total_operations != previous.total_operations + operator_total + 1
                 or current_pages[observation.page_id].last_operation_id_sha256 != operation_digest
                 or current.total_observations != previous.total_observations + 1
                 or current.total_refs != previous.total_refs + len(observation.refs)
@@ -5779,6 +6037,17 @@ def _validate_durable_browser_operation_record(
         allowed_content_types=allowed_upload_content_types,
     ):
         return None
+    if "invocation_control_epoch" in copied and (
+        type(copied["invocation_control_epoch"]) is not int
+        or not 1 <= copied["invocation_control_epoch"] < 2**53
+    ):
+        return None
+    try:
+        accounting = _operator_accounting_snapshot(copied.get("operator_page_operations", ()))
+        if accounting and "invocation_control_epoch" not in copied:
+            return None
+    except (TypeError, ValueError):
+        return None
     if not all(
         _is_sha256_hexdigest(value)
         for value in (
@@ -6436,6 +6705,12 @@ def _browser_operation_record(
     }
     if "upload_artifacts" in request:
         record["upload_artifacts"] = request["upload_artifacts"]
+    if "invocation_control_epoch" in request:
+        record["invocation_control_epoch"] = request["invocation_control_epoch"]
+        record["operator_page_operations"] = [
+            list(item)
+            for item in _operator_accounting_snapshot(request.get("_operator_page_operations", ()))
+        ]
     if result is not None:
         record["result"] = result.model_dump(mode="json")
     return copy_durable_json_object(record, "browser_operation_record")
@@ -6526,6 +6801,9 @@ def _browser_session_record(
             "allocation_fingerprint": allocation_fingerprint,
             "browser_session_id": browser_session_id,
             "page_set": page_set.model_dump(mode="json"),
+            "operator_page_operations": []
+            if live is None
+            else [list(item) for item in live.operator_page_operations],
             "page_authorities": page_authorities,
             "profile_ambiguous_lineage": (False if live is None else live.ambiguous_lineage),
             "profile_last_settled_revision": (None if live is None else live.last_settled_revision),
@@ -6617,6 +6895,15 @@ def _validate_durable_browser_session_record(
         return None, "restoration_required"
     if len(raw_authorities) != len(page_set.pages):
         return None, "restoration_required"
+    try:
+        operator_page_operations = _operator_accounting_snapshot(
+            copied.get("operator_page_operations", ())
+        )
+    except (TypeError, ValueError):
+        return None, "restoration_required"
+    operation_counts = {page.page_id: page.operation_count for page in page_set.pages}
+    if any(operation_counts.get(page_id, 0) < count for page_id, count in operator_page_operations):
+        return None, "restoration_required"
     pages: dict[str, _PageAuthority] = {}
     retained_ref_count = 0
     for raw_authority_value, summary in zip(raw_authorities, page_set.pages, strict=True):
@@ -6694,6 +6981,7 @@ def _validate_durable_browser_session_record(
             pages=pages,
             active_page_id=page_set.active_page_id,
             page_set=page_set,
+            operator_page_operations=operator_page_operations,
             allocation_authority=_LiveAllocationAuthority(
                 execution_profile_fingerprint=cast("str", copied["execution_profile_fingerprint"]),
                 environment_name=cast("str | None", copied["environment_name"]),

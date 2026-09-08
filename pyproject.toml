@@ -44,6 +44,7 @@ dev = [
   "testcontainers[postgres]>=4.0",
   "ty>=0.0.1a8",
   "uvicorn>=0.30",
+  "websockets>=17.0.1,<17.1",
 ]
 console = [
   "ipython>=9,<10",
@@ -84,6 +85,7 @@ vertex = [
 server = [
   "fastapi>=0.115,<0.137",
   "uvicorn>=0.30",
+  "websockets>=17.0.1,<17.1",
   "sse-starlette>=2.0",
 ]
 server-settings = [
@@ -91,6 +93,7 @@ server-settings = [
   "pydantic-settings>=2.7,<3",
   "sse-starlette>=2.0",
   "uvicorn>=0.30",
+  "websockets>=17.0.1,<17.1",
 ]
 all = [
   "boto3[crt]>=1.43.44,<2",
@@ -108,6 +111,7 @@ all = [
   "pypdf>=6.16.1",
   "pydantic-settings>=2.7,<3",
   "uvicorn>=0.30",
+  "websockets>=17.0.1,<17.1",
   "sse-starlette>=2.0",
 ]
 

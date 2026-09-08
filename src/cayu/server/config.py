@@ -38,6 +38,7 @@ from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
+from cayu.server._browser_control_config import BrowserControlServerConfig
 from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
 
 DEFAULT_SERVER_DEPLOYMENT_NAME = "development"
@@ -66,6 +67,7 @@ _EVALUATION_TARGET_KEY_RE = re.compile(r"[a-z][a-z0-9._-]{0,127}\Z", re.ASCII)
 
 __all__ = [
     "AuthenticatedAccess",
+    "BrowserControlServerConfig",
     "CorsConfig",
     "DashboardConfig",
     "DocsConfig",
@@ -544,6 +546,7 @@ class ServerConfig(BaseModel):
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     evaluation_promotion: EvaluationPromotionConfig | None = None
     evals: EvalsConfig | None = None
+    browser_control: BrowserControlServerConfig | None = None
     docs: DocsConfig = Field(default_factory=DocsConfig)
     cors: CorsConfig = Field(default_factory=CorsConfig)
     lifecycle: ServerLifecycleConfig = Field(default_factory=ServerLifecycleConfig)
@@ -580,6 +583,10 @@ class ServerConfig(BaseModel):
         return require_unicode_scalar_text(value, info.field_name)
 
     def _validate_mount_relationships(self) -> None:
+        if self.browser_control is not None and (
+            not self.api.enabled or not isinstance(self.access, AuthenticatedAccess)
+        ):
+            raise ValueError("browser_control requires authenticated API access.")
         if (
             self.api.enabled
             and self.dashboard.enabled
@@ -642,6 +649,7 @@ class ServerConfig(BaseModel):
         lifecycle: ServerLifecycleConfig | None = None,
         evaluation_promotion: EvaluationPromotionConfig | None = None,
         evals: EvalsConfig | None = None,
+        browser_control: BrowserControlServerConfig | None = None,
     ) -> ServerConfig:
         """Build a protected configuration around an application auth dependency."""
 
@@ -655,6 +663,7 @@ class ServerConfig(BaseModel):
             lifecycle=lifecycle or ServerLifecycleConfig(),
             evaluation_promotion=evaluation_promotion,
             evals=evals,
+            browser_control=browser_control,
         )
 
     def safe_summary(self) -> dict[str, Any]:
@@ -673,6 +682,7 @@ class ServerConfig(BaseModel):
             },
             "evaluation_promotion": {"configured": self.evaluation_promotion is not None},
             "evals": {"configured": self.evals is not None},
+            "browser_control": {"configured": self.browser_control is not None},
             "docs": {"enabled": self.docs.enabled},
             "cors": {
                 "allowed_origins": list(self.cors.allowed_origins),

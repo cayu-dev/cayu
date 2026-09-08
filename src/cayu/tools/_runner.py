@@ -854,7 +854,7 @@ class InvocationRunnerHandle:
 
 
 class _BrowserProfileInvocationRunnerHandle(InvocationRunnerHandle):
-    """Exact runtime-only handle for the built-in profile-aware browser tool."""
+    """Exact runtime-only private transport for built-in browser profile/control I/O."""
 
     __slots__ = ()
 
@@ -887,6 +887,8 @@ class _BrowserProfileInvocationRunnerHandle(InvocationRunnerHandle):
             return cast("_PrivateRunnerExecResult", await operation)
         finally:
             del operation
+
+    _exec_private_browser_control = _exec_private_browser_profile
 
 
 def _durable_runner_resource_identity(runner: Runner) -> str | None:
@@ -1736,6 +1738,7 @@ def invocation_runner_handle(
     execution_observer: RunnerExecutionObserver | None = None,
     publish_execution_arguments: bool = True,
     allow_private_browser_profile_io: bool = False,
+    allow_private_browser_control_io: bool = False,
 ) -> InvocationRunnerHandle | None:
     """Build the narrow runtime runner capability for one tool invocation."""
 
@@ -1745,7 +1748,7 @@ def invocation_runner_handle(
         raise TypeError("Registered environment runner must implement Runner.")
     handle_type = (
         _BrowserProfileInvocationRunnerHandle
-        if allow_private_browser_profile_io
+        if allow_private_browser_profile_io or allow_private_browser_control_io
         else InvocationRunnerHandle
     )
     return handle_type(

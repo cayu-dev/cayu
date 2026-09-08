@@ -89,6 +89,13 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
     ToolPolicyEvidence,
 )
+from cayu.runtime.browser_control import (
+    BrowserControlPolicy,
+    BrowserControlPolicyRequest,
+    BrowserControlPolicyResult,
+    BrowserOperatorPurpose,
+)
+from cayu.runtime.browser_control_config import BrowserControlConfig
 from cayu.runtime.budgets import (
     BudgetAction,
     BudgetCheck,
@@ -1252,6 +1259,11 @@ __all__ = [
     "BeforeToolCallHookContext",
     "BillingIdentity",
     "BillingIdentityState",
+    "BrowserControlConfig",
+    "BrowserControlPolicy",
+    "BrowserControlPolicyRequest",
+    "BrowserControlPolicyResult",
+    "BrowserOperatorPurpose",
     "BudgetAction",
     "BudgetCheck",
     "BudgetLedger",

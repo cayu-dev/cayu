@@ -70,6 +70,7 @@ try:
         DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
         DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
         AuthenticatedAccess,
+        BrowserControlServerConfig,
         CorsConfig,
         DashboardConfig,
         DocsConfig,
@@ -133,6 +134,7 @@ __all__ = [
     "AuthenticatedAccess",
     "AuthenticatedProductAccess",
     "BasicAuth",
+    "BrowserControlServerConfig",
     "CayuService",
     "CorsConfig",
     "DashboardConfig",
@@ -236,6 +238,18 @@ def create_server(
     resolved_config = config
     resolved_project_context = resolve_project_control_plane_context(project_context, app)
     api_auth = auth_dependency_for(resolved_config.access)
+    from cayu.server._browser_control_server import BrowserControlServer
+
+    browser_control_server = None
+    if resolved_config.browser_control is not None:
+        runtime = app._browser_control_runtime
+        if runtime is None or api_auth is None:
+            raise ValueError(
+                "Browser control requires application policy and authenticated access."
+            )
+        browser_control_server = BrowserControlServer(
+            runtime=runtime, config=resolved_config.browser_control, auth=api_auth
+        )
     dashboard_auth = auth_dependency_for(resolved_config.dashboard.access or resolved_config.access)
     lifecycle = resolved_config.lifecycle
     resolved_fastapi_options = _validate_fastapi_options(FastAPI, fastapi_options)
@@ -246,6 +260,15 @@ def create_server(
         )
     user_lifespan = resolved_fastapi_options.pop("lifespan", None)
     recovery_statuses = lifecycle.startup_recovery_statuses
+
+    async def drain_server_work() -> None:
+        try:
+            if browser_control_server is not None and not await browser_control_server.drain():
+                raise RuntimeError("Browser control shutdown remains unsettled.")
+        finally:
+            # A retained browser owner must not prevent the existing recovery
+            # and allocation cleanup owners from making shutdown progress.
+            await _drain_server_owned_work(app, lifecycle=lifecycle)
 
     async def recover_startup_state() -> RecoveryPlanRequest | None:
         await _recover_persisted_event_side_effects_during_startup(
@@ -296,7 +319,7 @@ def create_server(
                         )
                         await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                     finally:
-                        await _drain_server_owned_work(app, lifecycle=lifecycle)
+                        await drain_server_work()
                 finally:
                     await _close_project_control_plane_context(resolved_project_context)
             return
@@ -318,7 +341,7 @@ def create_server(
                         )
                         await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                     finally:
-                        await _drain_server_owned_work(app, lifecycle=lifecycle)
+                        await drain_server_work()
                 finally:
                     await _close_project_control_plane_context(resolved_project_context)
 
@@ -399,6 +422,8 @@ def create_server(
             _project_context=resolved_project_context,
         )
         server.include_router(router)
+        if browser_control_server is not None:
+            server.include_router(browser_control_server.router, prefix=control_plane_path)
 
     if resolved_config.dashboard.enabled:
         dashboard_mounted = mount_dashboard(

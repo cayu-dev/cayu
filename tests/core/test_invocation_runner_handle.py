@@ -928,7 +928,8 @@ def test_runtime_denies_private_browser_profile_dispatch_to_other_tools() -> Non
     assert private_material not in repr(events)
 
 
-def test_private_browser_profile_dispatch_quarantines_argument_evidence() -> None:
+@pytest.mark.parametrize("control", [False, True])
+def test_private_browser_profile_dispatch_quarantines_argument_evidence(control) -> None:
     private_material = "private-browser-profile-material"
     observations: list[tuple[str, dict[str, Any]]] = []
 
@@ -954,10 +955,13 @@ def test_private_browser_profile_dispatch_quarantines_argument_evidence() -> Non
             ),
             execution_observer=observe,
             publish_execution_arguments=True,
-            allow_private_browser_profile_io=True,
+            allow_private_browser_profile_io=not control,
+            allow_private_browser_control_io=control,
         )
         assert handle is not None
-        private_exec = handle._exec_private_browser_profile
+        private_exec = getattr(
+            handle, "_exec_private_browser_control" if control else "_exec_private_browser_profile"
+        )
         result = await private_exec(
             ExecCommand.process("echo", private_material),
             stdin=private_material,

@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -74,6 +74,7 @@ from cayu.core.tools import (
     _bind_runtime_tool_invocation_authority,
     _bound_policy_denial_result,
     _bound_policy_denial_text,
+    _RuntimeBrowserAllocationAuthority,
 )
 from cayu.environments import BoundWorkspace
 from cayu.environments.bindings import _runtime_owned_workspace_observer_name
@@ -101,6 +102,17 @@ from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._assistant_tool_round_publication import (
     validate_tool_exposure_terminal_event,
 )
+from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
+from cayu.runtime._browser_control_checkpoint import (
+    browser_control_checkpoint_mutation_scope,
+    browser_control_checkpoint_read_scope,
+)
+from cayu.runtime._browser_control_model import (
+    browser_model_control_admission,
+    browser_terminal_checkpoint_mutation,
+    validate_browser_model_publication,
+)
+from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.runtime._checkpoint_redaction import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
@@ -1315,6 +1327,7 @@ class ToolRoundExecutor:
         checkpoint_transform: CheckpointTransformFactory,
         apply_limit_evaluation: LimitEventStream,
         close_interrupted_round: InterruptedRoundEventStream,
+        browser_control_service: BrowserControlService | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -1331,6 +1344,7 @@ class ToolRoundExecutor:
         self._checkpoint_transform = checkpoint_transform
         self._apply_limit_evaluation = apply_limit_evaluation
         self._close_interrupted_round = close_interrupted_round
+        self._browser_control_service = browser_control_service
         self._workspace_capture_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS
         )
@@ -4236,7 +4250,7 @@ class ToolRoundExecutor:
             workspace_receipt_artifact_store,
             workspace_receipt_artifact_unavailable_detail,
         ) = _workspace_receipt_artifact_store(registered_environment)
-        from cayu.tools.browser_session import BrowserSessionTool
+        from cayu.tools.browser_session import BrowserSessionTool, _RunnerBrowserSessionBackend
 
         allow_private_browser_profile_io = (
             type(registered_tool.tool) is BrowserSessionTool
@@ -4272,6 +4286,12 @@ class ToolRoundExecutor:
                 execution_observer=observe_runner_execution,
                 publish_execution_arguments=registered_tool.publish_arguments,
                 allow_private_browser_profile_io=allow_private_browser_profile_io,
+                allow_private_browser_control_io=(
+                    type(registered_tool.tool) is BrowserSessionTool
+                    and invocation_context is not None
+                    and registered_environment is not None
+                    and registered_environment.live_allocation_fingerprint is not None
+                ),
             ),
             invocation_secret_redactor=redactor_provider,
             invocation_secret_snapshot_provider=invocation_secret_scope.snapshot,
@@ -4372,6 +4392,21 @@ class ToolRoundExecutor:
                 }
                 if storage_key in secondary_copy:
                     raise ValueError("A durable tool operation cannot duplicate its primary key.")
+                control_mutation = None
+                if type(
+                    registered_tool.tool
+                ) is BrowserSessionTool and effective_tool_call.arguments.get("operation") in {
+                    "observe",
+                    "close",
+                }:
+                    with browser_control_checkpoint_read_scope(session.id):
+                        control_checkpoint = await self._session_store.load_checkpoint(session.id)
+                    control_mutation = browser_terminal_checkpoint_mutation(
+                        control_checkpoint,
+                        session_id=session.id,
+                        operation_records={storage_key: desired_copy, **secondary_copy},
+                        operation_name=effective_tool_call.arguments.get("operation"),
+                    )
 
                 def publish(
                     current_session: Session,
@@ -4390,21 +4425,41 @@ class ToolRoundExecutor:
                             "Durable tool operation changed before publication."
                         )
                     records = {storage_key: desired_copy, **secondary_copy}
+                    if type(registered_tool.tool) is BrowserSessionTool:
+                        validate_browser_model_publication(
+                            checkpoint,
+                            session=current_session,
+                            operation_records=records,
+                            operation_name=effective_tool_call.arguments.get("operation"),
+                        )
+                    published_checkpoint = {} if checkpoint is None else dict(checkpoint)
+                    if control_mutation is not None:
+                        from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+
+                        published_checkpoint[BROWSER_CONTROLS_CHECKPOINT_KEY] = (
+                            control_mutation.desired.model_dump(mode="json")
+                        )
                     return SessionOperationPublication(
-                        checkpoint={} if checkpoint is None else checkpoint,
+                        checkpoint=published_checkpoint,
                         operation_records=records,
                     )
 
-                publication = asyncio.create_task(
-                    self._session_store.publish_session_operation(
-                        session.id,
-                        idempotency_key=storage_key,
-                        operation_transform=publish,
-                        events=[],
-                        expected_statuses={SessionStatus.RUNNING},
-                        expected_run_epoch=session.run_epoch,
+                with (
+                    browser_control_checkpoint_read_scope(session.id),
+                    browser_control_checkpoint_mutation_scope(control_mutation)
+                    if control_mutation is not None
+                    else nullcontext(),
+                ):
+                    publication = asyncio.create_task(
+                        self._session_store.publish_session_operation(
+                            session.id,
+                            idempotency_key=storage_key,
+                            operation_transform=publish,
+                            events=[],
+                            expected_statuses={SessionStatus.RUNNING},
+                            expected_run_epoch=session.run_epoch,
+                        )
                     )
-                )
                 outcome = await await_shielded_task_outcome(publication)
                 publication_error = outcome.error
                 if publication_error is not None:
@@ -4466,6 +4521,45 @@ class ToolRoundExecutor:
                     raise TypeError("Durable tool output must remain an object after redaction.")
                 return redacted
 
+            bootstrap_browser_control = None
+            browser_control_admission = None
+            if (
+                self._browser_control_service is not None
+                and type(registered_tool.tool) is BrowserSessionTool
+                and invocation_context is not None
+                and environment_name is not None
+                and registered_environment is not None
+                and registered_environment.live_allocation_fingerprint is not None
+            ):
+                browser_service = self._browser_control_service
+                browser_backend = registered_tool.tool._backend
+                browser_arguments = copy_durable_json_object(
+                    effective_tool_call.arguments, "browser_control.arguments"
+                )
+
+                async def bootstrap_browser_control(browser_session_id: str) -> None:
+                    if type(browser_backend) is not _RunnerBrowserSessionBackend:
+                        raise RuntimeError("Browser control requires the built-in runner backend.")
+                    await browser_service.bootstrap(
+                        tool_context,
+                        backend=browser_backend,
+                        browser_session_id=browser_session_id,
+                        arguments=browser_arguments,
+                    )
+
+                async def browser_control_admission(browser_session_id: str, operation_name: str):
+                    allocation = BrowserGuestBootstrap.allocation_for_invocation(
+                        tool_context,
+                        purpose=browser_service.purpose,
+                        browser_session_id=browser_session_id,
+                        arguments=browser_arguments,
+                    )
+                    with browser_control_checkpoint_read_scope(session.id):
+                        checkpoint = await self._session_store.load_checkpoint(session.id)
+                    return browser_model_control_admission(
+                        checkpoint, allocation=allocation, operation_name=operation_name
+                    )
+
             _bind_runtime_tool_invocation_authority(
                 tool_context,
                 parent_task_id=task_id,
@@ -4495,6 +4589,30 @@ class ToolRoundExecutor:
                 compare_and_set_durable_operation=(compare_and_set_durable_operation),
                 seal_durable_output=seal_durable_output,
                 secret_publication_sealer=invocation_secret_scope.seal_for_publication,
+                bootstrap_browser_control=bootstrap_browser_control,
+                browser_control_admission=browser_control_admission,
+                browser_allocation=(
+                    _RuntimeBrowserAllocationAuthority(
+                        session_id=session.id,
+                        session_instance_id=session.instance_id,
+                        run_epoch=session.run_epoch,
+                        interaction_id=invocation_context.active_profile.interaction_id,
+                        execution_profile_fingerprint=execution_profile.fingerprint,
+                        environment_name=environment_name,
+                        allocation_fingerprint=registered_environment.live_allocation_fingerprint,
+                        profile_checkpoint_policy=(
+                            "unavailable"
+                            if registered_tool.tool.browser_profile is None
+                            else registered_tool.tool.browser_profile.checkpoint_policy.value
+                        ),
+                    )
+                    if type(registered_tool.tool) is BrowserSessionTool
+                    and invocation_context is not None
+                    and environment_name is not None
+                    and registered_environment is not None
+                    and registered_environment.live_allocation_fingerprint is not None
+                    else None
+                ),
             )
         workspace_window_id: str | None = None
         workspace_attribution_window: WorkspaceMutationWindow | None = None

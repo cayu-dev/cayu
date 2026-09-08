@@ -31274,6 +31274,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         idempotency_key = _reject_reserved_runtime_publication_key(
             idempotency_key,
             "idempotency_key",
+            browser_control_read=True,
         )
         await self._ensure_ready()
         checkpoint_root_key = (

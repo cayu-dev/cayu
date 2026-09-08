@@ -981,6 +981,10 @@ class BrowserProfileUnavailable(RuntimeError):
     """The profile cannot be safely restored or checkpointed."""
 
 
+class BrowserProfileCheckpointConsentDenied(BrowserProfileUnavailable):
+    """New profile capture lacks operator consent; existing settlement remains owned."""
+
+
 class _ValidatedStoreMutationResult:
     """Private proof that the store ran the exact validated mutation callback."""
 

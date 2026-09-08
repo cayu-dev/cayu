@@ -94,6 +94,7 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._browser_control_runtime import BrowserControlRuntime
 from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
     runtime_checkpoint_session_store,
@@ -238,6 +239,7 @@ from cayu.runtime.approvals import (
     copy_tool_approval_recovery_request,
     copy_tool_approval_request,
 )
+from cayu.runtime.browser_control_config import BrowserControlConfig
 from cayu.runtime.budgets import (
     BudgetLedger,
     BudgetLimit,
@@ -783,6 +785,7 @@ class CayuApp:
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
         completion_verifier_profile_policy: CompletionVerifierProfilePolicy | None = None,
+        browser_control: BrowserControlConfig | None = None,
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
         context_counting: ContextCountingConfig | None = None,
         request_footprint: RequestFootprintConfig | None = None,
@@ -794,6 +797,14 @@ class CayuApp:
     ) -> None:
         # Resolve once at application startup. Strict deployments fail here,
         # before any session or provider authority can be admitted.
+        if browser_control is not None:
+            if type(browser_control) is not BrowserControlConfig:
+                raise TypeError("browser_control must be BrowserControlConfig.")
+            browser_control = BrowserControlConfig(
+                policy=browser_control.policy,
+                guest_endpoint=browser_control.guest_endpoint,
+                purpose=browser_control.purpose,
+            )
         current_runtime_build_provenance()
         resolved_config, config_sources = _resolve_cayu_app_config(config)
         self._config = resolved_config
@@ -998,6 +1009,16 @@ class CayuApp:
             event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
         )
         self._secret_redactor = resolved_secret_redactor
+        self._browser_control_runtime = (
+            None
+            if browser_control is None
+            else BrowserControlRuntime(
+                config=browser_control,
+                store=self._runtime_session_store,
+                redactor=self._secret_redactor,
+                clock=self._clock,
+            )
+        )
         self._completion_verifier_coordinator = CompletionVerifierCoordinator(
             task_store=self.task_store,
             secret_redactor=self._secret_redactor,
@@ -1099,6 +1120,11 @@ class CayuApp:
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             apply_limit_evaluation=self._apply_tool_round_limit,
             close_interrupted_round=self._close_tool_round_after_interrupt,
+            browser_control_service=(
+                self._browser_control_runtime.service
+                if self._browser_control_runtime is not None
+                else None
+            ),
         )
         self._recovery_coordinator = RecoveryCoordinator(
             session_store=self._runtime_session_store,

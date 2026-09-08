@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from weakref import ReferenceType, ref
 
 from pydantic import (
@@ -592,6 +592,30 @@ class DurableToolRecoveryAuthority:
 
 
 @dataclass(frozen=True, slots=True)
+class _RuntimeBrowserAllocationAuthority:
+    """Exact built-in browser allocation captured by the invocation owner."""
+
+    session_id: str
+    session_instance_id: str
+    run_epoch: int
+    interaction_id: str
+    execution_profile_fingerprint: str
+    environment_name: str
+    allocation_fingerprint: str
+    profile_checkpoint_policy: Literal[
+        "unavailable", "disabled", "on_close", "after_terminal_operation"
+    ] = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeBrowserControlAdmission:
+    """One runtime-owned control read; epoch and accounting cannot come from separate reads."""
+
+    control_epoch: int
+    operator_page_operations: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class _RuntimeToolInvocationAuthority:
     parent_task_id: str | None
     parent_run_epoch: int
@@ -613,6 +637,11 @@ class _RuntimeToolInvocationAuthority:
     ]
     seal_durable_output: Callable[[dict[str, Any]], dict[str, Any]]
     secret_publication_sealer: Callable[[], Any]
+    browser_allocation: _RuntimeBrowserAllocationAuthority | None = None
+    bootstrap_browser_control: Callable[[str], Awaitable[None]] | None = None
+    browser_control_admission: (
+        Callable[[str, str], Awaitable[_RuntimeBrowserControlAdmission | None]] | None
+    ) = None
 
 
 _RUNTIME_TOOL_INVOCATION_AUTHORITIES: dict[
@@ -654,11 +683,25 @@ def _bind_runtime_tool_invocation_authority(
     ],
     seal_durable_output: Callable[[dict[str, Any]], dict[str, Any]],
     secret_publication_sealer: Callable[[], Any],
+    browser_allocation: _RuntimeBrowserAllocationAuthority | None = None,
+    bootstrap_browser_control: Callable[[str], Awaitable[None]] | None = None,
+    browser_control_admission: Callable[
+        [str, str], Awaitable[_RuntimeBrowserControlAdmission | None]
+    ]
+    | None = None,
 ) -> None:
     """Bind runtime-only durable tool provenance after hooks finish."""
 
     if type(context) is not ToolContext:
         raise TypeError("Runtime tool invocation authority requires a ToolContext.")
+    if bootstrap_browser_control is not None and (
+        not callable(bootstrap_browser_control) or browser_allocation is None
+    ):
+        raise TypeError("Browser control bootstrap requires runtime allocation authority.")
+    if browser_control_admission is not None and (
+        not callable(browser_control_admission) or browser_allocation is None
+    ):
+        raise TypeError("Browser control epoch requires runtime allocation authority.")
     if not callable(secret_publication_sealer):
         raise TypeError("Runtime secret publication sealer must be callable.")
     if not callable(load_durable_operation):
@@ -703,6 +746,9 @@ def _bind_runtime_tool_invocation_authority(
         compare_and_set_durable_operation=compare_and_set_durable_operation,
         seal_durable_output=seal_durable_output,
         secret_publication_sealer=secret_publication_sealer,
+        browser_allocation=browser_allocation,
+        bootstrap_browser_control=bootstrap_browser_control,
+        browser_control_admission=browser_control_admission,
     )
 
     def discard(expired: ReferenceType[Any]) -> None:

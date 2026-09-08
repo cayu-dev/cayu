@@ -148,6 +148,10 @@ from cayu.memory_evidence import (
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
+from cayu.runtime._browser_control_checkpoint import (
+    browser_control_checkpoint_visible,
+    project_browser_control_checkpoint,
+)
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_ADMISSION_OCCURRENCE_TYPE,
     CHILD_SESSION_NOTIFICATION_OPERATION_KEY_PREFIX,
@@ -238,6 +242,7 @@ from cayu.runtime.build_provenance import (
     runtime_build_provenance_identity,
 )
 from cayu.runtime.checkpoints import (
+    BROWSER_CONTROLS_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -4773,6 +4778,7 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
                 INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
                 SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
                 WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
+                BROWSER_CONTROLS_CHECKPOINT_KEY,
             )
         )
     ):
@@ -4784,6 +4790,16 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
         # Schema normalization belongs to the runtime wrapper unless private
         # runtime authority is already attached to this checkpoint.
         updated = copy_durable_json_object(replacement, "checkpoint")
+    # Operator identities and takeover state are not generic checkpoint data.
+    # Ordinary replacement may neither introduce nor erase this private root.
+    # Lifecycle authority alone is not browser-control mutation authority.
+    browser_controls = project_browser_control_checkpoint(
+        authoritative_current, updated, session_id=session_id
+    )
+    updated.pop(BROWSER_CONTROLS_CHECKPOINT_KEY, None)
+    if browser_controls is not None:
+        updated[BROWSER_CONTROLS_CHECKPOINT_KEY] = browser_controls
+        updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
     if preserve_completion_result_publications:
         updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
         if (
@@ -4855,6 +4871,8 @@ def _copy_checkpoint_for_transform(
         copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
         copied.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
         copied.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
+    if not browser_control_checkpoint_visible(session_id=session_id):
+        copied.pop(BROWSER_CONTROLS_CHECKPOINT_KEY, None)
     return copied
 
 
@@ -6355,6 +6373,7 @@ class SessionOperationPublication(BaseModel):
         value: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
         copied = copy_durable_json_object(value, "operation_records")
+        _validate_session_operation_record_keys(copied)
         for key, record in copied.items():
             _reject_reserved_runtime_publication_key(key, "operation_records key")
             if type(record) is not dict:
@@ -17148,6 +17167,7 @@ class InMemorySessionStore(SessionStore):
         idempotency_key = _reject_reserved_runtime_publication_key(
             idempotency_key,
             "idempotency_key",
+            browser_control_read=True,
         )
         async with self._lock:
             if session_id not in self._sessions:
@@ -23197,8 +23217,14 @@ def validate_profiled_fork_evidence(
         raise ValueError("Fork event payload conflicts with its profile relationship.")
 
 
-def _reject_reserved_runtime_publication_key(value: str, field_name: str) -> str:
+def _reject_reserved_runtime_publication_key(
+    value: str, field_name: str, *, browser_control_read: bool = False
+) -> str:
+    from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
+
     value = require_clean_nonblank(value, field_name)
+    if not browser_control_read:
+        require_browser_control_operation_owner(value)
     if value == ZERO_WORK_INTERRUPTION_OPERATION_KEY:
         raise ValueError(f"{field_name} cannot use the reserved zero-work interruption key.")
     if value.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
@@ -23755,8 +23781,11 @@ def _validate_invocation_release_settlement_receipt_authority(
 
 
 def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
+    from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
+
     for key in records:
         _reject_reserved_runtime_publication_key(key, "operation_records key")
+        require_browser_control_operation_owner(key, records[key])
 
 
 def _prepare_initial_session_operation_records(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -13,6 +14,7 @@ from functools import partial
 from hashlib import sha256
 
 from cayu._exception_groups import add_exception_note_safely
+from cayu._task_wait import await_shielded_task_outcome
 from cayu.credentials import CredentialMode
 from cayu.egress._remote_adapter import run_enforcement_preflight
 from cayu.egress.adapter import (
@@ -72,6 +74,12 @@ DockerExec = Callable[[Sequence[str]], Awaitable[tuple[int, str]]]
 DockerRun = Callable[[Sequence[str]], Awaitable[tuple[int, str]]]
 
 
+@dataclass
+class _PreparationCleanup:
+    teardown: Callable[[], Awaitable[None]]
+    task: asyncio.Task[None] | None = None
+
+
 @dataclass(frozen=True)
 class _SidecarTransportAuthorization:
     directory: str
@@ -83,11 +91,15 @@ class _SidecarTransportAuthorization:
         shutil.rmtree(self.directory, ignore_errors=True)
 
 
-def _create_sidecar_transport_authorization() -> _SidecarTransportAuthorization:
+def _create_sidecar_transport_authorization(
+    *,
+    colocated_control_server: bool = False,
+) -> _SidecarTransportAuthorization:
     directory = tempfile.mkdtemp(prefix="cayu-egress-sidecar-")
     auth_path = os.path.join(directory, "broker.auth")
     connector_path = os.path.join(directory, "connect-broker")
     token = secrets.token_urlsafe(32).encode("ascii")
+    broker_host = b"cayu-control" if colocated_control_server else b"host.docker.internal"
     try:
         _write_private(auth_path, b"cayu:" + token, mode=0o600)
         _write_private(
@@ -110,7 +122,7 @@ def _create_sidecar_transport_authorization() -> _SidecarTransportAuthorization:
             b"  done\n"
             b'  [ -n "$bind_ip" ] || exit 70\n'
             b'  exec socat "TCP-LISTEN:8080,bind=${bind_ip},fork,reuseaddr" '
-            b'"PROXY:host.docker.internal:cayu-transport.invalid:443,'
+            b'"PROXY:' + broker_host + b":cayu-transport.invalid:443,"
             b'proxyport=${CAYU_BROKER_PORT},proxyauthfile=/run/cayu/broker.auth"\n'
             b"fi\n"
             b"exit 64\n",
@@ -291,7 +303,20 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         proxy_bind_host_resolver: Callable[[], Awaitable[str]] | None = None,
         seccomp_profile: str | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
+        control_server_container_id: str | None = None,
     ) -> None:
+        if control_server_container_id is not None and (
+            type(control_server_container_id) is not str
+            or len(control_server_container_id) != 64
+            or any(char not in "0123456789abcdef" for char in control_server_container_id)
+        ):
+            raise ValueError("Control server requires an exact full Docker container ID.")
+        if control_server_container_id is not None and proxy_host not in (None, "0.0.0.0"):
+            raise ValueError(
+                "A colocated control server requires a container-reachable broker listener."
+            )
+        self._control_server_container_id = control_server_container_id
+        self._preparation_cleanups: dict[str, _PreparationCleanup] = {}
         self._docker_cli_env_allowlist = normalize_docker_cli_env_allowlist(
             docker_cli_env_allowlist
         )
@@ -310,13 +335,56 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         # (loopback on Docker Desktop, bridge gateway on Linux). An explicit value
         # is used verbatim. The broker still requires a valid unguessable virtual
         # credential + destination/policy, so the listener is not usable on its own.
-        self._proxy_host = proxy_host
+        self._proxy_host = "0.0.0.0" if control_server_container_id is not None else proxy_host
         self._proxy_bind_host_resolver = proxy_bind_host_resolver or partial(
             resolve_proxy_bind_host,
             run=partial(
                 _run_docker_stdout,
                 docker_cli_env_allowlist=self._docker_cli_env_allowlist,
             ),
+        )
+
+    async def drain_preparation_cleanup(self) -> None:
+        """Retry failed preparation rollback, or join cleanup still in flight.
+
+        Keep this adapter alive until the drain succeeds. A failed or timed-out
+        drain retains its exact resource owner and can be called again.
+        """
+        for network, cleanup in tuple(self._preparation_cleanups.items()):
+            if await self._settle_preparation_cleanup(network, cleanup):
+                raise asyncio.CancelledError()
+
+    async def _settle_preparation_cleanup(self, network: str, cleanup: _PreparationCleanup) -> bool:
+        if self._preparation_cleanups.get(network) is not cleanup:
+            return False
+        if (
+            cleanup.task is not None
+            and cleanup.task.done()
+            and not cleanup.task.cancelled()
+            and cleanup.task.exception() is None
+        ):
+            del self._preparation_cleanups[network]
+            return False
+        if cleanup.task is None or cleanup.task.done():
+
+            async def teardown() -> None:
+                await cleanup.teardown()
+
+            cleanup.task = asyncio.create_task(teardown())
+
+            def retire(task: asyncio.Task[None]) -> None:
+                # Observe failures, but retain the callable for a later retry.
+                # Successful late completion needs no further operator sweep.
+                if task.cancelled() or task.exception() is not None:
+                    return
+                if cleanup.task is task and self._preparation_cleanups.get(network) is cleanup:
+                    del self._preparation_cleanups[network]
+
+            cleanup.task.add_done_callback(retire)
+        return await _await_bounded_cleanup_task(
+            cleanup.task,
+            timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+            timeout_message="Docker egress prepare rollback timed out.",
         )
 
     async def prepare(
@@ -342,6 +410,12 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         owns_certificate_authority: bool = True,
     ) -> EgressBinding:
         validate_grant_scope(session_id=session_id, grants=grants)
+        await self.drain_preparation_cleanup()
+        control_server_container_id = self._control_server_container_id
+        if control_server_container_id is not None and (
+            await self._container_id(control_server_container_id) != control_server_container_id
+        ):
+            raise UnsupportedEgressError("The exact control server container is unavailable.")
         loop = self._loop or asyncio.get_running_loop()
         bind_host = (
             self._proxy_host
@@ -355,7 +429,11 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         network = f"cayu-egress-net-{token}"
         sidecar = f"cayu-egress-{token}"
         label = f"{_SESSION_LABEL}={session_id}"
-        transport_authorization = _create_sidecar_transport_authorization()
+        transport_authorization = (
+            _create_sidecar_transport_authorization(colocated_control_server=True)
+            if control_server_container_id is not None
+            else _create_sidecar_transport_authorization()
+        )
         try:
             if certificate_authority is not None or not owns_certificate_authority:
                 server = TransparentEgressProxyServer(
@@ -380,6 +458,32 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         try:
             proxy_port = await server.start()
             await self._run(["network", "create", "--internal", "--label", label, network])
+            if control_server_container_id is not None:
+                attachment = asyncio.create_task(
+                    self._run(
+                        [
+                            "network",
+                            "connect",
+                            "--alias",
+                            "cayu-control",
+                            network,
+                            control_server_container_id,
+                        ]
+                    )
+                )
+                # Cancelling a Docker CLI waiter cannot prove that the daemon
+                # aborted network attachment. Join its exact outcome before
+                # allowing rollback to disconnect/remove the private network.
+                outcome = await await_shielded_task_outcome(attachment)
+                if outcome.error is not None:
+                    if outcome.cancellation is not None:
+                        raise BaseExceptionGroup(
+                            "Control server attachment failed during cancellation.",
+                            [outcome.cancellation, outcome.error],
+                        )
+                    raise outcome.error
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
             # Sidecar starts on the default bridge (with host-gateway) so it can
             # reach the host broker, then also joins the internal container network.
             await self._run(
@@ -414,22 +518,23 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             await self._run(["exec", sidecar, "sh", "-c", _SIDECAR_READY_SCRIPT])
         except BaseException as original:
             _consume_accounted_task_cancellation(original)
-            cleanup_task = asyncio.create_task(
-                self._teardown(
+            cleanup = _PreparationCleanup(
+                partial(
+                    self._teardown,
                     server,
                     network,
                     sidecar,
                     broker,
                     grants,
                     transport_authorization,
+                    control_server_container_id=control_server_container_id,
                 )
             )
+            # Publish the retry owner before starting rollback. The factory
+            # cannot own these resources because prepare never returned them.
+            self._preparation_cleanups[network] = cleanup
             try:
-                rollback_cancelled = await _await_bounded_cleanup_task(
-                    cleanup_task,
-                    timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
-                    timeout_message="Docker egress prepare rollback timed out.",
-                )
+                rollback_cancelled = await self._settle_preparation_cleanup(network, cleanup)
             except BaseException as cleanup_error:
                 add_exception_note_safely(
                     original,
@@ -466,6 +571,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 broker,
                 grants,
                 transport_authorization,
+                control_server_container_id=control_server_container_id,
             )
 
         return EgressBinding(
@@ -860,12 +966,19 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         broker: TransparentEgressBroker,
         grants: Sequence[VirtualCredentialGrant],
         transport_authorization: _SidecarTransportAuthorization,
+        *,
+        control_server_container_id: str | None = None,
     ) -> None:
         # Revoke before releasing any resource that enforced the grant boundary.
         # EgressBinding.close keeps failures retryable and never marks an
         # incomplete teardown closed.
         await broker.revoke_authority_and_wait(tuple(grant.presented_value for grant in grants))
         errors: list[str] = []
+        if control_server_container_id is not None:
+            try:
+                await self._disconnect_control_server(network, control_server_container_id)
+            except Exception as exc:
+                errors.append(f"control server detach: {type(exc).__name__}")
         for argv in (["rm", "-f", sidecar], ["network", "rm", network]):
             try:
                 exit_code, stderr = await self._docker_exec(argv)
@@ -883,6 +996,45 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             errors.append(f"sidecar transport authorization: {type(exc).__name__}")
         if errors:
             raise RuntimeError(f"Docker egress teardown incomplete: {'; '.join(errors)}")
+
+    async def _disconnect_control_server(self, network: str, container_id: str) -> None:
+        code, _ = await self._docker_exec(
+            ["network", "disconnect", "--force", network, container_id]
+        )
+        if code == 0:
+            return
+        # A failed attach or a lost detach acknowledgement may already have
+        # converged. Only positive network readback proves that condition.
+        code, output = await self._docker_run(
+            ["network", "inspect", "--format", "{{json .Containers}}", network]
+        )
+        if code == 0:
+            try:
+                containers = json.loads(output)
+            except (ValueError, TypeError):
+                containers = None
+            if type(containers) is dict and container_id not in containers:
+                return
+        # A previous close may have removed the whole network. Inspecting the
+        # container's networks also proves absence without trusting error prose.
+        code, output = await self._docker_run(
+            [
+                "inspect",
+                "--type",
+                "container",
+                "--format",
+                "{{json .NetworkSettings.Networks}}",
+                container_id,
+            ]
+        )
+        if code == 0:
+            try:
+                networks = json.loads(output)
+            except (ValueError, TypeError):
+                networks = None
+            if type(networks) is dict and network not in networks:
+                return
+        raise UnsupportedEgressError("Control server network detachment is unconfirmed.")
 
 
 def _docker_resource_is_absent(stderr: str) -> bool:

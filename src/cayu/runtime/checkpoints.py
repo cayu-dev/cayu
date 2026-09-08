@@ -27,7 +27,8 @@ COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY = "completion_result_event_p
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY = "runtime_authored_user_message"
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION = 1
 AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY = "ambiguous_pending_user_input"
-CURRENT_CHECKPOINT_SCHEMA_VERSION = 8
+BROWSER_CONTROLS_CHECKPOINT_KEY = "browser_controls"
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 9
 MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
 _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
@@ -381,9 +382,21 @@ def _migrate_checkpoint_v7_to_v8(checkpoint: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_checkpoint_v8_to_v9(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Never promote application-owned JSON into browser control authority."""
+
+    migrated = copy_durable_json_object(checkpoint, "checkpoint")
+    migrated.pop(BROWSER_CONTROLS_CHECKPOINT_KEY, None)
+    migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 9
+    return migrated
+
+
 _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
     current_version=CURRENT_CHECKPOINT_SCHEMA_VERSION,
     migrations=(
+        CheckpointMigration(
+            source_version=8, target_version=9, migrate=_migrate_checkpoint_v8_to_v9
+        ),
         CheckpointMigration(
             source_version=7, target_version=8, migrate=_migrate_checkpoint_v7_to_v8
         ),
@@ -509,10 +522,15 @@ def runtime_checkpoint_writer_view(
     )
     if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
         return copy_durable_json_object(current, "checkpoint")
-    if writer_version not in {1, 2, 3, 4, 5, 6, 7}:
+    if writer_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
     projected = copy_durable_json_object(current, "checkpoint")
+    if BROWSER_CONTROLS_CHECKPOINT_KEY in projected:
+        raise ValueError("Browser control authority cannot be represented by an older writer.")
+    if writer_version == 8:
+        projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 8
+        return projected
     if "workspace_checkpoints" in projected:
         raise ValueError("Workspace checkpoint authority cannot be represented by an older writer.")
     if writer_version == 7:

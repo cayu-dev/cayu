@@ -8184,6 +8184,7 @@ class SQLiteSessionStore(SessionStore):
         idempotency_key = _reject_reserved_runtime_publication_key(
             idempotency_key,
             "idempotency_key",
+            browser_control_read=True,
         )
 
         checkpoint_root_key = (
