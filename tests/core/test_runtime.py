@@ -56708,6 +56708,7 @@ def test_cayu_app_validates_provider_stream_events_at_runtime_boundary(
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
@@ -56747,6 +56748,7 @@ def test_cayu_app_validates_provider_stream_event_payload_container():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
@@ -56788,6 +56790,7 @@ def test_cayu_app_rejects_provider_stream_event_subclasses_before_attribute_acce
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]

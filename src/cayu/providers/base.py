@@ -1609,7 +1609,7 @@ def _normalized_provider_progress_kind(
 def _accepted_terminal_stream_event(event: object) -> bool:
     """Recognize the sole bundled result trusted after read cancellation."""
 
-    return isinstance(event, ModelStreamEvent) and event.type is ModelStreamEventType.COMPLETED
+    return type(event) is ModelStreamEvent and event.type is ModelStreamEventType.COMPLETED
 
 
 async def _guard_normalized_provider_stream(
@@ -1670,6 +1670,19 @@ async def _guard_normalized_provider_stream(
                         return
                     finally:
                         reset_provider_deadline_controller(token)
+                    # The deadline guard sees opaque adapter values before the
+                    # runtime's accounting-aware payload projection. Validate
+                    # the envelope before reading any provider-controlled hook.
+                    if type(event) is not ModelStreamEvent:
+                        raise TypeError("Model providers must yield ModelStreamEvent instances.")
+                    if type(event.type) is not ModelStreamEventType:
+                        raise ValueError(
+                            "Model provider stream event type must be a ModelStreamEventType."
+                        )
+                    if type(event.delta) is not str:
+                        raise ValueError("Model provider stream event delta must be a string.")
+                    if type(event.payload) is not dict:
+                        raise ValueError("Model provider stream event payload must be an object.")
                     if event.type is ModelStreamEventType.TEXT_DELTA:
                         controller.observe_text(event.delta)
                     progress = _normalized_provider_progress_kind(event)
