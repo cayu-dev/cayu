@@ -604,7 +604,7 @@ async def aclosing_provider_stream(
     cleanup_unsettled = False
     cleanup_task_tracked = False
     cleanup_action = "stream_close_lookup"
-    closing = False
+    closing: GeneratorExit | None = None
     task = asyncio.current_task()
     if cancellation_baseline is None:
         cancellation_baseline = task.cancelling() if task is not None else 0
@@ -619,8 +619,8 @@ async def aclosing_provider_stream(
     try:
         try:
             yield source
-        except GeneratorExit:
-            closing = True
+        except GeneratorExit as exc:
+            closing = exc
         except BaseException as exc:
             operation_failure = exc
     finally:
@@ -807,8 +807,8 @@ async def aclosing_provider_stream(
         cleanup_failure = None
         task = None
         _raise_detached_provider_stream_cleanup_error(terminal_failure)
-    if closing:
-        return
+    if closing is not None:
+        raise closing
 
 
 def _detached_provider_failure(failure: BaseException) -> BaseException:
@@ -897,7 +897,7 @@ def detach_provider_stream_traceback(
         failure: BaseException | None = None
         cleanup_failure: BaseException | None = None
         completed = False
-        closing = False
+        closing: GeneratorExit | None = None
         source: AsyncIterator[_T] | None = None
         cleanup_cancellation_baseline = 0
         try:
@@ -907,7 +907,9 @@ def detach_provider_stream_traceback(
                     yield item
                 completed = True
             except GeneratorExit:
-                closing = True
+                # Keep abandonment observable without retaining an opaque
+                # provider's message, receiver, or traceback frames.
+                closing = GeneratorExit("Provider operation terminated")
             except BaseExceptionGroup as exc:
                 failure = _detached_provider_failure(exc)
             except BaseException as exc:
@@ -951,8 +953,8 @@ def detach_provider_stream_traceback(
                 task = None
                 _raise_detached_provider_stream_cleanup_error(terminal_failure)
             raise cleanup_failure from None
-        if closing:
-            return
+        if closing is not None:
+            raise closing from None
         if not completed:  # pragma: no cover - non-caught base exceptions propagate
             raise AssertionError("provider stream termination was not captured")
 

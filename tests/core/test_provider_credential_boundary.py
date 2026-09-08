@@ -815,3 +815,40 @@ async def test_detached_provider_stream_rebuilds_deep_cleanup_group_iteratively(
 
     assert sum(1 for _ in iter_exception_tree(exc_info.value)) == 1_501
     assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_provider_close_preserves_original_generator_exit_after_async_cleanup() -> None:
+    closed = False
+    abandonment = GeneratorExit("original abandonment")
+
+    class Stream:
+        async def aclose(self):
+            nonlocal closed
+            await asyncio.sleep(0)
+            closed = True
+
+    with pytest.raises(GeneratorExit) as caught:
+        async with aclosing_provider_stream(Stream()):
+            raise abandonment
+    assert caught.value is abandonment
+    assert closed
+
+
+@pytest.mark.anyio
+async def test_detached_provider_abandonment_does_not_retain_receiver_or_credentials() -> None:
+    class Provider:
+        credential = "private-abandonment-credential"
+
+        @detach_provider_stream_traceback
+        async def stream(self):
+            yield "started"
+            raise GeneratorExit(self.credential)
+
+    provider = Provider()
+    stream = provider.stream()
+    assert await anext(stream) == "started"
+    with pytest.raises(GeneratorExit) as caught:
+        await anext(stream)
+    assert str(caught.value) == "Provider operation terminated"
+    assert_cayu_traceback_does_not_retain(caught.value, provider)

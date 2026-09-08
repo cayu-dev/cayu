@@ -4411,7 +4411,16 @@ async def _await_owned_compaction_provider_stream(
     if owner_task is None:  # pragma: no cover - coroutine execution invariant
         raise RuntimeError("Automatic compaction requires an owning task.")
     cancellation_requests = owner_task.cancelling()
-    provider_task = asyncio.ensure_future(operation)
+
+    async def capture_provider_abandonment() -> tuple[str, dict[str, Any]] | GeneratorExit:
+        try:
+            return await operation
+        except GeneratorExit as abandonment:
+            # Keep process-control signals out of the child Future so delegated
+            # coroutines can finish asynchronous accounting in their owner.
+            return abandonment
+
+    provider_task = asyncio.ensure_future(capture_provider_abandonment())
     caller_cancellation: asyncio.CancelledError | None = None
     try:
         while True:
@@ -4434,7 +4443,10 @@ async def _await_owned_compaction_provider_stream(
                 if caller_cancellation is not None:
                     raise caller_cancellation from None
                 if provider_task.done():
-                    return provider_task.result()
+                    terminal_result = provider_task.result()
+                    if isinstance(terminal_result, GeneratorExit):
+                        raise terminal_result from None
+                    return terminal_result
                 raise
             except BaseException as provider_failure:
                 if caller_cancellation is None:
@@ -4442,6 +4454,8 @@ async def _await_owned_compaction_provider_stream(
                 if isinstance(provider_failure, (GeneratorExit, KeyboardInterrupt, SystemExit)):
                     raise provider_failure from caller_cancellation
                 raise caller_cancellation from provider_failure
+            if isinstance(result, GeneratorExit):
+                raise result from caller_cancellation
             if caller_cancellation is not None:
                 raise caller_cancellation
             return result
@@ -4452,7 +4466,7 @@ async def _await_owned_compaction_provider_stream(
 
 
 def _consume_compaction_provider_task_outcome(
-    task: asyncio.Future[tuple[str, dict[str, Any]]],
+    task: asyncio.Future[tuple[str, dict[str, Any]] | GeneratorExit],
 ) -> None:
     """Consume a retained compactor task after process-control abandonment."""
 
