@@ -3043,3 +3043,53 @@ def test_legacy_sink_recovery_logs_only_the_public_projection(
 
     assert REDACTED_CUSTOM_EVENT_TYPE in caplog.text
     assert secret not in caplog.text
+
+
+@pytest.mark.parametrize("event_type", [EventType.SESSION_STARTED, EventType.SESSION_RESUMED])
+def test_run_epoch_key_survives_workload_secret_collision(event_type: EventType) -> None:
+    redactor = SecretRedactor(["run_epoch"])
+    event = Event(type=event_type, session_id="epoch-collision", payload={"run_epoch": 7})
+    prepared = prepare_new_runtime_event(event, redactor=redactor)
+    projected = project_runtime_event(prepared, sequence=1, redactor=redactor)
+    assert projected.payload == {"run_epoch": 7}
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.SESSION_COMPLETED,
+        EventType.SESSION_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    ],
+)
+def test_terminal_failure_evidence_keys_survive_secret_collisions(event_type: EventType) -> None:
+    evidence = {
+        "classification": "private-value",
+        "deadline_phase": "private-value",
+        "deadline": {
+            "expires_at": "private-value",
+            "source": "private-value",
+            "scope": "private-value",
+        },
+        "exception_types": ["private-value"],
+        "run_epoch": 7,
+        "secondary_failures": False,
+        "session_id": "private-value",
+        "settlement": "private-value",
+        "terminal_event_id": "private-value",
+        "truncated": False,
+    }
+    redactor = SecretRedactor(
+        ["failure_evidence", *evidence, "expires_at", "source", "scope", "private-value"]
+    )
+    event = Event(
+        type=event_type, session_id="failure-collision", payload={"failure_evidence": evidence}
+    )
+    prepared = prepare_new_runtime_event(event, redactor=redactor)
+    projected = project_runtime_event(prepared, sequence=1, redactor=redactor)
+    actual = projected.payload["failure_evidence"]
+    assert set(actual) == set(evidence)
+    assert set(actual["deadline"]) == {"expires_at", "source", "scope"}
+    assert actual["classification"] == REDACTED_SECRET
+    assert actual["deadline"]["source"] == REDACTED_SECRET
+    assert actual["run_epoch"] == 7

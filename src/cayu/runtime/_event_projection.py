@@ -2976,7 +2976,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     terminal_finalization_keys = (
         "binding_finalize_error binding_finalize_publication_error environment_factory_release "
-        "final_revision"
+        "failure_evidence final_revision"
     )
     terminal_finalization_containers = {
         "binding_finalize_error",
@@ -3012,8 +3012,23 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             ("final_revision", "finalization_delta", "paths", "*", "change"),
         }
     )
+    failure_evidence_owned_paths = {
+        ("failure_evidence", key)
+        for key in (
+            "classification",
+            "deadline",
+            "deadline_phase",
+            "exception_types",
+            "run_epoch",
+            "secondary_failures",
+            "session_id",
+            "settlement",
+            "terminal_event_id",
+            "truncated",
+        )
+    } | {("failure_evidence", "deadline", key) for key in ("expires_at", "source", "scope")}
     policies[EventType.SESSION_STARTED] = _observed_policy(
-        "agent_name input_contract parent_session_id prompt_contribution_manifest "
+        "agent_name input_contract parent_session_id prompt_contribution_manifest run_epoch "
         "traceparent tracestate",
         owned_nested_paths=_PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS,
         authority_keys={"input_contract"},
@@ -3022,7 +3037,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.SESSION_RESUMED] = _observed_policy(
         "agent_name appended_messages approval_id decision dispatch_id execution_profile_fingerprint expired input_contract input_id "
         "interruption_type model_attempt_id model_step_id parent_session_id resolved_by "
-        "task_id tool_call_id tool_round_id traceparent tracestate",
+        "run_epoch task_id tool_call_id tool_round_id traceparent tracestate",
         owned_nested_paths=_resolution_actor_nested_paths("resolved_by"),
         authority_keys={"execution_profile_fingerprint", "input_contract"},
         internal_authority_keys={"input_contract"},
@@ -3030,7 +3045,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_COMPLETED] = _observed_policy(
         terminal_finalization_keys,
-        owned_nested_paths=terminal_finalization_owned_paths,
+        owned_nested_paths=terminal_finalization_owned_paths | failure_evidence_owned_paths,
         authority_keys={"session_run_operation_id"},
         untrusted_container_keys=terminal_finalization_containers,
     )
@@ -3039,7 +3054,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "compaction_failure error error_type interaction_transition_failures interruption_type "
         "manual_recovery_required model_attempt_id model_step_id tool_call_id "
         f"tool_name tool_round_id {terminal_finalization_keys}",
-        owned_nested_paths=terminal_finalization_owned_paths,
+        owned_nested_paths=terminal_finalization_owned_paths | failure_evidence_owned_paths,
         authority_keys={"session_run_operation_id"},
         aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
         untrusted_container_keys={
@@ -3063,6 +3078,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "source_run_epoch usage_summary user_input user_input_supersession_intent "
         "ambiguous_user_input_supersession_intent " + terminal_finalization_keys,
         owned_nested_paths=terminal_finalization_owned_paths
+        | failure_evidence_owned_paths
         | _resolution_actor_nested_paths("requested_by", "resolved_by")
         | _APPROVAL_NESTED_SCHEMA_PATHS
         | _USER_INPUT_NESTED_SCHEMA_PATHS
