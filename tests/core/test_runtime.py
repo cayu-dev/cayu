@@ -13527,7 +13527,10 @@ def test_public_stream_abandonment_closes_provider_stream() -> None:
     assert closed is True
 
 
-def test_successful_provider_cleanup_race_is_not_published_as_cleanup_failure() -> None:
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_successful_provider_cleanup_race_is_not_published_as_cleanup_failure(
+    close_fails: bool,
+) -> None:
     class SuccessfulRacingCloseIterator:
         def __init__(self) -> None:
             self.reads = 0
@@ -13547,6 +13550,8 @@ def test_successful_provider_cleanup_race_is_not_published_as_cleanup_failure() 
             assert self.owner is not None
             self.owner.cancel("caller cancelled as provider cleanup completed")
             self.close_finished.set()
+            if close_fails:
+                raise RuntimeError("settled close failure")
 
     class SuccessfulRacingCloseProvider(FakeProvider):
         def __init__(self) -> None:
@@ -13596,13 +13601,21 @@ def test_successful_provider_cleanup_race_is_not_published_as_cleanup_failure() 
     assert EventType.SESSION_FAILED not in {event.type for event in stored_events}
     interrupted = [event for event in stored_events if event.type is EventType.SESSION_INTERRUPTED]
     assert len(interrupted) == 1
-    assert interrupted[0].payload["provider_cancellation_failures"] == [
+    failures = interrupted[0].payload["provider_cancellation_failures"]
+    assert failures[:1] == [
         {
             "phase": "model_stream",
             "error": "Model provider stream failed before cancellation.",
             "error_type": "ModelProviderStreamError",
         }
     ]
+
+    if close_fails:
+        assert len(failures) == 2
+        assert failures[1]["phase"] == "provider_stream_cleanup"
+        assert failures[1]["error_type"] == "ProviderStreamCleanupError"
+    else:
+        assert len(failures) == 1
 
 
 def test_provider_cancellation_marker_precedes_operator_terminal_transition() -> None:

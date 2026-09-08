@@ -697,6 +697,12 @@ async def aclosing_provider_stream(
             cleanup_failure = exc
             if cleanup_task_tracked:
                 cleanup_unsettled = not cleanup_task.done()
+                if isinstance(exc, asyncio.CancelledError) and cleanup_task.done():
+                    # Caller cancellation can arrive at the startup handoff after
+                    # the owned close has already succeeded. Its settled outcome
+                    # is authoritative for cleanup; caller cancellation remains
+                    # authoritative for the operation below.
+                    cleanup_failure = cleanup_task.result().error
             if (
                 cleanup_ownership is not None
                 and cleanup_ownership.reserved
