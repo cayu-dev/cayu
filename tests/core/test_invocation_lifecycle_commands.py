@@ -3339,3 +3339,78 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
     assert owner.invocation_context is not None
     assert owner.invocation_context.registered_environment is bound_environment
     assert owner.invocation_context.binding is environment_context.binding
+
+
+@pytest.mark.parametrize(
+    ("decision_epoch", "wrong_identity", "accepted"),
+    [(1, False, False), (2, False, True), (3, False, True), (4, False, False), (2, True, False)],
+)
+def test_settled_predecessor_is_authenticated_against_its_profile_epoch(
+    decision_epoch: int, wrong_identity: bool, accepted: bool
+) -> None:
+    from cayu.runtime._invocation_terminal_decision import (
+        InvocationTerminalOutcome,
+        build_invocation_terminal_decision,
+        invocation_terminal_event_id,
+    )
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        created = await store.apply_invocation_lifecycle_command(
+            _create_command(
+                session_id="predecessor-profile-epoch",
+                session_instance_id=str(uuid4()),
+                interaction_id="predecessor-interaction",
+                profile=_profile(),
+            )
+        )
+        # Recovery rebound the predecessor profile to epoch 3; release advanced
+        # the session to 4. A decision from epoch 4 is not this predecessor's.
+        session = created.session.model_copy(
+            update={"run_epoch": 4, "status": SessionStatus.INTERRUPTED}
+        )
+        predecessor = created.active_profile.model_copy(update={"run_epoch": 3})
+        event_identity = {
+            "outcome": InvocationTerminalOutcome.INTERRUPTED,
+            "session_id": session.id,
+            "session_instance_id": "other-instance" if wrong_identity else session.instance_id,
+            "run_epoch": decision_epoch,
+            "interaction_id": predecessor.interaction_id,
+            "source_id": "predecessor-interruption",
+        }
+        decision = build_invocation_terminal_decision(
+            outcome=InvocationTerminalOutcome.INTERRUPTED,
+            session_id=session.id,
+            session_instance_id=event_identity["session_instance_id"],
+            run_epoch=decision_epoch,
+            profile_interaction_id=predecessor.interaction_id,
+            interaction_id=predecessor.interaction_id,
+            execution_profile_fingerprint=predecessor.profile.fingerprint,
+            interaction_event_id=invocation_terminal_event_id(
+                **event_identity, event_kind="interaction"
+            ),
+            terminal_event_id=invocation_terminal_event_id(**event_identity, event_kind="session"),
+            observed_at=datetime(2026, 9, 7, tzinfo=UTC),
+            terminal_payload={},
+            interruption_request_id="predecessor-interruption",
+        )
+        checkpoint = {
+            SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: decision.model_dump(mode="json")
+        }
+        original = copy.deepcopy(checkpoint)
+        if accepted:
+            assert (
+                invocation_lifecycle_module._checkpoint_after_predecessor_terminal_decision(
+                    session, checkpoint, expected_active_profile=predecessor
+                )
+                is None
+            )
+        else:
+            with pytest.raises(SessionRunFenced, match="another predecessor"):
+                invocation_lifecycle_module._checkpoint_after_predecessor_terminal_decision(
+                    session, checkpoint, expected_active_profile=predecessor
+                )
+        assert checkpoint == original
+        await store.release_run_fence(session.id)
+
+    asyncio.run(scenario())

@@ -7695,6 +7695,7 @@ def test_provider_completion_winning_cancellation_is_reconciled_before_interrupt
             async for event in app.resume(
                 ResumeRequest(
                     session_id=session_id,
+                    max_steps=ModelCompletionRecoveryContext().max_steps,
                     messages=[Message.text("user", "continue after interruption")],
                 )
             )

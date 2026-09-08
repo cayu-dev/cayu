@@ -2429,11 +2429,14 @@ def _checkpoint_after_predecessor_terminal_decision(
         raise SessionRunFenced(
             "Invocation admission found a status-inconsistent settled predecessor."
         )
+    # Recovery may advance the session epoch while retaining a predecessor
+    # profile that was itself rebound from the terminal decision's owner.
+    # Source authority has already authenticated that exact durable profile.
     if not invocation_terminal_decision_matches_recovery_profile(
         settled,
         session_id=session.id,
         session_instance_id=session.instance_id,
-        current_run_epoch=session.run_epoch,
+        current_run_epoch=expected_active_profile.run_epoch,
         interaction_id=expected_active_profile.interaction_id,
         execution_profile_fingerprint=expected_active_profile.profile.fingerprint,
     ):
