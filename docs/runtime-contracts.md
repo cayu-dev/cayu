@@ -8241,8 +8241,22 @@ operation identity makes this path ineligible and requires manual
 reconciliation unless each accepted event has the cursor contract described
 below; retrieval is never used to overwrite or infer an untracked partial
 stream.
+
+Cancelling an incomplete-recovery caller does not cancel opaque adapter work or
+its iterator cleanup. The recovery owner retains its exact claim while that
+work settles, then propagates the caller's cancellation. A late adapter outcome
+still receives its normal durable classification; child-only cancellation is
+an unavailable provider outcome, not a new caller cancellation. Publication and
+cleanup failures remain secondary evidence, while fatal signals remain
+authoritative. The finite recovery-cleanup deadline bounds the caller's wait;
+expiry retains unresolved ownership rather than claiming that the work stopped.
+
 Queued and in-progress results remain attached to that stage and never authorize
-a replacement request. They retain their publication-eligible session state
+a replacement request. If local interruption retains a provider-owned stage,
+its interaction pauses with `pending_action_kind="provider_operation_recovery"`
+while the session becomes interrupted. This keeps the original interaction
+available for exact result and accounting recovery without reopening a closed
+interaction or creating a replacement request. They retain their publication-eligible session state
 after a recovery poll, so a later poll can commit the same operation's terminal
 result. Before dispatch, the active stage also retains the secret-free
 continuation inputs needed to normalize and publish offline output: redacted

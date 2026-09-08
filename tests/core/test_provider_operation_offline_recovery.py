@@ -441,12 +441,12 @@ class _BlockingRecoveryCloseEvents:
     def __init__(
         self,
         *,
-        suppress_cancellation: bool = False,
-        failure_after_cancellation: BaseException | None = None,
+        failure_after_release: BaseException | None = None,
     ) -> None:
         self.close_entered = asyncio.Event()
-        self.suppress_cancellation = suppress_cancellation
-        self.failure_after_cancellation = failure_after_cancellation
+        self.release_close = asyncio.Event()
+        self.close_finished = asyncio.Event()
+        self.failure_after_release = failure_after_release
         self.cancellation_observed = False
 
     def __aiter__(self) -> _BlockingRecoveryCloseEvents:
@@ -458,13 +458,40 @@ class _BlockingRecoveryCloseEvents:
     async def aclose(self) -> None:
         self.close_entered.set()
         try:
-            await asyncio.Event().wait()
+            await self.release_close.wait()
         except asyncio.CancelledError:
             self.cancellation_observed = True
-            if self.failure_after_cancellation is not None:
-                raise self.failure_after_cancellation from None
-            if not self.suppress_cancellation:
-                raise
+            raise
+        finally:
+            self.close_finished.set()
+        if self.failure_after_release is not None:
+            raise self.failure_after_release
+
+
+async def _cancel_recovery_owner_before_releasing_work(
+    owner: asyncio.Task[Any],
+    *,
+    store: SessionStore,
+    session_id: str,
+    release: asyncio.Event,
+    message: str,
+) -> None:
+    """Caller cancellation retains opaque work and its exact recovery claim."""
+
+    try:
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        claim_id = checkpoint["incomplete_session_recovery_claim"]["claim_id"]
+        assert owner.cancel(message)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert owner.cancelling() == 1
+        assert not owner.done()
+        retained = await store.load_checkpoint(session_id)
+        assert retained is not None
+        assert retained["incomplete_session_recovery_claim"]["claim_id"] == claim_id
+    finally:
+        release.set()
 
 
 def _exception_graph_reference_count(
@@ -776,6 +803,7 @@ class _FenceOnCancellationRequestStore(InMemorySessionStore):
 
 class _CommitThenRaiseInterruptionClaimStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -899,6 +927,7 @@ class _FailCancellationClaimHeartbeatStore(InMemorySessionStore):
 
 class _DelayCancellationResolutionAcknowledgementStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
         result = await super().publish_checkpoint_and_events(session_id, **kwargs)
@@ -1017,6 +1046,7 @@ class _LegacyResolutionProfileStore(InMemorySessionStore):
 
 class _BlockingInterruptionTransitionStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
+    terminal_interaction_publication_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -2952,9 +2982,10 @@ def test_exact_start_recovery_ignores_child_only_close_cancellation_after_public
     assert "CancelledError" not in caplog.text
 
 
-@pytest.mark.parametrize("close_suppresses_cancellation", [False, True])
+@pytest.mark.parametrize("close_fails", [False, True])
 def test_exact_start_recovery_preserves_real_task_cancellation_during_close(
-    close_suppresses_cancellation: bool,
+    close_fails: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
@@ -2978,7 +3009,7 @@ def test_exact_start_recovery_preserves_real_task_cancellation_during_close(
                 pass
 
         close_events = _BlockingRecoveryCloseEvents(
-            suppress_cancellation=close_suppresses_cancellation
+            failure_after_release=RuntimeError("late close failure") if close_fails else None
         )
 
         async def recover_start(
@@ -2999,30 +3030,45 @@ def test_exact_start_recovery_preserves_real_task_cancellation_during_close(
                 )
             )
         )
-        await close_events.close_entered.wait()
-        recovery_task.cancel("caller cancelled provider recovery close")
-        with pytest.raises(asyncio.CancelledError):
-            await recovery_task
+        await asyncio.wait_for(close_events.close_entered.wait(), timeout=5)
+        await _cancel_recovery_owner_before_releasing_work(
+            recovery_task,
+            store=store,
+            session_id=session_id,
+            release=close_events.release_close,
+            message="caller cancelled provider recovery close",
+        )
+        with pytest.raises(
+            asyncio.CancelledError, match="caller cancelled provider recovery close"
+        ):
+            await asyncio.wait_for(recovery_task, timeout=5)
 
         assert recovery_task.cancelling() == 1
         assert recovery_task.cancelled()
-        assert close_events.cancellation_observed
+        assert not close_events.cancellation_observed
+        assert close_events.close_finished.is_set()
         events = await store.load_events(session_id)
         assert sum(event.type is EventType.PROVIDER_OPERATION_STARTED for event in events) == 1
 
     asyncio.run(scenario())
+
+    assert (
+        "Provider recovery stream cleanup failed after exact start publication" in caplog.text
+    ) is close_fails
+    assert "late close failure" not in caplog.text
 
 
 def test_exact_start_recovery_does_not_redeliver_cancellation_from_event_fan_out() -> None:
     class BlockingProviderStartedSink(EventSink):
         def __init__(self) -> None:
             self.entered = asyncio.Event()
+            self.release = asyncio.Event()
 
         async def emit(self, event: Event) -> None:
             if event.type is not EventType.PROVIDER_OPERATION_STARTED:
                 return
             self.entered.set()
-            await asyncio.Event().wait()
+            await self.release.wait()
 
     async def scenario() -> None:
         store = InMemorySessionStore()
@@ -3070,10 +3116,18 @@ def test_exact_start_recovery_does_not_redeliver_cancellation_from_event_fan_out
                 )
             )
         )
-        await sink.entered.wait()
-        recovery_task.cancel("caller cancelled provider recovery fan-out")
-        with pytest.raises(asyncio.CancelledError) as raised:
-            await recovery_task
+        await asyncio.wait_for(sink.entered.wait(), timeout=5)
+        await _cancel_recovery_owner_before_releasing_work(
+            recovery_task,
+            store=store,
+            session_id=session_id,
+            release=sink.release,
+            message="caller cancelled provider recovery fan-out",
+        )
+        with pytest.raises(
+            asyncio.CancelledError, match="caller cancelled provider recovery fan-out"
+        ) as raised:
+            await asyncio.wait_for(recovery_task, timeout=5)
 
         assert recovery_task.cancelling() == 1
         assert recovery_task.cancelled()
@@ -3186,7 +3240,7 @@ def test_exact_start_recovery_preserves_cleanup_failure_under_caller_cancellatio
 
         publication_failure = RuntimeError("provider start recovery publication failed")
         cleanup_failure = RuntimeError("provider start recovery cleanup failed")
-        close_events = _BlockingRecoveryCloseEvents(failure_after_cancellation=cleanup_failure)
+        close_events = _BlockingRecoveryCloseEvents(failure_after_release=cleanup_failure)
 
         async def recover_start(
             _request: ProviderOperationStartRecoveryRequest,
@@ -3218,24 +3272,34 @@ def test_exact_start_recovery_preserves_cleanup_failure_under_caller_cancellatio
                 )
             )
         )
-        await close_events.close_entered.wait()
-        recovery_task.cancel("cancel provider recovery after publication failure")
-        with pytest.raises(asyncio.CancelledError):
-            await recovery_task
+        await asyncio.wait_for(close_events.close_entered.wait(), timeout=5)
+        await _cancel_recovery_owner_before_releasing_work(
+            recovery_task,
+            store=store,
+            session_id=session_id,
+            release=close_events.release_close,
+            message="cancel provider recovery after publication failure",
+        )
+        with pytest.raises(
+            asyncio.CancelledError, match="cancel provider recovery after publication failure"
+        ):
+            await asyncio.wait_for(recovery_task, timeout=5)
 
         assert recovery_task.cancelling() == 1
         assert recovery_task.cancelled()
         assert publication_failure.__cause__ is cleanup_failure
+        assert close_events.close_finished.is_set()
+        assert not close_events.cancellation_observed
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
-    "adapter_cancellation_behavior",
-    ["propagate", "replace", "suppress"],
+    "settlement",
+    ["snapshot", "failure", "child_cancel"],
 )
 def test_provider_recovery_preserves_real_task_cancellation(
-    adapter_cancellation_behavior: str,
+    settlement: str,
 ) -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
@@ -3243,23 +3307,21 @@ def test_provider_recovery_preserves_real_task_cancellation(
         provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
         await _stage_offline_operation(store, session_id=session_id, provider=provider)
         retrieval_started = asyncio.Event()
+        release_retrieval = asyncio.Event()
 
         async def retrieve(
             _state: ProviderOperationState,
         ) -> ProviderOperationSnapshot:
             retrieval_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                if adapter_cancellation_behavior == "replace":
-                    raise RuntimeError("provider replaced caller cancellation") from None
-                if adapter_cancellation_behavior == "suppress":
-                    return ProviderOperationSnapshot(
-                        state=provider.adapter.state,
-                        status=ProviderOperationStatus.IN_PROGRESS,
-                    )
-                raise
-            raise AssertionError("cancelled retrieval unexpectedly continued")
+            await release_retrieval.wait()
+            if settlement == "failure":
+                raise RuntimeError("provider retrieval failed while caller was cancelled")
+            if settlement == "child_cancel":
+                raise asyncio.CancelledError("provider-local cancellation")
+            return ProviderOperationSnapshot(
+                state=provider.adapter.state,
+                status=ProviderOperationStatus.IN_PROGRESS,
+            )
 
         provider.adapter.retrieve = retrieve  # type: ignore[method-assign]
         app = CayuApp(session_store=store, enable_logging=False)
@@ -3273,12 +3335,18 @@ def test_provider_recovery_preserves_real_task_cancellation(
                 )
             )
         )
-        await retrieval_started.wait()
+        await asyncio.wait_for(retrieval_started.wait(), timeout=5)
 
-        recovery_task.cancel("cancel provider recovery owner")
+        await _cancel_recovery_owner_before_releasing_work(
+            recovery_task,
+            store=store,
+            session_id=session_id,
+            release=release_retrieval,
+            message="cancel provider recovery owner",
+        )
         assert recovery_task.cancelling() == 1
-        with pytest.raises(asyncio.CancelledError):
-            await recovery_task
+        with pytest.raises(asyncio.CancelledError, match="cancel provider recovery owner"):
+            await asyncio.wait_for(recovery_task, timeout=5)
 
         assert recovery_task.cancelled()
         events = await store.load_events(session_id)
@@ -3287,12 +3355,14 @@ def test_provider_recovery_preserves_real_task_cancellation(
             for event in events
             if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
         ]
-        assert not required, [event.payload for event in required]
+        assert len(required) == (0 if settlement == "snapshot" else 1)
+        if required:
+            assert required[0].payload["recovery_reason"] == "unavailable"
 
     asyncio.run(scenario())
 
 
-def test_provider_reconnect_preserves_cancellation_suppressed_by_adapter_return() -> None:
+def test_provider_reconnect_settles_before_redelivering_caller_cancellation() -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
         session_id = "provider-reconnect-suppressed-owner-cancellation"
@@ -3304,21 +3374,19 @@ def test_provider_reconnect_preserves_cancellation_suppressed_by_adapter_return(
             provider=provider,
         )
         reconnect_started = asyncio.Event()
+        release_reconnect = asyncio.Event()
         close_events = _CloseRecordingRecoveryEvents()
 
         async def reconnect(
             state: ProviderOperationState,
         ) -> ProviderOperationConnection:
             reconnect_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                return ProviderOperationConnection(
-                    state=state,
-                    status=ProviderOperationStatus.IN_PROGRESS,
-                    events=close_events,
-                )
-            raise AssertionError("cancelled reconnect unexpectedly continued")
+            await release_reconnect.wait()
+            return ProviderOperationConnection(
+                state=state,
+                status=ProviderOperationStatus.IN_PROGRESS,
+                events=close_events,
+            )
 
         provider.adapter.reconnect = reconnect  # type: ignore[method-assign]
         app = CayuApp(session_store=store, enable_logging=False)
@@ -3332,11 +3400,17 @@ def test_provider_reconnect_preserves_cancellation_suppressed_by_adapter_return(
                 )
             )
         )
-        await reconnect_started.wait()
+        await asyncio.wait_for(reconnect_started.wait(), timeout=5)
 
-        recovery_task.cancel("cancel provider reconnect owner")
-        with pytest.raises(asyncio.CancelledError):
-            await recovery_task
+        await _cancel_recovery_owner_before_releasing_work(
+            recovery_task,
+            store=store,
+            session_id=session_id,
+            release=release_reconnect,
+            message="cancel provider reconnect owner",
+        )
+        with pytest.raises(asyncio.CancelledError, match="cancel provider reconnect owner"):
+            await asyncio.wait_for(recovery_task, timeout=5)
 
         assert recovery_task.cancelling() == 1
         assert recovery_task.cancelled()
@@ -3350,13 +3424,14 @@ def test_provider_reconnect_preserves_cancellation_suppressed_by_adapter_return(
 
 
 @pytest.mark.parametrize("entrance", ["recover_start", "reconnect"])
-def test_provider_recovery_preserves_cancellation_before_malformed_return_classification(
+def test_provider_recovery_preserves_cancellation_after_malformed_settlement(
     entrance: str,
 ) -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
         session_id = f"provider-recovery-malformed-return-cancellation-{entrance}"
         adapter_entered = asyncio.Event()
+        release_adapter = asyncio.Event()
 
         if entrance == "recover_start":
             provider: _OfflineOperationProvider = _IdempotentAmbiguousStartProvider()
@@ -3381,11 +3456,8 @@ def test_provider_recovery_preserves_cancellation_before_malformed_return_classi
                 _request: ProviderOperationStartRecoveryRequest,
             ) -> ProviderOperationConnection:
                 adapter_entered.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    return object()  # type: ignore[return-value]
-                raise AssertionError("cancelled start recovery unexpectedly continued")
+                await release_adapter.wait()
+                return object()  # type: ignore[return-value]
 
             provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
             app = runtime()
@@ -3402,11 +3474,8 @@ def test_provider_recovery_preserves_cancellation_before_malformed_return_classi
                 _state: ProviderOperationState,
             ) -> ProviderOperationConnection:
                 adapter_entered.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    return object()  # type: ignore[return-value]
-                raise AssertionError("cancelled reconnect unexpectedly continued")
+                await release_adapter.wait()
+                return object()  # type: ignore[return-value]
 
             provider.adapter.reconnect = reconnect  # type: ignore[method-assign]
             app = CayuApp(session_store=store, enable_logging=False)
@@ -3421,43 +3490,51 @@ def test_provider_recovery_preserves_cancellation_before_malformed_return_classi
                 )
             )
         )
-        await adapter_entered.wait()
+        await asyncio.wait_for(adapter_entered.wait(), timeout=5)
 
-        recovery_task.cancel(f"cancel malformed {entrance} owner")
-        with pytest.raises(asyncio.CancelledError):
-            await recovery_task
+        await _cancel_recovery_owner_before_releasing_work(
+            recovery_task,
+            store=store,
+            session_id=session_id,
+            release=release_adapter,
+            message=f"cancel malformed {entrance} owner",
+        )
+        with pytest.raises(asyncio.CancelledError, match=f"cancel malformed {entrance} owner"):
+            await asyncio.wait_for(recovery_task, timeout=5)
 
         assert recovery_task.cancelling() == 1
         assert recovery_task.cancelled()
         events = await store.load_events(session_id)
-        assert not any(
-            event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
-        )
+        required = [
+            event
+            for event in events
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        ]
+        assert len(required) == 1
+        assert required[0].payload["recovery_reason"] == "malformed"
 
     asyncio.run(scenario())
 
 
-def test_provider_recovery_preserves_mixed_failure_sibling_under_caller_cancellation() -> None:
+def test_provider_recovery_records_mixed_child_failure_under_caller_cancellation() -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
         session_id = "provider-recovery-mixed-owner-cancellation"
         provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
         await _stage_offline_operation(store, session_id=session_id, provider=provider)
         retrieval_started = asyncio.Event()
+        release_retrieval = asyncio.Event()
         provider_failure = RuntimeError("provider retrieval also failed")
 
         async def retrieve(
             _state: ProviderOperationState,
         ) -> ProviderOperationSnapshot:
             retrieval_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError as cancellation:
-                raise BaseExceptionGroup(
-                    "provider mixed recovery failure",
-                    [cancellation, provider_failure],
-                ) from None
-            raise AssertionError("cancelled retrieval unexpectedly continued")
+            await release_retrieval.wait()
+            raise BaseExceptionGroup(
+                "provider mixed recovery failure",
+                [asyncio.CancelledError("provider-local cancellation"), provider_failure],
+            )
 
         provider.adapter.retrieve = retrieve  # type: ignore[method-assign]
         app = CayuApp(session_store=store, enable_logging=False)
@@ -3471,21 +3548,33 @@ def test_provider_recovery_preserves_mixed_failure_sibling_under_caller_cancella
                 )
             )
         )
-        await retrieval_started.wait()
+        await asyncio.wait_for(retrieval_started.wait(), timeout=5)
 
-        recovery_task.cancel("cancel provider recovery with mixed failure")
-        with pytest.raises(asyncio.CancelledError) as raised:
-            await recovery_task
+        await _cancel_recovery_owner_before_releasing_work(
+            recovery_task,
+            store=store,
+            session_id=session_id,
+            release=release_retrieval,
+            message="cancel provider recovery with mixed failure",
+        )
+        with pytest.raises(
+            asyncio.CancelledError, match="cancel provider recovery with mixed failure"
+        ) as raised:
+            await asyncio.wait_for(recovery_task, timeout=5)
 
         assert recovery_task.cancelling() == 1
         assert recovery_task.cancelled()
-        assert isinstance(raised.value.__cause__, BaseExceptionGroup)
+        assert raised.value.__cause__ is None
         assert _exception_graph_reference_count(raised.value, raised.value) == 1
-        assert _exception_graph_reference_count(raised.value, provider_failure) == 1
+        assert _exception_graph_reference_count(raised.value, provider_failure) == 0
         events = await store.load_events(session_id)
-        assert not any(
-            event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
-        )
+        required = [
+            event
+            for event in events
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        ]
+        assert len(required) == 1
+        assert required[0].payload["recovery_reason"] == "unavailable"
 
     asyncio.run(scenario())
 
@@ -3503,6 +3592,7 @@ def test_provider_recovery_preserves_fatal_signal_under_caller_cancellation(
         provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
         await _stage_offline_operation(store, session_id=session_id, provider=provider)
         retrieval_started = asyncio.Event()
+        release_retrieval = asyncio.Event()
         fatal = FatalProviderRecoverySignal("provider recovery fatal signal")
         provider_cancellations: list[asyncio.CancelledError] = []
 
@@ -3510,17 +3600,15 @@ def test_provider_recovery_preserves_fatal_signal_under_caller_cancellation(
             _state: ProviderOperationState,
         ) -> ProviderOperationSnapshot:
             retrieval_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError as cancellation:
-                provider_cancellations.append(cancellation)
-                if grouped:
-                    raise BaseExceptionGroup(
-                        "provider recovery cancellation and fatal signal",
-                        [cancellation, fatal],
-                    ) from None
-                raise fatal from None
-            raise AssertionError("cancelled retrieval unexpectedly continued")
+            await release_retrieval.wait()
+            cancellation = asyncio.CancelledError("provider-local cancellation")
+            provider_cancellations.append(cancellation)
+            if grouped:
+                raise BaseExceptionGroup(
+                    "provider recovery cancellation and fatal signal",
+                    [cancellation, fatal],
+                )
+            raise fatal
 
         provider.adapter.retrieve = retrieve  # type: ignore[method-assign]
         app = CayuApp(session_store=store, enable_logging=False)
@@ -3534,11 +3622,17 @@ def test_provider_recovery_preserves_fatal_signal_under_caller_cancellation(
                 )
             )
         )
-        await retrieval_started.wait()
+        await asyncio.wait_for(retrieval_started.wait(), timeout=5)
 
-        recovery_task.cancel("cancel provider recovery before fatal signal")
+        await _cancel_recovery_owner_before_releasing_work(
+            recovery_task,
+            store=store,
+            session_id=session_id,
+            release=release_retrieval,
+            message="cancel provider recovery before fatal signal",
+        )
         with pytest.raises((FatalProviderRecoverySignal, BaseExceptionGroup)) as raised:
-            await recovery_task
+            await asyncio.wait_for(recovery_task, timeout=5)
 
         assert recovery_task.cancelling() == 1
         assert not recovery_task.cancelled()
@@ -7150,7 +7244,10 @@ def test_interruption_after_worker_loss_cancels_the_durable_provider_operation()
             )
         ]
 
-        assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
+        assert [event.type for event in events] == [
+            EventType.INTERACTION_PAUSED,
+            EventType.SESSION_INTERRUPTED,
+        ]
         assert provider.adapter.cancel_calls == [provider.adapter.state]
         durable_events = await store.load_events("offline-provider-cancellation")
         assert [
@@ -7192,7 +7289,10 @@ def test_worker_loss_interruption_reports_unsupported_provider_cancellation() ->
             )
         ]
 
-        assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
+        assert [event.type for event in events] == [
+            EventType.INTERACTION_PAUSED,
+            EventType.SESSION_INTERRUPTED,
+        ]
         inspection = await inspect_provider_operation(
             store,
             "offline-provider-cancellation-unsupported",
@@ -7228,7 +7328,10 @@ def test_interruption_claim_acknowledgement_loss_reconciles_committed_epoch() ->
         ]
 
         assert store.interruption_claim_committed is True
-        assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
+        assert [event.type for event in events] == [
+            EventType.INTERACTION_PAUSED,
+            EventType.SESSION_INTERRUPTED,
+        ]
         interrupted = await store.load(session_id)
         checkpoint = await store.load_checkpoint(session_id)
         interrupted_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
@@ -7299,6 +7402,16 @@ def test_budgeted_unsupported_cancellation_retains_then_settles_original_reserva
         assert interrupted_session is not None
         assert interrupted_profile is not None
         assert interrupted_profile.run_epoch == interrupted_session.run_epoch - 1
+        interrupted_events = await store.load_events(session_id)
+        pauses = [
+            event for event in interrupted_events if event.type is EventType.INTERACTION_PAUSED
+        ]
+        assert len(pauses) == 1
+        assert pauses[0].interaction_id == interrupted_profile.interaction_id
+        assert pauses[0].payload["pending_action_kind"] == "provider_operation_recovery"
+        assert not any(
+            event.type is EventType.INTERACTION_INTERRUPTED for event in interrupted_events
+        )
 
         provider.adapter.status = ProviderOperationStatus.COMPLETED
         provider.adapter.start_events = (
@@ -7438,6 +7551,7 @@ def test_offline_interruption_keeps_provider_frozen_across_status_transition(
         store.transition_release.set()
 
         assert [event.type for event in await interrupt_task] == [
+            EventType.INTERACTION_PAUSED,
             EventType.SESSION_INTERRUPTED,
             EventType.HOOK_STARTED,
             EventType.HOOK_COMPLETED,
@@ -7496,7 +7610,10 @@ def test_cancellation_claim_blocks_epoch_takeover_during_provider_call(
         assert during.run_epoch == before.run_epoch
 
         provider.adapter.cancel_release.set()
-        assert [event.type for event in await interrupt_task] == [EventType.SESSION_INTERRUPTED]
+        assert [event.type for event in await interrupt_task] == [
+            EventType.INTERACTION_PAUSED,
+            EventType.SESSION_INTERRUPTED,
+        ]
         try:
             inspection = await inspect_provider_operation(store, session_id)
             assert inspection.cancellation_status is ProviderOperationCancellationStatus.CANCELLED
@@ -7638,7 +7755,10 @@ def test_successful_claim_release_does_not_trigger_heartbeat_ownership_loss(
             )
         ]
 
-        assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
+        assert [event.type for event in events] == [
+            EventType.INTERACTION_PAUSED,
+            EventType.SESSION_INTERRUPTED,
+        ]
         current = await store.load(session_id)
         assert current is not None
         assert current.status is SessionStatus.INTERRUPTED
@@ -7786,7 +7906,10 @@ def test_lost_cancellation_acknowledgement_remains_truthfully_unconfirmed() -> N
             )
         ]
 
-        assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
+        assert [event.type for event in events] == [
+            EventType.INTERACTION_PAUSED,
+            EventType.SESSION_INTERRUPTED,
+        ]
         assert provider.adapter.cancel_calls == [provider.adapter.state]
         inspection = await inspect_provider_operation(store, session_id)
         assert inspection.cancellation_status is ProviderOperationCancellationStatus.FAILED
@@ -8659,6 +8782,7 @@ def test_offline_recovery_preserves_an_ordinary_tool_call_during_structured_outp
                     session_id=session_id,
                     messages=[Message.text("user", "continue")],
                     structured_output=spec,
+                    max_steps=context.max_steps,
                 )
             )
         ]
@@ -8726,6 +8850,7 @@ def test_resume_retrieves_queued_operation_then_relinquishes_run_fence() -> None
                 ResumeRequest(
                     session_id="resume-offline-queued",
                     messages=[Message.text("user", "continue when the operation finishes")],
+                    max_steps=ModelCompletionRecoveryContext().max_steps,
                 )
             )
         ]

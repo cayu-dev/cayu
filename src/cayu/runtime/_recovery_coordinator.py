@@ -6485,6 +6485,14 @@ class RecoveryCoordinator:
                 after_admission=after_admission,
                 invocation_context=invocation_context,
             )
+            # Admission has already advanced the durable epoch. Cleanup must
+            # own that epoch before any fallible read or public event yield.
+            invocation_context = invocation_context.with_rebound_session(
+                session,
+                active_profile=execution_profile_snapshot.model_copy(
+                    update={"run_epoch": session.run_epoch}
+                ),
+            )
             refreshed = await load_pending_provider_operation_disposition(
                 self._session_store,
                 pending.session_id,
@@ -6496,13 +6504,6 @@ class RecoveryCoordinator:
             pending, result = refreshed
             if resumed_event is not None:
                 yield resumed_event
-
-            invocation_context = invocation_context.with_rebound_session(
-                session,
-                active_profile=execution_profile_snapshot.model_copy(
-                    update={"run_epoch": session.run_epoch}
-                ),
-            )
 
             fallback_stream = self._run_pending_provider_operation_fallback(
                 pending=pending,

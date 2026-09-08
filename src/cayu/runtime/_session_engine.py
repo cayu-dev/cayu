@@ -8559,6 +8559,15 @@ class SessionEngine:
             pending_action_kind = _pending_interaction_action_kind(
                 checkpoint, run_epoch=session.run_epoch
             )
+            if (
+                pending_action_kind is None
+                and to_status is SessionStatus.INTERRUPTED
+                and provider_operation_owned
+            ):
+                # A locally interrupted invocation can retain remote work.
+                # Keep its interaction available for exact operation recovery
+                # until that work and its original accounting have settled.
+                pending_action_kind = "provider_operation_recovery"
         completion_pending_finalization = (
             to_status is SessionStatus.RUNNING and checkpoint_mutation is not None
         )
