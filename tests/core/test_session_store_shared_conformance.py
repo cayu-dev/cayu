@@ -113,6 +113,7 @@ from cayu.core import (
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import (
     event_payload_authority_is_runtime_generated,
+    event_with_runtime_envelope_authority,
     event_with_runtime_payload_authority,
 )
 from cayu.core.tools import (
@@ -186,6 +187,7 @@ from cayu.runtime import (
     PersistedEventSideEffectStatus,
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
+    ReleaseInvocationCommand,
     RequestFootprint,
     RequestFootprintConfig,
     ResolutionActor,
@@ -261,6 +263,7 @@ from cayu.runtime._event_projection import (
     public_event_sequence,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._invocation_lifecycle import _release_invocation_command_with_cleanup_authority
 from cayu.runtime._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
@@ -24611,8 +24614,10 @@ def test_session_store_conformance_interaction_transition_is_atomic_and_reconstr
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("runtime_envelope", [True, False])
 def test_session_store_conformance_terminal_decision_publishes_exact_event_pair_atomically(
     session_store_case,
+    runtime_envelope: bool,
 ) -> None:
     async def run() -> None:
         store = await _open_store(session_store_case)
@@ -24703,6 +24708,8 @@ def test_session_store_conformance_terminal_decision_publishes_exact_event_pair_
                 timestamp=observed_at,
                 payload=terminal_payload,
             )
+            if runtime_envelope:
+                terminal_event = event_with_runtime_envelope_authority(terminal_event, "session_id")
             published = await store.publish_interaction_transition(
                 session_id,
                 event=interaction_event,
@@ -24759,6 +24766,23 @@ def test_session_store_conformance_terminal_decision_publishes_exact_event_pair_
             assert replayed.replayed is True
             assert replayed.session == published.session
             assert replayed.terminal_event == terminal_event
+            terminal_receipt = await _load_raw_session_operation_record(
+                session_store_case,
+                store,
+                session_id=session_id,
+                storage_key=sessions_module._invocation_terminal_event_storage_key(
+                    terminal_event.id
+                ),
+            )
+            if runtime_envelope:
+                assert terminal_receipt is not None
+                assert terminal_receipt["event"] == terminal_event.model_dump(mode="json")
+                assert terminal_receipt["session_instance_id"] == admitted.session.instance_id
+                assert terminal_receipt[
+                    "active_profile"
+                ] == admitted.active_invocation_profile.model_dump(mode="json")
+            else:
+                assert terminal_receipt is None
 
             stale_failure = build_invocation_terminal_decision(
                 outcome=InvocationTerminalOutcome.FAILED,
@@ -24800,6 +24824,27 @@ def test_session_store_conformance_terminal_decision_publishes_exact_event_pair_
                     ),
                     terminal_decision=stale_failure,
                 )
+            release = _release_invocation_command_with_cleanup_authority(
+                ReleaseInvocationCommand(
+                    session_id=session_id,
+                    expected_session_instance_id=admitted.session.instance_id,
+                    expected_run_epoch=admitted.session.run_epoch,
+                    expected_active_profile=admitted.active_invocation_profile,
+                    terminal_session_event=terminal_event,
+                )
+            )
+            if runtime_envelope:
+                released = await store.apply_invocation_lifecycle_command(release)
+                assert released.session.run_epoch == admitted.session.run_epoch + 1
+                assert released.replayed is False
+                replayed_release = await store.apply_invocation_lifecycle_command(release)
+                assert replayed_release.replayed is True
+                assert replayed_release.session == released.session
+            else:
+                with pytest.raises(
+                    SessionRunFenced, match="exact durable terminal session evidence"
+                ):
+                    await store.apply_invocation_lifecycle_command(release)
         finally:
             await store.release_run_fence(session_id)
             await _close_store(store)

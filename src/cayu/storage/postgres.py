@@ -28798,6 +28798,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 projection_bytes,
                             ),
                         )
+                    await self._record_invocation_terminal_event_receipts(
+                        cur, session_id, committed_events, activity_at=updated_at
+                    )
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         session_id,
@@ -29602,9 +29605,24 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             """,
             rows,
         )
+        await self._record_invocation_terminal_event_receipts(
+            cur, session_id, copied_events, activity_at=activity_at
+        )
+        await self._enqueue_persisted_event_side_effects(cur, session_id, copied_events)
+
+    async def _record_invocation_terminal_event_receipts(
+        self,
+        cur: Any,
+        session_id: str,
+        events: Sequence[Event],
+        *,
+        activity_at: datetime,
+    ) -> None:
+        """Persist release evidence for terminal events in the owning transaction."""
+
         terminal_events = tuple(
             event
-            for event in copied_events
+            for event in events
             if event.type
             in {
                 EventType.SESSION_COMPLETED,
@@ -29638,7 +29656,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     for receipt_key, receipt_record in terminal_receipts
                 ],
             )
-        await self._enqueue_persisted_event_side_effects(cur, session_id, copied_events)
 
     async def _append_event_once_with_cursor(
         self,

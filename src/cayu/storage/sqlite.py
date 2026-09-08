@@ -1598,6 +1598,21 @@ def _append_events_in_transaction(
         """,
         rows,
     )
+    _record_invocation_terminal_event_receipts(
+        connection, session_id, events, activity_at=activity_at
+    )
+    _enqueue_persisted_event_side_effects(connection, session_id, events)
+
+
+def _record_invocation_terminal_event_receipts(
+    connection: sqlite3.Connection,
+    session_id: str,
+    events: Sequence[Event],
+    *,
+    activity_at: datetime,
+) -> None:
+    """Persist release evidence for terminal events in the owning transaction."""
+
     terminal_events = tuple(
         event
         for event in events
@@ -1639,7 +1654,6 @@ def _append_events_in_transaction(
                 for receipt_key, receipt_record in terminal_receipts
             ],
         )
-    _enqueue_persisted_event_side_effects(connection, session_id, events)
 
 
 def _append_event_once_in_transaction(
@@ -6254,6 +6268,9 @@ class SQLiteSessionStore(SessionStore):
                             projection_bytes,
                         ),
                     )
+                _record_invocation_terminal_event_receipts(
+                    connection, session_id, committed_events, activity_at=updated_at
+                )
                 _enqueue_persisted_event_side_effects(
                     connection,
                     session_id,
