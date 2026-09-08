@@ -1485,7 +1485,7 @@ def test_automatic_compaction_rejects_rewritten_settlement_classification() -> N
     )
 
     async def scenario():
-        return [
+        events = [
             event
             async for event in app.run(
                 RunRequest(
@@ -1499,6 +1499,14 @@ def test_automatic_compaction_rejects_rewritten_settlement_classification() -> N
                 )
             )
         ]
+        active = await app.session_store.load_active_model_completion_stage(
+            "sess_compaction_rewritten_settlement_kind"
+        )
+        assert active is not None
+        assert active.stage.state == "completed"
+        assert active.stage.purpose == "context-compaction"
+        assert active.stage.publication is not None
+        return events
 
     events = asyncio.run(scenario())
 

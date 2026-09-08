@@ -8474,55 +8474,60 @@ class SessionEngine:
             failed_before_effect = (
                 not model_completion_dispatched or provider_rejected_before_effect
             )
-            if failed_before_effect:
-                await close_context_exposure_without_provider_effect(
-                    store=self.session_store,
-                    session_id=session.id,
-                    stage_id=active_model_completion.stage.stage_id,
-                    stage_intent=active_model_completion.stage.intent,
-                    evidence_ref_suffix="provider-effect-absent",
-                )
-            else:
-                await close_unrecoverable_context_exposure(
-                    store=self.session_store,
-                    session_id=session.id,
-                    stage_id=active_model_completion.stage.stage_id,
-                    stage_intent=active_model_completion.stage.intent,
-                )
-            if not model_completion_dispatched:
-                await self._run_limit_controller.release_pre_provider_dispatch_reservations(
-                    reservation_ids=active_model_completion.stage.reservation_ids,
-                    recovery_contexts=budget_recovery_contexts,
-                    dispatch_id=budget_dispatch_id,
-                )
+            if active_model_completion.stage.state == "in_flight":
+                if failed_before_effect:
+                    await close_context_exposure_without_provider_effect(
+                        store=self.session_store,
+                        session_id=session.id,
+                        stage_id=active_model_completion.stage.stage_id,
+                        stage_intent=active_model_completion.stage.intent,
+                        evidence_ref_suffix="provider-effect-absent",
+                    )
+                else:
+                    await close_unrecoverable_context_exposure(
+                        store=self.session_store,
+                        session_id=session.id,
+                        stage_id=active_model_completion.stage.stage_id,
+                        stage_intent=active_model_completion.stage.intent,
+                    )
+                if not model_completion_dispatched:
+                    await self._run_limit_controller.release_pre_provider_dispatch_reservations(
+                        reservation_ids=active_model_completion.stage.reservation_ids,
+                        recovery_contexts=budget_recovery_contexts,
+                        dispatch_id=budget_dispatch_id,
+                    )
             await self._run_limit_controller.require_model_completion_reservation_settlements(
                 reservation_ids=active_model_completion.stage.reservation_ids,
                 recovery_contexts=budget_recovery_contexts,
                 dispatch_id=budget_dispatch_id,
             )
-            model_completion_settlement = model_completion_stage_settlement_request(
-                active_model_completion.stage,
-                interaction_id=interaction_id,
-                disposition=(
-                    ModelCompletionStageDisposition.FAILED_BEFORE_PROVIDER_EFFECT
-                    if failed_before_effect
-                    else ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
-                ),
-                reason_code=(
-                    "provider_authentication_failed"
-                    if provider_rejected_before_effect
-                    else (
-                        "model_attempt_failed"
-                        if to_status is SessionStatus.FAILED
-                        else "model_attempt_interrupted"
-                    )
-                ),
-                execution_profile_fingerprint=(
-                    None if execution_profile is None else execution_profile.fingerprint
-                ),
-                settlement_run_epoch=session.run_epoch,
-                settled_reservation_ids=active_model_completion.stage.reservation_ids,
-            )
+            # Accepted completions still require exact accounting settlement,
+            # but retain their publication evidence instead of receiving an
+            # in-flight provider-effect disposition.
+            if active_model_completion.stage.state == "in_flight":
+                model_completion_settlement = model_completion_stage_settlement_request(
+                    active_model_completion.stage,
+                    interaction_id=interaction_id,
+                    disposition=(
+                        ModelCompletionStageDisposition.FAILED_BEFORE_PROVIDER_EFFECT
+                        if failed_before_effect
+                        else ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+                    ),
+                    reason_code=(
+                        "provider_authentication_failed"
+                        if provider_rejected_before_effect
+                        else (
+                            "model_attempt_failed"
+                            if to_status is SessionStatus.FAILED
+                            else "model_attempt_interrupted"
+                        )
+                    ),
+                    execution_profile_fingerprint=(
+                        None if execution_profile is None else execution_profile.fingerprint
+                    ),
+                    settlement_run_epoch=session.run_epoch,
+                    settled_reservation_ids=active_model_completion.stage.reservation_ids,
+                )
         if interaction_id is None:
             if expected_recovery_claim_id is not None and only_if_no_queued_messages:
                 raise ValueError(
