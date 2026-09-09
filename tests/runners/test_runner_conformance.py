@@ -47,6 +47,17 @@ ORPHAN_OBSERVATION_DELAY_SECONDS = 0.6
 SETSID_PROBE = "if setsid -w true >/dev/null 2>&1; then "
 
 
+def _local_process_running(pid: int) -> bool:
+    try:
+        if sys.platform == "linux":
+            state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            return state.rpartition(")")[2].split()[0] != "Z"
+        os.kill(pid, 0)
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return True
+
+
 async def _local_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> RunnerHarness:
     return RunnerHarness(LocalRunner(root, inherit_env=False), root)
 
@@ -1515,6 +1526,7 @@ def test_runner_conformance_cancellation_cannot_leave_command_running(
         harness = await registration.factory(tmp_path, monkeypatch)
         started = tmp_path / "started.txt"
         orphan = tmp_path / "orphan.txt"
+        release = tmp_path / "release.txt"
         try:
             task = asyncio.create_task(
                 harness.runner.exec(
@@ -1522,28 +1534,34 @@ def test_runner_conformance_cancellation_cannot_leave_command_running(
                         sys.executable,
                         "-c",
                         (
-                            "import pathlib,time; "
-                            "pathlib.Path('started.txt').write_text('started'); "
-                            f"time.sleep({ORPHAN_WRITE_DELAY_SECONDS}); "
-                            "pathlib.Path('orphan.txt').write_text('orphan')"
+                            "import os,pathlib,time\n"
+                            "pathlib.Path('started.txt').write_text(str(os.getpid()))\n"
+                            "while not pathlib.Path('release.txt').exists():\n"
+                            "    time.sleep(0.01)\n"
+                            "pathlib.Path('orphan.txt').write_text('orphan')\n"
                         ),
                     )
                 )
             )
-            for _ in range(100):
-                if started.exists():
-                    break
-                await asyncio.sleep(0.02)
-            assert started.exists()
+            async with asyncio.timeout(10):
+                while not started.exists() or not started.read_text(encoding="utf-8"):
+                    await asyncio.sleep(0.02)
+            child_pid = int(started.read_text(encoding="utf-8"))
+            assert _local_process_running(child_pid)
             task.cancel()
             with pytest.raises(asyncio.CancelledError) as exc_info:
                 await task
             evidence.cleanup_artifact = getattr(exc_info.value, "artifacts", None)
-            await asyncio.sleep(ORPHAN_OBSERVATION_DELAY_SECONDS)
+            # The child cannot perform its mutation before cancellation, however
+            # long the parent is descheduled. Prove it stopped before releasing
+            # that gate, rather than inferring cleanup from a timed observation.
             evidence.observed = {
                 "started": started.exists(),
+                "child_running": _local_process_running(child_pid),
                 "orphan": orphan.exists(),
             }
+            assert not evidence.observed["child_running"]
+            release.touch()
             assert not orphan.exists()
 
             after = await harness.runner.exec(
@@ -1556,6 +1574,7 @@ def test_runner_conformance_cancellation_cannot_leave_command_running(
             }
             assert after.stdout == "reusable\n"
         finally:
+            release.touch()
             await harness.aclose()
 
     with evidence.reporting():

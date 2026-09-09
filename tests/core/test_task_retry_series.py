@@ -3141,6 +3141,115 @@ def test_task_worker_reconciles_lost_retry_settlement_acknowledgement() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("acknowledged", [True, False])
+def test_retry_settlement_waits_for_inflight_heartbeat_acknowledgement(
+    store_kind: str,
+    acknowledged: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.runtime._task_lease_authority import TaskLeaseAuthority
+    from cayu.runtime.task_worker import (
+        _renew_task_lease_before_deadline,
+        _settle_task_retry_request_with_lease_authority,
+    )
+
+    async def run() -> None:
+        clock = _MutableClock(datetime(2026, 8, 19, 12, tzinfo=UTC))
+        store = _store_for_kind(store_kind, tmp_path / "heartbeat-ack.sqlite", clock)
+        committed = asyncio.Event()
+        release_ack = asyncio.Event()
+        receipt_checked = asyncio.Event()
+        heartbeat = store.heartbeat
+        load_receipt = store.load_task_retry_settlement
+
+        async def delayed_heartbeat(*args, **kwargs):
+            updated = await heartbeat(*args, **kwargs)
+            committed.set()
+            await release_ack.wait()
+            if not acknowledged:
+                raise TaskClaimLost("heartbeat acknowledgement lost")
+            return updated
+
+        async def observed_receipt(*args, **kwargs):
+            receipt = await load_receipt(*args, **kwargs)
+            receipt_checked.set()
+            return receipt
+
+        monkeypatch.setattr(store, "heartbeat", delayed_heartbeat)
+        monkeypatch.setattr(store, "load_task_retry_settlement", observed_receipt)
+        await store.create_task(
+            TaskCreate(type="job", retry_policy=TaskRetryPolicy(max_attempts=1))
+        )
+        claimed = await store.claim_task("owner", lease_seconds=30)
+        assert claimed is not None
+        assert claimed.lease_expires_at is not None
+        authority = TaskLeaseAuthority(claimed.lease_expires_at)
+        clock.value += timedelta(seconds=1)
+        renewal = asyncio.create_task(
+            _renew_task_lease_before_deadline(
+                store,
+                claimed.id,
+                "owner",
+                30,
+                lease_authority=authority,
+                handoff_id=None,
+                claim_deadline_monotonic=time.monotonic() + 30,
+            )
+        )
+        settlement = None
+        try:
+            await asyncio.wait_for(committed.wait(), timeout=3)
+            request = TaskRetrySettlementRequest(
+                task_id=claimed.id,
+                worker_id="owner",
+                lease_expires_at=claimed.lease_expires_at,
+                idempotency_key="heartbeat-ack-settlement",
+                causal_budget_id=_retry_causal_budget_id(claimed),
+                disposition=TaskRetryAttemptDisposition.SUCCEEDED,
+                token_count=7,
+                estimated_cost=Decimal("0.10"),
+                result={"ok": True},
+            )
+            settlement = asyncio.create_task(
+                _settle_task_retry_request_with_lease_authority(store, request, authority)
+            )
+            await asyncio.wait_for(receipt_checked.wait(), timeout=3)
+            release_ack.set()
+            if acknowledged:
+                await renewal
+                result = await asyncio.wait_for(settlement, timeout=3)
+                assert result.task.status is TaskStatus.COMPLETED
+                assert result.task.retry_series is not None
+                assert result.task.retry_series.cumulative_tokens == 7
+                assert result.task.retry_series.cumulative_estimated_cost == Decimal("0.10")
+                replay = await _settle_task_retry_request_with_lease_authority(
+                    store, request, authority
+                )
+                assert replay == result
+                receipt = await load_receipt(claimed.id, request.idempotency_key)
+                assert receipt is not None
+                assert result == receipt
+            else:
+                with pytest.raises(TaskClaimLost, match="acknowledgement lost"):
+                    await renewal
+                with pytest.raises(TaskClaimLost):
+                    await asyncio.wait_for(settlement, timeout=3)
+                assert authority.lease_expires_at == claimed.lease_expires_at
+                assert await load_receipt(claimed.id, request.idempotency_key) is None
+        finally:
+            release_ack.set()
+            pending = [renewal] + ([settlement] if settlement is not None else [])
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await _close(store)
+
+    asyncio.run(run())
+
+
 def test_task_retry_worker_retains_lease_and_settles_before_redelivering_cancellation() -> None:
     class BlockingSettlementStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True

@@ -182,9 +182,20 @@ def _send_worker_payload_then_settle_shutdown(
 def _linux_process_running(pid: int) -> bool:
     try:
         state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return state != "Z"
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, ProcessLookupError])
+def test_linux_process_running_handles_exit_during_proc_read(
+    monkeypatch: pytest.MonkeyPatch, error: type[OSError]
+) -> None:
+    def disappeared(_path, **_kwargs):
+        raise error("process exited during proc read")
+
+    monkeypatch.setattr(Path, "read_text", disappeared)
+    assert not _linux_process_running(123)
 
 
 def _worktree_subprocess_environment() -> dict[str, str]:

@@ -96,6 +96,11 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     shards = _job_block(workflow, "test_shards")
     specialists = _job_block(workflow, "test_specialists")
 
+    for job in (shards, specialists):
+        assert "command -v rg" in job
+        assert "sudo apt-get install --yes ripgrep" in job
+        assert job.index("sudo apt-get install --yes ripgrep") < job.index("scripts/run_ci.py")
+
     assert "github.event_name == 'pull_request'" not in shards
     assert "timeout-minutes: 15" in shards
     assert (

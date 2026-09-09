@@ -3649,8 +3649,12 @@ async def _settle_task_retry_request_with_lease_authority(
                 task_store,
                 effective_request,
             )
-        if lease_authority.lease_expires_at == effective_lease:
-            raise last_claim_loss
+        # A renewal may have committed while its acknowledgement is still pending.
+        # Wait for that renewal before deciding whether this generation was lost;
+        # keep the store settlement itself outside the lock so heartbeats can run.
+        async with lease_authority.lock:
+            if lease_authority.lease_expires_at == effective_lease:
+                raise last_claim_loss
 
     assert last_claim_loss is not None
     raise last_claim_loss

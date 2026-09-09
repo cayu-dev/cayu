@@ -457,6 +457,7 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
     clock, tmp_path, store_kind, entrypoint, tool_count
 ):
     from cayu import CayuConfig, Tool, ToolExecutionConfig, ToolResult, ToolSpec
+    from cayu.deadlines import _TIMERS
     from cayu.workflows import StepError
 
     seen = []
@@ -478,8 +479,13 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
             )
             # Expire only once every tool is admitted, including parallel children.
             if len(seen) == tool_count:
-                clock.wall += timedelta(seconds=1)
-                clock.mono += 1
+                clock.wall += timedelta(seconds=3600)
+                clock.mono += 3600
+                # Expire the real asyncio timers only after admission. A short
+                # setup timer races SQLite I/O on a busy CI host.
+                for timer, _deadline in _TIMERS.get():
+                    if timer.when() is not None:
+                        timer.reschedule(asyncio.get_running_loop().time())
             try:
                 await asyncio.Event().wait()
                 return ToolResult(content="unexpected")
@@ -518,7 +524,7 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
         )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="worker", model="scripted-model"), tools=[BlockingTool()])
-        boundary = ExecutionDeadline.after(1)
+        boundary = ExecutionDeadline.after(3600)
         events = []
         if entrypoint == "run":
             with pytest.raises(TimeoutError) as failure:
@@ -569,7 +575,11 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
         await asyncio.sleep(0)
         assert loop_errors == []
 
-    asyncio.run(run())
+    async def bounded_run():
+        async with asyncio.timeout(30):
+            await run()
+
+    asyncio.run(bounded_run())
 
 
 def test_failed_step_retry_does_not_receive_a_fresh_child_duration(clock):
