@@ -207,6 +207,12 @@ Notes:
   egress factory supplies this callback automatically. Release callbacks are
   cancellation-safe and bounded to 15 seconds by default; set
   `release_timeout_s` on the result when the provider needs a different bound.
+  If binding fails for a newly created recoverable allocation, Cayu then
+  fences its exact published receipt into `REAPING` and calls the factory's
+  `reap_allocation` hook. Cleanup completes only after the provider records
+  `REAPED`; errors and timeouts remain owned by `drain_environment_cleanups`.
+  Reconnected allocations remain preserved. Wrappers around recoverable
+  factories must forward `reap_allocation` as well as `create_recoverable`.
   Code that calls a factory directly, outside `CayuApp`, assumes the same
   obligation and must release a result whose binding never succeeds.
 - `EnvironmentFactoryResult.environment` must be **exactly** an `Environment` (not a

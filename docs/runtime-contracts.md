@@ -1990,18 +1990,24 @@ runner, vault, reconnect, command, or credential objects.
 
 A result that owns live reconnectable resources provides an explicit `release`
 callback. Before binding adopts it, binding failure or cancellation invokes
-that callback once with `PRESERVE`, because reconnect identity is already
-checkpointed. A generic process-local result rejected by final admission is
-released with `DISCARD`; only after release positively completes does Cayu
+that callback once with `PRESERVE` to detach host-side handles. For a newly
+created recoverable allocation, the live failed-binding owner then atomically
+revokes the exact published receipt into `REAPING`, fenced by session instance,
+run epoch, and allocation identity, and invokes the factory's `reap_allocation`
+hook. This release is reported as `DISCARD`; success requires durable `REAPED`
+evidence after physical disposal. Reaper failures, cancellation, and timeouts
+remain owned by the public environment cleanup drain; retries only settle that
+allocation and never provision, bind, or dispatch model/tool work. Reconnect
+results retain their allocation. A generic process-local result rejected by final
+admission is released with `DISCARD`; only after release positively completes does Cayu
 atomically retire its exact reconnect identity. Commit-then-raise retirement is
-reconciled by the exact tombstone. A recoverable process-external allocation is
-never deleted by this generic path: it remains `PRESERVE`d for its durable
-provider-owned reaper. Release runs to its result-level `release_timeout_s`
+reconciled by the exact tombstone. Generic result release never directly deletes
+a recoverable allocation: deletion requires its durable provider-owned reaper. Release runs to its result-level `release_timeout_s`
 bound despite caller cancellation (15 seconds by default), after which the
 original cancellation remains authoritative. If a durable result omits its
-required callback, Cayu leaves the allocation untouched and records that
-limitation. After binding succeeds, the binding owns both the source and final
-runner and the factory release callback is no longer invoked.
+required callback and has no fresh allocation reaper, Cayu leaves the allocation
+untouched and records that limitation. After binding succeeds, the binding owns
+both the source and final runner and the factory release callback is no longer invoked.
 
 Forks copy reconnect metadata only as source context: the first child request
 is an explicit create, and later child resumes reconnect the child's own

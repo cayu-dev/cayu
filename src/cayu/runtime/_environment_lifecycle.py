@@ -511,6 +511,7 @@ class _ActiveEnvironmentSetup:
     disposal_recovery_factory: EnvironmentFactory | None = field(default=None, repr=False)
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = field(default=None, repr=False)
+    rejected_binding_cleanup: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     cleanup_predecessor_context: InvocationContext | None = field(default=None, repr=False)
     cleanup_started: bool = False
     cleanup_finished: bool = False
@@ -2746,6 +2747,20 @@ class EnvironmentLifecycle:
                 _ActiveEnvironmentSetup(
                     registered_environment=resolved_environment,
                     disposal_recovery_factory=factory,
+                    rejected_binding_cleanup=(
+                        None
+                        if allocation_context is None
+                        else self._new_allocation_binding_cleanup(
+                            session=session,
+                            factory=factory,
+                            release=result.release,
+                            request=request,
+                            receipt=EnvironmentAllocationReceipt(
+                                intent=allocation_context.intent,
+                                reconnect_metadata=reconnect_metadata,
+                            ),
+                        )
+                    ),
                     execution_profile=execution_profile,
                     invocation_context=(
                         None
@@ -3798,6 +3813,95 @@ class EnvironmentLifecycle:
                 raise progress_error from original_error
         return payload
 
+    def _new_allocation_binding_cleanup(
+        self,
+        *,
+        session: Session,
+        factory: EnvironmentFactory,
+        release: Callable[[EnvironmentFactoryReleaseAction], Awaitable[None]] | None,
+        request: EnvironmentFactoryRequest,
+        receipt: EnvironmentAllocationReceipt,
+    ) -> Callable[[], Awaitable[None]]:
+        """Keep CREATE authority with its live owner until binding adopts it."""
+        record: EnvironmentAllocationRecord | None = None
+        release_task: asyncio.Task[None] | None = None
+        release_settled = False
+
+        async def cleanup() -> None:
+            nonlocal record, release_task, release_settled
+            if release is not None and not release_settled:
+                if release_task is None:
+
+                    async def detach() -> None:
+                        await release(EnvironmentFactoryReleaseAction.PRESERVE)
+
+                    release_task = asyncio.create_task(detach())
+                # A host-only handoff cannot stand in for the whole discard.
+                # Retain this continuation until every detach owner settles.
+                await _settle_environment_factory_release(release_task)
+                release_settled = True
+            if record is None:
+                record = await self._allocation_coordinator.reclaim_rejected_binding_publication(
+                    session=session, receipt=receipt
+                )
+            current = await self._allocation_coordinator.load_record(
+                session_id=session.id, environment_name=request.environment_name
+            )
+            if (
+                current is None
+                or current.intent != receipt.intent
+                or current.reconnect_metadata != receipt.reconnect_metadata
+                or current.state
+                not in {
+                    EnvironmentAllocationState.REAPING,
+                    EnvironmentAllocationState.REAPED,
+                }
+            ):
+                raise RuntimeError("Rejected binding cleanup lost its exact allocation.")
+            if current.state is EnvironmentAllocationState.REAPED:
+                return
+            allocation = self._allocation_coordinator.context(
+                session_id=session.id,
+                inherited_owner_session_id=None,
+                environment_name=request.environment_name,
+                scope=receipt.intent.scope,
+                existing=current,
+            )
+            await factory.reap_allocation(request, allocation)
+            current = await self._allocation_coordinator.load_record(
+                session_id=session.id, environment_name=request.environment_name
+            )
+            if (
+                current is None
+                or current.intent != receipt.intent
+                or current.reconnect_metadata != receipt.reconnect_metadata
+                or current.state is not EnvironmentAllocationState.REAPED
+            ):
+                raise RuntimeError("Rejected binding allocation cleanup remains pending.")
+
+        def start() -> asyncio.Task[None]:
+            nonlocal release_task
+            if release_task is not None and not release_settled:
+                replacement = retry_environment_factory_cleanup_settlement_task(release_task)
+                if replacement is not release_task:
+                    release_task = replacement
+                else:
+                    for task in _environment_factory_release_retryable_handoffs(release_task):
+                        retry_environment_factory_cleanup_settlement_task(task)
+            task = asyncio.create_task(cleanup())
+            register_environment_factory_cleanup_retry(task, start)
+            return task
+
+        async def settle() -> None:
+            task = start()
+            try:
+                await asyncio.shield(task)
+            except BaseException as exc:
+                attach_environment_factory_cleanup_settlement_task(exc, task)
+                raise
+
+        return settle
+
     async def _release_unexposed_factory_environment(
         self,
         registered_environment: runtime_records.RegisteredEnvironment,
@@ -3810,13 +3914,27 @@ class EnvironmentLifecycle:
         execution_profile: ExecutionProfileIdentity | None,
         events: list[Event],
         release_failed_binding_reservations: Callable[[], None] | None = None,
+        rejected_binding_cleanup: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[runtime_records.RegisteredEnvironment, dict[str, Any] | None]:
         result = registered_environment.unclaimed_factory_result
         if result is None:
             return registered_environment, None
-        # Resolution checkpoints every factory result before returning it to
-        # binding. Once committed, release may detach live handles but must not
-        # destroy the durable allocation that a later resume will reconnect.
+        if rejected_binding_cleanup is not None:
+            action = EnvironmentFactoryReleaseAction.DISCARD
+
+            async def release_and_reap(action: EnvironmentFactoryReleaseAction) -> None:
+                await rejected_binding_cleanup()
+
+            result = replace(result, release=release_and_reap)
+            # A failed source reservation has no release callback of its own.
+            # Still retain failed/timed-out reaping as a public drain owner.
+            if release_failed_binding_reservations is None:
+
+                def release_failed_binding_reservations() -> None:
+                    pass
+
+        # Existing allocations remain reconnectable. A fresh failed binding
+        # instead revokes its exact receipt before provider-owned reaping.
         release_payload = await self._release_factory_result_with_progress(
             result,
             action=action,
@@ -4381,6 +4499,9 @@ class EnvironmentLifecycle:
                     execution_profile=execution_profile,
                     events=events,
                     release_failed_binding_reservations=(release_failed_binding_reservations),
+                    rejected_binding_cleanup=(
+                        None if setup_owner is None else setup_owner.rejected_binding_cleanup
+                    ),
                 )
             finally:
                 self._transfer_deferred_factory_cleanup(

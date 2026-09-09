@@ -32,6 +32,7 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     SQLiteSessionStore,
+    WorkspaceBinding,
 )
 
 
@@ -54,6 +55,13 @@ async def _child(root: Path, mode: str, fault: str) -> None:
                 and checkpoint.get("environment_factory_allocation_receipts")
             ):
                 os._exit(73)
+            if (
+                mode == "run"
+                and fault == "binding_rejection"
+                and record is not None
+                and record["state"] == "reaping"
+            ):
+                os._exit(75)
             if mode == "after_reaped" and record is not None and record["state"] == "reaped":
                 os._exit(74)
             if (
@@ -64,6 +72,13 @@ async def _child(root: Path, mode: str, fault: str) -> None:
             ):
                 self.lost_ack = True
                 raise TimeoutError("lost cleanup store acknowledgement")
+
+    class RejectedBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):
+            raise ValueError("fixture binding rejected")
+
+        async def finalize(self, bound, **kwargs):
+            raise AssertionError("Rejected binding must not finalize")
 
     class Factory(EnvironmentFactory):
         @property
@@ -120,7 +135,10 @@ async def _child(root: Path, mode: str, fault: str) -> None:
                     path.unlink(missing_ok=True)
 
             return EnvironmentFactoryResult(
-                environment=Environment(EnvironmentSpec(name=request.environment_name)),
+                environment=Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    binding=RejectedBinding() if fault == "binding_rejection" else None,
+                ),
                 reconnect_metadata=reconnect,
                 release=release,
             )
@@ -387,3 +405,24 @@ def test_valid_continuation_reconnects_exact_published_allocation(tmp_path: Path
     calls = (tmp_path / "calls.jsonl").read_text()
     assert calls.count('"create"') == 1
     assert calls.count('"reconnect"') == 1
+
+
+def test_failed_binding_reaping_survives_process_loss_after_transcript_publication(tmp_path: Path):
+    process = _process(tmp_path, "run", "binding_rejection")
+    assert process.returncode == 75, process.stderr
+    assert len(list(tmp_path.glob("*.resource"))) == 1
+    (tmp_path / "advance_store_clock").touch()
+    result = _recover(tmp_path)
+    assert "reaped_allocation" in result["actions"]
+    assert not list(tmp_path.glob("*.resource"))
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text())
+    assert "initial_transcript_pending" not in checkpoint
+    assert checkpoint["environment_factory_allocation_intents"]["remote"]["state"] == "reaped"
+    assert _recover(tmp_path, "repeat")["actions"] == ["skipped_terminal"]
+    events = json.loads((tmp_path / "events.json").read_text())
+    assert any(event["type"] == "environment.factory.completed" for event in events)
+    assert not any(event["type"] == "model.requested" for event in events)
+    calls = (tmp_path / "calls.jsonl").read_text()
+    assert calls.count('"create"') == 1
+    assert calls.count('"reap"') == 1
+    assert '"reconnect"' not in calls

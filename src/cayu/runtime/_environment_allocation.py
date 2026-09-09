@@ -616,6 +616,33 @@ class EnvironmentAllocationCoordinator:
         This requires a claimed session epoch and the still-unpublished initial
         transcript. It cannot revoke an allocation from a valid continuation.
         """
+        return await self._reclaim_publication(
+            session=session, receipt=receipt, require_pending_transcript=True
+        )
+
+    async def reclaim_rejected_binding_publication(
+        self,
+        *,
+        session: Session,
+        receipt: EnvironmentAllocationReceipt,
+    ) -> EnvironmentAllocationRecord:
+        """Fence a fresh allocation retained by the live failed-binding owner.
+
+        Unlike abandoned-process recovery, the caller owns the exact result of
+        CREATE and has settled its failed bind without exposing the environment.
+        Initial transcript publication may already have completed.
+        """
+        return await self._reclaim_publication(
+            session=session, receipt=receipt, require_pending_transcript=False
+        )
+
+    async def _reclaim_publication(
+        self,
+        *,
+        session: Session,
+        receipt: EnvironmentAllocationReceipt,
+        require_pending_transcript: bool,
+    ) -> EnvironmentAllocationRecord:
         name = receipt.intent.environment_name
         desired = EnvironmentAllocationRecord(
             intent=receipt.intent,
@@ -635,7 +662,10 @@ class EnvironmentAllocationCoordinator:
             existing = allocation_record_from_checkpoint(checkpoint, environment_name=name)
             if existing == desired:
                 return checkpoint
-            if _initial_transcript_pending_interaction_id(checkpoint) is None:
+            if (
+                require_pending_transcript
+                and _initial_transcript_pending_interaction_id(checkpoint) is None
+            ):
                 raise EnvironmentAllocationTransitionConflict(
                     "Initial setup is no longer abandoned."
                 )
