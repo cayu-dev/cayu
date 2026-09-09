@@ -47,6 +47,7 @@ from cayu.providers._http import (
     sanitize_provider_cancellation,
     validate_base_url,
 )
+from cayu.providers._openai_protocol import protocol_exception_fields
 from cayu.providers._thinking import validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountResult,
@@ -73,7 +74,9 @@ from cayu.providers.openai import (
     OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN,
     HttpxOpenAITransport,
     OpenAIAPIError,
+    OpenAIProtocolError,
     OpenAITransport,
+    OpenAIUnsupportedSearchSourceError,
     _effective_openai_request_options,
     _openai_tool,
     _preflight_openai_hosted_tools,
@@ -1170,6 +1173,23 @@ def _safe_subscription_error_event(
         retry_after_s = getattr(exc, "retry_after_s", None)
         if type(retry_after_s) in {int, float}:
             payload["retry_after_s"] = retry_after_s
+    if isinstance(exc, OpenAIProtocolError):
+        # Match the API adapter's bounded unknown-provider retry classification.
+        # Only the canonical projector may copy protocol evidence across this boundary.
+        payload["provider"] = provider_name
+        payload["provider_error_type"] = "protocol_error"
+        if isinstance(exc, OpenAIUnsupportedSearchSourceError):
+            payload["provider_error_type"] = "unsupported_capability"
+            payload["retryable"] = False
+        payload.update(
+            protocol_exception_fields(
+                exc,
+                credential_values=credential_sanitization_values(
+                    *_subscription_credential_values(credentials),
+                    *extra_header_values,
+                ),
+            )
+        )
     if isinstance(exc, ProviderStreamCleanupError):
         payload["stream_cleanup_failed"] = True
     return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import traceback
 from collections.abc import Mapping
 from typing import Any
@@ -24,13 +25,19 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamDeadlineError,
     ModelStreamEventType,
+    OpenAIProvider,
     OpenAIWebSearch,
 )
+from cayu.providers._openai_protocol import SearchSourceDiagnostic
 from cayu.providers.deadlines import (
     ProviderDeadlineKind,
     ProviderStreamDeadlineEvidence,
 )
-from cayu.providers.openai import OpenAIAPIError
+from cayu.providers.openai import (
+    OpenAIAPIError,
+    OpenAIProtocolError,
+    OpenAIUnsupportedSearchSourceError,
+)
 from cayu.providers.openai_subscription import (
     OpenAISubscriptionAuthError,
     OpenAISubscriptionCredentials,
@@ -929,3 +936,182 @@ async def test_subscription_deadline_uses_execution_provider_identity() -> None:
     model_error = next(event for event in durable_events if event.type is EventType.MODEL_ERROR)
     assert model_error.payload["provider"] == "openai_subscription"
     assert model_error.payload["model_attempt_id"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("recover", [True, False])
+async def test_subscription_protocol_diagnostics_and_unknown_retry_match_api(recover: bool) -> None:
+    results = []
+    for adapter in ("api", "subscription"):
+
+        class SequencedTransport(RecordingTransport):
+            async def stream_response_events(self, **kwargs: Any):
+                self.calls.append(dict(kwargs))
+                if len(self.calls) == 1 or not recover:
+                    yield {
+                        "type": "response.web_search_call.completed",
+                        "output_index": 10,
+                        "item_id": "ws_synthetic",
+                    }
+                else:
+                    yield {"type": "response.output_text.delta", "delta": "recovered"}
+                    yield {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_synthetic",
+                            "model": "gpt-5.4",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {},
+                        },
+                    }
+
+        transport = SequencedTransport()
+        provider = (
+            OpenAIProvider(api_key="synthetic", transport=transport)
+            if adapter == "api"
+            else OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport)
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                    max_steps=1,
+                    retry_policy=RetryPolicy(
+                        max_attempts=10,
+                        max_unknown_attempts=2,
+                        initial_delay_s=0,
+                    ),
+                )
+            )
+        ]
+        assert len(transport.calls) == 2
+        errors = [event.payload for event in events if event.type == EventType.MODEL_ERROR]
+        retries = [event.payload for event in events if event.type == EventType.MODEL_RETRY]
+        assert len(errors) == (1 if recover else 2)
+        assert len(retries) == 1
+        assert errors[0]["retry_disposition"] == "retry_scheduled"
+        for error in errors:
+            assert error["provider_error_type"] == "protocol_error"
+            assert error["reason"] == "unknown_provider"
+            assert error["effective_max_attempts"] == 2
+            assert error["provider_protocol_reason"] == (
+                "web_search_lifecycle_arrived_before_output_item_added"
+            )
+            trace = error["provider_protocol_stream_trace"]
+            assert len(trace) < 4096
+            assert json.loads(trace)[-1][1] == "response.web_search_call.completed"
+            assert "ws_synthetic" not in trace
+        if not recover:
+            assert errors[-1]["retry_disposition"] == "unknown_provider_attempt_cap"
+            assert errors[-1]["attempt"] == 2
+        assert events[-1].type == (
+            EventType.SESSION_COMPLETED if recover else EventType.SESSION_FAILED
+        )
+        results.append(
+            [
+                {
+                    key: value
+                    for key, value in error.items()
+                    if key.startswith("provider_protocol_")
+                    or key
+                    in {
+                        "retry_disposition",
+                        "effective_max_attempts",
+                        "attempt",
+                        "reason",
+                    }
+                }
+                for error in errors
+            ]
+        )
+    assert results[0] == results[1]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure_kind", ["unsupported_source", "explicit_nonretryable"])
+@pytest.mark.parametrize(
+    "credential_field", ["access_token", "refresh_token", "account_id", "header"]
+)
+async def test_subscription_protocol_projection_redacts_credentials_and_stays_nonretryable(
+    failure_kind: str,
+    credential_field: str,
+) -> None:
+    # A valid diagnostic label must still be omitted when it is a credential.
+    credential = "file"
+
+    class CanaryAuth:
+        async def credentials(self):
+            values = {
+                "access_token": "synthetic-access",
+                "refresh_token": "synthetic-refresh",
+                "account_id": "synthetic-account",
+            }
+            if credential_field != "header":
+                values[credential_field] = credential
+            return OpenAISubscriptionCredentials(expires_at=2_000_000_000, **values)
+
+    class FailingTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs: Any):
+            self.calls.append(dict(kwargs))
+            diagnostic = SearchSourceDiagnostic.from_value(0, credential)
+            if failure_kind == "unsupported_source":
+                exc = OpenAIUnsupportedSearchSourceError(source_diagnostic=diagnostic)
+            else:
+                exc = OpenAIProtocolError(
+                    "synthetic-access synthetic-refresh synthetic-account file",
+                    reason_code="web_search_action_sources_type_is_unsupported",
+                    source_diagnostic=diagnostic,
+                )
+                exc.retryable = False
+            raise exc
+            yield  # pragma: no cover
+
+    transport = FailingTransport()
+    provider = OpenAISubscriptionProvider(
+        auth=CanaryAuth(),
+        transport=transport,
+        extra_headers={"x-private": credential} if credential_field == "header" else {},
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(
+                    max_attempts=10, max_unknown_attempts=2, initial_delay_s=0
+                ),
+            )
+        )
+    ]
+    assert len(transport.calls) == 1
+    assert not any(event.type == EventType.MODEL_RETRY for event in events)
+    error = next(event.payload for event in events if event.type == EventType.MODEL_ERROR)
+    assert error["retryable"] is False
+    assert error["retry_disposition"] == "explicit_nonretryable"
+    assert error["provider_error_type"] == (
+        "unsupported_capability" if failure_kind == "unsupported_source" else "protocol_error"
+    )
+    assert error["provider_protocol_source_type_value_status"] == "omitted"
+    assert "provider_protocol_source_type_value" not in error
+    rendered = repr([event.model_dump(mode="json") for event in events])
+    assert all(
+        value not in rendered
+        for value in (
+            "synthetic-access",
+            "synthetic-refresh",
+            "synthetic-account",
+        )
+    )
+    assert error["error"] == "OpenAI subscription provider failed."
+    assert events[-1].type == EventType.SESSION_FAILED
