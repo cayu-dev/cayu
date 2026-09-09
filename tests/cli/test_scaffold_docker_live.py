@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
@@ -105,27 +106,41 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
     wheel_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(wheel, wheel_target)
     wheel_digest = "sha256:" + hashlib.sha256(wheel_target.read_bytes()).hexdigest()
-    # The candidate wheel can add base dependencies before that same version
-    # reaches PyPI. Lock its dependency requirements alongside the generated
-    # project's requirements before the image overlays the wheel with --no-deps.
+    # The candidate version need not be on PyPI yet. Replace the generated Cayu
+    # pins with this wheel's base/server requirements; the image installs the
+    # exact candidate wheel through its protected build context with --no-deps.
     with zipfile.ZipFile(wheel) as archive:
         metadata_paths = [
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
         ]
         assert len(metadata_paths) == 1
         metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
-    requirements = [
-        value
-        for value in metadata.get_all("Requires-Dist", [])
-        if "extra" not in str(Requirement(value).marker or "")
-    ]
     project_file = project / "pyproject.toml"
     project_text = project_file.read_text(encoding="utf-8")
-    project_text = project_text.replace(
-        "dependencies = [",
-        "dependencies = [\n" + "".join(f"  {json.dumps(value)},\n" for value in requirements),
-        1,
-    )
+    project_metadata = tomllib.loads(project_text)["project"]
+    for value in (
+        *project_metadata["dependencies"],
+        *project_metadata["optional-dependencies"]["dev"],
+    ):
+        dependency = Requirement(value)
+        if dependency.name != "cayu":
+            continue
+        assert str(dependency.specifier) == f"=={metadata['Version']}"
+        requirements = []
+        for raw in metadata.get_all("Requires-Dist", []):
+            requirement = Requirement(raw)
+            if "extra" in str(requirement.marker or ""):
+                # The selected server requirements have only an extra marker.
+                # Keep platform markers on base requirements for Docker's OS.
+                if not any(
+                    str(requirement.marker) == f'extra == "{extra}"' for extra in dependency.extras
+                ):
+                    continue
+                requirement.marker = None
+            requirements.append(str(requirement))
+        project_text = project_text.replace(
+            json.dumps(value), ", ".join(json.dumps(item) for item in requirements), 1
+        )
     project_file.write_text(project_text, encoding="utf-8")
     image = (
         "cayu-generated-coding-test:"
@@ -164,15 +179,16 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
         + "\n",
         encoding="utf-8",
     )
-    subprocess.run(
+    locked = subprocess.run(
         [uv, "lock"],
         cwd=project,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
+        capture_output=True,
+        text=True,
+        check=False,
         timeout=120,
     )
+    assert locked.returncode == 0, (locked.stdout + locked.stderr)[-4000:]
     build_deadline = time.monotonic() + 300
     for attempt in range(3):
         built = subprocess.run(
@@ -281,6 +297,15 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
             identity = await environment.runner.exec(ExecCommand.process("id", "-u"))
             assert identity.exit_code == 0
             assert identity.stdout.strip() == "1000"
+            installed = await environment.runner.exec(
+                ExecCommand.process(
+                    "python3",
+                    "-c",
+                    "from importlib.metadata import version; print(version('cayu'))",
+                )
+            )
+            assert installed.exit_code == 0
+            assert installed.stdout.strip() == metadata["Version"]
             network = await environment.runner.exec(
                 ExecCommand.process(
                     "python3",

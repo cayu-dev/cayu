@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-08-20",
-  "generated_at": "2026-08-20",
+  "catalog_version": "2026-09-09",
+  "generated_at": "2026-09-09",
   "models": [
     {
       "aliases": [],
@@ -12,7 +12,7 @@
       "match_prefixes": [
         "claude-fable-5-20"
       ],
-      "max_output_tokens": null,
+      "max_output_tokens": 128000,
       "modalities_in": [
         "text",
         "image",
@@ -24,7 +24,7 @@
       "model": "claude-fable-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://platform.claude.com/docs/en/about-claude/models/introducing-claude-fable-5-and-claude-mythos-5"
       },
@@ -45,7 +45,7 @@
       "match_prefixes": [
         "claude-haiku-4-5-20"
       ],
-      "max_output_tokens": null,
+      "max_output_tokens": 64000,
       "modalities_in": [
         "text",
         "image",
@@ -57,12 +57,12 @@
       "model": "claude-haiku-4-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/about-claude/models/overview"
+        "url": "https://platform.claude.com/docs/en/models/haiku-4-5/overview"
       },
       "provider_name": "anthropic",
-      "reasoning": false,
+      "reasoning": true,
       "release_date": null,
       "retirement_date": null,
       "structured_output": true,
@@ -90,9 +90,9 @@
       "model": "claude-opus-4-8",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-4-8"
+        "url": "https://platform.claude.com/docs/en/build-with-claude/context-windows"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -121,7 +121,7 @@
       "model": "claude-opus-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://platform.claude.com/docs/en/about-claude/models/overview"
       },
@@ -142,7 +142,7 @@
       "match_prefixes": [
         "claude-sonnet-4-6-20"
       ],
-      "max_output_tokens": null,
+      "max_output_tokens": 128000,
       "modalities_in": [
         "text",
         "image",
@@ -154,7 +154,7 @@
       "model": "claude-sonnet-4-6",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://platform.claude.com/docs/en/build-with-claude/context-windows"
       },
@@ -187,7 +187,7 @@
       "model": "claude-sonnet-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://platform.claude.com/docs/en/about-claude/models/whats-new-sonnet-5"
       },
@@ -219,7 +219,7 @@
       "model": "gpt-5.4-mini",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
@@ -251,7 +251,7 @@
       "model": "gpt-5.4-nano",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
@@ -283,7 +283,7 @@
       "model": "gpt-5.5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
@@ -315,7 +315,7 @@
       "model": "gpt-5.6-luna",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
@@ -347,7 +347,7 @@
       "model": "gpt-5.6-sol",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
@@ -379,7 +379,7 @@
       "model": "gpt-5.6-terra",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
@@ -409,15 +409,15 @@
       "model": "global.anthropic.claude-opus-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
-        "url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5.md"
+        "url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5.html"
       },
       "provider_name": "bedrock",
       "reasoning": true,
-      "release_date": "2026-07-23",
+      "release_date": "2026-07-24",
       "retirement_date": null,
-      "structured_output": true,
+      "structured_output": false,
       "tool_calling": true
     },
     {
@@ -453,7 +453,7 @@
     },
     {
       "aliases": [],
-      "context_window": 1000000,
+      "context_window": 1048576,
       "deprecated": false,
       "family": "gemini-flash",
       "knowledge_cutoff": null,
@@ -466,7 +466,8 @@
         "text",
         "image",
         "audio",
-        "video"
+        "video",
+        "pdf"
       ],
       "modalities_out": [
         "text"
@@ -474,7 +475,7 @@
       "model": "gemini-3.1-flash-lite",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite"
       },
@@ -487,7 +488,7 @@
     },
     {
       "aliases": [],
-      "context_window": 1000000,
+      "context_window": 1048576,
       "deprecated": false,
       "family": "gemini-pro",
       "knowledge_cutoff": null,
@@ -500,7 +501,8 @@
         "text",
         "image",
         "audio",
-        "video"
+        "video",
+        "pdf"
       ],
       "modalities_out": [
         "text"
@@ -508,7 +510,7 @@
       "model": "gemini-3.1-pro-preview",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview"
       },
@@ -521,7 +523,7 @@
     },
     {
       "aliases": [],
-      "context_window": 1000000,
+      "context_window": 1048576,
       "deprecated": false,
       "family": "gemini-flash",
       "knowledge_cutoff": null,
@@ -534,7 +536,8 @@
         "text",
         "image",
         "audio",
-        "video"
+        "video",
+        "pdf"
       ],
       "modalities_out": [
         "text"
@@ -542,7 +545,7 @@
       "model": "gemini-3.5-flash",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash"
       },
@@ -572,7 +575,7 @@
       "model": "gpt-5.6-luna",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
       },
@@ -604,7 +607,7 @@
       "model": "gpt-5.6-sol",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
       },
@@ -634,7 +637,7 @@
       "model": "gpt-5.6-terra",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
       },
@@ -733,7 +736,7 @@
       "model": "claude-opus-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-03",
+        "as_of": "2026-09-09",
         "source": "official",
         "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/opus-5"
       },

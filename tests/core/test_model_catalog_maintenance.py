@@ -368,7 +368,7 @@ def test_bedrock_opus_5_release_date_matches_aws_model_card() -> None:
     )
 
     assert model is not None
-    assert model.release_date == date(2026, 7, 23)
+    assert model.release_date == date(2026, 7, 24)
 
 
 @pytest.mark.parametrize(
@@ -918,7 +918,14 @@ def test_price_policy_freshness_applies_only_to_the_active_schedule() -> None:
         for item in default_price_book().prices
         if item.provider_name == "anthropic" and item.model == "claude-sonnet-5"
     )
-    current, future = price.schedules
+    # Exercise a fixed transition without depending on a provider's current
+    # promotional schedule (the announced Sonnet 5 increase was cancelled).
+    current = price.schedules[0].model_copy(
+        update={"effective_from": None, "effective_through": date(2026, 8, 31)}
+    )
+    future = current.model_copy(
+        update={"effective_from": date(2026, 9, 1), "effective_through": None}
+    )
     candidate = price.model_copy(
         update={
             "schedules": (

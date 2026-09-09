@@ -3,6 +3,8 @@
 import asyncio
 import gc
 import json
+import sqlite3
+import sys
 import threading
 import time
 import warnings
@@ -54,6 +56,10 @@ def scenario_warning_capture():
     # The standard recorder is process-global on supported Python builds.
     # Route other threads' warnings to pytest while recording this scenario
     # and async operations that inherit its context.
+    # A collection in this thread can finalize connections allocated by an
+    # earlier test. Keep those objects alive until our warning scope ends;
+    # their eventual warnings still reach pytest's outer recorder.
+    earlier_connections = [obj for obj in gc.get_objects() if isinstance(obj, sqlite3.Connection)]
     owned = ContextVar("audit_warning_scope", default=False)
     captured = []
     forward = warnings.showwarning
@@ -64,14 +70,17 @@ def scenario_warning_capture():
         else:
             forward(message, category, filename, lineno, file=file, line=line)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("always")
-        warnings.showwarning = showwarning
-        token = owned.set(True)
-        try:
-            yield captured
-        finally:
-            owned.reset(token)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            warnings.showwarning = showwarning
+            token = owned.set(True)
+            try:
+                yield captured
+            finally:
+                owned.reset(token)
+    finally:
+        earlier_connections.clear()
 
 
 def test_audit_warning_capture_preserves_unrelated_thread_warnings():
@@ -96,6 +105,32 @@ def test_audit_warning_capture_preserves_unrelated_thread_warnings():
     finally:
         release.set()
         worker.join(timeout=5)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 13), reason="SQLite resource warnings require Python 3.13"
+)
+def test_audit_warning_capture_preserves_earlier_connection_finalizers():
+    # Flush unrelated resource finalizers to pytest before this test creates
+    # the two connections whose warning ownership it checks.
+    gc.collect()
+
+    class CyclicConnection(sqlite3.Connection):
+        pass
+
+    earlier = sqlite3.connect(":memory:", factory=CyclicConnection)
+    earlier.cycle = earlier
+    with pytest.warns(ResourceWarning, match="unclosed database") as unrelated:
+        with scenario_warning_capture() as captured:
+            del earlier
+            current = sqlite3.connect(":memory:", factory=CyclicConnection)
+            current.cycle = current
+            del current
+            gc.collect()
+        gc.collect()
+    assert len(captured) == 1
+    assert "unclosed database" in captured[0]
+    assert len(unrelated) == 1
 
 
 @asynccontextmanager

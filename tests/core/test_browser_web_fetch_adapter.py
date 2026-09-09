@@ -1808,12 +1808,18 @@ def test_guest_standalone_loads_only_its_shipped_siblings(tmp_path: Path) -> Non
     shutil.copyfile(
         source.with_name("_browser_control_transport.py"), shipped / "_browser_control_transport.py"
     )
+    shutil.copyfile(
+        source.with_name("_browser_recording_guest.py"), shipped / "_browser_recording_guest.py"
+    )
     unrelated = tmp_path / "unrelated"
     unrelated.mkdir()
     (unrelated / "_browser_visual_guest.py").write_text(
         'raise RuntimeError("untrusted module imported")\n', encoding="utf-8"
     )
     (unrelated / "_browser_control_guest.py").write_text(
+        'raise RuntimeError("untrusted module imported")\n', encoding="utf-8"
+    )
+    (unrelated / "_browser_recording_guest.py").write_text(
         'raise RuntimeError("untrusted module imported")\n', encoding="utf-8"
     )
     protected = tmp_path / "protected"

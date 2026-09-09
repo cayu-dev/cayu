@@ -1309,7 +1309,9 @@ def test_auth_store_revalidates_directory_after_process_lock_wait(
     process.start()
     sender.close()
     try:
-        assert lock_attempted.wait(timeout=5)
+        # A cold spawned interpreter imports the runtime before the handshake.
+        # This bounds setup; the lock and directory-replacement proof is unchanged.
+        assert lock_attempted.wait(timeout=30)
         auth_home.rename(moved_home)
         auth_home.mkdir(mode=0o700)
         OpenAISubscriptionAuthStore(auth_path).save(

@@ -155,18 +155,20 @@ def test_release_runbook_records_external_security_prerequisites() -> None:
     assert "docs/releasing.md" in contributing
     assert "`ci.yml`" in runbook
     assert "required reviewer" in runbook
+    assert "self-approval disabled" in runbook
     assert "`v*` tag ruleset" in runbook
     assert "updates, deletion, and non-fast-forward changes" in runbook_words
-    assert "Do not push any `v*` tag" in runbook
+    assert "Leave PR merges and release tags to a maintainer" in runbook
     assert "PYPI_PUBLISH_ENABLED" in runbook
-    assert "exact, non-empty `## vX.Y.Z` section" in runbook
-    assert "does not generate release notes" in runbook
+    assert "matching, non-empty `## vX.Y.Z` section" in runbook
+    assert "matching release-note section verbatim" in runbook_words
     assert "`## Unreleased`" in runbook
-    assert "must not edit that tagged section" in runbook_words
+    assert "Never reuse a published version, move its tag, or edit its tagged release notes" in (
+        runbook_words
+    )
     assert "development version" in runbook_words
     assert "scripts/verify_release_state.py" in runbook
     assert "0.1.0a1" not in runbook
-    assert 'version="$(python -c' in runbook
 
 
 def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:

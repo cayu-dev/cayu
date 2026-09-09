@@ -39,17 +39,18 @@ def cases():
     }
 
 
-# Fixed fingerprints include text progress v2 and semantic cleanup policy v1.
+# Fixed fingerprints include 300-second idle defaults, text progress v2,
+# and semantic cleanup policy v1.
 _BASE_MATERIAL_SHA256 = {
-    "anthropic": "e80fda7cb981ae133375342f5f3eedb1451ca9ff4000682e6f15ab69e34b57d6",
-    "anthropic-tokens": "c1b216be87df40fc0076b8f550151e2bfdcd7a314e6392a678ddae58dc9dfc90",
-    "bedrock": "b7ad27364266b326041261b23cedaa17b48634ed744b26149fb27f882e8749d0",
-    "bedrock-route": "11bed9d201d2e9b326ffe8ca4eee658be51e11a18c23e1badf5a464652043f92",
-    "chat": "5e23079ace357b25bcbe6a13a667be063897356a7bb3c051ed9d67e6aae4b95f",
-    "openai": "2db00d154db1b256468a722b21b1330b882886bd7545f6272e95362d7be0a261",
-    "openai-background": "ea67a1b1b3328d3cc253f1917b0633e0ada145fba3d0bb9f3e77910a241607c7",
-    "openai-search": "af24f1fe667c3bf9e79747be2063339d056063decdf56beab48f8050714960ce",
-    "openrouter": "e1a8f89bc858116512cfdecac43151e76a7bc16fb5b0678b44d340233fa7ca5c",
+    "anthropic": "c4292274f58f832f7f29291c9dbf972e843488bf0e682ad0e3b801f63f4c782d",
+    "anthropic-tokens": "1175e0534936e52740a06703a041d22d23d2927850efa811843e57633da2e2d7",
+    "bedrock": "bc83166b1ce8ee51eeba8ae2d06581c48fcb7fe570b794ad9da1f8c678a2e888",
+    "bedrock-route": "239ae134fa3556d80111abc93903136c219b9f7c20086fbaa3db08449a142592",
+    "chat": "ef06fc7b45743da89ce0afb48035b7462f635d9fbe822ce46f1eb2077a9f5d33",
+    "openai": "91f0102224946afe1b65b1e1c5f1bfa8852f7958b73c07afe74e804671bd2a82",
+    "openai-background": "12d4c2badb4988320ae573ffd75f602ffb46a1fe444b82901966b28789cd9b4a",
+    "openai-search": "902b8510f3b60f4d5b22c831fe4d592656390b7f0c64146134a6551a554a7014",
+    "openrouter": "238bdd76b4e6cbead2f89ed3462935c660a7f8445dd439acc34f267ff5cb7312",
     "scripted": "cd8a343352e9c14f261c619ea4bfdb538bbfb31c8b9ea36856035a046d159c45",
     "scripted-background": "756612fad3d73854b2b4dcddb5bc60c7644af36dfb7965404ee64959f765267f",
 }

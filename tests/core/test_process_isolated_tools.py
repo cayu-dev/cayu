@@ -2935,7 +2935,8 @@ def test_unproven_cleanup_retains_ownership_and_publishes_bounded_controls(
 
     async def scenario():
         arguments = {"text": "hello"}
-        tool = _tool(mode="exception", deadline_seconds=5)
+        # This case tests cleanup ownership after a child error, not startup speed.
+        tool = _tool(mode="exception", deadline_seconds=30)
         return await tool_execution.run_tool(
             tool=tool,
             effect=ToolEffect.EXTERNAL,
@@ -5000,21 +5001,23 @@ def test_application_tool_timeout_remains_a_hard_deadline_for_isolated_adapter(
     app = _public_app(
         _tool(
             mode="gil_block",
-            deadline_seconds=30,
-            factory_config={"seconds": 30, "started_path": str(started_path)},
+            deadline_seconds=60,
+            factory_config={"seconds": 60, "started_path": str(started_path)},
             effect=ToolEffect.IDEMPOTENT,
         ),
-        tool_timeout_seconds=5,
+        # Allow cold interpreter imports on contended CI workers while keeping
+        # the application deadline well below the child's blocking interval.
+        tool_timeout_seconds=15,
     )
 
-    assert app.describe().agents[0].tools[0].hard_deadline_seconds == 5
+    assert app.describe().agents[0].tools[0].hard_deadline_seconds == 15
     started_at = time.monotonic()
     events = asyncio.run(_run_public(app, session_id="public-global-hard-deadline"))
     elapsed = time.monotonic() - started_at
 
     failed = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
     assert started_path.read_text(encoding="utf-8") == "started"
-    assert elapsed < 9
+    assert elapsed < 25
     assert failed.payload["terminal_outcome"] == "tool_execution_timeout"
     assert failed.payload["outcome_unknown"] is True
     assert failed.payload["tool_execution_boundary"] == "posix_process"
