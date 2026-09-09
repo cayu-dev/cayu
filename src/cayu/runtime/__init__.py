@@ -686,6 +686,11 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageSource,
     SessionMessageTarget,
 )
+from cayu.runtime.session_steering import (
+    SessionSteeringConflict,
+    SessionSteeringReceipt,
+    StopAfterCurrentToolRoundRequest,
+)
 from cayu.runtime.sessions import (
     DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
@@ -1838,6 +1843,8 @@ __all__ = [
     "SessionStatus",
     "SessionStatusConflict",
     "SessionStatusCounts",
+    "SessionSteeringConflict",
+    "SessionSteeringReceipt",
     "SessionStore",
     "SessionTopologyBranch",
     "SessionTopologyCycle",
@@ -1851,6 +1858,7 @@ __all__ = [
     "StaleRecoveryPlanError",
     "StaticToolExposurePolicy",
     "StaticToolPolicy",
+    "StopAfterCurrentToolRoundRequest",
     "StopDecision",
     "StopLimit",
     "StoreManifest",

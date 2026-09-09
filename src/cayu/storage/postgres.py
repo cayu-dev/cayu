@@ -24568,6 +24568,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    session_steering_version: ClassVar[int | None] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -31420,6 +31421,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 "Queued interaction handoff lost its predecessor "
                                 "settlement receipt."
                             )
+                        await self._reject_new_work_after_steering(cur, loaded)
                         rebound_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
                             loaded,
                             await self._load_checkpoint(cur, session_id),
@@ -32378,6 +32380,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             f"{prepared.expected_transcript_cursor}, current {current_cursor}."
                         )
 
+                    if active is None:
+                        await self._reject_new_work_after_steering(cur, loaded)
                     prepared_at = _next_runtime_publication_timestamp(loaded)
                     record = _model_completion_stage_preparation_record(
                         prepared,
@@ -33782,6 +33786,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             )
                             """,
                             rows,
+                        )
+                        await self._record_invocation_terminal_event_receipts(
+                            cur, session_id, copied_events, activity_at=updated_at
                         )
                         await self._enqueue_persisted_event_side_effects(
                             cur,
@@ -37791,6 +37798,27 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         for row in await cur.fetchall():
             labels_by_session_id[row[0]][row[1]] = row[2]
         return labels_by_session_id
+
+    async def _reject_new_work_after_steering(self, cur: Any, session: Session) -> None:
+        from cayu.runtime._session_steering import (
+            reject_new_work_after_steering,
+            steering_operation_key_from_checkpoint,
+        )
+
+        checkpoint = await self._load_checkpoint(cur, session.id)
+        key = steering_operation_key_from_checkpoint(session, checkpoint)
+        if key is not None:
+            await cur.execute(
+                "SELECT record FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = %s",
+                (session.id, key),
+            )
+            row = await cur.fetchone()
+            reject_new_work_after_steering(
+                session,
+                checkpoint,
+                None if row is None else _decode_model_completion_stage_record(row[0]),
+            )
 
     async def _load_checkpoint(self, cur: Any, session_id: str) -> dict[str, Any] | None:
         await cur.execute(

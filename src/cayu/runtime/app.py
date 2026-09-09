@@ -398,6 +398,10 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageQuery,
     SessionMessageSource,
 )
+from cayu.runtime.session_steering import (
+    SessionSteeringReceipt,
+    StopAfterCurrentToolRoundRequest,
+)
 from cayu.runtime.sessions import (
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
@@ -4761,6 +4765,17 @@ class CayuApp:
             store_resolved_session_id=store_resolved_session_id,
             store_resolved_source_session_id=store_resolved_source_session_id,
             expected_authorized_target_instance_id=expected_authorized_target_instance_id,
+        )
+
+    async def stop_after_current_tool_round(
+        self, request: StopAfterCurrentToolRoundRequest
+    ) -> SessionSteeringReceipt:
+        """Accept a durable cooperative stop without cancelling the current round."""
+
+        from cayu.runtime._session_steering import accept_session_steering
+
+        return await accept_session_steering(
+            request, session_store=self._runtime_session_store, redactor=self._secret_redactor
         )
 
     async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:

@@ -9698,6 +9698,7 @@ class SessionStore(ABC):
     durable_model_terminalization_version: ClassVar[int | None] = None
     queued_interaction_profile_handoff_version: ClassVar[int | None] = None
     session_message_lifecycle_version: ClassVar[int | None] = None
+    session_steering_version: ClassVar[int | None] = None
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
     supports_atomic_session_operation_initialization: ClassVar[bool] = False
@@ -11012,6 +11013,32 @@ class SessionStore(ABC):
         return (
             self.supports_atomic_model_completion_stage_release is True
             and capability_owner_index <= publication_owner_index
+        )
+
+    def _supports_session_steering_protocol(self) -> bool:
+        """Require one owner for acceptance and atomic new-stage exclusion."""
+
+        mro = type(self).__mro__
+        capability_owner = next(
+            index for index, owner in enumerate(mro) if "session_steering_version" in owner.__dict__
+        )
+        return (
+            type(self.session_steering_version) is int
+            and self.session_steering_version == 1
+            and all(
+                capability_owner
+                <= next(
+                    (index for index, owner in enumerate(mro) if method in owner.__dict__),
+                    len(mro),
+                )
+                for method in (
+                    "publish_session_operation",
+                    "_publish_session_operation",
+                    "prepare_model_completion_stage",
+                    "_prepare_model_completion_stage_atomic",
+                    "deliver_queued_session_messages",
+                )
+            )
         )
 
     def _supports_completion_result_event_publication_reservation_protocol(self) -> bool:
@@ -12463,6 +12490,7 @@ class InMemorySessionStore(SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    session_steering_version: ClassVar[int | None] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -17392,6 +17420,7 @@ class InMemorySessionStore(SessionStore):
 
             rebound_checkpoint: dict[str, Any] | None = None
             if profile_handoff is not None and selected:
+                self._reject_new_work_after_steering_unlocked(session)
                 receipt_record = self._session_operation_records.get(session_id, {}).get(
                     _interaction_transition_storage_key(
                         profile_handoff.predecessor_settlement_event_id
@@ -18163,6 +18192,19 @@ class InMemorySessionStore(SessionStore):
             )
             return dispatch
 
+    def _reject_new_work_after_steering_unlocked(self, session: Session) -> None:
+        from cayu.runtime._session_steering import (
+            reject_new_work_after_steering,
+            steering_operation_key_from_checkpoint,
+        )
+
+        checkpoint = self._checkpoints.get(session.id)
+        key = steering_operation_key_from_checkpoint(session, checkpoint)
+        if key is not None:
+            reject_new_work_after_steering(
+                session, checkpoint, self._session_operation_records[session.id].get(key)
+            )
+
     async def _prepare_model_completion_stage_atomic(
         self,
         prepared: _PreparedModelCompletionStage,
@@ -18243,6 +18285,8 @@ class InMemorySessionStore(SessionStore):
                     f"{prepared.expected_transcript_cursor}, current {current_cursor}."
                 )
 
+            if active is None:
+                self._reject_new_work_after_steering_unlocked(session)
             prepared_at = _next_runtime_publication_timestamp(session)
             preparation_record = _model_completion_stage_preparation_record(
                 prepared,

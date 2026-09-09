@@ -8056,6 +8056,104 @@ class SessionEngine:
                 expected_run_epoch=session.run_epoch,
             )
 
+    async def _stop_at_requested_tool_round_boundary(self, session: Session) -> None:
+        """Promote accepted steering only from the live owner's settled boundary.
+
+        Admission never signals cancellation. The same durable interaction key
+        survives recovery epoch changes, but cannot name a later interaction.
+        Pending approvals, user input, or tool recovery remain authoritative.
+        """
+
+        from cayu.runtime._session_steering import steering_operation_key
+        from cayu.runtime.session_steering import SessionSteeringConflict, SessionSteeringReceipt
+
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if profile is None:
+            return
+        key = steering_operation_key(session.instance_id, profile.interaction_id)
+        stored = await self.session_store.load_session_operation(session.id, key)
+        if stored is None:
+            return
+        receipt = SessionSteeringReceipt.model_validate(stored)
+        request = receipt.request
+        if (
+            request.session_id != session.id
+            or request.session_instance_id != session.instance_id
+            or request.interaction_id != profile.interaction_id
+            or request.expected_run_epoch > session.run_epoch
+            or receipt.execution_profile_fingerprint != profile.profile.fingerprint
+            or profile.run_epoch != session.run_epoch
+        ):
+            raise SessionSteeringConflict()
+        if _pending_interaction_action_kind(checkpoint, run_epoch=session.run_epoch) is not None:
+            return
+        if await self.session_store.load_active_model_completion_stage(session.id) is not None:
+            # A recovered provider operation still owns its outcome. Steering
+            # must not replace that reconciliation with a new terminal result.
+            return
+        payload = {
+            "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+            "interruption_request_id": key,
+            "reason": "Stopped at the requested complete tool-round boundary.",
+        }
+        prepare_interrupt = _checkpoint_with_pending_session_interrupt(
+            payload, include_interruption_cascade=False
+        )
+
+        def promote(current: Session, current_checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+            current_profile = active_invocation_execution_profile_from_checkpoint(
+                current_checkpoint
+            )
+            if (
+                current.instance_id != session.instance_id
+                or current.run_epoch != session.run_epoch
+                or current_profile != profile
+                or invocation_terminal_decision_from_checkpoint(current_checkpoint) is not None
+                or _pending_interaction_action_kind(current_checkpoint, run_epoch=current.run_epoch)
+                is not None
+            ):
+                raise SessionSteeringConflict()
+            return prepare_interrupt(current, current_checkpoint)
+
+        try:
+            with _invocation_lifecycle_authority_mutation_scope():
+                await self.session_store.transition_status_and_checkpoint(
+                    session.id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=promote,
+                    require_no_active_model_completion_dispatch=True,
+                )
+        except Exception:
+            # An ordinary interruption may win the race, or publication may
+            # commit before losing its acknowledgement. Neither permits a
+            # generic failure to replace the durable interruption owner.
+            await self._session_control.raise_if_interrupted(session.id)
+            raise
+        raise SessionInterruptedByRequest(session.id)
+
+    async def _has_promoted_safe_stop(self, session: Session) -> bool:
+        """Recognize this invocation's runtime-owned cooperative interruption.
+
+        Unlike hard interruption, safe steering never sends Task.cancel(). A
+        cancellation arriving during its settlement therefore still belongs to
+        the caller, even though the durable interrupted outcome must finish.
+        """
+        from cayu.runtime._session_steering import steering_operation_key
+
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        pending = (checkpoint or {}).get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+        return (
+            profile is not None
+            and profile.session_id == session.id
+            and profile.run_epoch == session.run_epoch
+            and type(pending) is dict
+            and pending.get("interruption_request_id")
+            == steering_operation_key(session.instance_id, profile.interaction_id)
+        )
+
     async def _ensure_interruption_terminal_decision(
         self,
         *,
@@ -22796,6 +22894,7 @@ class SessionEngine:
                 invocation_context = rebound
 
             first_model_step = initial_model_step_number or 1
+            await self._stop_at_requested_tool_round_boundary(session)
             model_steps = () if skip_model_steps else range(first_model_step, max_steps + 1)
             for step in model_steps:
                 model_step_identity = (
@@ -23235,6 +23334,7 @@ class SessionEngine:
                     await self._session_control.raise_if_interrupted(session.id)
                     for event in auxiliary_events:
                         yield copy_event(event)
+                    await self._stop_at_requested_tool_round_boundary(session)
 
                     if validation.valid:
                         self._record_workflow_structured_output(
@@ -23313,6 +23413,7 @@ class SessionEngine:
 
                 if not tool_calls:
                     close_new_pending_round_on_interrupt = False
+                    await self._stop_at_requested_tool_round_boundary(session)
                     if structured_output is not None:
                         yield await self._event_writer.emit(
                             event_with_execution_profile_authority(
@@ -23693,6 +23794,7 @@ class SessionEngine:
                     )
                 if tool_round_runner.stopped_for_limit:
                     return
+                await self._stop_at_requested_tool_round_boundary(session)
             else:
                 if not skip_model_steps:
                     async for event in self._stop_session_for_model_step_limit(
@@ -23826,7 +23928,16 @@ class SessionEngine:
                 invocation_context=invocation_context,
             ):
                 yield event
-        except SessionInterruptedByRequest:
+        except SessionInterruptedByRequest as interruption:
+            from cayu.runtime._session_steering import SessionSteeringBoundaryReached
+
+            if isinstance(interruption, SessionSteeringBoundaryReached):
+                try:
+                    await self._stop_at_requested_tool_round_boundary(session)
+                except SessionInterruptedByRequest:
+                    pass
+                else:
+                    raise SessionRunFenced("Safe steering did not establish its terminal boundary.")
             await materialize_deferred_messages_after_failure()
             interruption_events: list[Event] = []
             if close_new_pending_round_on_interrupt:
@@ -23985,32 +24096,51 @@ class SessionEngine:
                 or detach_credential_safe_provider_cancellation(cancellation) is not None
             )
             if await self._session_control.interrupt_requested(session.id):
-                clear_current_task_cancellation()
-                await materialize_deferred_messages_after_failure()
+                try:
+                    preserve_caller_cancellation = await self._has_promoted_safe_stop(session)
+                except Exception as classification_failure:
+                    # Without positive classification, do not consume the caller's
+                    # cancellation. The durable interruption remains recoverable.
+                    raise cancellation from classification_failure
                 interruption_events = []
-                if close_new_pending_round_on_interrupt:
-                    async for event in self._close_durable_pending_tool_round_after_interrupt(
+
+                async def finish_requested_interruption() -> None:
+                    await materialize_deferred_messages_after_failure()
+                    if close_new_pending_round_on_interrupt:
+                        async for event in self._close_durable_pending_tool_round_after_interrupt(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=execution_profile,
+                            invocation_context=invocation_context,
+                        ):
+                            interruption_events.append(event)
+                    async for event in self._handle_session_interrupted(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        environment_name=environment_name,
                         execution_profile=execution_profile,
                         invocation_context=invocation_context,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                        interaction_transition_failures=tuple(interaction_transition_failures),
+                        provider_cancellation_failures=provider_cancellation_diagnostics,
                     ):
                         interruption_events.append(event)
-                async for event in self._handle_session_interrupted(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=environment_name,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                    run_started_at=run_started_at,
-                    turn_usage_tracker=turn_usage_tracker,
-                    active_run=active_run,
-                    interaction_transition_failures=tuple(interaction_transition_failures),
-                    provider_cancellation_failures=provider_cancellation_diagnostics,
-                ):
-                    interruption_events.append(event)
+
+                if preserve_caller_cancellation:
+                    await _run_interaction_transition_cancellation_cleanup_steps(
+                        cancellation,
+                        supervisor=self._recovery_cleanup_supervisor,
+                        steps=(
+                            ("cooperative interruption settlement", finish_requested_interruption),
+                        ),
+                    )
+                    raise cancellation
+                clear_current_task_cancellation()
+                await finish_requested_interruption()
                 for event in interruption_events:
                     yield event
                 return

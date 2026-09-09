@@ -2610,6 +2610,11 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageSource,
     SessionMessageTarget,
 )
+from cayu.runtime.session_steering import (
+    SessionSteeringConflict,
+    SessionSteeringReceipt,
+    StopAfterCurrentToolRoundRequest,
+)
 from cayu.runtime.sessions import (
     SessionMessageActionResult,
     SessionMessageInspection,
@@ -5281,6 +5286,8 @@ __all__ = [
     "SessionStatusConflict",
     "SessionStatusCounts",
     "SessionStatusIs",
+    "SessionSteeringConflict",
+    "SessionSteeringReceipt",
     "SessionStore",
     "SessionTopologyBranch",
     "SessionTopologyCycle",
@@ -5312,6 +5319,7 @@ __all__ = [
     "StepFailure",
     "StepResult",
     "StepRunOptions",
+    "StopAfterCurrentToolRoundRequest",
     "StopDecision",
     "StopLimit",
     "StructuredCommandToolPolicy",

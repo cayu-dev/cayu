@@ -1739,9 +1739,10 @@ same request returns the original acceptance event; changing content, mode, or
 actor under that key is a conflict.
 
 Acceptance atomically inserts the queue row and its `session.message.queued`
-event. `next_turn` input becomes eligible only after the current assistant step
-and any complete tool-call round have been persisted, and before the next model
-request. `on_idle` input becomes eligible only when the runtime would otherwise
+event. `next_turn` input becomes eligible only after the current assistant turn
+finishes, including all of its model/tool rounds; it is not injected between a
+tool result and the assistant response that consumes it. `on_idle` input becomes
+eligible only when the runtime would otherwise
 complete the session. At either boundary, queued `next_turn` messages have
 priority over `on_idle` messages and each mode preserves store-assigned FIFO
 order. A drain fixes its maximum eligible ordering key before reading its first
@@ -1802,6 +1803,60 @@ Steering does not resolve a tool approval, answer `ask_user`, or repair an
 unknown tool outcome; those control actions retain their dedicated resolution
 and recovery APIs. The optional server exposes the replayable mutation as
 `POST /api/sessions/{session_id}/messages`.
+
+#### Cooperative in-run stopping
+
+`CayuApp.stop_after_current_tool_round(StopAfterCurrentToolRoundRequest(...))`
+is a separate application-owned SDK control for a long-running turn. It does
+not enqueue a message, change `next_turn`, cancel a tool, or automatically resume
+the session. Applications authorize the operator before invoking this control;
+the queue HTTP access policy does not grant permission to stop an invocation.
+
+The request identifies the stored session id, its `Session.instance_id`, the
+active execution profile's `interaction_id`, the observed `Session.run_epoch`
+as `expected_run_epoch`, and a caller-owned `idempotency_key`. An application
+with access to its session store can observe the session and use
+`active_invocation_execution_profile_from_checkpoint` from
+`cayu.runtime.execution_profiles` on the stored checkpoint. Observation is not
+a claim: acceptance atomically rejects a changed incarnation, interaction, or
+epoch, a non-running session, or an already elected terminal decision.
+
+The returned `SessionSteeringReceipt` proves durable acceptance, not completion.
+One immutable request belongs to the exact session incarnation and interaction.
+Replaying the same complete request returns its receipt, including after lost
+acknowledgement or terminalization; changing any request field conflicts.
+Applications retain that request for retry rather than rebuilding it from a
+later observation. Identity fields must not contain registered workload secrets.
+
+The execution owner finishes and durably publishes the current complete tool
+round before promoting the accepted request through the existing fenced
+interruption lifecycle with `interruption_type="operator_requested"`. This is an
+explicit application control, not an inferred provider or tool failure.
+New model-stage admission and steering acceptance use
+the same store transaction boundary: acceptance that wins before a new stage
+prevents that stage from dispatching. A stage already admitted retains ownership
+of its result and recovery; a safe stop never treats an unknown provider or tool
+outcome as completed. Pending approvals and `ask_user` remain on their existing
+resolution paths, and the accepted stop follows continuation of that same
+interaction. A later new interaction does not inherit it.
+
+The same exclusion covers a new queued-interaction handoff within the active
+invocation, before queue delivery changes the interaction identity. A previously
+committed delivery receipt remains replayable; steering never undelivers input.
+
+After interruption, ordinary `resume` (or the required task-linked continuation)
+delivers an eligible queued correction exactly once before the next ordinary
+model request. `ResumeRequest.messages` remains required and nonempty; the stop
+receipt is not a substitute for a continuation request. Linked task settlement,
+terminal hooks, and cleanup keep their existing single-winner ownership rules.
+
+Memory, SQLite, and PostgreSQL implement `SessionStore.session_steering_version = 1`.
+A custom store must explicitly own atomic receipt publication, model-stage
+exclusion, and queued-interaction handoff exclusion, including overrides of
+these operations, before accepting new stops.
+Missing, boolean, or unsupported versions fail closed. The runtime checkpoint
+wrapper delegates this capability to the underlying store. Read-only replay of
+an already committed receipt does not admit a new operation.
 
 `RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. `RunRequest.task_id` optionally links a session run to an existing task. Reusing `RunRequest.session_id` never resumes an existing session.
 `RunRequest.target` optionally selects an exact `ModelTarget(provider_name=..., model=...)` for a new session. An explicit target bypasses agent-level provider selection and model-pattern routing. Without one, the agent spec supplies the model and provider resolution is: agent spec `provider_name`, provider `model_patterns`, then the app default provider. `CayuApp.register_provider(..., model_patterns=[...])` accepts shell-style glob patterns such as `gpt-*` or `claude-*`; ambiguous matches fail before session creation. Resume, fork, approval continuation, and recovery keep using the provider recorded on the stored session unless a clean resume explicitly adopts a different `ResumeRequest.target` as described below.

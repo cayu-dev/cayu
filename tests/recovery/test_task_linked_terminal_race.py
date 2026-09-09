@@ -28,6 +28,8 @@ from cayu import (
     SessionMessageDeliveryMode,
     SessionMessageQueueStatus,
     SessionStatus,
+    SessionSteeringConflict,
+    StopAfterCurrentToolRoundRequest,
     TaskQuery,
     TaskStatus,
 )
@@ -35,6 +37,7 @@ from cayu.runtime._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 
 pytestmark = pytest.mark.process
 
@@ -67,19 +70,28 @@ def terminal_race_backend(
 
 
 @pytest.mark.parametrize(
-    ("race_mode", "expected_phase", "expected_provider_requests"),
+    ("race_mode", "expected_phase", "expected_provider_requests", "safe_stop"),
     [
         pytest.param(
             "provider_failure",
             "provider_started_after_tool",
             2,
+            False,
             id="provider-already-dispatched",
         ),
         pytest.param(
             "before_next_provider",
             "tool_completed_before_next_provider",
             1,
+            False,
             id="interrupt-before-next-provider",
+        ),
+        pytest.param(
+            "before_next_provider",
+            "tool_completed_before_next_provider",
+            1,
+            True,
+            id="safe-stop-before-next-provider",
         ),
     ],
 )
@@ -89,6 +101,7 @@ def test_remote_interrupt_and_linked_task_failure_elect_one_terminal_outcome(
     race_mode: str,
     expected_phase: str,
     expected_provider_requests: int,
+    safe_stop: bool,
 ) -> None:
     suffix = uuid4().hex
     session_id = f"terminal-race-session-{suffix}"
@@ -132,20 +145,39 @@ def test_remote_interrupt_and_linked_task_failure_elect_one_terminal_outcome(
                     delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
                 )
             )
-            with pytest.raises(TimeoutError, match="interruption is still finalizing"):
-                _ = [
-                    event
-                    async for event in app.interrupt_session(
-                        InterruptSessionRequest(
-                            session_id=session_id,
-                            reason="remote operator wins",
-                        )
+            if safe_stop:
+                current = await session_store.load(session_id)
+                assert current is not None
+                profile = active_invocation_execution_profile_from_checkpoint(
+                    await session_store.load_checkpoint(session_id)
+                )
+                assert profile is not None
+                await app.stop_after_current_tool_round(
+                    StopAfterCurrentToolRoundRequest(
+                        session_id=session_id,
+                        session_instance_id=current.instance_id,
+                        interaction_id=profile.interaction_id,
+                        expected_run_epoch=current.run_epoch,
+                        idempotency_key=f"safe-stop-{suffix}",
                     )
-                ]
+                )
+            else:
+                with pytest.raises(TimeoutError, match="interruption is still finalizing"):
+                    _ = [
+                        event
+                        async for event in app.interrupt_session(
+                            InterruptSessionRequest(
+                                session_id=session_id,
+                                reason="remote operator wins",
+                            )
+                        )
+                    ]
 
             interrupting = await session_store.load(session_id)
             assert interrupting is not None
-            assert interrupting.status is SessionStatus.INTERRUPTING
+            assert interrupting.status is (
+                SessionStatus.RUNNING if safe_stop else SessionStatus.INTERRUPTING
+            )
             worker.signal("release_provider_failure")
             worker_result = await asyncio.to_thread(worker.wait_success)
             assert worker_result["processed"] == 1
@@ -255,6 +287,25 @@ def test_process_loss_after_failure_decision_recovers_exact_terminal_outcome(
             tools=terminal_race_tools(harness.marker_path),
         )
         try:
+            before = await session_store.load(session_id)
+            checkpoint_before = await session_store.load_checkpoint(session_id)
+            events_before = await session_store.load_events(session_id)
+            assert before is not None and before.status is SessionStatus.RUNNING
+            assert invocation_terminal_decision_from_checkpoint(checkpoint_before) is not None
+            profile = active_invocation_execution_profile_from_checkpoint(checkpoint_before)
+            assert profile is not None
+            with pytest.raises(SessionSteeringConflict):
+                await app.stop_after_current_tool_round(
+                    StopAfterCurrentToolRoundRequest(
+                        session_id=session_id,
+                        session_instance_id=before.instance_id,
+                        interaction_id=profile.interaction_id,
+                        expected_run_epoch=before.run_epoch,
+                        idempotency_key=f"too-late-{suffix}",
+                    )
+                )
+            assert await session_store.load_checkpoint(session_id) == checkpoint_before
+            assert await session_store.load_events(session_id) == events_before
             recovered = await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,

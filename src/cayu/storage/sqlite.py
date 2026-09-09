@@ -1120,6 +1120,27 @@ def _load_checkpoint_state(
     return copy_durable_json_object(json.loads(row["state_json"]), "checkpoint")
 
 
+def _reject_new_work_after_steering(connection: sqlite3.Connection, session: Session) -> None:
+    from cayu.runtime._session_steering import (
+        reject_new_work_after_steering,
+        steering_operation_key_from_checkpoint,
+    )
+
+    checkpoint = _load_checkpoint_state(connection, session.id)
+    key = steering_operation_key_from_checkpoint(session, checkpoint)
+    if key is not None:
+        row = connection.execute(
+            "SELECT record_json FROM cayu_session_operations "
+            "WHERE session_id = ? AND idempotency_key = ?",
+            (session.id, key),
+        ).fetchone()
+        reject_new_work_after_steering(
+            session,
+            checkpoint,
+            None if row is None else _decode_model_completion_stage_record(row["record_json"]),
+        )
+
+
 def _load_interruption_cascade_marker(
     connection: sqlite3.Connection,
     session_id: str,
@@ -1884,6 +1905,7 @@ class SQLiteSessionStore(SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    session_steering_version: ClassVar[int | None] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -8278,6 +8300,7 @@ class SQLiteSessionStore(SessionStore):
                 rows = deliverable_rows
                 rebound_checkpoint: dict[str, Any] | None = None
                 if rows and profile_handoff is not None:
+                    _reject_new_work_after_steering(connection, loaded)
                     receipt_row = connection.execute(
                         "SELECT record_json FROM cayu_session_operations "
                         "WHERE session_id = ? AND idempotency_key = ?",
@@ -9279,6 +9302,8 @@ class SQLiteSessionStore(SessionStore):
                         f"{prepared.expected_transcript_cursor}, current {current_cursor}."
                     )
 
+                if active is None:
+                    _reject_new_work_after_steering(connection, loaded)
                 prepared_at = _next_runtime_publication_timestamp(loaded)
                 record = _model_completion_stage_preparation_record(
                     prepared,
@@ -10613,6 +10638,9 @@ class SQLiteSessionStore(SessionStore):
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         event_rows,
+                    )
+                    _record_invocation_terminal_event_receipts(
+                        connection, session_id, copied_events, activity_at=updated_at
                     )
                     _enqueue_persisted_event_side_effects(
                         connection,
