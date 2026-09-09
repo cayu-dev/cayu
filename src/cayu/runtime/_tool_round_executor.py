@@ -8049,12 +8049,15 @@ class ToolRoundRun:
             if publication_coordinator is not None:
                 publication_coordinator.seal_capacity()
             raise
-        except (KeyboardInterrupt, SystemExit, GeneratorExit):
-            # An async-generator close cannot yield, but a tool outcome that is
-            # already durably staged must still become authoritative before
-            # the invocation owner disappears.
-            async for _event in publish_staged_terminals_before_interrupt():
-                pass
+        except (KeyboardInterrupt, SystemExit, GeneratorExit) as interrupt:
+            # An async-generator close cannot yield. If workspace settlement
+            # still owns the stage, retain it for recovery without replacing
+            # the original supervisory signal with a publication failure.
+            try:
+                async for _event in publish_staged_terminals_before_interrupt():
+                    pass
+            except Exception as publication_failure:
+                raise interrupt from publication_failure
             raise
 
         if publication_coordinator is not None:

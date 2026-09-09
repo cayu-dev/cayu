@@ -6115,6 +6115,16 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
         store.cleanup_release.set()
         with pytest.raises(BaseExceptionGroup) as raised:
             await consumer
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None and checkpoint.get("workspace_observations")
+        pending = tool_round_recovery_module.pending_tool_round_from_checkpoint(checkpoint)
+        assert pending is not None
+        assert any(
+            stage.event.type is EventType.TOOL_CALL_FAILED
+            and stage.tool_call_id == "call-workspace"
+            and stage.publication_started_at is None
+            for stage in pending.staged_terminals
+        )
         durable = await store.query_events(EventQuery(session_id=session_id))
         persisted = await store.load(session_id)
         assert persisted is not None
@@ -6164,13 +6174,16 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
     paused_events = [
         event for event in durable_events if event.type is EventType.INTERACTION_PAUSED
     ]
-    assert paused_events == []
-    assert any(
+    # Artifact publication was interrupted: recovery retains the exact failed
+    # tool stage until workspace settlement permits its terminal publication.
+    assert len(paused_events) == 1
+    assert paused_events[0].payload["pending_action_kind"] == "tool_recovery"
+    assert not any(
         event.type is EventType.TOOL_CALL_FAILED
         and event.payload["tool_call_id"] == "call-workspace"
         for event in durable_events
     )
-    assert any(event.type is EventType.INTERACTION_INTERRUPTED for event in durable_events)
+    assert not any(event.type is EventType.INTERACTION_INTERRUPTED for event in durable_events)
     assert any(event.type is EventType.SESSION_INTERRUPTED for event in durable_events)
     assert not any(
         event.type
@@ -6255,6 +6268,16 @@ def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
 
         closer = asyncio.create_task(close_stream())
         closer_cancellation_requests = await closer
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None and checkpoint.get("workspace_observations")
+        pending = tool_round_recovery_module.pending_tool_round_from_checkpoint(checkpoint)
+        assert pending is not None
+        assert any(
+            stage.event.type is EventType.TOOL_CALL_FAILED
+            and stage.tool_call_id == "call-workspace"
+            and stage.publication_started_at is None
+            for stage in pending.staged_terminals
+        )
         durable = await store.query_events(EventQuery(session_id=session_id))
         return (
             delivered_events,
@@ -6298,13 +6321,16 @@ def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
     paused_events = [
         event for event in durable_events if event.type is EventType.INTERACTION_PAUSED
     ]
-    assert paused_events == []
-    assert any(
+    # Artifact publication was interrupted: recovery retains the exact failed
+    # tool stage until workspace settlement permits its terminal publication.
+    assert len(paused_events) == 1
+    assert paused_events[0].payload["pending_action_kind"] == "tool_recovery"
+    assert not any(
         event.type is EventType.TOOL_CALL_FAILED
         and event.payload["tool_call_id"] == "call-workspace"
         for event in durable_events
     )
-    assert any(event.type is EventType.INTERACTION_INTERRUPTED for event in durable_events)
+    assert not any(event.type is EventType.INTERACTION_INTERRUPTED for event in durable_events)
     assert any(event.type is EventType.SESSION_INTERRUPTED for event in durable_events)
 
 

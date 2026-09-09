@@ -41,6 +41,7 @@ from cayu.runtime.approvals import (
     copy_distinct_pending_tool_call_approvals,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
 from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
@@ -957,6 +958,10 @@ def checkpoint_without_pending_tool_round(
     copied_checkpoint = (
         {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     )
+    # Workspace settlement retains the pending round as its recovery authority.
+    # A completed tool event alone does not authorize retiring that owner.
+    if copied_checkpoint.get(WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY):
+        raise RuntimeError("Cannot retire a tool round with unsettled workspace observations.")
     copied_checkpoint.pop(PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
     return copied_checkpoint
 
@@ -1224,6 +1229,10 @@ def started_staged_terminal_publication_transform(
         copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
         if type(copied) is not dict:
             raise AssertionError("Checkpoint copied as a non-object.")
+        # Pinning publication timing changes the event digest. Keep the exact
+        # workspace-bound stage until observation recovery has consumed it.
+        if copied.get(WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY):
+            raise RuntimeError("Cannot publish tool stages before workspace settlement.")
         existing = checkpoint_staged_terminals(copied, tool_round_identity=identity)
         updated: list[StagedToolCallTerminal] = []
         found = False
