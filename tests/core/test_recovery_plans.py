@@ -350,7 +350,7 @@ def test_recovery_plan_blocks_live_recovery_and_task_owners_without_mutation(
 
         await store.transform_checkpoint("sess_owned_recovery_plan", install_live_claim)
 
-        async def active_task_claims(_session_id: str):
+        async def active_task_claims(_session, _checkpoint):
             return (
                 RecoveryTaskClaimEvidence(
                     task_ref="task:sha256:" + "c" * 64,

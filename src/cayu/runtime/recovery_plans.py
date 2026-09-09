@@ -230,7 +230,9 @@ class RecoveryTaskClaimEvidence(BaseModel):
 
     task_ref: str
     status: TaskStatus
-    ownership_status: Literal["active", "expired", "unowned", "invalid"] = "active"
+    # Direct attachments remain bound to their exact session incarnation;
+    # "unowned" is reserved for receipt-backed worker handoffs.
+    ownership_status: Literal["active", "expired", "unowned", "direct", "invalid"] = "active"
     worker_ref: str | None = None
     lease_expires_at: datetime | None = None
 

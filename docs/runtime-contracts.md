@@ -1866,6 +1866,16 @@ ordinary registration and recovery blockers.
 
 Registered applications expose recovery as a two-step operator workflow. `CayuApp.plan_recovery(RecoveryPlanRequest(...))` performs bounded, read-only inspection of explicitly selected session ids or statuses. Each immutable plan item binds the public session identity, session incarnation, lifecycle and run epoch, the durable execution-profile fingerprint and current registrations, recovery and task claims, pending approval/input/manual-tool actions, active model-stage and provider-reattachment capability, and any pending interruption cascade. The serialized plan includes only safe identifiers and digests: it never includes prompts, messages, tool arguments or results, credentials, reconnect metadata, checkpoint payloads, or raw exception messages. Use `cayu recovery plan --session SESSION_ID --output plan.json` (or a bounded repeated `--status` selection) to create this artifact through the project's canonical application factory.
 
+Direct `app.run(RunRequest(task_id=...))` execution without a worker lease is
+supported. After a settled interruption, its task remains `running`, attached to
+the exact session incarnation. Recovery reports task ownership as `direct` only
+after the task store confirms that attachment and the session's exact invocation
+release receipt proves interrupted settlement. This is distinct from `unowned`,
+which requires a committed native-worker handoff receipt and an elected worker
+for continuation. A direct attachment continues through ordinary `app.resume`;
+planning neither claims its task nor invents a handoff or completion. Missing,
+stale, or conflicting attachment/release evidence remains `invalid_durable_state`.
+
 `CayuApp.execute_recovery(RecoveryExecutionRequest(...))` accepts that exact plan plus explicit decisions. `cayu recovery execute plan.json --execution-id ID` is the equivalent operator command. An unchanged item with only deterministic work defaults to `automatic_repair`; unknown model or tool effects, approvals, and user input remain blocked until an exact allowed decision is supplied. State drift after planning returns a blocked stale-plan receipt without mutation. Each mutating item first acquires a store-time lease in its checkpoint, then composes the existing run fencing, provider reattachment, tool/manual recovery, interruption, environment lifecycle, and budget-settlement boundaries. Its completion atomically clears that lease and appends a deterministic `recovery.plan.item.executed` receipt. Retrying the same plan and execution id replays that receipt instead of reapplying recovery. Independent sessions may execute concurrently up to `max_concurrency`; the per-session durable owner, rather than a cohort-wide lock, prevents duplicate work. Cancellation never converts an uncertain mutation into success, and a new plan is required after state changes. When `ServerLifecycleConfig.startup_recovery_statuses` is explicitly configured, server startup uses this same bounded plan/execution contract, a deterministic execution id, and bounded per-session concurrency for every cursor page; startup recovery remains disabled when that application policy is absent.
 
 An app can register either a concrete `Environment` or an

@@ -37,6 +37,11 @@ from cayu.runtime._environment_lifecycle import (
     pending_completion_finalization_from_checkpoint,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._invocation_lifecycle import (
+    InvocationLifecycleCommandKind,
+    _invocation_lifecycle_receipt_from_checkpoint,
+    require_released_invocation_command_authority,
+)
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._recovery_coordinator import (
@@ -47,7 +52,10 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_exact_interrupted_handoff_capability_is_complete,
 )
 from cayu.runtime.approvals import ToolApprovalRecoveryOutcome
-from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+    execution_profile_from_session_metadata,
+)
 from cayu.runtime.pending_actions import (
     checkpoint_has_pending_action_candidate,
     pending_action_from_records,
@@ -863,11 +871,13 @@ class RecoveryPlanCoordinator:
             environment_recovery = RecoveryEnvironmentEvidence()
             blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.INVALID_DURABLE_STATE))
 
-        task_claims = await self._task_claims(session)
+        task_claims = await self._task_claims(session, checkpoint)
         if any(claim.ownership_status == "active" for claim in task_claims):
             blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.ACTIVE_TASK_CLAIM))
         recoverable_task_claims = tuple(
-            claim for claim in task_claims if claim.ownership_status in {"expired", "unowned"}
+            claim
+            for claim in task_claims
+            if claim.ownership_status in {"expired", "unowned", "direct"}
         )
         if (
             any(claim.ownership_status == "invalid" for claim in task_claims)
@@ -1013,7 +1023,9 @@ class RecoveryPlanCoordinator:
             actions.append(action)
         return tuple(actions), invalid
 
-    async def _task_claims(self, session: Session) -> tuple[RecoveryTaskClaimEvidence, ...]:
+    async def _task_claims(
+        self, session: Session, checkpoint: dict[str, object] | None
+    ) -> tuple[RecoveryTaskClaimEvidence, ...]:
         if self._task_store is None:
             return ()
         tasks = await self._task_store.list_tasks(TaskQuery(session_id=session.id, limit=1000))
@@ -1061,6 +1073,13 @@ class RecoveryPlanCoordinator:
                 )
                 if type(receipt) is TaskInterruptedHandoffReceipt and receipt.task == task:
                     ownership_status = "unowned"
+            elif (
+                task.status is TaskStatus.RUNNING
+                and task.session_instance_id == session.instance_id
+                and task.interrupted_handoff_id is None
+                and await self._settled_direct_task_attachment(session, checkpoint, task)
+            ):
+                ownership_status = "direct"
             evidence.append(
                 RecoveryTaskClaimEvidence(
                     task_ref=_safe_ref("task", task.id),
@@ -1074,12 +1093,58 @@ class RecoveryPlanCoordinator:
             )
         return tuple(sorted(evidence, key=lambda item: item.task_ref))
 
+    async def _settled_direct_task_attachment(
+        self, session: Session, checkpoint: dict[str, object] | None, task: Task
+    ) -> bool:
+        """Prove direct attachment and the exact invocation's interrupted release.
+
+        Direct runs never owned a worker lease to release. Their existing
+        continuation contract uses a store-authoritative task/session attachment
+        read and the session's invocation fence instead of an elected handoff.
+        Merely observing an unleased RUNNING task is not settlement evidence.
+        """
+        if self._task_store is None or session.status is not SessionStatus.INTERRUPTED:
+            return False
+        try:
+            profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if profile is None:
+                return False
+            require_released_invocation_command_authority(
+                session,
+                checkpoint,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                active_profile=profile,
+            )
+            receipt = _invocation_lifecycle_receipt_from_checkpoint(
+                checkpoint,
+                command_identity=(
+                    f"{InvocationLifecycleCommandKind.RELEASE.value}:"
+                    f"{session.id}:{session.instance_id}:{profile.run_epoch}"
+                ),
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        if receipt is None or receipt.result_session.status is not SessionStatus.INTERRUPTED:
+            return False
+        try:
+            attached = await self._task_store.load_direct_attached_task_resume(
+                task.id,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+            )
+        except (KeyError, TaskClaimLost, NotImplementedError):
+            return False
+        return type(attached) is Task and attached == task
+
     async def _recoverable_task_for_item(
         self,
         *,
         private_session_id: str,
         item: RecoveryPlanItem,
     ) -> Task | None:
+        # Direct attachments continue under the session's invocation authority;
+        # only worker handoffs enter the task claim/heartbeat path below.
         expected = tuple(
             claim for claim in item.task_claims if claim.ownership_status in {"expired", "unowned"}
         )
