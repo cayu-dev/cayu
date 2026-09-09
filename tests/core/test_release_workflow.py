@@ -64,7 +64,7 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
     assert all(_COMMIT_PIN.fullmatch(reference) for reference in references), references
 
 
-def test_pull_requests_and_main_run_the_core_workers_with_selected_high_value_gates() -> None:
+def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
     workflow = _CI_WORKFLOW.read_text()
 
     assert _job_ids(workflow) == {
@@ -189,7 +189,9 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
         "needs: [static, test_shards, test_specialists, sqlite-cancellation, package-build, package, "
         "dashboard, release-qualification]" in publish
     )
-    assert "if: startsWith(github.ref, 'refs/tags/v')" in github_release
+    assert (
+        "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" in github_release
+    )
     assert "needs: [publish, package-build]" in github_release
 
     assert "prerelease: ${{ steps.release-package.outputs.prerelease }}" in package
@@ -242,7 +244,7 @@ def test_release_artifact_job_enforces_tagged_note_immutability() -> None:
     assert "--notes docs/release-notes.md" in package_manifest
 
 
-def test_selected_high_value_jobs_preserve_premerge_and_main_contracts() -> None:
+def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> None:
     workflow = _CI_WORKFLOW.read_text()
     runner = _CI_RUNNER.read_text()
     package_manifest = _PACKAGE_MANIFEST.read_text()
@@ -294,3 +296,36 @@ def test_selected_high_value_jobs_preserve_premerge_and_main_contracts() -> None
         "Verify installed wheel and source-distribution sidecar exports"
     )
     assert "publishing: true" not in package_manifest[sidecar_offset : sidecar_offset + 180]
+
+
+def test_ci_triggers_skip_main_pushes_and_cover_draft_transitions() -> None:
+    workflow = _CI_WORKFLOW.read_text()
+    triggers = workflow.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
+    assert "branches:" not in triggers
+    assert 'tags: ["v*"]' in triggers
+    assert "workflow_dispatch:" in triggers
+    assert (
+        "types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]" in triggers
+    )
+    assert "group: ci-${{ github.ref }}" in workflow
+    assert "cancel-in-progress: true" in workflow
+
+
+def test_draft_prs_skip_every_independent_worker_before_allocation() -> None:
+    workflow = _CI_WORKFLOW.read_text()
+    draft_guard = "    if: github.event_name != 'pull_request' || !github.event.pull_request.draft"
+    for name in ("verification-scope", "static", "test_shards", "test_specialists"):
+        block = _job_block(workflow, name)
+        assert draft_guard in block
+        assert block.index(draft_guard) < block.index("runs-on:")
+    for name in ("sqlite-cancellation", "package-build", "dashboard"):
+        assert "needs: verification-scope" in _job_block(workflow, name)
+    assert "needs: package-build" in _job_block(workflow, "package")
+
+
+def test_manual_tag_validation_cannot_publish() -> None:
+    workflow = _CI_WORKFLOW.read_text()
+    for name in ("publish", "github-release"):
+        condition = _job_block(workflow, name).split("needs:", 1)[0]
+        assert "github.event_name == 'push'" in condition
+        assert "startsWith(github.ref, 'refs/tags/v')" in condition

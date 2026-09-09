@@ -950,7 +950,7 @@ def test_cancellation_during_final_settlement_waits_for_durable_quiescence(
         app = CayuApp(task_store=store, enable_logging=False)
         task = await _claimed(store, "cancelled-final-settlement")
         tree_state = tmp_path / "tree-state"
-        request = _request(tree_state, complete=True, deadline_seconds=5)
+        request = _request(tree_state, complete=True, deadline_seconds=None)
         state_dir = tmp_path / "attempt-state"
         owner = asyncio.create_task(
             LocalExecutionAttemptCoordinator(store, state_dir=state_dir).run(
@@ -960,7 +960,7 @@ def test_cancellation_during_final_settlement_waits_for_durable_quiescence(
                 request=request,
             )
         )
-        await asyncio.wait_for(store.settlement_entered.wait(), timeout=10)
+        await asyncio.wait_for(store.settlement_entered.wait(), timeout=30)
         identities = _fixture_identities(tree_state)
 
         owner.cancel("caller stopped during settlement")

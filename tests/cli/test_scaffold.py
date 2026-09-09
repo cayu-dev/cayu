@@ -727,7 +727,9 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         check=False,
         capture_output=True,
         text=True,
-        timeout=180,
+        # This runs the entire generated architecture and composition suite
+        # in another interpreter, alongside the outer CI shard.
+        timeout=600,
     )
     assert generated_suite.returncode == 0, generated_suite.stdout + generated_suite.stderr
 

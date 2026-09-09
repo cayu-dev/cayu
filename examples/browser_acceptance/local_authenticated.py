@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import aclosing, asynccontextmanager
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -89,7 +89,7 @@ class Operator:
     def __init__(self, client, tls, fixture):
         self.client, self.tls, self.fixture = client, tls, fixture
         self.headers = {}
-        self.session_id = None
+        self.session_id: str | None = None
         self.request_id = "bt_" + secrets.token_hex(16)
 
     async def call(self, method, path, data=None):
@@ -114,6 +114,8 @@ class Operator:
         return response.json()
 
     async def current(self):
+        if self.session_id is None:
+            raise RuntimeError("Operator session has not been initialized")
         value = await self.call("GET", "/sessions/" + self.session_id)
         rows = value["browsers"]
         if len(rows) != 1:
@@ -154,6 +156,7 @@ class Operator:
 
     async def send(self, kind, value):
         from websockets.asyncio.client import connect
+        from websockets.typing import Origin, Subprotocol
 
         from cayu.server._browser_input_routes import OPERATOR_INPUT_SUBPROTOCOL
         from cayu.tools._browser_control_transport import _private_transport_logger
@@ -179,11 +182,11 @@ class Operator:
         async with connect(
             "wss://127.0.0.1:8443/api/browser-control/input",
             ssl=self.tls,
-            origin="https://operator.test",
+            origin=Origin("https://operator.test"),
             proxy=None,
             compression=None,
             max_size=65536,
-            subprotocols=[OPERATOR_INPUT_SUBPROTOCOL],
+            subprotocols=[Subprotocol(OPERATOR_INPUT_SUBPROTOCOL)],
             logger=_private_transport_logger(),
         ) as channel:
             await channel.send(ticket["ticket"])
@@ -317,6 +320,7 @@ async def _setup(startup_cleanups):
         BrowserAcceptancePlanV1,
         live_authenticated_browser_acceptance_manifest,
     )
+    from cayu.providers._http import aclose_transport
     from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
     from cayu.runtime.browser_control import (
         BrowserControlPolicy,
@@ -535,12 +539,15 @@ async def _setup(startup_cleanups):
             self.count += 1
             self.reserved += reserve
             print("PHASE provider-request-" + str(self.count), flush=True)
-            async with aclosing(delegate.stream_chat_completions(**kwargs)) as events:
+            events = delegate.stream_chat_completions(**kwargs)
+            try:
                 async for event in events:
                     yield event
+            finally:
+                await aclose_transport(events)
 
         async def aclose(self):
-            await delegate.aclose()
+            await aclose_transport(delegate)
 
     guard = Guard()
     provider.transport = guard

@@ -732,7 +732,7 @@ class _OwnedEnvironmentAdoptionHandler(EgressAuthorityAdoptionHandler):
             owner_fingerprint=egress_authority_owner_fingerprint(owner_token),
             source_environment_fingerprint=expected_environment_fingerprint,
         )
-        return await self._target_factory.adopt_authority(
+        result = await self._target_factory.adopt_authority(
             factory_result=(self._factory_result_override or factory_result),
             authorized=authorized,
             coordinator=coordinator,
@@ -740,6 +740,12 @@ class _OwnedEnvironmentAdoptionHandler(EgressAuthorityAdoptionHandler):
             agent_name="assistant",
             execution_profile_fingerprint=decision.candidate_profile.fingerprint,
         )
+        assert result.environment.runner is not None
+        assert (
+            result.environment.runner.execution_environment_authority()
+            is self._target_factory.execution_environment_authority()
+        )
+        return result
 
 
 class RecordingEgressAuthorityAdoptionHandler(EgressAuthorityAdoptionHandler):

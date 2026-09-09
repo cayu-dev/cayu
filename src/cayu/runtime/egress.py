@@ -749,11 +749,15 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 owner_token=owner_token,
                 target_authority=self._egress_authority_identity,
             )
-            return _runtime_egress_authority_adoption_result(
+            result = _runtime_egress_authority_adoption_result(
                 transition=active,
                 factory_result=factory_result,
                 coordinator=coordinator,
             )
+            # The sealed handoff proves the exact active target before the
+            # retained runner acquires this factory's admission authority.
+            managed_runner._execution_environment_authority = self._execution_environment_authority
+            return result
         registry = VirtualCredentialRegistry()
         grants = tuple(
             registry.mint(
@@ -810,11 +814,14 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             target_redactor=target_redactor,
             target_audit=audit,
         )
-        return _runtime_egress_authority_adoption_result(
+        result = _runtime_egress_authority_adoption_result(
             transition=active,
             factory_result=factory_result,
             coordinator=coordinator,
         )
+        # Preserve the allocation while rebinding its verified target owner.
+        managed_runner._execution_environment_authority = self._execution_environment_authority
+        return result
 
     async def renew_parked_authority(
         self,

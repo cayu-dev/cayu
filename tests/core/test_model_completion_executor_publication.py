@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from tests.core._execution_profile_fixtures import create_admitted_session
+from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.core import AgentSpec, Event, EventType, Message
@@ -1273,7 +1274,10 @@ def test_model_executor_publishes_completion_before_grouped_aclose_failure() -> 
     assert cancelling == 0
     assert cancelled is True
     assert raised.args == ("Provider operation cancelled",)
-    assert provider_cancellation_failures(raised) == (
+    assert tuple(
+        without_redacted_cleanup_context(failure)
+        for failure in provider_cancellation_failures(raised)
+    ) == (
         {
             "phase": "provider_stream_cleanup",
             "error": "Provider stream cleanup did not complete normally.",

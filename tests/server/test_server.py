@@ -846,6 +846,8 @@ def test_server_run_environment_factory_failure_terminalizes_linked_task() -> No
         EventType.INTERACTION_STARTED,
         EventType.ENVIRONMENT_FACTORY_STARTED,
         EventType.TASK_STARTED,
+        EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
+        EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
         EventType.ENVIRONMENT_FACTORY_FAILED,
         EventType.TASK_FAILED,
         EventType.INTERACTION_FAILED,
@@ -909,6 +911,8 @@ def test_server_run_binding_failure_terminalizes_prestarted_task() -> None:
 
     assert [event["type"] for event in events] == [
         EventType.INTERACTION_STARTED,
+        EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
+        EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
         EventType.ENVIRONMENT_BINDING_STARTED,
         EventType.TASK_STARTED,
         EventType.ENVIRONMENT_BINDING_FAILED,

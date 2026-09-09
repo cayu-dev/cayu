@@ -508,3 +508,49 @@ def test_replay_does_not_hide_new_pending_evidence(store):
         assert await store.load_checkpoint("zero-work") == checkpoint
 
     _run(store, exercise)
+
+
+def test_postgres_preflight_keeps_one_snapshot_during_peer_terminalization(
+    postgres_dsn, monkeypatch
+):
+    from tests.core.test_postgres_session_store import _new_store, _truncate
+
+    async def exercise():
+        await _truncate(postgres_dsn)
+        reader = _new_store(postgres_dsn)
+        writer = _new_store(postgres_dsn)
+        try:
+            await _orphan(reader)
+            session = await reader.load("zero-work")
+            checkpoint = await reader.load_checkpoint("zero-work")
+            original_load = reader._load
+            committed = None
+
+            async def load_then_commit_peer(cursor, session_id):
+                nonlocal committed
+                loaded = await original_load(cursor, session_id)
+                if committed is None:
+                    committed = await writer._terminalize_zero_work_interruption(
+                        ZeroWorkInterruptionRequest(session, checkpoint, None, True)
+                    )
+                    assert committed is not None
+                return loaded
+
+            monkeypatch.setattr(reader, "_load", load_then_commit_peer)
+            preflight = await reader._terminalize_zero_work_interruption(
+                ZeroWorkInterruptionRequest(session, checkpoint, None, False)
+            )
+            assert preflight is not None
+            assert not preflight.replayed
+            assert committed is not None
+            assert preflight.events == committed.events
+            replay = await reader._terminalize_zero_work_interruption(
+                ZeroWorkInterruptionRequest(session, checkpoint, None, True)
+            )
+            assert replay is not None and replay.replayed
+            assert replay.events == committed.events
+        finally:
+            await reader.close()
+            await writer.close()
+
+    asyncio.run(exercise())

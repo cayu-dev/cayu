@@ -89,7 +89,7 @@ PyPI access.
    uv run python -m maintenance.model_catalog.check
    ```
 
-   Pull-request and `main` CI deliberately skip wall-clock staleness so unchanged
+   Pull-request and manual branch CI deliberately skip wall-clock staleness so unchanged
    branches remain deterministic. The tag workflow does not skip it. Do not create
    the tag if this command fails; re-verify the reported records against their
    official sources and land the refreshed catalog first.

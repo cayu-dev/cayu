@@ -23,6 +23,19 @@ Our current maintainer priorities are:
 6. **New integrations** — usually belong outside this repo; see
    [placement policy](#placement-policy-what-lands-in-tree) before writing code.
 
+## CI triggers
+
+CI runs when a non-draft pull request opens, receives a push, reopens, or is
+marked ready for review. Draft PRs skip CI workers; converting a PR back to draft
+cancels its superseded run. New PR pushes also cancel older runs for that PR.
+
+Merging or pushing directly to `main` does not automatically run CI. Maintainers
+can run `ci.yml` manually against a selected branch or tag from the Actions UI or
+with `gh workflow run ci.yml --ref <branch-or-tag>`. Manual runs validate without
+publishing. `v*` tag pushes retain release validation and gated publishing.
+Full-scale qualification also retains its separate nightly schedule and manual
+trigger.
+
 ## Before you start: search first
 
 - Search **open and closed** issues and PRs for your symptom or idea — duplicates are

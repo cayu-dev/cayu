@@ -205,7 +205,9 @@ def test_v3_authored_suite_executes_all_trials_and_applies_pass_threshold(tmp_pa
             assert launched.status_code == 202
             run_id = launched.json()["runs"][0]["run"]["spec"]["run_id"]
 
-            deadline = time.monotonic() + 5
+            # Await eventual durable completion without imposing a five-second
+            # performance requirement on concurrent CI workers.
+            deadline = time.monotonic() + 30
             run = None
             while time.monotonic() < deadline:
                 response = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)

@@ -816,9 +816,10 @@ def test_binding_finalize_nonportable_diagnostic_remains_terminal(
 
     assert session is not None
     assert session.status is SessionStatus.COMPLETED
-    assert [event.type for event in events[-3:]] == [
+    assert [event.type for event in events[-4:]] == [
         EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
         EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+        EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,
         EventType.SESSION_COMPLETED,
     ]
     expected = {
@@ -834,10 +835,10 @@ def test_binding_finalize_nonportable_diagnostic_remains_terminal(
         ],
     }
     assert {
-        key: events[-2].payload[key] for key in ("error", "error_type", "outcome", "failures")
+        key: events[-3].payload[key] for key in ("error", "error_type", "outcome", "failures")
     } == expected
     assert events[-1].payload["binding_finalize_error"] == expected
-    assert "workload-secret" not in repr(events[-2].payload) + repr(events[-1].payload)
+    assert "workload-secret" not in repr(events[-3].payload) + repr(events[-1].payload)
 
 
 def test_binding_finalize_hostile_exception_access_cannot_escape() -> None:

@@ -1017,7 +1017,7 @@ def test_generate_slice_fails_closed_for_a_pattern_bound_agent_shadow(
     monkeypatch,
     capsys,
 ) -> None:
-    assert main(["new", "reviewer", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "reviewer", "--dir", str(tmp_path), "--without", "knowledge,memory"]) == 0
     capsys.readouterr()
     project = tmp_path / "reviewer"
     agent_path = project / "agents" / "agent.py"

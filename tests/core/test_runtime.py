@@ -46,6 +46,7 @@ from tests.core._session_operation_fault_harness import (
 )
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
+from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 from tests.provider_traceback_assertions import is_cayu_source_filename
 from tests.runner_cancellation import cancelled_error_with_artifacts
 
@@ -13475,7 +13476,10 @@ def test_cayu_app_preserves_caller_cancellation_during_provider_stream_cleanup(
         ]
         assert len(interrupted_events) == 1
         interrupted = interrupted_events[0]
-        assert interrupted.payload["provider_cancellation_failures"] == [
+        assert [
+            without_redacted_cleanup_context(failure)
+            for failure in interrupted.payload["provider_cancellation_failures"]
+        ] == [
             {
                 "phase": "model_stream",
                 "error": "Model provider stream failed before cancellation.",
@@ -13753,7 +13757,10 @@ def test_provider_cancellation_marker_precedes_operator_terminal_transition() ->
         assert len(interrupt_events) == 1
         assert interrupt_events[0].type is EventType.SESSION_INTERRUPTED
         assert run_events[-1].id == interrupt_events[0].id
-        assert interrupt_events[0].payload["provider_cancellation_failures"] == [
+        assert [
+            without_redacted_cleanup_context(failure)
+            for failure in interrupt_events[0].payload["provider_cancellation_failures"]
+        ] == [
             {
                 "phase": "model_stream",
                 "error": "Model provider stream failed before cancellation.",
@@ -14061,9 +14068,10 @@ def test_cayu_app_preserves_caller_cancellation_when_provider_replaces_its_type(
                 "model_attempt_id": started.payload["model_attempt_id"],
             }
         ]
-        assert interrupted[0].payload.get("provider_cancellation_failures", []) == (
-            expected_failures
-        )
+        assert [
+            without_redacted_cleanup_context(failure)
+            for failure in interrupted[0].payload.get("provider_cancellation_failures", [])
+        ] == (expected_failures)
         assert EventType.MODEL_ERROR not in {event.type for event in events}
         assert EventType.SESSION_FAILED not in {event.type for event in events}
         assert canary not in json.dumps(
@@ -14147,7 +14155,10 @@ def test_cayu_app_preserves_caller_cancellation_across_late_explicit_close_failu
         events = [record.event for record in records]
         interrupted = [event for event in events if event.type is EventType.SESSION_INTERRUPTED]
         assert len(interrupted) == 1
-        assert interrupted[0].payload["provider_cancellation_failures"] == [
+        assert [
+            without_redacted_cleanup_context(failure)
+            for failure in interrupted[0].payload["provider_cancellation_failures"]
+        ] == [
             {
                 "phase": "provider_stream_cleanup",
                 "error": "Provider stream cleanup did not complete normally.",
@@ -14473,7 +14484,10 @@ def test_chat_completions_adapter_preserves_nested_cancellation_diagnostics() ->
         )
         assert transport.requests == 1
         assert len(interrupted) == 1
-        assert interrupted[0].payload["provider_cancellation_failures"] == [
+        assert [
+            without_redacted_cleanup_context(failure)
+            for failure in interrupted[0].payload["provider_cancellation_failures"]
+        ] == [
             {
                 "phase": "model_stream",
                 "error": "Model provider stream failed before cancellation.",
@@ -29397,7 +29411,9 @@ def test_interrupt_close_reuses_validated_checkpoint_for_subagent_reattachment()
 
     assert len(spawn_events) == 1
     assert spawn_events[0].payload["result"]["structured"]["child_session_id"] == "child"
-    assert store.checkpoint_reads_after_child_query == 1
+    # Assistant publication and final recovery publication each read once;
+    # child reattachment reuses the checkpoint supplied by the coordinator.
+    assert store.checkpoint_reads_after_child_query == 2
 
 
 def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id():

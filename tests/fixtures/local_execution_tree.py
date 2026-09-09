@@ -184,6 +184,27 @@ def _child(
             return
         _publish_playwright_processes(root, browser_executable=browser_executable)
         (root / "playwright-ready").write_text(str(browser.version), encoding="utf-8")
+
+    # Completion triggers real process-tree cleanup. Do not let the parent
+    # exit before the descendants have published the identities the test
+    # needs to prove that cleanup reached every process.
+    def descendants_ready() -> bool:
+        for role, process in zip(("grandchild", "background_server"), children, strict=True):
+            try:
+                identity = json.loads((root / f"{role}.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return False
+            if identity["pid"] != process.pid:
+                return False
+        return True
+
+    ready_deadline = time.monotonic() + 30
+    while not descendants_ready():
+        if any(child.poll() is not None for child in children):
+            raise RuntimeError("A fixture descendant exited before publishing its identity.")
+        if time.monotonic() >= ready_deadline:
+            raise TimeoutError("Fixture descendants did not publish their identities.")
+        time.sleep(0.01)
     (root / "tree-ready").write_text("ready", encoding="ascii")
     if complete:
         return

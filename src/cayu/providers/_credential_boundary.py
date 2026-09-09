@@ -22,7 +22,11 @@ from cayu._exception_state import (
     set_exception_state,
 )
 from cayu._validation import require_durable_nonblank
-from cayu.providers._cleanup_diagnostics import cleanup_diagnostics, copy_cleanup_diagnostics
+from cayu.providers._cleanup_diagnostics import (
+    MAX_CLEANUP_DIAGNOSTIC_FIELDS,
+    cleanup_diagnostics,
+    copy_cleanup_diagnostics,
+)
 from cayu.providers.base import ModelProviderError, ModelStreamDeadlineError
 from cayu.providers.deadlines import (
     DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
@@ -247,7 +251,7 @@ def copy_provider_cancellation_failures(
             raise TypeError(f"Provider cancellation failure {index} must be a dict.")
         failure = cast("dict[object, object]", failure)
         if (
-            len(failure) > 16
+            len(failure) > 3 + MAX_CLEANUP_DIAGNOSTIC_FIELDS
             or any(type(key) is not str for key in failure)
             or not {"phase", "error", "error_type"} <= failure.keys()
         ):

@@ -102,7 +102,7 @@ def prepare_zero_work_interruption(
     blocked: bool,
     now: datetime,
 ) -> ZeroWorkInterruptionPublication | None:
-    """Called only with a bounded snapshot under the backend's writer lock."""
+    """Use a bounded consistent snapshot; publication also holds the writer lock."""
     if (
         blocked
         or session.id != request.session.id

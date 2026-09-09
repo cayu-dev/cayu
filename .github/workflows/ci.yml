@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +16,7 @@ concurrency:
 
 jobs:
   verification-scope:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Verification scope
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 2
@@ -50,6 +52,7 @@ jobs:
             --head-sha "$HEAD_SHA" >> "$GITHUB_OUTPUT"
 
   static:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Static checks
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 5
@@ -59,6 +62,7 @@ jobs:
       - run: python3 scripts/run_ci.py --lane static
 
   test_shards:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test shard ${{ matrix.shard }}/32 (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 15
@@ -86,6 +90,7 @@ jobs:
           if-no-files-found: error
 
   test_specialists:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test specialist ${{ matrix.lane }} (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 15
@@ -254,6 +259,7 @@ jobs:
     if: >-
       !cancelled() &&
       !failure() &&
+      github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
     needs: [static, test_shards, test_specialists, sqlite-cancellation, package-build, package, dashboard, release-qualification]
@@ -279,7 +285,7 @@ jobs:
 
   github-release:
     name: Create GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [publish, package-build]
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 5

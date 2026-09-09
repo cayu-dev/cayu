@@ -552,11 +552,14 @@ def test_whole_command_bounds_blocking_publication_and_cleans_staging(
     monkeypatch,
     capsys,
 ) -> None:
+    # Both publisher and reconciler spawn fresh interpreters. Keep a bounded
+    # command while allowing cleanup startup on a busy CI worker.
     limits = doctor_cli.DEFAULT_SUPPORT_BUNDLE_LIMITS.model_copy(
         update={
             "worker_timeout_seconds": 0.2,
             "publication_timeout_seconds": 15.0,
-            "command_timeout_seconds": 30.0,
+            "reconciliation_timeout_seconds": 15.0,
+            "command_timeout_seconds": 45.0,
         }
     )
     monkeypatch.setattr(doctor_cli, "DEFAULT_SUPPORT_BUNDLE_LIMITS", limits)

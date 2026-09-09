@@ -3957,6 +3957,7 @@ from cayu import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
+    ExecutionEnvironmentAuthority,
     ExecutionExecutableEvidence,
     ExecutionRequirements,
     ExecutionToolRequirementEvidence,
@@ -4354,6 +4355,7 @@ class _LocalDockerRunner(DockerRunner):
         self,
         root: Path,
         candidate: ExecutionAdmissionCandidate,
+        authority: ExecutionEnvironmentAuthority,
     ) -> None:
         super().__init__(
             "generated-docker-smoke",
@@ -4364,6 +4366,7 @@ class _LocalDockerRunner(DockerRunner):
         self.local = LocalRunner(root, inherit_env=False)
         self.root = root
         self.candidate = candidate
+        self.authority = authority
         self.closed = False
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
@@ -4376,6 +4379,9 @@ class _LocalDockerRunner(DockerRunner):
 
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
         return self.candidate
+
+    def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
+        return self.authority
 
     async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
         argv = tuple(command.argv or ())
@@ -4601,7 +4607,9 @@ def _install_fake_docker_factory(
 ) -> None:
     async def fake_create(factory, request):
         candidate = _live_candidate(factory)
-        runner = _LocalDockerRunner(target, candidate)
+        runner = _LocalDockerRunner(
+            target, candidate, factory.execution_environment_authority()
+        )
         created_runners.append(runner)
         workspace = RunnerWorkspace(
             runner,

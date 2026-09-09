@@ -40,9 +40,11 @@ authoritative only where a maintained guide points to the implementation or the
 
 ## Operations and verification
 
+- [Citation offset diagnostics](citation-offset-diagnostics.md)
 - [Diagnostic support bundles](diagnostic-support-bundles.md)
 - [Git command policy](git-command-policy.md)
 - [Nightly verification](nightly-verification.md)
+- [Provider stream-close diagnostics](provider-stream-close-investigation.md)
 - [Runtime stability qualification](runtime-qualification.md)
 - [Release notes](release-notes.md)
 - [Releasing](releasing.md)
@@ -54,6 +56,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Function-call event ordering investigation](function-call-event-ordering.md)
 - [Hosted-search event ordering investigation](hosted-search-event-ordering.md)
 - [Hosted-search source diagnostics](hosted-search-source-diagnostics.md)
+- [Responses output-index collision diagnostics](responses-output-index-investigation.md)
 - [Database storage and migrations ADR](adr/0001-database-storage-and-migrations.md)
 - [AWS Bedrock and Lambda MicroVM implementation record](aws-bedrock-lambda-microvm-implementation-plan.md)
 - [AWS credentials](aws-credentials.md)

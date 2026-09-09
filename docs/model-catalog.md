@@ -188,7 +188,7 @@ future schedules retain the evidence for the published transition and become
 freshness-gated when they take effect. A gap or expired current price triggers
 verification rather than falling back to another schedule.
 
-Ordinary PR and `main` CI do not make an unchanged branch fail solely because wall time
+Ordinary PR and manual branch CI do not make an unchanged branch fail solely because wall time
 passed. Release-tag verification enforces freshness for published artifacts; maintainers
 run the documented local refresh when that gate reports stale records. Installed releases
 remain offline and deterministic; applications decide when to upgrade or replace either

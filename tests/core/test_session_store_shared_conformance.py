@@ -42,6 +42,7 @@ from tests.core.completion_result_resolver_conformance import (
 from tests.core.transcript_search_conformance import (
     assert_transcript_search_conformance,
 )
+from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._recovery_coordinator as recovery_coordinator_module
@@ -2199,7 +2200,10 @@ def test_session_store_conformance_persists_provider_stream_cancellation_diagnos
             ]
             assert len(interrupted_events) == 1
             interrupted = interrupted_events[0]
-            assert interrupted.payload["provider_cancellation_failures"] == [
+            assert [
+                without_redacted_cleanup_context(failure)
+                for failure in interrupted.payload["provider_cancellation_failures"]
+            ] == [
                 {
                     "phase": "model_stream",
                     "error": "Model provider stream failed before cancellation.",

@@ -32,9 +32,8 @@ usage, and retry exhaustion.
 
 The documentation does not resolve all Unicode indexing details. These tests
 establish Runtime's existing interpretation, not upstream Unicode equivalence.
-No original failing annotation or isolated upstream/intermediary capture was
-available for #1601. The historical failure remains unattributed; changing
-index units or text association requires sanitized evidence from that boundary.
+Changing index units or text association requires sanitized evidence from the
+provider or intermediary boundary.
 No active workload or live provider request is needed for these controls.
 
 A separate pre-existing stream limit remains: a message supplied only inside

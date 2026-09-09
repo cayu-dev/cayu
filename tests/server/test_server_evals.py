@@ -189,9 +189,10 @@ def _wait_for_terminal(
     client: TestClient,
     run_id: str,
     *,
-    timeout: float = 5.0,
+    timeout: float = 30.0,
     path_prefix: str = "/api",
 ) -> dict:
+    # This polls eventual completion; it does not assert an execution deadline.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         response = client.get(f"{path_prefix}/evals/runs/{run_id}", headers=_AUTH_HEADERS)

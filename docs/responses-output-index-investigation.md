@@ -1,8 +1,5 @@
 # Responses output-index collision investigation
 
-Tracking: #1591; related ordering investigation: #1495. These are separate
-failure shapes; no common cause has been established.
-
 A completed message at output index 7 followed by a function-call addition at
 index 7 remains a protocol error (`function_call_output_index_type_mismatch`).
 The parser must not renumber either item or accept an incompatible identity.
@@ -36,13 +33,7 @@ is the intermediary's index rewrite; item and response aliases otherwise agree.
 Both are rejected. Existing function/search ordering suites cover valid
 interleaving, completion, usage, and bounded retry behavior.
 
-## Reproduction baseline and limits
-
-Baseline: Runtime `eae5abdfd6ec5d166ef011b655cad2ae7adaec80`, version 0.4.0,
-including the provider lifecycle centralization. Environment: macOS 15.7.7 arm64,
-Python 3.14.3, httpx 0.28.1, httpcore 1.0.9, anyio 4.13.0, pytest 9.0.3.
-The PR records the exact tested implementation commit. The native Responses
-adapter uses httpx; no OpenAI SDK or live provider/model version was exercised.
+## Verification
 
 Run with this checkout's `src` and root first in `PYTHONPATH`:
 
@@ -50,9 +41,6 @@ Run with this checkout's `src` and root first in `PYTHONPATH`:
 python -m pytest -q tests/core/test_openai_output_index_collision.py tests/core/test_openai_function_ordering.py tests/core/test_openai_search_ordering.py
 ```
 
-The focused suite passes 110 tests. Loopback sockets require local socket
-permission. No paid probe, deployed intermediary, original upstream capture,
-Linux/Windows run, or full qualification was performed. The historical
-upstream/intermediary versions and first divergence remain unknown. These
-controls improve diagnosis; they do not attribute or resolve the original
-incident, and #1591 remains an open investigation.
+Loopback sockets require local socket permission. These synthetic controls
+verify rejection and diagnostic behavior; they do not attribute the cause of
+an unobserved provider or intermediary failure.

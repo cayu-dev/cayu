@@ -1,9 +1,13 @@
 """Authenticated control admission through native boundary evidence and publication."""
 
 import asyncio
+import gc
 import json
+import threading
 import time
-from contextlib import asynccontextmanager
+import warnings
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
@@ -43,6 +47,55 @@ _MALFORMED_HANDBACK_CASES = (
     "handback_malformed_phase",
     "handback_malformed_epoch",
 )
+
+
+@contextmanager
+def scenario_warning_capture():
+    # The standard recorder is process-global on supported Python builds.
+    # Route other threads' warnings to pytest while recording this scenario
+    # and async operations that inherit its context.
+    owned = ContextVar("audit_warning_scope", default=False)
+    captured = []
+    forward = warnings.showwarning
+
+    def showwarning(message, category, filename, lineno, file=None, line=None):
+        if owned.get():
+            captured.append(str(message))
+        else:
+            forward(message, category, filename, lineno, file=file, line=line)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        warnings.showwarning = showwarning
+        token = owned.set(True)
+        try:
+            yield captured
+        finally:
+            owned.reset(token)
+
+
+def test_audit_warning_capture_preserves_unrelated_thread_warnings():
+    release = threading.Event()
+
+    def unrelated_worker():
+        assert release.wait(timeout=5)
+        warnings.warn("unrelated resource", ResourceWarning, stacklevel=1)
+
+    worker = threading.Thread(target=unrelated_worker)
+    worker.start()
+    try:
+        with (
+            pytest.warns(ResourceWarning, match="unrelated resource"),
+            scenario_warning_capture() as captured,
+        ):
+            warnings.warn("owned scenario", UserWarning, stacklevel=1)
+            release.set()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+        assert captured == ["owned scenario"]
+    finally:
+        release.set()
+        worker.join(timeout=5)
 
 
 @asynccontextmanager
@@ -95,7 +148,7 @@ async def audit_publication_fixture(backend, tmp_path, postgres_dsn):
     ],
 )
 def test_http_boundary_audit_remains_owned_and_private(
-    tmp_path, monkeypatch, backend, case, recwarn, caplog, capsys, request
+    tmp_path, monkeypatch, backend, case, caplog, capsys, request
 ):
     canary = "audit-private-canary"
     postgres_dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
@@ -352,7 +405,13 @@ def test_http_boundary_audit_remains_owned_and_private(
                 )
                 assert await control.drain()
 
-    asyncio.run(scenario())
+    # Collect earlier tests' unreachable subprocess resources before capturing
+    # this scenario's warnings. They remain visible to pytest's outer recorder.
+    gc.collect()
+    with scenario_warning_capture() as scenario_warnings:
+        asyncio.run(scenario())
+        # Include warnings from resources released by this scenario itself.
+        gc.collect()
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn
+    assert not scenario_warnings, scenario_warnings

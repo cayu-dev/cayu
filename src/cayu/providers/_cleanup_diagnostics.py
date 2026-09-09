@@ -59,6 +59,7 @@ _OPTIONAL_FIELDS = {
     "cleanup_cause_message",
     "cleanup_local_stack",
 }
+MAX_CLEANUP_DIAGNOSTIC_FIELDS = len(_REQUIRED_FIELDS | _OPTIONAL_FIELDS)
 _PROVIDER_CODES = {
     "openai": {"rate_limit_exceeded", "server_error", "insufficient_quota"},
     "anthropic": {"rate_limit_error", "overloaded_error", "api_error"},

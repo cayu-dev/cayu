@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -7369,6 +7370,7 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
             super().__init__(ownership_clock=ownership_clock)
             self.heartbeat_started = asyncio.Event()
             self.release_heartbeat = asyncio.Event()
+            self.heartbeat_retried = asyncio.Event()
             self.stalled = False
 
         async def publish_session_operation_guarded_with_store_time(
@@ -7378,6 +7380,8 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
                 self.stalled = True
                 self.heartbeat_started.set()
                 await self.release_heartbeat.wait()
+            elif kwargs.get("events") == []:
+                self.heartbeat_retried.set()
             return await super().publish_session_operation_guarded_with_store_time(
                 session_id, **kwargs
             )
@@ -7403,7 +7407,6 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
                 await self._store.heartbeat_started.wait()
                 # Publish the first attempt late enough that its guarded claim
                 # renewal extends beyond the original local lease deadline.
-                await asyncio.sleep(1)
                 self._advance_clock()
             else:
                 self.second_dispatch_started.set()
@@ -7419,6 +7422,12 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
     async def run() -> None:
         accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
         now = {"value": accepted_at}
+        monotonic_now = {"value": 0.0}
+        monkeypatch.setattr(
+            session_engine_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: monotonic_now["value"]),
+        )
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_LEASE",
@@ -7429,10 +7438,15 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
+
+        def advance_publication_clock() -> None:
+            now["value"] = accepted_at + timedelta(seconds=1)
+            monotonic_now["value"] = 1.0
+
         store = StalledFirstHeartbeatStore(ownership_clock=lambda: now["value"])
         provider = PublishWhileHeartbeatStalledProvider(
             store=store,
-            advance_clock=lambda: now.update(value=accepted_at + timedelta(seconds=1)),
+            advance_clock=advance_publication_clock,
         )
         app = CayuApp(
             session_store=store,
@@ -7485,7 +7499,10 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
             await asyncio.wait_for(provider.second_dispatch_started.wait(), timeout=10)
             # This is past the original two-second deadline, but remains
             # inside the two-second lease measured from event publication.
-            await asyncio.sleep(1.1)
+            monotonic_now["value"] = 2.1
+            # Wait for the stalled renewal to time out and a new heartbeat to
+            # start, with the runtime clock fixed inside the renewed lease.
+            await asyncio.wait_for(store.heartbeat_retried.wait(), timeout=10)
             assert not task.done()
             assert provider.calls == 2
 

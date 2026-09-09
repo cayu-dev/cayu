@@ -157,6 +157,10 @@ async def postgres_terminalize(
     async with store._connection() as conn:
         try:
             async with conn.cursor() as cur:
+                if not request.commit:
+                    # Preflight spans several tables. READ COMMITTED can pair
+                    # a pre-terminal session with a peer's committed receipts.
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 session = (
                     await store._load_for_update(cur, sid)
                     if request.commit

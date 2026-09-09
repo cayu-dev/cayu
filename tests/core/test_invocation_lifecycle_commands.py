@@ -3316,8 +3316,8 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
     retained = owner.invocation_context
     assert retained is not None
 
-    # A separately authenticated context with the old environment does not own
-    # this cleanup, even if all of its other authority values agree.
+    # Independently derived contexts may advance from the exact predecessor
+    # environment when every other retained authority reference agrees.
     other_context = _authenticated_invocation_context(
         active_profile=environment_context.active_profile,
         binding=environment_context.binding,
@@ -3331,8 +3331,26 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
         budget_policy=app.budget_policy,
         tool_capability_ceiling=environment_context.tool_capability_ceiling,
     )
-    with pytest.raises(RuntimeError, match="does not own the retained environment"):
-        _retain_cleanup_invocation_context(owner, other_context)
+    _retain_cleanup_invocation_context(owner, other_context)
+    assert owner.invocation_context is not None
+    assert owner.invocation_context.registered_environment is bound_environment
+    assert owner.invocation_context.registered_provider is registered_provider
+    changed_authority = _authenticated_invocation_context(
+        active_profile=environment_context.active_profile,
+        binding=environment_context.binding,
+        validated_profile=environment_context.profile,
+        registered_agent=registered_agent,
+        registered_provider=registered_provider,
+        registered_environment=registered_environment,
+        runtime_hooks=app._runtime_hooks,
+        loop_policies=tuple([policy]),
+        request_loop_policies=(),
+        budget_policy=app.budget_policy,
+        tool_capability_ceiling=environment_context.tool_capability_ceiling,
+    )
+    retained = owner.invocation_context
+    with pytest.raises(RuntimeError, match="invocation context changed"):
+        _retain_cleanup_invocation_context(owner, changed_authority)
     assert owner.invocation_context is retained
 
     _retain_cleanup_invocation_context(owner, environment_context)

@@ -571,6 +571,9 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
             nonlocal dispatch_calls
             dispatch_calls += 1
 
+        async def refresh_live_model_semantics() -> None:
+            return None
+
         def record_model_completion(event: Event) -> Event:
             completed_events.append(event)
             return event
@@ -593,6 +596,7 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
             prepare_provider_dispatch=prepare_provider_dispatch,
             before_provider_dispatch=before_provider_dispatch,
             validate_live_model_semantics=lambda: None,
+            refresh_live_model_semantics=refresh_live_model_semantics,
             record_model_attempt_identity=observed_model_attempt_ids.append,
         ):
             if event is not None:

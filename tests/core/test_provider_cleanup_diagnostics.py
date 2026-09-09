@@ -179,6 +179,11 @@ def test_provider_specific_cleanup_fields_are_allowlisted(provider, code):
         "error": "Provider stream cleanup did not complete normally.",
         "error_type": "ProviderStreamCleanupError",
         **fields,
+        "model_step_id": "mstep_" + "1" * 32,
+        "model_attempt_id": "matt_" + "2" * 32,
+        "cleanup_cause_type": "RuntimeError",
+        "cleanup_cause_message": "redacted",
+        "cleanup_local_stack": '[["_credential_boundary.py",1]]',
     }
     assert copy_provider_cancellation_failures(json.loads(json.dumps([diagnostic]))) == (
         diagnostic,
