@@ -772,6 +772,11 @@ def normalize_dashboard_runtime_config(
     if type(copied) is not dict:
         raise ValueError(f"{field_name} must be an object.")
     require_durable_json_text(copied, field_name)
+    review_purpose = copied.get("humanReviewPurpose")
+    if review_purpose is not None:
+        require_clean_nonblank(review_purpose, f"{field_name}.humanReviewPurpose")
+        if len(review_purpose) > 128:
+            raise ValueError(f"{field_name}.humanReviewPurpose must be at most 128 characters.")
     configured_price_book = copied.get("priceBook")
     if configured_price_book is not None:
         try:

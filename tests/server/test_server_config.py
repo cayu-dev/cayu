@@ -858,3 +858,14 @@ def test_mount_cayu_rejects_an_unresolved_access_policy() -> None:
 
     with pytest.raises(TypeError, match="OpenAccess or AuthenticatedAccess"):
         mount_cayu(FastAPI(), CayuApp(), access={"kind": "open"})
+
+
+@pytest.mark.parametrize("purpose", ["", " ", "x" * 129, 42, True])
+def test_dashboard_rejects_invalid_human_review_purpose(purpose):
+    with pytest.raises((ValidationError, ValueError, TypeError)):
+        DashboardConfig(runtime_config={"humanReviewPurpose": purpose})
+
+
+def test_dashboard_accepts_explicit_human_review_purpose():
+    config = DashboardConfig(runtime_config={"humanReviewPurpose": "delivery"})
+    assert config.runtime_config["humanReviewPurpose"] == "delivery"

@@ -32,6 +32,10 @@ import {
   MutationTransportStatus,
   mutationTransportErrorMessage,
 } from "../components/dashboard/mutation-transport-status"
+import {
+  ProtectedHumanReview,
+  type ProtectedReviewDecision,
+} from "../components/dashboard/protected-human-review"
 import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { SessionAnnotations } from "../components/dashboard/session-annotations"
 import { Badge } from "../components/ui/badge"
@@ -66,6 +70,7 @@ import {
   type SessionSummary,
   type SessionTranscriptPage,
 } from "../lib/api"
+import { dashboardConfig } from "../lib/config"
 import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import {
   formatBytes,
@@ -2476,6 +2481,30 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     }
   }
 
+  const handleProtectedReviewDecision = async (body: ProtectedReviewDecision) => {
+    if (!pendingActionResolutionCapability.enabled || resolvingAction || mutationCommandsLocked) {
+      throw new Error("Resolution is unavailable. Refresh pending interactions.")
+    }
+    setResolvingAction(true)
+    setActionError(null)
+    try {
+      const snapshot = await observeSessionMutation("pending_action", (browser, options) =>
+        "input_id" in body
+          ? browser.executeResolveUserInputMutation(body, options)
+          : browser.executeResolveToolApprovalMutation(body, options),
+      )
+      if (snapshot === null || snapshot.phase !== "terminal") {
+        throw new Error(
+          (snapshot && mutationTransportErrorMessage(snapshot)) ??
+            "The decision outcome is unavailable.",
+        )
+      }
+      await finishContinuation()
+    } finally {
+      setResolvingAction(false)
+    }
+  }
+
   const handleApprovalDecision = async (
     action: Extract<PendingAction, { kind: "approval" }>,
     decision: "approve" | "deny",
@@ -2509,7 +2538,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       await finishContinuation()
     } catch (error) {
       setResolvingAction(false)
-      setActionError(error instanceof Error ? error.message : "Failed to resolve the approval.")
+      setActionError(
+        `${error instanceof Error ? error.message : "Failed to resolve the approval."} Refresh pending interactions. If protected review is required, ask the application owner to configure humanReviewPurpose.`,
+      )
     }
   }
 
@@ -2538,7 +2569,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       await finishContinuation()
     } catch (error) {
       setResolvingAction(false)
-      setActionError(error instanceof Error ? error.message : "Failed to submit user input.")
+      setActionError(
+        `${error instanceof Error ? error.message : "Failed to submit user input."} Refresh pending interactions. If protected review is required, ask the application owner to configure humanReviewPurpose.`,
+      )
     }
   }
 
@@ -3242,35 +3275,54 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
 
       <SessionAnnotations key={session.id} session={session} />
 
-      {pendingAction && (
-        <PendingActionBanner
-          key={
-            pendingAction.kind === "approval"
-              ? pendingAction.approvalId
-              : pendingAction.kind === "user_input"
-                ? pendingAction.inputId
-                : pendingAction.toolCallId
+      {pendingAction &&
+      dashboardConfig.humanReviewPurpose !== null &&
+      pendingAction.kind !== "manual_recovery" ? (
+        <ProtectedHumanReview
+          key={`${session.id}:${pendingAction.kind}:${pendingAction.kind === "approval" ? pendingAction.approvalId : pendingAction.inputId}`}
+          sessionId={session.id}
+          purpose={dashboardConfig.humanReviewPurpose}
+          kind={pendingAction.kind === "approval" ? "tool_approval" : "user_input"}
+          disabled={
+            resolvingAction ||
+            mutationCommandsLocked ||
+            pendingActionResolutionUnavailableText !== null
           }
-          action={pendingAction}
-          resolving={resolvingAction || mutationCommandsLocked}
           unavailableReason={pendingActionResolutionUnavailableText}
-          error={actionError}
-          onApprove={(reason) =>
-            pendingAction.kind === "approval" &&
-            void handleApprovalDecision(pendingAction, "approve", reason)
-          }
-          onDeny={(reason) =>
-            pendingAction.kind === "approval" &&
-            void handleApprovalDecision(pendingAction, "deny", reason)
-          }
-          onAnswer={(answer) =>
-            pendingAction.kind === "user_input" && void handleUserInputAnswer(pendingAction, answer)
-          }
-          onRecover={(outcome, message, answer) =>
-            pendingAction.kind === "manual_recovery" &&
-            void handleManualRecovery(pendingAction, outcome, message, answer)
-          }
+          onDecision={handleProtectedReviewDecision}
         />
+      ) : (
+        pendingAction && (
+          <PendingActionBanner
+            key={
+              pendingAction.kind === "approval"
+                ? pendingAction.approvalId
+                : pendingAction.kind === "user_input"
+                  ? pendingAction.inputId
+                  : pendingAction.toolCallId
+            }
+            action={pendingAction}
+            resolving={resolvingAction || mutationCommandsLocked}
+            unavailableReason={pendingActionResolutionUnavailableText}
+            error={actionError}
+            onApprove={(reason) =>
+              pendingAction.kind === "approval" &&
+              void handleApprovalDecision(pendingAction, "approve", reason)
+            }
+            onDeny={(reason) =>
+              pendingAction.kind === "approval" &&
+              void handleApprovalDecision(pendingAction, "deny", reason)
+            }
+            onAnswer={(answer) =>
+              pendingAction.kind === "user_input" &&
+              void handleUserInputAnswer(pendingAction, answer)
+            }
+            onRecover={(outcome, message, answer) =>
+              pendingAction.kind === "manual_recovery" &&
+              void handleManualRecovery(pendingAction, outcome, message, answer)
+            }
+          />
+        )
       )}
 
       {pendingActionIssue && (

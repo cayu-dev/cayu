@@ -160,3 +160,20 @@ decision=ToolApprovalDecision.APPROVE, review_reference=view.reference))`.
 Consume these async event streams. If content is redacted, show the fixed guidance
 and either contact the application owner or explicitly deny the approval using
 `ToolApprovalDecision.DENY`; never manufacture an empty executable proposal.
+
+## Bundled dashboard
+
+Set `DashboardConfig(runtime_config={"humanReviewPurpose": "delivery"})` on
+`ServerConfig.protected(...)`, using the purpose your application policy accepts.
+Embedded mounts accept the same key in `dashboard_config`. Cayu supplies no
+default purpose. Both API and dashboard must authenticate the operator.
+
+For normal input and approval pauses, click **Refresh review**, inspect the
+permitted fields and the scope of every call, then answer, approve, or deny.
+The dashboard sends the displayed reference and its protected identities;
+ordinary pending-action IDs are only projection aliases. Reviews stay in
+component memory and are fetched with `no-store`, outside shared query caches.
+A failed or stale decision clears the review and requires explicit inspection
+again. Redacted/unavailable approval content permits only denial when a bound
+reference is present; missing references disable all decisions. Recovery gates
+still require the explicit SDK/server recovery contract described above.

@@ -3,6 +3,7 @@ import type { PriceBook } from "./generated/server-api"
 export type DashboardConfig = {
   basePath: string
   apiBaseUrl: string
+  humanReviewPurpose: string | null
   priceBook: PriceBook | null
 }
 
@@ -15,6 +16,7 @@ declare global {
 export const dashboardConfig: DashboardConfig = {
   basePath: normalizePublicPath(window.__CAYU_DASHBOARD_CONFIG__?.basePath ?? "/"),
   apiBaseUrl: normalizePublicUrl(window.__CAYU_DASHBOARD_CONFIG__?.apiBaseUrl ?? "/api"),
+  humanReviewPurpose: window.__CAYU_DASHBOARD_CONFIG__?.humanReviewPurpose ?? null,
   priceBook: window.__CAYU_DASHBOARD_CONFIG__?.priceBook ?? null,
 }
 
