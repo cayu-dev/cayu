@@ -8690,7 +8690,7 @@ finite positive values: `transport_idle_timeout_s` observes raw response bytes,
 reasoning, content, tool calls, hosted-tool activity, citations, usage, or
 terminal progress, and `absolute_stream_timeout_s` caps the active streaming
 dispatch until an authoritative terminal response is accepted. Their defaults
-are 120, 120, 120, and 600 seconds respectively. Configure the six bundled
+are 300, 300, 300, and 600 seconds respectively. Configure the six bundled
 providers with one immutable `ProviderStreamDeadlines` policy:
 
 ```python
@@ -8700,9 +8700,9 @@ from cayu.providers import OpenAIProvider, ProviderStreamDeadlines
 OpenAIProvider(
     timeout_s=600,
     stream_deadlines=ProviderStreamDeadlines(
-        transport_idle_timeout_s=120,
-        protocol_idle_timeout_s=120,
-        semantic_progress_timeout_s=120,
+        transport_idle_timeout_s=300,
+        protocol_idle_timeout_s=300,
+        semantic_progress_timeout_s=300,
         absolute_stream_timeout_s=600,
     ),
 )

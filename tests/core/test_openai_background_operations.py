@@ -1048,9 +1048,9 @@ async def test_openai_background_reconnect_starts_after_last_accepted_sequence()
             },
             "starting_after": 1,
             "timeout_s": 60.0,
-            "transport_idle_timeout_s": 120.0,
-            "protocol_idle_timeout_s": 120.0,
-            "semantic_progress_timeout_s": 120.0,
+            "transport_idle_timeout_s": 300.0,
+            "protocol_idle_timeout_s": 300.0,
+            "semantic_progress_timeout_s": 300.0,
             "absolute_stream_timeout_s": 600.0,
         }
     ]

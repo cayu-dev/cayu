@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import suppress
 
 import pytest
@@ -10,11 +10,15 @@ import pytest
 import cayu.providers.deadlines as provider_deadlines_module
 from cayu import Message
 from cayu.providers import (
+    AnthropicProvider,
+    BedrockProvider,
     ChatCompletionsProtocolError,
     ChatCompletionsProvider,
     OpenAIProtocolError,
     OpenAIProvider,
+    OpenAISubscriptionProvider,
     ProviderOperationState,
+    VertexProvider,
     chat_completions_stream_events,
 )
 from cayu.providers.base import (
@@ -72,6 +76,64 @@ def _request() -> ModelRequest:
 async def _blocked_events() -> AsyncIterator[ModelStreamEvent]:
     await asyncio.Event().wait()
     yield ModelStreamEvent.completed({})  # pragma: no cover
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda **kw: AnthropicProvider(api_key="test-key", **kw),
+        lambda **kw: BedrockProvider(**kw),
+        lambda **kw: ChatCompletionsProvider(api_key="test-key", **kw),
+        lambda **kw: OpenAIProvider(api_key="test-key", **kw),
+        lambda **kw: OpenAISubscriptionProvider(**kw),
+        lambda **kw: VertexProvider(project_id="test-project", credentials=object(), **kw),
+    ],
+    ids=["anthropic", "bedrock", "chat", "openai", "subscription", "vertex"],
+)
+def test_bundled_provider_deadline_defaults_and_explicit_overrides(
+    factory: Callable[..., ModelProvider],
+) -> None:
+    defaults = factory().stream_deadlines
+    assert defaults.transport_idle_timeout_s == 300
+    assert defaults.protocol_idle_timeout_s == 300
+    assert defaults.semantic_progress_timeout_s == 300
+    assert defaults.absolute_stream_timeout_s == 600
+    custom = ProviderStreamDeadlines(
+        transport_idle_timeout_s=7,
+        protocol_idle_timeout_s=11,
+        semantic_progress_timeout_s=13,
+        absolute_stream_timeout_s=17,
+    )
+    assert factory(stream_deadlines=custom).stream_deadlines is custom
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", list(ProviderDeadlineKind))
+async def test_default_clock_survives_old_idle_bound_and_expires_at_new_bound(
+    monkeypatch: pytest.MonkeyPatch, kind: ProviderDeadlineKind
+) -> None:
+    loop = asyncio.get_running_loop()
+    now = float(int(loop.time()))
+    started = now
+    monkeypatch.setattr(loop, "time", lambda: now)
+    controller = ProviderStreamDeadlineController(ProviderStreamDeadlines())
+    timeout = 600 if kind is ProviderDeadlineKind.ABSOLUTE else 300
+
+    async def ready() -> str:
+        return "alive"
+
+    try:
+        for elapsed in (121, timeout - 1):
+            now = started + elapsed
+            assert await controller.wait_for(ready(), kinds=(kind,)) == "alive"
+        now = started + timeout
+        with pytest.raises(ProviderStreamDeadlineExceeded) as captured:
+            await controller.wait_for(asyncio.Event().wait(), kinds=(kind,))
+        assert captured.value.evidence.deadline_kind is kind
+        assert captured.value.evidence.configured_timeout_s == timeout
+        assert captured.value.evidence.elapsed_s == timeout
+    finally:
+        controller.close()
 
 
 @pytest.mark.anyio

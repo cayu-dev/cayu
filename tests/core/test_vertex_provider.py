@@ -810,9 +810,9 @@ async def test_vertex_provider_streams_sse_events_incrementally() -> None:
     assert "model" not in call["payload"]
     assert call["payload"]["anthropic_version"] == "vertex-2023-10-16"
     assert call["headers"]["Authorization"] == "Bearer fake-token"
-    assert call["transport_idle_timeout_s"] == 120.0
-    assert call["protocol_idle_timeout_s"] == 120.0
-    assert call["semantic_progress_timeout_s"] == 120.0
+    assert call["transport_idle_timeout_s"] == 300.0
+    assert call["protocol_idle_timeout_s"] == 300.0
+    assert call["semantic_progress_timeout_s"] == 300.0
     assert call["absolute_stream_timeout_s"] == 600.0
 
 

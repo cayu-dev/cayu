@@ -1945,9 +1945,9 @@ async def test_anthropic_provider_streams_sse_events_incrementally() -> None:
     call = transport.calls[0]
     assert call["url"] == "https://api.anthropic.com/v1/messages"
     assert call["payload"]["stream"] is True
-    assert call["transport_idle_timeout_s"] == 120.0
-    assert call["protocol_idle_timeout_s"] == 120.0
-    assert call["semantic_progress_timeout_s"] == 120.0
+    assert call["transport_idle_timeout_s"] == 300.0
+    assert call["protocol_idle_timeout_s"] == 300.0
+    assert call["semantic_progress_timeout_s"] == 300.0
     assert call["absolute_stream_timeout_s"] == 600.0
     assert call["headers"]["x-api-key"] == "test-key"
 
