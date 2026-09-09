@@ -1398,6 +1398,7 @@ def _durable_context(
     secret_redactor: SecretRedactor | None = None,
     secret_tracker: Any | None = None,
     browser_control_epoch: Any | None = None,
+    session_store: SQLiteSessionStore | None = None,
 ) -> ToolContext:
     from cayu.core.tools import _RuntimeBrowserAllocationAuthority
 
@@ -1413,6 +1414,8 @@ def _durable_context(
         )
 
     async def load(key: str) -> dict[str, Any] | None:
+        if session_store is not None:
+            return await session_store.load_session_operation(ctx.session_id, key)
         record = records.get(key)
         return None if record is None else json.loads(json.dumps(record))
 
@@ -1430,6 +1433,24 @@ def _durable_context(
         }
         if fail_before_state in states:
             raise ConnectionError(f"worker stopped before {fail_before_state} publication")
+        if session_store is not None:
+
+            def publish(current_session, checkpoint, current):
+                assert current_session.run_epoch == 1
+                assert current == expected
+                return SessionOperationPublication(
+                    checkpoint={} if checkpoint is None else checkpoint,
+                    operation_records={key: desired, **secondary},
+                )
+
+            await session_store.publish_session_operation(
+                ctx.session_id,
+                idempotency_key=key,
+                operation_transform=publish,
+                events=[],
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=1,
+            )
         records[key] = json.loads(json.dumps(desired))
         records.update(json.loads(json.dumps(secondary)))
         if fail_after_state in states:
@@ -13324,44 +13345,68 @@ def test_browser_session_publishes_artifacts_without_inline_bytes(
     asyncio.run(_browser_session_publishes_artifacts_without_inline_bytes(tmp_path, operation))
 
 
-@pytest.mark.parametrize("new_worker", [False, True])
-def test_completed_allocation_generation_preserves_old_browser_receipts(tmp_path, new_worker):
-    async def scenario():
+@pytest.mark.parametrize("worker", ["same", "fresh", "sqlite"])
+def test_completed_allocation_generation_preserves_old_browser_receipts(tmp_path, worker):
+    async def scenario(stack):
         backend = _FakeBrowserBackend()
         records = {}
-        tool = _tool(backend)
+        store = None
+        store_path = tmp_path / "browser-generation.sqlite"
+        if worker == "sqlite":
+            store = SQLiteSessionStore(store_path)
+            stack.push_async_callback(store.close)
+            await store.create(
+                RunRequest(
+                    session_id="parent-session",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "open the page")],
+                ),
+                identity=SessionIdentity(provider_name="test", model="test"),
+                interaction_started_event=Event(
+                    id="browser-generation-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id="parent-session",
+                    interaction_id="browser-generation-interaction",
+                    agent_name="assistant",
+                ),
+                interaction_source_messages=[Message.text("user", "open the page")],
+            )
+
+        def context(**kwargs):
+            return _durable_context(tmp_path, records=records, session_store=store, **kwargs)
+
+        tool = BrowserSessionTool(max_sessions=1, _backend=backend)
         first_args = {
             "operation": "navigate",
             "url": "https://example.test/form",
             "operation_id": "first",
         }
-        first = await tool.run(
-            _durable_context(tmp_path, args=first_args, records=records), first_args
-        )
+        first = await tool.run(context(args=first_args), first_args)
         assert not first.is_error
         original_records = json.loads(json.dumps(records))
-        if new_worker:
-            tool = _tool(backend)
+        if worker == "sqlite":
+            await store.close()
+            store = SQLiteSessionStore(store_path)
+            stack.push_async_callback(store.close)
+        if worker != "same":
+            tool = BrowserSessionTool(max_sessions=1, _backend=backend)
         next_args = {**first_args, "operation_id": "next"}
         refused = await tool.run(
-            _durable_context(
-                tmp_path,
+            context(
                 args=next_args,
-                records=records,
                 allocation_fingerprint="c" * 64,
                 tool_call_id="next-call",
             ),
             next_args,
         )
-        assert refused.structured["error"] == "allocation_lost"
+        assert refused.structured["error"] in {"allocation_lost", "resource_exhausted"}
+        assert refused.structured["execution"]["dispatch"] == "not_started"
         assert len(backend.calls) == 1
         generation = "d" * 32
         # Runtime supplies this namespace only after exact positive disposal.
         fresh = await tool.run(
-            _durable_context(
-                tmp_path,
+            context(
                 args=next_args,
-                records=records,
                 allocation_fingerprint="c" * 64,
                 allocation_generation=generation,
                 tool_call_id="next-call",
@@ -13373,6 +13418,19 @@ def test_completed_allocation_generation_preserves_old_browser_receipts(tmp_path
         assert fresh.structured["session_id"] != first.structured["session_id"]
         assert all(records[key] == value for key, value in original_records.items())
         assert f"browser-parent:v2:{generation}" in records
+        extra_args = {**first_args, "operation_id": "extra"}
+        full = await tool.run(
+            context(
+                args=extra_args,
+                allocation_fingerprint="c" * 64,
+                allocation_generation=generation,
+                tool_call_id="extra-call",
+            ),
+            extra_args,
+        )
+        assert full.structured["error"] == "resource_exhausted"
+        assert full.structured["execution"]["dispatch"] == "not_started"
+        assert len(backend.calls) == 2
         observe = {
             "operation": "observe",
             "session_id": first.structured["session_id"],
@@ -13380,10 +13438,8 @@ def test_completed_allocation_generation_preserves_old_browser_receipts(tmp_path
             "operation_id": "old-observation",
         }
         old = await tool.run(
-            _durable_context(
-                tmp_path,
+            context(
                 args=observe,
-                records=records,
                 allocation_fingerprint="c" * 64,
                 allocation_generation=generation,
                 tool_call_id="old-call",
@@ -13392,10 +13448,8 @@ def test_completed_allocation_generation_preserves_old_browser_receipts(tmp_path
         )
         assert old.structured["error"] == "allocation_lost"
         replay = await tool.run(
-            _durable_context(
-                tmp_path,
+            context(
                 args=first_args,
-                records=records,
                 allocation_fingerprint="c" * 64,
                 allocation_generation=generation,
             ),
@@ -13403,5 +13457,13 @@ def test_completed_allocation_generation_preserves_old_browser_receipts(tmp_path
         )
         assert replay.structured["error"] in {"allocation_lost", "operation_conflict"}
         assert len(backend.calls) == 2
+        assert all(records[key] == value for key, value in original_records.items())
+        if store is not None:
+            for key, value in records.items():
+                assert await store.load_session_operation("parent-session", key) == value
 
-    asyncio.run(scenario())
+    async def run():
+        async with contextlib.AsyncExitStack() as stack:
+            await scenario(stack)
+
+    asyncio.run(run())

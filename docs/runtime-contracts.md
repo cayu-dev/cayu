@@ -9332,6 +9332,11 @@ records positive guest-owned retirement evidence. Initial launch retains a
 separate bounded startup-cleanup settlement window after the ordinary
 connection deadline so late positive retirement evidence reaches the parent;
 absence of that evidence remains ambiguous and capacity-bearing.
+Durable browser admission charges `max_sessions` to Runtime's current allocation
+generation. Positive terminal disposal permits a new generation to reuse that
+capacity in the same worker or after restore. Historical browser handles and
+operation receipts remain fenced and intact; changing the allocation fingerprint
+without a new Runtime-issued generation does not authorize replacement.
 
 Single-page behavior remains the default: it restores Chromium popup blocking,
 installs the pre-document target/`window.open` guard, and treats an unexpected

@@ -3206,7 +3206,10 @@ class BrowserSessionTool(Tool):
         preflight = _preflight_request(
             parent_state,
             request,
-            max_sessions=self.max_sessions,
+            # Durable admission below counts the authoritative allocation
+            # generation. Local sessions also retain historical handles and must
+            # not charge positively retired generations against that capacity.
+            max_sessions=self.max_sessions if durable_operation_key is None else None,
         )
         if preflight is not None:
             return preflight
@@ -5564,11 +5567,11 @@ def _preflight_request(
     parent_state: _ParentBrowserState,
     request: Mapping[str, Any],
     *,
-    max_sessions: int,
+    max_sessions: int | None,
 ) -> ToolResult | None:
     operation = request["operation"]
     if operation == "navigate":
-        if len(parent_state.sessions) >= max_sessions:
+        if max_sessions is not None and len(parent_state.sessions) >= max_sessions:
             return _error_result("resource_exhausted", dispatch="not_started")
         return None
     session = parent_state.sessions.get(request["session_id"])
