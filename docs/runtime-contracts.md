@@ -1876,7 +1876,13 @@ session id, causal budget id, labels, metadata, execution requirements, and
 previous reconnect metadata for that session/environment) and returns a
 concrete `Environment` for that session. `operation=CREATE` is used for new
 sessions, a retry whose earlier setup never committed an allocation, and a
-fork's first child allocation; `operation=RECONNECT` is used once that session
+fork's first child allocation. For a fork carrying a durable allocation receipt,
+Runtime validates inherited allocation ownership against immutable lineage and
+keeps the copied records for durable allocation coordination, but passes no parent reconnect metadata to the child's
+`CREATE` request. This includes completed Docker coding parents whose physical
+execution has been finalized; the child receives its own durably owned allocation.
+Same-session pending cleanup and ambiguous settlement retain their exact recovery
+authority. `operation=RECONNECT` is used once that session
 owns a durable allocation and requires the factory to fail closed rather than
 allocate a replacement when durable identity is missing. The returned
 environment must keep the registered environment name so

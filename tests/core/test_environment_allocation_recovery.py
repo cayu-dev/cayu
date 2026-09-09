@@ -1185,6 +1185,40 @@ def test_fork_replaces_only_its_copied_parent_allocation_receipt() -> None:
     asyncio.run(run())
 
 
+def test_fork_resume_rejects_foreign_reconnect_owner_before_factory_admission() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _FakeRemoteProvider()
+        factory = _FakeRemoteFactory(provider)
+        parent = await _create_session(store, session_id="parent")
+        result = await _resolve(
+            store, parent, factory, operation=EnvironmentFactoryOperation.CREATE
+        )
+        assert result.error is None
+        checkpoint = await store.load_checkpoint(parent.id)
+        assert checkpoint is not None
+        child = await _create_session(store, session_id="child", parent_session_id=parent.id)
+        checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY][_ENVIRONMENT_NAME] = (
+            "foreign-owner"
+        )
+        checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY][_ENVIRONMENT_NAME][
+            "intent"
+        ]["session_id"] = "foreign-owner"
+        await store.checkpoint(child.id, checkpoint)
+
+        result = await _resolve(
+            store, child, factory, operation=EnvironmentFactoryOperation.RECONNECT
+        )
+        assert isinstance(result.error, ValueError)
+        assert "immutable session lineage" in str(result.error)
+        assert len(factory.requests) == 1
+        assert len(provider.create_calls) == 1
+        assert provider.reap_calls == []
+        assert await store.load_checkpoint(child.id) == checkpoint
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("retained_disposal", [False, True])
 def test_detached_fork_replaces_inherited_allocation_from_immutable_lineage(
     retained_disposal: bool,
@@ -1277,6 +1311,7 @@ def test_detached_fork_replaces_inherited_allocation_from_immutable_lineage(
         assert len(factory.requests) == 2
         assert factory.requests[1].operation is EnvironmentFactoryOperation.CREATE
         assert factory.requests[1].parent_session_id == source_id
+        assert factory.requests[1].reconnect_metadata == {}
         assert len(allocation_provider.create_calls) == 2
         assert allocation_provider.reap_calls == []
         assert len(model_provider.requests) == 2

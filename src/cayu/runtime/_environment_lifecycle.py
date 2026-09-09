@@ -2373,6 +2373,15 @@ class EnvironmentLifecycle:
                 # Allocation provenance is authoritative; Cayu does not scan
                 # historical events to infer ownership.
                 effective_operation = EnvironmentFactoryOperation.CREATE
+                if allocation_receipt is not None:
+                    if allocation_owner != source_allocation_owner_session_id:
+                        raise ValueError(
+                            "Environment allocation owner conflicts with immutable session lineage."
+                        )
+                    # The copied checkpoint remains intact for the allocation
+                    # coordinator's exact lineage and publication checks. Its
+                    # source handle is not reconnect authority for a new child.
+                    reconnect_metadata = {}
             request = EnvironmentFactoryRequest(
                 session_id=session.id,
                 agent_name=registered_agent.spec.name,
