@@ -21,6 +21,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [GitHub delivery](github-delivery.md)
 - [Human review](human-review.md)
 - [Memory foundation](memory-foundation.md)
+- [Search when automatic recall is insufficient](knowledge-search-fallback.md)
 - [Model catalog](model-catalog.md)
 - [Operation outcomes](operation-outcomes.md)
 - [Named checks](named-checks.md)

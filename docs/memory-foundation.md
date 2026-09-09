@@ -410,6 +410,10 @@ interaction, freezes the redacted provider-neutral contribution through retries,
 tool rounds, repair, compaction, and recovery, and expires it at the next real
 user message. It never mutates the durable transcript.
 
+Silent automatic recall does not prove that knowledge is absent. Applications
+can combine it with [explicit search when evidence is insufficient](knowledge-search-fallback.md),
+using existing scoped tools without loosening the admission gate.
+
 Applications whose knowledge store supports bounded change/readiness streams and
 frontier-restricted revision search can opt into `MemoryDeltaPolicy`. The base
 `MemoryFocus` remains byte-stable. At a later safe model boundary, an accessible
