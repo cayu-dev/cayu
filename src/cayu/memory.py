@@ -32,6 +32,7 @@ from cayu.recall import (
     RecallSourceDiagnostic,
 )
 from cayu.recall_relevance import (
+    PHRASE_RELEVANCE_TEXT_VERSION,
     RELEVANCE_TEXT_VERSION,
     TITLE_RELEVANCE_TEXT_VERSION,
     RecallCandidateDecision,
@@ -113,7 +114,7 @@ class AutomaticRecallPolicy(BaseModel):
     fusion_strategy_version: str
     fusion_configuration_version: str
     relevance_policy: Literal[
-        "rank_only.v1", "cayu.query_concepts.v1", "cayu.query_concepts.v2"
+        "rank_only.v1", "cayu.query_concepts.v1", "cayu.query_concepts.v2", "cayu.query_concepts.v3"
     ] = Field(default="rank_only.v1", exclude_if=lambda value: value == "rank_only.v1")
     relevance_text_version: str | None = Field(default=None, exclude_if=lambda value: value is None)
     mode: AutomaticRecallMode = AutomaticRecallMode.OFFER_AND_STRONG_MATCHES
@@ -189,12 +190,12 @@ class AutomaticRecallPolicy(BaseModel):
 
     @model_validator(mode="after")
     def validate_policy(self) -> AutomaticRecallPolicy:
-        if self.relevance_policy in {"cayu.query_concepts.v1", "cayu.query_concepts.v2"}:
-            text_version = (
-                TITLE_RELEVANCE_TEXT_VERSION
-                if self.relevance_policy == "cayu.query_concepts.v2"
-                else RELEVANCE_TEXT_VERSION
-            )
+        if self.relevance_policy != "rank_only.v1":
+            text_version = {
+                "cayu.query_concepts.v1": RELEVANCE_TEXT_VERSION,
+                "cayu.query_concepts.v2": TITLE_RELEVANCE_TEXT_VERSION,
+                "cayu.query_concepts.v3": PHRASE_RELEVANCE_TEXT_VERSION,
+            }[self.relevance_policy]
             if self.relevance_text_version is None:
                 object.__setattr__(self, "relevance_text_version", text_version)
             elif self.relevance_text_version != text_version:
@@ -1583,7 +1584,7 @@ def admit_recall(
     eligibility = {}
     for fused_rank, candidate in enumerate(evaluated, start=1):
         evidence_bytes = len(candidate.record.text.encode("utf-8"))
-        if policy.relevance_policy == "cayu.query_concepts.v2":
+        if policy.relevance_policy in {"cayu.query_concepts.v2", "cayu.query_concepts.v3"}:
             evidence_bytes += len((candidate.record.title or "").encode("utf-8"))
         if evidence_bytes > policy.max_candidate_text_bytes:
             oversized_candidates.add(candidate.record.identity.sort_key())

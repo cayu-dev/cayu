@@ -1937,8 +1937,8 @@ explicit `work_context` remains supported. Scope and admission are independent.
 
 ### Shipped relevance eligibility
 
-Generated projects select `cayu.query_concepts.v2` with calibration
-`standard-local-recall-query-concepts-v3`. Rank fusion still orders candidates;
+Generated projects select `cayu.query_concepts.v3` with calibration
+`standard-local-recall-query-concepts-v4`. Rank fusion still orders candidates;
 rank, list population, ties, repeated words, and channel agreement cannot establish
 eligibility. The gate compares unique normalized current-query concepts against
 bounded authorized candidate text and its revision-exact knowledge title (up to
@@ -1947,9 +1947,42 @@ concept/identifier, or at least two
 concepts covering 60% of a multi-concept query. The versioned vocabulary includes
 limited release/rollback, authentication, and timeout paraphrases, plus cache,
 retry, and bucket inflections. Exact path and hyphenated identifiers are not
-stemmed. `cayu.query_concepts.v1` retains its original body-only vocabulary and
-policy identity; existing applications opt into v2 explicitly. This is a
-conservative text heuristic, not a general semantic-confidence estimator.
+stemmed.
+
+V3 also accepts an exact contiguous phrase of three **distinct** normalized
+concepts shared with the candidate body or title. This allows a specific topic
+such as "release rollback procedure" to remain relevant when a user also asks
+for JSON, a brief answer, or abstention. Sentence/line boundaries and a fixed
+set of delivery/schema words (including `return`, `JSON`, `keys`, and `status`)
+break phrases. Commas also break phrase windows, but preserve an ongoing delivery
+classification: "write short, clear complete sentences" remains one excluded
+instruction. A sentence, semicolon or line boundary resets that classification.
+Boundaries include Unicode line separators and common full-width sentence
+punctuation, not just ASCII newlines. For the additional phrase path,
+recognized English delivery clauses are excluded in full: a leading imperative
+and style/format descriptor (such as "be concise and clear" or "answer in short
+simple sentences"), or a supported no-guessing prefix. Appended delivery commands
+introduced by `and`, `then`, `also`, or `please` exclude the rest of that clause
+without discarding the preceding factual topic. These exclusions apply
+only to the query and do not remove material from the model's context. A format
+word later in a factual clause, such as "return the approved maintenance window
+in JSON", does not by itself exclude that clause. Title and body cannot be
+joined to manufacture a match. Repeated
+words, two-concept overlap, and matching formatting instructions do not supply
+this additional signal. Receipts distinguish it as `query_phrase_support`.
+The original 60% whole-query rule and all score, scope, freshness and byte
+limits still apply to their respective paths. Phrase matching is a bounded
+linear text scan, with no model call or embedding requirement.
+
+The delivery vocabulary and prefixes are fixed, bounded heuristics, not complete
+natural-language instruction detection. This is a relevance heuristic, not an
+instruction parser, entailment check,
+contradiction detector or general semantic-confidence estimator. It can support
+one topic within a multi-topic request; it does not prove every requested
+constraint is satisfied. `cayu.query_concepts.v1` and `v2` retain their original
+vocabulary, behavior and policy identities. Existing applications opt into v3
+with a new calibration name; captured old policies are not silently reinterpreted.
+Re-anchoring's separate mandatory v2 gate is unchanged.
 
 Lexical-only defaults remain useful. Supported semantic/hybrid hits use the same
 text gate; raw embedding scores are never interpreted as universal confidence.

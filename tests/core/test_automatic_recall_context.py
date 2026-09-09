@@ -996,7 +996,8 @@ def test_memory_delta_appends_new_revision_once_without_changing_base_focus() ->
 
 
 @pytest.mark.parametrize(
-    "relevance", ["rank_only.v1", "cayu.query_concepts.v1", "cayu.query_concepts.v2"]
+    "relevance",
+    ["rank_only.v1", "cayu.query_concepts.v1", "cayu.query_concepts.v2", "cayu.query_concepts.v3"],
 )
 def test_reanchor_policy_requires_validated_independent_relevance(relevance: str) -> None:
     admission = AutomaticRecallPolicy.model_validate(
