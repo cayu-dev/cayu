@@ -1828,6 +1828,12 @@ def _environment_identity_material(
                 "behavior": environment_entry,
                 "factory_backed": registered_environment.factory_backed,
                 "factory": factory_entry,
+                **(
+                    {"factory_secret_resolution_scope": "static"}
+                    if registered_environment.factory_backed
+                    and registered_environment.factory_secret_resolution_scope == "static"
+                    else {}
+                ),
                 "runner": runner_entry,
                 "workspace_presence": (
                     "factory_managed"

@@ -2699,6 +2699,11 @@ class CayuApp:
         )
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
+        factory_secret_resolution_scope = factory.secret_resolution_scope
+        if factory_secret_resolution_scope not in ("static", "dynamic"):
+            raise ValueError(
+                "Environment factory secret_resolution_scope must be static or dynamic."
+            )
         stored_environment = Environment(stored_spec, artifact_store=artifact_store)
         artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
 
@@ -2708,6 +2713,7 @@ class CayuApp:
             environment=stored_environment,
             factory=factory,
             factory_backed=True,
+            factory_secret_resolution_scope=factory_secret_resolution_scope,
             factory_execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
                 factory.execution_profile_identity,
                 redactor=self._secret_redactor,
@@ -2961,6 +2967,7 @@ class CayuApp:
                     ),
                     factory=registered_environment.factory,
                     factory_backed=registered_environment.factory_backed,
+                    factory_secret_resolution_scope=registered_environment.factory_secret_resolution_scope,
                     bound_workspace=(
                         copy_bound_workspace(registered_environment.bound_workspace)
                         if registered_environment.bound_workspace is not None

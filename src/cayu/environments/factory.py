@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from math import isfinite
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from cayu._exception_groups import iter_exception_tree
 from cayu._exception_state import exception_state, set_exception_state
@@ -680,6 +680,18 @@ class EnvironmentFactoryResult:
 
 class EnvironmentFactory(ABC):
     """Creates or attaches a concrete environment for a session."""
+
+    @property
+    def secret_resolution_scope(self) -> Literal["static", "dynamic"]:
+        """Declare the immutable secret capability of every CREATE/RECONNECT result.
+
+        Static factories must never expose a vault or credential proxy. Runtime
+        snapshots this declaration at registration, fingerprints it for recovery,
+        and rejects violating results before binding or tool dispatch. Undeclared
+        factories remain dynamic, even when one result has no secret resolvers.
+        """
+
+        return "dynamic"
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:

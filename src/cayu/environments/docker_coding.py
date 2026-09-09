@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -78,6 +78,7 @@ from cayu.workspaces.base import matches_list_pattern
 from cayu.workspaces.revisions import (
     WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
     compare_workspace_revisions,
     observe_deterministic_workspace,
@@ -345,6 +346,19 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             delete_missing=True,
             source_conflict_policy="require_revision",
             preserve_git_modes=True,
+        )
+
+    async def observe_revision(self, bound: BoundWorkspace) -> WorkspaceRevisionObservation:
+        """Observe the bounded guest file tree, excluding protected runtime paths."""
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("Workspace revision observation requires a BoundWorkspace.")
+        if bound.workspace is not self._docker_target:
+            raise ValueError("Docker coding observation requires its exact target workspace.")
+        return await observe_deterministic_workspace(
+            self._docker_target,
+            observer=type(self).__name__,
+            limits=WorkspaceRevisionObservationLimits(),
         )
 
     async def bind(
@@ -785,6 +799,12 @@ class DockerCodingWorkspaceBinding(SyncBinding):
 
 class DockerCodingEnvironmentFactory(EnvironmentFactory):
     """Create exact, non-networked Docker environments for explicitly trusted code."""
+
+    @property
+    def secret_resolution_scope(self) -> Literal["static"]:
+        """Every native Docker coding result is credential-free."""
+
+        return "static"
 
     def __init__(
         self,

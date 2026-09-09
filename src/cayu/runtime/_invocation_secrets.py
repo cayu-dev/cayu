@@ -58,10 +58,11 @@ def registered_environment_secret_resolution_scope(
 
     if registered_environment is None:
         return "static"
-    # A factory may reconnect the same durable environment with a different
-    # vault/proxy capability set. Without an explicit immutable capability
-    # contract, factory origin is positive evidence of dynamic scope.
-    if registered_environment.factory is not None or registered_environment.factory_backed:
+    # Only a snapshotted, enforced factory contract proves static scope across
+    # materialization and reconnect. Inspect concrete capabilities as well.
+    if (
+        registered_environment.factory is not None or registered_environment.factory_backed
+    ) and registered_environment.factory_secret_resolution_scope != "static":
         return "dynamic"
     environment = registered_environment.environment
     return "dynamic" if environment.vault is not None or environment.proxy is not None else "static"

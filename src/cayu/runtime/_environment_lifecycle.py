@@ -2446,6 +2446,12 @@ class EnvironmentLifecycle:
                     "Environment factory resolution must return EnvironmentFactoryResult."
                 )
             environment = copy_environment(result.environment)
+            if registered_environment.factory_secret_resolution_scope == "static" and (
+                environment.vault is not None or environment.proxy is not None
+            ):
+                raise ValueError(
+                    "Static environment factory must not expose a vault or credential proxy."
+                )
             if environment.spec.name != environment_name:
                 raise ValueError(
                     "Environment factory returned a different environment name: "
@@ -2566,6 +2572,7 @@ class EnvironmentLifecycle:
                 spec=registered_environment.spec,
                 environment=environment,
                 factory_backed=True,
+                factory_secret_resolution_scope=registered_environment.factory_secret_resolution_scope,
                 factory_execution_profile_identity=(
                     registered_environment.factory_execution_profile_identity
                 ),
@@ -4232,6 +4239,7 @@ class EnvironmentLifecycle:
             spec=registered_environment.spec,
             environment=bound_environment,
             factory_backed=registered_environment.factory_backed,
+            factory_secret_resolution_scope=registered_environment.factory_secret_resolution_scope,
             runner_execution_profile_identity=(
                 registered_environment.runner_execution_profile_identity
             ),

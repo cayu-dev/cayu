@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from cayu._validation import copy_durable_json_object, require_durable_clean_nonblank
@@ -155,6 +155,7 @@ class RegisteredEnvironment:
     # Capability provenance survives factory materialization without retaining
     # the live factory as part of the session-owned environment lifecycle.
     factory_backed: bool = False
+    factory_secret_resolution_scope: Literal["static", "dynamic"] = "dynamic"
     bound_workspace: BoundWorkspace | None = None
     binding_payload: dict[str, Any] | None = None
     execution_candidate: str | None = None

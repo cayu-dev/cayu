@@ -4978,7 +4978,10 @@ def _runtime_owned_workspace_observer_name(binding: object) -> str | None:
     their observation identity is projected through a separate owned boundary.
     """
 
+    from cayu.environments.docker_coding import DockerCodingWorkspaceBinding
+
     if type(binding) not in {
+        DockerCodingWorkspaceBinding,
         NativeBinding,
         DeterministicWorkspaceBinding,
         NoWorkspaceBinding,
