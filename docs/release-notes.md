@@ -1,5 +1,19 @@
 # Release notes
 
+## v0.5.1
+
+A reliability update for retry settlement and release verification.
+
+- Retry settlement waits for an in-flight heartbeat acknowledgement before
+  treating a changed lease generation as lost, while keeping heartbeat renewal
+  active during settlement.
+- CI installs its search dependency explicitly and synchronizes deadline,
+  cancellation, and process-exit checks under scheduling delays.
+
+Compatibility requirements remain storage revision **82**, server contract
+**44**, and manifest/generator schema **17**. Features and upgrade requirements
+are unchanged from v0.5.0.
+
 ## v0.5.0
 
 Cayu adds durable composition, tool discovery, and memory controls for agents

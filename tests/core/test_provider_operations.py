@@ -1893,18 +1893,29 @@ def test_cancellation_during_unsettled_provider_start_is_bounded(
                 ),
             )
         )
-        await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
-        task.cancel("cancel unsettled provider start")
-        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
-            await asyncio.wait_for(task, timeout=1)
-        await asyncio.wait_for(adapter.local_cancellation_observed.wait(), timeout=1)
-        inspection = await inspect_provider_operation(
-            app.session_store,
-            "cancel_unsettled_provider_start",
-        )
-        adapter.start_release.set()
-        await asyncio.sleep(0)
-        return task.cancelled(), adapter.start_calls, inspection.status
+        try:
+            await asyncio.wait_for(adapter.start_entered.wait(), timeout=10)
+            task.cancel("cancel unsettled provider start")
+            # Observe settlement without wait_for injecting a second cancellation
+            # and turning the expected CancelledError into TimeoutError under load.
+            # The blocked start must remain unreleased while the run settles.
+            completed, _pending = await asyncio.wait({task}, timeout=10)
+            assert task in completed
+            assert not adapter.start_release.is_set()
+            with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
+                await task
+            await asyncio.wait_for(adapter.local_cancellation_observed.wait(), timeout=10)
+            inspection = await inspect_provider_operation(
+                app.session_store,
+                "cancel_unsettled_provider_start",
+            )
+            return task.cancelled(), adapter.start_calls, inspection.status
+        finally:
+            adapter.start_release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
 
     cancelled, start_calls, status = asyncio.run(scenario())
 
