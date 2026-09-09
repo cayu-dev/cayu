@@ -414,6 +414,11 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             runner._owner.require_owned()
             runner._admission_complete = True
 
+    async def is_allocation_disposed(self, reconnect_metadata: Mapping[str, Any]) -> bool:
+        if self._reconnect is None:
+            return False
+        return await self._reconnect.is_allocation_disposed(reconnect_metadata)
+
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
         if self._reconnect is None or not isinstance(runner, DockerRunner):
             return super().reconnect_metadata(runner)

@@ -1019,6 +1019,25 @@ explicit disposal/rebuild. Alias conflicts require deployment-owner reconciliati
 Runtime does not detach foreign endpoints. Confirmed absence is distinguished from daemon
 lookup failure. Reconnect never creates a replacement main container.
 
+Ordinary resume of a **completed** session may start a fresh allocation after
+execution-profile admission. The same applies to a failed invocation with no
+pending recovery boundary, including a previous resume that failed on `disposed`. Runtime asks the factory to prove disposal of the
+exact saved allocation; Docker requires its locked private journal to match the
+saved identity and be positively `disposed`, without a pending mutation. Only
+then does Runtime atomically retire reconnect metadata and its matching receipt,
+fenced to the admitted session generation. This also handles metadata left by
+older Runtime versions. Runtime/browser upgrades still require explicit profile
+adoption; disposal proof does not authorize a profile change.
+
+The fresh allocation receives a separate browser accounting generation. Existing
+browser sessions, refs, and operation receipts remain bound to their original
+allocation and cannot be replayed against the replacement. Start the new browser
+with a new `navigate` operation. Live pauses and recovery retain strict
+exact-allocation reconnect; missing, uncertain, conflicting, or pending-disposal
+journals never authorize a replacement. Custom factory wrappers should forward
+`is_allocation_disposed(request)` when wrapping a factory that supports this
+read-only positive attestation hook; its default is `False`.
+
 Terminal finalization records `disposal_pending` before exact-ID removal. A later
 attempt completes already-authorized disposal rather than reviving it. Teardown
 revokes/drains authority and removes the owned sidecar/network, retaining failures
@@ -1053,6 +1072,17 @@ Real-Docker acceptance (requires the pinned v11 image built from
 ```bash
 CAYU_RUN_DOCKER_RECONNECT=1 PYTHONPATH=src:. \
   python -m pytest -q tests/egress/test_docker_reconnect_e2e.py
+```
+
+Completed-turn resume qualification additionally requires `cayu-view-reconnect:local`
+(from `examples/browser_view_reconnect/Dockerfile`) and browser v12. The upgrade
+lane uses a read-only source checkout of `1eed25e` and browser v11, then resumes
+with the current Runtime and browser v12 in the same surviving application container:
+
+```bash
+CAYU_RUN_DOCKER_RECONNECT=1 \
+CAYU_DOCKER_COMPLETED_RESUME_OLD_SOURCE=/path/to/old-runtime-checkout \
+PYTHONPATH=src:. python -m pytest -q tests/egress/test_docker_completed_resume_e2e.py
 ```
 
 The fixtures use a synthetic upstream and a workspace sentinel. The application

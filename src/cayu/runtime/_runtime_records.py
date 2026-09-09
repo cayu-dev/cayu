@@ -183,6 +183,8 @@ class RegisteredEnvironment:
     # stable across a factory reconnect but absent for process-local/static
     # environments, which must not claim browser continuity after restart.
     live_allocation_fingerprint: str | None = None
+    # Durable namespace minted only after positively settled terminal disposal.
+    allocation_generation: str | None = None
     registration_source: str | None = None
     registration_symbol: str | None = None
     # Runtime-owned authority for one concrete environment/binding generation.

@@ -1001,6 +1001,22 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 "outside the runtime allocation coordinator."
             )
 
+    async def is_allocation_disposed(self, request: EnvironmentFactoryRequest) -> bool:
+        adapter = self._adapter or self._resolve_adapter(asyncio.get_running_loop())
+        if not adapter.supports_reconnect:
+            return False
+        identity = _parse_reconnect_metadata(
+            request,
+            runner_kind=adapter.runner_kind,
+            require_allocation_fingerprint=(
+                adapter.egress_authority_cutover_strategy
+                is EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
+            ),
+        )
+        if identity is None:
+            return False
+        return await adapter.is_allocation_disposed(adapter.validate_reconnect_metadata(identity))
+
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         return await self._create(request, allocation=None)
 

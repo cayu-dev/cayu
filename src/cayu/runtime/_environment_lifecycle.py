@@ -17,7 +17,7 @@ from datetime import datetime
 from hashlib import sha256
 from math import isfinite
 from typing import Any, Literal
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from cayu._coding_product_authority import (
     CODING_PRODUCT_FINAL_GIT_RECEIPT_SCHEMA,
@@ -238,6 +238,7 @@ from cayu.workspaces.revisions import (
 FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES = 4096
 _PENDING_ALLOCATION_DISPOSAL_KEY = "environment_factory_pending_disposals"
 _RETIRED_ALLOCATION_DISPOSAL_KEY = "environment_factory_retired_disposals"
+_ALLOCATION_GENERATIONS_KEY = "environment_factory_allocation_generations"
 _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE = "_cayu_environment_factory_release"
 _MAX_LAZY_ENVIRONMENT_CLEANUP_SETTLEMENTS = 16
 _LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS = 0.01
@@ -335,6 +336,23 @@ async def _finish_environment_lifecycle(
         phase=phase,
         retained_owner=retained_owner,
     )
+
+
+def _retired_allocation_generation(
+    checkpoint: dict[str, Any] | None, *, session: Session, environment_name: str
+) -> str | None:
+    retired = (checkpoint or {}).get(_ALLOCATION_GENERATIONS_KEY, {}).get(environment_name)
+    if retired is None:
+        return None
+    generation = retired.get("successor_generation")
+    if (
+        retired.get("session_instance_id") != session.instance_id
+        or type(generation) is not str
+        or len(generation) != 32
+        or any(character not in "0123456789abcdef" for character in generation)
+    ):
+        raise RuntimeError("Terminal allocation lost its successor generation.")
+    return generation
 
 
 def _live_allocation_fingerprint(
@@ -2130,6 +2148,7 @@ class EnvironmentLifecycle:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         adopted_factory_result: EnvironmentFactoryResult | None = None,
+        new_terminal_invocation: bool = False,
     ) -> EnvironmentFactoryResolutionResult:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -2309,6 +2328,17 @@ class EnvironmentLifecycle:
                     run_epoch=session.run_epoch,
                 )
                 checkpoint = await self._session_store.load_checkpoint(session.id)
+            if new_terminal_invocation and adopted_factory_result is None:
+                await self._retire_terminal_allocation(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    factory=factory,
+                )
+                checkpoint = await self._session_store.load_checkpoint(session.id)
+            allocation_generation = _retired_allocation_generation(
+                checkpoint, session=session, environment_name=environment_name
+            )
             reconnect_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
                 checkpoint,
                 environment_name=environment_name,
@@ -2589,6 +2619,7 @@ class EnvironmentLifecycle:
                         allocation_receipt,
                     )
                 ),
+                allocation_generation=allocation_generation,
                 registration_source=registered_environment.registration_source,
                 registration_symbol=registered_environment.registration_symbol,
                 workspace_mutation_fence=(
@@ -2777,6 +2808,104 @@ class EnvironmentLifecycle:
             session_id,
             self.checkpoint_transform_preserving_runtime_state(checkpoint),
         )
+
+    async def _retire_terminal_allocation(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str,
+        factory: EnvironmentFactory,
+    ) -> None:
+        """Retire terminal invocation metadata only after exact provider disposal proof."""
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        reconnect, owner = _factory_reconnect_state_from_checkpoint(
+            checkpoint, environment_name=environment_name
+        )
+        if owner != session.id or not reconnect:
+            return
+
+        expected_receipt = self._allocation_coordinator.receipt_from_checkpoint(
+            checkpoint, environment_name=environment_name
+        )
+
+        def require_exact(current: dict[str, Any] | None) -> None:
+            current_reconnect, current_owner = _factory_reconnect_state_from_checkpoint(
+                current, environment_name=environment_name
+            )
+            if current_owner != session.id or current_reconnect != reconnect:
+                raise RuntimeError("Terminal allocation lost its exact reconnect authority.")
+            if (
+                self._allocation_coordinator.record_from_checkpoint(
+                    current, environment_name=environment_name
+                )
+                is not None
+                or (current or {}).get(_PENDING_ALLOCATION_DISPOSAL_KEY, {}).get(environment_name)
+                is not None
+                or pending_completion_finalization_from_checkpoint(current) is not None
+            ):
+                raise RuntimeError("Terminal allocation has unsettled lifecycle authority.")
+            receipt = self._allocation_coordinator.receipt_from_checkpoint(
+                current, environment_name=environment_name
+            )
+            if receipt != expected_receipt:
+                raise RuntimeError("Terminal allocation receipt changed during verification.")
+            if receipt is not None and (
+                receipt.intent.session_id != session.id
+                or receipt.intent.environment_name != environment_name
+                or receipt.reconnect_metadata != reconnect
+            ):
+                raise RuntimeError("Terminal allocation conflicts with its receipt.")
+
+        require_exact(checkpoint)
+        request = EnvironmentFactoryRequest(
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            operation=EnvironmentFactoryOperation.RECONNECT,
+            reconnect_metadata=reconnect,
+            execution_requirements=registered_agent.execution_requirements,
+        )
+        disposed = await environment_operation_boundary.await_environment_operation(
+            lambda: factory.is_allocation_disposed(request),
+            operation_name="Terminal environment allocation disposal verification",
+            redactor=self._secret_redactor,
+        )
+        if type(disposed) is not bool:
+            raise TypeError("Environment factory disposal verification must return a bool.")
+        if not disposed:
+            return
+
+        generation = uuid4().hex
+
+        def retire(current_session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
+            if (
+                current_session.instance_id != session.instance_id
+                or current_session.run_epoch != session.run_epoch
+                or current_session.status is not SessionStatus.RUNNING
+            ):
+                raise SessionRunFenced(
+                    "Terminal allocation retirement lost its session generation."
+                )
+            require_exact(current)
+            copied = copy_json_value(current or {}, "checkpoint")
+            copied.setdefault(_ALLOCATION_GENERATIONS_KEY, {})[environment_name] = {
+                "session_instance_id": session.instance_id,
+                "reconnect_metadata": reconnect,
+                "successor_generation": generation,
+            }
+            for key in (
+                ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+                ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+            ):
+                values = copied.get(key, {})
+                values.pop(environment_name, None)
+                if not values:
+                    copied.pop(key, None)
+            return copied
+
+        await self._session_store.transform_checkpoint(session.id, retire)
 
     async def _retire_disposed_allocation(
         self,
@@ -3241,6 +3370,7 @@ class EnvironmentLifecycle:
         runtime_keys = (
             _PENDING_ALLOCATION_DISPOSAL_KEY,
             _RETIRED_ALLOCATION_DISPOSAL_KEY,
+            _ALLOCATION_GENERATIONS_KEY,
             ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
@@ -4258,6 +4388,7 @@ class EnvironmentLifecycle:
                 registered_environment.unclaimed_factory_result is not None
             ),
             live_allocation_fingerprint=(registered_environment.live_allocation_fingerprint),
+            allocation_generation=registered_environment.allocation_generation,
             registration_source=registered_environment.registration_source,
             registration_symbol=registered_environment.registration_symbol,
             binding_generation_id=registered_environment.binding_generation_id,

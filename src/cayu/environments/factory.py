@@ -803,6 +803,18 @@ class EnvironmentFactory(ABC):
             "Environment factory cannot recover completed-publication disposal."
         )
 
+    async def is_allocation_disposed(self, request: EnvironmentFactoryRequest) -> bool:
+        """Positively attest terminal disposal of the exact reconnect allocation.
+
+        Called only for a new invocation after a completed or failed session,
+        after profile admission, never to continue pending recovery. Return True only with durable provider ownership evidence;
+        absence or uncertainty is not proof. Do not dispose, reconnect, or create
+        resources here. The default preserves exact-allocation reconnect.
+        Wrappers must forward this hook to preserve this capability.
+        """
+        del request
+        return False
+
     @abstractmethod
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         """Return a concrete environment for the requested session."""

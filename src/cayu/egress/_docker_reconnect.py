@@ -681,6 +681,29 @@ class DockerReconnect:
             await self.run(["rm", "-f", sidecar["Id"]])
         claim.write(sidecar_id=None, sidecar_name=None)
 
+    async def is_allocation_disposed(self, reconnect_metadata: Mapping[str, Any]) -> bool:
+        identity = validate_identity(reconnect_metadata)
+        await self.validate_host()
+        claim = self.claim(identity["allocation_id"])
+        try:
+            claim.read()
+            if claim.journal.get("identity") != identity:
+                raise DockerEgressReconnectError("identity_mismatch")
+            # A terminal journal is immutable. Do not require the new worker's
+            # configuration to equal the retired one: profile admission may
+            # have explicitly authorized a new Runtime or browser version.
+            # All live-state configuration checks remain in prepare().
+            return claim.journal["state"] == "disposed" and not claim.journal.get(
+                "pending_mutation"
+            )
+        finally:
+            # This observer dispatched no provider mutation. Release only its
+            # file lock, even if a preceding worker left pending_mutation in
+            # the journal. Keep that durable uncertainty unchanged; normal
+            # mutation owners still use close() and its settlement guard.
+            claim.handle.close()
+            claim.closed = True
+
     async def prepare(
         self,
         *,

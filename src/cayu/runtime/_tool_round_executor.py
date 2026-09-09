@@ -4624,6 +4624,11 @@ class ToolRoundExecutor:
                     if registered_environment is None
                     else registered_environment.live_allocation_fingerprint
                 ),
+                environment_allocation_generation=(
+                    None
+                    if registered_environment is None
+                    else registered_environment.allocation_generation
+                ),
                 current_session_lineage={
                     "session_id": session.id,
                     "session_instance_id": session.instance_id,

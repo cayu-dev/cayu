@@ -518,3 +518,65 @@ def test_preflight_failure_never_admits_or_thaws_retained_guest(tmp_path, monkey
         claim.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["disposed", "active", "retained", "recovering", "disposal_pending", "ownership_uncertain"],
+)
+def test_disposal_proof_requires_exact_terminal_journal(tmp_path, state):
+    async def scenario():
+        docker, adapter, manager, identity = setup(tmp_path)
+        claim = manager.claim(TOKEN)
+        claim.read()
+        claim.write(state=state)
+        claim.close()
+        assert await adapter.is_allocation_disposed(identity) is (state == "disposed")
+        assert all(command[:2] == ["context", "inspect"] for command in docker.commands)
+        # The proof is independent of new worker configuration only when the
+        # exact old journal is terminal. Reconnect still refuses that identity.
+        if state == "disposed":
+            adapter._sidecar_image = "new-sidecar-version"
+            assert await adapter.is_allocation_disposed(identity)
+            with pytest.raises(DockerEgressReconnectError, match="configuration_mismatch"):
+                await adapter.prepare_reconnect(
+                    session_id="session",
+                    environment_name="environment",
+                    grants=(),
+                    broker=None,
+                    reconnect_metadata=identity,
+                )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["missing", "mismatch", "locked", "pending_mutation"])
+def test_disposal_proof_fails_closed(tmp_path, fault):
+    async def scenario():
+        _, adapter, manager, identity = setup(tmp_path)
+        claim = manager.claim(TOKEN)
+        claim.read()
+        claim.write(state="disposed")
+        if fault == "mismatch":
+            claim.write(identity={**identity, "session_id": "other"})
+        if fault != "locked":
+            claim.close()
+        if fault == "missing":
+            (tmp_path / f"{TOKEN}.json").unlink()
+        if fault == "pending_mutation":
+            path = tmp_path / f"{TOKEN}.json"
+            journal = json.loads(path.read_text())
+            path.write_text(json.dumps({**journal, "pending_mutation": True}))
+        try:
+            if fault == "pending_mutation":
+                assert not await adapter.is_allocation_disposed(identity)
+                assert json.loads(path.read_text())["pending_mutation"] is True
+                observer = manager.claim(TOKEN)
+                observer.close()
+            else:
+                with pytest.raises(DockerEgressReconnectError):
+                    await adapter.is_allocation_disposed(identity)
+        finally:
+            claim.close()
+
+    asyncio.run(scenario())

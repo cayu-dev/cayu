@@ -43,6 +43,7 @@ _SOURCE_OWNED_CHECKPOINT_KEYS = frozenset(
         # A fork must create its own allocation without inheriting that authority.
         "environment_factory_pending_disposals",
         "environment_factory_retired_disposals",
+        "environment_factory_allocation_generations",
     }
 )
 

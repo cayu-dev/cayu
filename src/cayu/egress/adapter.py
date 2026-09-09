@@ -788,6 +788,15 @@ class SandboxEgressAdapter(ABC):
         """
         del runner
 
+    async def is_allocation_disposed(self, reconnect_metadata: Mapping[str, Any]) -> bool:
+        """Prove exact terminal disposal without mutating provider resources.
+
+        Missing or uncertain ownership never authorizes replacement. Adapters
+        without a durable disposal proof preserve normal reconnect behavior.
+        """
+        del reconnect_metadata
+        return False
+
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
         """Return durable identity required to reattach to ``runner``."""
         return {}

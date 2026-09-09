@@ -3339,7 +3339,9 @@ class BrowserSessionTool(Tool):
                 or durable_session_key is None
             ):  # pragma: no cover - established by the identical durable-authority guard above
                 raise RuntimeError("durable browser operation keys were not initialized")
-            raw_parent = await durable_authority.load_durable_operation(_DURABLE_BROWSER_PARENT_KEY)
+            raw_parent = await durable_authority.load_durable_operation(
+                _durable_browser_parent_key(durable_authority)
+            )
             try:
                 current_parent_state, parent_failure = _validate_durable_browser_parent_record(
                     raw_parent,
@@ -3408,7 +3410,7 @@ class BrowserSessionTool(Tool):
             )
             try:
                 await durable_authority.compare_and_set_durable_operation(
-                    _DURABLE_BROWSER_PARENT_KEY,
+                    _durable_browser_parent_key(durable_authority),
                     raw_parent,
                     durable_parent_intent,
                     {
@@ -3450,7 +3452,7 @@ class BrowserSessionTool(Tool):
                     state="uncertain",
                 )
                 await durable_authority.compare_and_set_durable_operation(
-                    _DURABLE_BROWSER_PARENT_KEY,
+                    _durable_browser_parent_key(durable_authority),
                     durable_parent_intent,
                     durable_parent_dispatched,
                     {
@@ -3953,7 +3955,9 @@ class BrowserSessionTool(Tool):
                         fingerprint,
                     )
                     live_session.last_operation_fingerprint = fingerprint
-        raw_parent = await durable_authority.load_durable_operation(_DURABLE_BROWSER_PARENT_KEY)
+        raw_parent = await durable_authority.load_durable_operation(
+            _durable_browser_parent_key(durable_authority)
+        )
         try:
             durable_parent_state, failure = _validate_durable_browser_parent_record(
                 raw_parent,
@@ -4418,7 +4422,7 @@ class BrowserSessionTool(Tool):
             )
             publication_attempted = True
             await authority.compare_and_set_durable_operation(
-                _DURABLE_BROWSER_PARENT_KEY,
+                _durable_browser_parent_key(authority),
                 expected_parent,
                 terminal_parent,
                 {
@@ -4440,7 +4444,7 @@ class BrowserSessionTool(Tool):
                             )
                             == canonical_durable_json_bytes(expected, "browser_expected")
                             for key, expected in (
-                                (_DURABLE_BROWSER_PARENT_KEY, terminal_parent),
+                                (_durable_browser_parent_key(authority), terminal_parent),
                                 (operation_key, terminal),
                                 (_durable_browser_session_key(session_id), session_record),
                             )
@@ -6508,6 +6512,16 @@ def _browser_operation_locator_record(
 
 def _durable_browser_session_key(browser_session_id: str) -> str:
     return "browser-session:v1:" + hashlib.sha256(browser_session_id.encode("utf-8")).hexdigest()
+
+
+def _durable_browser_parent_key(authority: Any) -> str:
+    generation = authority.environment_allocation_generation
+    if generation is None:
+        return _DURABLE_BROWSER_PARENT_KEY
+    # Only Runtime's positively settled terminal retirement starts another
+    # allocation generation. Keep legacy parents and all operation/session
+    # receipts intact, so old actions still refuse replacement allocations.
+    return f"browser-parent:v2:{generation}"
 
 
 def _browser_parent_record(

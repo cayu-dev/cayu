@@ -628,6 +628,7 @@ class _RuntimeToolInvocationAuthority:
     effective_arguments_sha256: str
     execution_profile_fingerprint: str
     environment_allocation_fingerprint: str | None
+    environment_allocation_generation: str | None
     current_session_lineage: Mapping[str, Any]
     load_durable_operation: Callable[[str], Awaitable[dict[str, Any] | None]]
     authorize_shared_artifact: Callable[[dict[str, Any], str, str], Awaitable[dict[str, Any]]]
@@ -673,6 +674,7 @@ def _bind_runtime_tool_invocation_authority(
     effective_arguments: dict[str, Any],
     execution_profile_fingerprint: str,
     environment_allocation_fingerprint: str | None,
+    environment_allocation_generation: str | None = None,
     current_session_lineage: Mapping[str, Any] | None = None,
     load_durable_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
     authorize_shared_artifact: Callable[[dict[str, Any], str, str], Awaitable[dict[str, Any]]]
@@ -702,6 +704,14 @@ def _bind_runtime_tool_invocation_authority(
         not callable(browser_control_admission) or browser_allocation is None
     ):
         raise TypeError("Browser control epoch requires runtime allocation authority.")
+    if environment_allocation_generation is not None and (
+        type(environment_allocation_generation) is not str
+        or len(environment_allocation_generation) != 32
+        or any(
+            character not in "0123456789abcdef" for character in environment_allocation_generation
+        )
+    ):
+        raise ValueError("Runtime allocation generation must be a 32-character hex identity.")
     if not callable(secret_publication_sealer):
         raise TypeError("Runtime secret publication sealer must be callable.")
     if not callable(load_durable_operation):
@@ -731,6 +741,7 @@ def _bind_runtime_tool_invocation_authority(
         ).hexdigest(),
         execution_profile_fingerprint=execution_profile_fingerprint,
         environment_allocation_fingerprint=environment_allocation_fingerprint,
+        environment_allocation_generation=environment_allocation_generation,
         current_session_lineage=freeze_json_value(
             copy_durable_json_object(
                 {} if current_session_lineage is None else current_session_lineage,

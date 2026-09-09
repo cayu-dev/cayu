@@ -19392,6 +19392,10 @@ class SessionEngine:
             start_task_on_enter=start_task_on_enter,
             messages_already_persisted=not continuing_recovery_boundary,
             messages_deferred=continuing_recovery_boundary,
+            new_terminal_invocation=(
+                loaded_session.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}
+                and not continuing_recovery_boundary
+            ),
             deliver_queued_input_before_first_step=not continuing_recovery_boundary,
             pending_tool_round_source_transcript_cursor=(
                 None
@@ -21360,6 +21364,7 @@ class SessionEngine:
         preserve_failure_until_initial_provider_dispatch: bool = False,
         egress_environment_handoff: EgressAuthorityAdoptionResult | None = None,
         parked_egress_factory_result: EnvironmentFactoryResult | None = None,
+        new_terminal_invocation: bool = False,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -21735,6 +21740,7 @@ class SessionEngine:
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
                 adopted_factory_result=adopted_factory_result,
+                new_terminal_invocation=new_terminal_invocation,
             )
             registered_environment = factory_resolution.registered_environment
             if registered_environment is not None:

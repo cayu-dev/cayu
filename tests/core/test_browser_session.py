@@ -1390,6 +1390,7 @@ def _durable_context(
     runner: Any | None = None,
     artifact_store: LocalArtifactStore | None = None,
     allocation_fingerprint: str | None = "a" * 64,
+    allocation_generation: str | None = None,
     execution_profile_fingerprint: str = "b" * 64,
     tool_call_id: str = "tool-call-1",
     fail_before_state: str | None = None,
@@ -1462,6 +1463,7 @@ def _durable_context(
         effective_arguments=args,
         execution_profile_fingerprint=execution_profile_fingerprint,
         environment_allocation_fingerprint=allocation_fingerprint,
+        environment_allocation_generation=allocation_generation,
         load_durable_operation=load,
         compare_and_set_durable_operation=compare_and_set,
         seal_durable_output=seal_durable_output,
@@ -13320,3 +13322,86 @@ def test_browser_session_publishes_artifacts_without_inline_bytes(
     operation: str,
 ) -> None:
     asyncio.run(_browser_session_publishes_artifacts_without_inline_bytes(tmp_path, operation))
+
+
+@pytest.mark.parametrize("new_worker", [False, True])
+def test_completed_allocation_generation_preserves_old_browser_receipts(tmp_path, new_worker):
+    async def scenario():
+        backend = _FakeBrowserBackend()
+        records = {}
+        tool = _tool(backend)
+        first_args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "first",
+        }
+        first = await tool.run(
+            _durable_context(tmp_path, args=first_args, records=records), first_args
+        )
+        assert not first.is_error
+        original_records = json.loads(json.dumps(records))
+        if new_worker:
+            tool = _tool(backend)
+        next_args = {**first_args, "operation_id": "next"}
+        refused = await tool.run(
+            _durable_context(
+                tmp_path,
+                args=next_args,
+                records=records,
+                allocation_fingerprint="c" * 64,
+                tool_call_id="next-call",
+            ),
+            next_args,
+        )
+        assert refused.structured["error"] == "allocation_lost"
+        assert len(backend.calls) == 1
+        generation = "d" * 32
+        # Runtime supplies this namespace only after exact positive disposal.
+        fresh = await tool.run(
+            _durable_context(
+                tmp_path,
+                args=next_args,
+                records=records,
+                allocation_fingerprint="c" * 64,
+                allocation_generation=generation,
+                tool_call_id="next-call",
+            ),
+            next_args,
+        )
+        assert not fresh.is_error, fresh.structured
+        assert len(backend.calls) == 2
+        assert fresh.structured["session_id"] != first.structured["session_id"]
+        assert all(records[key] == value for key, value in original_records.items())
+        assert f"browser-parent:v2:{generation}" in records
+        observe = {
+            "operation": "observe",
+            "session_id": first.structured["session_id"],
+            "page_id": first.structured["page_id"],
+            "operation_id": "old-observation",
+        }
+        old = await tool.run(
+            _durable_context(
+                tmp_path,
+                args=observe,
+                records=records,
+                allocation_fingerprint="c" * 64,
+                allocation_generation=generation,
+                tool_call_id="old-call",
+            ),
+            observe,
+        )
+        assert old.structured["error"] == "allocation_lost"
+        replay = await tool.run(
+            _durable_context(
+                tmp_path,
+                args=first_args,
+                records=records,
+                allocation_fingerprint="c" * 64,
+                allocation_generation=generation,
+            ),
+            first_args,
+        )
+        assert replay.structured["error"] in {"allocation_lost", "operation_conflict"}
+        assert len(backend.calls) == 2
+
+    asyncio.run(scenario())
