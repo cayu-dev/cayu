@@ -26,6 +26,17 @@ _EVENT_TYPES = frozenset(
     }
 )
 _RELATIONS = frozenset({"missing", "invalid", "unregistered", "matches", "differs"})
+_ITEM_TYPES = frozenset(
+    {
+        "message",
+        "function_call",
+        "reasoning",
+        "web_search_call",
+        "tool_search_call",
+        "missing",
+        "other",
+    }
+)
 _STATES = frozenset({"pending", "completed", "absent"})
 
 
@@ -35,6 +46,7 @@ class SearchStreamDiagnostic:
     # item identity relation, response identity relation. Never raw identities.
     entries: tuple[tuple[int, str, int, str, str, str], ...]
     truncated: bool
+    item_types: tuple[tuple[int, str, str], ...] = ()
 
 
 def search_stream_diagnostic_fields(diagnostic: object) -> dict[str, str | int]:
@@ -61,11 +73,41 @@ def search_stream_diagnostic_fields(diagnostic: object) -> dict[str, str | int]:
         ):
             if type(value) is not str or len(value) > 64 or value not in vocabulary:
                 return {}
-    return {
+    if type(diagnostic.item_types) is not tuple or len(diagnostic.item_types) > _TRACE_LIMIT:
+        return {}
+    if diagnostic.item_types and (len(diagnostic.item_types) != len(diagnostic.entries)):
+        return {}
+    for position, row in enumerate(diagnostic.item_types):
+        if type(row) is not tuple or len(row) != 3:
+            return {}
+        ordinal, incoming, registered = row
+        if (
+            type(ordinal) is not int
+            or not 1 <= ordinal <= _COUNTER_LIMIT
+            or ordinal != diagnostic.entries[position][0]
+        ):
+            return {}
+        if any(
+            type(value) is not str or len(value) > 64 or value not in _ITEM_TYPES
+            for value in (incoming, registered)
+        ):
+            return {}
+    fields = {
         "provider_protocol_stream_boundary": "native_adapter",
         "provider_protocol_stream_trace": json.dumps(diagnostic.entries, separators=(",", ":")),
         "provider_protocol_stream_trace_truncated": int(diagnostic.truncated),
     }
+    if diagnostic.item_types:
+        fields["provider_protocol_stream_item_types"] = json.dumps(
+            diagnostic.item_types, separators=(",", ":")
+        )
+    return fields
+
+
+def _item_type(value: object) -> str:
+    if value is None:
+        return "missing"
+    return value if type(value) is str and len(value) <= 64 and value in _ITEM_TYPES else "other"
 
 
 def _relation(value: object, expected: object, *, strip: bool = False) -> str:
@@ -147,6 +189,7 @@ class FunctionStreamTrace(SearchStreamTrace):
     def __init__(self) -> None:
         super().__init__()
         self.has_function = False
+        self._item_types: deque[tuple[int, str, str]] = deque(maxlen=_TRACE_LIMIT)
 
     def record(
         self,
@@ -166,11 +209,25 @@ class FunctionStreamTrace(SearchStreamTrace):
         state, expected = "absent", None
         if registered is not None:
             state, expected = "pending", registered.item_id
-        elif finished is not None and finished.get("type") == "function_call":
+        elif finished is not None:
             state, expected = "completed", finished.get("id")
         item = event.get("item")
+        self._item_types.append(
+            (
+                self._ordinal,
+                _item_type(item.get("type") if isinstance(item, Mapping) else None),
+                "function_call"
+                if registered is not None
+                else _item_type(finished.get("type") if finished is not None else None),
+            )
+        )
         self.has_function |= kind in {
             "response.function_call_arguments.delta",
             "response.function_call_arguments.done",
         } or (isinstance(item, Mapping) and item.get("type") == "function_call")
         self._record(event, state, expected, response_id, kind, index, valid_index)
+
+    def snapshot(self) -> SearchStreamDiagnostic:
+        return SearchStreamDiagnostic(
+            tuple(self._entries), self._truncated, tuple(self._item_types)
+        )
