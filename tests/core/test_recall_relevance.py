@@ -143,7 +143,13 @@ def test_v2_inflections_do_not_inflate_concepts_or_fuzz_identifiers(query, text,
 
 @pytest.mark.parametrize(
     "relevance_policy",
-    ["rank_only.v1", "cayu.query_concepts.v1", "cayu.query_concepts.v2", "cayu.query_concepts.v3"],
+    [
+        "rank_only.v1",
+        "cayu.query_concepts.v1",
+        "cayu.query_concepts.v2",
+        "cayu.query_concepts.v3",
+        "cayu.query_concepts.v4",
+    ],
 )
 @pytest.mark.parametrize("bound", ["below_body", "body", "below_combined", "combined"])
 def test_title_byte_admission_and_candidate_diagnostics_agree(relevance_policy, bound):
@@ -166,7 +172,8 @@ def test_title_byte_admission_and_candidate_diagnostics_agree(relevance_policy, 
         result, _policy(relevance_policy=relevance_policy, max_candidate_text_bytes=limit)
     )
     oversized = bound == "below_body" or (
-        relevance_policy in {"cayu.query_concepts.v2", "cayu.query_concepts.v3"}
+        relevance_policy
+        in {"cayu.query_concepts.v2", "cayu.query_concepts.v3", "cayu.query_concepts.v4"}
         and bound != "combined"
     )
     assert (contribution.focus is None) is oversized
@@ -209,7 +216,7 @@ def test_generated_default_rejects_picnics_and_keeps_useful_procedure(
     assert main(["new", "relevance_app", "--dir", str(tmp_path)]) == 0
     with project_context(tmp_path / "relevance_app"):
         policy = importlib.import_module("memory.context").build_context_policy()
-    assert policy.admission_policy.relevance_policy == "cayu.query_concepts.v3"
+    assert policy.admission_policy.relevance_policy == "cayu.query_concepts.v4"
 
     async def run():
         scope = KnowledgeAccessScope.for_namespace("default")

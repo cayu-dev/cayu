@@ -291,7 +291,18 @@ def test_phrase_policy_identity_is_distinct_and_round_trips():
     assert policy.fingerprint() != _policy(relevance_policy="cayu.query_concepts.v2").fingerprint()
 
 
-def test_runtime_delivers_phrase_supported_record_and_persists_its_reason():
+@pytest.mark.parametrize(
+    "version,query,text",
+    [
+        (PHRASE_RELEVANCE_VERSION, QUERY, "Release rollback procedure: restore the healthy image."),
+        (
+            "cayu.query_concepts.v4",
+            "What is the artifact signing key alias? Return only JSON with keys value and status. Do not guess.",
+            "Artifact signing key alias: production-signer.",
+        ),
+    ],
+)
+def test_runtime_delivers_phrase_supported_record_and_persists_its_reason(version, query, text):
     from test_automatic_recall_context import (
         _admission,
         _CountingKnowledgeStore,
@@ -310,7 +321,6 @@ def test_runtime_delivers_phrase_supported_record_and_persists_its_reason():
         sessions = _CountingSessionStore()
         scope = KnowledgeAccessScope.for_namespace("project:cayu")
         knowledge = _CountingKnowledgeStore(access_scope=scope)
-        text = "Release rollback procedure: restore the healthy image."
         await knowledge.create_entry(
             KnowledgeEntry(id="rollback", namespace="project:cayu", text=text)
         )
@@ -342,9 +352,7 @@ def test_runtime_delivers_phrase_supported_record_and_persists_its_reason():
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=_policy(
-                admission_policy=_admission().model_copy(
-                    update={"relevance_policy": PHRASE_RELEVANCE_VERSION}
-                )
+                admission_policy=_admission().model_copy(update={"relevance_policy": version})
             ),
         )
         events = [
@@ -353,7 +361,7 @@ def test_runtime_delivers_phrase_supported_record_and_persists_its_reason():
                 RunRequest(
                     agent_name="assistant",
                     session_id="phrase-runtime",
-                    messages=[Message.text("user", QUERY)],
+                    messages=[Message.text("user", query)],
                 )
             )
         ]

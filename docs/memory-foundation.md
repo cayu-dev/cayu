@@ -1937,8 +1937,8 @@ explicit `work_context` remains supported. Scope and admission are independent.
 
 ### Shipped relevance eligibility
 
-Generated projects select `cayu.query_concepts.v3` with calibration
-`standard-local-recall-query-concepts-v4`. Rank fusion still orders candidates;
+Generated projects select `cayu.query_concepts.v4` with calibration
+`standard-local-recall-query-concepts-v5`. Rank fusion still orders candidates;
 rank, list population, ties, repeated words, and channel agreement cannot establish
 eligibility. The gate compares unique normalized current-query concepts against
 bounded authorized candidate text and its revision-exact knowledge title (up to
@@ -1979,8 +1979,24 @@ natural-language instruction detection. This is a relevance heuristic, not an
 instruction parser, entailment check,
 contradiction detector or general semantic-confidence estimator. It can support
 one topic within a multi-topic request; it does not prove every requested
-constraint is satisfied. `cayu.query_concepts.v1` and `v2` retain their original
-vocabulary, behavior and policy identities. Existing applications opt into v3
+constraint is satisfied.
+
+V4 retains the whole-query rule but allows ambiguous schema words (`key`,
+`status`, `field`, `string`, `object`, and `value`) in factual phrases,
+such as "artifact signing key alias". A phrase made entirely of those schema
+words still cannot supply the additional signal. Literal markers such as `null`,
+`known`, and `unknown` remain barriers. Recognized delivery commands,
+including explicit object/field declarations and `use status
+known/unknown/null/true/false`, are excluded even without an explicit connector.
+Style imperatives are not classified at arbitrary interior query positions.
+Inline `in/as/using JSON/YAML/XML/Markdown` ends the factual phrase portion only
+when it denotes a delivery suffix (a terminal format, `only`, or `with keys/fields`),
+not a technical subject such as JSON schema validation. This is a bounded
+English heuristic, not general schema or instruction parsing. It neither
+introduces semantic admission nor interprets negation or applicability.
+
+`cayu.query_concepts.v1`, `v2`, and `v3` retain their original
+vocabulary, behavior and policy identities. Existing applications opt into v4
 with a new calibration name; captured old policies are not silently reinterpreted.
 Re-anchoring's separate mandatory v2 gate is unchanged.
 

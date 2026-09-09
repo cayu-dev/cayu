@@ -35,6 +35,7 @@ from cayu.recall_relevance import (
     PHRASE_RELEVANCE_TEXT_VERSION,
     RELEVANCE_TEXT_VERSION,
     TITLE_RELEVANCE_TEXT_VERSION,
+    TOPIC_RELEVANCE_TEXT_VERSION,
     RecallCandidateDecision,
     query_concept_eligibility,
 )
@@ -114,7 +115,11 @@ class AutomaticRecallPolicy(BaseModel):
     fusion_strategy_version: str
     fusion_configuration_version: str
     relevance_policy: Literal[
-        "rank_only.v1", "cayu.query_concepts.v1", "cayu.query_concepts.v2", "cayu.query_concepts.v3"
+        "rank_only.v1",
+        "cayu.query_concepts.v1",
+        "cayu.query_concepts.v2",
+        "cayu.query_concepts.v3",
+        "cayu.query_concepts.v4",
     ] = Field(default="rank_only.v1", exclude_if=lambda value: value == "rank_only.v1")
     relevance_text_version: str | None = Field(default=None, exclude_if=lambda value: value is None)
     mode: AutomaticRecallMode = AutomaticRecallMode.OFFER_AND_STRONG_MATCHES
@@ -195,6 +200,7 @@ class AutomaticRecallPolicy(BaseModel):
                 "cayu.query_concepts.v1": RELEVANCE_TEXT_VERSION,
                 "cayu.query_concepts.v2": TITLE_RELEVANCE_TEXT_VERSION,
                 "cayu.query_concepts.v3": PHRASE_RELEVANCE_TEXT_VERSION,
+                "cayu.query_concepts.v4": TOPIC_RELEVANCE_TEXT_VERSION,
             }[self.relevance_policy]
             if self.relevance_text_version is None:
                 object.__setattr__(self, "relevance_text_version", text_version)
@@ -1584,7 +1590,11 @@ def admit_recall(
     eligibility = {}
     for fused_rank, candidate in enumerate(evaluated, start=1):
         evidence_bytes = len(candidate.record.text.encode("utf-8"))
-        if policy.relevance_policy in {"cayu.query_concepts.v2", "cayu.query_concepts.v3"}:
+        if policy.relevance_policy in {
+            "cayu.query_concepts.v2",
+            "cayu.query_concepts.v3",
+            "cayu.query_concepts.v4",
+        }:
             evidence_bytes += len((candidate.record.title or "").encode("utf-8"))
         if evidence_bytes > policy.max_candidate_text_bytes:
             oversized_candidates.add(candidate.record.identity.sort_key())

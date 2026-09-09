@@ -18,6 +18,8 @@ TITLE_RELEVANCE_VERSION = "cayu.query_concepts.v2"
 TITLE_RELEVANCE_TEXT_VERSION = f"{TITLE_RELEVANCE_VERSION}+unicode-{unicodedata.unidata_version}"
 PHRASE_RELEVANCE_VERSION = "cayu.query_concepts.v3"
 PHRASE_RELEVANCE_TEXT_VERSION = f"{PHRASE_RELEVANCE_VERSION}+unicode-{unicodedata.unidata_version}"
+TOPIC_RELEVANCE_VERSION = "cayu.query_concepts.v4"
+TOPIC_RELEVANCE_TEXT_VERSION = f"{TOPIC_RELEVANCE_VERSION}+unicode-{unicodedata.unidata_version}"
 # Fixed calibration vocabulary; changing it requires a new version.
 _STOP = frozenset(
     [
@@ -131,6 +133,24 @@ _PHRASE_BOILERPLATE = frozenset(
         "values",
     }
 )
+# These words also name factual subjects. v4 filters recognized schema clauses
+# at the query boundary rather than erasing them from every factual phrase.
+_FACTUAL_SCHEMA_WORDS = frozenset(
+    {
+        "key",
+        "keys",
+        "field",
+        "fields",
+        "status",
+        "string",
+        "object",
+        "value",
+        "values",
+    }
+)
+_TOPIC_BOILERPLATE = _PHRASE_BOILERPLATE - _FACTUAL_SCHEMA_WORDS
+_SERIALIZATION_FORMATS = frozenset({"json", "yaml", "xml", "markdown"})
+_SCHEMA_STATUS_VALUES = frozenset({"known", "unknown", "null", "true", "false"})
 _TERM = re.compile(r"[^\W_]+(?:[-./][^\W_]+)*")
 _PHRASE_BREAK = re.compile(
     r"[,.!?;\n\r\v\f\x1c-\x1e\x85\u2028\u2029\u3002\uff0c\uff01\uff1f\uff1b]"
@@ -211,11 +231,89 @@ _DELIVERY_PREFIXES = (
 )
 
 
-def _is_delivery_clause(terms: list[str], start: int = 0) -> bool:
+def _format_delivery(terms: list[str], position: int) -> bool:
+    """A serialization suffix, not a subject such as JSON schema validation."""
+    if position >= len(terms) or terms[position] not in _SERIALIZATION_FORMATS:
+        return False
+    following = position + 1
+    return (
+        following == len(terms)
+        or terms[following] == "only"
+        or (
+            following + 1 < len(terms)
+            and terms[following] == "with"
+            and terms[following + 1] in {"keys", "fields"}
+        )
+    )
+
+
+def _schema_delivery(terms: list[str], start: int) -> bool:
+    """Recognize explicit output declarations, including unpunctuated suffixes.
+
+    Do not reuse style-imperative detection at arbitrary query positions:
+    'how should we use short lived credentials' is a factual subject.
+    """
+    if start >= len(terms):
+        return False
+    if start and terms[start - 1] in {
+        "to",
+        "we",
+        "you",
+        "they",
+        "should",
+        "could",
+        "would",
+        "must",
+        "not",
+    }:
+        return False
+    verb = terms[start]
+    if verb == "use":
+        return (
+            start + 2 < len(terms)
+            and terms[start + 1] == "status"
+            and terms[start + 2] in _SCHEMA_STATUS_VALUES
+        )
+    if verb not in {"return", "respond", "reply", "output", "emit", "include"}:
+        return False
+    position = start + 1
+    while position < len(terms) and terms[position] in _DELIVERY_FILLERS:
+        position += 1
+    if _format_delivery(terms, position):
+        return True
+    if position < len(terms) and terms[position] in _SERIALIZATION_FORMATS:
+        position += 1
+    if position + 2 < len(terms) and terms[position : position + 2] == ["object", "with"]:
+        position += 2
+    # A named field declaration, not 'include fields in the database index'.
+    return (
+        position + 1 < len(terms)
+        and terms[position] in {"fields", "keys"}
+        and terms[position + 1]
+        not in {
+            "in",
+            "from",
+            "of",
+            "for",
+            "with",
+            "used",
+            "stored",
+            "required",
+            "describing",
+            "that",
+            "which",
+            "needed",
+        }
+    )
+
+
+def _is_delivery_clause(terms: list[str], start: int = 0, *, topic: bool = False) -> bool:
     if start < len(terms) and terms[start] == "please":
         start += 1
     if start == len(terms):
         return False
+    if topic and _schema_delivery(terms, start):
+        return True
     # Only the leading descriptor establishes a delivery clause. A format word
     # later in 'return the maintenance window in JSON' must not erase the topic.
     if terms[start] in _DELIVERY_VERBS:
@@ -227,14 +325,18 @@ def _is_delivery_clause(terms: list[str], start: int = 0) -> bool:
     return any(tuple(terms[start : start + len(prefix)]) == prefix for prefix in _DELIVERY_PREFIXES)
 
 
-def _topic_clause(terms: list[str]) -> list[str]:
-    if _is_delivery_clause(terms):
+def _topic_clause(terms: list[str], *, topic: bool = False) -> list[str]:
+    if _is_delivery_clause(terms, topic=topic):
         return []
     # Also exclude appended delivery commands without requiring punctuation.
     # Inspect by index rather than repeatedly allocating whole suffixes.
     for index, term in enumerate(terms):
+        if topic and _schema_delivery(terms, index):
+            return terms[:index]
+        if topic and term in {"in", "as", "using"} and _format_delivery(terms, index + 1):
+            return terms[:index]
         if term in {"and", "then", "also", "please"} and _is_delivery_clause(
-            terms, index if term == "please" else index + 1
+            terms, index if term == "please" else index + 1, topic=topic
         ):
             return terms[:index]
     return terms
@@ -263,10 +365,13 @@ def _clauses(text: str) -> Iterator[tuple[list[str], bool]]:
         yield terms, reset_delivery
 
 
-def _phrases(text: str, *, query: bool = False) -> Iterator[tuple[str, str, str]]:
+def _phrases(
+    text: str, *, query: bool = False, topic: bool = False
+) -> Iterator[tuple[str, str, str]]:
     """Linear scan; three distinct concepts in one uninterrupted topic phrase."""
     window: deque[str] = deque(maxlen=3)
     delivery = False
+    boilerplate = _TOPIC_BOILERPLATE if topic else _PHRASE_BOILERPLATE
     for clause, reset_delivery in _clauses(text):
         window.clear()
         if query:
@@ -274,17 +379,21 @@ def _phrases(text: str, *, query: bool = False) -> Iterator[tuple[str, str, str]
                 delivery = False
             if delivery:
                 continue
-            topic = _topic_clause(clause)
-            delivery = len(topic) != len(clause)
-            clause = topic
+            topic_clause = _topic_clause(clause, topic=topic)
+            delivery = len(topic_clause) != len(clause)
+            clause = topic_clause
         for term in clause:
-            if term in _PHRASE_BOILERPLATE:
+            if term in boilerplate:
                 window.clear()
                 continue
             if term in _STOP:
                 continue
             window.append(_V2_CONCEPTS.get(term, term))
-            if len(window) == 3 and len(set(window)) == 3:
+            if (
+                len(window) == 3
+                and len(set(window)) == 3
+                and (not topic or any(word not in _FACTUAL_SCHEMA_WORDS for word in window))
+            ):
                 yield window[0], window[1], window[2]
 
 
@@ -330,7 +439,12 @@ def query_concept_eligibility(
     title: str | None = None,
 ) -> tuple[str, str]:
     """At most 8,192 query bytes / 128,000 text bytes; no channel confidence."""
-    if version not in {RELEVANCE_VERSION, TITLE_RELEVANCE_VERSION, PHRASE_RELEVANCE_VERSION}:
+    if version not in {
+        RELEVANCE_VERSION,
+        TITLE_RELEVANCE_VERSION,
+        PHRASE_RELEVANCE_VERSION,
+        TOPIC_RELEVANCE_VERSION,
+    }:
         raise ValueError("Unsupported query concept version.")
     if query is None:
         return "insufficient_evidence", "missing_query_evidence"
@@ -345,11 +459,22 @@ def query_concept_eligibility(
     # and a majority of its evidence. Repetition/volume cannot change the result.
     if len(supported) >= min(2, len(terms)) and len(supported) / len(terms) >= 0.6:
         return "eligible", "query_concept_support"
-    if version == PHRASE_RELEVANCE_VERSION and len(supported) >= 3:
-        query_phrases = set(_phrases(query, query=True))
+    if version in {PHRASE_RELEVANCE_VERSION, TOPIC_RELEVANCE_VERSION} and len(supported) >= 3:
+        topic = version == TOPIC_RELEVANCE_VERSION
+        query_phrases = set(_phrases(query, query=True, topic=topic))
+        if topic:
+            # A phrase cannot match if any constituent concept is absent from
+            # both body and title. Avoid a second full candidate scan in that
+            # common partial-overlap case; ordering is still checked below.
+            query_phrases = {
+                phrase for phrase in query_phrases if all(word in supported for word in phrase)
+            }
         if query_phrases and (
-            any(phrase in query_phrases for phrase in _phrases(text))
-            or (title is not None and any(phrase in query_phrases for phrase in _phrases(title)))
+            any(phrase in query_phrases for phrase in _phrases(text, topic=topic))
+            or (
+                title is not None
+                and any(phrase in query_phrases for phrase in _phrases(title, topic=topic))
+            )
         ):
             return "eligible", "query_phrase_support"
     return "low_relevance", "weak_query_support"
