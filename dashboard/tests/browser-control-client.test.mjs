@@ -481,3 +481,124 @@ test("private input ticket contains only exact control authority and requires se
   assert.equal(JSON.parse(calls[1].body).input_kind, "tab")
   client.dispose()
 })
+
+// Exercise the same refresh sequence used by the explicit View page handler.
+test("fresh views bind new revisions and refuse replacements, missing pages and races", async (t) => {
+  const { requestFreshBrowserView, browserViewFailureMessage } = await import(
+    "../src/lib/browser-control-client.ts"
+  )
+  const fresh = { ...browser, revision: 9, control_epoch: 3 }
+  const page = { page_id: "page", revision: "navigated", control_epoch: 3 }
+  const replacements = Object.entries(browser.identity).map(([key, value]) => ({
+    ...fresh,
+    identity: {
+      ...browser.identity,
+      [key]:
+        key === "operator_purpose"
+          ? { code: "other", expected_origins: ["https://site.test"] }
+          : key === "profile_checkpoint_policy"
+            ? "disabled"
+            : typeof value === "number"
+              ? value + 1
+              : `${value}-replacement`,
+    },
+  }))
+  const cases = [
+    { name: "fresh evidence", success: true, count: 4 },
+    { name: "retired", browsers: [], count: 2 },
+    { name: "ambiguous", browsers: [fresh, fresh], count: 2 },
+    ...replacements.map((replacement, index) => ({
+      name: `identity fence ${index}`,
+      browsers: [replacement],
+      count: 2,
+    })),
+    {
+      name: "missing page",
+      pages: [{ ...page, page_id: "other" }],
+      count: 3,
+      message: /page is no longer available/,
+    },
+    {
+      name: "closed",
+      browsers: [{ ...fresh, state: "closed" }],
+      count: 2,
+      message: /closed or unavailable/,
+    },
+    {
+      name: "sensitive",
+      browsers: [{ ...fresh, sensitive_entry: true }],
+      count: 2,
+      message: /paused/,
+    },
+    {
+      name: "pending sensitive",
+      browsers: [{ ...fresh, sensitive_entry_pending: true }],
+      count: 2,
+      message: /paused/,
+    },
+    ...["operator-session", "session", "pages", "view-ticket"].map((failAt, index) => ({
+      name: `conflict at ${failAt}`,
+      failAt,
+      count: index + 1,
+    })),
+    { name: "closed during discovery", cancelAt: "session", count: 2 },
+    { name: "closed during pages", cancelAt: "pages", count: 3 },
+  ]
+  for (const scenario of cases)
+    await t.test(scenario.name, async () => {
+      const calls = []
+      let current = true
+      const client = createBrowserControlClient(root, "session", async (url, init) => {
+        const path = url.pathname.split("/").at(-1)
+        calls.push({ path, body: init.body && JSON.parse(init.body) })
+        if (path === scenario.cancelAt) current = false
+        if (path === scenario.failAt) return new Response("private-canary", { status: 409 })
+        if (path === "operator-session")
+          return Response.json({ operator_session_token: "continuity" })
+        if (path === "session") return Response.json({ browsers: scenario.browsers ?? [fresh] })
+        if (path === "pages") {
+          const pages = scenario.pages ?? [page]
+          return Response.json({
+            pages,
+            locations: pages.map((page) => ({ page, origin: null })),
+            active_page_id: pages[0]?.page_id ?? null,
+          })
+        }
+        assert.equal(path, "view-ticket")
+        return Response.json({ ticket: "fresh-ticket" })
+      })
+      try {
+        const pending = requestFreshBrowserView(client, browser, "page", () => current)
+        if (scenario.success) {
+          assert.equal(await pending, "fresh-ticket")
+          assert.deepEqual(calls[2].body, {
+            identity: browser.identity,
+            expected_record_revision: 9,
+          })
+          assert.deepEqual(calls[3].body, {
+            identity: browser.identity,
+            expected_record_revision: 9,
+            page,
+          })
+          assert.equal(browser.revision, 2)
+        } else if (scenario.cancelAt) {
+          assert.equal(await pending, "")
+        } else {
+          await assert.rejects(pending, (error) => {
+            assert.match(
+              browserViewFailureMessage(error),
+              scenario.message ?? /unavailable|no longer available/,
+            )
+            assert.doesNotMatch(browserViewFailureMessage(error), /canary|settle|repeat input/)
+            return true
+          })
+        }
+        assert.deepEqual(
+          calls.map((call) => call.path),
+          ["operator-session", "session", "pages", "view-ticket"].slice(0, scenario.count),
+        )
+      } finally {
+        client.dispose()
+      }
+    })
+})

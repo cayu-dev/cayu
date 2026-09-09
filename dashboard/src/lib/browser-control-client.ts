@@ -393,3 +393,47 @@ export function createBrowserControlClient(
     },
   }
 }
+
+// Only the explicit read-only View page action uses refreshed evidence. Control
+// and input intents keep their original fences and are never replayed here.
+export async function requestFreshBrowserView(
+  client: ReturnType<typeof createBrowserControlClient>,
+  selected: BrowserDescriptor,
+  pageId: string,
+  current: () => boolean,
+): Promise<string> {
+  const browsers = await client.discover()
+  if (!current()) return ""
+  // Compare the complete validated identity, including allocation/run/worker
+  // fences and application purpose, independently of object property order.
+  const identity = descriptor(selected, selected.identity.session_id).identity
+  const matches = browsers.filter(
+    (browser) => JSON.stringify(browser.identity) === JSON.stringify(identity),
+  )
+  const browser = matches[0]
+  if (matches.length !== 1 || !browser)
+    throw new BrowserViewUnavailable(
+      "The selected browser is no longer available. Rediscover browsers.",
+    )
+  if (browser.sensitive_entry || browser.sensitive_entry_pending)
+    throw new BrowserViewUnavailable("Private view is paused for sensitive entry.")
+  if (!["agent_controlled", "takeover_requested", "operator_controlled"].includes(browser.state))
+    throw new BrowserViewUnavailable(
+      "The selected browser is closed or unavailable for viewing. Refresh discovery.",
+    )
+  const evidence = await client.pages(browser)
+  if (!current()) return ""
+  const page = evidence.pages.find((candidate) => candidate.page_id === pageId)
+  if (!page)
+    throw new BrowserViewUnavailable("The selected page is no longer available. Rediscover pages.")
+  // A race after discovery must still fail at the server; never retry it.
+  return client.viewerTicket(browser, page)
+}
+
+export class BrowserViewUnavailable extends Error {}
+
+export function browserViewFailureMessage(error: unknown): string {
+  return error instanceof BrowserViewUnavailable
+    ? error.message
+    : "Private view unavailable. The browser or page may have changed or closed, or capture may be paused. Refresh discovery before opening a new view."
+}

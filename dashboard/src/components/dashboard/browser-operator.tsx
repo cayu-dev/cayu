@@ -5,7 +5,9 @@ import {
   type BrowserInputKind,
   type BrowserPage,
   type BrowserPageLocation,
+  browserViewFailureMessage,
   createBrowserControlClient,
+  requestFreshBrowserView,
 } from "../../lib/browser-control-client"
 import { startBrowserPageObserver } from "../../lib/browser-page-observer"
 import { encodePrivateBrowserText, startPrivateBrowserInput } from "../../lib/browser-private-input"
@@ -91,6 +93,7 @@ export function BrowserOperator({ sessionId }: { sessionId: string }) {
 
   async function perform(
     action: (owner: NonNullable<typeof client.current>, current: () => boolean) => Promise<void>,
+    readOnlyView = false,
   ) {
     if (running.current) return
     running.current = true
@@ -105,8 +108,12 @@ export function BrowserOperator({ sessionId }: { sessionId: string }) {
         )
       }
       await action(client.current, current)
-    } catch {
+    } catch (error) {
       if (current()) {
+        if (readOnlyView) {
+          setStatus(browserViewFailureMessage(error))
+          return
+        }
         // Keep continuity for readback after an acknowledgement loss. Replacing
         // it here would discard ownership of an already accepted takeover. Keep
         // the viewer alive too: an accepted sensitive-entry transition may still
@@ -272,7 +279,7 @@ export function BrowserOperator({ sessionId }: { sessionId: string }) {
                   if (!current()) return
                   viewer.current = null
                   clear()
-                  let ticket = await owner.viewerTicket(selected, page)
+                  let ticket = await requestFreshBrowserView(owner, selected, page.page_id, current)
                   if (!current()) {
                     ticket = ""
                     return
@@ -304,7 +311,7 @@ export function BrowserOperator({ sessionId }: { sessionId: string }) {
                   setStatus(
                     "Private view requested; frames remain transient. A blank canvas may mean capture is paused or access has ended.",
                   )
-                })
+                }, true)
               }
             >
               View page {index + 1}
