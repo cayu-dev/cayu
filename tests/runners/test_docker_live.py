@@ -423,3 +423,63 @@ def test_real_docker_failure_diagnostics_survive_durable_tool_evidence(tmp_path,
         timeout=10,
     )
     assert inspected.returncode != 0
+
+
+@pytest.mark.parametrize("mode", ["fallback", "no_setsid", "direct", "shell"])
+def test_quote_heavy_transport_on_linux(mode):
+    import json
+    import shlex
+
+    from cayu.runners.docker import _build_docker_exec_argv
+
+    docker_path = _docker_path_or_skip()
+    payload = ["alpha'beta"] * 1000
+    raw = (
+        "import json, os, sys; print(json.dumps(["
+        + repr(payload)
+        + ", sys.stdin.read(), os.getcwd(), os.environ['CANARY'], sys.argv[1:]]))"
+    )
+    extra = ["plain", "space quote' double\" newline\n$HOME; false"]
+    command = ExecCommand.process("python3", "-c", raw, *extra)
+    if mode == "shell":
+        command = ExecCommand.bash(shlex.join(command.argv))
+    argv = _build_docker_exec_argv(
+        docker_path,
+        "synthetic",
+        command,
+        cwd="/tmp",
+        env_file=None,
+        has_stdin=True,
+        pid_file="/tmp/synthetic.pid",
+        direct_process_supervisor=mode == "direct",
+    )
+    guest = argv[argv.index("synthetic") + 1 :]
+    if mode == "no_setsid":
+        guest[-1] = "setsid() { return 1; }; " + guest[-1]
+    result = subprocess.run(
+        [
+            docker_path,
+            "run",
+            "--rm",
+            "--network=none",
+            "-i",
+            "-w",
+            "/tmp",
+            "-e",
+            "CANARY=environment-canary",
+            "python:3.12-slim",
+            *guest,
+        ],
+        input="stdin-canary",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        payload,
+        "stdin-canary",
+        "/tmp",
+        "environment-canary",
+        extra,
+    ]

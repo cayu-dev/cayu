@@ -57,6 +57,7 @@ from cayu.runners._secrets import (
 )
 from cayu.runners._subprocess import (
     SubprocessCommand,
+    SubprocessLaunchRefused,
     copy_runner_env,
     remove_runner_env,
     run_subprocess,
@@ -700,6 +701,7 @@ def _build_docker_exec_argv(
             pid_file,
             *command.argv,
         ]
+        _validate_docker_exec_argv(argv)
         return argv
     if command.kind == "process":
         if command.argv is None:
@@ -710,7 +712,18 @@ def _build_docker_exec_argv(
             raise ValueError("Shell commands require a script.")
         command_script = command.shell
     argv += ["sh", "-c", _supervised_command_script(command_script, pid_file)]
+    _validate_docker_exec_argv(argv)
     return argv
+
+
+def _validate_docker_exec_argv(argv: list[str]) -> None:
+    # Conservative portable admission ceiling below Linux MAX_ARG_STRLEN.
+    # Include terminators and pointer overhead in the aggregate budget. Host
+    # environment/platform limits can still reject exec; the spawn boundary
+    # separately identifies proven E2BIG refusals.
+    sizes = [len(os.fsencode(arg)) + 1 for arg in argv]
+    if any(size > 64 * 1024 for size in sizes) or sum(sizes) + 8 * (len(argv) + 1) > 128 * 1024:
+        raise ValueError("Docker command transport exceeds the local admission limit.")
 
 
 _PYTHON_PROCESS_SUPERVISOR = """\
@@ -852,29 +865,29 @@ async def _run_docker(
 
 def _supervised_command_script(command_script: str, pid_file: str) -> str:
     quoted_state_dir = shlex.quote(posixpath.dirname(pid_file))
-    setsid_body = _supervised_command_body(command_script, pid_file=pid_file, process_group=True)
+    setsid_body = _supervised_command_body(pid_file=pid_file, process_group=True)
     # Some minimal images lack ``setsid -w``, while Docker still gives the exec
     # shell its own process group. Detect that authority from procfs instead of
     # recording PID-only cleanup and stranding the shell's descendants.
-    fallback_body = _supervised_command_body(command_script, pid_file=pid_file, process_group=None)
+    fallback_body = _supervised_command_body(pid_file=pid_file, process_group=None)
+    # Quote the payload once; fixed supervisor bodies forward it as data.
     return (
+        f"set -- {shlex.quote(command_script)}; "
         f"mkdir -p {quoted_state_dir}; "
         "if setsid -w true >/dev/null 2>&1; then "
-        f"exec setsid -w sh -c {shlex.quote(setsid_body)}; "
+        f'exec setsid -w sh -c {shlex.quote(setsid_body)} cayu "$1"; '
         "else "
-        f"exec sh -c {shlex.quote(fallback_body)}; "
+        f'exec sh -c {shlex.quote(fallback_body)} cayu "$1"; '
         "fi"
     )
 
 
 def _supervised_command_body(
-    command_script: str,
     *,
     pid_file: str,
     process_group: bool | None,
 ) -> str:
     quoted_pid_file = shlex.quote(pid_file)
-    quoted_command_script = shlex.quote(command_script)
     if process_group is None:
         process_group_probe = (
             "process_group=0; "
@@ -890,7 +903,7 @@ def _supervised_command_body(
     return (
         process_group_probe
         + f"printf '%s %s\\n' \"$$\" {process_group_value} > {quoted_pid_file} || exit 1; "
-        f"sh -c {quoted_command_script}; "
+        'sh -c "$1"; '
         "status=$?; "
         f"rm -f {quoted_pid_file}; "
         'exit "$status"'
@@ -2705,6 +2718,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     output_limit_bytes=output_limit,
                     output_redactor=invocation_redactor,
                 )
+            except SubprocessLaunchRefused:
+                # The local exec syscall refused the CLI before guest dispatch.
+                raise
             except asyncio.CancelledError as exc:
                 cleanup = await self._cleanup_command(
                     handle=handle,

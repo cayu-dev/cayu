@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import os
 import signal
 import subprocess
@@ -11,7 +12,7 @@ from typing import BinaryIO, TypeVar
 
 from cayu._validation import require_durable_clean_nonblank, require_durable_text
 from cayu.runners._cleanup import _cleanup_artifact
-from cayu.runners._diagnostics import tag_runner_failure_phase
+from cayu.runners._diagnostics import SubprocessLaunchRefused, tag_runner_failure_phase
 from cayu.runners._redacted_output import RedactedOutputCapture
 from cayu.runners.base import ExecResult, attach_cancellation_artifacts
 from cayu.vaults import SecretRedactor
@@ -287,6 +288,10 @@ async def run_subprocess(
         )
 
     except Exception as error:
+        if isinstance(error, OSError) and error.errno == errno.E2BIG:
+            refusal = SubprocessLaunchRefused(errno.E2BIG, "Local subprocess launch refused")
+            tag_runner_failure_phase(refusal, "launch")
+            raise refusal from None
         tag_runner_failure_phase(error, "launch")
         raise
 

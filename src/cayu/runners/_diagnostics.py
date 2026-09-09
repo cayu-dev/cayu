@@ -6,6 +6,11 @@ import errno as errno_module
 
 from cayu._exception_state import set_exception_state
 
+
+class SubprocessLaunchRefused(OSError):
+    """An exec E2BIG refusal positively established at the local spawn boundary."""
+
+
 _TRUSTED_RUNNER_ERROR_TYPE_NAMES = frozenset(
     {
         "ArithmeticError",
@@ -78,6 +83,7 @@ _TRUSTED_RUNNER_ERROR_TYPE_NAMES = frozenset(
         "NotFoundException",
         "NotImplementedError",
         "OSError",
+        "SubprocessLaunchRefused",
         "OverflowError",
         "PathNotFoundError",
         "PendingDeprecationWarning",
@@ -152,6 +158,7 @@ _RUNNER_FAILURE_PHASES = frozenset(
     {"launch", "transport", "stream_handling", "process_wait", "filesystem", "cleanup"}
 )
 _TRUSTED_OS_ERRORS = (
+    SubprocessLaunchRefused,
     OSError,
     BlockingIOError,
     ChildProcessError,
@@ -186,7 +193,7 @@ def safe_runner_failure_fields(errno: object, phase: object) -> dict[str, object
 
 
 def runner_failure_fields(error: BaseException) -> dict[str, object]:
-    """Read errno only from exact builtin OS errors, never custom descriptors."""
+    """Read errno only from exact trusted OS errors, never custom descriptors."""
 
     number = None
     if any(type(error) is candidate for candidate in _TRUSTED_OS_ERRORS):

@@ -263,6 +263,15 @@ required by the configured helper. Pass the same argument to
 `DockerEgressAdapter` when virtual egress creates or prepares the Docker
 workload.
 
+Docker exec transport admits at most 64 KiB per encoded argument (including its
+terminator) and 128 KiB in aggregate (including argument pointer overhead).
+The shell supervisor quotes the command once and forwards it through positional
+arguments; it does not consume command stdin. Commands over these limits raise
+a bounded `ValueError` before Docker dispatch. A local exec `E2BIG` refusal also
+leaves the runner reusable without guest cleanup. Other transport failures and
+cancellation still require guest settlement; a launch-phase diagnostic alone is
+not proof of non-dispatch.
+
 Also avoid baking long-lived secrets into the sandbox image or a persistent
 sandbox env, where they outlive the command and may be exfiltrated by sandboxed
 code. Modal's own guidance is explicit: never put secrets inside a sandbox. For
