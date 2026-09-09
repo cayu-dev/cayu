@@ -73,6 +73,7 @@ from cayu.providers._http import (
     validate_base_url,
     validate_url,
 )
+from cayu.providers._openai_citation_offsets import CitationOffsetDiagnostic
 from cayu.providers._openai_protocol import (
     OpenAIProtocolDiagnosticError,
     SearchSourceDiagnostic,
@@ -346,11 +347,13 @@ class OpenAIProtocolError(OpenAIError, OpenAIProtocolDiagnosticError):
         reason_code: str = "unspecified",
         source_diagnostic: SearchSourceDiagnostic | None = None,
         stream_diagnostic: SearchStreamDiagnostic | None = None,
+        citation_diagnostic: CitationOffsetDiagnostic | None = None,
     ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
         self.source_diagnostic = source_diagnostic
         self.stream_diagnostic = stream_diagnostic
+        self.citation_diagnostic = citation_diagnostic
 
 
 class OpenAIUnsupportedSearchSourceError(OpenAIProtocolError):
@@ -984,6 +987,11 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                 str(safe),
                 reason_code=cast("str", fields["provider_protocol_reason"]),
                 source_diagnostic=diagnostic,
+                citation_diagnostic=(
+                    exc.citation_diagnostic
+                    if "provider_protocol_citation_condition" in fields
+                    else None
+                ),
                 stream_diagnostic=(
                     exc.stream_diagnostic if "provider_protocol_stream_trace" in fields else None
                 ),
@@ -3949,21 +3957,14 @@ def _url_citation_event(
         )
     if isinstance(title, str) and not title.strip():
         title = None
-    if (start_index is None) != (end_index is None):
+    diagnostic = CitationOffsetDiagnostic.invalid_offsets(
+        annotation, text_length=len(text), text_offset=text_offset
+    )
+    if diagnostic is not None:
         raise OpenAIProtocolError(
             f"OpenAI citation {path} has invalid text offsets.",
             reason_code="citation_has_invalid_text_offsets",
-        )
-    if start_index is not None and (
-        type(start_index) is not int
-        or type(end_index) is not int
-        or start_index < 0
-        or end_index <= start_index
-        or end_index > len(text)
-    ):
-        raise OpenAIProtocolError(
-            f"OpenAI citation {path} has invalid text offsets.",
-            reason_code="citation_has_invalid_text_offsets",
+            citation_diagnostic=diagnostic,
         )
     payload: dict[str, Any] = {
         "citation_type": "url_citation",

@@ -6,6 +6,7 @@ here explicitly. No response value, exception text, or dynamic path is copied.
 
 from dataclasses import dataclass
 
+from cayu.providers._openai_citation_offsets import citation_offset_fields
 from cayu.providers._openai_search_trace import search_stream_diagnostic_fields
 from cayu.providers.operations import ProviderOperationMalformedError
 
@@ -92,6 +93,8 @@ def protocol_exception_fields(
                 credential_values=credential_values,
             )
         )
+    if fields["provider_protocol_reason"] == "citation_has_invalid_text_offsets":
+        fields.update(citation_offset_fields(getattr(error, "citation_diagnostic", None)))
     fields.update(search_stream_diagnostic_fields(getattr(error, "stream_diagnostic", None)))
     return fields
 
