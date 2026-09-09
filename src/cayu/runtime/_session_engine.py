@@ -23923,7 +23923,13 @@ class SessionEngine:
                 )
                 failure_payload["failure_evidence"] = (
                     exception_evidence(error)
-                    .model_copy(update={"session_id": session.id, "run_epoch": session.run_epoch})
+                    .model_copy(
+                        update={
+                            "session_id": session.id,
+                            "run_epoch": session.run_epoch,
+                            "terminal_event_id": None,
+                        }
+                    )
                     .model_dump(mode="json")
                 )
                 provider_cleanup_failure = budget_provider_cleanup_failure(error)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -47,6 +48,18 @@ class FailureEvidence(BaseModel):
         return self
 
 
+@dataclass(frozen=True)
+class _ChildFailureIdentity:
+    # Process-local diagnostic provenance, never continuation authority.
+    evidence: FailureEvidence
+
+
+def retain_child_failure_identity(exc: BaseException, evidence: FailureEvidence) -> None:
+    """Carry a workflow's observed child through cancellation/timeout wrapping."""
+    if evidence.session_id is not None or evidence.secondary_failures:
+        exc.__dict__["_cayu_child_failure_identity"] = _ChildFailureIdentity(evidence)
+
+
 def exception_evidence(exc: BaseException) -> FailureEvidence:
     """Inspect only bounded type identifiers and Runtime deadline metadata."""
     pending = [exc]
@@ -58,6 +71,7 @@ def exception_evidence(exc: BaseException) -> FailureEvidence:
     timeout = False
     truncated = False
     secondary = False
+    child_identities: dict[tuple[str, int | None, str | None], FailureEvidence] = {}
     while pending and len(seen) < 16:
         item = pending.pop()
         if id(item) in seen:
@@ -65,6 +79,14 @@ def exception_evidence(exc: BaseException) -> FailureEvidence:
         seen.add(id(item))
         name = type(item).__name__
         names.append(name[:128] if name.isascii() and name.isidentifier() else "Exception")
+        retained = item.__dict__.get("_cayu_child_failure_identity")
+        if type(retained) is _ChildFailureIdentity:
+            child = retained.evidence
+            secondary |= child.secondary_failures
+            if child.session_id is not None:
+                child_identities[(child.session_id, child.run_epoch, child.terminal_event_id)] = (
+                    child
+                )
         interrupted |= isinstance(item, asyncio.CancelledError)
         timeout |= isinstance(item, TimeoutError)
         raw = getattr(item, "execution_deadline", None)
@@ -90,7 +112,17 @@ def exception_evidence(exc: BaseException) -> FailureEvidence:
         cause = item.__cause__ or item.__context__
         if cause is not None:
             pending.append(cause)
+    # A group can contain multiple children. Never select a sibling's identity
+    # or a partial traversal as the sole terminal reference for the group.
+    child = (
+        next(iter(child_identities.values()))
+        if len(child_identities) == 1 and not pending and not truncated
+        else None
+    )
     return FailureEvidence(
+        session_id=child.session_id if child is not None else None,
+        run_epoch=child.run_epoch if child is not None else None,
+        terminal_event_id=child.terminal_event_id if child is not None else None,
         classification="deadline"
         if deadline
         else "timeout"

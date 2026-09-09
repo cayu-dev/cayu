@@ -9925,6 +9925,16 @@ the observing workflow attempt; `evidence.run_epoch` identifies the child run
 that produced the failure. `evidence.terminal_event_id` references a stored
 terminal event, never the public stream's presentation alias. These fields may
 be absent, for example before admission, for plain awaitables, or on older events.
+Once a child start or authenticated create establishes an exact session/run,
+workflow cancellation retains that diagnostic identity through timeout wrapping
+and repeated cancellation, including when terminal publication or lookup fails.
+A missing terminal does not erase the observed run. Only matching stored terminal
+evidence supplies `terminal_event_id`; a newer run's terminal is never borrowed.
+Before child creation, requested/generated IDs remain non-authoritative and these
+evidence fields stay absent. Pre-start recovery records that lack an executing
+epoch do not establish a run-to-terminal reference, even if their status is terminal.
+An exception group containing different child identities has no single child
+reference. These process-local annotations introduce no serialized authority.
 The session identity bound accommodates native IDs up to 2048 UTF-8 bytes without
 truncating their correlation identity.
 Replaying an interrupted child or explicitly attaching a failed child preserves

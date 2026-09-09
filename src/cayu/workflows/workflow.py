@@ -20,7 +20,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._clock import normalize_utc_datetime
-from cayu._task_wait import await_shielded_task_outcome
+from cayu._task_wait import await_shielded_task_outcome, capture_awaitable_outcome
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -46,7 +46,12 @@ from cayu.deadlines import (
     effective_deadline,
     resumed_execution_deadline,
 )
-from cayu.failure_evidence import FailureEvidence, event_failure_evidence, exception_evidence
+from cayu.failure_evidence import (
+    FailureEvidence,
+    event_failure_evidence,
+    exception_evidence,
+    retain_child_failure_identity,
+)
 from cayu.runtime import (
     BudgetLimit,
     CayuApp,
@@ -1068,6 +1073,8 @@ async def _run_step(
         ):
             return False
         generated_child_ownership = _GeneratedChildOwnership.CREATED_UNATTACHED
+        assert created is not None  # authenticated exact create claim
+        state.run_epoch = created.run_epoch
         if started_event is None:  # pragma: no cover - generated-child invariant
             raise AssertionError("Unacknowledged workflow child is missing its start event.")
         if not await ctx.journal.append_step_started(
@@ -1095,6 +1102,43 @@ async def _run_step(
             )
         )
         return True
+
+    def observed_child_failure_evidence(exc: BaseException) -> FailureEvidence:
+        evidence = exception_evidence(exc)
+        if state.run_epoch is None:
+            # A requested/generated id alone is not proof a child was created.
+            return evidence
+        evidence = evidence.model_copy(
+            update={
+                "session_id": child_session_id,
+                "run_epoch": state.run_epoch,
+                "terminal_event_id": None,
+            }
+        )
+        return evidence
+
+    async def collect_child_failure_evidence(exc: BaseException) -> FailureEvidence:
+        evidence = observed_child_failure_evidence(exc)
+        retain_child_failure_identity(exc, evidence)
+        if state.run_epoch is None:
+            return evidence
+        # A missing terminal or failed diagnostic read must retain known identity
+        # without promoting it into settlement evidence. Stream IDs may be aliases.
+        with contextlib.suppress(Exception):
+            durable = await _child_failure_state(ctx, child_session_id)
+            if (
+                durable.run_epoch in (None, state.run_epoch)
+                and durable.evidence.session_id == child_session_id
+                and durable.evidence.run_epoch == state.run_epoch
+            ):
+                evidence = evidence.model_copy(
+                    update={
+                        "terminal_event_id": durable.evidence.terminal_event_id,
+                        "secondary_failures": evidence.secondary_failures
+                        or durable.evidence.secondary_failures,
+                    }
+                )
+        return evidence
 
     try:
         if started_event is not None:
@@ -1129,32 +1173,59 @@ async def _run_step(
         if capture_structured_output:
             ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
 
-        async def settle_cancelled_child() -> None:
-            nonlocal generated_child_ownership
-            aclose = getattr(run_stream, "aclose", None)
-            if aclose is not None:
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await aclose()
-            await authenticate_unacknowledged_generated_child()
-            if not generated_child_ownership.is_generated or generated_child_ownership.is_created:
-                await ctx.app.recover_incomplete_session(
-                    IncompleteSessionRecoveryRequest(
-                        session_id=child_session_id,
-                        reason="workflow_step_cancelled",
-                        metadata={"workflow": ctx.workflow_name, "step_id": step_id},
-                    )
-                )
+        cancellation_evidence = observed_child_failure_evidence(cancellation)
+        close_failed = False
 
-        settlement_task = asyncio.create_task(settle_cancelled_child())
+        async def settle_cancelled_child(signal: asyncio.CancelledError) -> None:
+            nonlocal generated_child_ownership, cancellation_evidence, close_failed
+            try:
+                aclose = getattr(run_stream, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except (Exception, asyncio.CancelledError):
+                        close_failed = True
+                await authenticate_unacknowledged_generated_child()
+                if (
+                    not generated_child_ownership.is_generated
+                    or generated_child_ownership.is_created
+                ):
+                    await ctx.app.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(
+                            session_id=child_session_id,
+                            reason="workflow_step_cancelled",
+                            metadata={"workflow": ctx.workflow_name, "step_id": step_id},
+                        )
+                    )
+            finally:
+                cancellation_evidence = await collect_child_failure_evidence(signal)
+
+        signal = cancellation
+        settlement_task = asyncio.create_task(
+            capture_awaitable_outcome(lambda: settle_cancelled_child(signal))
+        )
         settlement = await await_shielded_task_outcome(
             settlement_task,
             cancellation=cancellation,
         )
-        if settlement.error is not None:
+        settlement_failure = settlement.error or (
+            settlement.result.error if settlement.result is not None else None
+        )
+        if settlement_failure is not None:
             cancellation.add_note(
-                f"Workflow child cancellation settlement failed: {type(settlement.error).__name__}."
+                f"Workflow child cancellation settlement failed: {type(settlement_failure).__name__}."
             )
         authoritative_cancellation = settlement.cancellation or cancellation
+        retain_child_failure_identity(
+            authoritative_cancellation,
+            cancellation_evidence.model_copy(
+                update={
+                    "secondary_failures": cancellation_evidence.secondary_failures
+                    or close_failed
+                    or settlement_failure is not None,
+                }
+            ),
+        )
         if authoritative_cancellation is cancellation:
             raise
         raise authoritative_cancellation from None
@@ -1171,23 +1242,49 @@ async def _run_step(
         if capture_structured_output:
             ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
         if generated_child_ownership is _GeneratedChildOwnership.UNCREATED:
+            reconciliation_evidence = observed_child_failure_evidence(exc)
+
+            async def reconcile_child_failure(signal: Exception) -> None:
+                nonlocal reconciliation_evidence
+                try:
+                    await recover_authenticated_unacknowledged_child(
+                        reason="workflow_step_create_acknowledgement_lost"
+                    )
+                finally:
+                    # Authentication may establish identity before recovery fails.
+                    # Keep lookup inside the shield, including repeated cancellation.
+                    reconciliation_evidence = observed_child_failure_evidence(signal)
+                    reconciliation_evidence = await collect_child_failure_evidence(signal)
+                    retain_child_failure_identity(signal, reconciliation_evidence)
+
+            reconciliation_signal = exc
             reconciliation_task = asyncio.create_task(
-                recover_authenticated_unacknowledged_child(
-                    reason="workflow_step_create_acknowledgement_lost"
-                )
+                capture_awaitable_outcome(lambda: reconcile_child_failure(reconciliation_signal))
             )
             reconciliation = await await_shielded_task_outcome(reconciliation_task)
+            reconciliation_failure = reconciliation.error or (
+                reconciliation.result.error if reconciliation.result is not None else None
+            )
             if reconciliation.cancellation is not None:
-                if reconciliation.error is not None:
+                retain_child_failure_identity(
+                    reconciliation.cancellation,
+                    reconciliation_evidence.model_copy(
+                        update={
+                            "secondary_failures": reconciliation_evidence.secondary_failures
+                            or reconciliation_failure is not None,
+                        }
+                    ),
+                )
+                if reconciliation_failure is not None:
                     reconciliation.cancellation.add_note(
                         "Workflow child create reconciliation failed: "
-                        f"{type(reconciliation.error).__name__}."
+                        f"{type(reconciliation_failure).__name__}."
                     )
                 raise reconciliation.cancellation from None
-            if reconciliation.error is not None:
+            if reconciliation_failure is not None:
                 exc.add_note(
                     "Workflow child create reconciliation failed: "
-                    f"{type(reconciliation.error).__name__}."
+                    f"{type(reconciliation_failure).__name__}."
                 )
         else:
             await close_unattached_generated_child()
@@ -1199,27 +1296,9 @@ async def _run_step(
             is not None
         ):
             raise
+        evidence = await collect_child_failure_evidence(exc)
+        retain_child_failure_identity(exc, evidence)
         (await ctx.execution_deadline()).require_admission("workflow_step_completion")
-        durable_state = _StepRunEventState()
-        # Diagnostic lookup failure must not replace the primary failure.
-        with contextlib.suppress(Exception):
-            durable_state = await _child_failure_state(ctx, child_session_id)
-        evidence = exception_evidence(exc)
-        if (
-            state.run_epoch is not None
-            and durable_state.evidence.run_epoch == state.run_epoch
-            and durable_state.evidence.terminal_event_id is not None
-        ):
-            evidence = evidence.model_copy(
-                update={
-                    "session_id": durable_state.evidence.session_id,
-                    "run_epoch": durable_state.evidence.run_epoch,
-                    "terminal_event_id": durable_state.evidence.terminal_event_id,
-                    "secondary_failures": (
-                        evidence.secondary_failures or durable_state.evidence.secondary_failures
-                    ),
-                }
-            )
         raise StepError(
             str(exc),
             evidence=evidence,
@@ -1227,10 +1306,12 @@ async def _run_step(
             step_id=step_id,
             session_id=child_session_id,
         ) from exc
-    except BaseException:
+    except BaseException as exc:
         if capture_structured_output:
             ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
         await close_unattached_generated_child()
+        if isinstance(exc, BaseExceptionGroup):
+            retain_child_failure_identity(exc, await collect_child_failure_evidence(exc))
         raise
 
     raw_output_available = False
@@ -1241,7 +1322,11 @@ async def _run_step(
             raw_output,
         ) = ctx.app._session_engine.take_workflow_structured_output(child_session_id)
     if state.failure is not None or state.interrupted is not None:
-        (await ctx.execution_deadline()).require_admission("workflow_step_completion")
+        try:
+            (await ctx.execution_deadline()).require_admission("workflow_step_completion")
+        except BaseException as exc:
+            retain_child_failure_identity(exc, await collect_child_failure_evidence(exc))
+            raise
         # Public stream IDs can be presentation aliases. Only a store event is
         # a durable reference, and it must belong to the observed run epoch.
         evidence = state.evidence.model_copy(update={"terminal_event_id": None})
@@ -1564,11 +1649,13 @@ async def parallel(steps: Iterable[Awaitable[StepResult]]) -> ParallelResult:
                 )
             )
         elif isinstance(outcome, BaseException):
+            evidence = exception_evidence(outcome)
             results.append(
                 StepFailure(
                     error=str(outcome),
                     error_type=type(outcome).__name__,
-                    evidence=exception_evidence(outcome),
+                    evidence=evidence,
+                    session_id=evidence.session_id,
                 )
             )
         else:  # pragma: no cover - gather only yields results or exceptions

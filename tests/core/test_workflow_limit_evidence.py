@@ -417,7 +417,7 @@ def test_limit_publication_loses_to_store_epoch_fence(tmp_path, monkeypatch, bou
         failure = result.failures[0]
         assert fenced is not None
         assert "SessionRunFenced" in failure.evidence.exception_types
-        assert failure.evidence.run_epoch is None
+        assert failure.evidence.session_id == failure.session_id
         assert failure.evidence.terminal_event_id is None
         assert failure.evidence.settlement == "unknown"
         events = await store.load_events(failure.session_id)
@@ -425,7 +425,8 @@ def test_limit_publication_loses_to_store_epoch_fence(tmp_path, monkeypatch, bou
             e.type in {"session.interrupted", "session.failed", "session.completed"} for e in events
         )
         started = next(e for e in events if e.type == "session.started")
-        assert fenced.run_epoch > started.payload["run_epoch"]
+        assert failure.evidence.run_epoch == started.payload["run_epoch"]
+        assert fenced.run_epoch > failure.evidence.run_epoch
         await store.close()
 
     asyncio.run(run())
