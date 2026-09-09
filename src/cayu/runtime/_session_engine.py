@@ -182,6 +182,7 @@ from cayu.runtime._environment_allocation import (
     environment_allocation_owners_from_checkpoint,
     require_authorized_environment_allocation_owners,
 )
+from cayu.runtime._environment_exposure import transfer_queued_environment_exposure
 from cayu.runtime._environment_lifecycle import (
     EnvironmentBindingFinalizeResult,
     EnvironmentLifecycle,
@@ -12651,10 +12652,16 @@ class SessionEngine:
                     raise SessionRunFenced(
                         "Queued delivery did not return its exact active-profile handoff."
                     )
-                invocation_context = invocation_context.with_queued_interaction(
+                successor = invocation_context.with_queued_interaction(
                     session,
                     active_profile=active_invocation_profile,
                 )
+                transfer_queued_environment_exposure(
+                    session=session,
+                    predecessor=invocation_context,
+                    successor=successor,
+                )
+                invocation_context = successor
                 _activate_session_interaction(session_id, delivery_interaction_id)
             if batch.events:
                 await self._event_writer.fan_out_persisted(list(batch.events))

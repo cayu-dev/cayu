@@ -39,8 +39,9 @@ _ENVIRONMENT_EXPOSURE_AUTHORITY_TOKEN = object()
 
 @dataclass(slots=True, repr=False)
 class _EnvironmentExposureAdmission:
-    """Mutable freshness state owned only by one authenticated exposure."""
+    """Mutable dispatch ownership and freshness for one authenticated exposure."""
 
+    interaction_id: str | None
     decision: ExecutionAdmissionDecision
     renewal_lock: asyncio.Lock
     settlement_task: asyncio.Task[None] | None = None
@@ -53,7 +54,6 @@ class _EnvironmentExposure:
     token: object
     session_id: str
     session_instance_id: str
-    interaction_id: str | None
     run_epoch: int
     registered_agent: Any
     execution_profile: Any
@@ -129,7 +129,6 @@ def expose_registered_environment(
         token=_ENVIRONMENT_EXPOSURE_AUTHORITY_TOKEN,
         session_id=session.id,
         session_instance_id=session.instance_id,
-        interaction_id=interaction_id,
         run_epoch=session.run_epoch,
         registered_agent=registered_agent,
         execution_profile=execution_profile,
@@ -147,6 +146,7 @@ def expose_registered_environment(
         knowledge_store=environment.knowledge_store,
         decision=decision,
         admission=_EnvironmentExposureAdmission(
+            interaction_id=interaction_id,
             decision=decision,
             renewal_lock=asyncio.Lock(),
         ),
@@ -194,7 +194,6 @@ def _environment_exposure(
         or invocation_context.profile is not execution_profile
         or exposure.session_id != session.id
         or exposure.session_instance_id != session.instance_id
-        or exposure.interaction_id != invocation_context.binding.interaction_id
         or exposure.run_epoch != session.run_epoch
         or exposure.registered_agent is not registered_agent
         or exposure.execution_profile is not execution_profile
@@ -214,6 +213,7 @@ def _environment_exposure(
         or exposure.decision.status != "admitted"
         or exposure.decision.candidate != exposure.candidate
         or type(exposure.admission) is not _EnvironmentExposureAdmission
+        or exposure.admission.interaction_id != invocation_context.binding.interaction_id
         or type(exposure.admission.renewal_lock) is not asyncio.Lock
         or type(exposure.admission.decision) is not ExecutionAdmissionDecision
         or (
@@ -230,6 +230,38 @@ def _environment_exposure(
             "Environment execution requires the exact runtime-admitted exposure authority."
         )
     return exposure
+
+
+def transfer_queued_environment_exposure(
+    *,
+    session: Session,
+    predecessor: InvocationContext,
+    successor: InvocationContext,
+) -> None:
+    """Move dispatch ownership after an authenticated same-epoch queued handoff.
+
+    Retain the exact environment and admission state, including evidence age and
+    outstanding settlement. The predecessor can no longer authorize dispatch.
+    """
+
+    if (
+        replace(predecessor.binding, interaction_id=successor.binding.interaction_id)
+        != successor.binding
+        or predecessor.binding.interaction_id == successor.binding.interaction_id
+        or predecessor.profile is not successor.profile
+        or predecessor.registered_agent is not successor.registered_agent
+        or predecessor.registered_environment is not successor.registered_environment
+    ):
+        raise RuntimeError("Queued environment exposure lost its exact invocation successor.")
+    exposure = _environment_exposure(
+        predecessor.registered_environment,
+        session=session,
+        invocation_context=predecessor,
+        registered_agent=predecessor.registered_agent,
+        execution_profile=predecessor.profile,
+    )
+    if exposure is not None:
+        exposure.admission.interaction_id = successor.binding.interaction_id
 
 
 def _admission_identity(
