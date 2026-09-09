@@ -2993,7 +2993,10 @@ def _format_search_hits(
         if hit.chunk is not None:
             chunk = f" chunk_index={hit.chunk.chunk_index}"
         score = f" score={hit.score:.4f}" if hit.score is not None else ""
-        lines.append(f"{index}. entry_id={entry.id!r} kind={entry.kind!r}{title}{chunk}{score}")
+        lines.append(
+            f"{index}. entry_id={entry.id!r} revision={entry.revision} "
+            f"kind={entry.kind!r}{title}{chunk}{score}"
+        )
         text_preview, preview_truncated = _bounded_preview(
             hit.text_preview,
             preview_bytes,
@@ -3003,7 +3006,10 @@ def _format_search_hits(
         if text_preview:
             suffix = " [preview truncated]" if preview_truncated else ""
             lines.append(f"{text_preview}{suffix}")
-    lines.append("Use read_knowledge with entry_id and optional chunk_index to expand a hit.")
+    lines.append(
+        "Expand a hit with read_knowledge using its entry_id, revision and optional chunk_index. "
+        "Omit revision to read the current entry; never guess a revision."
+    )
     return "\n".join(lines)
 
 
@@ -3071,7 +3077,7 @@ def _format_knowledge_list(
 def _format_chunks(entry_id: str, chunks: list[KnowledgeChunk]) -> str:
     lines = [f"Knowledge chunks for entry_id {entry_id!r}:"]
     for chunk in chunks:
-        lines.append(f"[chunk_index={chunk.chunk_index}]")
+        lines.append(f"[chunk_index={chunk.chunk_index} revision={chunk.entry_revision}]")
         lines.append(chunk.text)
     return "\n".join(lines)
 

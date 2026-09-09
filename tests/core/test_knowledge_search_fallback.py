@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 import pytest
@@ -17,10 +19,15 @@ from cayu import (
     EnvironmentSpec,
     EventType,
     InMemoryEmbeddingKnowledgeStore,
+    InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
+    KnowledgeIndexer,
+    KnowledgeIndexRequest,
     Message,
+    ModelProvider,
     ModelStreamEvent,
+    ReadKnowledgeTool,
     RequestFootprintConfig,
     RunRequest,
     ScriptedModelProvider,
@@ -34,6 +41,7 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
+from cayu.providers.base import ModelRequest
 from cayu.recall_relevance import query_concept_eligibility
 
 
@@ -50,6 +58,91 @@ class _FixtureEmbeddings(TextEmbeddingProvider):
                 for index, _ in enumerate(request.texts)
             ],
         )
+
+
+def test_model_can_expand_the_search_revision_using_only_tool_text() -> None:
+    class ReferenceReader(ModelProvider):
+        name = "reference-reader"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelStreamEvent.tool_call(
+                    name="search_knowledge", arguments={"query": "release authority", "limit": 1}
+                )
+            elif len(self.requests) == 2:
+                results = [
+                    part
+                    for message in request.messages
+                    for part in message.content
+                    if isinstance(part, ToolResultPart)
+                ]
+                assert len(results) == 1 and not results[0].is_error
+                # Deliberately read the model-visible content, not ToolResult.structured.
+                reference = re.search(r"entry_id='([^']+)' revision=(\d+)", results[0].content)
+                assert reference is not None
+                yield ModelStreamEvent.tool_call(
+                    name="read_knowledge",
+                    arguments={
+                        "entry_id": reference.group(1),
+                        "revision": int(reference.group(2)),
+                    },
+                )
+            else:
+                yield ModelStreamEvent.text_delta("Reference expanded.")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+
+    async def run() -> None:
+        namespace = "project:references"
+        scope = KnowledgeAccessScope.for_namespace(namespace)
+        store = InMemoryKnowledgeStore(access_scope=scope)
+        indexer = KnowledgeIndexer(store)
+        for text in ("Release authority: retired team.", "Release authority: reviewed team."):
+            await indexer.index_text(
+                KnowledgeIndexRequest(entry_id="release", namespace=namespace, text=text)
+            )
+        provider = ReferenceReader()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="project"), knowledge_store=store, knowledge_access_scope=scope
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="test-model"),
+            tools=[SearchKnowledgeTool(default_namespace=namespace), ReadKnowledgeTool()],
+        )
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    messages=[Message.text("user", "Who approves releases?")],
+                    max_steps=3,
+                )
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_COMPLETED, events[-1].payload
+        assert len(provider.requests) == 3
+        results = [
+            part
+            for message in provider.requests[-1].messages
+            for part in message.content
+            if isinstance(part, ToolResultPart)
+        ]
+        assert len(results) == 2 and all(not result.is_error for result in results)
+        assert "[chunk_index=0 revision=2]" in results[-1].content
+        assert "reviewed team" in results[-1].content
+        assert all("retired team" not in request.model_dump_json() for request in provider.requests)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("lookup", ["current", "missing", "denied"])

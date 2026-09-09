@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -298,6 +299,7 @@ def test_search_knowledge_returns_ranked_hits_with_filters() -> None:
 
     assert result.is_error is False
     assert "entry_id='payments'" in result.content
+    assert "entry_id='payments' revision=1" in result.content
     assert "read_knowledge" in result.content
     assert result.structured is not None
     query = result.structured["query"]
@@ -2095,6 +2097,7 @@ def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
     ]
     assert [hit["entry_id"] for hit in result.structured["hits"]] == ["remote_git_credentials"]
     assert result.structured["hits"][0]["score_kind"] == "inmemory_semantic"
+    assert "entry_id='remote_git_credentials' revision=1" in result.content
     assert "chunk_index=0" in result.content
 
 
@@ -3165,6 +3168,42 @@ def test_read_knowledge_returns_bounded_chunks() -> None:
     assert result.structured["entry_id"] == "doc"
     assert result.structured["chunks"]
     assert result.structured["chunks"][0]["entry_id"] == "doc"
+
+
+@pytest.mark.parametrize("revision", [None, 1, 2])
+def test_search_read_text_preserves_revision_identity_across_publication(
+    revision: int | None,
+) -> None:
+    async def run() -> None:
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        indexer = KnowledgeIndexer(store)
+        for text in ("Release authority: original team.", "Release authority: reviewed team."):
+            await indexer.index_text(KnowledgeIndexRequest(entry_id="release", text=text))
+        context = ToolContext(session_id="session_1", knowledge_store=store)
+        search = await SearchKnowledgeTool().run(context, {"query": "Release authority"})
+        assert not search.is_error
+        reference = re.search(r"entry_id='(release)' revision=(\d+)", search.content)
+        assert reference is not None
+        assert reference.group(2) == "2"
+        assert "reviewed team" in search.content
+        assert "original team" not in search.content
+        assert "never guess a revision" in search.content
+        await indexer.index_text(
+            KnowledgeIndexRequest(entry_id="release", text="Release authority: latest team.")
+        )
+        arguments: dict[str, Any] = {"entry_id": reference.group(1)}
+        if revision is not None:
+            arguments["revision"] = int(reference.group(2)) if revision == 2 else revision
+        result = await ReadKnowledgeTool().run(context, arguments)
+        expected_revision = 3 if revision is None else revision
+        expected_team = {1: "original", 2: "reviewed", 3: "latest"}[expected_revision]
+        assert not result.is_error
+        assert result.structured is not None
+        assert result.structured["revision"] == expected_revision
+        assert f"[chunk_index=0 revision={expected_revision}]" in result.content
+        assert f"Release authority: {expected_team} team." in result.content
+
+    asyncio.run(run())
 
 
 def test_read_knowledge_cannot_bypass_a_current_tombstone_with_revision() -> None:
