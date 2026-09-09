@@ -93,7 +93,7 @@ async def until(predicate, *, timeout=90):
             await asyncio.sleep(0.1)
 
 
-async def run(root, *, keep_server=False):
+async def run(root, *, keep_server=False, explicit_close=False):
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     (root / "staging").mkdir(mode=0o700)
     pin = certificates(root)
@@ -124,6 +124,7 @@ async def run(root, *, keep_server=False):
     config = {
         "control_server_container_id": control,
         "origin": origin,
+        "explicit_close": explicit_close,
         "password": secrets.token_urlsafe(32),
         "viewer_key": secrets.token_hex(32),
         "review_key": secrets.token_hex(32),
@@ -330,11 +331,13 @@ async def run(root, *, keep_server=False):
                 # exact changed page through the existing UI before capturing.
                 canvas = await open_view(panel)
                 await changed(canvas, initial)
+                allocation = json.loads((root / "allocation.json").read_text())["identity"]
+                ownership_path = root / "ownership" / f"{allocation['allocation_id']}.json"
+                sidecars = {json.loads(ownership_path.read_text())["sidecar_id"]}
                 (root / "before-changed.continue").touch()
                 await finish(invocation)
                 await review(client, "user_input")
                 await cleared(panel, canvas)
-                allocation = json.loads((root / "allocation.json").read_text())["identity"]
                 assert json.loads(docker("inspect", allocation["container_id"]))[0]["State"][
                     "Running"
                 ]
@@ -431,6 +434,7 @@ async def run(root, *, keep_server=False):
                 await stage("after-changed", resume)
                 canvas = await open_view(panel)
                 await changed(canvas, current)
+                sidecars.add(json.loads(ownership_path.read_text())["sidecar_id"])
                 (root / "after-changed.continue").touch()
                 await finish(resume)
                 await cleared(panel, canvas)
@@ -447,16 +451,31 @@ async def run(root, *, keep_server=False):
                     "decision": "approve",
                     "review_reference": view["reference"],
                 }
-                await finish(track(client.post("/api/tool-approvals/resolve", json=decision)))
+                approval = track(client.post("/api/tool-approvals/resolve", json=decision))
+                await stage("committed", approval)
+                sidecars.add(json.loads(ownership_path.read_text())["sidecar_id"])
+                assert all(type(identifier) is str and identifier for identifier in sidecars)
+                with sqlite3.connect(root / "portal.sqlite") as portal:
+                    assert portal.execute("SELECT * FROM receipts").fetchall() == [
+                        ("demo-proposal", "approved")
+                    ]
+                (root / "committed.continue").touch()
+                await finish(approval)
                 with sqlite3.connect(root / "portal.sqlite") as portal:
                     assert portal.execute("SELECT * FROM receipts").fetchall() == [
                         ("demo-proposal", "approved")
                     ]
                 assert json.loads((root / "business-receipt.json").read_text())["committed"]
+                if explicit_close:
+                    closed = json.loads((root / "close-receipt.json").read_text())
+                    assert closed["closed"] is True
+                    assert closed["execution"]["dispatch"] == "completed"
+                    assert closed["execution"]["terminal"] == "settled"
                 await browser.close()
                 assert json.loads(docker("inspect", control))[0]["State"]["Running"]
                 for kind, identifier in [
                     ("container", allocation["container_id"]),
+                    *(("container", identifier) for identifier in sidecars),
                     ("network", allocation["network_id"]),
                 ]:
                     assert (
@@ -481,6 +500,8 @@ async def run(root, *, keep_server=False):
                     protected_tool_approval=True,
                     independent_mutation_count=1,
                     allocation_cleanup=True,
+                    sidecar_cleanup=True,
+                    explicit_close=explicit_close,
                     application_container_survived=True,
                     browser_container_id=allocation["container_id"],
                     page_id=before["page_id"],
@@ -531,5 +552,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Keep the owned application container after verifying allocation cleanup.",
     )
+    parser.add_argument(
+        "--explicit-close",
+        action="store_true",
+        help="End the approved journey with an explicit browser_session close operation.",
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.state_dir.absolute(), keep_server=args.keep_server))
+    asyncio.run(
+        run(
+            args.state_dir.absolute(),
+            keep_server=args.keep_server,
+            explicit_close=args.explicit_close,
+        )
+    )

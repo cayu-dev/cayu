@@ -1,6 +1,7 @@
 """Private allocation-authenticated guest channel, separate from operator access."""
 
 import asyncio
+import contextlib
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -49,7 +50,11 @@ class _GuestSocket:
 
     async def close(self) -> None:
         if self.socket.application_state is WebSocketState.CONNECTED:
-            await self.socket.close(code=1000)
+            # The peer may disappear between the state check and ASGI send.
+            # Command-owner disconnect fencing has already run; this proves
+            # only transport closure, never acknowledgement of a model action.
+            with contextlib.suppress(WebSocketDisconnect):
+                await self.socket.close(code=1000)
 
     async def idle(self) -> bool:
         try:

@@ -628,7 +628,7 @@ class BrowserBackendIdentity(BaseModel):
     browser: str = Field(min_length=1, max_length=64)
     browser_version: str = Field(min_length=1, max_length=128)
     worker_protocol: Literal["cayu.browser-session.v4"]
-    worker_version: Literal["11"]
+    worker_version: Literal["12"]
 
     @field_validator("backend", "backend_version", "browser", "browser_version")
     @classmethod

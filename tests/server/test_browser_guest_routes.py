@@ -691,3 +691,35 @@ def test_guest_route_refuses_untrusted_admission_before_acceptance(tmp_path, cas
             assert await store.load_checkpoint("session") == before
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [None, OSError, RuntimeError, asyncio.CancelledError])
+def test_guest_socket_close_distinguishes_disconnect_from_cleanup_failure(failure):
+    from starlette.websockets import WebSocket, WebSocketState
+
+    from cayu.server._browser_guest_routes import _GuestSocket
+
+    async def scenario():
+        sent = []
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "websocket.close" and failure is not None:
+                raise failure()
+
+        socket = WebSocket({"type": "websocket"}, receive, send)
+        await socket.accept()
+        connection = _GuestSocket(socket)
+        if failure in {RuntimeError, asyncio.CancelledError}:
+            with pytest.raises(failure):
+                await connection.close()
+        else:
+            # Starlette turns ASGI OSError into WebSocketDisconnect(1006).
+            await connection.close()
+        assert socket.application_state is WebSocketState.DISCONNECTED
+        assert sent[-1]["type"] == "websocket.close"
+
+    asyncio.run(scenario())

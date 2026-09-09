@@ -17,12 +17,15 @@ pytestmark = [
 ]
 
 
-def test_protected_ui_same_browser_after_worker_restart(tmp_path):
+@pytest.mark.parametrize("explicit_close", [False, True])
+def test_protected_ui_same_browser_after_worker_restart(tmp_path, explicit_close):
     from examples.browser_view_reconnect.run import run
 
     root = tmp_path / "combined"
-    asyncio.run(run(root))
+    asyncio.run(run(root, explicit_close=explicit_close))
     evidence = json.loads((root / "evidence.json").read_text())
+    assert evidence["explicit_close"] is explicit_close
+    assert evidence["sidecar_cleanup"]
     assert evidence["same_browser_container"] and evidence["same_page"]
     assert evidence["changing_frames_before"] and evidence["changing_frames_after"]
     assert evidence["independent_mutation_count"] == 1

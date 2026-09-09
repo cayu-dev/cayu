@@ -21,7 +21,7 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:11-playwright-1.62.0` image, the
+`cayu-browser-fetch:12-playwright-1.62.0` image, the
 `cayu.browser-session.v4` protocol and worker version 9, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
@@ -775,3 +775,13 @@ text never executes or becomes fallback evidence: the guest intercepts the
 classified response before body execution, while broker egress denial remains
 authoritative. See
 [WebBridge access routing](web-fetch.md#classified-access-barriers-and-explicit-routing).
+
+### Close response settlement
+
+Worker 12 keeps the admitted explicit-close response handler alive through bounded
+response drain and socket closure before allowing daemon shutdown. Queued requests
+and receipt replays cannot release that handler's shutdown signal. Native cleanup
+failures remain failures, and missing acknowledgements remain ambiguous; a guest
+WebSocket disconnect alone never proves that a model action succeeded. Deploy the
+pinned worker-12 image with this Runtime revision. Existing worker-11 allocation
+authority does not become compatible merely by retagging an image.

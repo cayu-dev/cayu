@@ -23,12 +23,23 @@ uv sync --extra dev --extra browser
 .venv/bin/python -m playwright install chromium
 
 docker build -f examples/browser_fetch/Dockerfile \
-  -t cayu-browser-fetch:11-playwright-1.62.0 .
+  -t cayu-browser-fetch:12-playwright-1.62.0 .
 docker build -f examples/browser_view_reconnect/Dockerfile \
   -t cayu-view-reconnect:local .
 
 PYTHONPATH=src:. .venv/bin/python examples/browser_view_reconnect/run.py \
   --state-dir /tmp/cayu-view-reconnect-demo
+```
+
+Add `--explicit-close` to finish with a fresh `browser_session` close operation
+after protected input, worker replacement, and approval. The harness requires a
+settled closed result, checks both generations of sidecars are gone, and verifies
+that the application container survives. Without this flag, normal completion
+owns allocation cleanup. The opt-in test runs both endings:
+
+```sh
+CAYU_RUN_DOCKER_VIEW_RECONNECT=1 PYTHONPATH=src:. .venv/bin/pytest -q \
+  tests/egress/test_docker_viewer_reconnect_e2e.py::test_protected_ui_same_browser_after_worker_restart
 ```
 
 Choose a **new**, absolute state directory on that Docker host. The harness creates

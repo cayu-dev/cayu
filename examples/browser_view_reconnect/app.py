@@ -278,7 +278,22 @@ class Provider(ModelProvider):
         elif "commit" not in results:
             await self.gate("after-changed", results["display-after"].structured)
             call, name, args = "commit", "commit_proposal", PROPOSAL
+        elif CONFIG.get("explicit_close") and "close" not in results:
+            assert results["commit"].structured["committed"]
+            await self.gate("committed", results["display-after"].structured)
+            call, args = (
+                "close",
+                {
+                    "operation": "close",
+                    "operation_id": "close",
+                    "session_id": results["navigate"].structured["session_id"],
+                },
+            )
         else:
+            if CONFIG.get("explicit_close"):
+                persist("close-receipt.json", results["close"].structured)
+            else:
+                await self.gate("committed", results["display-after"].structured)
             assert results["commit"].structured["committed"]
             persist("business-receipt.json", results["commit"].structured)
             yield ModelStreamEvent.text_delta("One approved synthetic proposal committed.")

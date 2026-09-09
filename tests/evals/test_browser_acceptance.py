@@ -119,7 +119,7 @@ def _runtime_identity() -> BrowserAcceptanceRuntimeIdentityV1:
     return BrowserAcceptanceRuntimeIdentityV1.build(
         runtime_build_provenance=build,
         browser_protocol="cayu.browser-session.v4",
-        browser_worker_version="11",
+        browser_worker_version="12",
         playwright_version="1.62.0",
         chromium_identity="chromium-fixture",
         runner_fingerprint="3" * 64,

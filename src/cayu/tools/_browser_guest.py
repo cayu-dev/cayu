@@ -103,7 +103,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "11"
+INTERACTIVE_WORKER_VERSION = "12"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -140,6 +140,7 @@ _INTERACTIVE_IDLE_SECONDS = 15 * 60
 _INTERACTIVE_CONNECT_SECONDS = 5.0
 _INTERACTIVE_STARTUP_SETTLEMENT_SECONDS = 5.0
 _INTERACTIVE_IDLE_POLL_SECONDS = 0.25
+_INTERACTIVE_RESPONSE_DRAIN_SECONDS = 5.0
 _INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES = 1024 * 1024
 _INTERACTIVE_MAX_PROFILE_ORIGINS = 32
 _INTERACTIVE_MAX_PROFILE_COOKIES = 256
@@ -4471,6 +4472,7 @@ class _InteractiveDaemon:
         self.close_requested = asyncio.Event()
         self.closing = False
         self.close_after_response = False
+        self.close_response_owner: asyncio.Task[Any] | None = None
         self.idle_expired = False
         self.operations: dict[str, _InteractiveOperationRecord] = {}
         self.page_cleanup_operations: dict[str, _InteractiveOperationRecord] = {}
@@ -5604,10 +5606,12 @@ class _InteractiveDaemon:
             await self._expire_background_pages(request.limits, delta=delta)
             if request.operation == "close":
                 self.closing = True
+                # Only this admitted request may release explicit-close shutdown.
+                # A queued request or replay must not retire its response channel.
+                self.close_response_owner = asyncio.current_task()
                 cleanup_ok = await self.close(
                     timeout_seconds=max(1.0, min(10.0, request.limits.max_wait_ms / 1000))
                 )
-                self.close_requested.set()
                 if not cleanup_ok:
                     return _interactive_error_payload(_GuestFailure("cleanup_failed"))
                 return _interactive_closed_payload()
@@ -9218,45 +9222,57 @@ async def _interactive_daemon_main(session_id: str) -> int:
 
         async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
-                raw_line = await reader.readuntil(b"\n")
-                if len(raw_line) > _INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES:
-                    raise _GuestFailure("incompatible_browser")
-                raw = json.loads(raw_line.decode("utf-8"))
-                if type(raw) is dict and raw.get("protocol_version") == CONTROL_BOOTSTRAP_PROTOCOL:
-                    target, material = _private_control_bootstrap(raw)
-                    raw.clear()
-                    raw_line = b""
-                    if target != daemon.session_id:
+                try:
+                    raw_line = await reader.readuntil(b"\n")
+                    if len(raw_line) > _INTERACTIVE_MAX_PRIVATE_REQUEST_BYTES:
                         raise _GuestFailure("incompatible_browser")
-                    try:
-                        response = await daemon.bootstrap_operator_channel(material)
-                    finally:
-                        material.clear()
-                else:
-                    response = await daemon.execute(_interactive_request_from_json(raw))
-            except _GuestFailure as exc:
-                response = _interactive_error_payload(exc)
-            except (json.JSONDecodeError, UnicodeError, asyncio.LimitOverrunError):
-                response = _interactive_error_payload(_GuestFailure("incompatible_browser"))
-            except Exception:
-                response = _interactive_error_payload(_GuestFailure("browser_crash"))
-            encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode(
-                "utf-8"
-            )
-            if len(encoded) > _INTERACTIVE_MAX_MESSAGE_BYTES:
-                encoded = json.dumps(
-                    _interactive_error_payload(_GuestFailure("oversized_response")),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            writer.write(encoded + b"\n")
-            with contextlib.suppress(Exception):
-                await writer.drain()
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-            if daemon.close_after_response:
-                daemon.close_requested.set()
+                    raw = json.loads(raw_line.decode("utf-8"))
+                    if (
+                        type(raw) is dict
+                        and raw.get("protocol_version") == CONTROL_BOOTSTRAP_PROTOCOL
+                    ):
+                        target, material = _private_control_bootstrap(raw)
+                        raw.clear()
+                        raw_line = b""
+                        if target != daemon.session_id:
+                            raise _GuestFailure("incompatible_browser")
+                        try:
+                            response = await daemon.bootstrap_operator_channel(material)
+                        finally:
+                            material.clear()
+                    else:
+                        response = await daemon.execute(_interactive_request_from_json(raw))
+                except _GuestFailure as exc:
+                    response = _interactive_error_payload(exc)
+                except (json.JSONDecodeError, UnicodeError, asyncio.LimitOverrunError):
+                    response = _interactive_error_payload(_GuestFailure("incompatible_browser"))
+                except Exception:
+                    response = _interactive_error_payload(_GuestFailure("browser_crash"))
+                encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+                if len(encoded) > _INTERACTIVE_MAX_MESSAGE_BYTES:
+                    encoded = json.dumps(
+                        _interactive_error_payload(_GuestFailure("oversized_response")),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                with contextlib.suppress(Exception):
+                    async with asyncio.timeout(_INTERACTIVE_RESPONSE_DRAIN_SECONDS):
+                        writer.write(encoded + b"\n")
+                        await writer.drain()
+            finally:
+                try:
+                    writer.close()
+                    with contextlib.suppress(Exception):
+                        async with asyncio.timeout(_INTERACTIVE_RESPONSE_DRAIN_SECONDS):
+                            await writer.wait_closed()
+                finally:
+                    if (
+                        daemon.close_response_owner is asyncio.current_task()
+                        or daemon.close_after_response
+                    ):
+                        daemon.close_requested.set()
 
         with contextlib.suppress(OSError):
             socket_path.unlink()
@@ -9286,9 +9302,16 @@ async def _wait_for_interactive_shutdown(daemon: _InteractiveDaemon) -> None:
     while True:
         if daemon.close_requested.is_set():
             return
+        if daemon.close_response_owner is not None:
+            # The response handler has bounded drain/close waits and owns this
+            # signal. Idle expiry must not cancel an acknowledgement in flight.
+            await asyncio.sleep(_INTERACTIVE_IDLE_POLL_SECONDS)
+            continue
         async with daemon.lock:
             if daemon.close_requested.is_set():
                 return
+            if daemon.close_response_owner is not None:
+                continue
             if daemon.configuration_limits is not None:
                 try:
                     await daemon._expire_background_pages(

@@ -93,7 +93,7 @@ _IDENTITY = BrowserBackendIdentity(
     browser="chromium",
     browser_version="test-chromium",
     worker_protocol="cayu.browser-session.v4",
-    worker_version="11",
+    worker_version="12",
 )
 
 
@@ -961,7 +961,7 @@ class _WireRunner:
             stdout=json.dumps(
                 {
                     "protocol_version": "cayu.browser-session.v4",
-                    "worker_version": "11",
+                    "worker_version": "12",
                     "playwright_version": "1.62.0",
                     "kind": "success",
                     "allocation_disposition": "live",
@@ -985,7 +985,7 @@ class _WireRunner:
                             "browser": "chromium",
                             "browser_version": "test-chromium",
                             "worker_protocol": "cayu.browser-session.v4",
-                            "worker_version": "11",
+                            "worker_version": "12",
                         },
                     },
                     "page_set": {
@@ -1066,7 +1066,7 @@ class _ProfileWireRunner(_WireRunner):
                     stdout=json.dumps(
                         {
                             "protocol_version": "cayu.browser-session.v4",
-                            "worker_version": "11",
+                            "worker_version": "12",
                             "playwright_version": "1.62.0",
                             "kind": "error",
                             "allocation_disposition": "retired",
@@ -1078,7 +1078,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "11",
+                        "worker_version": "12",
                         "playwright_version": "1.62.0",
                         "kind": "profile_restore",
                         "allocation_disposition": "live",
@@ -1091,7 +1091,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "11",
+                        "worker_version": "12",
                         "playwright_version": "1.62.0",
                         "kind": "profile_checkpoint",
                         "allocation_disposition": "live",
@@ -1104,7 +1104,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "11",
+                        "worker_version": "12",
                         "playwright_version": "1.62.0",
                         "kind": "closed",
                         "allocation_disposition": "retired",
@@ -1292,7 +1292,7 @@ def _browser_profile_binding(
         ),
         destination_policy=BrowserProfileDestinationPolicy.build(("https://example.test",)),
         browser_protocol="cayu.browser-session.v4",
-        browser_worker_version="11",
+        browser_worker_version="12",
         store=store,
         key_authority=AESGCMBrowserProfileKeyAuthority(
             authority_id="browser-profile-test-key",
@@ -1700,7 +1700,7 @@ def _interactive_raw_request(operation: str) -> dict[str, Any]:
     raw: dict[str, Any] = {
         "visual_policy": None,
         "protocol_version": "cayu.browser-session.v4",
-        "worker_version": "11",
+        "worker_version": "12",
         "expected_playwright_version": "1.62.0",
         "operation": operation,
         "session_id": "bs_test",
@@ -5044,7 +5044,7 @@ def test_profile_guest_response_protects_page_evidence(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "11",
+                "worker_version": "12",
             },
         }
 
@@ -7647,7 +7647,7 @@ def test_interactive_guest_operation_ledger_deduplicates_without_replay() -> Non
             self.calls += 1
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "11",
+                "worker_version": "12",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"call": self.calls, "operation": request.operation},
@@ -7773,7 +7773,7 @@ def test_interactive_guest_admits_switches_closes_and_tracks_popup_lineage() -> 
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "11",
+                    "worker_version": "12",
                 },
             }
 
@@ -8640,7 +8640,7 @@ def test_interactive_guest_operation_ledger_reserves_cleanup_capacity() -> None:
         async def _execute_locked(self, request):
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "11",
+                "worker_version": "12",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"operation": request.operation},
@@ -9525,7 +9525,7 @@ def test_interactive_guest_ref_limits_independently_retire_allocation(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "11",
+                "worker_version": "12",
             },
         }
 
@@ -9824,7 +9824,7 @@ def test_interactive_guest_popup_guard_bounds_one_effect_before_target_admission
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "11",
+                    "worker_version": "12",
                 },
             }
 
