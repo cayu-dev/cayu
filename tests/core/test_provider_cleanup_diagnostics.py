@@ -89,7 +89,21 @@ def test_cleanup_diagnostics_preserve_cancellation(failure, reason, exception_ty
         if reason is None:
             assert failures == ()
             return
-        assert failures == (
+        assert failures[0]["cleanup_exception_message"] == "redacted"
+        assert failures[0]["cleanup_cause_type"] == "CancelledError"
+        assert failures[0]["cleanup_cause_message"] == "redacted"
+        stack = json.loads(failures[0]["cleanup_local_stack"])
+        assert 1 <= len(stack) <= 8
+        assert all(name == "_credential_boundary.py" and line > 0 for name, line in stack)
+        extended = {
+            "cleanup_exception_message",
+            "cleanup_cause_type",
+            "cleanup_cause_message",
+            "cleanup_local_stack",
+        }
+        assert tuple(
+            {k: v for k, v in failure.items() if k not in extended} for failure in failures
+        ) == (
             {
                 "phase": "provider_stream_cleanup",
                 "error": "Provider stream cleanup did not complete normally.",
@@ -455,3 +469,110 @@ def test_owned_close_pending_is_not_reported_as_timeout_or_remote_settlement():
             await asyncio.wait_for(finished.wait(), 1)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "aclose(): asynchronous generator is already running",
+        "anext(): asynchronous generator is already running",
+        "Event loop is closed",
+        CANARY,
+    ],
+)
+def test_close_exception_message_and_cause_are_sanitized(message):
+    from cayu.providers._cleanup_diagnostics import cleanup_diagnostics, copy_cleanup_diagnostics
+
+    error = RuntimeError(message)
+    error.__cause__ = httpx.CloseError(CANARY)
+    fields = cleanup_diagnostics(error, unsettled=False, action="stream_close")
+    assert fields["cleanup_exception_message"] == ("redacted" if message == CANARY else message)
+    assert fields["cleanup_cause_type"] == "CloseError"
+    assert fields["cleanup_cause_message"] == "redacted"
+    assert fields["remote_settlement_state"] == "unknown"
+    assert CANARY not in json.dumps(fields)
+    assert copy_cleanup_diagnostics(fields) == fields
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cleanup_exception_message", CANARY),
+        ("cleanup_cause_message", CANARY),
+        ("cleanup_cause_type", CANARY),
+        ("cleanup_local_stack", json.dumps([[CANARY, 1]])),
+        ("cleanup_local_stack", json.dumps([["_http.py", True]])),
+        ("cleanup_local_stack", json.dumps([["_http.py", 1]] * 9)),
+    ],
+)
+def test_close_exception_evidence_rejects_untrusted_projection(field, value):
+    from cayu.providers._cleanup_diagnostics import cleanup_diagnostics, copy_cleanup_diagnostics
+
+    fields = cleanup_diagnostics(RuntimeError(), unsettled=False, action="stream_close")
+    fields[field] = value
+    with pytest.raises(ValueError):
+        copy_cleanup_diagnostics(fields)
+
+
+def test_actual_generator_reentrancy_has_distinct_sanitized_message():
+    from cayu.providers._cleanup_diagnostics import cleanup_diagnostics
+
+    async def scenario():
+        reading = asyncio.Event()
+
+        async def busy_stream():
+            reading.set()
+            await asyncio.Event().wait()
+            yield None
+
+        stream = busy_stream()
+        pending = asyncio.create_task(anext(stream))
+        try:
+            await reading.wait()
+            with pytest.raises(RuntimeError) as caught:
+                await stream.aclose()
+            fields = cleanup_diagnostics(caught.value, unsettled=False, action="stream_close")
+            assert (
+                fields["cleanup_exception_message"]
+                == "aclose(): asynchronous generator is already running"
+            )
+            assert fields["cleanup_reason"] == "close_exception"
+            assert fields["stream_close_state"] == "not_confirmed"
+            assert fields["remote_settlement_state"] == "unknown"
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await stream.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("path_style", ["posix", "windows"])
+@pytest.mark.parametrize("location", ["provider", "foreign_directory", "foreign_filename"])
+def test_cleanup_stack_matches_native_provider_paths(monkeypatch, path_style, location):
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    import cayu.providers._cleanup_diagnostics as diagnostics
+
+    path_type = PureWindowsPath if path_style == "windows" else PurePosixPath
+    root = path_type(
+        "C:/site-packages/cayu/providers"
+        if path_style == "windows"
+        else "/site-packages/cayu/providers"
+    )
+    filename = root / "_http.py"
+    if location == "foreign_directory":
+        filename = root.parent / "extension" / "_http.py"
+    elif location == "foreign_filename":
+        filename = root / "extension.py"
+    monkeypatch.setattr(diagnostics, "_PROVIDER_ROOT", str(root))
+    monkeypatch.setattr(diagnostics, "Path", path_type)
+    try:
+        exec(compile('raise RuntimeError("Event loop is closed")', str(filename), "exec"))
+    except RuntimeError as error:
+        fields = diagnostics.cleanup_diagnostics(error, unsettled=False, action="stream_close")
+    if location == "provider":
+        assert json.loads(fields["cleanup_local_stack"]) == [["_http.py", 1]]
+    else:
+        assert "cleanup_local_stack" not in fields
+    assert diagnostics.copy_cleanup_diagnostics(fields) == fields

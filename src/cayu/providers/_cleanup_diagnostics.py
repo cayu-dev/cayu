@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -52,11 +54,78 @@ _OPTIONAL_FIELDS = {
     "cleanup_status_code",
     "cleanup_provider",
     "cleanup_error_code",
+    "cleanup_exception_message",
+    "cleanup_cause_type",
+    "cleanup_cause_message",
+    "cleanup_local_stack",
 }
 _PROVIDER_CODES = {
     "openai": {"rate_limit_exceeded", "server_error", "insufficient_quota"},
     "anthropic": {"rate_limit_error", "overloaded_error", "api_error"},
 }
+
+
+# Exception text is an untrusted payload. Only exact, content-free interpreter
+# messages cross this boundary; arbitrary transport text is never exported.
+_SAFE_MESSAGES = frozenset(
+    {
+        "aclose(): asynchronous generator is already running",
+        "anext(): asynchronous generator is already running",
+        "Cannot call send() once a close message has been sent.",
+        "Event loop is closed",
+    }
+)
+_STACK_FILES = frozenset(
+    {
+        "_credential_boundary.py",
+        "_http.py",
+        "_stream_lifecycle.py",
+        "deadlines.py",
+        "openai.py",
+        "openai_subscription.py",
+        "anthropic.py",
+    }
+)
+_PROVIDER_ROOT = str(Path(__file__).parent)
+
+
+def _safe_message(failure: BaseException) -> str:
+    args = BaseException.__dict__["args"].__get__(failure, BaseException)
+    if (
+        type(args) is tuple
+        and len(args) == 1
+        and type(args[0]) is str
+        and len(args[0]) <= 128
+        and args[0] in _SAFE_MESSAGES
+    ):
+        return args[0]
+    return "redacted"
+
+
+def _local_exception_evidence(failure: BaseException) -> dict[str, Any]:
+    result: dict[str, Any] = {"cleanup_exception_message": _safe_message(failure)}
+    cause = BaseException.__dict__["__cause__"].__get__(failure, BaseException)
+    if cause is None:
+        cause = BaseException.__dict__["__context__"].__get__(failure, BaseException)
+    if isinstance(cause, BaseException):
+        result["cleanup_cause_type"] = next(
+            (name for cls, name in _EXCEPTION_TYPES if type(cause) is cls), "unknown"
+        )
+        result["cleanup_cause_message"] = _safe_message(cause)
+    tb = BaseException.__dict__["__traceback__"].__get__(failure, BaseException)
+    frames = []
+    for _ in range(32):
+        if tb is None:
+            break
+        filename = tb.tb_frame.f_code.co_filename
+        for name in _STACK_FILES:
+            if filename == str(Path(_PROVIDER_ROOT) / name):
+                frames.append([name, tb.tb_lineno])
+                break
+        tb = tb.tb_next
+    if frames:
+        result["cleanup_local_stack"] = json.dumps(frames[-8:], separators=(",", ":"))
+    return result
 
 
 def cleanup_diagnostics(
@@ -93,6 +162,8 @@ def cleanup_diagnostics(
         "remote_cancellation_state": "unknown",
         "remote_settlement_state": "unknown",
     }
+    if failure is not None:
+        result.update(_local_exception_evidence(failure))
     if type(failure) is ModelProviderError:
         status = exception_state(failure, "status_code")
         if type(status) is int and 100 <= status <= 599:
@@ -136,6 +207,36 @@ def copy_cleanup_diagnostics(fields: dict[str, Any]) -> dict[str, Any]:
         code = fields["cleanup_error_code"]
         if type(code) is not str or provider is None or code not in _PROVIDER_CODES[provider]:
             raise ValueError("Provider cleanup code is invalid.")
+    for name in ("cleanup_exception_message", "cleanup_cause_message"):
+        if name in fields and (
+            type(fields[name]) is not str or fields[name] not in {*_SAFE_MESSAGES, "redacted"}
+        ):
+            raise ValueError("Provider cleanup exception message is invalid.")
+    if "cleanup_cause_type" in fields and (
+        type(fields["cleanup_cause_type"]) is not str
+        or fields["cleanup_cause_type"] not in _ENUM_FIELDS["cleanup_exception_type"]
+    ):
+        raise ValueError("Provider cleanup cause type is invalid.")
+    if "cleanup_local_stack" in fields:
+        value = fields["cleanup_local_stack"]
+        if type(value) is not str or len(value) > 1024:
+            raise ValueError("Provider cleanup stack is invalid.")
+        try:
+            frames = json.loads(value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Provider cleanup stack is invalid.") from exc
+        if type(frames) is not list or not 1 <= len(frames) <= 8:
+            raise ValueError("Provider cleanup stack is invalid.")
+        for frame in frames:
+            if (
+                type(frame) is not list
+                or len(frame) != 2
+                or type(frame[0]) is not str
+                or frame[0] not in _STACK_FILES
+                or type(frame[1]) is not int
+                or not 1 <= frame[1] <= 1_000_000
+            ):
+                raise ValueError("Provider cleanup stack frame is invalid.")
     for name in _IDENTITY_FIELDS & fields.keys():
         if type(fields[name]) is not str or len(fields[name]) > EXECUTION_UNIT_ID_MAX_CHARS:
             raise ValueError("Provider cleanup identity is invalid.")

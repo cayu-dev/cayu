@@ -286,7 +286,17 @@ async def test_explicit_live_model_cleanup_owner_releases_caller_during_opaque_c
     assert task.cancelling() == 1
     assert task.cancelled()
     assert not close_finished.is_set()
-    assert provider_cancellation_failures(exc_info.value) == (
+    failures = provider_cancellation_failures(exc_info.value)
+    assert failures[1]["cleanup_exception_message"] == "redacted"
+    assert "_credential_boundary.py" in failures[1]["cleanup_local_stack"]
+    assert tuple(
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"cleanup_exception_message", "cleanup_local_stack"}
+        }
+        for item in failures
+    ) == (
         {
             "phase": "model_stream",
             "error": "Model provider stream failed before cancellation.",
@@ -356,7 +366,17 @@ async def test_explicit_cleanup_owner_preserves_real_cancellation_after_deadline
 
         assert task.cancelling() == 1
         assert task.cancelled()
-        assert provider_cancellation_failures(exc_info.value) == (
+        failures = provider_cancellation_failures(exc_info.value)
+        assert failures[1]["cleanup_exception_message"] == "redacted"
+        assert "_credential_boundary.py" in failures[1]["cleanup_local_stack"]
+        assert tuple(
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"cleanup_exception_message", "cleanup_local_stack"}
+            }
+            for item in failures
+        ) == (
             {
                 "phase": "model_stream",
                 "error": "Model provider stream failed before cancellation.",

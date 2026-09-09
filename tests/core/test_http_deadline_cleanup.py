@@ -326,3 +326,115 @@ def test_http_close_failure_or_retention_is_not_clean(close_kind):
                 await provider.aclose()
 
     asyncio.run(scenario())
+
+
+def test_loopback_repeated_cancellation_during_owned_close():
+    from cayu import Message, ModelRequest
+    from cayu.providers._credential_boundary import (
+        aclosing_provider_stream,
+        provider_cancellation_failures,
+    )
+
+    async def scenario():
+        owners_before = set(deadline_state._PROVIDER_DEADLINE_AWAIT_OWNERS)
+        reading, closing, release, settled = (asyncio.Event() for _ in range(4))
+        peer_closed = asyncio.Event()
+        closes = 0
+
+        async def serve(reader, writer):
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                length = next(
+                    int(line.split(b":", 1)[1])
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+                await reader.readexactly(length)
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                    + frame({"type": "response.created", "response": {"id": "synthetic"}})
+                )
+                await writer.drain()
+                await reader.read()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                peer_closed.set()
+
+        class GatedStream(httpx.AsyncByteStream):
+            def __init__(self, inner):
+                self.inner = inner
+
+            async def __aiter__(self):
+                async for chunk in self.inner:
+                    yield chunk
+                    reading.set()
+
+            async def aclose(self):
+                nonlocal closes
+                closes += 1
+                closing.set()
+                await release.wait()
+                await self.inner.aclose()
+                settled.set()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        class LocalTransport(httpx.AsyncHTTPTransport):
+            async def handle_async_request(self, request):
+                request.url = httpx.URL(f"http://127.0.0.1:{port}/responses")
+                response = await super().handle_async_request(request)
+                response.stream = GatedStream(response.stream)
+                return response
+
+        transport = HttpxOpenAITransport()
+        async with httpx.AsyncClient(transport=LocalTransport(), trust_env=False) as client:
+            transport._client._client = client
+            provider = OpenAIProvider(api_key="synthetic", transport=transport)
+
+            async def consume():
+                stream = provider.runtime_stream(
+                    ModelRequest(
+                        model="synthetic",
+                        messages=[Message.text("user", "synthetic")],
+                    )
+                )
+                async with aclosing_provider_stream(stream):
+                    async for _ in stream:
+                        pass
+
+            task = asyncio.create_task(consume())
+            try:
+                await asyncio.wait_for(reading.wait(), 2)
+                task.cancel("first")
+                await asyncio.wait_for(closing.wait(), 2)
+                task.cancel("second")
+                with pytest.raises(asyncio.CancelledError) as caught:
+                    await asyncio.wait_for(task, 2)
+                assert task.cancelling() >= 2
+                failures = provider_cancellation_failures(caught.value)
+                assert failures
+                assert all(
+                    item.get("remote_settlement_state", "unknown") == "unknown" for item in failures
+                )
+                assert closes == 1
+                assert not settled.is_set()
+                assert deadline_state._PROVIDER_DEADLINE_AWAIT_OWNERS - owners_before
+                release.set()
+                await asyncio.wait_for(settled.wait(), 2)
+                await asyncio.wait_for(peer_closed.wait(), 2)
+                async with asyncio.timeout(2):
+                    while deadline_state._PROVIDER_DEADLINE_AWAIT_OWNERS - owners_before:
+                        await asyncio.sleep(0)
+                assert closes == 1
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await provider.aclose()
+                server.close()
+                await server.wait_closed()
+
+    asyncio.run(scenario())
