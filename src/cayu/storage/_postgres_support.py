@@ -37,6 +37,12 @@ from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
 # collides with an application's own tables in a shared database. This tuple is the
 # baseline-revision DDL (ADR 0001 revision 1); the cayu_schema_migrations
 # bookkeeping table is created separately by the migrator.
+SESSION_MESSAGE_ACCEPTANCE_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_cayu_events_queue_acceptance "
+    "ON cayu_events (session_id, (event #>> '{payload,queue_id}')) "
+    "WHERE event_type = 'session.message.queued'"
+)
+
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS cayu_sessions (
@@ -277,6 +283,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         idempotency_key TEXT NOT NULL,
         content TEXT NOT NULL,
         message_json JSONB,
+        conditions_json JSONB,
+        terminal_json JSONB,
         delivery_mode TEXT NOT NULL,
         status TEXT NOT NULL,
         requested_by JSONB,
@@ -474,6 +482,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON cayu_session_labels(key, value, session_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_order "
     "ON cayu_events(session_id, session_order)",
+    SESSION_MESSAGE_ACCEPTANCE_INDEX_DDL,
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_events_budget_reservation_identity
     ON cayu_events ((payload ->> 'reservation_id'))

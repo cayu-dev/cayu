@@ -93,6 +93,7 @@ REDACTED_CUSTOM_EVENT_TYPE = "custom.redacted"
 PRIVATE_EVENT_AUTHORITY = "[PRIVATE_EVENT_AUTHORITY]"
 _ENVELOPE_ALIAS_FIELD_BY_NESTED_PATH: Mapping[tuple[str, ...], str] = {
     ("interaction_ids", "*"): "interaction_id",
+    ("source", "session_id"): "session_id",
 }
 
 
@@ -829,6 +830,18 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     },
     EventType.SESSION_MESSAGE_QUEUED: {("delivery_mode",): frozenset({"next_turn", "on_idle"})},
     EventType.SESSION_MESSAGE_DELIVERED: {("delivery_mode",): frozenset({"next_turn", "on_idle"})},
+    **{
+        event_type: {
+            ("status",): frozenset({status}),
+            ("delivery_mode",): frozenset({"next_turn", "on_idle"}),
+        }
+        for event_type, status in (
+            (EventType.SESSION_MESSAGE_WITHDRAWN, "withdrawn"),
+            (EventType.SESSION_MESSAGE_QUARANTINED, "quarantined"),
+            (EventType.SESSION_MESSAGE_STALE, "stale"),
+            (EventType.SESSION_MESSAGE_EXPIRED, "expired"),
+        )
+    },
     **{
         event_type: {("task_status",): _TASK_STATUS_VALUES}
         for event_type in {
@@ -3238,15 +3251,40 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.SESSION_LIMIT_REACHED] = _observed_policy(
         "actual cost_summary limit maximum message reason usage_summary"
     )
+    message_source_paths = {
+        ("source", key)
+        for key in (
+            "session_id",
+            "session_instance_id",
+            "run_epoch",
+            "transcript_cursor",
+            "transcript_sha256",
+            "checkpoint_sha256",
+        )
+    }
     message_policy = _observed_policy(
         "accepted_run_epoch accepted_transcript_cursor actor delivery_mode ordering_key "
-        "input_contract queue_id run_epoch transcript_cursor",
-        owned_nested_paths=_resolution_actor_nested_paths("actor"),
+        "input_contract queue_id run_epoch transcript_cursor source",
+        owned_nested_paths=_resolution_actor_nested_paths("actor") | message_source_paths,
         authority_keys={"input_contract"},
         internal_authority_keys={"input_contract"},
+        nested_authority_paths={("source", "session_id")},
+        envelope_aliased_nested_authority_paths={("source", "session_id")},
     )
     policies[EventType.SESSION_MESSAGE_QUEUED] = message_policy
     policies[EventType.SESSION_MESSAGE_DELIVERED] = message_policy
+    for event_type in (
+        EventType.SESSION_MESSAGE_WITHDRAWN,
+        EventType.SESSION_MESSAGE_QUARANTINED,
+        EventType.SESSION_MESSAGE_STALE,
+        EventType.SESSION_MESSAGE_EXPIRED,
+    ):
+        policies[event_type] = _observed_policy(
+            "queue_id ordering_key actor run_epoch transcript_cursor status delivery_mode source",
+            owned_nested_paths=_resolution_actor_nested_paths("actor") | message_source_paths,
+            nested_authority_paths={("source", "session_id")},
+            envelope_aliased_nested_authority_paths={("source", "session_id")},
+        )
     profile_paths = {
         (profile_key, path)
         for profile_key in ("expected_profile", "candidate_profile")

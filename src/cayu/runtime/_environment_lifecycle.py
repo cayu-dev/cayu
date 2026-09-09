@@ -162,6 +162,7 @@ from cayu.runtime._environment_exposure import (
     await_environment_exposure_settlement,
     expose_registered_environment,
     refresh_and_require_environment_exposed,
+    transfer_queued_environment_exposure,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import (
@@ -196,12 +197,15 @@ from cayu.runtime.sessions import (
     CheckpointTransform,
     EventOrder,
     EventQuery,
+    QueuedInteractionProfileHandoff,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     Session,
+    SessionMessageDeliveryBatch,
     SessionRunFenced,
     SessionStatus,
     SessionStore,
+    _copy_queued_interaction_profile_handoff,
     _current_session_invocation_settlement_transition,
     _current_session_invocation_terminal_event,
     _current_session_run_epoch,
@@ -1005,6 +1009,78 @@ class EnvironmentLifecycle:
         decision.require_admitted()
         return selected
 
+    def accept_queued_interaction(
+        self,
+        *,
+        session: Session,
+        invocation_context: InvocationContext,
+        batch: SessionMessageDeliveryBatch,
+        profile_handoff: QueuedInteractionProfileHandoff,
+        predecessor_settlement_event: Event,
+        interaction_started_event: Event,
+    ) -> InvocationContext:
+        """Transfer live exposure only after exact store-owned first delivery."""
+
+        if (
+            type(session) is not Session
+            or type(session.run_epoch) is not int
+            or type(invocation_context) is not InvocationContext
+            or type(batch) is not SessionMessageDeliveryBatch
+            or type(profile_handoff) is not QueuedInteractionProfileHandoff
+            or type(predecessor_settlement_event) is not Event
+            or type(interaction_started_event) is not Event
+        ):
+            raise TypeError(
+                "Queued exposure transfer requires typed invocation and delivery proof."
+            )
+        invocation_context._validate()
+        if invocation_context.registered_environment is None:
+            # No exposure is being transferred. Preserve the existing
+            # context-only SDK handoff contract (including recovery fixtures);
+            # environmental publication proof is not an admission gate here.
+            return invocation_context.with_queued_interaction(
+                session, active_profile=profile_handoff.target_active_profile
+            )
+        # Custom stores may return post-construction mutations. Validate and
+        # detach events before exact serialization can emit serializer warnings.
+        predecessor_settlement_event = copy_event(predecessor_settlement_event)
+        interaction_started_event = copy_event(interaction_started_event)
+        delivered_events = tuple(copy_event(event) for event in batch.events)
+        expected_started = interaction_started_event.model_dump(mode="json")
+        handoff = _copy_queued_interaction_profile_handoff(
+            session.id,
+            batch.delivery_id,
+            batch.interaction_id,
+            interaction_started_event,
+            profile_handoff,
+        )
+        assert handoff is not None
+        if (
+            not batch.messages
+            or handoff.expected_session_instance_id != session.instance_id
+            or handoff.expected_active_profile != invocation_context.active_profile
+            or batch.active_invocation_profile != handoff.target_active_profile
+            or predecessor_settlement_event.id != handoff.predecessor_settlement_event_id
+            or predecessor_settlement_event.session_id != session.id
+            or predecessor_settlement_event.type is not EventType.INTERACTION_COMPLETED
+            or predecessor_settlement_event.interaction_id
+            != invocation_context.binding.interaction_id
+            or interaction_started_event.session_id != session.id
+            or interaction_started_event.type is not EventType.INTERACTION_STARTED
+            or sum(event.model_dump(mode="json") == expected_started for event in delivered_events)
+            != 1
+        ):
+            raise SessionRunFenced("Queued exposure transfer lost exact atomic delivery proof.")
+        successor = invocation_context.with_queued_interaction(
+            session, active_profile=handoff.target_active_profile
+        )
+        transfer_queued_environment_exposure(
+            session=session,
+            predecessor=invocation_context,
+            successor=successor,
+        )
+        return successor
+
     async def _admit_and_expose_environment(
         self,
         *,
@@ -1739,8 +1815,38 @@ class EnvironmentLifecycle:
                 # for this run. Retain the current fence and preserve the
                 # process-control or primary failure that initiated cleanup.
                 return
+        if (
+            terminal_event is None
+            and transition is not None
+            and transition.only_if_no_queued_messages
+            and session.status is SessionStatus.COMPLETED
+        ):
+            receipt = await self._session_store.load_interaction_transition_receipt(
+                session_id, transition=transition
+            )
+            if (
+                receipt is not None
+                and receipt.transition == transition
+                and not receipt.status_changed
+            ):
+                # A failed completion publisher can be quiescent without having
+                # produced session-terminal proof. Preserve the primary failure
+                # and retain this false predecessor's fence for terminal recovery.
+                # A true conditional receipt still proves ordinary completion.
+                return
         use_terminal_event = terminal_event is not None and (
-            transition is None or transition.to_status is not session.status
+            transition is None
+            or transition.to_status is not session.status
+            # Queue-conditional interaction settlement can precede a separate
+            # session-only completion. Its immutable receipt may still say
+            # status_changed=False; do not reinterpret it as session settlement.
+            # The typed release command authenticates the exact durable terminal
+            # event against this incarnation, epoch and active profile instead.
+            or (
+                transition.only_if_no_queued_messages
+                and terminal_event.type is EventType.SESSION_COMPLETED
+                and session.status is SessionStatus.COMPLETED
+            )
         )
         if transition is None and not use_terminal_event:
             if stale_invocation:

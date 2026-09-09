@@ -789,8 +789,16 @@ def prepare_enqueue_message_request(
     *,
     redactor: SecretRedactor,
     store_resolved_session_id: str | None = None,
+    store_resolved_source_session_id: str | None = None,
+    expected_authorized_target_instance_id: str | None = None,
 ) -> EnqueueSessionMessageRequest:
     request = copy_enqueue_session_message_request(request)
+    require_secret_free_session_authority(
+        expected_authorized_target_instance_id,
+        field_name="expected_authorized_target_instance_id",
+        redactor=redactor,
+        authority_kind="durable queued-message authority",
+    )
     require_store_resolved_or_secret_free_session_authority(
         request.session_id,
         store_resolved_value=store_resolved_session_id,
@@ -805,6 +813,40 @@ def prepare_enqueue_message_request(
             redactor=redactor,
             authority_kind="durable queued-message authority",
         )
+    # Conditions are exact authority, not display text. Never replace part of a
+    # digest/identity with a redaction marker and persist a different operation.
+    for prefix, condition in (
+        ("source", request.conditions.source),
+        ("target", request.conditions.target),
+    ):
+        if condition is None:
+            continue
+        for field_name in (
+            "session_id",
+            "session_instance_id",
+            "transcript_sha256",
+            "checkpoint_sha256",
+        ):
+            value = getattr(condition, field_name, None)
+            if (
+                prefix == "source"
+                and field_name == "session_id"
+                and request.conditions.source is not None
+            ):
+                require_store_resolved_or_secret_free_session_authority(
+                    request.conditions.source.session_id,
+                    store_resolved_value=store_resolved_source_session_id,
+                    field_name="conditions.source.session_id",
+                    redactor=redactor,
+                    authority_kind="durable queued-message authority",
+                )
+                continue
+            require_secret_free_session_authority(
+                value,
+                field_name=f"conditions.{prefix}.{field_name}",
+                redactor=redactor,
+                authority_kind="durable queued-message authority",
+            )
     redacted_content = redactor.redact_text(request.content)
     redacted_message = (
         None
@@ -821,6 +863,7 @@ def prepare_enqueue_message_request(
         content=redacted_content,
         message=redacted_message,
         delivery_mode=request.delivery_mode,
+        conditions=request.conditions,
         requested_by=redact_resolution_actor(
             request.requested_by,
             field_name="requested_by",

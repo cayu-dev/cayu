@@ -89,6 +89,28 @@ def test_required_names_are_declared_in_dunder_all() -> None:
         assert name in cayu.__all__, f"{name!r} missing from cayu.__all__"
 
 
+def test_session_message_lifecycle_types_have_matching_public_exports() -> None:
+    for name in (
+        "SessionMessageAccessContext",
+        "SessionMessageAccessDenied",
+        "SessionMessageAccessPolicy",
+        "SessionMessageActionRequest",
+        "SessionMessageActionResult",
+        "SessionMessageConditions",
+        "SessionMessageConflict",
+        "SessionMessageCursor",
+        "SessionMessageInspection",
+        "SessionMessageInspectionRecord",
+        "SessionMessageQuery",
+        "SessionMessageQueueStatus",
+        "SessionMessageSource",
+        "SessionMessageTarget",
+    ):
+        assert name in cayu.__all__
+        assert name in cayu_runtime.__all__
+        assert getattr(cayu, name) is getattr(cayu_runtime, name)
+
+
 def test_manifest_api_keeps_structural_types_out_of_the_root_namespace() -> None:
     for name in MANIFEST_TOP_LEVEL_EXPORTS:
         assert hasattr(cayu, name), f"cayu.{name} is a supported entry point"

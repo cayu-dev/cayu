@@ -400,7 +400,11 @@ def test_auth_guards_mutating_routes(method: str, path: str, body: dict | None) 
     response = client.request(method, path, json=body)
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "Missing or invalid credentials."
+    assert response.json()["detail"] == (
+        "Session-message request was denied."
+        if path.endswith("/messages")
+        else "Missing or invalid credentials."
+    )
 
 
 def test_auth_denied_run_creates_no_task_or_session() -> None:
@@ -594,7 +598,11 @@ def test_auth_guards_streaming_event_routes(
     response = client.request(method, path, json=body)
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "Missing or invalid credentials."
+    assert response.json()["detail"] == (
+        "Session-message request was denied."
+        if path.endswith("/messages")
+        else "Missing or invalid credentials."
+    )
 
 
 def test_authenticated_requests_reach_read_handlers() -> None:

@@ -202,6 +202,7 @@ from cayu.runtime._session_engine import (
     _WorkAttemptRecoveryAlreadyActive,
     _WorkAttemptRuntimeAuthority,
 )
+from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
 from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
 from cayu.runtime._task_store_operation_boundary import (
@@ -390,6 +391,13 @@ from cayu.runtime.retry_policy import (
     RetryPolicy,
     copy_retry_policy,
 )
+from cayu.runtime.session_message_lifecycle import (
+    SessionMessageAccessContext,
+    SessionMessageAccessPolicy,
+    SessionMessageActionRequest,
+    SessionMessageQuery,
+    SessionMessageSource,
+)
 from cayu.runtime.sessions import (
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
@@ -417,6 +425,8 @@ from cayu.runtime.sessions import (
     ResumeRequest,
     RunRequest,
     Session,
+    SessionMessageActionResult,
+    SessionMessageInspection,
     SessionOrder,
     SessionQuery,
     SessionRunFenced,
@@ -789,6 +799,7 @@ class CayuApp:
         loop_policies: Iterable[LoopPolicy] | None = None,
         mcp_manifest_policy: McpManifestPolicy | None = None,
         human_review_policy: HumanReviewPolicy | None = None,
+        session_message_access_policy: SessionMessageAccessPolicy | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
         completion_verifier_profile_policy: CompletionVerifierProfilePolicy | None = None,
@@ -1268,6 +1279,17 @@ class CayuApp:
             load_session_invocation=self.session_invocation_for_dispatch,
             classify_dispatch_settlement=self._queued_dispatch_settlement_state,
             acknowledge_dispatch=self._acknowledge_queued_dispatch,
+        )
+
+        self._session_message_coordinator = SessionMessageCoordinator(
+            store=self.session_store,
+            policy=session_message_access_policy,
+            redactor=self._secret_redactor,
+            resolve_session=self._resolve_public_session_authority,
+            project_session=self.project_session_id_for_exposure,
+            project_event=self._project_emitted_event_for_public_api,
+            enqueue=self._enqueue_session_message_private,
+            fan_out=self._event_writer.fan_out_persisted,
         )
 
     def redact_json(self, value: Any) -> Any:
@@ -4649,27 +4671,79 @@ class CayuApp:
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
+        *,
+        context: SessionMessageAccessContext | None = None,
     ) -> EnqueueSessionMessageResult:
-        if type(request) is not EnqueueSessionMessageRequest:
-            raise TypeError("Runtime queued input requires an EnqueueSessionMessageRequest.")
-        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
-            request.session_id
+        """Queue steering; scoped/provenance admission requires trusted context."""
+        return await self._session_message_coordinator.enqueue(request, context=context)
+
+    async def inspect_session_messages(
+        self,
+        query: SessionMessageQuery,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> SessionMessageInspection:
+        """Inspect protected queue content without claiming or executing work."""
+        return await self._session_message_coordinator.inspect(query, context=context)
+
+    async def _authorize_session_message_enqueue(
+        self,
+        request: EnqueueSessionMessageRequest,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> None:
+        """Authorize HTTP replay before exposing an earlier acceptance stream."""
+        await self._session_message_coordinator.prepare_enqueue(request, context=context)
+
+    async def _enqueue_session_message_from_http(
+        self,
+        request: EnqueueSessionMessageRequest,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> EnqueueSessionMessageResult:
+        """Trusted server entrance; never pass caller-supplied actor objects."""
+        return await self._session_message_coordinator.enqueue_from_http(request, context=context)
+
+    async def _enqueue_session_message_from_scenario(
+        self, request: EnqueueSessionMessageRequest
+    ) -> EnqueueSessionMessageResult:
+        """Trusted scenario driver entrance; actor identity is runtime-authored."""
+        return await self._session_message_coordinator.enqueue_from_scenario(request)
+
+    async def _apply_session_message_action_from_http(
+        self,
+        request: SessionMessageActionRequest,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> SessionMessageActionResult:
+        """Trusted server entrance for authenticated terminal-action actors."""
+        return await self._session_message_coordinator.apply_action_from_http(
+            request, context=context
         )
-        request = request.model_copy(update={"session_id": session_id}, deep=True)
-        result = await self._enqueue_session_message_private(
-            request,
-            store_resolved_session_id=store_resolved_session_id,
-        )
-        event = await self._project_emitted_event_for_public_api(result.event)
-        return result.model_copy(
-            update={
-                "event": event,
-                "message": result.message.model_copy(
-                    update={"accepted_event_id": event.id},
-                    deep=True,
-                ),
-            },
-            deep=True,
+
+    async def apply_session_message_action(
+        self,
+        request: SessionMessageActionRequest,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> SessionMessageActionResult:
+        """Withdraw/quarantine an exact record under application-owned authority."""
+        return await self._session_message_coordinator.apply_action(request, context=context)
+
+    async def snapshot_session_message_source(
+        self,
+        session_id: str,
+        *,
+        context: SessionMessageAccessContext,
+        include_transcript_digest: bool = False,
+        include_checkpoint_digest: bool = False,
+    ) -> SessionMessageSource:
+        """Authorize a source before reading its protected transcript/checkpoint."""
+        return await self._session_message_coordinator.snapshot_source(
+            session_id,
+            context=context,
+            include_transcript_digest=include_transcript_digest,
+            include_checkpoint_digest=include_checkpoint_digest,
         )
 
     async def _enqueue_session_message_private(
@@ -4677,12 +4751,16 @@ class CayuApp:
         request: EnqueueSessionMessageRequest,
         *,
         store_resolved_session_id: str | None = None,
+        store_resolved_source_session_id: str | None = None,
+        expected_authorized_target_instance_id: str | None = None,
     ) -> EnqueueSessionMessageResult:
         if type(request) is not EnqueueSessionMessageRequest:
             raise TypeError("Runtime queued input requires an EnqueueSessionMessageRequest.")
         return await self._session_engine.enqueue_session_message(
             request=request,
             store_resolved_session_id=store_resolved_session_id,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+            expected_authorized_target_instance_id=expected_authorized_target_instance_id,
         )
 
     async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:

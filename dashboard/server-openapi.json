@@ -9210,6 +9210,9 @@
       "EnqueueSessionMessageBody": {
         "additionalProperties": false,
         "properties": {
+          "conditions": {
+            "$ref": "#/components/schemas/SessionMessageConditions"
+          },
           "content": {
             "maxLength": 65536,
             "minLength": 1,
@@ -17223,12 +17226,258 @@
         "title": "EvaluationTargetIdentity",
         "type": "object"
       },
+      "Event": {
+        "additionalProperties": false,
+        "description": "Append-only runtime event.\n\nEvents are the common language between terminal output, dashboard views,\npersistent sessions, webhooks, and hosted-platform adapters.",
+        "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
+          "environment_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Environment Name"
+          },
+          "id": {
+            "maxLength": 512,
+            "title": "Id",
+            "type": "string"
+          },
+          "interaction_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interaction Id"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          },
+          "tool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Name"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EventType"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Type"
+          },
+          "workflow_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Name"
+          }
+        },
+        "required": [
+          "type",
+          "session_id"
+        ],
+        "title": "Event",
+        "type": "object"
+      },
       "EventOrder": {
         "enum": [
           "sequence_asc",
           "sequence_desc"
         ],
         "title": "EventOrder",
+        "type": "string"
+      },
+      "EventType": {
+        "enum": [
+          "workspace.checkpoint.updated",
+          "server.mutation.accepted",
+          "recovery.plan.item.executed",
+          "session.started",
+          "session.resumed",
+          "session.completed",
+          "session.failed",
+          "session.interrupted",
+          "session.interruption_cascade_retry_requested",
+          "session.interruption_cascade_completed",
+          "session.interruption_cascade_failed",
+          "session.awaiting_user_input",
+          "session.checkpointed",
+          "session.forked",
+          "session.limit_reached",
+          "session.message.queued",
+          "session.message.delivered",
+          "session.message.withdrawn",
+          "session.message.quarantined",
+          "session.message.stale",
+          "session.message.expired",
+          "session.model.switched",
+          "session.execution_profile.decided",
+          "session.execution_profile.rejected",
+          "session.run_fenced",
+          "turn.completed",
+          "interaction.started",
+          "interaction.resumed",
+          "interaction.paused",
+          "interaction.completed",
+          "interaction.failed",
+          "interaction.interrupted",
+          "budget.checked",
+          "budget.limit_reached",
+          "budget.reserved",
+          "budget.reconciled",
+          "budget.reservation_failed",
+          "budget.reservation_released",
+          "credential.proxy.checked",
+          "credential.mode.selected",
+          "egress.grant.minted",
+          "egress.grant.revoked",
+          "egress.request.authorized",
+          "egress.request.denied",
+          "egress.authority.requested",
+          "egress.authority.authorized",
+          "egress.authority.installing",
+          "egress.authority.activated",
+          "egress.authority.refused",
+          "egress.authority.ambiguous",
+          "mcp.manifest.checked",
+          "mcp.manifest.blocked",
+          "task.created",
+          "task.started",
+          "task.completed",
+          "task.failed",
+          "task.cancelled",
+          "task.interrupted_handoff",
+          "task.completion_result.resolved",
+          "model.started",
+          "model.text.delta",
+          "model.thinking.delta",
+          "model.hosted_tool_call",
+          "model.citation",
+          "model.completed",
+          "model.error",
+          "model.http_cleanup",
+          "model.retry",
+          "model.attempt_discarded",
+          "provider.operation.starting",
+          "provider.operation.started",
+          "provider.operation.progress",
+          "provider.operation.cancel_requested",
+          "provider.operation.cancel_resolved",
+          "provider.operation.reconnect_scheduled",
+          "provider.operation.reconnect_started",
+          "provider.operation.recovery_required",
+          "provider.operation.resolved",
+          "provider.operation.reconciled",
+          "request.footprint.recorded",
+          "tool.exposure.recorded",
+          "tool.grant.issued",
+          "tool.grant.reused",
+          "tool.grant.reconstructed",
+          "tool.grant.expired",
+          "tool.grant.revoked",
+          "tool.grant.fork_reset",
+          "tool.reference.consumed",
+          "tool.reference.rejoined",
+          "tool.reference.rejected",
+          "structured_output.validated",
+          "structured_output.validating",
+          "structured_output.failed",
+          "structured_output.retry",
+          "context.compaction.started",
+          "context.compaction.completed",
+          "context.compaction.failed",
+          "context.counted",
+          "context.count.failed",
+          "context.count.reconciled",
+          "context.pressure.estimated",
+          "context.pressure.reconciled",
+          "context.overflow.detected",
+          "context.overflow.recovering",
+          "context.overflow.failed",
+          "memory.recall.started",
+          "memory.recall.completed",
+          "memory.recall.failed",
+          "memory.recall.admitted",
+          "environment.binding.started",
+          "environment.binding.completed",
+          "environment.binding.failed",
+          "environment.binding.finalize_started",
+          "environment.binding.finalize_completed",
+          "environment.binding.finalize_failed",
+          "environment.factory.started",
+          "environment.factory.completed",
+          "environment.factory.failed",
+          "environment.lifecycle.progress",
+          "environment.lifecycle.transition",
+          "workspace.revision.observed",
+          "workspace.mutation.recorded",
+          "workspace.observation.finalized",
+          "hook.started",
+          "hook.completed",
+          "hook.failed",
+          "tool.call.started",
+          "tool.call.completed",
+          "tool.call.failed",
+          "tool.call.blocked",
+          "tool.call.approval_requested",
+          "tool.call.approved",
+          "tool.call.approval_denied",
+          "tool.call.approval_expired",
+          "workflow.started",
+          "workflow.step.started",
+          "workflow.step.completed",
+          "workflow.completed",
+          "memory.search",
+          "runner.exec.started",
+          "runner.exec.completed",
+          "runtime.sink.failed",
+          "runtime.interaction_transition.acknowledgement_failed"
+        ],
+        "title": "EventType",
         "type": "string"
       },
       "ExecutionEvidenceOverride": {
@@ -29252,6 +29501,136 @@
         "title": "SessionExecutionSource",
         "type": "string"
       },
+      "SessionMessageActionBody": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Revision",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "session_instance_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Session Instance Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_instance_id",
+          "idempotency_key",
+          "expected_revision"
+        ],
+        "title": "SessionMessageActionBody",
+        "type": "object"
+      },
+      "SessionMessageActionResult": {
+        "additionalProperties": false,
+        "description": "Terminal queue mutation and its atomically persisted content-free event.",
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/Event"
+          },
+          "record": {
+            "$ref": "#/components/schemas/SessionMessageInspectionRecord"
+          },
+          "replayed": {
+            "default": false,
+            "title": "Replayed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "record",
+          "event"
+        ],
+        "title": "SessionMessageActionResult",
+        "type": "object"
+      },
+      "SessionMessageConditions": {
+        "additionalProperties": false,
+        "description": "Optional provenance and delivery constraints; never ordinary metadata.",
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionMessageSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionMessageTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "SessionMessageConditions",
+        "type": "object"
+      },
+      "SessionMessageCursor": {
+        "additionalProperties": false,
+        "description": "Incarnation-bound position within a fixed admission high-water mark.\n\nPriority is NEXT_TURN (0), ON_IDLE (1), then unreadable modes (2).\nThe cursor is pagination input, never application access authority.",
+        "properties": {
+          "after_ordering_key": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "After Ordering Key",
+            "type": "integer"
+          },
+          "after_priority": {
+            "maximum": 2.0,
+            "minimum": 0.0,
+            "title": "After Priority",
+            "type": "integer"
+          },
+          "session_instance_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Session Instance Id",
+            "type": "string"
+          },
+          "through_ordering_key": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Through Ordering Key",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_instance_id",
+          "through_ordering_key",
+          "after_priority",
+          "after_ordering_key"
+        ],
+        "title": "SessionMessageCursor",
+        "type": "object"
+      },
       "SessionMessageDeliveryMode": {
         "enum": [
           "next_turn",
@@ -29259,6 +29638,244 @@
         ],
         "title": "SessionMessageDeliveryMode",
         "type": "string"
+      },
+      "SessionMessageInspection": {
+        "additionalProperties": false,
+        "description": "One protected delivery-priority page and its exact session instance.",
+        "properties": {
+          "next_cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionMessageCursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "records": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/SessionMessageInspectionRecord"
+            },
+            "maxItems": 100,
+            "title": "Records",
+            "type": "array"
+          },
+          "session_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "session_instance_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Session Instance Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "session_instance_id"
+        ],
+        "title": "SessionMessageInspection",
+        "type": "object"
+      },
+      "SessionMessageInspectionRecord": {
+        "additionalProperties": false,
+        "description": "Safe row envelope: unreadable content never becomes deliverable input.",
+        "properties": {
+          "message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionQueuedMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ordering_key": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Ordering Key",
+            "type": "integer"
+          },
+          "queue_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Queue Id",
+            "type": "string"
+          },
+          "revision": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Revision",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionMessageQueueStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "terminal_event_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Event Id"
+          },
+          "validity": {
+            "enum": [
+              "valid",
+              "unreadable"
+            ],
+            "title": "Validity",
+            "type": "string"
+          }
+        },
+        "required": [
+          "queue_id",
+          "ordering_key",
+          "revision",
+          "status",
+          "validity"
+        ],
+        "title": "SessionMessageInspectionRecord",
+        "type": "object"
+      },
+      "SessionMessageQueueStatus": {
+        "enum": [
+          "queued",
+          "delivered",
+          "withdrawn",
+          "quarantined",
+          "stale",
+          "expired"
+        ],
+        "title": "SessionMessageQueueStatus",
+        "type": "string"
+      },
+      "SessionMessageSource": {
+        "additionalProperties": false,
+        "description": "Exact source observation, checked by the store before first acceptance.\n\nSource observations are historical after admission: identical retries do not\nreinterpret them against a newer source. A copied observation is not access\nauthority; the application must independently authorize the source session.",
+        "properties": {
+          "checkpoint_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkpoint Sha256"
+          },
+          "run_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Run Epoch",
+            "type": "integer"
+          },
+          "session_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "session_instance_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Session Instance Id",
+            "type": "string"
+          },
+          "transcript_cursor": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Transcript Cursor",
+            "type": "integer"
+          },
+          "transcript_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript Sha256"
+          }
+        },
+        "required": [
+          "session_id",
+          "session_instance_id",
+          "run_epoch",
+          "transcript_cursor"
+        ],
+        "title": "SessionMessageSource",
+        "type": "object"
+      },
+      "SessionMessageSourceBody": {
+        "additionalProperties": false,
+        "properties": {
+          "include_checkpoint_digest": {
+            "default": false,
+            "title": "Include Checkpoint Digest",
+            "type": "boolean"
+          },
+          "include_transcript_digest": {
+            "default": false,
+            "title": "Include Transcript Digest",
+            "type": "boolean"
+          }
+        },
+        "title": "SessionMessageSourceBody",
+        "type": "object"
+      },
+      "SessionMessageTarget": {
+        "additionalProperties": false,
+        "description": "Expected target immediately before this message's transcript append.\n\nThe instance prevents deletion/recreation from satisfying an old request.\nBoth epoch and permanent transcript cursor must match exactly. Earlier\ndelivered messages advance that cursor; terminal rejection does not. This\ndefinition is independent of the store's delivery batch size.",
+        "properties": {
+          "run_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Run Epoch",
+            "type": "integer"
+          },
+          "session_instance_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Session Instance Id",
+            "type": "string"
+          },
+          "transcript_cursor": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Transcript Cursor",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_instance_id",
+          "run_epoch",
+          "transcript_cursor"
+        ],
+        "title": "SessionMessageTarget",
+        "type": "object"
       },
       "SessionOperationalSnapshot": {
         "additionalProperties": false,
@@ -29301,6 +29918,148 @@
         ],
         "title": "SessionOrder",
         "type": "string"
+      },
+      "SessionQueuedMessage": {
+        "additionalProperties": false,
+        "description": "One durable queued user message and its delivery state.",
+        "properties": {
+          "accepted_at": {
+            "format": "date-time",
+            "title": "Accepted At",
+            "type": "string"
+          },
+          "accepted_event_id": {
+            "title": "Accepted Event Id",
+            "type": "string"
+          },
+          "accepted_run_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Accepted Run Epoch",
+            "type": "integer"
+          },
+          "accepted_transcript_cursor": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Accepted Transcript Cursor",
+            "type": "integer"
+          },
+          "conditions": {
+            "$ref": "#/components/schemas/SessionMessageConditions"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "delivered_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivered At"
+          },
+          "delivered_event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivered Event Id"
+          },
+          "delivered_run_epoch": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivered Run Epoch"
+          },
+          "delivered_transcript_cursor": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivered Transcript Cursor"
+          },
+          "delivery_mode": {
+            "$ref": "#/components/schemas/SessionMessageDeliveryMode"
+          },
+          "idempotency_key": {
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Message"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ordering_key": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Ordering Key",
+            "type": "integer"
+          },
+          "queue_id": {
+            "title": "Queue Id",
+            "type": "string"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResolutionActor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SessionMessageQueueStatus"
+          }
+        },
+        "required": [
+          "queue_id",
+          "session_id",
+          "idempotency_key",
+          "content",
+          "delivery_mode",
+          "status",
+          "ordering_key",
+          "accepted_run_epoch",
+          "accepted_transcript_cursor",
+          "accepted_event_id",
+          "accepted_at"
+        ],
+        "title": "SessionQueuedMessage",
+        "type": "object"
       },
       "SessionStateResponse": {
         "additionalProperties": false,
@@ -40117,6 +40876,261 @@
       }
     },
     "/api/sessions/{session_id}/messages": {
+      "get": {
+        "operationId": "inspect_session_messages_api_sessions__session_id__messages_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor_session_instance_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor Session Instance Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor_through_ordering_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor Through Ordering Key"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor_after_priority",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor After Priority"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor_after_ordering_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor After Ordering Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionMessageInspection"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request attempts to override authenticated actor identity.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Session-message access is not authorized.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request conflicts with exact durable authority or terminal state.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeds the private request byte limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid session-message request; rejected input is not reflected.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The session-message operation failed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The store does not support this session-message operation.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect Session Messages"
+      },
       "post": {
         "operationId": "enqueue_session_message_api_sessions__session_id__messages_post",
         "parameters": [
@@ -40174,6 +41188,60 @@
             },
             "description": "Server-Sent Events stream. Each runtime event is emitted as an SSE frame whose `data:` value is a JSON SseEventEnvelope. A classified terminal runtime or observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request attempts to override authenticated actor identity.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Session-message access is not authorized.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -40192,17 +41260,51 @@
                 }
               }
             },
-            "description": "The replay event marker is unknown or the mutation conflicts with the current session state."
+            "description": "The request conflicts with exact durable authority or terminal state.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeds the private request byte limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ApiErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid session-message request; rejected input is not reflected.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
             "content": {
@@ -40212,10 +41314,603 @@
                 }
               }
             },
-            "description": "The mutation could not open an accepted durable stream."
+            "description": "The session-message operation failed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The store does not support this session-message operation.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Enqueue Session Message"
+      }
+    },
+    "/api/sessions/{session_id}/messages/source-snapshot": {
+      "post": {
+        "operationId": "snapshot_session_message_source_api_sessions__session_id__messages_source_snapshot_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionMessageSourceBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionMessageSource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request attempts to override authenticated actor identity.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Session-message access is not authorized.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request conflicts with exact durable authority or terminal state.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeds the private request byte limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid session-message request; rejected input is not reflected.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The session-message operation failed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The store does not support this session-message operation.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Snapshot Session Message Source"
+      }
+    },
+    "/api/sessions/{session_id}/messages/{queue_id}/quarantine": {
+      "post": {
+        "operationId": "quarantine_session_message_api_sessions__session_id__messages__queue_id__quarantine_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "queue_id",
+            "required": true,
+            "schema": {
+              "title": "Queue Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionMessageActionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionMessageActionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request attempts to override authenticated actor identity.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Session-message access is not authorized.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request conflicts with exact durable authority or terminal state.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeds the private request byte limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid session-message request; rejected input is not reflected.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The session-message operation failed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The store does not support this session-message operation.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Quarantine Session Message"
+      }
+    },
+    "/api/sessions/{session_id}/messages/{queue_id}/withdraw": {
+      "post": {
+        "operationId": "withdraw_session_message_api_sessions__session_id__messages__queue_id__withdraw_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "queue_id",
+            "required": true,
+            "schema": {
+              "title": "Queue Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionMessageActionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionMessageActionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request attempts to override authenticated actor identity.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Session-message access is not authorized.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request conflicts with exact durable authority or terminal state.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request exceeds the private request byte limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid session-message request; rejected input is not reflected.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The session-message operation failed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The store does not support this session-message operation.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-store",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Withdraw Session Message"
       }
     },
     "/api/sessions/{session_id}/metadata": {

@@ -17269,6 +17269,20 @@ class RecoveryCoordinator:
                     # cannot settle a different terminal outcome produced by
                     # this exact recovery claim.
                     settlement = None
+                if (
+                    settlement is not None
+                    and settlement.only_if_no_queued_messages
+                    and settlement.to_status is SessionStatus.COMPLETED
+                    and session.status is SessionStatus.COMPLETED
+                ):
+                    # The transition spec does not prove its conditional status
+                    # change committed. Rejected-only draining may have completed
+                    # the session separately, leaving an immutable predecessor
+                    # receipt with status_changed=False. Let this recovery owner
+                    # release under its exact claim only after the existing
+                    # quiescence and terminal-evidence checks below; do not reuse
+                    # that predecessor as proof of session completion.
+                    settlement = None
                 if settlement is None:
                     if authoritative_failure is not None and not (
                         claim_has_not_dispatched_work or recovery_work_quiescent

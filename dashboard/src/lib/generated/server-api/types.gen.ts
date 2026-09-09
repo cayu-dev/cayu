@@ -4574,6 +4574,7 @@ export type EgressAuthorityPolicyIdentity = {
  * EnqueueSessionMessageBody
  */
 export type EnqueueSessionMessageBody = {
+    conditions?: SessionMessageConditions;
     /**
      * Content
      */
@@ -8471,9 +8472,67 @@ export type EvaluationTargetIdentity = {
 };
 
 /**
+ * Event
+ *
+ * Append-only runtime event.
+ *
+ * Events are the common language between terminal output, dashboard views,
+ * persistent sessions, webhooks, and hosted-platform adapters.
+ */
+export type Event = {
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Environment Name
+     */
+    environment_name?: string | null;
+    /**
+     * Id
+     */
+    id?: string;
+    /**
+     * Interaction Id
+     */
+    interaction_id?: string | null;
+    /**
+     * Payload
+     */
+    payload?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Timestamp
+     */
+    timestamp?: string;
+    /**
+     * Tool Name
+     */
+    tool_name?: string | null;
+    /**
+     * Type
+     */
+    type: EventType | string;
+    /**
+     * Workflow Name
+     */
+    workflow_name?: string | null;
+};
+
+/**
  * EventOrder
  */
 export type EventOrder = 'sequence_asc' | 'sequence_desc';
+
+/**
+ * EventType
+ */
+export type EventType = 'workspace.checkpoint.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
 
 /**
  * ExecutionEvidenceOverride
@@ -14701,9 +14760,213 @@ export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_is
 export type SessionExecutionSource = 'http_run' | 'sdk_run' | 'fork' | 'subagent' | 'task' | 'workflow_step';
 
 /**
+ * SessionMessageActionBody
+ */
+export type SessionMessageActionBody = {
+    /**
+     * Expected Revision
+     */
+    expected_revision: string;
+    /**
+     * Idempotency Key
+     */
+    idempotency_key: string;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string;
+};
+
+/**
+ * SessionMessageActionResult
+ *
+ * Terminal queue mutation and its atomically persisted content-free event.
+ */
+export type SessionMessageActionResult = {
+    event: Event;
+    record: SessionMessageInspectionRecord;
+    /**
+     * Replayed
+     */
+    replayed?: boolean;
+};
+
+/**
+ * SessionMessageConditions
+ *
+ * Optional provenance and delivery constraints; never ordinary metadata.
+ */
+export type SessionMessageConditions = {
+    /**
+     * Expires At
+     */
+    expires_at?: string | null;
+    source?: SessionMessageSource | null;
+    target?: SessionMessageTarget | null;
+};
+
+/**
+ * SessionMessageCursor
+ *
+ * Incarnation-bound position within a fixed admission high-water mark.
+ *
+ * Priority is NEXT_TURN (0), ON_IDLE (1), then unreadable modes (2).
+ * The cursor is pagination input, never application access authority.
+ */
+export type SessionMessageCursor = {
+    /**
+     * After Ordering Key
+     */
+    after_ordering_key: number;
+    /**
+     * After Priority
+     */
+    after_priority: number;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string;
+    /**
+     * Through Ordering Key
+     */
+    through_ordering_key: number;
+};
+
+/**
  * SessionMessageDeliveryMode
  */
 export type SessionMessageDeliveryMode = 'next_turn' | 'on_idle';
+
+/**
+ * SessionMessageInspection
+ *
+ * One protected delivery-priority page and its exact session instance.
+ */
+export type SessionMessageInspection = {
+    next_cursor?: SessionMessageCursor | null;
+    /**
+     * Records
+     */
+    records?: Array<SessionMessageInspectionRecord>;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string;
+};
+
+/**
+ * SessionMessageInspectionRecord
+ *
+ * Safe row envelope: unreadable content never becomes deliverable input.
+ */
+export type SessionMessageInspectionRecord = {
+    message?: SessionQueuedMessage | null;
+    /**
+     * Ordering Key
+     */
+    ordering_key: number;
+    /**
+     * Queue Id
+     */
+    queue_id: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    status: SessionMessageQueueStatus | null;
+    /**
+     * Terminal Event Id
+     */
+    terminal_event_id?: string | null;
+    /**
+     * Validity
+     */
+    validity: 'valid' | 'unreadable';
+};
+
+/**
+ * SessionMessageQueueStatus
+ */
+export type SessionMessageQueueStatus = 'queued' | 'delivered' | 'withdrawn' | 'quarantined' | 'stale' | 'expired';
+
+/**
+ * SessionMessageSource
+ *
+ * Exact source observation, checked by the store before first acceptance.
+ *
+ * Source observations are historical after admission: identical retries do not
+ * reinterpret them against a newer source. A copied observation is not access
+ * authority; the application must independently authorize the source session.
+ */
+export type SessionMessageSource = {
+    /**
+     * Checkpoint Sha256
+     */
+    checkpoint_sha256?: string | null;
+    /**
+     * Run Epoch
+     */
+    run_epoch: number;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string;
+    /**
+     * Transcript Cursor
+     */
+    transcript_cursor: number;
+    /**
+     * Transcript Sha256
+     */
+    transcript_sha256?: string | null;
+};
+
+/**
+ * SessionMessageSourceBody
+ */
+export type SessionMessageSourceBody = {
+    /**
+     * Include Checkpoint Digest
+     */
+    include_checkpoint_digest?: boolean;
+    /**
+     * Include Transcript Digest
+     */
+    include_transcript_digest?: boolean;
+};
+
+/**
+ * SessionMessageTarget
+ *
+ * Expected target immediately before this message's transcript append.
+ *
+ * The instance prevents deletion/recreation from satisfying an old request.
+ * Both epoch and permanent transcript cursor must match exactly. Earlier
+ * delivered messages advance that cursor; terminal rejection does not. This
+ * definition is independent of the store's delivery batch size.
+ */
+export type SessionMessageTarget = {
+    /**
+     * Run Epoch
+     */
+    run_epoch: number;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string;
+    /**
+     * Transcript Cursor
+     */
+    transcript_cursor: number;
+};
 
 /**
  * SessionOperationalSnapshot
@@ -14727,6 +14990,71 @@ export type SessionOperationalSnapshot = {
  * SessionOrder
  */
 export type SessionOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc' | 'last_activity_at_asc' | 'last_activity_at_desc';
+
+/**
+ * SessionQueuedMessage
+ *
+ * One durable queued user message and its delivery state.
+ */
+export type SessionQueuedMessage = {
+    /**
+     * Accepted At
+     */
+    accepted_at: string;
+    /**
+     * Accepted Event Id
+     */
+    accepted_event_id: string;
+    /**
+     * Accepted Run Epoch
+     */
+    accepted_run_epoch: number;
+    /**
+     * Accepted Transcript Cursor
+     */
+    accepted_transcript_cursor: number;
+    conditions?: SessionMessageConditions;
+    /**
+     * Content
+     */
+    content: string;
+    /**
+     * Delivered At
+     */
+    delivered_at?: string | null;
+    /**
+     * Delivered Event Id
+     */
+    delivered_event_id?: string | null;
+    /**
+     * Delivered Run Epoch
+     */
+    delivered_run_epoch?: number | null;
+    /**
+     * Delivered Transcript Cursor
+     */
+    delivered_transcript_cursor?: number | null;
+    delivery_mode: SessionMessageDeliveryMode;
+    /**
+     * Idempotency Key
+     */
+    idempotency_key: string;
+    message?: Message | null;
+    /**
+     * Ordering Key
+     */
+    ordering_key: number;
+    /**
+     * Queue Id
+     */
+    queue_id: string;
+    requested_by?: ResolutionActor | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    status: SessionMessageQueueStatus;
+};
 
 /**
  * SessionStateResponse
@@ -21028,6 +21356,85 @@ export type UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponses = {
 
 export type UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponse = UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponses[keyof UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponses];
 
+export type InspectSessionMessagesApiSessionsSessionIdMessagesGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Cursor Session Instance Id
+         */
+        cursor_session_instance_id?: string | null;
+        /**
+         * Cursor Through Ordering Key
+         */
+        cursor_through_ordering_key?: number | null;
+        /**
+         * Cursor After Priority
+         */
+        cursor_after_priority?: number | null;
+        /**
+         * Cursor After Ordering Key
+         */
+        cursor_after_ordering_key?: number | null;
+    };
+    url: '/api/sessions/{session_id}/messages';
+};
+
+export type InspectSessionMessagesApiSessionsSessionIdMessagesGetErrors = {
+    /**
+     * The request attempts to override authenticated actor identity.
+     */
+    400: ApiErrorResponse;
+    /**
+     * Authentication is required.
+     */
+    401: ApiErrorResponse;
+    /**
+     * Session-message access is not authorized.
+     */
+    403: ApiErrorResponse;
+    /**
+     * The request conflicts with exact durable authority or terminal state.
+     */
+    409: ApiErrorResponse;
+    /**
+     * The request exceeds the private request byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Invalid session-message request; rejected input is not reflected.
+     */
+    422: ApiErrorResponse;
+    /**
+     * The session-message operation failed.
+     */
+    500: ApiErrorResponse;
+    /**
+     * The store does not support this session-message operation.
+     */
+    503: ApiErrorResponse;
+};
+
+export type InspectSessionMessagesApiSessionsSessionIdMessagesGetError = InspectSessionMessagesApiSessionsSessionIdMessagesGetErrors[keyof InspectSessionMessagesApiSessionsSessionIdMessagesGetErrors];
+
+export type InspectSessionMessagesApiSessionsSessionIdMessagesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionMessageInspection;
+};
+
+export type InspectSessionMessagesApiSessionsSessionIdMessagesGetResponse = InspectSessionMessagesApiSessionsSessionIdMessagesGetResponses[keyof InspectSessionMessagesApiSessionsSessionIdMessagesGetResponses];
+
 export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostData = {
     body: EnqueueSessionMessageBody;
     headers?: {
@@ -21050,21 +21457,41 @@ export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostData = {
 
 export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostErrors = {
     /**
+     * The request attempts to override authenticated actor identity.
+     */
+    400: ApiErrorResponse;
+    /**
+     * Authentication is required.
+     */
+    401: ApiErrorResponse;
+    /**
+     * Session-message access is not authorized.
+     */
+    403: ApiErrorResponse;
+    /**
      * The replay session or mutation target does not exist.
      */
     404: ApiErrorResponse;
     /**
-     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     * The request conflicts with exact durable authority or terminal state.
      */
     409: ApiErrorResponse;
     /**
-     * Validation Error
+     * The request exceeds the private request byte limit.
      */
-    422: HttpValidationError;
+    413: ApiErrorResponse;
     /**
-     * The mutation could not open an accepted durable stream.
+     * Invalid session-message request; rejected input is not reflected.
+     */
+    422: ApiErrorResponse;
+    /**
+     * The session-message operation failed.
      */
     500: ApiErrorResponse;
+    /**
+     * The store does not support this session-message operation.
+     */
+    503: ApiErrorResponse;
 };
 
 export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostError = EnqueueSessionMessageApiSessionsSessionIdMessagesPostErrors[keyof EnqueueSessionMessageApiSessionsSessionIdMessagesPostErrors];
@@ -21077,6 +21504,188 @@ export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostResponses = {
 };
 
 export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostResponse = EnqueueSessionMessageApiSessionsSessionIdMessagesPostResponses[keyof EnqueueSessionMessageApiSessionsSessionIdMessagesPostResponses];
+
+export type SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostData = {
+    body: SessionMessageSourceBody;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/messages/source-snapshot';
+};
+
+export type SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostErrors = {
+    /**
+     * The request attempts to override authenticated actor identity.
+     */
+    400: ApiErrorResponse;
+    /**
+     * Authentication is required.
+     */
+    401: ApiErrorResponse;
+    /**
+     * Session-message access is not authorized.
+     */
+    403: ApiErrorResponse;
+    /**
+     * The request conflicts with exact durable authority or terminal state.
+     */
+    409: ApiErrorResponse;
+    /**
+     * The request exceeds the private request byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Invalid session-message request; rejected input is not reflected.
+     */
+    422: ApiErrorResponse;
+    /**
+     * The session-message operation failed.
+     */
+    500: ApiErrorResponse;
+    /**
+     * The store does not support this session-message operation.
+     */
+    503: ApiErrorResponse;
+};
+
+export type SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostError = SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostErrors[keyof SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostErrors];
+
+export type SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionMessageSource;
+};
+
+export type SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostResponse = SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostResponses[keyof SnapshotSessionMessageSourceApiSessionsSessionIdMessagesSourceSnapshotPostResponses];
+
+export type QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostData = {
+    body: SessionMessageActionBody;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+        /**
+         * Queue Id
+         */
+        queue_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/messages/{queue_id}/quarantine';
+};
+
+export type QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostErrors = {
+    /**
+     * The request attempts to override authenticated actor identity.
+     */
+    400: ApiErrorResponse;
+    /**
+     * Authentication is required.
+     */
+    401: ApiErrorResponse;
+    /**
+     * Session-message access is not authorized.
+     */
+    403: ApiErrorResponse;
+    /**
+     * The request conflicts with exact durable authority or terminal state.
+     */
+    409: ApiErrorResponse;
+    /**
+     * The request exceeds the private request byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Invalid session-message request; rejected input is not reflected.
+     */
+    422: ApiErrorResponse;
+    /**
+     * The session-message operation failed.
+     */
+    500: ApiErrorResponse;
+    /**
+     * The store does not support this session-message operation.
+     */
+    503: ApiErrorResponse;
+};
+
+export type QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostError = QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostErrors[keyof QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostErrors];
+
+export type QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionMessageActionResult;
+};
+
+export type QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostResponse = QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostResponses[keyof QuarantineSessionMessageApiSessionsSessionIdMessagesQueueIdQuarantinePostResponses];
+
+export type WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostData = {
+    body: SessionMessageActionBody;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+        /**
+         * Queue Id
+         */
+        queue_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/messages/{queue_id}/withdraw';
+};
+
+export type WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostErrors = {
+    /**
+     * The request attempts to override authenticated actor identity.
+     */
+    400: ApiErrorResponse;
+    /**
+     * Authentication is required.
+     */
+    401: ApiErrorResponse;
+    /**
+     * Session-message access is not authorized.
+     */
+    403: ApiErrorResponse;
+    /**
+     * The request conflicts with exact durable authority or terminal state.
+     */
+    409: ApiErrorResponse;
+    /**
+     * The request exceeds the private request byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Invalid session-message request; rejected input is not reflected.
+     */
+    422: ApiErrorResponse;
+    /**
+     * The session-message operation failed.
+     */
+    500: ApiErrorResponse;
+    /**
+     * The store does not support this session-message operation.
+     */
+    503: ApiErrorResponse;
+};
+
+export type WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostError = WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostErrors[keyof WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostErrors];
+
+export type WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionMessageActionResult;
+};
+
+export type WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostResponse = WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostResponses[keyof WithdrawSessionMessageApiSessionsSessionIdMessagesQueueIdWithdrawPostResponses];
 
 export type UpdateSessionMetadataApiSessionsSessionIdMetadataPatchData = {
     body: UpdateSessionMetadataBody;

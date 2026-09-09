@@ -40,6 +40,7 @@ from cayu._exception_groups import (
 )
 from cayu._exception_state import exception_state, pop_exception_state, set_exception_state
 from cayu._task_wait import (
+    CapturedAwaitableOutcome,
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
     capture_awaitable_outcome,
@@ -182,7 +183,6 @@ from cayu.runtime._environment_allocation import (
     environment_allocation_owners_from_checkpoint,
     require_authorized_environment_allocation_owners,
 )
-from cayu.runtime._environment_exposure import transfer_queued_environment_exposure
 from cayu.runtime._environment_lifecycle import (
     EnvironmentBindingFinalizeResult,
     EnvironmentLifecycle,
@@ -606,6 +606,7 @@ from cayu.runtime.sessions import (
     SessionOperationPublication,
     SessionOrder,
     SessionQuery,
+    SessionQueuedMessagesPending,
     SessionRunFenced,
     SessionRuntimeIdentity,
     SessionRuntimePublicationConflict,
@@ -626,6 +627,7 @@ from cayu.runtime.sessions import (
     _current_session_interaction_recovered_active_through,
     _current_session_interaction_started_at,
     _current_session_invocation_interaction_ids,
+    _current_session_invocation_terminal_event,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _event_with_session_run_operation,
@@ -826,6 +828,16 @@ class _ExpiredIncompleteRecoveryClaim(Exception):
 
 class SessionCompactionAttemptSuperseded(RuntimeError):
     """A recovered compaction attempt owns the durable operation claim."""
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedCompletionResult:
+    outcome: Literal["continue", "complete", "stopped"]
+    session: Session
+    events: list[Event]
+    invocation_context: InvocationContext | None
+    completion_finalization_marker: dict[str, Any] | None = None
+    continuation: AsyncGenerator[Event, None] | None = None
 
 
 class _TerminalRuntimeHookClaimState(StrEnum):
@@ -4391,14 +4403,14 @@ async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:
 
 async def _collect_through_event_type(
     iterator: AsyncIterator[Event],
-    event_type: EventType,
+    event_type: EventType | tuple[EventType, ...],
     *,
     missing_message: str,
 ) -> tuple[list[Event], Event]:
     events: list[Event] = []
     async for event in iterator:
         events.append(event)
-        if event.type == event_type:
+        if event.type in ((event_type,) if isinstance(event_type, EventType) else event_type):
             return events, event
     raise RuntimeError(missing_message)
 
@@ -10601,7 +10613,9 @@ class SessionEngine:
             raise RuntimeError("Prepared work-attempt session lookup returned no session.")
         profile = execution_profile_from_session_metadata(session.metadata)
         raw_deferred_input = await read_work_attempt_session_store(
-            lambda: self.session_store.load_deferred_interaction_input(session.id),
+            lambda session_id=session.id: self.session_store.load_deferred_interaction_input(
+                session_id
+            ),
             operation_name="Prepared work-attempt deferred-input lookup",
             redactor=self._secret_redactor,
         )
@@ -12496,6 +12510,8 @@ class SessionEngine:
         request: EnqueueSessionMessageRequest,
         *,
         store_resolved_session_id: str | None = None,
+        store_resolved_source_session_id: str | None = None,
+        expected_authorized_target_instance_id: str | None = None,
     ) -> EnqueueSessionMessageResult:
         """Durably queue user steering for delivery by the active controller."""
 
@@ -12503,8 +12519,16 @@ class SessionEngine:
             request,
             redactor=self._secret_redactor,
             store_resolved_session_id=store_resolved_session_id,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+            expected_authorized_target_instance_id=expected_authorized_target_instance_id,
         )
-        result = await self.session_store.enqueue_session_message(redacted_request)
+        if expected_authorized_target_instance_id is None:
+            result = await self.session_store.enqueue_session_message(redacted_request)
+        else:
+            result = await self.session_store.enqueue_session_message(
+                redacted_request,
+                expected_authorized_target_instance_id=expected_authorized_target_instance_id,
+            )
         if not result.replayed:
             await self._event_writer.fan_out_persisted([result.event])
         return result
@@ -12519,6 +12543,7 @@ class SessionEngine:
         messages: list[Message],
         include_on_idle: bool,
         continue_active_interaction: bool = False,
+        reject_only: bool = False,
         invocation_context: InvocationContext | None = None,
         predecessor_settlement_event: Event | None = None,
     ) -> tuple[list[Event], InvocationContext | None]:
@@ -12570,26 +12595,36 @@ class SessionEngine:
                 raise NotImplementedError(
                     "This SessionStore does not attest atomic queued interaction handoffs."
                 )
-            delivery_interaction_id = str(uuid4())
-            target_active_profile = ActiveInvocationExecutionProfile(
-                session_id=session.id,
-                interaction_id=delivery_interaction_id,
-                run_epoch=session.run_epoch,
-                profile=invocation_context.profile,
-            )
-            profile_handoff = QueuedInteractionProfileHandoff(
-                expected_session_instance_id=session.instance_id,
-                predecessor_settlement_event_id=predecessor_settlement_event.id,
-                expected_active_profile=invocation_context.active_profile,
-                target_active_profile=target_active_profile,
-            )
+
+            def prepare_first_delivery() -> tuple[str, QueuedInteractionProfileHandoff, Event]:
+                assert invocation_context is not None and predecessor_settlement_event is not None
+                interaction_id = str(uuid4())
+                handoff = QueuedInteractionProfileHandoff(
+                    expected_session_instance_id=session.instance_id,
+                    predecessor_settlement_event_id=predecessor_settlement_event.id,
+                    expected_active_profile=invocation_context.active_profile,
+                    target_active_profile=ActiveInvocationExecutionProfile(
+                        session_id=session.id,
+                        interaction_id=interaction_id,
+                        run_epoch=session.run_epoch,
+                        profile=invocation_context.profile,
+                    ),
+                )
+                return (
+                    interaction_id,
+                    handoff,
+                    self._interaction_started_event(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        interaction_id=interaction_id,
+                        queued_profile_handoff=handoff,
+                    ),
+                )
+
             interaction_started = False
-            interaction_started_event = self._interaction_started_event(
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-                interaction_id=delivery_interaction_id,
-                queued_profile_handoff=profile_handoff,
+            delivery_interaction_id, profile_handoff, interaction_started_event = (
+                prepare_first_delivery()
             )
         delivery_batch_index = 0
         while True:
@@ -12611,6 +12646,7 @@ class SessionEngine:
                                 None if interaction_started else interaction_started_event
                             ),
                             profile_handoff=(None if interaction_started else profile_handoff),
+                            **({"reject_only": True} if reject_only else {}),
                         )
                     )
                 except Exception as error:
@@ -12626,6 +12662,7 @@ class SessionEngine:
                             None if interaction_started else interaction_started_event
                         ),
                         profile_handoff=(None if interaction_started else profile_handoff),
+                        **({"reject_only": True} if reject_only else {}),
                     )
             except SessionStatusConflict:
                 # An interrupt can win after the loop's durable status check,
@@ -12648,20 +12685,20 @@ class SessionEngine:
                     or active_invocation_profile is None
                     or active_invocation_profile != profile_handoff.target_active_profile
                     or invocation_context is None
+                    or predecessor_settlement_event is None
+                    or interaction_started_event is None
                 ):
                     raise SessionRunFenced(
                         "Queued delivery did not return its exact active-profile handoff."
                     )
-                successor = invocation_context.with_queued_interaction(
-                    session,
-                    active_profile=active_invocation_profile,
-                )
-                transfer_queued_environment_exposure(
+                invocation_context = self._environment_lifecycle.accept_queued_interaction(
                     session=session,
-                    predecessor=invocation_context,
-                    successor=successor,
+                    invocation_context=invocation_context,
+                    batch=batch,
+                    profile_handoff=profile_handoff,
+                    predecessor_settlement_event=predecessor_settlement_event,
+                    interaction_started_event=interaction_started_event,
                 )
-                invocation_context = successor
                 _activate_session_interaction(session_id, delivery_interaction_id)
             if batch.events:
                 await self._event_writer.fan_out_persisted(list(batch.events))
@@ -12676,7 +12713,16 @@ class SessionEngine:
                 interaction_started = True
             if not batch.has_more:
                 return delivered_events, invocation_context
-            delivery_batch_index += 1
+            if not interaction_started:
+                # A rejection receipt is immutable, but it did not start the
+                # proposed interaction. The next batch is still a first delivery
+                # and needs its own matching delivery/start/handoff identity.
+                delivery_interaction_id, profile_handoff, interaction_started_event = (
+                    prepare_first_delivery()
+                )
+                delivery_batch_index = 0
+            else:
+                delivery_batch_index += 1
 
     async def _compact_session(
         self,
@@ -15508,6 +15554,7 @@ class SessionEngine:
     async def _handle_queued_messages_before_completion(
         self,
         *,
+        finish_completion: Callable[[Session, dict[str, Any] | None], AsyncGenerator[Event, None]],
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
@@ -15521,9 +15568,39 @@ class SessionEngine:
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None = None,
         predecessor_settlement_event: Event | None = None,
-    ) -> tuple[bool, list[Event], InvocationContext | None]:
-        if step < max_steps:
-            events, rebound_context = await self._deliver_queued_session_messages(
+        task_id: str | None = None,
+    ) -> AsyncGenerator[Event | _QueuedCompletionResult, None]:
+        events: list[Event] = []
+        delivery_method = self.session_store.deliver_queued_session_messages
+        store_type = type(delivery_method.__self__)
+        delivery_owner = next(
+            (
+                owner
+                for owner in type.__getattribute__(store_type, "__mro__")
+                if "deliver_queued_session_messages" in type.__getattribute__(owner, "__dict__")
+            ),
+            None,
+        )
+        declaration = (
+            {} if delivery_owner is None else type.__getattribute__(delivery_owner, "__dict__")
+        )
+        version = declaration.get("session_message_lifecycle_version")
+        store_version = getattr(store_type, "session_message_lifecycle_version", None)
+        can_reject_only = (
+            type(store_version) is int
+            and store_version == 1
+            and type(version) is int
+            and version == 1
+            and getattr(delivery_method, "__func__", None)
+            is declaration.get("deliver_queued_session_messages")
+        )
+        while True:
+            if step >= max_steps and not can_reject_only:
+                # Ordinary unconditioned SDK steering does not require the new
+                # lifecycle capability. Preserve its queue and existing limit stop.
+                break
+            message_count = len(messages)
+            drained_events, rebound_context = await self._deliver_queued_session_messages(
                 session_id=session.id,
                 session=session,
                 registered_agent=registered_agent,
@@ -15532,26 +15609,200 @@ class SessionEngine:
                 include_on_idle=True,
                 invocation_context=invocation_context,
                 predecessor_settlement_event=predecessor_settlement_event,
+                reject_only=step >= max_steps,
             )
-            return True, events, rebound_context
-        events = [
-            event
-            async for event in self._stop_session_for_model_step_limit(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=environment_name,
-                messages=messages,
-                step=step,
-                max_steps=max_steps,
-                run_started_at=run_started_at,
-                turn_usage_tracker=turn_usage_tracker,
-                active_run=active_run,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
+            events.extend(drained_events)
+            if len(messages) != message_count:
+                yield _QueuedCompletionResult("continue", session, events, rebound_context)
+                return
+            if rebound_context is not invocation_context:
+                raise SessionRunFenced("Terminal-only queue drain changed invocation authority.")
+
+            # Expose rejection evidence before committing session completion.
+            # A consumer closing here can release the unchanged predecessor
+            # settlement without inventing terminal-session proof.
+            for event in events:
+                yield event
+            events.clear()
+
+            # The predecessor interaction already has an immutable settlement.
+            # Complete only the session; replaying that settlement cannot make
+            # a new empty-queue decision or install a finalization marker.
+            marker: dict[str, Any] | None = None
+            mutation: dict[str, Any] | None = None
+            binding = (
+                None
+                if registered_environment is None
+                else registered_environment.environment.binding
             )
-        ]
-        return False, events, invocation_context
+            if (
+                binding is not None
+                and registered_environment is not None
+                and registered_environment.bound_workspace is not None
+                and binding._completion_requires_successful_finalization(
+                    registered_environment.bound_workspace
+                )
+            ):
+                if execution_profile is None:
+                    raise RuntimeError("Completion-critical finalization lost its profile.")
+                marker, mutation = (
+                    self._environment_lifecycle.prepare_completion_finalization_transition(
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                        task_id=task_id,
+                    )
+                )
+
+            async def commit_and_finish_completion(
+                marker: dict[str, Any] | None = marker,
+                mutation: dict[str, Any] | None = mutation,
+            ) -> _QueuedCompletionResult:
+                # Mutation admission must atomically check the empty queue,
+                # preserve epoch/profile, and fence the current store owner.
+                completed_session = (
+                    await self.session_store.transition_status_if_no_queued_messages(
+                        session.id,
+                        from_statuses={SessionStatus.RUNNING},
+                        to_status=SessionStatus.RUNNING
+                        if mutation is not None
+                        else SessionStatus.COMPLETED,
+                        **({"checkpoint_mutation": mutation} if mutation is not None else {}),
+                    )
+                )
+                # Protect only the commit-to-terminal-proof window. Post-terminal
+                # hooks keep their existing cancellation-aware owner; draining
+                # them under this shield could make a cooperative hook unkillable.
+                continuation = finish_completion(completed_session, marker)
+                try:
+                    completed_events, _ = await _collect_through_event_type(
+                        continuation,
+                        (
+                            EventType.SESSION_COMPLETED,
+                            EventType.SESSION_FAILED,
+                            EventType.SESSION_INTERRUPTED,
+                        ),
+                        missing_message="Queued completion produced no terminal event.",
+                    )
+                    completed_session = await self._require_session(session.id)
+                except BaseException as publication_close_failure:
+                    await self._run_cleanup_steps(
+                        authoritative_failure=publication_close_failure,
+                        steps=(("queued completion publication close", continuation.aclose),),
+                    )
+                    raise
+                return _QueuedCompletionResult(
+                    "complete",
+                    completed_session,
+                    completed_events,
+                    invocation_context,
+                    marker,
+                    continuation,
+                )
+
+            async def owned_completion() -> tuple[
+                CapturedAwaitableOutcome[_QueuedCompletionResult], Event | None
+            ]:
+                captured = await capture_awaitable_outcome(commit_and_finish_completion)
+                return captured, _current_session_invocation_terminal_event(session.id)
+
+            continuation: AsyncGenerator[Event, None] | None = None
+            try:
+                # Reads before dispatch are abortable. Once dispatched, the
+                # store revalidates the owner under its atomic mutation fence.
+                await self._session_control.raise_if_interrupted(session.id)
+                current = await self.session_store.load(session.id)
+                current_profile = active_invocation_execution_profile_from_checkpoint(
+                    await self.session_store.load_checkpoint(session.id)
+                )
+                if (
+                    invocation_context is None
+                    or current is None
+                    or current.instance_id != session.instance_id
+                    or current.run_epoch != session.run_epoch
+                    or current_profile != invocation_context.active_profile
+                ):
+                    raise SessionRunFenced("Terminal-only completion lost invocation authority.")
+                completion_task = asyncio.create_task(
+                    owned_completion(), name="cayu-queued-session-completion"
+                )
+                outcome = await await_shielded_task_outcome(completion_task)
+                if outcome.error is not None:
+                    raise outcome.error
+                assert outcome.result is not None
+                captured, terminal_event = outcome.result
+                if captured.result is not None:
+                    continuation = captured.result.continuation
+                if terminal_event is not None:
+                    # The child owns publication; ContextVars do not merge back.
+                    # Carry only its exact durable terminal proof to our finalizer.
+                    _mark_session_invocation_terminal_event(terminal_event)
+                if outcome.cancellation is not None:
+                    cancellation = outcome.cancellation
+                    current_task = asyncio.current_task()
+                    requests_to_preserve = outcome.cancellation_requests_consumed + (
+                        0 if current_task is None else current_task.cancelling()
+                    )
+                    if requests_to_preserve:
+                        retain_workspace_observation_pending_cancellation_requests(
+                            cancellation, requests_to_preserve
+                        )
+                    if captured.error is not None:
+                        if isinstance(captured.error, Exception):
+                            raise cancellation from captured.error
+                        failure = BaseExceptionGroup(
+                            "Queued completion failed with caller cancellation.",
+                            [captured.error, cancellation],
+                        )
+                        retain_workspace_observation_pending_cancellation_requests(
+                            failure, requests_to_preserve
+                        )
+                        raise failure from None
+                    raise cancellation
+                if captured.error is not None:
+                    raise captured.error
+                assert captured.result is not None
+                assert continuation is not None
+                for event in captured.result.events:
+                    yield event
+                async for event in continuation:
+                    yield event
+                yield _QueuedCompletionResult(
+                    "complete", captured.result.session, [], invocation_context, marker
+                )
+            except SessionQueuedMessagesPending:
+                if step >= max_steps:
+                    break
+                continue
+            except (SessionRunFenced, SessionStatusConflict):
+                await self._session_control.raise_if_interrupted(session.id)
+                raise
+            finally:
+                if continuation is not None:
+                    await self._run_cleanup_steps(
+                        authoritative_failure=sys.exception(),
+                        steps=(("queued completion continuation close", continuation.aclose),),
+                    )
+            return
+        events.extend(
+            [
+                event
+                async for event in self._stop_session_for_model_step_limit(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    messages=messages,
+                    step=step,
+                    max_steps=max_steps,
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                )
+            ]
+        )
+        yield _QueuedCompletionResult("stopped", session, events, invocation_context)
 
     async def _enforce_compaction_budget_limits(
         self,
@@ -21542,6 +21793,229 @@ class SessionEngine:
         current_task = asyncio.current_task()
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None
         run_started_at = time.monotonic()
+
+        async def complete_session(
+            completed_session: Session,
+            completion_finalization_marker: dict[str, Any] | None,
+        ) -> AsyncGenerator[Event, None]:
+            nonlocal session, task_finished
+            session = completed_session
+            prefinalized_completion: EnvironmentBindingFinalizeResult | None = None
+            binding = (
+                None
+                if registered_environment is None
+                else registered_environment.environment.binding
+            )
+            if (
+                binding is not None
+                and registered_environment is not None
+                and registered_environment.bound_workspace is not None
+                and binding._completion_requires_successful_finalization(
+                    registered_environment.bound_workspace
+                )
+            ):
+                if execution_profile is None:
+                    raise RuntimeError(
+                        "Completion-critical workspace finalization lost its execution profile."
+                    )
+                completion_marker = completion_finalization_marker
+                if completion_marker is None:
+                    raise RuntimeError(
+                        "Completion-critical workspace finalization lost its durable marker."
+                    )
+                completion_event = await self._bind_event_to_session_run_operation(
+                    Event(
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                    ),
+                    session=session,
+                )
+                prefinalized_completion = await self._environment_lifecycle.finalize_terminal_event(
+                    event=completion_event,
+                    session=session,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                )
+                finalize_error = prefinalized_completion.event.payload.get("binding_finalize_error")
+                if type(finalize_error) is dict:
+                    # Capture conditional-write progress made before a partial
+                    # failure so a restarted worker resumes at the exact
+                    # revision boundary. A stale pre-attempt marker remains
+                    # replay-safe if this refresh itself cannot be acknowledged.
+                    completion_marker = (
+                        await self._environment_lifecycle.checkpoint_completion_finalization(
+                            session=session,
+                            registered_environment=registered_environment,
+                            execution_profile=execution_profile,
+                            task_id=task_id,
+                        )
+                    )
+                    error_message = finalize_error.get("error")
+                    error_type = finalize_error.get("error_type")
+                    if type(error_message) is not str or type(error_type) is not str:
+                        raise RuntimeError(
+                            "Workspace finalization failure lost its durable diagnostic."
+                        )
+                    if task_id is not None:
+                        task = await self._fail_task(
+                            task_id=task_id,
+                            task_worker_id=task_worker_id,
+                            task_handoff_id=task_handoff_id,
+                            session=session,
+                            error=task_failure_payload_from_diagnostic(
+                                ExceptionDiagnostic(
+                                    message=error_message,
+                                    error_type=error_type,
+                                ),
+                                session_id=session.id,
+                                additional_fields={
+                                    "phase": "workspace_finalize",
+                                    "workspace_output_committed": False,
+                                },
+                            ),
+                        )
+                        task_finished = True
+                        if active_run is not None:
+                            active_run.task_finished = True
+                        yield await self._event_writer.emit(
+                            _task_event(
+                                event_type=EventType.TASK_FAILED,
+                                task=task,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                            )
+                        )
+                    (
+                        session,
+                        interaction_failed_event,
+                        _,
+                    ) = await self._publish_sibling_interaction_transition(
+                        session=session,
+                        invocation_context=invocation_context,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        to_status=SessionStatus.FAILED,
+                        execution_profile=execution_profile,
+                    )
+                    if interaction_failed_event is not None:
+                        yield interaction_failed_event
+                    for failed_turn_event in await self._emit_turn_completed_once(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        status=SessionStatus.FAILED,
+                        run_started_at=run_started_at,
+                        usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                        invocation_context=invocation_context,
+                    ):
+                        yield failed_turn_event
+                    failed_payload = copy_json_value(
+                        prefinalized_completion.event.payload,
+                        "payload",
+                    )
+                    failed_payload.update(
+                        {
+                            "error": error_message,
+                            "error_type": error_type,
+                            "failure_phase": "workspace_finalize",
+                            "workspace_output_committed": False,
+                        }
+                    )
+                    failed_terminal = copy_event(prefinalized_completion.event).model_copy(
+                        update={
+                            "type": EventType.SESSION_FAILED,
+                            "payload": failed_payload,
+                        },
+                        deep=True,
+                    )
+                    failed_finalize_result = EnvironmentBindingFinalizeResult(
+                        event=failed_terminal,
+                        events=prefinalized_completion.events,
+                        cancellation=prefinalized_completion.cancellation,
+                        cancellation_requests_consumed=(
+                            prefinalized_completion.cancellation_requests_consumed
+                        ),
+                    )
+                    terminal_stream = self._emit_terminal_event_with_hooks(
+                        event=failed_terminal,
+                        phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                        environment_finalize_result=failed_finalize_result,
+                    )
+                    async with contextlib.aclosing(terminal_stream) as owned_terminal_stream:
+                        async for failed_terminal_event in owned_terminal_stream:
+                            yield failed_terminal_event
+                    return
+                session = await self._environment_lifecycle.complete_completion_finalization(
+                    session=session,
+                    expected_marker=completion_marker,
+                )
+            if task_id is not None:
+                await self._session_control.raise_if_interrupted(session.id)
+                task = await self._complete_task(
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+                task_finished = True
+                if active_run is not None:
+                    active_run.task_finished = True
+                yield await self._event_writer.emit(
+                    _task_event(
+                        event_type=EventType.TASK_COMPLETED,
+                        task=task,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                )
+            for event in await self._emit_turn_completed_once(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=SessionStatus.COMPLETED,
+                run_started_at=run_started_at,
+                usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+                invocation_context=invocation_context,
+            ):
+                yield event
+            terminal_stream = self._emit_terminal_event_with_hooks(
+                event=(
+                    prefinalized_completion.event
+                    if prefinalized_completion is not None
+                    else Event(
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                    )
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+                environment_finalize_result=prefinalized_completion,
+            )
+            async with contextlib.aclosing(terminal_stream) as owned_terminal_stream:
+                async for event in owned_terminal_stream:
+                    yield event
+
         # A fresh run means any earlier interrupt was fully handled before the
         # session transitioned back to RUNNING; drop a stale signal so it does
         # not force per-delta store polling for the whole resumed run.
@@ -22022,31 +22496,43 @@ class SessionEngine:
                         raise RuntimeError(
                             "Recovered structured-output result has no valid model step."
                         ) from None
-                    (
-                        should_continue,
-                        queued_events,
-                        rebound_invocation_context,
-                    ) = await self._handle_queued_messages_before_completion(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        messages=messages,
-                        step=recovered_step,
-                        max_steps=max_steps,
-                        run_started_at=run_started_at,
-                        turn_usage_tracker=turn_usage_tracker,
-                        active_run=active_run,
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                        predecessor_settlement_event=interaction_completed_event,
+                    queued_completion = None
+                    async with contextlib.aclosing(
+                        self._handle_queued_messages_before_completion(
+                            finish_completion=complete_session,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=environment_name,
+                            messages=messages,
+                            step=recovered_step,
+                            max_steps=max_steps,
+                            run_started_at=run_started_at,
+                            turn_usage_tracker=turn_usage_tracker,
+                            active_run=active_run,
+                            execution_profile=execution_profile,
+                            invocation_context=invocation_context,
+                            predecessor_settlement_event=interaction_completed_event,
+                            task_id=task_id,
+                        )
+                    ) as queued_stream:
+                        async for queued_item in queued_stream:
+                            if isinstance(queued_item, Event):
+                                yield queued_item
+                            else:
+                                queued_completion = queued_item
+                    assert queued_completion is not None
+                    session = queued_completion.session
+                    completion_finalization_marker = (
+                        queued_completion.completion_finalization_marker
                     )
+                    rebound_invocation_context = queued_completion.invocation_context
                     if rebound_invocation_context is None:
                         raise RuntimeError("Queued handoff lost live invocation authority.")
                     invocation_context = rebound_invocation_context
-                    for event in queued_events:
+                    for event in queued_completion.events:
                         yield event
-                    if not should_continue:
+                    if queued_completion.outcome in {"stopped", "complete"}:
                         return
                 else:
                     skip_model_steps = True
@@ -22772,29 +23258,42 @@ class SessionEngine:
                         if interaction_completed_event is not None:
                             yield interaction_completed_event
                         if not session_completed:
-                            (
-                                should_continue,
-                                queued_events,
-                                rebound_invocation_context,
-                            ) = await self._handle_queued_messages_before_completion(
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                environment_name=environment_name,
-                                messages=messages,
-                                step=step,
-                                max_steps=max_steps,
-                                run_started_at=run_started_at,
-                                turn_usage_tracker=turn_usage_tracker,
-                                active_run=active_run,
-                                execution_profile=execution_profile,
-                                invocation_context=invocation_context,
-                                predecessor_settlement_event=interaction_completed_event,
+                            queued_completion = None
+                            async with contextlib.aclosing(
+                                self._handle_queued_messages_before_completion(
+                                    finish_completion=complete_session,
+                                    session=session,
+                                    registered_agent=registered_agent,
+                                    registered_environment=registered_environment,
+                                    environment_name=environment_name,
+                                    messages=messages,
+                                    step=step,
+                                    max_steps=max_steps,
+                                    run_started_at=run_started_at,
+                                    turn_usage_tracker=turn_usage_tracker,
+                                    active_run=active_run,
+                                    execution_profile=execution_profile,
+                                    invocation_context=invocation_context,
+                                    predecessor_settlement_event=interaction_completed_event,
+                                    task_id=task_id,
+                                )
+                            ) as queued_stream:
+                                async for queued_item in queued_stream:
+                                    if isinstance(queued_item, Event):
+                                        yield queued_item
+                                    else:
+                                        queued_completion = queued_item
+                            assert queued_completion is not None
+                            session = queued_completion.session
+                            completion_finalization_marker = (
+                                queued_completion.completion_finalization_marker
                             )
-                            install_queued_invocation_context(rebound_invocation_context)
-                            for event in queued_events:
+                            install_queued_invocation_context(queued_completion.invocation_context)
+                            for event in queued_completion.events:
                                 yield event
-                            if not should_continue:
+                            if queued_completion.outcome == "stopped":
+                                return
+                            if queued_completion.outcome == "complete":
                                 return
                             continue
                         break
@@ -22878,29 +23377,46 @@ class SessionEngine:
                                 if interaction_completed_event is not None:
                                     yield interaction_completed_event
                                 if not session_completed:
-                                    (
-                                        should_continue,
-                                        queued_events,
-                                        rebound_invocation_context,
-                                    ) = await self._handle_queued_messages_before_completion(
-                                        session=session,
-                                        registered_agent=registered_agent,
-                                        registered_environment=registered_environment,
-                                        environment_name=environment_name,
-                                        messages=messages,
-                                        step=step,
-                                        max_steps=max_steps,
-                                        run_started_at=run_started_at,
-                                        turn_usage_tracker=turn_usage_tracker,
-                                        active_run=active_run,
-                                        execution_profile=execution_profile,
-                                        invocation_context=invocation_context,
-                                        predecessor_settlement_event=(interaction_completed_event),
+                                    queued_completion = None
+                                    async with contextlib.aclosing(
+                                        self._handle_queued_messages_before_completion(
+                                            finish_completion=complete_session,
+                                            session=session,
+                                            registered_agent=registered_agent,
+                                            registered_environment=registered_environment,
+                                            environment_name=environment_name,
+                                            messages=messages,
+                                            step=step,
+                                            max_steps=max_steps,
+                                            run_started_at=run_started_at,
+                                            turn_usage_tracker=turn_usage_tracker,
+                                            active_run=active_run,
+                                            execution_profile=execution_profile,
+                                            invocation_context=invocation_context,
+                                            predecessor_settlement_event=(
+                                                interaction_completed_event
+                                            ),
+                                            task_id=task_id,
+                                        )
+                                    ) as queued_stream:
+                                        async for queued_item in queued_stream:
+                                            if isinstance(queued_item, Event):
+                                                yield queued_item
+                                            else:
+                                                queued_completion = queued_item
+                                    assert queued_completion is not None
+                                    session = queued_completion.session
+                                    completion_finalization_marker = (
+                                        queued_completion.completion_finalization_marker
                                     )
-                                    install_queued_invocation_context(rebound_invocation_context)
-                                    for event in queued_events:
+                                    install_queued_invocation_context(
+                                        queued_completion.invocation_context
+                                    )
+                                    for event in queued_completion.events:
                                         yield event
-                                    if not should_continue:
+                                    if queued_completion.outcome == "stopped":
+                                        return
+                                    if queued_completion.outcome == "complete":
                                         return
                                     continue
                                 break
@@ -23105,29 +23621,42 @@ class SessionEngine:
                     if interaction_completed_event is not None:
                         yield interaction_completed_event
                     if not session_completed:
-                        (
-                            should_continue,
-                            queued_events,
-                            rebound_invocation_context,
-                        ) = await self._handle_queued_messages_before_completion(
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            environment_name=environment_name,
-                            messages=messages,
-                            step=step,
-                            max_steps=max_steps,
-                            run_started_at=run_started_at,
-                            turn_usage_tracker=turn_usage_tracker,
-                            active_run=active_run,
-                            execution_profile=execution_profile,
-                            invocation_context=invocation_context,
-                            predecessor_settlement_event=interaction_completed_event,
+                        queued_completion = None
+                        async with contextlib.aclosing(
+                            self._handle_queued_messages_before_completion(
+                                finish_completion=complete_session,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                environment_name=environment_name,
+                                messages=messages,
+                                step=step,
+                                max_steps=max_steps,
+                                run_started_at=run_started_at,
+                                turn_usage_tracker=turn_usage_tracker,
+                                active_run=active_run,
+                                execution_profile=execution_profile,
+                                invocation_context=invocation_context,
+                                predecessor_settlement_event=interaction_completed_event,
+                                task_id=task_id,
+                            )
+                        ) as queued_stream:
+                            async for queued_item in queued_stream:
+                                if isinstance(queued_item, Event):
+                                    yield queued_item
+                                else:
+                                    queued_completion = queued_item
+                        assert queued_completion is not None
+                        session = queued_completion.session
+                        completion_finalization_marker = (
+                            queued_completion.completion_finalization_marker
                         )
-                        install_queued_invocation_context(rebound_invocation_context)
-                        for event in queued_events:
+                        install_queued_invocation_context(queued_completion.invocation_context)
+                        for event in queued_completion.events:
                             yield event
-                        if not should_continue:
+                        if queued_completion.outcome == "stopped":
+                            return
+                        if queued_completion.outcome == "complete":
                             return
                         continue
                     break
@@ -23183,217 +23712,11 @@ class SessionEngine:
                         yield event
                     return
 
-            prefinalized_completion: EnvironmentBindingFinalizeResult | None = None
-            binding = (
-                None
-                if registered_environment is None
-                else registered_environment.environment.binding
-            )
-            if (
-                binding is not None
-                and registered_environment is not None
-                and registered_environment.bound_workspace is not None
-                and binding._completion_requires_successful_finalization(
-                    registered_environment.bound_workspace
-                )
-            ):
-                if execution_profile is None:
-                    raise RuntimeError(
-                        "Completion-critical workspace finalization lost its execution profile."
-                    )
-                completion_marker = completion_finalization_marker
-                if completion_marker is None:
-                    raise RuntimeError(
-                        "Completion-critical workspace finalization lost its durable marker."
-                    )
-                completion_event = await self._bind_event_to_session_run_operation(
-                    Event(
-                        type=EventType.SESSION_COMPLETED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                    ),
-                    session=session,
-                )
-                prefinalized_completion = await self._environment_lifecycle.finalize_terminal_event(
-                    event=completion_event,
-                    session=session,
-                    registered_environment=registered_environment,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                )
-                finalize_error = prefinalized_completion.event.payload.get("binding_finalize_error")
-                if type(finalize_error) is dict:
-                    # Capture conditional-write progress made before a partial
-                    # failure so a restarted worker resumes at the exact
-                    # revision boundary. A stale pre-attempt marker remains
-                    # replay-safe if this refresh itself cannot be acknowledged.
-                    completion_marker = (
-                        await self._environment_lifecycle.checkpoint_completion_finalization(
-                            session=session,
-                            registered_environment=registered_environment,
-                            execution_profile=execution_profile,
-                            task_id=task_id,
-                        )
-                    )
-                    error_message = finalize_error.get("error")
-                    error_type = finalize_error.get("error_type")
-                    if type(error_message) is not str or type(error_type) is not str:
-                        raise RuntimeError(
-                            "Workspace finalization failure lost its durable diagnostic."
-                        )
-                    if task_id is not None:
-                        task = await self._fail_task(
-                            task_id=task_id,
-                            task_worker_id=task_worker_id,
-                            task_handoff_id=task_handoff_id,
-                            session=session,
-                            error=task_failure_payload_from_diagnostic(
-                                ExceptionDiagnostic(
-                                    message=error_message,
-                                    error_type=error_type,
-                                ),
-                                session_id=session.id,
-                                additional_fields={
-                                    "phase": "workspace_finalize",
-                                    "workspace_output_committed": False,
-                                },
-                            ),
-                        )
-                        task_finished = True
-                        if active_run is not None:
-                            active_run.task_finished = True
-                        yield await self._event_writer.emit(
-                            _task_event(
-                                event_type=EventType.TASK_FAILED,
-                                task=task,
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                            )
-                        )
-                    (
-                        session,
-                        interaction_failed_event,
-                        _,
-                    ) = await self._publish_sibling_interaction_transition(
-                        session=session,
-                        invocation_context=invocation_context,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        to_status=SessionStatus.FAILED,
-                        execution_profile=execution_profile,
-                    )
-                    if interaction_failed_event is not None:
-                        yield interaction_failed_event
-                    for failed_turn_event in await self._emit_turn_completed_once(
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        status=SessionStatus.FAILED,
-                        run_started_at=run_started_at,
-                        usage_tracker=turn_usage_tracker,
-                        active_run=active_run,
-                        invocation_context=invocation_context,
-                    ):
-                        yield failed_turn_event
-                    failed_payload = copy_json_value(
-                        prefinalized_completion.event.payload,
-                        "payload",
-                    )
-                    failed_payload.update(
-                        {
-                            "error": error_message,
-                            "error_type": error_type,
-                            "failure_phase": "workspace_finalize",
-                            "workspace_output_committed": False,
-                        }
-                    )
-                    failed_terminal = copy_event(prefinalized_completion.event).model_copy(
-                        update={
-                            "type": EventType.SESSION_FAILED,
-                            "payload": failed_payload,
-                        },
-                        deep=True,
-                    )
-                    failed_finalize_result = EnvironmentBindingFinalizeResult(
-                        event=failed_terminal,
-                        events=prefinalized_completion.events,
-                        cancellation=prefinalized_completion.cancellation,
-                        cancellation_requests_consumed=(
-                            prefinalized_completion.cancellation_requests_consumed
-                        ),
-                    )
-                    async for failed_terminal_event in self._emit_terminal_event_with_hooks(
-                        event=failed_terminal,
-                        phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                        environment_finalize_result=failed_finalize_result,
-                    ):
-                        yield failed_terminal_event
-                    return
-                session = await self._environment_lifecycle.complete_completion_finalization(
-                    session=session,
-                    expected_marker=completion_marker,
-                )
-            if task_id is not None:
-                await self._session_control.raise_if_interrupted(session.id)
-                task = await self._complete_task(
-                    task_id=task_id,
-                    task_worker_id=task_worker_id,
-                    task_handoff_id=task_handoff_id,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                )
-                task_finished = True
-                if active_run is not None:
-                    active_run.task_finished = True
-                yield await self._event_writer.emit(
-                    _task_event(
-                        event_type=EventType.TASK_COMPLETED,
-                        task=task,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                    )
-                )
-            for event in await self._emit_turn_completed_once(
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-                status=SessionStatus.COMPLETED,
-                run_started_at=run_started_at,
-                usage_tracker=turn_usage_tracker,
-                active_run=active_run,
-                invocation_context=invocation_context,
-            ):
-                yield event
-            async for event in self._emit_terminal_event_with_hooks(
-                event=(
-                    prefinalized_completion.event
-                    if prefinalized_completion is not None
-                    else Event(
-                        type=EventType.SESSION_COMPLETED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                    )
-                ),
-                phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-                environment_finalize_result=prefinalized_completion,
-            ):
-                yield event
+            async with contextlib.aclosing(
+                complete_session(session, completion_finalization_marker)
+            ) as completion_stream:
+                async for event in completion_stream:
+                    yield event
         except ToolApprovalRequired as exc:
             await materialize_deferred_messages_after_failure()
             (
@@ -28569,7 +28892,7 @@ class SessionEngine:
             yield terminal_event
             if not run_runtime_hooks:
                 return
-            async for hook_event in self._run_runtime_hooks(
+            hook_stream = self._run_runtime_hooks(
                 phase=phase,
                 session=session,
                 terminal_event=terminal_event,
@@ -28581,12 +28904,15 @@ class SessionEngine:
                 ),
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
-            ):
-                yield hook_event
+            )
+            async with contextlib.aclosing(hook_stream) as owned_hook_stream:
+                async for hook_event in owned_hook_stream:
+                    yield hook_event
 
         try:
-            async for emitted_event in emit_finalized_terminal_boundary():
-                yield emitted_event
+            async with contextlib.aclosing(emit_finalized_terminal_boundary()) as terminal_stream:
+                async for emitted_event in terminal_stream:
+                    yield emitted_event
         except BaseException as post_finalize_failure:
             cancellation = finalize_result.cancellation
             if cancellation is None or any(

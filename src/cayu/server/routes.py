@@ -28,6 +28,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StringConstraints,
     ValidationError,
@@ -281,6 +282,16 @@ from cayu.runtime.provider_operations import (
     inspect_provider_operation,
 )
 from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.session_message_lifecycle import (
+    SessionMessageAccessContext,
+    SessionMessageAccessDenied,
+    SessionMessageActionRequest,
+    SessionMessageConditions,
+    SessionMessageConflict,
+    SessionMessageCursor,
+    SessionMessageQuery,
+    SessionMessageSource,
+)
 from cayu.runtime.sessions import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
@@ -302,7 +313,9 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionDebugState,
+    SessionMessageActionResult,
     SessionMessageDeliveryMode,
+    SessionMessageInspection,
     SessionOrder,
     SessionOutcome,
     SessionQuery,
@@ -384,6 +397,7 @@ from cayu.server.contracts import (
     TOOL_DISCOVERY_VIEW_ENDPOINT_RESPONSES,
     USAGE_ROLLUP_ENDPOINT_RESPONSES,
     AgentsResponse,
+    ApiErrorResponse,
     ApiInteractionSummary,
     ApiReviewedKnowledgeEntry,
     ApiSession,
@@ -873,6 +887,70 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
             return response
 
         return bounded_route_handler
+
+
+SESSION_MESSAGE_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    status: {
+        "model": ApiErrorResponse,
+        "description": description,
+        "headers": {"Cache-Control": {"schema": {"type": "string", "const": "private, no-store"}}},
+    }
+    for status, description in (
+        (400, "The request attempts to override authenticated actor identity."),
+        (401, "Authentication is required."),
+        (403, "Session-message access is not authorized."),
+        (409, "The request conflicts with exact durable authority or terminal state."),
+        (413, "The request exceeds the private request byte limit."),
+        (422, "Invalid session-message request; rejected input is not reflected."),
+        (500, "The session-message operation failed."),
+        (503, "The store does not support this session-message operation."),
+    )
+}
+
+
+class _PrivateSessionMessageRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound queue requests and keep every response/diagnostic content-private."""
+
+    max_request_bytes = 1024 * 1024
+    invalid_request_detail = "Invalid session-message request."
+    oversized_request_detail = "Session-message request exceeds the server byte limit."
+    reject_duplicate_json_keys = True
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def private_handler(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except SessionMessageAccessDenied:
+                return _private_no_store_error_response(
+                    403, "Session-message access is not authorized."
+                )
+            except (SessionMessageConflict, ValueError, TypeError):
+                return _private_no_store_error_response(409, "Session-message request conflicts.")
+            except KeyError:
+                return _private_no_store_error_response(
+                    403, "Session-message access is not authorized."
+                )
+            except NotImplementedError:
+                return _private_no_store_error_response(
+                    503, "Session-message operation is unavailable."
+                )
+            except HTTPException as exc:
+                return _private_no_store_error_response(
+                    exc.status_code, "Session-message request was denied."
+                )
+            except Exception:
+                return _private_no_store_error_response(500, "Session-message operation failed.")
+
+        return private_handler
+
+
+def _private_session_message_route_class(auth: AuthDependency | None) -> type[APIRoute]:
+    class PrivateSessionMessageRoute(_PrivateSessionMessageRoute):
+        preparse_auth = None if auth is None else staticmethod(auth)
+
+    return PrivateSessionMessageRoute
 
 
 class _BoundedSessionTopologyRoute(_BoundedPrivateJsonBodyRoute):
@@ -1381,6 +1459,11 @@ async def _accepted_event_stream_response(
                 "Terminal event publication outcome is uncertain; inspect durable "
                 "session state before retrying the mutation."
             ),
+        ) from acceptance_error
+    if isinstance(acceptance_error, SessionMessageAccessDenied):
+        raise HTTPException(
+            status_code=403,
+            detail="Session-message access is not authorized.",
         ) from acceptance_error
     if isinstance(acceptance_error, KeyError):
         raise HTTPException(
@@ -1912,6 +1995,7 @@ class EnqueueSessionMessageBody(BaseModel):
     message: Message | None = None
     delivery_mode: SessionMessageDeliveryMode
     requested_by: ResolutionActor | None = None
+    conditions: SessionMessageConditions = Field(default_factory=SessionMessageConditions)
 
     @field_validator("content")
     @classmethod
@@ -1952,6 +2036,21 @@ class EnqueueSessionMessageBody(BaseModel):
                 "EnqueueSessionMessageBody.requested_by",
             )
         return self
+
+
+class SessionMessageActionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    session_instance_id: str = Field(min_length=1, max_length=512)
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SessionMessageSourceBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    include_transcript_digest: StrictBool = False
+    include_checkpoint_digest: StrictBool = False
 
 
 class UpdateSessionLabelsBody(BaseModel):
@@ -4094,6 +4193,10 @@ def create_router(
 
     router = APIRouter(prefix=api_prefix, lifespan=evals_lifespan)
     bounded_control_plane_router = APIRouter(route_class=_BoundedControlPlaneRequestRoute)
+    session_message_router = APIRouter(
+        route_class=_private_session_message_route_class(auth),
+        responses=SESSION_MESSAGE_ENDPOINT_RESPONSES,
+    )
     bounded_evaluation_promotion_router = APIRouter(route_class=_BoundedEvaluationPromotionRoute)
     bounded_captured_evaluation_router = APIRouter(route_class=_BoundedCapturedEvaluationRoute)
     bounded_evals_router = APIRouter(
@@ -4167,6 +4270,14 @@ def create_router(
         return await auth_dependency(request)
 
     optional_auth_context = Depends(_optional_auth_context)
+
+    async def _session_message_context(request: Request) -> SessionMessageAccessContext:
+        context = await _optional_auth_context(request)
+        if context is None:
+            raise SessionMessageAccessDenied()
+        return SessionMessageAccessContext(subject=context.subject, tenant=context.tenant)
+
+    session_message_context = Depends(_session_message_context)
 
     async def _tool_view_auth_context(request: Request) -> AuthContext:
         context = await _optional_auth_context(request)
@@ -9100,46 +9211,47 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
-    @router.post(
+    @session_message_router.post(
         "/sessions/{session_id}/messages",
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses={**STREAMING_ENDPOINT_RESPONSES, **SESSION_MESSAGE_ENDPOINT_RESPONSES},
     )
     async def enqueue_session_message(
         session_id: NonBlankString,
         body: EnqueueSessionMessageBody,
         http_request: Request,
-        auth_context: AuthContext | None = optional_auth_context,
+        context: SessionMessageAccessContext = session_message_context,
         mutation_id: MutationIdHeader = None,
     ):
-        replay = await _replay_events_response(
-            http_request,
-            expected_session_id=session_id,
-        )
-        if replay is not None:
-            return replay
-        private_session_id = await _resolve_public_session_id(session_id)
-        session = await session_store.load(private_session_id)
-        if session is None:
+        if body.requested_by is not None:
             raise HTTPException(
-                status_code=404,
-                detail=f"Session not found: {session_id}",
+                status_code=400, detail="Session-message actors are derived from authentication."
             )
+        request = EnqueueSessionMessageRequest(
+            session_id=session_id,
+            idempotency_key=body.idempotency_key,
+            content=body.content,
+            message=body.message,
+            delivery_mode=body.delivery_mode,
+            conditions=body.conditions,
+        )
+        await cayu_app._authorize_session_message_enqueue(request, context=context)
+        if "last-event-id" in http_request.headers:
+            raise HTTPException(
+                status_code=400,
+                detail="Retry session-message acceptance with the identical request body.",
+            )
+        private_session_id = await _resolve_public_session_id(session_id)
 
         async def operation() -> AsyncIterator[Event]:
-            result = await cayu_app.enqueue_session_message(
-                EnqueueSessionMessageRequest(
-                    session_id=session_id,
-                    idempotency_key=body.idempotency_key,
-                    content=body.content,
-                    message=body.message,
-                    delivery_mode=body.delivery_mode,
-                    requested_by=_request_interruption_actor(
-                        auth_context,
-                        body.requested_by,
-                    ),
-                )
-            )
+            try:
+                result = await cayu_app._enqueue_session_message_from_http(request, context=context)
+            except SessionMessageAccessDenied:
+                raise
+            except (ValueError, TypeError, KeyError):
+                raise SessionMessageConflict() from None
+            except Exception:
+                raise RuntimeError("Session-message operation failed.") from None
             yield result.event
 
         return await _accepted_event_stream_response(
@@ -9151,7 +9263,131 @@ def create_router(
                 mutation_kind="session.message.enqueue",
                 session_id=private_session_id,
             ),
-            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
+            conflict_error_types=(SessionMessageConflict,),
+        )
+
+    @session_message_router.get(
+        "/sessions/{session_id}/messages",
+        response_model=SessionMessageInspection,
+    )
+    async def inspect_session_messages(
+        session_id: str,
+        http_request: Request,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        cursor_session_instance_id: Annotated[
+            str | None, Query(min_length=1, max_length=512)
+        ] = None,
+        cursor_through_ordering_key: Annotated[
+            int | None, Query(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+        ] = None,
+        cursor_after_priority: Annotated[int | None, Query(ge=0, le=2)] = None,
+        cursor_after_ordering_key: Annotated[
+            int | None, Query(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+        ] = None,
+        context: SessionMessageAccessContext = session_message_context,
+    ) -> SessionMessageInspection:
+        allowed = {
+            "limit",
+            "cursor_session_instance_id",
+            "cursor_through_ordering_key",
+            "cursor_after_priority",
+            "cursor_after_ordering_key",
+        }
+        if any(
+            key not in allowed or len(http_request.query_params.getlist(key)) != 1
+            for key in http_request.query_params
+        ):
+            raise HTTPException(status_code=422, detail="Invalid session-message query.")
+        values = (
+            cursor_session_instance_id,
+            cursor_through_ordering_key,
+            cursor_after_priority,
+            cursor_after_ordering_key,
+        )
+        cursor = None
+        if any(value is not None for value in values):
+            if (
+                cursor_session_instance_id is None
+                or cursor_through_ordering_key is None
+                or cursor_after_priority is None
+                or cursor_after_ordering_key is None
+            ):
+                raise HTTPException(status_code=422, detail="Incomplete session-message cursor.")
+            try:
+                cursor = SessionMessageCursor(
+                    session_instance_id=cursor_session_instance_id,
+                    through_ordering_key=cursor_through_ordering_key,
+                    after_priority=cursor_after_priority,
+                    after_ordering_key=cursor_after_ordering_key,
+                )
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=422, detail="Invalid session-message cursor."
+                ) from None
+        return await cayu_app.inspect_session_messages(
+            SessionMessageQuery(session_id=session_id, cursor=cursor, limit=limit),
+            context=context,
+        )
+
+    @session_message_router.post(
+        "/sessions/{session_id}/messages/source-snapshot",
+        response_model=SessionMessageSource,
+    )
+    async def snapshot_session_message_source(
+        session_id: str,
+        body: SessionMessageSourceBody,
+        context: SessionMessageAccessContext = session_message_context,
+    ) -> SessionMessageSource:
+        return await cayu_app.snapshot_session_message_source(
+            session_id,
+            context=context,
+            include_transcript_digest=body.include_transcript_digest,
+            include_checkpoint_digest=body.include_checkpoint_digest,
+        )
+
+    async def _apply_session_message_action(
+        session_id: str,
+        queue_id: str,
+        body: SessionMessageActionBody,
+        context: SessionMessageAccessContext,
+        action: Literal["withdraw", "quarantine"],
+    ) -> SessionMessageActionResult:
+        return await cayu_app._apply_session_message_action_from_http(
+            SessionMessageActionRequest(
+                session_id=session_id,
+                queue_id=queue_id,
+                session_instance_id=body.session_instance_id,
+                idempotency_key=body.idempotency_key,
+                expected_revision=body.expected_revision,
+                action=action,
+            ),
+            context=context,
+        )
+
+    @session_message_router.post(
+        "/sessions/{session_id}/messages/{queue_id}/withdraw",
+        response_model=SessionMessageActionResult,
+    )
+    async def withdraw_session_message(
+        session_id: str,
+        queue_id: str,
+        body: SessionMessageActionBody,
+        context: SessionMessageAccessContext = session_message_context,
+    ) -> SessionMessageActionResult:
+        return await _apply_session_message_action(session_id, queue_id, body, context, "withdraw")
+
+    @session_message_router.post(
+        "/sessions/{session_id}/messages/{queue_id}/quarantine",
+        response_model=SessionMessageActionResult,
+    )
+    async def quarantine_session_message(
+        session_id: str,
+        queue_id: str,
+        body: SessionMessageActionBody,
+        context: SessionMessageAccessContext = session_message_context,
+    ) -> SessionMessageActionResult:
+        return await _apply_session_message_action(
+            session_id, queue_id, body, context, "quarantine"
         )
 
     @bounded_control_plane_router.post(
@@ -11415,6 +11651,7 @@ def create_router(
         return {"ok": True}
 
     router.include_router(bounded_control_plane_router)
+    router.include_router(session_message_router)
     router.include_router(bounded_evaluation_promotion_router)
     router.include_router(bounded_captured_evaluation_router)
     router.include_router(bounded_evals_router)

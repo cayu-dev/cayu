@@ -17,9 +17,22 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, LiteralString, NoRetur
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from cayu.runtime import _session_message_queue as message_queue
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime.costs import PriceBook
+from cayu.runtime.session_message_lifecycle import (
+    SessionMessageActionRequest,
+    SessionMessageConditions,
+    SessionMessageConflict,
+    SessionMessageQuery,
+    SessionMessageSource,
+    session_message_rejection,
+)
+from cayu.runtime.sessions import (
+    SessionMessageActionResult,
+    SessionMessageInspection,
+)
 
 if TYPE_CHECKING:
     from cayu.knowledge_maintenance_governance import (
@@ -348,6 +361,7 @@ from cayu.runtime.sessions import (
     _active_model_completion_stage_record,
     _active_unexpired_incomplete_recovery_claim_id,
     _active_unexpired_session_operation_id,
+    _apply_queue_completion_checkpoint_mutation,
     _apply_runtime_publication_checkpoint_mutation,
     _apply_runtime_publication_operation_record_mutations,
     _assemble_terminal_session_evidence,
@@ -419,6 +433,7 @@ from cayu.runtime.sessions import (
     _prepare_interaction_transition,
     _prepare_interaction_transition_receipt_lookup,
     _prepare_model_completion_stage_promotion,
+    _prepare_queue_completion_checkpoint_mutation,
     _prepare_session_fork_request,
     _PreparedModelCompletionStage,
     _PreparedModelCompletionStageAbandonment,
@@ -998,7 +1013,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
     }
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 81
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 83
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 76
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
@@ -1231,8 +1246,12 @@ _SESSION_MESSAGE_QUEUE_COLUMNS = (
     "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
     "requested_by, accepted_run_epoch, accepted_transcript_cursor, accepted_event_id, "
     "accepted_at, delivered_run_epoch, delivered_transcript_cursor, delivered_event_id, "
-    "delivered_at, message_json"
+    "delivered_at, message_json, conditions_json, terminal_json"
 )
+
+
+def _session_message_raw_row(row: Any) -> dict[str, Any]:
+    return dict(zip(_SESSION_MESSAGE_QUEUE_COLUMNS.split(", "), row, strict=True))
 
 
 def _queued_session_message_from_row(row: Any) -> SessionQueuedMessage:
@@ -1242,6 +1261,9 @@ def _queued_session_message_from_row(row: Any) -> SessionQueuedMessage:
         queue_id=row[1],
         session_id=row[2],
         idempotency_key=row[3],
+        conditions=SessionMessageConditions.model_validate(
+            {} if row[17] is None else _json_obj(row[17])
+        ),
         content=row[4],
         message=(None if row[16] is None else Message.model_validate(_json_obj(row[16]))),
         delivery_mode=row[5],
@@ -1708,6 +1730,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         """
         CREATE TABLE IF NOT EXISTS cayu_session_message_deliveries (
             delivery_id TEXT PRIMARY KEY,
+            reject_only BOOLEAN NOT NULL DEFAULT FALSE,
             session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
             interaction_id TEXT,
             include_on_idle BOOLEAN NOT NULL,
@@ -3029,6 +3052,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ),
     80: ("ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS failure_diagnostic_json TEXT",),
     82: pg_support.POSTGRES_ACCOUNTING_DDL,
+    83: (
+        pg_support.SESSION_MESSAGE_ACCEPTANCE_INDEX_DDL,
+        "ALTER TABLE cayu_session_message_queue ADD COLUMN IF NOT EXISTS conditions_json JSONB",
+        "ALTER TABLE cayu_session_message_queue ADD COLUMN IF NOT EXISTS terminal_json JSONB",
+        "ALTER TABLE cayu_session_message_deliveries ADD COLUMN IF NOT EXISTS reject_only BOOLEAN NOT NULL DEFAULT FALSE",
+    ),
     79: (
         """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
@@ -6339,6 +6368,8 @@ class _PostgresStoreBase:
                             await self._validate_eval_run_scenario_progress_column(cur)
                         if self._min_required_revision >= 57:
                             await self._validate_session_message_queue_typed_message_column(cur)
+                        if self._min_required_revision >= 83:
+                            await self._validate_session_message_lifecycle_columns(cur)
                         if self._min_required_revision >= 59:
                             await self._validate_session_instance_schema(cur)
                         if self._min_required_revision >= 61:
@@ -6645,6 +6676,8 @@ class _PostgresStoreBase:
             await self._validate_eval_run_scenario_progress_column(cur)
         if self._min_required_revision >= 57:
             await self._validate_session_message_queue_typed_message_column(cur)
+        if self._min_required_revision >= 83:
+            await self._validate_session_message_lifecycle_columns(cur)
         if self._min_required_revision >= 61:
             await self._validate_work_attempt_admission_schema(cur)
         if self._min_required_revision >= 62:
@@ -6768,6 +6801,8 @@ class _PostgresStoreBase:
             await self._validate_eval_run_scenario_progress_column(cur)
         if revision.revision == 57:
             await self._validate_session_message_queue_typed_message_column(cur)
+        if revision.revision == 83:
+            await self._validate_session_message_lifecycle_columns(cur)
         if revision.revision == 58:
             await self._validate_verified_work_schema(
                 cur,
@@ -10513,6 +10548,44 @@ class _PostgresStoreBase:
                 "conflicts with Cayu's revision-74 authored-suite concurrency contract. "
                 "Run `cayu storage migrate` or restore the database from a known-good backup."
             )
+
+    async def _validate_session_message_lifecycle_columns(self, cur: Any) -> None:
+        await cur.execute(
+            "SELECT indisvalid, indisready, pg_get_indexdef(indexrelid) "
+            "FROM pg_index WHERE indexrelid = to_regclass('idx_cayu_events_queue_acceptance')"
+        )
+        index = await cur.fetchone()
+        definition = "" if index is None else " ".join(index[2].lower().split())
+        if (
+            index is None
+            or not index[0]
+            or not index[1]
+            or "using btree (session_id, ((event #>> '{payload,queue_id}'::text[])))"
+            not in definition
+            or "where (event_type = 'session.message.queued'::text)" not in definition
+        ):
+            raise RuntimeError("Postgres queue acceptance lookup index conflicts with revision 83.")
+        await cur.execute(
+            "SELECT column_name, data_type, is_nullable, column_default "
+            "FROM information_schema.columns WHERE table_schema = current_schema() "
+            "AND table_name = 'cayu_session_message_queue' "
+            "AND column_name IN ('conditions_json', 'terminal_json')"
+        )
+        columns = {row[0]: tuple(row[1:]) for row in await cur.fetchall()}
+        if any(
+            columns.get(name) != ("jsonb", "YES", None)
+            for name in ("conditions_json", "terminal_json")
+        ):
+            raise RuntimeError(
+                "Postgres session-message lifecycle columns conflict with revision 83."
+            )
+        await cur.execute(
+            "SELECT data_type, is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'cayu_session_message_deliveries' "
+            "AND column_name = 'reject_only'"
+        )
+        if await cur.fetchone() != ("boolean", "NO", "false"):
+            raise RuntimeError("Postgres queue rejection receipt conflicts with revision 83.")
 
     async def _validate_session_message_queue_typed_message_column(self, cur: Any) -> None:
         await cur.execute(
@@ -24490,6 +24563,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     terminal_interaction_publication_version: ClassVar[int | None] = 1
     durable_model_terminalization_version: ClassVar[int | None] = 1
     queued_interaction_profile_handoff_version: ClassVar[int | None] = 1
+    session_message_lifecycle_version: ClassVar[int | None] = 1
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
@@ -28334,11 +28408,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
+        checkpoint_mutation: dict[str, Any] | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
+        mutation = _prepare_queue_completion_checkpoint_mutation(checkpoint_mutation, to_status)
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
@@ -28361,6 +28437,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionQueuedMessagesPending(
                             f"Session has durable queued messages: {session_id}"
                         )
+                    if mutation is not None:
+                        checkpoint = _apply_queue_completion_checkpoint_mutation(
+                            loaded, mutation, await self._load_checkpoint(cur, session_id)
+                        )
+                        if checkpoint is None:
+                            raise ValueError(
+                                "Queue completion mutation cannot delete its checkpoint."
+                            )
+                        await self._upsert_checkpoint(cur, session_id, checkpoint, updated_at)
                     await cur.execute(
                         "UPDATE cayu_sessions SET status = %s, updated_at = %s, "
                         "last_activity_at = %s, run_epoch = run_epoch + %s WHERE id = %s",
@@ -28368,7 +28453,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             str(to_status),
                             updated_at,
                             updated_at,
-                            1 if to_status == SessionStatus.RUNNING else 0,
+                            1 if to_status == SessionStatus.RUNNING and mutation is None else 0,
                             session_id,
                         ),
                     )
@@ -28381,7 +28466,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     "status": to_status,
                     "updated_at": updated_at,
                     "last_activity_at": updated_at,
-                    "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
+                    "run_epoch": loaded.run_epoch
+                    + (to_status == SessionStatus.RUNNING and mutation is None),
                 }
             )
             if to_status == SessionStatus.RUNNING:
@@ -30396,9 +30482,336 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             rows = await cur.fetchall()
         return [_persisted_event_side_effect_delivery_from_row(row) for row in rows]
 
+    async def _session_message_source_locked(
+        self,
+        cur: Any,
+        session: Session,
+        *,
+        include_transcript_digest: bool,
+        include_checkpoint_digest: bool,
+    ) -> SessionMessageSource:
+        cursor = await _transcript_cursor(cur, session.id)
+        transcript_digest = None
+        if include_transcript_digest:
+            hasher = message_queue.SourceTranscriptHasher(cursor)
+            after = 0
+            while True:
+                await cur.execute(
+                    "SELECT session_order, message FROM cayu_transcript_messages "
+                    "WHERE session_id = %s AND session_order > %s ORDER BY session_order LIMIT 100",
+                    (session.id, after),
+                )
+                rows = await cur.fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    hasher.add(row[0] - 1, Message.model_validate(_json_obj(row[1])))
+                after = rows[-1][0]
+            transcript_digest = hasher.hexdigest()
+        checkpoint = None
+        if include_checkpoint_digest:
+            checkpoint = await self._load_checkpoint(cur, session.id)
+        return message_queue.source_snapshot(
+            session,
+            cursor,
+            transcript_sha256=transcript_digest,
+            checkpoint=checkpoint,
+            include_checkpoint_digest=include_checkpoint_digest,
+        )
+
+    async def _session_message_read_session(self, cur: Any, session_id: str) -> Session:
+        # Inspection must also work on read-only connections. One MVCC snapshot
+        # binds session identity, queue pages, transcript and checkpoint reads.
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        await cur.execute(
+            f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise KeyError("Session not found.")
+        return pg_support.session_from_row(row, labels=await self._load_labels(cur, session_id))
+
+    async def snapshot_session_message_source(
+        self,
+        session_id: str,
+        *,
+        include_transcript_digest: bool = False,
+        include_checkpoint_digest: bool = False,
+        expected_authorized_session_instance_id: str | None = None,
+    ) -> SessionMessageSource:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if (
+            type(include_transcript_digest) is not bool
+            or type(include_checkpoint_digest) is not bool
+        ):
+            raise TypeError("Snapshot digest flags must be bool.")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            session = await self._session_message_read_session(cur, session_id)
+            message_queue.require_authorized_session_instance(
+                session, expected_authorized_session_instance_id
+            )
+            return await self._session_message_source_locked(
+                cur,
+                session,
+                include_transcript_digest=include_transcript_digest,
+                include_checkpoint_digest=include_checkpoint_digest,
+            )
+
+    async def _session_message_raw_bounded(
+        self,
+        cur: Any,
+        session_id: str,
+        queue_id: str,
+    ) -> dict[str, Any]:
+        columns = _SESSION_MESSAGE_QUEUE_COLUMNS.split(", ")
+        projection = ", ".join(
+            f"CASE WHEN octet_length({name}::text) <= 131072 THEN {name} END AS {name}"
+            for name in columns
+        )
+        hashes = ", ".join(
+            f"CASE WHEN octet_length({name}::text) > 131072 "
+            f"THEN encode(sha256(convert_to({name}::text, 'UTF8')), 'hex') END"
+            for name in columns
+        )
+        await cur.execute(
+            f"SELECT {projection}, {hashes} FROM cayu_session_message_queue "
+            "WHERE session_id = %s AND queue_id = %s",
+            (session_id, queue_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise SessionMessageConflict()
+        raw: dict[str, Any] = dict(zip(columns, row[: len(columns)], strict=True))
+        for name, digest in zip(columns, row[len(columns) :], strict=True):
+            if digest is not None:
+                raw[name] = message_queue.OversizedStorageValue(digest)
+        return raw
+
+    async def _session_message_acceptance_events(
+        self,
+        cur: Any,
+        session_id: str,
+        rows: list[dict[str, Any]],
+        *,
+        quarantine_queue_id: str | None = None,
+    ) -> dict[str, Event]:
+        """Batch-read bounded audit projections of canonical events under the session lock."""
+        ids = [row["accepted_event_id"] for row in rows]
+        if quarantine_queue_id is None and any(
+            type(event_id) is not str or len(event_id) > 512 for event_id in ids
+        ):
+            raise SessionMessageConflict()
+        if not ids:
+            return {}
+        projection = (
+            "jsonb_build_object('queue_id', event->'payload'->'queue_id', "
+            "'source', event->'payload'->'source')"
+        )
+        predicate = (
+            "event_id = ANY(%s)"
+            if quarantine_queue_id is None
+            else "event #>> '{payload,queue_id}' = %s LIMIT 2"
+        )
+        await cur.execute(
+            f"SELECT event_id, CASE WHEN octet_length(({projection})::text) <= 32768 "
+            f"THEN {projection} END FROM cayu_events WHERE session_id = %s "
+            f"AND event_type = 'session.message.queued' AND {predicate}",
+            (session_id, ids if quarantine_queue_id is None else quarantine_queue_id),
+        )
+        events = await cur.fetchall()
+        if quarantine_queue_id is not None and len(events) != 1:
+            raise SessionMessageConflict()
+        if any(row[1] is None for row in events):
+            raise SessionMessageConflict()
+        return {
+            row[0]: Event(
+                id=row[0],
+                type=EventType.SESSION_MESSAGE_QUEUED,
+                session_id=session_id,
+                payload=_json_obj(row[1]),
+            )
+            for row in events
+        }
+
+    async def inspect_session_messages(
+        self,
+        query: SessionMessageQuery,
+        *,
+        expected_authorized_session_instance_id: str | None = None,
+    ) -> SessionMessageInspection:
+        query = message_queue.copy_inspection_query(query)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            session = await self._session_message_read_session(cur, query.session_id)
+            message_queue.require_authorized_session_instance(
+                session, expected_authorized_session_instance_id
+            )
+            maximum = 0
+            if query.cursor is None:
+                await cur.execute(
+                    "SELECT COALESCE(MAX(ordering_key), 0) FROM cayu_session_message_queue "
+                    "WHERE session_id = %s",
+                    (session.id,),
+                )
+                maximum = (await cur.fetchone())[0]
+            boundary = message_queue.inspection_boundary(session, query.cursor, maximum)
+            await cur.execute(
+                "WITH ordered AS (SELECT queue_id, ordering_key, "
+                "CASE delivery_mode WHEN 'next_turn' THEN 0 WHEN 'on_idle' THEN 1 ELSE 2 END "
+                "AS priority FROM cayu_session_message_queue "
+                "WHERE session_id = %s AND ordering_key <= %s) "
+                "SELECT queue_id, ordering_key, priority FROM ordered "
+                "WHERE (priority, ordering_key) > (%s, %s) "
+                "ORDER BY priority, ordering_key LIMIT %s",
+                (
+                    session.id,
+                    boundary.through_ordering_key,
+                    boundary.after_priority,
+                    boundary.after_ordering_key,
+                    query.limit + 1,
+                ),
+            )
+            rows = await cur.fetchall()
+            raw_rows = [
+                await self._session_message_raw_bounded(cur, session.id, row[0])
+                for row in rows[: query.limit]
+            ]
+            records = tuple(
+                message_queue.inspect_record(
+                    raw, lambda raw=raw: _queued_session_message_from_row(tuple(raw.values()))
+                )
+                for raw in raw_rows
+            )
+            return SessionMessageInspection(
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                records=records,
+                next_cursor=(
+                    message_queue.inspection_next_cursor(
+                        boundary,
+                        rows[query.limit - 1][2],
+                        records[-1].ordering_key,
+                    )
+                    if len(rows) > query.limit
+                    else None
+                ),
+            )
+
+    async def apply_session_message_action(
+        self,
+        request: SessionMessageActionRequest,
+    ) -> SessionMessageActionResult:
+        request = SessionMessageActionRequest(**message_queue.action_material(request))
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    session = await self._load_for_update(cur, request.session_id)
+                    if session is None or session.instance_id != request.session_instance_id:
+                        raise SessionMessageConflict()
+                    await cur.execute(
+                        "SELECT queue_id FROM cayu_session_message_queue "
+                        "WHERE session_id = %s AND queue_id = %s FOR UPDATE",
+                        (session.id, request.queue_id),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise SessionMessageConflict()
+                    raw = await self._session_message_raw_bounded(cur, session.id, request.queue_id)
+                    accepted_events = await self._session_message_acceptance_events(
+                        cur,
+                        session.id,
+                        [raw],
+                        quarantine_queue_id=request.queue_id
+                        if request.action == "quarantine"
+                        else None,
+                    )
+                    accepted_event = (
+                        next(iter(accepted_events.values()))
+                        if request.action == "quarantine"
+                        else accepted_events.get(raw["accepted_event_id"])
+                    )
+                    replay = message_queue.replay_action(
+                        raw, request, accepted_event=accepted_event
+                    )
+                    record = message_queue.inspect_record(
+                        raw, lambda: _queued_session_message_from_row(tuple(raw.values()))
+                    )
+                    if replay is not None:
+                        await conn.commit()
+                        return SessionMessageActionResult(
+                            record=record, event=replay, replayed=True
+                        )
+                    if (
+                        record.revision != request.expected_revision
+                        or raw["status"] != "queued"
+                        or any(
+                            raw[key] is not None
+                            for key in (
+                                "delivered_event_id",
+                                "delivered_at",
+                                "delivered_run_epoch",
+                                "delivered_transcript_cursor",
+                            )
+                        )
+                    ):
+                        raise SessionMessageConflict()
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_session_message_deliveries "
+                        "WHERE session_id = %s AND queue_ids @> %s::jsonb LIMIT 1",
+                        (session.id, _dumps([request.queue_id])),
+                    )
+                    if await cur.fetchone() is not None or (
+                        request.action == "withdraw" and record.validity != "valid"
+                    ):
+                        raise SessionMessageConflict()
+                    status = SessionMessageQueueStatus(
+                        "withdrawn" if request.action == "withdraw" else "quarantined"
+                    )
+                    event = message_queue.terminal_event(
+                        session,
+                        raw,
+                        status,
+                        await self._session_store_now(cur),
+                        actor=request.requested_by,
+                        accepted_event=accepted_event,
+                    )
+                    await cur.execute(
+                        "UPDATE cayu_session_message_queue SET status = %s, terminal_json = %s "
+                        "WHERE session_id = %s AND queue_id = %s AND status = 'queued'",
+                        (
+                            str(status),
+                            _dumps(message_queue.terminal_receipt(status, event, request)),
+                            session.id,
+                            request.queue_id,
+                        ),
+                    )
+                    await self._append_events_with_cursor(
+                        cur, session.id, [event], expected_run_epoch=None
+                    )
+                    updated = await self._session_message_raw_bounded(
+                        cur, session.id, request.queue_id
+                    )
+                    result = SessionMessageActionResult(
+                        record=message_queue.inspect_record(
+                            updated,
+                            lambda: _queued_session_message_from_row(tuple(updated.values())),
+                        ),
+                        event=event,
+                    )
+                await conn.commit()
+                return result
+            except BaseException:
+                await conn.rollback()
+                raise
+
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
+        *,
+        expected_authorized_target_instance_id: str | None = None,
     ) -> EnqueueSessionMessageResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -30407,9 +30820,33 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    loaded = await self._load_for_update(cur, request.session_id)
+                    # A->B and B->A provenance admissions acquire the same lock order.
+                    source_id = (
+                        None
+                        if request.conditions.source is None
+                        else request.conditions.source.session_id
+                    )
+                    locked = {
+                        sid: await self._load_for_update(cur, sid)
+                        for sid in sorted(
+                            {request.session_id} | ({source_id} if source_id else set())
+                        )
+                    }
+                    loaded = locked[request.session_id]
                     if loaded is None:
                         raise KeyError(f"Session not found: {request.session_id}")
+                    if expected_authorized_target_instance_id is not None and (
+                        type(expected_authorized_target_instance_id) is not str
+                        or loaded.instance_id != expected_authorized_target_instance_id
+                    ):
+                        raise SessionMessageConflict()
+                    if request.conditions.source is not None:
+                        source = locked[request.conditions.source.session_id]
+                        if (
+                            source is None
+                            or source.instance_id != request.conditions.source.session_instance_id
+                        ):
+                            raise SessionMessageConflict()
                     await cur.execute(
                         f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} "
                         "FROM cayu_session_message_queue "
@@ -30448,6 +30885,22 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             "Session messages cannot be enqueued while completion finalization "
                             "is pending."
                         )
+                    if request.conditions.source is not None:
+                        expected_source = request.conditions.source
+                        source = locked[expected_source.session_id]
+                        if (
+                            source is None
+                            or await self._session_message_source_locked(
+                                cur,
+                                source,
+                                include_transcript_digest=expected_source.transcript_sha256
+                                is not None,
+                                include_checkpoint_digest=expected_source.checkpoint_sha256
+                                is not None,
+                            )
+                            != expected_source
+                        ):
+                            raise SessionMessageConflict()
                     transcript_cursor = await _transcript_cursor(cur, request.session_id)
                     accepted_at = await self._session_store_now(cur)
                     queue_id = str(uuid4())
@@ -30489,6 +30942,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if ordering_row is None:
                         raise RuntimeError("Postgres queue insert did not return an ordering key.")
                     ordering_key = ordering_row[0]
+                    await cur.execute(
+                        "UPDATE cayu_session_message_queue SET conditions_json = %s WHERE queue_id = %s",
+                        (
+                            _dumps(request.conditions.model_dump(mode="json")),
+                            queue_id,
+                        ),
+                    )
                     accepted_message = enqueue_session_message_input(request)
                     accepted_event = event_with_runtime_payload_authority(
                         Event(
@@ -30507,6 +30967,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     run_epoch=loaded.run_epoch,
                                     transcript_cursor=transcript_cursor,
                                 ),
+                                **message_queue.source_event_payload(request.conditions.source),
                                 SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
                                     session_messages_input_contract_evidence(
                                         (accepted_message,),
@@ -30591,6 +31052,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         *,
         include_on_idle: bool,
+        reject_only: bool = False,
         delivery_id: str | None = None,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
@@ -30622,6 +31084,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         )
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
+        if type(reject_only) is not bool:
+            raise TypeError("reject_only must be a bool.")
         eligible_through = _validate_message_delivery_eligible_through(eligible_through)
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
             raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
@@ -30638,7 +31102,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         SELECT session_id, interaction_id, include_on_idle,
                                requested_eligible_through, eligible_through,
                                batch_limit, has_more, interaction_started_event,
-                               queue_ids, events
+                               queue_ids, events, reject_only
                         FROM cayu_session_message_deliveries
                         WHERE delivery_id = %s
                         """,
@@ -30651,6 +31115,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                         if (
                             delivery_row[0] != session_id
+                            or delivery_row[10] != reject_only
                             or delivery_row[1] != interaction_id
                             or delivery_row[2] != include_on_idle
                             or delivery_row[3] != eligible_through
@@ -30813,6 +31278,46 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             (session_id, boundary, limit),
                         )
                         rows = await cur.fetchall()
+                    reject_only_more = False
+                    if reject_only:
+                        # Eligible rows remain pending. Scan in bounded pages so they cannot hide
+                        # an expired record behind the first delivery-sized prefix.
+                        rows = []
+                        scan_now = await self._session_store_now(cur)
+                        scan_cursor = await _transcript_cursor(cur, session_id)
+                        for mode in ("next_turn", "on_idle") if include_on_idle else ("next_turn",):
+                            after = 0
+                            while len(rows) < limit + 1:
+                                await cur.execute(
+                                    f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} FROM cayu_session_message_queue "
+                                    "WHERE session_id = %s AND status = 'queued' AND delivery_mode = %s "
+                                    "AND ordering_key > %s AND ordering_key <= %s "
+                                    "ORDER BY ordering_key LIMIT 100 FOR UPDATE",
+                                    (session_id, mode, after, boundary),
+                                )
+                                page = await cur.fetchall()
+                                if not page:
+                                    break
+                                for candidate in page:
+                                    queued = _queued_session_message_from_row(candidate)
+                                    if (
+                                        session_message_rejection(
+                                            queued.conditions,
+                                            session_instance_id=loaded.instance_id,
+                                            run_epoch=loaded.run_epoch,
+                                            transcript_cursor=scan_cursor,
+                                            now=scan_now,
+                                        )
+                                        is not None
+                                    ):
+                                        rows.append(candidate)
+                                        if len(rows) == limit + 1:
+                                            reject_only_more = True
+                                            break
+                                after = page[-1][0]
+                            if len(rows) == limit + 1:
+                                break
+                        rows = rows[:limit]
                     if not rows:
                         await cur.execute(
                             """
@@ -30844,6 +31349,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 await self._session_store_now(cur),
                             ),
                         )
+                        await cur.execute(
+                            "UPDATE cayu_session_message_deliveries SET reject_only = %s WHERE delivery_id = %s",
+                            (reject_only, delivery_id),
+                        )
                         await conn.commit()
                         return SessionMessageDeliveryBatch(
                             delivery_id=delivery_id,
@@ -30851,8 +31360,50 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             eligible_through=boundary,
                             has_more=False,
                         )
+                    transcript_cursor = await _transcript_cursor(cur, session_id)
+                    delivered_at = scan_now if reject_only else await self._session_store_now(cur)
+                    accepted_events = await self._session_message_acceptance_events(
+                        cur,
+                        session_id,
+                        [_session_message_raw_row(row) for row in rows],
+                    )
+                    rejection_events: list[Event] = []
+                    deliverable_rows = []
+                    for row in rows:
+                        queued = _queued_session_message_from_row(row)
+                        rejection = session_message_rejection(
+                            queued.conditions,
+                            session_instance_id=loaded.instance_id,
+                            run_epoch=loaded.run_epoch,
+                            transcript_cursor=transcript_cursor + len(deliverable_rows),
+                            now=delivered_at,
+                        )
+                        if rejection is None:
+                            if not reject_only:
+                                deliverable_rows.append(row)
+                            continue
+                        event = message_queue.terminal_event(
+                            loaded,
+                            _session_message_raw_row(row),
+                            rejection,
+                            delivered_at,
+                            accepted_event=accepted_events.get(row[10]),
+                            actor=queued.requested_by,
+                            interaction_id=interaction_id,
+                        )
+                        rejection_events.append(event)
+                        await cur.execute(
+                            "UPDATE cayu_session_message_queue SET status = %s, terminal_json = %s "
+                            "WHERE queue_id = %s AND status = 'queued'",
+                            (
+                                str(rejection),
+                                _dumps(message_queue.terminal_receipt(rejection, event)),
+                                queued.queue_id,
+                            ),
+                        )
+                    rows = deliverable_rows
                     rebound_checkpoint: dict[str, Any] | None = None
-                    if profile_handoff is not None:
+                    if rows and profile_handoff is not None:
                         await cur.execute(
                             "SELECT record FROM cayu_session_operations "
                             "WHERE session_id = %s AND idempotency_key = %s",
@@ -30876,10 +31427,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             settlement_record=_json_obj(receipt_row[0]),
                             replayed_delivery=False,
                         )
-                    transcript_cursor = await _transcript_cursor(cur, session_id)
-                    delivered_at = await self._session_store_now(cur)
                     updated_messages: list[SessionQueuedMessage] = []
-                    delivery_events: list[Event] = []
+                    delivery_events: list[Event] = list(rejection_events)
                     transcript_messages: list[Message] = []
                     for offset, row in enumerate(rows, start=1):
                         queued_message = _queued_session_message_from_row(row)
@@ -30901,6 +31450,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                         actor=queued_message.requested_by,
                                         run_epoch=loaded.run_epoch,
                                         transcript_cursor=delivered_cursor,
+                                    ),
+                                    **message_queue.source_audit_payload(
+                                        _session_message_raw_row(row), accepted_events.get(row[10])
                                     ),
                                     "accepted_run_epoch": queued_message.accepted_run_epoch,
                                     "accepted_transcript_cursor": (
@@ -30970,10 +31522,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 updated.queue_id,
                             ),
                         )
+                    delivery_events.sort(key=lambda event: event.payload["ordering_key"])
                     persisted_events = [
                         *(
                             [interaction_started_event]
-                            if interaction_started_event is not None
+                            if updated_messages and interaction_started_event is not None
                             else []
                         ),
                         *delivery_events,
@@ -31038,6 +31591,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         (session_id, boundary),
                     )
                     remaining = await cur.fetchone()
+                    has_more = reject_only_more if reject_only else remaining is not None
                     await cur.execute(
                         """
                         INSERT INTO cayu_session_message_deliveries (
@@ -31060,7 +31614,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             eligible_through,
                             boundary,
                             limit,
-                            remaining is not None,
+                            has_more,
                             (
                                 None
                                 if interaction_started_event is None
@@ -31070,6 +31624,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             _dumps([event.model_dump(mode="json") for event in persisted_events]),
                             delivered_at,
                         ),
+                    )
+                    await cur.execute(
+                        "UPDATE cayu_session_message_deliveries SET reject_only = %s WHERE delivery_id = %s",
+                        (reject_only, delivery_id),
                     )
                     if rebound_checkpoint is not None:
                         await self._upsert_checkpoint(
@@ -31085,9 +31643,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     delivery_id=delivery_id,
                     interaction_id=interaction_id,
                     eligible_through=boundary,
-                    has_more=remaining is not None,
+                    has_more=has_more,
                     active_invocation_profile=(
-                        None if profile_handoff is None else profile_handoff.target_active_profile
+                        None
+                        if not updated_messages or profile_handoff is None
+                        else profile_handoff.target_active_profile
                     ),
                 )
             except Exception:

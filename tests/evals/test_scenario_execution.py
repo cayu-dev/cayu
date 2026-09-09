@@ -24,6 +24,7 @@ from cayu import (
     EvalStoreTransientContention,
     ExecutionProfileBehaviorIdentity,
     InMemoryEvalStore,
+    InMemorySessionStore,
     Message,
     ModelProvider,
     ModelRequest,
@@ -35,9 +36,11 @@ from cayu import (
     ScenarioInitialInputEventV2,
     ScenarioInputV2,
     ScenarioLaunchSettingsV2,
+    ScenarioQueuedInputEventV2,
     ScenarioResumedInputEventV2,
     ScenarioTextPartV2,
     ScenarioUserMessageV2,
+    SessionMessageQuery,
     SQLiteEvalStore,
     SQLiteSessionStore,
     Tool,
@@ -134,7 +137,7 @@ class _ReviewTool(Tool):
         return ToolResult(content="reviewed")
 
 
-def _scenario(*, occurrence: int = 1) -> EvalScenarioDocumentV2:
+def _scenario(*, occurrence: int = 1, queued: bool = False) -> EvalScenarioDocumentV2:
     scenario_input = ScenarioInputV2.create(
         (ScenarioUserMessageV2.create((ScenarioTextPartV2(text="Review this request."),)),)
     )
@@ -148,8 +151,20 @@ def _scenario(*, occurrence: int = 1) -> EvalScenarioDocumentV2:
                 id="initial",
                 input=scenario_input,
             ),
+            *(
+                (
+                    ScenarioQueuedInputEventV2(
+                        sequence=1,
+                        id="queued-follow-up",
+                        input=scenario_input,
+                        delivery_mode="next_turn",
+                    ),
+                )
+                if queued
+                else ()
+            ),
             ScenarioApprovalCheckpointEventV2(
-                sequence=1,
+                sequence=2 if queued else 1,
                 id="review-approval",
                 tool_name="review_action",
                 occurrence=occurrence,
@@ -262,12 +277,21 @@ def _manual_resume_scenario() -> EvalScenarioDocumentV2:
     )
 
 
-def test_scenario_execution_waits_for_fresh_approval_and_publishes_corpus_result() -> None:
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_scenario_execution_waits_for_fresh_approval_and_publishes_corpus_result(
+    tmp_path, queued, backend
+) -> None:
     async def exercise() -> None:
         provider = _ApprovalProvider()
-        target = _approval_target(provider)
+        session_store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "scenario.sqlite")
+        )
+        target = _approval_target(provider, session_store=session_store)
         app = target.app
-        scenario = _scenario()
+        scenario = _scenario(queued=queued)
         settings = ScenarioLaunchSettingsV2(timeout_seconds=30)
         preflight = await preflight_eval_scenario(
             scenario,
@@ -300,7 +324,19 @@ def test_scenario_execution_waits_for_fresh_approval_and_publishes_corpus_result
         )
         corpus = corpus_for_eval_scenario(scenario, binding, target)
         compiled = compile_corpus_suite(corpus, target, "scenario")
-        store = InMemoryEvalStore()
+
+        class ApprovalObservedEvalStore(InMemoryEvalStore):
+            def __init__(self):
+                super().__init__()
+                self.approval_ready = asyncio.Event()
+
+            async def update_scenario_trial(self, claim, trial):
+                record = await super().update_scenario_trial(claim, trial)
+                if trial.phase == EvalScenarioTrialPhase.AWAITING_APPROVAL:
+                    self.approval_ready.set()
+                return record
+
+        store = ApprovalObservedEvalStore()
         await store.save_scenario(scenario, redact_json=app.redact_json)
         await store.save_corpus(corpus, redact_json=app.redact_json)
         request = EvalRunRequest(
@@ -328,13 +364,28 @@ def test_scenario_execution_waits_for_fresh_approval_and_publishes_corpus_result
                 poll_seconds=0.001,
             )
         )
-        while True:
-            run = await store.load_run(request.run_id)
-            assert run is not None
-            progress = run.scenario_progress
-            if progress is not None and progress.trials[0].phase == "awaiting_approval":
-                break
-            await asyncio.sleep(0)
+        # Wait for the committed progress boundary rather than repeatedly
+        # copying an in-memory run while SQLite's worker threads need to run.
+        approval_ready = asyncio.create_task(store.approval_ready.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {execution, approval_ready}, timeout=30, return_when=asyncio.FIRST_COMPLETED
+            )
+            if execution in done:
+                await execution
+                pytest.fail("Scenario finished before its approval checkpoint.")
+            assert approval_ready in done, "Scenario did not publish its approval checkpoint."
+        finally:
+            approval_ready.cancel()
+            await asyncio.gather(approval_ready, return_exceptions=True)
+            if not store.approval_ready.is_set():
+                execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
+        run = await store.load_run(request.run_id)
+        assert run is not None
+        progress = run.scenario_progress
+        assert progress is not None
+        assert progress.trials[0].phase == "awaiting_approval"
         await store.submit_scenario_approval(
             request.run_id,
             EvalScenarioApprovalSubmission(
@@ -358,6 +409,24 @@ def test_scenario_execution_waits_for_fresh_approval_and_publishes_corpus_result
         assert result.run.status == "passed"
         assert result.run.cases[0].trials[0].output.text == "approved answer"
         assert provider.request_count == 2
+        if queued:
+            session_id = published.scenario_progress.trials[0].session_id
+            assert session_id is not None
+            read_store = (
+                SQLiteSessionStore(tmp_path / "scenario.sqlite")
+                if backend == "sqlite"
+                else session_store
+            )
+            page = await read_store.inspect_session_messages(
+                SessionMessageQuery(session_id=session_id)
+            )
+            assert len(page.records) == 1
+            message = page.records[0].message
+            assert message is not None
+            assert message.requested_by is not None
+            assert message.requested_by.subject == "cayu:eval-scenario"
+            assert message.requested_by.source == "system"
+            assert page.records[0].status == "delivered"
 
     asyncio.run(exercise())
 

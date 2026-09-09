@@ -435,6 +435,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=81, kind=RevisionKind.BREAKING, compatible_from=81),
     # Transactional accounting invalidation requires all writers to participate.
     Revision(revision=82, kind=RevisionKind.BREAKING, compatible_from=82),
+    # All queue writers must enforce freshness and immutable terminal outcomes.
+    Revision(revision=83, kind=RevisionKind.BREAKING, compatible_from=83),
 )
 
 #: The revision an empty database is initialized to.

@@ -310,6 +310,19 @@ from cayu.runtime.public_authority import (
 )
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.service_manifest import RuntimeStoreDurability
+from cayu.runtime.session_message_lifecycle import (
+    SessionMessageActionRequest,
+    SessionMessageConditions,
+    SessionMessageConflict,
+    SessionMessageCursor,
+    SessionMessageQuery,
+    SessionMessageQueueStatus,
+    SessionMessageSource,
+    copy_session_message_action,
+    copy_session_message_conditions,
+    session_message_checkpoint_sha256,
+    session_message_rejection,
+)
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -1538,11 +1551,6 @@ class SessionMessageDeliveryMode(StrEnum):
     ON_IDLE = "on_idle"
 
 
-class SessionMessageQueueStatus(StrEnum):
-    QUEUED = "queued"
-    DELIVERED = "delivered"
-
-
 class SessionDebugState(StrEnum):
     NEEDS_ATTENTION = "needs_attention"
     SESSION_FAILURE = "session_failure"
@@ -2105,7 +2113,15 @@ class EnqueueSessionMessageRequest(BaseModel):
     message: Message | None = None
     delivery_mode: SessionMessageDeliveryMode
     requested_by: ResolutionActor | None = None
+    conditions: SessionMessageConditions = Field(default_factory=SessionMessageConditions)
     _input_redactions_applied: bool = PrivateAttr(default=False)
+
+    @field_validator("conditions", mode="before")
+    @classmethod
+    def copy_conditions(cls, value):
+        if isinstance(value, SessionMessageConditions):
+            return copy_session_message_conditions(value)
+        return value
 
     @field_validator("session_id", "idempotency_key")
     @classmethod
@@ -2183,6 +2199,14 @@ class SessionQueuedMessage(BaseModel):
     )
     delivered_event_id: str | None = None
     delivered_at: datetime | None = None
+    conditions: SessionMessageConditions = Field(default_factory=SessionMessageConditions)
+
+    @field_validator("conditions", mode="before")
+    @classmethod
+    def copy_conditions(cls, value):
+        if isinstance(value, SessionMessageConditions):
+            return copy_session_message_conditions(value)
+        return value
 
     @field_validator(
         "queue_id",
@@ -2212,6 +2236,69 @@ class SessionQueuedMessage(BaseModel):
         if message.role is not MessageRole.USER:
             raise ValueError("Queued session messages must have the user role.")
         return message
+
+
+class SessionMessageInspectionRecord(BaseModel):
+    """Safe row envelope: unreadable content never becomes deliverable input."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    queue_id: StrictStr = Field(min_length=1, max_length=512)
+    ordering_key: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    revision: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    status: SessionMessageQueueStatus | None
+    validity: Literal["valid", "unreadable"]
+    message: SessionQueuedMessage | None = Field(default=None, repr=False)
+    terminal_event_id: StrictStr | None = Field(default=None, min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_inspection(self) -> SessionMessageInspectionRecord:
+        if self.validity == "valid":
+            if (
+                self.message is None
+                or self.status != self.message.status
+                or self.queue_id != self.message.queue_id
+                or self.ordering_key != self.message.ordering_key
+            ):
+                raise ValueError("Queue inspection record has inconsistent typed evidence.")
+        elif self.message is not None:
+            raise ValueError("Unreadable queue inspection cannot contain message content.")
+        return self
+
+
+class SessionMessageInspection(BaseModel):
+    """One protected delivery-priority page and its exact session instance."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    session_id: StrictStr = Field(min_length=1, max_length=512)
+    session_instance_id: StrictStr = Field(min_length=1, max_length=512)
+    records: tuple[SessionMessageInspectionRecord, ...] = Field(default=(), max_length=100)
+    next_cursor: SessionMessageCursor | None = None
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> SessionMessageInspection:
+        if self.next_cursor is not None and (
+            self.next_cursor.session_instance_id != self.session_instance_id
+            or not self.records
+            or self.next_cursor.after_ordering_key != self.records[-1].ordering_key
+            or any(
+                record.ordering_key > self.next_cursor.through_ordering_key
+                for record in self.records
+            )
+        ):
+            raise ValueError("Queue inspection cursor conflicts with its page.")
+        return self
+
+
+class SessionMessageActionResult(BaseModel):
+    """Terminal queue mutation and its atomically persisted content-free event."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    record: SessionMessageInspectionRecord
+    event: Event
+    replayed: StrictBool = False
 
 
 class EnqueueSessionMessageResult(BaseModel):
@@ -2703,23 +2790,7 @@ class InteractionTransitionSpec(BaseModel):
                 "interaction completion."
             )
         if self.checkpoint_mutation is not None:
-            operations = self.checkpoint_mutation.get("operations")
-            if type(operations) is not list or len(operations) != 1:
-                raise ValueError(
-                    "A completion-finalization transition requires exactly one checkpoint "
-                    "operation."
-                )
-            operation = operations[0]
-            if (
-                type(operation) is not dict
-                or operation.get("key") != PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
-                or operation.get("expected_value_digest") is not None
-                or operation.get("action") != "set"
-                or type(operation.get("value")) is not dict
-            ):
-                raise ValueError(
-                    "A completion-finalization transition must install a new pending marker."
-                )
+            _validate_completion_finalization_mutation_shape(self.checkpoint_mutation)
         if self.model_completion_stage_settlement is not None:
             if self.only_if_no_queued_messages:
                 raise ValueError(
@@ -9626,6 +9697,7 @@ class SessionStore(ABC):
     terminal_interaction_publication_version: ClassVar[int | None] = None
     durable_model_terminalization_version: ClassVar[int | None] = None
     queued_interaction_profile_handoff_version: ClassVar[int | None] = None
+    session_message_lifecycle_version: ClassVar[int | None] = None
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
     supports_atomic_session_operation_initialization: ClassVar[bool] = False
@@ -10373,8 +10445,14 @@ class SessionStore(ABC):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
+        checkpoint_mutation: dict[str, Any] | None = None,
     ) -> Session:
-        """Atomically terminalize only when no durable queued input remains."""
+        """Atomically terminalize only when no durable queued input remains.
+
+        A completion-finalization checkpoint mutation keeps RUNNING at the
+        current epoch while installing its existing owned finalization marker.
+        It does not admit a new invocation or rewrite an interaction receipt.
+        """
 
     @abstractmethod
     async def publish_interaction_transition(
@@ -10711,8 +10789,53 @@ class SessionStore(ABC):
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
+        *,
+        expected_authorized_target_instance_id: str | None = None,
     ) -> EnqueueSessionMessageResult:
-        """Atomically accept queued input with its causal event, or replay it."""
+        """Atomically accept queued input with its causal event, or replay it.
+
+        When supplied by the authorization owner, the target incarnation must
+        match under the transaction lock before either replay or admission.
+        This fence is not a persisted message freshness condition.
+        """
+
+    async def inspect_session_messages(
+        self,
+        query: SessionMessageQuery,
+        *,
+        expected_authorized_session_instance_id: str | None = None,
+    ) -> SessionMessageInspection:
+        """Read one bounded delivery-priority page, retaining unreadable row identities.
+
+        Check the optional authorization-owner incarnation before reading queue
+        content, including on the first page without a cursor.
+        """
+        raise NotImplementedError("Session-message inspection is not supported by this store.")
+
+    async def apply_session_message_action(
+        self, request: SessionMessageActionRequest
+    ) -> SessionMessageActionResult:
+        """Atomically withdraw/quarantine an exact undelivered row and publish its event."""
+        raise NotImplementedError(
+            "Session-message terminal actions are not supported by this store."
+        )
+
+    async def snapshot_session_message_source(
+        self,
+        session_id: str,
+        *,
+        include_transcript_digest: bool = False,
+        include_checkpoint_digest: bool = False,
+        expected_authorized_session_instance_id: str | None = None,
+    ) -> SessionMessageSource:
+        """Capture source identity/cursor and requested digests under one store snapshot.
+
+        Check the optional authorization-owner incarnation before accessing
+        transcript or checkpoint content, within that same snapshot.
+        """
+        raise NotImplementedError(
+            "Session-message source snapshots are not supported by this store."
+        )
 
     @abstractmethod
     async def deliver_queued_session_messages(
@@ -10726,12 +10849,19 @@ class SessionStore(ABC):
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
         profile_handoff: QueuedInteractionProfileHandoff | None = None,
+        reject_only: bool = False,
     ) -> SessionMessageDeliveryBatch:
         """Atomically append and mark one bounded queue batch delivered.
 
         Runtime callers supply a stable ``delivery_id`` for acknowledgement-loss
         reconstruction. Omitting it creates a one-shot identity for direct store
         callers and returns that identity in the result.
+
+        ``reject_only`` retires stale/expired records without delivering valid
+        input, for a runtime that has exhausted its model-step authority. Valid
+        records remain pending; ``has_more`` then describes remaining rejection
+        work inside the fixed eligibility boundary. The mode is part of the
+        exact delivery identity and cannot change on replay.
         """
 
     async def repair_queued_interaction_profile_handoff(
@@ -11670,6 +11800,7 @@ class SessionStore(ABC):
         retained_event_bytes = 0
         queued_message_count = 0
         delivered_message_count = 0
+        rejected_message_count = 0
         operation_event_count = 0
         after_sequence = 0
         while True:
@@ -11721,6 +11852,12 @@ class SessionStore(ABC):
                     budget_events.append(budget_event)
                 queued_message_count += event.type == EventType.SESSION_MESSAGE_QUEUED
                 delivered_message_count += event.type == EventType.SESSION_MESSAGE_DELIVERED
+                rejected_message_count += event.type in {
+                    EventType.SESSION_MESSAGE_WITHDRAWN,
+                    EventType.SESSION_MESSAGE_QUARANTINED,
+                    EventType.SESSION_MESSAGE_STALE,
+                    EventType.SESSION_MESSAGE_EXPIRED,
+                }
                 operation_event_count += event.type == EventType.SERVER_MUTATION_ACCEPTED
             after_sequence = records[-1].sequence
             if len(records) < _SESSION_INSPECTION_PAGE_SIZE:
@@ -11785,7 +11922,7 @@ class SessionStore(ABC):
             queued_message_count=queued_message_count,
             delivered_message_count=delivered_message_count,
             outstanding_message_count=max(
-                queued_message_count - delivered_message_count,
+                queued_message_count - delivered_message_count - rejected_message_count,
                 0,
             ),
             operation_event_count=operation_event_count,
@@ -12300,6 +12437,7 @@ class _InMemoryMessageDeliveryRecord:
     interaction_started_event: Event | None
     profile_handoff: QueuedInteractionProfileHandoff | None
     batch: SessionMessageDeliveryBatch
+    reject_only: bool = False
 
 
 class InMemorySessionStore(SessionStore):
@@ -12320,6 +12458,7 @@ class InMemorySessionStore(SessionStore):
     terminal_interaction_publication_version: ClassVar[int | None] = 1
     durable_model_terminalization_version: ClassVar[int | None] = 1
     queued_interaction_profile_handoff_version: ClassVar[int | None] = 1
+    session_message_lifecycle_version: ClassVar[int | None] = 1
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
@@ -12522,6 +12661,10 @@ class InMemorySessionStore(SessionStore):
             tuple[str, SessionMessageDeliveryMode], deque[SessionQueuedMessage]
         ] = {}
         self._session_message_delivery_records: dict[str, _InMemoryMessageDeliveryRecord] = {}
+        self._session_message_terminal_receipts: dict[tuple[str, str], dict[str, Any]] = {}
+        # Event-owned lookup index, not a copy of acceptance provenance. Retain
+        # at most two IDs: a second canonical acceptance makes quarantine ambiguous.
+        self._session_message_acceptance_event_ids: dict[tuple[str, str], set[str]] = {}
         self._next_session_message_ordering_key = 1
 
     @property
@@ -14628,6 +14771,16 @@ class InMemorySessionStore(SessionStore):
             self._session_operation_records.pop(session_id, None)
             self._pending_action_session_ids.discard(session_id)
             self._queued_session_messages_by_idempotency.pop(session_id, None)
+            self._session_message_acceptance_event_ids = {
+                key: ids
+                for key, ids in self._session_message_acceptance_event_ids.items()
+                if key[0] != session_id
+            }
+            self._session_message_terminal_receipts = {
+                key: receipt
+                for key, receipt in self._session_message_terminal_receipts.items()
+                if key[0] != session_id
+            }
             self._session_message_delivery_records = {
                 delivery_id: record
                 for delivery_id, record in self._session_message_delivery_records.items()
@@ -15112,11 +15265,13 @@ class InMemorySessionStore(SessionStore):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
+        checkpoint_mutation: dict[str, Any] | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
+        mutation = _prepare_queue_completion_checkpoint_mutation(checkpoint_mutation, to_status)
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -15134,15 +15289,25 @@ class InMemorySessionStore(SessionStore):
                     f"Session has durable queued messages: {session_id}"
                 )
             now = self._ownership_clock()
+            checkpoint = (
+                None
+                if mutation is None
+                else _apply_queue_completion_checkpoint_mutation(
+                    session, mutation, self._checkpoints.get(session_id)
+                )
+            )
             updated = session.model_copy(
                 update={
                     "status": to_status,
                     "updated_at": now,
                     "last_activity_at": now,
-                    "run_epoch": session.run_epoch + (to_status == SessionStatus.RUNNING),
+                    "run_epoch": session.run_epoch
+                    + (to_status == SessionStatus.RUNNING and mutation is None),
                 }
             )
             self._sessions[session_id] = updated
+            if checkpoint is not None:
+                self._store_checkpoint_unlocked(session_id, checkpoint)
             self._refresh_child_lifecycle_candidate_unlocked(updated)
             result = updated.model_copy(deep=True)
             if to_status == SessionStatus.RUNNING:
@@ -16081,6 +16246,14 @@ class InMemorySessionStore(SessionStore):
             self._events[session_id].append(stored_event)
             self._event_records.append(record)
             self._event_records_by_id[(session_id, stored_event.id)] = record
+            if stored_event.type is EventType.SESSION_MESSAGE_QUEUED:
+                queue_id = stored_event.payload.get("queue_id")
+                if type(queue_id) is str and len(queue_id) <= 512:
+                    ids = self._session_message_acceptance_event_ids.setdefault(
+                        (session_id, queue_id), set()
+                    )
+                    if len(ids) < 2:
+                        ids.add(stored_event.id)
             self._cost_event_index.append(record)
             session_records.append(record)
             if session.parent_session_id is not None and stored_event.type in {
@@ -16584,15 +16757,275 @@ class InMemorySessionStore(SessionStore):
             )
         return delivery
 
+    def _session_message_source_unlocked(
+        self,
+        session_id: str,
+        *,
+        include_transcript_digest: bool,
+        include_checkpoint_digest: bool,
+    ) -> SessionMessageSource:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError("Session-message source not found.")
+        messages = self._transcripts.get(session_id, [])
+        transcript = None
+        if include_transcript_digest:
+            transcript = TranscriptSnapshot(
+                records=[
+                    TranscriptRecord(index=index, message=detach_message(message))
+                    for index, message in enumerate(messages)
+                ],
+                cursor=len(messages),
+            )
+        return SessionMessageSource(
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            run_epoch=session.run_epoch,
+            transcript_cursor=len(messages),
+            transcript_sha256=(
+                None if transcript is None else fork_source_transcript_sha256(transcript)
+            ),
+            checkpoint_sha256=(
+                session_message_checkpoint_sha256(self._checkpoints.get(session_id))
+                if include_checkpoint_digest
+                else None
+            ),
+        )
+
+    def _session_message_accepted_event_unlocked(
+        self,
+        raw: dict[str, Any],
+        *,
+        quarantine: bool = False,
+    ) -> Event | None:
+        if quarantine:
+            ids = self._session_message_acceptance_event_ids.get(
+                (raw["session_id"], raw["queue_id"]), set()
+            )
+            if len(ids) != 1:
+                raise SessionMessageConflict()
+            record = self._event_records_by_id.get((raw["session_id"], next(iter(ids))))
+            return None if record is None else record.event
+        event_id = raw["accepted_event_id"]
+        if type(event_id) is not str or len(event_id) > 512:
+            raise SessionMessageConflict()
+        record = self._event_records_by_id.get((raw["session_id"], event_id))
+        return None if record is None else record.event
+
+    def _raw_session_message_unlocked(self, message: SessionQueuedMessage) -> dict[str, Any]:
+        raw = message.model_dump(mode="json", warnings=False)
+        raw["terminal_json"] = self._session_message_terminal_receipts.get(
+            (message.session_id, message.queue_id)
+        )
+        return raw
+
+    def _inspect_session_message_unlocked(
+        self, message: SessionQueuedMessage
+    ) -> SessionMessageInspectionRecord:
+        from cayu.runtime._session_message_queue import inspect_record
+
+        raw = self._raw_session_message_unlocked(message)
+        return inspect_record(
+            raw,
+            lambda: SessionQueuedMessage.model_validate(
+                {key: value for key, value in raw.items() if key != "terminal_json"}
+            ),
+        )
+
+    async def inspect_session_messages(
+        self,
+        query: SessionMessageQuery,
+        *,
+        expected_authorized_session_instance_id: str | None = None,
+    ) -> SessionMessageInspection:
+        from cayu.runtime._session_message_queue import (
+            copy_inspection_query,
+            inspection_boundary,
+            inspection_next_cursor,
+            inspection_priority,
+            require_authorized_session_instance,
+        )
+
+        query = copy_inspection_query(query)
+        async with self._lock:
+            session = self._sessions.get(query.session_id)
+            if session is None:
+                raise KeyError("Session-message target not found.")
+            require_authorized_session_instance(session, expected_authorized_session_instance_id)
+            candidates = self._queued_session_messages_by_idempotency.get(session.id, {}).values()
+            boundary = inspection_boundary(
+                session,
+                query.cursor,
+                max((message.ordering_key for message in candidates), default=0)
+                if query.cursor is None
+                else 0,
+            )
+            messages = heapq.nsmallest(
+                query.limit + 1,
+                (
+                    message
+                    for message in candidates
+                    if message.ordering_key <= boundary.through_ordering_key
+                    and (inspection_priority(message.delivery_mode), message.ordering_key)
+                    > (boundary.after_priority, boundary.after_ordering_key)
+                ),
+                key=lambda message: (
+                    inspection_priority(message.delivery_mode),
+                    message.ordering_key,
+                ),
+            )
+            records = tuple(
+                self._inspect_session_message_unlocked(message)
+                for message in messages[: query.limit]
+            )
+            return SessionMessageInspection(
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                records=records,
+                next_cursor=(
+                    inspection_next_cursor(
+                        boundary,
+                        inspection_priority(messages[query.limit - 1].delivery_mode),
+                        records[-1].ordering_key,
+                    )
+                    if len(messages) > query.limit
+                    else None
+                ),
+            )
+
+    async def apply_session_message_action(
+        self, request: SessionMessageActionRequest
+    ) -> SessionMessageActionResult:
+        from cayu.runtime._session_message_queue import (
+            raw_revision,
+            replay_action,
+            terminal_event,
+            terminal_receipt,
+        )
+
+        request = copy_session_message_action(request)
+        async with self._lock:
+            session = self._sessions.get(request.session_id)
+            if session is None or session.instance_id != request.session_instance_id:
+                raise SessionMessageConflict()
+            messages = self._queued_session_messages_by_idempotency.get(session.id, {})
+            message = next(
+                (item for item in messages.values() if item.queue_id == request.queue_id), None
+            )
+            if message is None:
+                raise SessionMessageConflict()
+            raw = self._raw_session_message_unlocked(message)
+            accepted_event = self._session_message_accepted_event_unlocked(
+                raw,
+                quarantine=request.action == "quarantine",
+            )
+            replay = replay_action(raw, request, accepted_event=accepted_event)
+            if replay is not None:
+                return SessionMessageActionResult(
+                    record=self._inspect_session_message_unlocked(message),
+                    event=replay,
+                    replayed=True,
+                )
+            if (
+                raw_revision(raw) != request.expected_revision
+                or message.status != SessionMessageQueueStatus.QUEUED
+                or message.delivered_event_id is not None
+                or any(
+                    delivered.queue_id == message.queue_id
+                    for delivery in self._session_message_delivery_records.values()
+                    if delivery.session_id == session.id
+                    for delivered in delivery.batch.messages
+                )
+            ):
+                raise SessionMessageConflict()
+            if (
+                request.action == "withdraw"
+                and self._inspect_session_message_unlocked(message).validity != "valid"
+            ):
+                raise SessionMessageConflict()
+            status = (
+                SessionMessageQueueStatus.WITHDRAWN
+                if request.action == "withdraw"
+                else SessionMessageQueueStatus.QUARANTINED
+            )
+            event = terminal_event(
+                session,
+                raw,
+                status,
+                self._ownership_clock(),
+                actor=request.requested_by,
+                accepted_event=accepted_event,
+            )
+            updated = message.model_copy(update={"status": status}, deep=True)
+            updated_session = self._append_events_unlocked(session, [event])
+            self._session_message_terminal_receipts[(session.id, message.queue_id)] = (
+                terminal_receipt(status, event, request)
+            )
+            messages[message.idempotency_key] = updated
+            for mode in SessionMessageDeliveryMode:
+                key = (session.id, mode)
+                pending = self._pending_session_messages.get(key)
+                if pending is not None:
+                    remaining = deque(item for item in pending if item.queue_id != message.queue_id)
+                    if remaining:
+                        self._pending_session_messages[key] = remaining
+                    else:
+                        del self._pending_session_messages[key]
+            self._sessions[session.id] = updated_session
+            return SessionMessageActionResult(
+                record=self._inspect_session_message_unlocked(updated), event=event
+            )
+
+    async def snapshot_session_message_source(
+        self,
+        session_id: str,
+        *,
+        include_transcript_digest: bool = False,
+        include_checkpoint_digest: bool = False,
+        expected_authorized_session_instance_id: str | None = None,
+    ) -> SessionMessageSource:
+        from cayu.runtime._session_message_queue import require_authorized_session_instance
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if (
+            type(include_transcript_digest) is not bool
+            or type(include_checkpoint_digest) is not bool
+        ):
+            raise TypeError("Source snapshot digest flags must be bools.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError("Session-message source not found.")
+            require_authorized_session_instance(session, expected_authorized_session_instance_id)
+            return self._session_message_source_unlocked(
+                session_id,
+                include_transcript_digest=include_transcript_digest,
+                include_checkpoint_digest=include_checkpoint_digest,
+            )
+
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
+        *,
+        expected_authorized_target_instance_id: str | None = None,
     ) -> EnqueueSessionMessageResult:
         request = copy_enqueue_session_message_request(request)
         async with self._lock:
             session = self._sessions.get(request.session_id)
             if session is None:
                 raise KeyError(f"Session not found: {request.session_id}")
+            if expected_authorized_target_instance_id is not None and (
+                type(expected_authorized_target_instance_id) is not str
+                or session.instance_id != expected_authorized_target_instance_id
+            ):
+                raise SessionMessageConflict()
+            if request.conditions.source is not None:
+                source_session = self._sessions.get(request.conditions.source.session_id)
+                if (
+                    source_session is None
+                    or source_session.instance_id != request.conditions.source.session_instance_id
+                ):
+                    raise SessionMessageConflict()
             messages_by_idempotency = self._queued_session_messages_by_idempotency.get(
                 request.session_id
             )
@@ -16628,9 +17061,18 @@ class InMemorySessionStore(SessionStore):
                 )
             accepted_at = self._ownership_clock()
             queue_id = str(uuid4())
+            source = request.conditions.source
+            if source is not None and source != self._session_message_source_unlocked(
+                source.session_id,
+                include_transcript_digest=source.transcript_sha256 is not None,
+                include_checkpoint_digest=source.checkpoint_sha256 is not None,
+            ):
+                raise SessionMessageConflict()
             ordering_key = self._next_session_message_ordering_key
             accepted_transcript_cursor = len(self._transcripts.get(session.id, []))
             accepted_message = enqueue_session_message_input(request)
+            from cayu.runtime._session_message_queue import source_event_payload
+
             accepted_event = event_with_runtime_payload_authority(
                 Event(
                     type=EventType.SESSION_MESSAGE_QUEUED,
@@ -16647,6 +17089,7 @@ class InMemorySessionStore(SessionStore):
                             run_epoch=session.run_epoch,
                             transcript_cursor=accepted_transcript_cursor,
                         ),
+                        **source_event_payload(request.conditions.source),
                         SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
                             session_messages_input_contract_evidence(
                                 (accepted_message,),
@@ -16673,6 +17116,7 @@ class InMemorySessionStore(SessionStore):
                 accepted_event_id=accepted_event.id,
                 accepted_at=accepted_at,
                 requested_by=_audit_resolution_actor(request.requested_by),
+                conditions=request.conditions,
             )
             self._sessions[session.id] = self._append_events_unlocked(
                 session,
@@ -16700,6 +17144,7 @@ class InMemorySessionStore(SessionStore):
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
         profile_handoff: QueuedInteractionProfileHandoff | None = None,
+        reject_only: bool = False,
     ) -> SessionMessageDeliveryBatch:
         session_id = require_clean_nonblank(session_id, "session_id")
         delivery_id = (
@@ -16709,6 +17154,8 @@ class InMemorySessionStore(SessionStore):
         )
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
+        if type(reject_only) is not bool:
+            raise TypeError("reject_only must be a bool.")
         if interaction_id is not None:
             interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
         interaction_started_event = _copy_queued_interaction_started_event(
@@ -16742,6 +17189,7 @@ class InMemorySessionStore(SessionStore):
                     interaction_id=interaction_id,
                     interaction_started_event=interaction_started_event,
                     profile_handoff=profile_handoff,
+                    reject_only=reject_only,
                 )
                 replayed_batch = existing_delivery.batch.model_copy(
                     update={"replayed": True},
@@ -16813,6 +17261,30 @@ class InMemorySessionStore(SessionStore):
 
             selected_key: tuple[str, SessionMessageDeliveryMode] | None = None
             selected: list[SessionQueuedMessage] = []
+            delivered_at = self._ownership_clock()
+            transcript_cursor = len(self._transcripts.get(session_id, []))
+
+            def validated_message(message: SessionQueuedMessage) -> SessionQueuedMessage:
+                # Reconstruct the complete record, as persistent stores do. Passing
+                # the existing model to model_validate would trust mutated fields;
+                # serializing it first could emit rejected values in warnings.
+                return SessionQueuedMessage.model_validate(
+                    {name: getattr(message, name) for name in SessionQueuedMessage.model_fields}
+                )
+
+            def rejected_now(message: SessionQueuedMessage) -> bool:
+                message = validated_message(message)
+                return (
+                    session_message_rejection(
+                        message.conditions,
+                        session_instance_id=session.instance_id,
+                        run_epoch=session.run_epoch,
+                        transcript_cursor=transcript_cursor,
+                        now=delivered_at,
+                    )
+                    is not None
+                )
+
             delivery_modes: tuple[SessionMessageDeliveryMode, ...] = (
                 SessionMessageDeliveryMode.NEXT_TURN,
             )
@@ -16827,8 +17299,12 @@ class InMemorySessionStore(SessionStore):
                 for message in pending:
                     if len(selected) >= limit or message.ordering_key > boundary:
                         break
+                    message = validated_message(message)
+                    if reject_only and not rejected_now(message):
+                        continue
                     selected.append(message)
-                break
+                if selected:
+                    break
             if not selected:
                 batch = SessionMessageDeliveryBatch(
                     delivery_id=delivery_id,
@@ -16846,14 +17322,76 @@ class InMemorySessionStore(SessionStore):
                         interaction_started_event=interaction_started_event,
                         profile_handoff=profile_handoff,
                         batch=batch,
+                        reject_only=reject_only,
                     )
                 )
                 return batch
             if selected_key is None:
                 raise RuntimeError("Queued message selection lost its pending index.")
 
+            from cayu.runtime._session_message_queue import (
+                source_audit_payload,
+                terminal_event,
+                terminal_receipt,
+            )
+
+            selected_all = selected
+            selected_ids = {message.queue_id for message in selected_all}
+
+            def has_eligible(delivery_mode: SessionMessageDeliveryMode) -> bool:
+                pending = self._pending_session_messages.get((session_id, delivery_mode), ())
+                return any(
+                    message.queue_id not in selected_ids
+                    and message.ordering_key <= boundary
+                    and (not reject_only or rejected_now(message))
+                    for message in pending
+                )
+
+            # Lookahead can reject malformed rows. Finish it before publishing
+            # any events or changing the pending index, including reject-only drains.
+            has_more = has_eligible(SessionMessageDeliveryMode.NEXT_TURN) or (
+                include_on_idle and has_eligible(SessionMessageDeliveryMode.ON_IDLE)
+            )
+            accepted_events = {
+                message.queue_id: self._session_message_accepted_event_unlocked(
+                    self._raw_session_message_unlocked(message)
+                )
+                for message in selected_all
+            }
+            selected = []
+            rejected_messages: list[SessionQueuedMessage] = []
+            rejection_events: list[Event] = []
+            rejected_receipts: dict[tuple[str, str], dict[str, Any]] = {}
+            for queued_message in selected_all:
+                rejection = session_message_rejection(
+                    queued_message.conditions,
+                    session_instance_id=session.instance_id,
+                    run_epoch=session.run_epoch,
+                    transcript_cursor=transcript_cursor + len(selected),
+                    now=delivered_at,
+                )
+                if rejection is None:
+                    selected.append(queued_message)
+                    continue
+                event = terminal_event(
+                    session,
+                    self._raw_session_message_unlocked(queued_message),
+                    rejection,
+                    delivered_at,
+                    accepted_event=accepted_events[queued_message.queue_id],
+                    actor=queued_message.requested_by,
+                    interaction_id=interaction_id,
+                )
+                rejection_events.append(event)
+                rejected_messages.append(
+                    queued_message.model_copy(update={"status": rejection}, deep=True)
+                )
+                rejected_receipts[(session_id, queued_message.queue_id)] = terminal_receipt(
+                    rejection, event
+                )
+
             rebound_checkpoint: dict[str, Any] | None = None
-            if profile_handoff is not None:
+            if profile_handoff is not None and selected:
                 receipt_record = self._session_operation_records.get(session_id, {}).get(
                     _interaction_transition_storage_key(
                         profile_handoff.predecessor_settlement_event_id
@@ -16871,8 +17409,6 @@ class InMemorySessionStore(SessionStore):
                     replayed_delivery=False,
                 )
 
-            transcript_cursor = len(self._transcripts.get(session_id, []))
-            delivered_at = self._ownership_clock()
             updated_messages: list[SessionQueuedMessage] = []
             delivery_events: list[Event] = []
             transcript_messages: list[Message] = []
@@ -16895,6 +17431,10 @@ class InMemorySessionStore(SessionStore):
                                 actor=queued_message.requested_by,
                                 run_epoch=session.run_epoch,
                                 transcript_cursor=delivered_cursor,
+                            ),
+                            **source_audit_payload(
+                                self._raw_session_message_unlocked(queued_message),
+                                accepted_events[queued_message.queue_id],
                             ),
                             "accepted_run_epoch": queued_message.accepted_run_epoch,
                             "accepted_transcript_cursor": (
@@ -16928,35 +17468,16 @@ class InMemorySessionStore(SessionStore):
                 transcript_messages.append(delivered_message)
 
             persisted_events = [
-                *([interaction_started_event] if interaction_started_event is not None else []),
-                *delivery_events,
+                *(
+                    [interaction_started_event]
+                    if interaction_started_event is not None and selected
+                    else []
+                ),
+                *sorted(
+                    [*delivery_events, *rejection_events],
+                    key=lambda event: event.payload["ordering_key"],
+                ),
             ]
-            updated_session = self._append_events_unlocked(session, persisted_events)
-            self._transcripts.setdefault(session_id, []).extend(transcript_messages)
-            self._extend_transcript_search_unlocked(session_id, transcript_messages)
-            self._transcript_interaction_ids.setdefault(session_id, [])
-            self._extend_transcript_attribution_unlocked(
-                session_id, [interaction_id] * len(transcript_messages)
-            )
-            selected_queue = self._pending_session_messages[selected_key]
-            for _ in selected:
-                selected_queue.popleft()
-            if not selected_queue:
-                del self._pending_session_messages[selected_key]
-            messages_by_idempotency = self._queued_session_messages_by_idempotency[session_id]
-            for updated_message in updated_messages:
-                messages_by_idempotency[updated_message.idempotency_key] = updated_message
-            self._sessions[session_id] = updated_session
-            if rebound_checkpoint is not None:
-                self._store_checkpoint_unlocked(session_id, rebound_checkpoint)
-
-            def has_eligible(delivery_mode: SessionMessageDeliveryMode) -> bool:
-                pending = self._pending_session_messages.get((session_id, delivery_mode))
-                return pending is not None and pending[0].ordering_key <= boundary
-
-            has_more = has_eligible(SessionMessageDeliveryMode.NEXT_TURN) or (
-                include_on_idle and has_eligible(SessionMessageDeliveryMode.ON_IDLE)
-            )
             batch = SessionMessageDeliveryBatch(
                 messages=tuple(updated_messages),
                 events=tuple(persisted_events),
@@ -16965,10 +17486,12 @@ class InMemorySessionStore(SessionStore):
                 eligible_through=boundary,
                 has_more=has_more,
                 active_invocation_profile=(
-                    None if profile_handoff is None else profile_handoff.target_active_profile
+                    None
+                    if profile_handoff is None or not selected
+                    else profile_handoff.target_active_profile
                 ),
             )
-            self._session_message_delivery_records[delivery_id] = _InMemoryMessageDeliveryRecord(
+            delivery_record = _InMemoryMessageDeliveryRecord(
                 session_id=session_id,
                 include_on_idle=include_on_idle,
                 requested_eligible_through=eligible_through,
@@ -16977,7 +17500,31 @@ class InMemorySessionStore(SessionStore):
                 interaction_started_event=interaction_started_event,
                 profile_handoff=profile_handoff,
                 batch=batch,
+                reject_only=reject_only,
             )
+            selected_queue = deque(
+                message
+                for message in self._pending_session_messages[selected_key]
+                if message.queue_id not in selected_ids
+            )
+            updated_session = self._append_events_unlocked(session, persisted_events)
+            self._transcripts.setdefault(session_id, []).extend(transcript_messages)
+            self._extend_transcript_search_unlocked(session_id, transcript_messages)
+            self._transcript_interaction_ids.setdefault(session_id, [])
+            self._extend_transcript_attribution_unlocked(
+                session_id, [interaction_id] * len(transcript_messages)
+            )
+            self._pending_session_messages[selected_key] = selected_queue
+            if not selected_queue:
+                del self._pending_session_messages[selected_key]
+            messages_by_idempotency = self._queued_session_messages_by_idempotency[session_id]
+            for updated_message in [*updated_messages, *rejected_messages]:
+                messages_by_idempotency[updated_message.idempotency_key] = updated_message
+            self._session_message_terminal_receipts.update(rejected_receipts)
+            self._sessions[session_id] = updated_session
+            if rebound_checkpoint is not None:
+                self._store_checkpoint_unlocked(session_id, rebound_checkpoint)
+            self._session_message_delivery_records[delivery_id] = delivery_record
             return batch
 
     async def repair_queued_interaction_profile_handoff(
@@ -22239,6 +22786,7 @@ def copy_enqueue_session_message_request(
         message=(None if request.message is None else detach_message(request.message)),
         delivery_mode=request.delivery_mode,
         requested_by=copy_resolution_actor(request.requested_by),
+        conditions=copy_session_message_conditions(request.conditions),
     )
     copied._input_redactions_applied = request._input_redactions_applied
     return copied
@@ -22838,6 +23386,7 @@ def _validate_equivalent_queued_session_message(
         existing.content != request.content
         or existing.message != request.message
         or existing.delivery_mode != request.delivery_mode
+        or existing.conditions != request.conditions
         or resolution_actor_payload(existing.requested_by)
         != resolution_actor_payload(request.requested_by)
     ):
@@ -23997,6 +24546,67 @@ def runtime_publication_checkpoint_mutation(
                 )
             )
     return RuntimePublicationMutation(operations=tuple(operations))
+
+
+def _validate_completion_finalization_mutation_shape(value: dict[str, Any]) -> None:
+    """Completion may only install one previously absent finalization marker."""
+
+    operations = value.get("operations")
+    if type(operations) is not list or len(operations) != 1:
+        raise ValueError(
+            "A completion-finalization transition requires exactly one checkpoint operation."
+        )
+    operation = operations[0]
+    if (
+        type(operation) is not dict
+        or operation.get("key") != PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
+        or operation.get("expected_value_digest") is not None
+        or operation.get("action") != "set"
+        or type(operation.get("value")) is not dict
+    ):
+        raise ValueError("A completion-finalization transition must install a new pending marker.")
+
+
+def _prepare_queue_completion_checkpoint_mutation(
+    value: dict[str, Any] | None,
+    to_status: SessionStatus,
+) -> RuntimePublicationMutation | None:
+    if value is None:
+        return None
+    if to_status is not SessionStatus.RUNNING:
+        raise ValueError("Queue completion checkpointing must retain running status.")
+    copied = copy_durable_json_object(value, "checkpoint_mutation")
+    _validate_completion_finalization_mutation_shape(copied)
+    mutation = RuntimePublicationMutation.model_validate(copied)
+    from cayu.runtime._environment_lifecycle import pending_completion_finalization_from_checkpoint
+
+    pending_completion_finalization_from_checkpoint(
+        {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: mutation.operations[0].value}
+    )
+    return mutation
+
+
+def _apply_queue_completion_checkpoint_mutation(
+    session: Session,
+    mutation: RuntimePublicationMutation,
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Check durable owner authority under the session lock, then apply the marker CAS."""
+
+    active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    marker = mutation.operations[0].value
+    if (
+        session.status is not SessionStatus.RUNNING
+        or active is None
+        or active.session_id != session.id
+        or active.run_epoch != session.run_epoch
+        or marker["execution_profile_fingerprint"] != active.profile.fingerprint
+        or marker["environment_name"] != session.environment_name
+    ):
+        raise SessionRunFenced("Queue completion finalization lost its active owner authority.")
+    updated = _apply_runtime_publication_checkpoint_mutation(mutation, checkpoint)
+    assert updated is not None
+    return updated
 
 
 def _apply_runtime_publication_checkpoint_mutation(
@@ -28967,6 +29577,7 @@ def _validate_equivalent_message_delivery(
     interaction_id: str | None,
     interaction_started_event: Event | None,
     profile_handoff: QueuedInteractionProfileHandoff | None,
+    reject_only: bool = False,
 ) -> None:
     if (
         existing.session_id != session_id
@@ -28976,6 +29587,7 @@ def _validate_equivalent_message_delivery(
         or existing.interaction_id != interaction_id
         or existing.interaction_started_event != interaction_started_event
         or existing.profile_handoff != profile_handoff
+        or existing.reject_only != reject_only
     ):
         raise ValueError("delivery_id was already used for a different queue delivery.")
 
@@ -29084,13 +29696,28 @@ def _checkpoint_after_queued_interaction_profile_handoff(
         or receipt.event.type is not EventType.INTERACTION_COMPLETED
         or receipt.event.interaction_id != expected.interaction_id
         or not receipt.only_if_no_queued_messages
-        or receipt.to_status is not SessionStatus.COMPLETED
+        or receipt.to_status not in {SessionStatus.COMPLETED, SessionStatus.RUNNING}
         or receipt.status_changed
         or receipt.terminal_event is not None
     ):
         raise SessionRunFenced(
             "Queued interaction handoff lacks the exact predecessor settlement receipt."
         )
+    if receipt.to_status is SessionStatus.RUNNING:
+        # A completion-critical predecessor remains RUNNING only to install
+        # its finalization marker at an empty-queue boundary. Reconstruct the
+        # full transition contract: it requires exactly one unconditional set
+        # of pending_completion_finalization, not an arbitrary checkpoint write.
+        # status_changed=False above proves that this mutation was not applied.
+        try:
+            transition = _interaction_transition_spec_from_receipt(receipt)
+            if transition.checkpoint_mutation is None:
+                raise ValueError
+            RuntimePublicationMutation.model_validate(transition.checkpoint_mutation)
+        except (TypeError, ValueError):
+            raise SessionRunFenced(
+                "Queued interaction handoff lacks a completion-finalization transition."
+            ) from None
     current = active_invocation_execution_profile_from_checkpoint(checkpoint)
     if current == target:
         if not replayed_delivery:

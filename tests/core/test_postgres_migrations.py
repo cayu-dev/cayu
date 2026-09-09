@@ -1041,7 +1041,7 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
         finally:
             await creator.close()
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
-            await conn.execute("DELETE FROM cayu_schema_migrations WHERE revision = 82")
+            await conn.execute("DELETE FROM cayu_schema_migrations WHERE revision = 83")
             await conn.commit()
 
     asyncio.run(prepare())
@@ -1082,7 +1082,7 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
                 postgres_dsn,
                 "--waive-backup",
                 "--acknowledge-breaking",
-                "82",
+                "83",
             ]
         )
         == 1

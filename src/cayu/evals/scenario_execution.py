@@ -456,7 +456,7 @@ class _ScenarioTrialDriver:
                 return
             messages = _scenario_messages(event.input, self.scenario, self.binding)
             for message_index, message in enumerate(messages):
-                await self.target.app.enqueue_session_message(
+                await self.target.app._enqueue_session_message_from_scenario(
                     EnqueueSessionMessageRequest(
                         session_id=self.session_id,
                         idempotency_key=(
@@ -466,10 +466,6 @@ class _ScenarioTrialDriver:
                         content=_queued_message_text(message),
                         message=message,
                         delivery_mode=SessionMessageDeliveryMode(event.delivery_mode),
-                        requested_by=ResolutionActor(
-                            subject="cayu:eval-scenario",
-                            source=ResolutionActorSource.SYSTEM,
-                        ),
                     )
                 )
             self.next_sequence += 1

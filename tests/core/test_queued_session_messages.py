@@ -2348,8 +2348,18 @@ def test_sqlite_queue_delivery_replay_survives_event_retention(tmp_path) -> None
                     before=datetime.now(UTC) + timedelta(days=1),
                     session_id=session_id,
                 )
-                == 4
+                == 2
             )
+            # Queue-linked evidence remains the canonical source for protected
+            # inspection, provenance, and public event aliases. Unrelated
+            # interaction events can still be pruned and reconstructed from the
+            # exact delivery receipt below.
+            retained = await store.load_events(session_id)
+            assert {event.type for event in retained} == {
+                EventType.SESSION_MESSAGE_QUEUED,
+                EventType.SESSION_MESSAGE_DELIVERED,
+            }
+            assert accepted.event.id in {event.id for event in retained}
 
             replayed = await store.deliver_queued_session_messages(
                 session_id,

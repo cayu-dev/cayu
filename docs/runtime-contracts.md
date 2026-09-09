@@ -1722,6 +1722,11 @@ Checkpoint field updates that can race with runtime finalization use `transform_
 
 ### Durable session steering
 
+Protected queue inspection, terminal actions, provenance, and scoped HTTP
+admission are described in [Session-message lifecycle](session-message-lifecycle.md).
+HTTP enqueue requires an authenticated caller and an explicit
+`SessionMessageAccessPolicy`; authentication alone is not session authorization.
+
 `CayuApp.enqueue_session_message(EnqueueSessionMessageRequest(...))` queues a
 bounded user message for a session that is currently `pending` or `running`.
 The request carries a session id, caller idempotency key, UTF-8 content (at most

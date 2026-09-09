@@ -37,6 +37,15 @@ lookup.
 
 ## Safe application-owned boundary
 
+Session-message lifecycle operations have a narrow application-owned policy:
+`SessionMessageAccessPolicy` authorizes the exact session incarnation and action
+using your trusted ownership data. Configure it on `CayuApp` before exposing
+message enqueue, inspection, source snapshots, withdrawal, or quarantine over
+HTTP. Source and target access are checked independently; `AuthContext.tenant`
+and copied source snapshots do not replace those checks. See
+[Protected session-message lifecycle](../session-message-lifecycle.md).
+This opt-in does not make the remaining built-in routes tenant-scoped.
+
 For new services, generate the maintained tracer bullet first:
 
 ```bash

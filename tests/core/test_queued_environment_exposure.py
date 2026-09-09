@@ -124,10 +124,10 @@ def test_public_on_idle_preserves_environment_exposure(factory_backed: bool, enq
 
 
 def test_queued_exposure_transfer_revokes_predecessor(monkeypatch: pytest.MonkeyPatch) -> None:
-    from cayu.runtime import _session_engine
+    from cayu.runtime import _environment_lifecycle
     from cayu.runtime._environment_exposure import require_environment_exposed
 
-    transfer = _session_engine.transfer_queued_environment_exposure
+    transfer = _environment_lifecycle.transfer_queued_environment_exposure
     transfers = []
 
     def checked_transfer(*, session, predecessor, successor):
@@ -163,6 +163,8 @@ def test_queued_exposure_transfer_revokes_predecessor(monkeypatch: pytest.Monkey
         assert admission.settlement_task is settlement
         transfers.append(successor)
 
-    monkeypatch.setattr(_session_engine, "transfer_queued_environment_exposure", checked_transfer)
+    monkeypatch.setattr(
+        _environment_lifecycle, "transfer_queued_environment_exposure", checked_transfer
+    )
     test_public_on_idle_preserves_environment_exposure(factory_backed=False, enqueue=True)
     assert len(transfers) == 1

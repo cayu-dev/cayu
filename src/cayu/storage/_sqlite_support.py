@@ -562,6 +562,8 @@ _BASELINE_DDL = """
         idempotency_key TEXT NOT NULL,
         content TEXT NOT NULL,
         message_json TEXT CHECK (message_json IS NULL OR json_valid(message_json)),
+        conditions_json TEXT,
+        terminal_json TEXT,
         delivery_mode TEXT NOT NULL,
         status TEXT NOT NULL,
         requested_by_json TEXT,
@@ -578,6 +580,7 @@ _BASELINE_DDL = """
 
     CREATE TABLE IF NOT EXISTS cayu_session_message_deliveries (
         delivery_id TEXT PRIMARY KEY,
+        reject_only INTEGER NOT NULL DEFAULT 0 CHECK (reject_only IN (0, 1)),
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         interaction_id TEXT,
         include_on_idle INTEGER NOT NULL,
@@ -883,6 +886,9 @@ _BASELINE_DDL = """
           ), 6) NOT GLOB '*[^0-9a-f]*';
     CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp
         ON cayu_events(event_type, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_queue_acceptance
+        ON cayu_events(session_id, json_extract(payload_json, '$.queue_id'))
+        WHERE event_type = 'session.message.queued';
     CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name
         ON cayu_events(agent_name);
     CREATE INDEX IF NOT EXISTS idx_cayu_events_environment_name
@@ -4098,6 +4104,11 @@ _MIGRATION_STEPS: dict[int, str] = {
     """,
     80: "ALTER TABLE cayu_eval_runs ADD COLUMN failure_diagnostic_json TEXT;",
     82: SQLITE_ACCOUNTING_DDL,
+    83: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_queue_acceptance
+        ON cayu_events(session_id, json_extract(payload_json, '$.queue_id'))
+        WHERE event_type = 'session.message.queued';
+    """,
     79: """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
             child_session_id TEXT COLLATE BINARY PRIMARY KEY
@@ -4476,6 +4487,15 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "TEXT CHECK (scenario_progress_json IS NULL OR "
             "(json_valid(scenario_progress_json) AND "
             "length(CAST(scenario_progress_json AS BLOB)) BETWEEN 1 AND 262144))",
+        ),
+    ),
+    83: (
+        ("cayu_session_message_queue", "conditions_json", "TEXT"),
+        ("cayu_session_message_queue", "terminal_json", "TEXT"),
+        (
+            "cayu_session_message_deliveries",
+            "reject_only",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (reject_only IN (0, 1))",
         ),
     ),
     57: (
@@ -6189,6 +6209,8 @@ def reconcile_schema(
         _validate_eval_run_scenario_progress_column(connection)
     if app_min_supported >= 57:
         _validate_session_message_queue_typed_message_column(connection)
+    if app_min_supported >= 83:
+        _validate_session_message_lifecycle_columns(connection)
     if app_min_supported >= 59:
         _validate_session_instance_schema(connection)
     if app_min_supported >= 61:
@@ -9981,6 +10003,31 @@ def _validate_eval_run_trial_checkpoint_schema(connection: sqlite3.Connection) -
         )
 
 
+def _validate_session_message_lifecycle_columns(connection: sqlite3.Connection) -> None:
+    index = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        ("idx_cayu_events_queue_acceptance",),
+    ).fetchone()
+    definition = _normalize_sqlite_schema_sql(None if index is None else index[0]).replace(" ", "")
+    if (
+        "oncayu_events(session_id,json_extract(payload_json,'$.queue_id'))" not in definition
+        or "whereevent_type='session.message.queued'" not in definition
+    ):
+        raise RuntimeError("SQLite queue acceptance lookup index conflicts with revision 83.")
+    columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), row[4])
+        for row in connection.execute("PRAGMA table_info(cayu_session_message_queue)")
+    }
+    if any(columns.get(name) != ("TEXT", 0, None) for name in ("conditions_json", "terminal_json")):
+        raise RuntimeError("SQLite session-message lifecycle columns conflict with revision 83.")
+    receipts = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), row[4])
+        for row in connection.execute("PRAGMA table_info(cayu_session_message_deliveries)")
+    }
+    if receipts.get("reject_only") != ("INTEGER", 1, "0"):
+        raise RuntimeError("SQLite queue rejection receipt conflicts with revision 83.")
+
+
 def _validate_session_message_queue_typed_message_column(
     connection: sqlite3.Connection,
 ) -> None:
@@ -10630,6 +10677,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_eval_run_scenario_progress_column(connection)
         if rev.revision == 57:
             _validate_session_message_queue_typed_message_column(connection)
+        if rev.revision == 83:
+            _validate_session_message_lifecycle_columns(connection)
         if rev.revision == 58:
             _validate_verified_work_schema(
                 connection,

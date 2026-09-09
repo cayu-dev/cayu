@@ -12146,8 +12146,27 @@ def test_sse_replay_preserves_canonical_policy_denial_attribution() -> None:
     ]
 
 
+def _authorized_message_endpoint():
+    from cayu import SessionMessageAccessPolicy
+    from cayu.server import AuthContext
+
+    class MessagePolicy(SessionMessageAccessPolicy):
+        def authorize(self, context, *, session_id, session_instance_id, action):
+            return (
+                context.subject == "operator@example.com"
+                and session_id == "session-message-endpoint"
+                and action == "enqueue"
+            )
+
+    async def authenticate(_request):
+        return AuthContext(subject="operator@example.com")
+
+    app = CayuApp(session_message_access_policy=MessagePolicy(), enable_logging=False)
+    return app, TestClient(create_server(app, config=ServerConfig.protected(authenticate)))
+
+
 def test_enqueue_session_message_endpoint_uses_replayable_mutation_contract() -> None:
-    app = CayuApp(enable_logging=False)
+    app, client = _authorized_message_endpoint()
 
     async def prepare() -> None:
         await app.session_store.create(
@@ -12160,7 +12179,6 @@ def test_enqueue_session_message_endpoint_uses_replayable_mutation_contract() ->
         )
 
     asyncio.run(prepare())
-    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
     session_id = "session-message-endpoint"
     with client.stream(
         "POST",
@@ -12169,7 +12187,6 @@ def test_enqueue_session_message_endpoint_uses_replayable_mutation_contract() ->
             "idempotency_key": "message-endpoint-1",
             "content": "Please prioritize the failing deployment.",
             "delivery_mode": "next_turn",
-            "requested_by": {"subject": "operator@example.com"},
         },
         headers={"Cayu-Mutation-ID": "mutation-message-1"},
     ) as response:
@@ -12182,7 +12199,7 @@ def test_enqueue_session_message_endpoint_uses_replayable_mutation_contract() ->
     assert queued["payload"]["actor"] == {
         "subject": "operator@example.com",
         "tenant": None,
-        "source": "request",
+        "source": "http_auth",
     }
     assert "content" not in queued["payload"]
 
@@ -12201,12 +12218,11 @@ def test_enqueue_session_message_endpoint_uses_replayable_mutation_contract() ->
         "accepted_event_sequence": public_event_sequence(queued["id"]),
         "accepted_event_type": EventType.SESSION_MESSAGE_QUEUED,
     }
-    assert "/api/sessions/{session_id}/messages" in client.get("/openapi.json").json()["paths"]
+    assert "/api/sessions/{session_id}/messages" in client.app.openapi()["paths"]
 
 
 def test_enqueue_session_message_endpoint_rejects_nonportable_text() -> None:
-    app = CayuApp(enable_logging=False)
-    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    _, client = _authorized_message_endpoint()
 
     response = client.post(
         "/api/sessions/session_1/messages",
@@ -13394,14 +13410,6 @@ def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly(
                 "idempotency_key": "compact-replay",
                 "expected_run_epoch": 0,
                 "expected_transcript_cursor": 1,
-            },
-        ),
-        (
-            "/api/sessions/session_approval_replay/messages",
-            {
-                "idempotency_key": "message-replay",
-                "content": "queued steering that must not execute",
-                "delivery_mode": "next_turn",
             },
         ),
     ],
