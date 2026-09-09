@@ -3891,6 +3891,7 @@ def create_router(
     openapi_url: str | None = "/openapi.json",
     replay_idle_timeout_s: float = 300.0,
     dashboard_configured: bool = False,
+    browser_recordings_configured: bool = False,
     dashboard_pricing_configured: bool = False,
     deployment_name: str | None = None,
     dashboard_access_authenticated: bool | None = None,
@@ -4105,6 +4106,7 @@ def create_router(
     )
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
+        browser_recordings_configured=browser_recordings_configured,
         dashboard_configured=dashboard_configured,
         tasks_configured=task_store is not None,
         knowledge_configured=knowledge_store is not None,

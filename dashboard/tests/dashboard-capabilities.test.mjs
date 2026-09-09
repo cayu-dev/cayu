@@ -200,3 +200,21 @@ test("unavailable explanations distinguish missing configuration from unsupporte
     "This operation is not supported by this Cayu deployment.",
   )
 })
+
+test("recording reads require the optional server capability", () => {
+  const snapshot = capabilities()
+  const requirement = { kind: "surface", surface: "browser_recordings" }
+  assert.equal(dashboardCapabilityEnabled(snapshot, requirement), false)
+  snapshot.surfaces.browser_recordings = {
+    configured: false,
+    read: operation(false, "not_configured"),
+    mutate: operation(false, "unsupported"),
+  }
+  assert.equal(dashboardCapabilityEnabled(snapshot, requirement), false)
+  snapshot.surfaces.browser_recordings = {
+    configured: true,
+    read: operation(true),
+    mutate: operation(false, "unsupported"),
+  }
+  assert.equal(dashboardCapabilityEnabled(snapshot, requirement), true)
+})

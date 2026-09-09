@@ -21,7 +21,7 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:12-playwright-1.62.0` image, the
+`cayu-browser-fetch:13-playwright-1.62.0` image, the
 `cayu.browser-session.v4` protocol and worker version 9, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
@@ -783,5 +783,11 @@ response drain and socket closure before allowing daemon shutdown. Queued reques
 and receipt replays cannot release that handler's shutdown signal. Native cleanup
 failures remain failures, and missing acknowledgements remain ambiguous; a guest
 WebSocket disconnect alone never proves that a model action succeeded. Deploy the
-pinned worker-12 image with this Runtime revision. Existing worker-11 allocation
+pinned worker-13 image with this Runtime revision. Existing worker-12 allocation
 authority does not become compatible merely by retagging an image.
+
+## Optional video recording
+
+Applications can opt into [Docker browser recording](browser-recording.md) for
+private post-run playback. Recording is separate from live viewing, visual model
+attachments and browser-profile checkpoint consent.

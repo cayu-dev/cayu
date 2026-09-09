@@ -2792,6 +2792,30 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         """Retry exact retained admission-probe cleanup without reconnecting."""
         return await drain_acquisition_restorations("docker", timeout_s=timeout_s)
 
+    async def _finalize_browser_recordings(self, *, normal: bool) -> None:
+        """Settle optional media before allocation disposal; never browser input."""
+        if (
+            self.workload_authority(PINNED_BROWSER_SESSION_WORKLOAD.name)
+            != PINNED_BROWSER_SESSION_WORKLOAD
+        ):
+            return
+        with contextlib.suppress(Exception):
+            await _run_docker(
+                self.docker_path,
+                [
+                    "exec",
+                    self.container_reference,
+                    "python3",
+                    "/opt/cayu-browser/worker.py",
+                    "--finalize-recordings",
+                    "normal" if normal else "partial",
+                ],
+                docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+                timeout_s=6,
+            )
+        # Missing acknowledgement is reconciled as partial/unavailable. Never
+        # repeat browser input or business work to fill a media gap.
+
     async def close(self) -> None:
         action = self.close_action
         await self._settle_terminal_lifecycle(

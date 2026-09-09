@@ -26,6 +26,7 @@ import {
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { BrowserOperator } from "../components/dashboard/browser-operator"
+import { BrowserRecordings } from "../components/dashboard/browser-recordings"
 import { EvaluationPromotionAction } from "../components/dashboard/evaluation-promotion"
 import { Page, PayloadViewer, StateMessage } from "../components/dashboard/layout"
 import {
@@ -2913,6 +2914,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   return (
     <Page className="space-y-4">
       <BrowserOperator key={sessionId} sessionId={sessionId} />
+      <BrowserRecordings key={`recordings-${sessionId}`} sessionId={sessionId} />
       <div className="flex flex-shrink-0 items-start gap-3">
         <Link
           to="/sessions"

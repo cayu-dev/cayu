@@ -99,11 +99,32 @@ else:
     validate_control_endpoint = _transport_module.validate_control_endpoint
     control_connection_closed_normally = _transport_module.control_connection_closed_normally
 
+try:
+    from ._browser_recording_guest import (
+        GuestRecording,
+        RecordingCaptureDenied,
+        recording_configuration,
+    )
+except ImportError:
+    _recording_spec = importlib.util.spec_from_file_location(
+        "_browser_recording_guest",
+        Path(__file__).resolve().with_name("_browser_recording_guest.py"),
+    )
+    if _recording_spec is None or _recording_spec.loader is None:
+        raise ImportError("The browser recording guest module is unavailable.") from None
+    _recording_module = importlib.util.module_from_spec(_recording_spec)
+    sys.modules[_recording_spec.name] = _recording_module
+    _recording_spec.loader.exec_module(_recording_module)
+    GuestRecording = _recording_module.GuestRecording
+    recording_configuration = _recording_module.recording_configuration
+    RecordingCaptureDenied = _recording_module.RecordingCaptureDenied
+
+
 PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "12"
+INTERACTIVE_WORKER_VERSION = "13"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -801,6 +822,7 @@ class _InteractiveRequest:
     profile_capture_limit: int | None = None
     profile_timeout_seconds: float | None = None
     visual_policy: dict[str, Any] | None = None
+    recording: dict[str, Any] | None = field(default=None, repr=False)
     visual_revision: str | None = None
     visual_ref: str | None = None
     screenshot_sha256: str | None = None
@@ -1198,6 +1220,8 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
     allowed.add("invocation_control_epoch")
     if operation == "screenshot":
         allowed.add("full_page")
+    if "recording" in raw:
+        allowed.add("recording")
     if "browser_profile" in raw:
         allowed.add("browser_profile")
     if set(raw) - allowed or expected[operation] - set(raw):
@@ -1664,6 +1688,7 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         reconcile_only=reconcile_only,
         invocation_control_epoch=invocation_control_epoch,
         visual_policy=visual_policy,
+        recording=recording_configuration(raw.get("recording")),
         visual_revision=visual_revision,
         visual_ref=visual_ref,
         screenshot_sha256=screenshot_sha256,
@@ -4499,6 +4524,8 @@ class _InteractiveDaemon:
         self.control = GuestControlFence(worker_instance=self.visual_worker_instance)
         self.total_visual_captures = 0
         self.configuration_visual_policy: dict[str, Any] | None = None
+        self.recording: GuestRecording | None = None
+        self.recording_normal_close = False
         self.popup_effect_opener_page_id: str | None = None
         self.popup_effect_opener_origin: str | None = None
         self.popup_cleanup_pages: list[Any] = []
@@ -4687,6 +4714,12 @@ class _InteractiveDaemon:
             elif len(operation_records) >= request.limits.max_operations:
                 return _interactive_error_payload(_GuestFailure("resource_exhausted"))
             try:
+                if request.operation == "close":
+                    self.recording_normal_close = True
+                if self.recording is not None and request.operation in {"fill", "press", "upload"}:
+                    # Text/key/file entry can establish authentication without
+                    # cookies. Version 1 ends capture before admitting it.
+                    self.recording.suspended = True
                 response = await self._execute_locked(request)
             except _GuestFailure as exc:
                 response = (
@@ -5008,6 +5041,8 @@ class _InteractiveDaemon:
         self.control.check_operator(request_id=request_id, epoch=epoch)
         # Stop new capture before waiting for the lifecycle lock or old frames.
         self.operator_frames.suspend()
+        if self.recording is not None:
+            self.recording.suspended = True
         try:
             async with self.lock:
                 await self.operator_frames.pause()
@@ -5474,6 +5509,7 @@ class _InteractiveDaemon:
         material = {
             "limits": asdict(request.limits),
             "visual_policy": request.visual_policy,
+            "recording": request.recording,
             "multi_page": request.multi_page,
             "popup_policy": asdict(request.popup_policy),
         }
@@ -5508,6 +5544,8 @@ class _InteractiveDaemon:
         self.configuration_multi_page = request.multi_page
         self.configuration_popup_policy = request.popup_policy
         self.configuration_visual_policy = request.visual_policy
+        if request.recording is not None:
+            self.recording = GuestRecording(self, request.recording)
 
     async def _execute_locked(self, request: _InteractiveRequest) -> dict[str, Any]:
         """Execute while the caller owns the daemon lifecycle lock."""
@@ -7896,6 +7934,8 @@ class _InteractiveDaemon:
 
     async def close(self, *, timeout_seconds: float = 5.0) -> bool:
         self.closing = True
+        if self.recording is not None:
+            self.recording.suspended = True
         self.operator_frames.suspend()
         self.control.uncertain()
         deadline = asyncio.get_running_loop().time() + max(0.001, timeout_seconds)
@@ -8113,6 +8153,13 @@ class _InteractiveDaemon:
             asyncio.create_task(settle_all())
         )
         cleanup_ok = not outcome.errors
+        if self.recording is not None:
+            with contextlib.suppress(Exception):
+                await self.recording.close(
+                    normal=self.recording_normal_close
+                    and cleanup_ok
+                    and outcome.cancellation is None
+                )
         if cleanup_ok:
             self.control.state = "closed"
             self.pages.clear()
@@ -9240,6 +9287,14 @@ async def _interactive_daemon_main(session_id: str) -> int:
                             response = await daemon.bootstrap_operator_channel(material)
                         finally:
                             material.clear()
+                    elif (
+                        type(raw) is dict
+                        and set(raw) == {"recording_finalize"}
+                        and type(raw["recording_finalize"]) is bool
+                    ):
+                        if daemon.recording is not None:
+                            await daemon.recording.close(normal=raw["recording_finalize"])
+                        response = {"recording_finalized": True}
                     else:
                         response = await daemon.execute(_interactive_request_from_json(raw))
                 except _GuestFailure as exc:
@@ -9374,7 +9429,29 @@ def _error_payload(error: _GuestFailure) -> dict[str, Any]:
     return payload
 
 
+async def _finalize_recordings(normal: bool) -> None:
+    # Bounded enumeration in this exact admitted container, not a host scan.
+    sockets = tuple(_INTERACTIVE_ROOT.glob("*.sock"))[:64]
+
+    async def settle(path: Path) -> None:
+        with contextlib.suppress(Exception):
+            await _interactive_send(path, {"recording_finalize": normal})
+
+    async with asyncio.timeout(5):
+        await asyncio.gather(*(settle(path) for path in sockets))
+
+
 def main() -> int:
+    if (
+        len(sys.argv) == 3
+        and sys.argv[1] == "--finalize-recordings"
+        and sys.argv[2] in {"normal", "partial"}
+    ):
+        try:
+            asyncio.run(_finalize_recordings(sys.argv[2] == "normal"))
+            return 0
+        except Exception:
+            return 1
     if len(sys.argv) == 4 and sys.argv[1] == _PROFILE_CLEANUP_ARGUMENT:
         return _temporary_profile_cleanup_main(sys.argv[2], sys.argv[3])
     if len(sys.argv) == 3 and sys.argv[1] == _INTERACTIVE_DAEMON_ARGUMENT:

@@ -965,6 +965,8 @@ class DockerReconnect:
             raise DockerEgressReconnectError("ownership_uncertain")
         claim = runner._owner
         claim.require_owned()
+        if outcome != "interrupted":
+            await runner._finalize_browser_recordings(normal=outcome == "completed")
         if outcome == "interrupted":
             await self.freeze(claim)
             runner.close_action = "none"

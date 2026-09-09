@@ -209,6 +209,7 @@ def create_server(
     *,
     config: ServerConfig,
     project_context: ProjectControlPlaneContext | None = None,
+    browser_recordings: Any | None = None,
     fastapi_options: Mapping[str, Any] | None = None,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -250,6 +251,13 @@ def create_server(
         browser_control_server = BrowserControlServer(
             runtime=runtime, config=resolved_config.browser_control, auth=api_auth
         )
+    if browser_recordings is not None:
+        from cayu.server.browser_recording import BrowserRecordingServer
+
+        if type(browser_recordings) is not BrowserRecordingServer or api_auth is None:
+            raise ValueError(
+                "Recording playback requires authenticated access and application policy."
+            )
     dashboard_auth = auth_dependency_for(resolved_config.dashboard.access or resolved_config.access)
     lifecycle = resolved_config.lifecycle
     resolved_fastapi_options = _validate_fastapi_options(FastAPI, fastapi_options)
@@ -263,6 +271,8 @@ def create_server(
 
     async def drain_server_work() -> None:
         try:
+            if browser_recordings is not None:
+                await browser_recordings.drain()
             if browser_control_server is not None and not await browser_control_server.drain():
                 raise RuntimeError("Browser control shutdown remains unsettled.")
         finally:
@@ -299,6 +309,8 @@ def create_server(
 
     @asynccontextmanager
     async def cayu_lifespan(server):
+        if browser_recordings is not None:
+            browser_recordings.start()
         side_effect_recovery_task: asyncio.Task[None] | None = None
         incomplete_session_recovery_task: asyncio.Task[None] | None = None
         if user_lifespan is None:
@@ -408,6 +420,7 @@ def create_server(
             openapi_url=server.openapi_url,
             replay_idle_timeout_s=lifecycle.replay_idle_timeout_s,
             dashboard_configured=resolved_config.dashboard.enabled,
+            browser_recordings_configured=browser_recordings is not None,
             dashboard_pricing_configured=pricing_metadata is not None,
             deployment_name=resolved_config.deployment_name,
             dashboard_access_authenticated=(
@@ -424,6 +437,10 @@ def create_server(
         server.include_router(router)
         if browser_control_server is not None:
             server.include_router(browser_control_server.router, prefix=control_plane_path)
+        if browser_recordings is not None:
+            server.include_router(
+                browser_recordings.router(auth=api_auth), prefix=control_plane_path
+            )
 
     if resolved_config.dashboard.enabled:
         dashboard_mounted = mount_dashboard(

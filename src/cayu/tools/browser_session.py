@@ -54,6 +54,7 @@ from cayu.browser_profiles import (
     browser_profile_state_from_playwright,
     browser_profile_state_to_playwright,
 )
+from cayu.browser_recording import BrowserRecordingConfig
 from cayu.core.tools import (
     DurableToolRecoveryAuthority,
     Tool,
@@ -628,7 +629,7 @@ class BrowserBackendIdentity(BaseModel):
     browser: str = Field(min_length=1, max_length=64)
     browser_version: str = Field(min_length=1, max_length=128)
     worker_protocol: Literal["cayu.browser-session.v4"]
-    worker_version: Literal["12"]
+    worker_version: Literal["13"]
 
     @field_validator("backend", "backend_version", "browser", "browser_version")
     @classmethod
@@ -1116,6 +1117,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         max_total_artifacts: int,
         max_page_cleanup_operations: int,
         visual_policy: BrowserVisualPolicy | None = None,
+        recording: BrowserRecordingConfig | None = None,
         max_scroll_repeats: int,
         max_upload_files: int,
         max_upload_file_bytes: int,
@@ -1161,6 +1163,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         self.max_total_artifacts = max_total_artifacts
         self.max_page_cleanup_operations = max_page_cleanup_operations
         self.visual_policy = visual_policy
+        self.recording = recording
         self.max_scroll_repeats = max_scroll_repeats
         self.max_upload_files = max_upload_files
         self.max_upload_file_bytes = max_upload_file_bytes
@@ -1207,7 +1210,11 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
             return prepared
         runner, payload, output_limit, timeout_seconds = prepared
         try:
-            execution = await runner.exec(
+            private_exec = getattr(runner, "_exec_private_browser_control", None)
+            dispatch = private_exec if self.recording is not None else runner.exec
+            if dispatch is None:
+                raise RuntimeError("Private recording transport is unavailable.")
+            execution = await dispatch(
                 _browser_worker_command(DEFAULT_BROWSER_FETCH_WORKER_COMMAND),
                 timeout_s=max(1, int(timeout_seconds + 0.999)),
                 stdin=payload,
@@ -1244,7 +1251,11 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
             return prepared
         runner, payload, output_limit, timeout_seconds = prepared
         try:
-            execution = await runner.exec(
+            private_exec = getattr(runner, "_exec_private_browser_control", None)
+            dispatch = private_exec if self.recording is not None else runner.exec
+            if dispatch is None:
+                raise RuntimeError("Private recording transport is unavailable.")
+            execution = await dispatch(
                 _browser_worker_command(DEFAULT_BROWSER_FETCH_WORKER_COMMAND),
                 timeout_s=max(1, int(timeout_seconds + 0.999)),
                 stdin=payload,
@@ -1644,6 +1655,23 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         payload_document["visual_policy"] = (
             None if self.visual_policy is None else self.visual_policy.model_dump(mode="json")
         )
+        if self.recording is not None:
+            authority = _runtime_tool_invocation_authority(ctx)
+            bound = None if authority is None else authority.browser_allocation
+            if (
+                bound is None
+                or self.recording.session_id != ctx.session_id
+                or bound.session_id != ctx.session_id
+            ):
+                return _pre_dispatch_backend_failure(request, "capability_refused")
+            payload_document["recording"] = {
+                **self.recording.private_guest_configuration(),
+                "identity": {
+                    "session_id": bound.session_id,
+                    "session_instance_id": bound.session_instance_id,
+                    "allocation_fingerprint": bound.allocation_fingerprint,
+                },
+            }
         payload = json.dumps(
             payload_document,
             ensure_ascii=False,
@@ -1673,6 +1701,13 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         except Exception:
             return _pre_dispatch_backend_failure(request, "capability_refused")
         if not _browser_runner_is_admitted(candidate):
+            return _pre_dispatch_backend_failure(request, "capability_refused")
+        if self.recording is not None and (candidate is None or candidate.candidate != "docker"):
+            return _pre_dispatch_backend_failure(request, "capability_refused")
+        if self.recording is not None and (
+            not isinstance(runner, _OutputSecretAwareRunnerHandle)
+            or runner.output_secret_values_present() is not False
+        ):
             return _pre_dispatch_backend_failure(request, "capability_refused")
         if (
             self.expected_runner_candidate is not None
@@ -1886,9 +1921,15 @@ class BrowserSessionTool(Tool):
         expected_artifact_store_id: str | None = None,
         browser_profile: BrowserProfileBinding | None = None,
         visual_policy: BrowserVisualPolicy | dict[str, Any] | None = None,
+        recording: BrowserRecordingConfig | None = None,
         spec: ToolSpec | None = None,
         _backend: BrowserSessionBackend | None = None,
     ) -> None:
+        self.recording = recording
+        if recording is not None and type(recording) is not BrowserRecordingConfig:
+            raise TypeError("recording must be BrowserRecordingConfig or None.")
+        if recording is not None and browser_profile is not None:
+            raise ValueError("Recording cannot use an authenticated browser profile.")
         self.visual_policy = (
             None
             if visual_policy is None
@@ -2238,6 +2279,7 @@ class BrowserSessionTool(Tool):
             max_total_artifacts=self.max_total_artifacts,
             max_page_cleanup_operations=self.max_page_cleanup_operations,
             visual_policy=self.visual_policy,
+            recording=self.recording,
             max_scroll_repeats=self.max_scroll_repeats,
             max_upload_files=self.max_upload_files,
             max_upload_file_bytes=self.max_upload_file_bytes,
@@ -2361,7 +2403,7 @@ class BrowserSessionTool(Tool):
         )
         if backend_configuration != tool_configuration:
             return None
-        if backend.visual_policy != self.visual_policy:
+        if backend.visual_policy != self.visual_policy or backend.recording != self.recording:
             return None
         if (
             self.expected_environment_authority is not None
@@ -2422,6 +2464,16 @@ class BrowserSessionTool(Tool):
             material["expected_artifact_store_id"] = self.expected_artifact_store_id
         if self.browser_profile is not None:
             material["browser_profile"] = self.browser_profile.execution_profile_material()
+        material["recording"] = (
+            None
+            if self.recording is None
+            else {
+                **self.recording.model_dump(mode="json"),
+                "credential_sha256": hashlib.sha256(
+                    self.recording.credential.get_secret_value().encode("ascii")
+                ).hexdigest(),
+            }
+        )
         material["visual_policy"] = (
             None if self.visual_policy is None else self.visual_policy.model_dump(mode="json")
         )

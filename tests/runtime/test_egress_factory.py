@@ -739,6 +739,9 @@ class _FakeDockerRunner(Runner):
     async def close(self) -> None:
         self.closed = True
 
+    async def _finalize_browser_recordings(self, *, normal: bool) -> None:
+        pass
+
 
 class _ExecutingVirtualRunner(Runner):
     """Hermetic subprocess runner that applies the factory's virtual env overlay."""

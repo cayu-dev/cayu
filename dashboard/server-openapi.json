@@ -7476,6 +7476,16 @@
           "artifacts": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
+          "browser_recordings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "dashboard": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },

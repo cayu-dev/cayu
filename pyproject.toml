@@ -49,6 +49,10 @@ dev = [
 console = [
   "ipython>=9,<10",
 ]
+recording = [
+  "pillow>=10",
+  "websockets>=17.0.1,<17.1",
+]
 browser = [
   "playwright>=1.61",
 ]

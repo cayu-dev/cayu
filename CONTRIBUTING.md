@@ -130,6 +130,8 @@ Prerequisites: [uv](https://docs.astral.sh/uv/) and Python ≥ 3.11 (CI runs 3.1
 installs it on demand). Docker is optional. It is required for container-runner and
 container-egress tests and for the default testcontainers-managed Postgres setup; the
 Postgres tier can instead use a disposable external server with database-creation permission.
+Recording tests require FFmpeg with the VP8 encoder on the application host
+(`brew install ffmpeg` on macOS or `apt-get install ffmpeg` on Debian/Ubuntu).
 
 ```bash
 git clone https://github.com/cayu-dev/cayu.git && cd cayu

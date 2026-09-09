@@ -3688,6 +3688,7 @@ export type ControlPlaneMutationCapabilities = {
  */
 export type ControlPlaneSurfaceCapabilities = {
     artifacts: OptionalSurfaceCapability;
+    browser_recordings?: OptionalSurfaceCapability | null;
     dashboard: OptionalSurfaceCapability;
     evals: OptionalSurfaceCapability;
     evaluation_promotion: OptionalSurfaceCapability;

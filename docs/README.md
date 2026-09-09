@@ -8,6 +8,7 @@ authoritative only where a maintained guide points to the implementation or the
 
 - [Advanced runtime examples](advanced-runtime-examples.md)
 - [Browser sessions](browser-session.md)
+- [Browser recordings](browser-recording.md)
 - [Build a runner](build-a-runner.md)
 - [Cayu Cloud](cayu-cloud.md)
 - [Maintained coding product](coding-product.md)

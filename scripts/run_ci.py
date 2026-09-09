@@ -567,6 +567,7 @@ def _sync_python_test_environment(runner: LocalCiRunner, *, browser: bool) -> No
 def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
     if shard not in range(1, _GENERAL_SHARDS + 1):
         raise ValueError(f"general shard must be between 1 and {_GENERAL_SHARDS}")
+    runner.run("Verify recording encoder prerequisite", ("ffmpeg", "-version"))
     runner.run(
         f"Python 3.14 general shard {shard}/{_GENERAL_SHARDS}",
         (

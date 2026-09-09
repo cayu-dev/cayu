@@ -39,6 +39,7 @@ class ControlPlaneCapabilitySnapshot:
     eval_target_configured: bool
     eval_project_identity_configured: bool
     eval_captured_results_supported: bool
+    browser_recordings_configured: bool = False
 
     @property
     def evaluation_promotion_supported(self) -> bool:
@@ -78,6 +79,10 @@ class ControlPlaneCapabilitySnapshot:
                 else ServerContractActor(subject=actor.subject, tenant=actor.tenant)
             ),
             surfaces=ControlPlaneSurfaceCapabilities(
+                browser_recordings=_optional_surface(
+                    self.browser_recordings_configured,
+                    mutation_supported=False,
+                ),
                 dashboard=_optional_surface(
                     self.dashboard_configured,
                     mutation_supported=False,
@@ -147,6 +152,7 @@ def inspect_control_plane_capabilities(
     eval_target_configured: bool | None = None,
     eval_project_identity_configured: bool | None = None,
     eval_captured_results_supported: bool = False,
+    browser_recordings_configured: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
@@ -162,6 +168,7 @@ def inspect_control_plane_capabilities(
         else eval_project_identity_configured
     )
     for field_name, value in (
+        ("browser_recordings_configured", browser_recordings_configured),
         ("dashboard_configured", dashboard_configured),
         ("tasks_configured", tasks_configured),
         ("knowledge_configured", knowledge_configured),
@@ -186,6 +193,7 @@ def inspect_control_plane_capabilities(
     ):
         raise ValueError("Configured Evals requires store, target, and project identity evidence.")
     return ControlPlaneCapabilitySnapshot(
+        browser_recordings_configured=browser_recordings_configured,
         cayu_version=_cayu_distribution_version(),
         dashboard_configured=dashboard_configured,
         tasks_configured=tasks_configured,

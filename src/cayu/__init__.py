@@ -1,5 +1,6 @@
 """Cayu public API."""
 
+from cayu._browser_recording_store import BrowserRecordingStore, BrowserRecordingUnavailable
 from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu._version import __version__
 from cayu.agent_bundle_containers import (
@@ -204,6 +205,16 @@ from cayu.browser_profiles import (
     BrowserProfileWriterClaim,
     InMemoryBrowserProfileStore,
     SQLiteBrowserProfileStore,
+)
+from cayu.browser_recording import (
+    BrowserRecordingCapability,
+    BrowserRecordingConfig,
+    BrowserRecordingGap,
+    BrowserRecordingIdentity,
+    BrowserRecordingManifest,
+    BrowserRecordingPolicy,
+    BrowserRecordingSegment,
+    browser_recording_capability,
 )
 from cayu.coding_products import (
     CODING_PRODUCT_EVIDENCE_KIND,
@@ -3749,6 +3760,15 @@ __all__ = [
     "BrowserProfileTerminalOutcome",
     "BrowserProfileUnavailable",
     "BrowserProfileWriterClaim",
+    "BrowserRecordingCapability",
+    "BrowserRecordingConfig",
+    "BrowserRecordingGap",
+    "BrowserRecordingIdentity",
+    "BrowserRecordingManifest",
+    "BrowserRecordingPolicy",
+    "BrowserRecordingSegment",
+    "BrowserRecordingStore",
+    "BrowserRecordingUnavailable",
     "BrowserSessionTool",
     "BrowserVisualPolicy",
     "BrowserWebFetchAdapter",
@@ -5670,6 +5690,7 @@ __all__ = [
     "authored_suite_launch_settings",
     "authorize_shared_artifact_materialization",
     "authorized_egress_authority_transition",
+    "browser_recording_capability",
     "build_captured_evaluation_candidate",
     "build_egress_authority_cutover_receipt",
     "build_egress_authority_identity",

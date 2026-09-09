@@ -23,7 +23,7 @@ uv sync --extra dev --extra browser
 .venv/bin/python -m playwright install chromium
 
 docker build -f examples/browser_fetch/Dockerfile \
-  -t cayu-browser-fetch:12-playwright-1.62.0 .
+  -t cayu-browser-fetch:13-playwright-1.62.0 .
 docker build -f examples/browser_view_reconnect/Dockerfile \
   -t cayu-view-reconnect:local .
 

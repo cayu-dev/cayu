@@ -57,10 +57,11 @@ def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> N
 def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:
     runner = _dry_runner()
     _run_general_shard(runner, 4)
-    assert len(runner.evidence) == 1
-    assert "--splits 32 --group 4" in runner.evidence[0].command
+    assert len(runner.evidence) == 2
+    assert runner.evidence[0].command == "ffmpeg -version"
+    assert "--splits 32 --group 4" in runner.evidence[-1].command
     assert (
-        "not (stress or qualification or postgres or browser_docker)" in runner.evidence[0].command
+        "not (stress or qualification or postgres or browser_docker)" in runner.evidence[-1].command
     )
 
     specialist = _dry_runner()
@@ -418,13 +419,14 @@ def test_pr_gate_keeps_process_regressions_and_release_waits_for_qualification()
     general = _dry_runner()
     _run_general_shard(general, 1)
     assert (
-        "not (stress or qualification or postgres or browser_docker)" in general.evidence[0].command
+        "not (stress or qualification or postgres or browser_docker)"
+        in general.evidence[-1].command
     )
     qualification = _dry_runner()
     _run_specialist_lane(qualification, "qualification-1")
     assert "stress or qualification" in qualification.evidence[0].command
     assert "-n 1" in qualification.evidence[0].command
-    assert "-n 2" in general.evidence[0].command
+    assert "-n 2" in general.evidence[-1].command
     workflow = (_ROOT / ".github/workflows/ci.yml").read_text()
     assert "uses: ./.github/workflows/qualification.yml" in workflow
     publish = workflow.split("  publish:", 1)[1].split("  github-release:", 1)[0]

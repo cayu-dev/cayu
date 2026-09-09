@@ -1057,9 +1057,9 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     ) -> RunnerFinalizationResult:
         if self._reconnect is not None and isinstance(runner, DockerRunner):
             return await self._reconnect.finalize(runner, outcome=outcome)
-        del outcome
         if not isinstance(runner, DockerRunner):
             raise TypeError("Docker adapter received a different runner type.")
+        await runner._finalize_browser_recordings(normal=outcome == "completed")
         await runner.close()
         return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 

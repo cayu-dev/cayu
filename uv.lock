@@ -223,6 +223,10 @@ postgres = [
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
 ]
+recording = [
+    { name = "pillow" },
+    { name = "websockets" },
+]
 server = [
     { name = "fastapi" },
     { name = "sse-starlette" },
@@ -281,6 +285,7 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'all'", specifier = ">=10" },
     { name = "pillow", marker = "extra == 'dev'", specifier = ">=10" },
     { name = "pillow", marker = "extra == 'files'", specifier = ">=10" },
+    { name = "pillow", marker = "extra == 'recording'", specifier = ">=10" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.61" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'all'", specifier = ">=3.2" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'dev'", specifier = ">=3.2" },
@@ -313,10 +318,11 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'server-settings'", specifier = ">=0.30" },
     { name = "websockets", marker = "extra == 'all'", specifier = ">=17.0.1,<17.1" },
     { name = "websockets", marker = "extra == 'dev'", specifier = ">=17.0.1,<17.1" },
+    { name = "websockets", marker = "extra == 'recording'", specifier = ">=17.0.1,<17.1" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=17.0.1,<17.1" },
     { name = "websockets", marker = "extra == 'server-settings'", specifier = ">=17.0.1,<17.1" },
 ]
-provides-extras = ["dev", "console", "browser", "aws", "postgres", "files", "e2b", "egress", "microsandbox", "otel", "vertex", "server", "server-settings", "all"]
+provides-extras = ["dev", "console", "recording", "browser", "aws", "postgres", "files", "e2b", "egress", "microsandbox", "otel", "vertex", "server", "server-settings", "all"]
 
 [package.metadata.requires-dev]
 nightly = [
@@ -1142,7 +1148,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess" },
+    { name = "ptyprocess", marker = "python_full_version < '3.12' or sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [

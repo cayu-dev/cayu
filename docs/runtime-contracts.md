@@ -9374,6 +9374,13 @@ Only the exact active-page `download` operation admits a download event.
 Automatic and popup-initiated downloads are cancelled and quarantine their
 originating page through one of the same bounded page-cleanup owners.
 
+Opt-in [Docker browser recording](browser-recording.md) is a separate versioned
+application authority. It is disabled by default, uses exact session/allocation/
+browser identities, and admits only bounded active-page samples in fresh contexts.
+Live viewing, model visual attachments and profile checkpoints do not imply
+recording or playback consent. Recording publication and retrieval use the private
+recording store; media never enters ordinary tool results or transcripts.
+
 The same closed tool supports true Chromium back/forward traversal, GET/HEAD-only
 reload, bounded semantic scroll, strict current-ref hover, and session-owned
 artifact upload. Every admitted successful operation advances the page revision,

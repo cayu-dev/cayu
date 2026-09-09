@@ -193,6 +193,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert body["capabilities"]["configured_store_roles"] == ["session"]
     assert body["capabilities"]["actor"] is None
     assert body["capabilities"]["surfaces"] == {
+        "browser_recordings": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
         "dashboard": {
             "configured": True,
             "read": {"enabled": True, "unavailable_reason": None},
@@ -324,6 +329,13 @@ def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tm
     assert capabilities["actor"] == {"subject": "operator-a", "tenant": "tenant-a"}
     assert "must-not-appear" not in response.text
     for name, surface in capabilities["surfaces"].items():
+        if name == "browser_recordings":
+            assert surface == {
+                "configured": False,
+                "read": {"enabled": False, "unavailable_reason": "not_configured"},
+                "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+            }
+            continue
         if name in {"evaluation_promotion", "evals"}:
             assert surface == {
                 "configured": False,

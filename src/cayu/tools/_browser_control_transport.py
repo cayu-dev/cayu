@@ -77,7 +77,11 @@ def _private_transport_logger() -> logging.Logger:
 
 
 async def open_guest_control_channel(
-    *, endpoint: str, credential: str, tls: ssl.SSLContext | None = None
+    *,
+    endpoint: str,
+    credential: str,
+    tls: ssl.SSLContext | None = None,
+    subprotocol: str = CONTROL_SUBPROTOCOL,
 ) -> ClientConnection:
     """Open one bounded connection, without redirects, retry, or implicit proxy.
 
@@ -107,7 +111,7 @@ async def open_guest_control_channel(
         endpoint,
         ssl=tls,
         additional_headers={"Authorization": f"Bearer {credential}"},
-        subprotocols=[Subprotocol(CONTROL_SUBPROTOCOL)],
+        subprotocols=[Subprotocol(subprotocol)],
         compression=None,
         proxy=None,
         open_timeout=5,
