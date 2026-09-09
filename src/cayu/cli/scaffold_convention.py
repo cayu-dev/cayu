@@ -1277,6 +1277,12 @@ generation and checking contract, not runtime authority. Implement a concern
 in its owning package first, then wire it through `agents/registration.py` or
 the explicit application composition seam. Keep `app.py` composition-only.
 
+Service-owned artifact, knowledge, and delegation extensions are declared in
+`[tool.cayu.scaffold].extensions`, sorted and unique, after explicit wiring.
+Keep generated `capabilities` unchanged. See
+`cayu guide applications#explicit-service-extensions` for migration and scope
+requirements; declarations grant no authority and do not change authentication.
+
 | Requested concern | Canonical home |
 | --- | --- |
 | Agent identity, model defaults, thinking, and metadata | `agents/` |
@@ -1452,7 +1458,7 @@ def convention_files(
     }.issubset(selected):
         files["tests/test_standard_capabilities.py"] = configured(_TEST_STANDARD_CAPABILITIES_PY)
     for spec in CAPABILITIES:
-        if plan.preset not in spec.supported_presets:
+        if plan.preset not in (*spec.supported_presets, *spec.extension_presets):
             continue
         card_path = _CAPABILITY_CARD_PATHS.get(spec.name)
         if card_path is not None:
@@ -1465,6 +1471,12 @@ def capability_card(plan: ApplicationPlan, name: str) -> str:
 
     spec = capability_spec(name)
     state = "configured" if name in plan.capabilities else "available but not configured"
+    if plan.preset in spec.extension_presets:
+        state = (
+            "explicit extension, not configured; implement in owning modules, then add "
+            f'`"{name}"` to sorted `[tool.cayu.scaffold].extensions`; '
+            "see `cayu guide applications#explicit-service-extensions`"
+        )
     registrations = ", ".join(f"`{path}`" for path in spec.files) or "application-owned seam"
     verification = spec.verification or ("uv run --no-sync cayu inspect --json",)
     commands = "\n".join(f"   - `{command}`" for command in verification)
@@ -1502,6 +1514,7 @@ def scaffold_contract(plan: ApplicationPlan) -> str:
             else (f'coding_command_authority = "{plan.coding_command_authority}"\n')
         )
         + f"capabilities = [{capabilities}]\n"
+        + "extensions = []\n"
     )
 
 
@@ -1533,9 +1546,11 @@ def _capability_summary(plan: ApplicationPlan) -> str:
         "| --- | --- | --- |",
     ]
     for spec in CAPABILITIES:
-        if plan.preset not in spec.supported_presets:
+        if plan.preset not in (*spec.supported_presets, *spec.extension_presets):
             continue
         state = "configured" if spec.name in selected else "available, not configured"
+        if plan.preset in spec.extension_presets:
+            state = "explicit extension; declare after wiring"
         rows.append(f"| `{spec.name}` | {state} | {spec.summary} |")
     return (
         "\n## Capability profile\n\n"

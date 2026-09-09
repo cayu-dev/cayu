@@ -3689,6 +3689,10 @@ def _run_new_discovery(args: argparse.Namespace) -> int | None:
         print(f"{spec.name} ({spec.status})")
         print(spec.summary)
         print("Supported presets: " + ", ".join(spec.supported_presets))
+        if spec.extension_presets:
+            print("Explicit extension presets: " + ", ".join(spec.extension_presets))
+            print("Declaration: [tool.cayu.scaffold].extensions (owning-module wiring required)")
+            print("Guide: cayu guide applications#explicit-service-extensions")
         if spec.implied:
             print("Implies: " + ", ".join(spec.implied))
         if spec.files:

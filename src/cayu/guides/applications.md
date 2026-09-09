@@ -146,6 +146,70 @@ explicitly. `cayu new`, `cayu check`, and `cayu inspect` never migrate a project
 All presets use the same application convention. Use `--preset` and `--execution`
 to select the application and execution environment.
 
+## Explicit service extensions
+
+Services can declare application-owned `artifacts`, `knowledge`, and `delegation`
+extensions without changing preset or maintained authentication. The catalog's
+`extension_presets` lists where this declaration is supported; `supported_presets`
+continues to describe generator support. `cayu new --with artifacts --preset service`
+therefore points to this manual extension path rather than generating unreviewed
+service wiring. `cayu new --explain artifacts --json` exposes both contracts.
+
+Keep the normalized generated `capabilities` and add a separate sorted, unique
+`extensions` list in the existing `[tool.cayu.scaffold]` table. For example, an
+otherwise default service with an explicit artifact extension declares:
+
+```toml
+[tool.cayu.scaffold]
+convention = 1
+preset = "service"
+database = "sqlite"
+provider = "neutral"
+execution = "none"
+capabilities = ["approvals", "evals", "observability", "tasks"]
+extensions = ["artifacts"]
+```
+
+Existing projects may omit `extensions` (equivalent to `[]`). If an earlier
+attempt added an extension to `capabilities`, move just that entry to `extensions`.
+Retain the project's actual provider, adapters, and generated capability choices.
+To declare all three, use `extensions = ["artifacts", "delegation", "knowledge"]`.
+Unknown, duplicate, unsorted, and unsupported declarations are errors.
+
+Implement and review the public constructors in their canonical homes:
+
+- **Artifacts:** register `ListArtifactsTool()` in `tools/registration.py` and
+  construct the `LocalArtifactStore` and `Environment` in `environments/local.py`.
+  Update the environment's explicit behavior identity with the implementation.
+- **Knowledge:** construct the scoped store in `configuration/storage.py`, define
+  access and retrieval scope in `knowledge/retrieval.py`, and wire the environment
+  in `environments/local.py`. Register `ListKnowledgeTool`, `SearchKnowledgeTool`,
+  `ReadKnowledgeTool`, and `RememberKnowledgeTool` together for one agent in
+  `tools/registration.py`; authorize proposal effects in `policies/tools.py` and
+  give the changed tool and policy behavior explicit versioned identities for recovery.
+- **Delegation:** define and explicitly register child agents in `agents/`,
+  construct `SubagentTool` and `SubagentResultTool` with the owning app and stores
+  through `agents/registration.py`, and keep lifecycle work in `operations/`.
+  Declare child targets, limits, result access, exposure, and effect policy explicitly.
+
+Generated disabled-concern guards are ordinary source: update the relevant owning
+builders with their collaborators and identities. Do not read scaffold metadata
+at runtime to enable tools or stores. Retain import safety and composition-only
+`app.py`; keep service routes, product authentication, tenant lookup, and operator
+policy intact. Artifact visibility, knowledge namespaces, and child-result access
+must follow authenticated application scopes. A project-wide knowledge namespace
+is suitable only for intentionally shared knowledge, not tenant-private records.
+An extension declaration does not establish tenant isolation for custom behavior.
+
+Run `cayu check --deploy --fail-on warning --json` with the service's authentication
+configuration and run its security tests plus tests for the new scope boundaries.
+The checker compares the union of generated capabilities and declared extensions
+against the constructed stores and complete tool families. An undeclared store or
+tool remains drift; declaration alone also fails when constructors are absent or
+a tool family is incomplete. Source ownership, import safety, and maintained
+service/authentication checks still run. Metadata neither changes runtime objects
+nor grants model exposure, execution authority, or provider access.
+
 ## Generator compatibility
 
 `cayu generate tool` and `cayu generate slice` inspect the declared scaffold

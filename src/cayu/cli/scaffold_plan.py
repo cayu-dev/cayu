@@ -87,6 +87,7 @@ class CapabilitySpec:
     summary: str
     status: CapabilityStatus
     supported_presets: tuple[PresetName, ...]
+    extension_presets: tuple[PresetName, ...] = ()
     implied: tuple[str, ...] = ()
     conflicts: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
@@ -102,6 +103,9 @@ class CapabilitySpec:
             "summary": self.summary,
             "status": self.status,
             "supported_presets": list(self.supported_presets),
+            "extension_presets": list(self.extension_presets),
+            "extension_declaration": "tool.cayu.scaffold.extensions",
+            "extension_docs": "cayu guide applications#explicit-service-extensions",
             "implied": list(self.implied),
             "requires": list(self.implied),
             "conflicts": list(self.conflicts),
@@ -221,6 +225,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         summary="Reviewed durable knowledge, retrieval, curation, and maintenance.",
         status="preset-owned",
         supported_presets=("agent", "coding"),
+        extension_presets=("service",),
         files=("knowledge/", "configuration/storage.py"),
         verification=("uv run --no-sync cayu check --json",),
     ),
@@ -260,6 +265,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         summary="Child-agent registration, delegation, and result recovery.",
         status="preset-owned",
         supported_presets=("coding",),
+        extension_presets=("service",),
         files=("operations/completion.py", "agents/registration.py"),
     ),
     CapabilitySpec(
@@ -281,6 +287,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         summary="Durable local artifacts with bounded model-facing discovery.",
         status="preset-owned",
         supported_presets=("agent", "coding"),
+        extension_presets=("service",),
         files=("environments/local.py", "data/artifacts/"),
         verification=("uv run --no-sync pytest -q tests/test_application.py",),
     ),
@@ -422,6 +429,7 @@ class ApplicationPlan:
                 "command_authority": self.coding_command_authority,
             },
             "capabilities": list(self.capabilities),
+            "extensions": [],
             "files": list(files),
             "directories": list(directories),
             "private_files": list(private_files),
@@ -529,6 +537,14 @@ def normalize_application_plan(
     for name_value in requested:
         spec = capability_spec(name_value)
         if name_value not in selected_preset.default_capabilities and spec.status != "selectable":
+            if selected_preset.name in spec.extension_presets:
+                raise ScaffoldPlanError(
+                    "capability_not_selectable",
+                    f"capability {name_value!r} requires explicit owning-module wiring for "
+                    f"preset {preset!r}; declare it in [tool.cayu.scaffold].extensions "
+                    "after implementation, keeping capabilities unchanged. "
+                    "See `cayu guide applications#explicit-service-extensions`",
+                )
             raise ScaffoldPlanError(
                 "capability_not_selectable",
                 f"capability {name_value!r} is {spec.status}; use its documented "
@@ -646,3 +662,30 @@ def _plan_dependencies(plan: ApplicationPlan) -> tuple[str, ...]:
     for name in plan.capabilities:
         dependencies.update(capability_spec(name).dependencies)
     return tuple(sorted(dependencies))
+
+
+def normalize_extension_declarations(
+    plan: ApplicationPlan, extensions: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Validate application-owned declarations without making them generator selections."""
+
+    for name in extensions:
+        spec = capability_spec(name)
+        if plan.preset not in spec.extension_presets:
+            raise ScaffoldPlanError(
+                "unsupported_extension",
+                f"capability {name!r} has no declared extension contract for {plan.preset!r}",
+            )
+        if name in plan.capabilities:
+            raise ScaffoldPlanError("extension_overlap", "extensions must not repeat capabilities")
+        if (
+            plan.database not in spec.supported_databases
+            or plan.execution not in spec.supported_executions
+        ):
+            raise ScaffoldPlanError(
+                "unsupported_extension_adapter", "extension adapters are unsupported"
+            )
+    normalized = tuple(sorted(set(extensions)))
+    if extensions != normalized:
+        raise ScaffoldPlanError("extensions_not_normalized", "extensions must be sorted and unique")
+    return normalized

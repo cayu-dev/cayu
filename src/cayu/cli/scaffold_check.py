@@ -14,6 +14,7 @@ from cayu.cli.scaffold_plan import (
     ApplicationPlan,
     ScaffoldPlanError,
     normalize_application_plan,
+    normalize_extension_declarations,
     preset_spec,
 )
 from cayu.runtime.checks import DiagnosticSeverity, ProjectDiagnostic
@@ -169,7 +170,11 @@ def check_scaffold_capabilities(
                 code="SCAFFOLD_CAPABILITY_DRIFT",
                 path=surface,
                 message=f"Declared {capability} capability disagrees with the constructed application.",
-                hint="Update the owning constructors and the normalized scaffold plan together.",
+                hint=(
+                    "Update the owning constructors and scaffold declaration together; "
+                    "explicit service extensions belong in [tool.cayu.scaffold].extensions. "
+                    "See `cayu guide applications#explicit-service-extensions`."
+                ),
                 parameters={"capability": capability, "expected": expected, "observed": observed},
                 severity=DiagnosticSeverity.ERROR,
             )
@@ -346,7 +351,12 @@ def _invalid_scaffold_contract(exc: ScaffoldPlanError) -> ProjectDiagnostic:
         code="SCAFFOLD_CONTRACT_INVALID",
         path="pyproject.toml:[tool.cayu.scaffold]",
         message=f"The declared scaffold plan is invalid ({exc.code}).",
-        hint="Restore the normalized plan emitted by `cayu new --dry-run --json`.",
+        hint=(
+            "Restore generated capabilities from `cayu new --dry-run --json`; "
+            "declare supported owning-module extensions separately in "
+            "[tool.cayu.scaffold].extensions. "
+            "See `cayu guide applications#explicit-service-extensions`."
+        ),
         parameters={"reason": exc.code},
         severity=DiagnosticSeverity.ERROR,
     )
@@ -384,7 +394,15 @@ def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan
             "capabilities_not_normalized",
             "capabilities must match the normalized selected plan",
         )
-    return plan
+    extensions = contract.get("extensions", [])
+    if not isinstance(extensions, list) or any(type(item) is not str for item in extensions):
+        raise ScaffoldPlanError("invalid_extensions", "extensions must be a list of strings")
+    normalized_extensions = normalize_extension_declarations(
+        plan, tuple(cast("list[str]", extensions))
+    )
+    # Only diagnostic expectations include extensions. Runtime construction and
+    # generation never read these declarations to select collaborators.
+    return replace(plan, capabilities=tuple(sorted((*plan.capabilities, *normalized_extensions))))
 
 
 def _check_selected_plan_source(
