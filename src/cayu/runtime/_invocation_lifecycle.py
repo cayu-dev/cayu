@@ -2893,8 +2893,16 @@ async def apply_invocation_lifecycle_command(
                 result_session=session,
             )
 
+        from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
+
         try:
-            with _invocation_lifecycle_authority_mutation_scope():
+            # Admission hashes the complete source checkpoint, just like rebind.
+            # Authorize this internal callback's private read without granting
+            # generic transforms visibility or browser-control mutation authority.
+            with (
+                _invocation_lifecycle_authority_mutation_scope(),
+                browser_control_checkpoint_read_scope(copied.session_id),
+            ):
                 session = await store.admit_session_invocation(
                     copied.session_id,
                     admission=SessionInvocationAdmission(
