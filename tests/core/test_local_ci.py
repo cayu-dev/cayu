@@ -19,6 +19,8 @@ _ensure_exact_head = _RUNNER["_ensure_exact_head"]
 _isolated_execution_worktree = _RUNNER["_isolated_execution_worktree"]
 _load_package_steps = _RUNNER["_load_package_steps"]
 _package_temporary_parent = _RUNNER["_package_temporary_parent"]
+_run_test_collection = _RUNNER["_run_test_collection"]
+_run_python_suite = _RUNNER["_run_python_suite"]
 _run_general_shard = _RUNNER["_run_general_shard"]
 _run_general_shards = _RUNNER["_run_general_shards"]
 _run_release_artifacts = _RUNNER["_run_release_artifacts"]
@@ -37,6 +39,7 @@ def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> N
 
     for command in (
         "python3 scripts/run_ci.py --lane static",
+        "python3 scripts/run_ci.py --lane collection",
         'python3 scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"',
         "python3 scripts/run_ci.py --lane specialist",
         "python3 scripts/run_ci.py --lane sqlite-cancellation",
@@ -52,6 +55,47 @@ def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> N
     )
     assert immutable.publishing_only is True
     assert all("uses:" not in step.command for step in package_steps)
+
+
+def test_collection_preflight_gates_hosted_test_matrices() -> None:
+    workflow = (_ROOT / ".github/workflows/ci.yml").read_text()
+    for job in ("test_shards", "test_specialists"):
+        assert f"  {job}:\n    needs: test-collection\n" in workflow
+    qualification = (_ROOT / ".github/workflows/qualification.yml").read_text()
+    assert "  qualification:\n    needs: test-collection\n" in qualification
+
+    runner = _dry_runner()
+    assert _run_test_collection(runner) is True
+    assert len(runner.evidence) == 1
+    command = runner.evidence[0].command
+    assert "CAYU_REQUIRE_CURRENT_TEST_DURATIONS=1" in command
+    assert "--collect-only -qq -n 0" in command
+    assert "--splits" not in command
+
+
+def test_collection_failure_prevents_local_fanout_even_with_keep_going(monkeypatch) -> None:
+    phases = []
+    namespace = _run_python_suite.__globals__
+    monkeypatch.setitem(
+        namespace, "_sync_python_test_environment", lambda *_args, **_kwargs: phases.append("sync")
+    )
+
+    def failed_collection(_runner):
+        phases.append("collection")
+        return False
+
+    def unexpected_fanout(*_args, **_kwargs):
+        pytest.fail("test work started after collection failed")
+
+    monkeypatch.setitem(namespace, "_run_test_collection", failed_collection)
+    monkeypatch.setitem(namespace, "_run_docker_prerequisite", unexpected_fanout)
+    monkeypatch.setitem(namespace, "_run_general_shards", unexpected_fanout)
+    monkeypatch.setitem(namespace, "_run_specialist_lane", unexpected_fanout)
+    runner = LocalCiRunner(root=_ROOT, dry_run=False, keep_going=True)
+
+    _run_python_suite(runner, jobs=2)
+
+    assert phases == ["sync", "collection"]
 
 
 def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:

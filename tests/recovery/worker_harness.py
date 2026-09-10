@@ -58,7 +58,9 @@ from cayu.runtime.public_authority import (
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tools import SubagentExecutionMode, SubagentSpec, SubagentTool
 
-_WORKER_TIMEOUT_S = 20.0
+# Covers interpreter startup, durable recovery, replay checks, and process exit.
+# These integration guards are independent of the Runtime deadlines under test.
+_WORKER_TIMEOUT_S = 60.0
 _POLL_INTERVAL_S = 0.02
 _PROVIDER_NAME = "recovery-harness"
 _AGENT_NAME = "recovery-agent"

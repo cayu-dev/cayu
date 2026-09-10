@@ -670,14 +670,7 @@ def test_workos_transient_refresh_failure_preserves_running_deployment_recovery(
     tmp_path: Path,
     transient_status: int | None,
 ) -> None:
-    refresh_responses = (
-        []
-        if transient_status is None
-        else [(transient_status, {"error": "temporary"}) for _ in range(3)]
-    )
-    server, thread, forms, deployment_authorizations = _start_refresh_and_deployment_server(
-        refresh_responses
-    )
+    server, thread, forms, deployment_authorizations = _start_refresh_and_deployment_server([])
     api_url = f"http://127.0.0.1:{server.server_port}"
     now = time.time()
     store, credentials = _configure_saved_workos_login(
@@ -687,30 +680,34 @@ def test_workos_transient_refresh_failure_preserves_running_deployment_recovery(
         expires_at=now + 3600,
     )
     client = cloud_cli._cloud_client(
-        SimpleNamespace(api_key_file=None, context=None, timeout_seconds=1.0),
+        SimpleNamespace(api_key_file=None, context=None, timeout_seconds=30.0),
         context={},
         context_path=None,
     )
-    network_attempts: list[str] = []
-    if transient_status is None:
+    refresh_attempts: list[tuple[str, dict[str, str] | None]] = []
 
-        def unavailable_request(
-            _client: WorkOSDeviceAuthClient,
-            _method: str,
-            url: str,
-            *,
-            form: dict[str, str] | None = None,
-            timeout_seconds: float | None = None,
-            total_timeout_seconds: float | None = None,
-        ) -> object:
-            del form, timeout_seconds, total_timeout_seconds
-            network_attempts.append(url)
+    def unavailable_request(
+        _client: WorkOSDeviceAuthClient,
+        _method: str,
+        url: str,
+        *,
+        form: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        total_timeout_seconds: float | None = None,
+    ) -> httpx.Response:
+        del timeout_seconds, total_timeout_seconds
+        refresh_attempts.append((url, form))
+        if transient_status is None:
             raise CloudAuthError(
                 "login_unavailable",
                 "Cayu Cloud authentication service is unavailable.",
             )
+        return httpx.Response(transient_status, json={"error": "temporary"})
 
-        monkeypatch.setattr(WorkOSDeviceAuthClient, "_request", unavailable_request)
+    # Retry/fallback semantics must not depend on HTTP client startup fitting
+    # a one-second attempt deadline. Real HTTP refresh/rotation and absolute
+    # attempt cancellation have separate integration coverage below.
+    monkeypatch.setattr(WorkOSDeviceAuthClient, "_request", unavailable_request)
     sleeps: list[float] = []
     monkeypatch.setattr(cloud_auth.time, "sleep", sleeps.append)
     monkeypatch.setattr(cloud_auth.time, "time", lambda: now + 3570)
@@ -733,7 +730,21 @@ def test_workos_transient_refresh_failure_preserves_running_deployment_recovery(
     assert raised.value.category == "deployment_still_running"
     assert raised.value.public_details()["deployment_id"] == "dep_running"
     assert sleeps == list(cloud_auth._REFRESH_RETRY_DELAYS_SECONDS)
-    assert (len(network_attempts) if transient_status is None else len(forms)) == 3
+    assert (
+        refresh_attempts
+        == [
+            (
+                f"{api_url}/user_management/authenticate",
+                {
+                    "client_id": credentials.workos_client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": credentials.refresh_token,
+                },
+            )
+        ]
+        * 3
+    )
+    assert forms == []
     assert deployment_authorizations == [f"Bearer {credentials.access_token}"]
     assert store.load() == credentials
 

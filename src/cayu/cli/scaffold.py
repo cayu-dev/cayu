@@ -159,6 +159,9 @@ def _safe_git_argv(git: str, *arguments: str, hooks_dir: Path) -> list[str]:
         "--no-pager",
         "-c",
         "core.fsmonitor=false",
+        # A detached post-commit repack can mutate .git while publication seals it.
+        "-c",
+        "maintenance.auto=false",
         "-c",
         f"core.excludesFile={os.devnull}",
         "-c",

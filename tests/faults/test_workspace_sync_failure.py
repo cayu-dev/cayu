@@ -41,6 +41,7 @@ from cayu import (
 )
 from cayu.runtime import InMemoryEventSink, SessionStatus
 from cayu.runtime import _environment_lifecycle as lifecycle_module
+from cayu.runtime._environment_lifecycle import pending_completion_finalization_from_checkpoint
 from cayu.runtime.work_attempt_admission import (
     WorkAttemptExecutionRequest,
     WorkAttemptRecoveryRequest,
@@ -578,9 +579,6 @@ def test_sync_binding_retains_owner_after_finalize_failure_commit_is_reconciled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # This exercises successful settlement, not the separate bounded-poll case.
-    # Filesystem work need not finish within the production admission's 10ms.
-    monkeypatch.setattr(lifecycle_module, "_LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS", 1.0)
     store = FailingFinalizeEvidenceStore()
     store.commit_finalize_evidence_before_failure = True
     app, binding, source, target, _target_root = _sync_durability_test_app(tmp_path, store)
@@ -613,15 +611,56 @@ def test_sync_binding_retains_owner_after_finalize_failure_commit_is_reconciled(
         assert events[-1].type == EventType.SESSION_FAILED
         assert EventType.SESSION_COMPLETED not in {event.type for event in events}
 
+        assert (
+            pending_completion_finalization_from_checkpoint(
+                await store.load_checkpoint("sync-durability-reconciled")
+            )
+            is not None
+        )
+
+        # Recovery must follow positive settlement of the process-local owner;
+        # admission only polls retained cleanup for a short, bounded interval.
+        lifecycle = app._environment_lifecycle
+        original_abort = lifecycle.abort_environment_setup
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        async def blocked_cleanup(**kwargs: Any) -> None:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            await original_abort(**kwargs)
+
+        monkeypatch.setattr(lifecycle, "abort_environment_setup", blocked_cleanup)
+        async with asyncio.timeout(30):
+            drain = asyncio.create_task(app.drain_environment_cleanups(timeout_s=20))
+            try:
+                await cleanup_started.wait()
+                await lifecycle._settle_retained_environment_cleanups()
+                assert not drain.done()
+                with pytest.raises(ValueError, match="already bound by an active session"):
+                    await binding.bind(source, None, session_id="blocked-reconciled-rebind")
+                assert_sync_resources_owned(source, target, generation=generation, expected=True)
+            finally:
+                allow_cleanup.set()
+                drained = await drain
+            assert drained
+        monkeypatch.setattr(lifecycle, "abort_environment_setup", original_abort)
+
+        assert (
+            pending_completion_finalization_from_checkpoint(
+                await store.load_checkpoint("sync-durability-reconciled")
+            )
+            is None
+        )
+        # Draining already finalized the retained workspace and cleared its
+        # durable retry marker, so recovery must not repeat that work.
         recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="sync-durability-reconciled",
                 reason="workspace_finalization_reconciliation_test",
             )
         )
-        assert recovery.actions == (
-            IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_FINALIZATION,
-        )
+        assert recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
         assert binding._states == {}
         assert_sync_resources_owned(source, target, generation=generation, expected=False)
         assert (

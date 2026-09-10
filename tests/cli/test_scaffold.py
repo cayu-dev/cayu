@@ -1080,6 +1080,52 @@ def test_cayu_new_coding_rejects_false_success_dependency_shims(
     assert f"{command} semantic probe failed" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("execution", ["none", "docker"])
+def test_cayu_new_coding_does_not_start_automatic_git_maintenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    execution: str,
+) -> None:
+    from cayu.cli import scaffold
+
+    _bypass_coding_dependency_preflight(monkeypatch)
+    trace = tmp_path / "git-trace.jsonl"
+    original_environment = scaffold._sanitized_scaffold_git_environment
+
+    def traced_environment(*, cwd: Path) -> dict[str, str]:
+        environment = original_environment(cwd=cwd)
+        environment["GIT_TRACE2_EVENT"] = str(trace)
+        return environment
+
+    monkeypatch.setattr(scaffold, "_sanitized_scaffold_git_environment", traced_environment)
+    result = main(
+        [
+            "new",
+            "quiet-coder",
+            "--preset",
+            "coding",
+            "--execution",
+            execution,
+            "--dir",
+            str(tmp_path),
+        ]
+    )
+
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "cmd_name" and event.get("name") == "commit" for event in events)
+    # Observe real Git children, rather than depending on repack timing or Git's
+    # version-specific threshold for deleting the objects publication is sealing.
+    maintenance = [
+        event
+        for event in events
+        if event["event"] == "child_start"
+        and {"maintenance", "gc"}.intersection(event.get("argv", []))
+    ]
+    assert maintenance == []
+    assert result == 0
+    assert (tmp_path / "quiet-coder" / ".git" / "HEAD").is_file()
+
+
 def test_cayu_new_coding_confines_git_authority_and_ignores_global_hooks(
     tmp_path: Path,
     capsys,

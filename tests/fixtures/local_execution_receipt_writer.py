@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import sys
 import time
 from pathlib import Path
 
-from cayu.runtime import _local_execution_supervisor as supervisor
+# Production launches this stdlib-only supervisor by file path. Match that
+# boundary without importing the complete SDK just to write a staging receipt.
+supervisor = runpy.run_path(
+    str(Path(__file__).resolve().parents[2] / "src/cayu/runtime/_local_execution_supervisor.py")
+)
 
 
 def main() -> None:
@@ -24,8 +29,8 @@ def main() -> None:
         while True:
             time.sleep(1)
 
-    supervisor.os.replace = pause_before_rename  # type: ignore[assignment]
-    supervisor._atomic_receipt(receipt_path, payload)
+    supervisor["os"].replace = pause_before_rename
+    supervisor["_atomic_receipt"](receipt_path, payload)
 
 
 if __name__ == "__main__":

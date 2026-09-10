@@ -91,6 +91,29 @@ from cayu.runtime import CheckpointCompactionContextPolicy, ModelCompactor
 _DOCKER_PROBE_COMPLETION_TOKEN = re.compile(r"cayu-admission-probe-complete-[0-9a-f]{32}")
 
 
+class _EvidenceClock(datetime):
+    current = datetime(2026, 1, 1, tzinfo=UTC)
+
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[no-untyped-def]
+        value = cls.current
+        return value.replace(tzinfo=None) if tz is None else value.astimezone(tz)
+
+    @classmethod
+    def advance(cls, *, seconds: float) -> None:
+        cls.current += timedelta(seconds=seconds)
+
+
+@pytest.fixture
+def evidence_clock(monkeypatch: pytest.MonkeyPatch) -> type[_EvidenceClock]:
+    # Evidence ages only at the dispatch boundary selected by each test.
+    # Leave real event-loop deadlines and cancellation scheduling intact.
+    monkeypatch.setattr(_EvidenceClock, "current", datetime(2026, 1, 1, tzinfo=UTC))
+    monkeypatch.setattr(admission_module, "datetime", _EvidenceClock)
+    monkeypatch.setitem(globals(), "datetime", _EvidenceClock)
+    return _EvidenceClock
+
+
 def _completed_docker_probe_result(
     args: list[str],
     *,
@@ -1487,19 +1510,9 @@ def test_final_runner_requires_exact_factory_environment_authority(
 
 
 def test_expired_exposure_is_refused_again_at_actual_provider_dispatch(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import cayu.environments.admission as admission_module
-
-    class AdmissionClock(datetime):
-        current = datetime.now(UTC)
-
-        @classmethod
-        def now(cls, tz=None):
-            return cls.current if tz is None else cls.current.astimezone(tz)
-
-    monkeypatch.setattr(admission_module, "datetime", AdmissionClock)
-
     class ExpiringEvidenceRunner(_EvidenceRunner):
         current_candidate: ExecutionAdmissionCandidate | None = None
 
@@ -1509,7 +1522,7 @@ def test_expired_exposure_is_refused_again_at_actual_provider_dispatch(
         async def collect_execution_admission_candidate(
             self,
         ) -> ExecutionAdmissionCandidate:
-            observed_at = AdmissionClock.now(UTC)
+            observed_at = evidence_clock.now(UTC)
             self.current_candidate = ExecutionAdmissionCandidate(
                 candidate="hosted",
                 evidence=ExecutionCapabilityEvidence(
@@ -1537,8 +1550,7 @@ def test_expired_exposure_is_refused_again_at_actual_provider_dispatch(
             if self.delay_next_dispatch:
                 self.delay_next_dispatch = False
                 self.dispatch_delay_applied = True
-                # Expire proof at this exact boundary, not during CI setup.
-                AdmissionClock.current += timedelta(seconds=2)
+                evidence_clock.advance(seconds=1.1)
             return super().provider_operation_mode
 
     async def run() -> tuple[list[Event], _RecordingProvider]:
@@ -2155,6 +2167,7 @@ def test_docker_final_probe_settles_guest_before_factory_release(
 
 
 def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class ExpiringEvidenceRunner(_EvidenceRunner):
@@ -2240,7 +2253,7 @@ def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
         async def delay_after_tool_intent(event: Event) -> Event:
             persisted = await original_emit(event)
             if event.type is EventType.TOOL_CALL_STARTED:
-                await asyncio.sleep(1.1)
+                evidence_clock.advance(seconds=1.1)
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", delay_after_tool_intent)
@@ -2255,6 +2268,7 @@ def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
 
 
 def test_expired_exposure_refuses_background_provider_before_start(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class ExpiringEvidenceRunner(_EvidenceRunner):
@@ -2351,7 +2365,7 @@ def test_expired_exposure_refuses_background_provider_before_start(
         async def expire_after_durable_start_intent(event: Event) -> Event:
             persisted = await original_emit(event)
             if event.type is EventType.PROVIDER_OPERATION_STARTING:
-                await asyncio.sleep(2.1)
+                evidence_clock.advance(seconds=2.1)
             return persisted
 
         monkeypatch.setattr(
@@ -2383,6 +2397,7 @@ def test_expired_exposure_refuses_background_provider_before_start(
     [None, "environment_fingerprint", "image_fingerprint", "toolchain_profile_fingerprint"],
 )
 def test_runtime_renews_expired_evidence_without_changing_exact_environment_identity(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
     drift_field: str | None,
 ) -> None:
@@ -2395,9 +2410,7 @@ def test_runtime_renews_expired_evidence_without_changing_exact_environment_iden
         def provider_operation_mode(self):
             if self.delay_next_dispatch:
                 self.delay_next_dispatch = False
-                import time
-
-                time.sleep(1.1)
+                evidence_clock.advance(seconds=1.1)
             return super().provider_operation_mode
 
     async def run() -> tuple[list[Event], DispatchDelayedProvider, _RenewingEvidenceRunner]:
@@ -2645,6 +2658,7 @@ def test_shared_runner_preserves_distinct_observer_state_through_public_renewal(
 
 
 def test_runtime_renews_expired_evidence_at_exact_tool_dispatch(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class ToolProvider(ModelProvider):
@@ -2705,7 +2719,7 @@ def test_runtime_renews_expired_evidence_at_exact_tool_dispatch(
         async def delay_after_tool_intent(event: Event) -> Event:
             persisted = await original_emit(event)
             if event.type is EventType.TOOL_CALL_STARTED:
-                await asyncio.sleep(1.1)
+                evidence_clock.advance(seconds=1.1)
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", delay_after_tool_intent)
@@ -2723,6 +2737,7 @@ def test_runtime_renews_expired_evidence_at_exact_tool_dispatch(
 @pytest.mark.parametrize("delay_seam", ["billing", "provider_child"])
 @pytest.mark.parametrize("renewal_outcome", ["verified", "identity_drift", "cancel"])
 def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
     delay_seam: str,
     renewal_outcome: str,
@@ -2784,7 +2799,7 @@ def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch(
         async def billing_identity_for_request(self, request: ModelRequest) -> None:
             del request
             if delay_seam == "billing":
-                await asyncio.sleep(2.1)
+                evidence_clock.advance(seconds=2.1)
             return None
 
         async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -2808,7 +2823,7 @@ def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch(
         ):
 
             async def delayed():
-                await asyncio.sleep(2.1)
+                evidence_clock.advance(seconds=2.1)
                 return await operation
 
             return original_ensure_future(delayed(), loop=loop)
@@ -2896,6 +2911,7 @@ def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch(
 
 
 def test_environment_admission_renewal_preserves_real_task_cancellation(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class BlockingRenewalRunner(_RenewingEvidenceRunner):
@@ -2939,7 +2955,7 @@ def test_environment_admission_renewal_preserves_real_task_cancellation(
                 event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
                 and event.payload["phase"] == "exposure"
             ):
-                await asyncio.sleep(2.1)
+                evidence_clock.advance(seconds=2.1)
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", expire_after_exposure)
@@ -2962,6 +2978,7 @@ def test_environment_admission_renewal_preserves_real_task_cancellation(
 
 @pytest.mark.parametrize("failure", ["cancel", "timeout", "cancel_settlement", "cancel_lock"])
 def test_cancelled_environment_admission_renewal_fences_binding_cleanup(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
@@ -3057,7 +3074,7 @@ def test_cancelled_environment_admission_renewal_fences_binding_cleanup(
                 event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
                 and event.payload["phase"] == "exposure"
             ):
-                await asyncio.sleep(2.1)
+                evidence_clock.advance(seconds=2.1)
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", expire_after_exposure)
@@ -3142,6 +3159,7 @@ def test_cancelled_environment_admission_renewal_fences_binding_cleanup(
 
 
 def test_environment_admission_renewal_rejects_runner_generated_cancellation(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RunnerGeneratedCancellation(_RenewingEvidenceRunner):
@@ -3187,7 +3205,7 @@ def test_environment_admission_renewal_rejects_runner_generated_cancellation(
                 event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
                 and event.payload["phase"] == "exposure"
             ):
-                await asyncio.sleep(2.1)
+                evidence_clock.advance(seconds=2.1)
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", expire_after_exposure)
@@ -3204,6 +3222,7 @@ def test_environment_admission_renewal_rejects_runner_generated_cancellation(
 
 
 def test_environment_admission_renewal_reconciles_acknowledgement_loss(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class AcknowledgementLossRunner(_RenewingEvidenceRunner):
@@ -3258,7 +3277,7 @@ def test_environment_admission_renewal_reconciles_acknowledgement_loss(
                 event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
                 and event.payload["phase"] == "exposure"
             ):
-                await asyncio.sleep(2.1)
+                evidence_clock.advance(seconds=2.1)
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", expire_after_exposure)
@@ -3281,6 +3300,7 @@ def test_environment_admission_renewal_reconciles_acknowledgement_loss(
 
 @pytest.mark.parametrize("initial_settlement_fails", [False, True])
 def test_environment_admission_renewal_settles_before_binding_cleanup(
+    evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
     initial_settlement_fails: bool,
 ) -> None:
@@ -3374,7 +3394,7 @@ def test_environment_admission_renewal_settles_before_binding_cleanup(
                 event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
                 and event.payload["phase"] == "exposure"
             ):
-                await asyncio.sleep(2.1)
+                evidence_clock.advance(seconds=2.1)
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", expire_after_exposure)

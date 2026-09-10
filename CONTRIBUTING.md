@@ -224,9 +224,18 @@ runs across eight jobs. Each PR shard uses two pytest workers with file-level sc
 to preserve module fixture isolation. Ordinary process recovery regressions remain in the PR gate.
 Tests marked `stress` or `qualification`, including full-scale evidence and capacity checks,
 run separately across eight shards in `qualification.yml`, daily and on manual dispatch.
-CI
-rejects a duration snapshot after more than 5% of collected tests lack timings; refresh it
-with the command above before it can materially unbalance the shards.
+A single unsharded collection job runs before the general and specialist matrices. It
+reports import and collection errors directly and rejects a duration snapshot after more
+than 5% of collected tests lack timings. Run it locally with
+`python3 scripts/run_ci.py --lane collection` (no Docker daemon required). Record new test
+timings with `uv run pytest <changed-test-paths> --store-durations`; this preserves the
+existing snapshot entries. Use the full refresh command above when replacing the snapshot.
+
+Deadline and cancellation tests should wait for the intended operation to start before
+triggering their fault. Use explicit readiness signals or a controlled clock for unit
+coverage, and reserve real wall-clock deadlines for integration checks with enough margin
+for process startup. Keep cleanup ownership and settlement assertions intact; a successful
+retry alone does not establish that an ownership failure is harmless.
 
 Release tags rerun every retained gate and require full-scale qualification, add release-only
 freshness and tag/version checks, and may publish the exact artifact validated by that release

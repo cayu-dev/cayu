@@ -200,7 +200,7 @@ def test_runner_reports_clean_only_when_every_collector_is_collected() -> None:
     assert report.omitted_count == 0
 
 
-def test_runner_preserves_successes_and_types_failures_and_unavailability() -> None:
+def test_runner_preserves_successes_and_types_failures_and_unavailability(monkeypatch) -> None:
     async def succeed(_context):
         return collected(_runtime_evidence())
 
@@ -210,7 +210,12 @@ def test_runner_preserves_successes_and_types_failures_and_unavailability() -> N
     async def fail(_context):
         raise RuntimeError("raw-secret-canary")
 
+    clock = [0.0]
+
     async def time_out(_context):
+        # Expire only the deliberately blocked collector. Earlier collectors
+        # must not depend on receiving CPU within a ten-millisecond budget.
+        clock[0] += 0.02
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
@@ -220,18 +225,24 @@ def test_runner_preserves_successes_and_types_failures_and_unavailability() -> N
             "collection_timeout_seconds": 1,
         }
     )
-    report = asyncio.run(
-        collect_support_bundle(
-            _context(limits=limits),
-            (
-                FunctionalSupportBundleCollector("success", succeed),
-                FunctionalSupportBundleCollector("unsupported", unsupported),
-                FunctionalSupportBundleCollector("failure", fail),
-                FunctionalSupportBundleCollector("timeout", time_out),
-            ),
-            now=lambda: datetime(2026, 1, 2, tzinfo=UTC),
-        )
-    )
+
+    async def collect():
+        loop = asyncio.get_running_loop()
+        clock[0] = loop.time()
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            return await collect_support_bundle(
+                _context(limits=limits),
+                (
+                    FunctionalSupportBundleCollector("success", succeed),
+                    FunctionalSupportBundleCollector("unsupported", unsupported),
+                    FunctionalSupportBundleCollector("failure", fail),
+                    FunctionalSupportBundleCollector("timeout", time_out),
+                ),
+                now=lambda: datetime(2026, 1, 2, tzinfo=UTC),
+            )
+
+    report = asyncio.run(collect())
 
     assert report.outcome is SupportBundleOutcome.PARTIAL
     assert [

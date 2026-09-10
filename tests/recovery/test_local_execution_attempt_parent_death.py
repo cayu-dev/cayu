@@ -640,19 +640,21 @@ def test_root_process_group_signal_cannot_kill_the_cleanup_supervisor(
         app = CayuApp(task_store=store, enable_logging=False)
         task = await _claimed(store, "root-process-group-signal")
         tree_state = tmp_path / "tree-state"
-        result = await LocalExecutionAttemptCoordinator(
-            store,
-            state_dir=tmp_path / "attempt-state",
-        ).run(
-            app=app,
-            task=task,
-            worker_id="worker-a",
-            request=_request(
-                tree_state,
-                deadline_seconds=10,
-                signal_process_group=True,
-            ),
-        )
+        # The fixture supplies its own terminal event after tree readiness.
+        async with asyncio.timeout(60):
+            result = await LocalExecutionAttemptCoordinator(
+                store,
+                state_dir=tmp_path / "attempt-state",
+            ).run(
+                app=app,
+                task=task,
+                worker_id="worker-a",
+                request=_request(
+                    tree_state,
+                    deadline_seconds=None,
+                    signal_process_group=True,
+                ),
+            )
         identities = _fixture_identities(tree_state)
         assert result.attempt.start is not None
         assert result.attempt.receipt is not None
@@ -715,20 +717,24 @@ def test_clean_process_exit_does_not_prove_non_idempotent_external_outcome(
         store = InMemoryTaskStore()
         app = CayuApp(task_store=store, enable_logging=False)
         task = await _claimed(store, "external-completed-tree")
-        result = await LocalExecutionAttemptCoordinator(
-            store,
-            state_dir=tmp_path / "attempt-state",
-        ).run(
-            app=app,
-            task=task,
-            worker_id="worker-a",
-            request=_request(
-                tmp_path / "tree-state",
-                complete=True,
-                deadline_seconds=5,
-                effect_policy=LocalExecutionEffectPolicy.NON_IDEMPOTENT_EXTERNAL,
-            ),
-        )
+        # The fixture supplies its own terminal event after tree readiness.
+        async with asyncio.timeout(60):
+            result = await LocalExecutionAttemptCoordinator(
+                store,
+                state_dir=tmp_path / "attempt-state",
+            ).run(
+                app=app,
+                task=task,
+                worker_id="worker-a",
+                request=_request(
+                    tmp_path / "tree-state",
+                    complete=True,
+                    deadline_seconds=None,
+                    effect_policy=LocalExecutionEffectPolicy.NON_IDEMPOTENT_EXTERNAL,
+                ),
+            )
+        assert result.attempt.receipt is not None
+        assert result.attempt.receipt.terminal_reason == "root_exit"
         assert result.attempt.quiescence is LocalExecutionAttemptQuiescence.QUIESCENT
         assert result.attempt.effect_outcome is LocalExecutionAttemptEffectOutcome.OUTCOME_UNKNOWN
         assert result.attempt.retry_admissible is False
@@ -1018,18 +1024,21 @@ def test_exact_replay_clears_receipt_after_settlement_acknowledgement_loss(
         app = CayuApp(task_store=store, enable_logging=False)
         task = await _claimed(store, "settlement-acknowledgement-loss")
         tree_state = tmp_path / "tree-state"
-        # This tests exact settlement replay, not expiry during child startup.
-        request = _request(tree_state, complete=True, deadline_seconds=30)
+        # This fault is a lost settlement acknowledgement after natural
+        # completion. A startup deadline can kill the fixture before it has
+        # published the descendant identities this test must inspect.
+        request = _request(tree_state, complete=True, deadline_seconds=None)
         state_dir = tmp_path / "attempt-state"
         coordinator = LocalExecutionAttemptCoordinator(store, state_dir=state_dir)
 
         with pytest.raises(RuntimeError, match="settlement acknowledgement loss"):
-            await coordinator.run(
-                app=app,
-                task=task,
-                worker_id="worker-a",
-                request=request,
-            )
+            async with asyncio.timeout(60):
+                await coordinator.run(
+                    app=app,
+                    task=task,
+                    worker_id="worker-a",
+                    request=request,
+                )
         starts_after_first_run = store.start_publications
         assert starts_after_first_run == 2
         assert len(list(state_dir.glob("*.receipt.json"))) == 1
@@ -1041,6 +1050,10 @@ def test_exact_replay_clears_receipt_after_settlement_acknowledgement_loss(
             request=request,
         )
         assert replayed.attempt.quiescence is LocalExecutionAttemptQuiescence.QUIESCENT
+        assert replayed.attempt.receipt is not None
+        assert (
+            replayed.attempt.receipt.effect_outcome is LocalExecutionAttemptEffectOutcome.SUCCEEDED
+        )
         assert replayed.stdout == ""
         assert replayed.stderr == ""
         assert replayed.stdout_truncated is True
@@ -1274,6 +1287,7 @@ def test_process_loss_after_receipt_staging_fsync_recovers_exact_settlement(
         writer = subprocess.Popen(
             [
                 sys.executable,
+                "-S",  # Keep this crash fixture independent of SDK/site-package startup.
                 str(_RECEIPT_WRITER_FIXTURE),
                 str(payload_path),
                 str(receipt_path),
@@ -1285,7 +1299,9 @@ def test_process_loss_after_receipt_staging_fsync_recovers_exact_settlement(
             stderr=subprocess.DEVNULL,
         )
         try:
-            deadline = asyncio.get_running_loop().time() + 5
+            # Wait for the actual fsynced staging marker; this is a setup hang
+            # guard, not a receipt-writing performance requirement.
+            deadline = asyncio.get_running_loop().time() + 30
             while not writer_ready.is_file():
                 if writer.poll() is not None:
                     raise AssertionError("receipt writer exited before staging")

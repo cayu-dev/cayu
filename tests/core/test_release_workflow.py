@@ -46,6 +46,7 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
         for job_name in (
             "verification-scope",
             "static",
+            "test-collection",
             "test_shards",
             "test_specialists",
             "sqlite-cancellation",
@@ -70,6 +71,7 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
     assert _job_ids(workflow) == {
         "verification-scope",
         "static",
+        "test-collection",
         "test_shards",
         "test_specialists",
         "sqlite-cancellation",
@@ -80,7 +82,7 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
         "publish",
         "github-release",
     }
-    for core_job in ("static", "test_shards", "test_specialists"):
+    for core_job in ("static", "test-collection", "test_shards", "test_specialists"):
         assert "startsWith(github.ref, 'refs/tags/v')" not in _job_block(workflow, core_job)
     scope = _job_block(workflow, "verification-scope")
     assert "python3 scripts/select_ci_jobs.py" in scope
@@ -193,7 +195,7 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "startsWith(github.ref, 'refs/tags/v')" in publish
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
     assert (
-        "needs: [static, test_shards, test_specialists, sqlite-cancellation, package-build, package, "
+        "needs: [static, test-collection, test_shards, test_specialists, sqlite-cancellation, package-build, package, "
         "dashboard, release-qualification]" in publish
     )
     assert (
@@ -321,7 +323,13 @@ def test_ci_triggers_skip_main_pushes_and_cover_draft_transitions() -> None:
 def test_draft_prs_skip_every_independent_worker_before_allocation() -> None:
     workflow = _CI_WORKFLOW.read_text()
     draft_guard = "    if: github.event_name != 'pull_request' || !github.event.pull_request.draft"
-    for name in ("verification-scope", "static", "test_shards", "test_specialists"):
+    for name in (
+        "verification-scope",
+        "static",
+        "test-collection",
+        "test_shards",
+        "test_specialists",
+    ):
         block = _job_block(workflow, name)
         assert draft_guard in block
         assert block.index(draft_guard) < block.index("runs-on:")

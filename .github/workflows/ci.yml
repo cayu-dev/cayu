@@ -61,7 +61,19 @@ jobs:
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: python3 scripts/run_ci.py --lane static
 
+  test-collection:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    name: Test collection
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Validate collection before starting test workers
+        run: python3 scripts/run_ci.py --lane collection
+
   test_shards:
+    needs: test-collection
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test shard ${{ matrix.shard }}/32 (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
@@ -102,6 +114,7 @@ jobs:
           if-no-files-found: error
 
   test_specialists:
+    needs: test-collection
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test specialist ${{ matrix.lane }} (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
@@ -207,8 +220,8 @@ jobs:
     name: Release package contracts (${{ matrix.group }})
     needs: package-build
     runs-on: ${{ fromJSON(github.event.repository.private && (matrix.group == 'core' && '["self-hosted","linux","arm64","gcp-ci"]' || '["self-hosted","linux","x64","gcp-ci","gcp-ci-package"]') || (matrix.group == 'core' && '["ubuntu-24.04-arm"]' || '["ubuntu-latest"]')) }}
-    # The server group installs browser system packages on each fresh runner.
-    timeout-minutes: ${{ matrix.group == 'server' && 30 || 10 }}
+    # Server and dashboard install browser system packages on each fresh runner.
+    timeout-minutes: ${{ (matrix.group == 'server' || matrix.group == 'dashboard') && 30 || 10 }}
     strategy:
       fail-fast: false
       matrix:
@@ -281,7 +294,7 @@ jobs:
       github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
-    needs: [static, test_shards, test_specialists, sqlite-cancellation, package-build, package, dashboard, release-qualification]
+    needs: [static, test-collection, test_shards, test_specialists, sqlite-cancellation, package-build, package, dashboard, release-qualification]
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     environment:

@@ -47,6 +47,7 @@ def frame(x):
         ("noncooperative", "silence"),
         ("receipt_failure", "silence"),
         ("delayed_receipt", "silence"),
+        ("socket_delayed_receipt", "whitespace"),
     ],
 )
 async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
@@ -147,12 +148,12 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
     transport = HttpxOpenAITransport()
     path = tmp_path / "sessions.db"
     store = SQLiteSessionStore(path)
-    if mode in {"receipt_failure", "delayed_receipt"}:
+    if mode in {"receipt_failure", "delayed_receipt", "socket_delayed_receipt"}:
         append_event = store.append_event
 
         async def reject_receipt(session_id, event):
             if event.type == "model.http_cleanup":
-                if mode == "delayed_receipt":
+                if mode in {"delayed_receipt", "socket_delayed_receipt"}:
                     await release.wait()
                 else:
                     raise RuntimeError("synthetic receipt persistence failure")
@@ -163,7 +164,11 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
     running = opening = None
     try:
         async with httpx.AsyncClient(
-            transport=Local() if mode == "socket" else httpx.MockTransport(handle)
+            transport=(
+                Local()
+                if mode in {"socket", "socket_delayed_receipt"}
+                else httpx.MockTransport(handle)
+            )
         ) as client:
             transport._client._client = client
             provider = OpenAIProvider(
@@ -220,14 +225,22 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
             assert error.payload["provider_effect_outcome"] == "unknown"
             assert error.payload["retry_disposition"] == "suppressed"
             assert error.payload["effective_max_attempts"] == 1
-            assert error.payload.get("stream_cleanup_failed", False) == (
-                mode not in {"socket", "mock"}
-            )
+            # Socket shutdown and SQLite receipt publication may outlast the
+            # bounded 100/50 ms joins on a loaded worker. The original error
+            # can therefore report unconfirmed cleanup even when it later
+            # succeeds. Require the immutable, exact durable receipt below.
+            if mode not in {"socket", "mock"}:
+                assert error.payload["stream_cleanup_failed"] is True
+            elif not error.payload.get("stream_cleanup_failed", False):
+                assert initial_plan.active_model_stage.local_http_cleanup == "succeeded"
             if mode in {"delayed", "noncooperative"}:
                 assert not closed.is_set()
                 assert ds._PROVIDER_DEADLINE_AWAIT_OWNERS
                 assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
-            if mode == "delayed_receipt":
+            if mode in {"delayed_receipt", "socket_delayed_receipt"}:
+                # For a socket, peer EOF observation is independent of the
+                # local close/receipt task; join it explicitly before checking.
+                await asyncio.wait_for(closed.wait(), 2)
                 assert closed.is_set()
                 assert ds._PROVIDER_DEADLINE_AWAIT_OWNERS
                 assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
@@ -289,6 +302,8 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
                     assert unrelated_plan.allowed_actions == settled_plan.allowed_actions
             assert next(e for e in events if e.id == error.id) == error
             assert requests == 1
+            if mode in {"socket", "socket_delayed_receipt"}:
+                await asyncio.wait_for(closed.wait(), 2)
             assert closed.is_set() == (mode != "failure")
             assert not handlers
             assert not [t for t in asyncio.all_tasks() - baseline_tasks if not t.done()]

@@ -149,7 +149,12 @@ def test_named_workers_construct_apps_in_distinct_child_processes(tmp_path):
 )
 def test_process_group_signal_stops_and_reaps_children(tmp_path, name, signum, expected):
     _project(tmp_path)
-    process = _start(tmp_path, "worker", name, "--processes", "2", "--shutdown-grace-seconds", ".3")
+    # Cooperative workers must finish Python/SDK teardown after observing the
+    # signal. Keep the short grace only for the deliberately stubborn worker.
+    grace = "5" if name == "wait" else ".3"
+    process = _start(
+        tmp_path, "worker", name, "--processes", "2", "--shutdown-grace-seconds", grace
+    )
     try:
         pids = _wait_markers(tmp_path, 2)
         process.send_signal(signum)

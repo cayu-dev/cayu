@@ -5,6 +5,7 @@ import hashlib
 import json
 import multiprocessing
 import sqlite3
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import wraps
@@ -1231,6 +1232,33 @@ class _BlockingRuntimeProvider(ScriptedModelProvider):
             raise
         yield ModelStreamEvent.text_delta("Friday")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+def _expire_runtime_deadline_after_provider_start(monkeypatch, provider) -> None:
+    """Exercise the runner's real timeout after the blocked provider is admitted."""
+
+    class RuntimeDeadlineAsyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        @asynccontextmanager
+        async def timeout(self, seconds):
+            # Only this module's runtime timeout is controlled; provider and
+            # cleanup asyncio operations keep their original implementations.
+            async with asyncio.timeout(min(seconds, 30)) as scope:
+
+                async def expire_after_start():
+                    await provider.started.wait()
+                    scope.reschedule(asyncio.get_running_loop().time())
+
+                expiry = asyncio.create_task(expire_after_start())
+                try:
+                    yield scope
+                finally:
+                    expiry.cancel()
+                    await asyncio.gather(expiry, return_exceptions=True)
+
+    monkeypatch.setattr(memory_intervention_execution_module, "asyncio", RuntimeDeadlineAsyncio())
 
 
 class _FailOnceTerminalEvidenceSQLiteSessionStore(SQLiteSessionStore):
@@ -3166,13 +3194,15 @@ async def test_concrete_runner_uses_canonical_recall_and_keeps_production_store_
 
 
 @_async_test
-async def test_concrete_runner_records_a_real_runtime_deadline_as_timed_out(tmp_path) -> None:
+async def test_concrete_runner_records_a_real_runtime_deadline_as_timed_out(
+    tmp_path, monkeypatch
+) -> None:
     provider = _BlockingRuntimeProvider()
+    _expire_runtime_deadline_after_provider_start(monkeypatch, provider)
     executor, executions, request, _ = await _canonical_execution_harness(
         tmp_path,
         provider=provider,
         suffix="timeout",
-        timeout_seconds=1,
     )
 
     outcome = await executor.execute_trial(request)
@@ -3201,14 +3231,14 @@ async def test_concrete_runner_records_a_real_runtime_deadline_as_timed_out(tmp_
 @_async_test
 async def test_timeout_result_survives_lost_journal_acknowledgement_without_redispatch(
     tmp_path,
+    monkeypatch,
 ) -> None:
     provider = _BlockingRuntimeProvider()
+    _expire_runtime_deadline_after_provider_start(monkeypatch, provider)
     executor, executions, request, _ = await _canonical_execution_harness(
         tmp_path,
         provider=provider,
         suffix="timeout-ack-lost",
-        # Allow normal setup to reach the deliberately blocked provider on CI.
-        timeout_seconds=5,
     )
     executor = _executor_with_execution_store(
         executor,
@@ -3242,8 +3272,10 @@ async def test_timeout_result_survives_lost_journal_acknowledgement_without_redi
 @_async_test
 async def test_timeout_authority_survives_terminal_evidence_failure_without_redispatch(
     tmp_path,
+    monkeypatch,
 ) -> None:
     provider = _BlockingRuntimeProvider()
+    _expire_runtime_deadline_after_provider_start(monkeypatch, provider)
     sessions = _FailOnceTerminalEvidenceSQLiteSessionStore(
         tmp_path / "timeout-evidence-failure-sessions.db"
     )
@@ -3251,7 +3283,6 @@ async def test_timeout_authority_survives_terminal_evidence_failure_without_redi
         tmp_path,
         provider=provider,
         suffix="timeout-evidence-failure",
-        timeout_seconds=1,
         sessions=sessions,
     )
 
@@ -3322,8 +3353,10 @@ async def test_timeout_authority_survives_terminal_evidence_failure_without_redi
 @_async_test
 async def test_timeout_authority_survives_cancellation_during_terminal_evidence(
     tmp_path,
+    monkeypatch,
 ) -> None:
     provider = _BlockingRuntimeProvider()
+    _expire_runtime_deadline_after_provider_start(monkeypatch, provider)
     sessions = _BlockOnceTerminalEvidenceSQLiteSessionStore(
         tmp_path / "timeout-evidence-cancellation-sessions.db"
     )
@@ -3331,10 +3364,6 @@ async def test_timeout_authority_survives_cancellation_during_terminal_evidence(
         tmp_path,
         provider=provider,
         suffix="timeout-evidence-cancellation",
-        # The absolute deadline includes canonical preflight. Leave enough
-        # headroom for a loaded CI worker so this test reaches provider
-        # dispatch before exercising cancellation during terminal readback.
-        timeout_seconds=5,
         sessions=sessions,
     )
     task = asyncio.create_task(executor.execute_trial(request))

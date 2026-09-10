@@ -564,6 +564,16 @@ def _sync_python_test_environment(runner: LocalCiRunner, *, browser: bool) -> No
     )
 
 
+def _run_test_collection(runner: LocalCiRunner) -> bool:
+    # Keep collection errors on the controller: xdist can mask a UsageError as
+    # an internal worker-finished assertion before any test has executed.
+    return runner.run(
+        "Python 3.14 test collection and duration snapshot",
+        ("uv", "run", "--no-sync", "pytest", "--collect-only", "-qq", "-n", "0"),
+        env={"CAYU_REQUIRE_CURRENT_TEST_DURATIONS": "1"},
+    )
+
+
 def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
     if shard not in range(1, _GENERAL_SHARDS + 1):
         raise ValueError(f"general shard must be between 1 and {_GENERAL_SHARDS}")
@@ -668,8 +678,10 @@ def _run_general_shards(runner: LocalCiRunner, *, jobs: int) -> None:
 
 
 def _run_python_suite(runner: LocalCiRunner, *, jobs: int) -> None:
-    _run_docker_prerequisite(runner)
     _sync_python_test_environment(runner, browser=False)
+    if not _run_test_collection(runner):
+        return
+    _run_docker_prerequisite(runner)
     _run_general_shards(runner, jobs=jobs)
     _sync_python_test_environment(runner, browser=True)
     _install_playwright_chromium(runner)
@@ -1006,6 +1018,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--lane",
         choices=(
             "static",
+            "collection",
             "general",
             "specialist",
             "sqlite-cancellation",
@@ -1082,6 +1095,9 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
     try:
         if args.lane == "static":
             _run_static(runner)
+        elif args.lane == "collection":
+            _sync_python_test_environment(runner, browser=False)
+            _run_test_collection(runner)
         elif args.lane == "general":
             if args.shard is None:
                 raise ValueError("--lane general requires --shard")

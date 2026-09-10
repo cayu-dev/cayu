@@ -2187,8 +2187,11 @@ def test_caller_cancellation_during_cleanup_retains_the_preceding_child_failure(
             return await original_settle(*args, **kwargs)
 
         monkeypatch.setattr(isolated_process, "_settle_owned_supervisor", blocked_settle)
-        task = asyncio.create_task(_execute(_tool(mode="crash", deadline_seconds=5)))
-        await asyncio.wait_for(cleanup_entered.wait(), timeout=10)
+        # The preceding failure must be the real child crash. Allow SDK child
+        # startup before the hard deadline, then use the cleanup barrier to
+        # place caller cancellation; deadline behavior has separate coverage.
+        task = asyncio.create_task(_execute(_tool(mode="crash", deadline_seconds=30)))
+        await asyncio.wait_for(cleanup_entered.wait(), timeout=35)
         task.cancel("cancel during process cleanup")
         cancelling = task.cancelling()
         release_cleanup.set()
