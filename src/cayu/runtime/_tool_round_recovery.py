@@ -22,6 +22,7 @@ from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _transcript as transcript_support
 from cayu.runtime import _web_access_results as web_access_results
+from cayu.runtime._argument_continuity import capture_arguments, redact_continuity
 from cayu.runtime._assistant_tool_round_publication import (
     AssistantToolRoundPublication,
     StagedToolCallTerminal,
@@ -702,6 +703,7 @@ def _updated_assistant_publication(
         updated_publication = AssistantToolRoundPublication(
             state="ready" if set(covered_ids) == expected_ids else "pending",
             message=publication_message,
+            argument_continuity=redact_continuity(publication.argument_continuity, redactor),
             covered_tool_call_ids=covered_ids,
             secret_resolution_scope=publication.secret_resolution_scope,
         )
@@ -806,6 +808,8 @@ def checkpoint_with_pending_tool_round(
     assistant_message_state: Literal["published", "quarantined"] = "published",
     quarantined_assistant_message: Message | None = None,
     secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown",
+    continuity_tool_names: frozenset[str] = frozenset(),
+    continuity_knowledge_scope: Any = None,
     structured_output: StructuredOutputSpec | None = None,
     thinking: ThinkingConfig | None = None,
     max_steps: int | None = None,
@@ -856,6 +860,17 @@ def checkpoint_with_pending_tool_round(
         assistant_publication = AssistantToolRoundPublication(
             state="blocked" if publication_message is None else "pending",
             message=publication_message,
+            argument_continuity=(
+                capture_arguments(
+                    tool_calls,
+                    names=continuity_tool_names,
+                    scope=continuity_knowledge_scope,
+                    profile=None if active_profile is None else active_profile.profile.fingerprint,
+                    redactor=resolved_redactor,
+                )
+                if publication_message is not None
+                else None
+            ),
             reason=("opaque_provider_state_secret" if publication_message is None else None),
             secret_resolution_scope=secret_resolution_scope,
         )

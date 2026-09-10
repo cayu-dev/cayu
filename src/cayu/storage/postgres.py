@@ -24702,6 +24702,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     """Postgres-backed session store for durable multi-tenant runtime state."""
 
     supports_usage_aggregates: ClassVar[bool] = True
+    supports_private_argument_continuity: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_targeted_tool_grants: ClassVar[bool] = True
@@ -33227,6 +33228,23 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 request.operation_record_mutations,
                                 current_mutation_records,
                             )
+                        )
+
+                    if request.argument_continuity is not None:
+                        from cayu.runtime._argument_continuity import STORAGE_KEY, append_record
+
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s FOR UPDATE",
+                            (session_id, STORAGE_KEY),
+                        )
+                        private_row = await cur.fetchone()
+                        operation_mutation_records[STORAGE_KEY] = append_record(
+                            None if private_row is None else _json_obj(private_row[0]),
+                            continuity=request.argument_continuity,
+                            request_digest=prepared.request_digest,
+                            session=loaded,
+                            messages=request.transcript_messages,
                         )
 
                     if locked_stage is not None:

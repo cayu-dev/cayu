@@ -968,6 +968,7 @@ class _RuntimeCheckpointSessionStore:
             events=request.events,
             operation_record_mutations=request.operation_record_mutations,
             referenced_events=request.referenced_events,
+            argument_continuity=request.argument_continuity,
         )
 
     def _decode_publication_checkpoint(

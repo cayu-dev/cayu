@@ -121,6 +121,7 @@ class RegisteredTool:
     command_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     tool: Tool
     execution_requirements: tuple[ToolExecutionRequirement, ...] = ()
+    retain_arguments_for_model: bool = False
     child_session_recovery: ChildSessionRecoveryMatcher | None = None
     durable_tool_recovery: DurableToolRecovery | None = None
     effect_reconciler: RegisteredToolEffectReconciler | None = None

@@ -9743,6 +9743,23 @@ class ModelStepRun:
                 context_messages.append(child_session_contribution.message.model_copy(deep=True))
             child_session_notification_binding = child_session_contribution.stage_binding
 
+        from cayu.runtime._argument_continuity import materialize
+
+        context_messages = await materialize(
+            store=self._executor._session_store,
+            session=self._session,
+            profile=None
+            if self._execution_profile is None
+            else self._execution_profile.fingerprint,
+            messages=context_messages,
+            names=frozenset(
+                tool.name
+                for tool in self._registered_agent.tools.values()
+                if tool.retain_arguments_for_model and not tool.publish_arguments
+            ),
+            redactor=self._executor._secret_redactor,
+            scope=self._knowledge_access_scope,
+        )
         model_request = await self._executor.build_request(
             session=self._session,
             registered_agent=self._registered_agent,
@@ -11031,6 +11048,23 @@ class ModelStepRun:
                 )
             recovery_child_notification_binding = child_session_contribution.stage_binding
 
+        from cayu.runtime._argument_continuity import materialize
+
+        recovery_context_messages = await materialize(
+            store=self._executor._session_store,
+            session=self._session,
+            profile=None
+            if self._execution_profile is None
+            else self._execution_profile.fingerprint,
+            messages=recovery_context_messages,
+            names=frozenset(
+                tool.name
+                for tool in self._registered_agent.tools.values()
+                if tool.retain_arguments_for_model and not tool.publish_arguments
+            ),
+            redactor=self._executor._secret_redactor,
+            scope=self._knowledge_access_scope,
+        )
         recovery_request = await self._executor.build_request(
             session=self._session,
             registered_agent=self._registered_agent,

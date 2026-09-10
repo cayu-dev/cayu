@@ -1253,6 +1253,15 @@ class Tool(ABC):
         return True
 
     @property
+    def retain_arguments_for_model(self) -> bool:
+        """Retain bounded redacted original inputs privately for the same profile.
+
+        Independent of audit publication; oversized and compacted-away inputs
+        may be omitted. This does not grant knowledge read or activation rights.
+        """
+        return False
+
+    @property
     def description(self) -> str:
         return self.spec.description
 

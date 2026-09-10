@@ -11,6 +11,7 @@ from cayu._validation import require_clean_nonblank, require_durable_text
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
 from cayu.core.tools import ToolResult
+from cayu.runtime._argument_continuity import ArgumentContinuity
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.tool_exposure import (
     NOT_EXPOSED_IN_REQUEST_REASON,
@@ -194,6 +195,7 @@ class AssistantToolRoundPublication(BaseModel):
 
     state: Literal["pending", "ready", "blocked"]
     message: Message | None = None
+    argument_continuity: ArgumentContinuity | None = Field(default=None, repr=False)
     covered_tool_call_ids: list[str] = Field(default_factory=list)
     secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown"
     reason: (
@@ -221,6 +223,8 @@ class AssistantToolRoundPublication(BaseModel):
     @model_validator(mode="after")
     def validate_state(self) -> AssistantToolRoundPublication:
         if self.state == "blocked":
+            if self.argument_continuity is not None:
+                raise ValueError("Blocked assistant publication cannot retain model arguments.")
             if self.message is not None or self.reason is None:
                 raise ValueError("Blocked assistant publication requires only a fixed reason.")
         elif self.message is None or self.reason is not None:

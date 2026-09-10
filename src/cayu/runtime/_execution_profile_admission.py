@@ -667,6 +667,7 @@ def resolve_execution_profile_identity(
                     "effect": tool.effect.value,
                     "workspace_mutation": tool.workspace_mutation,
                     "publishes_arguments": tool.publish_arguments,
+                    "retains_arguments_for_model": tool.retain_arguments_for_model,
                 }
                 for tool in registered_agent.tools.values()
             ],

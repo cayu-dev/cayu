@@ -2956,11 +2956,13 @@ def test_shutdown_grace_bounds_a_stalled_durable_release(tmp_path, monkeypatch) 
         ("protocol", "provider_protocol_failed"),
     ],
 )
+@pytest.mark.parametrize("hold_acknowledgement", [False, True])
 def test_worker_persists_safe_causal_failure_across_restart(
-    tmp_path, monkeypatch, caplog, boundary, reason
+    tmp_path, monkeypatch, caplog, boundary, reason, hold_acknowledgement
 ):
     from cayu.providers.openai import OpenAIProtocolError
 
+    caplog.set_level(logging.WARNING, logger=evals_worker_module.__name__)
     provider = _provider(trials=1)
     target = _target(provider)
     corpus = _corpus(trials=1)
@@ -2981,6 +2983,16 @@ def test_worker_persists_safe_causal_failure_across_restart(
         raise OpenAIProtocolError(secret, reason_code="web_search_action_type_is_unsupported")
 
     async def exercise():
+        acknowledgement = asyncio.Event()
+        if hold_acknowledgement:
+            original_fail_run = store.fail_run
+
+            async def hold_committed_failure(*args, **kwargs):
+                record = await original_fail_run(*args, **kwargs)
+                await acknowledgement.wait()
+                return record
+
+            monkeypatch.setattr(store, "fail_run", hold_committed_failure)
         request = EvalRunRequest(
             run_id="eval-causal-failure",
             idempotency_key="sha256:" + "9" * 64,
@@ -3026,6 +3038,7 @@ def test_worker_persists_safe_causal_failure_across_restart(
                 )
         finally:
             await coordinator.stop()
+            acknowledgement.set()
             await store.close()
         # New store owner must see the same exact fenced failure evidence.
         reopened = SQLiteEvalStore(database)
@@ -3065,5 +3078,66 @@ asyncio.run(read())
     assert secret not in child.stdout + child.stderr
     assert secret not in caplog.text
     causal_logs = [r for r in caplog.records if hasattr(r, "eval_failure_diagnostic")]
-    assert causal_logs
-    assert causal_logs[-1].eval_failure_diagnostic["reason"] == reason
+    if hold_acknowledgement:
+        assert not causal_logs
+    # A terminal record may be observed before its writer returns. Shutdown or
+    # the claim monitor may then cancel the post-commit, best-effort log. Durable
+    # evidence above must survive regardless; acknowledged logging is tested
+    # separately without a competing cancellation owner.
+    for log in causal_logs:
+        assert log.eval_failure_diagnostic["reason"] == reason
+
+
+@pytest.mark.parametrize("claim_lost", [False, True])
+def test_worker_logs_failure_only_after_publication_acknowledgement(
+    tmp_path, monkeypatch, caplog, claim_lost
+):
+    from cayu.evals.store import EvalRunClaimLost, EvalRunFailureCode, EvalRunFailureDiagnostic
+
+    caplog.set_level(logging.WARNING, logger=evals_worker_module.__name__)
+
+    async def exercise():
+        target = _target(_provider(trials=1))
+        store = SQLiteEvalStore(tmp_path / "log-ack.db")
+        coordinator = evals_worker_module.EvalRunCoordinator(_evals_config(target, store))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        diagnostic = EvalRunFailureDiagnostic(reason="corpus_load_failed")
+        code = EvalRunFailureCode.CORPUS_UNAVAILABLE
+        record = SimpleNamespace(id="log-ack", failure_code=code, failure_diagnostic=diagnostic)
+
+        async def publish(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            if claim_lost:
+                raise EvalRunClaimLost("claim lost")
+            return record
+
+        monkeypatch.setattr(store, "fail_run", publish)
+        task = asyncio.create_task(
+            coordinator._finalize_failure(
+                SimpleNamespace(run_id="log-ack", epoch=1),
+                code,
+                diagnostic=diagnostic,
+                refresh=False,
+            )
+        )
+        try:
+            async with asyncio.timeout(10):
+                await entered.wait()
+                assert not any(hasattr(log, "eval_failure_diagnostic") for log in caplog.records)
+                release.set()
+                await task
+            logs = [log for log in caplog.records if hasattr(log, "eval_failure_diagnostic")]
+            assert len(logs) == (0 if claim_lost else 1)
+            if logs:
+                assert logs[0].eval_run_id == record.id
+                assert logs[0].eval_failure_diagnostic == diagnostic.model_dump(mode="json")
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await store.close()
+
+    asyncio.run(exercise())

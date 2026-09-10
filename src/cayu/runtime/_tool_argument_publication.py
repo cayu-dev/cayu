@@ -52,7 +52,7 @@ class ToolArgumentProjection:
         return payload
 
     def transcript_arguments(self) -> dict[str, Any]:
-        """Return the only argument object safe for model-visible history."""
+        """Return the argument object for the public transcript projection."""
 
         return (
             {} if self.arguments is None else copy_durable_json_object(self.arguments, "arguments")

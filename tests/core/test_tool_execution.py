@@ -1267,12 +1267,17 @@ def test_remember_knowledge_success_withholds_arguments_from_events_and_transcri
             "public": [event.model_dump(mode="json") for event in events],
             "private": [event.model_dump(mode="json") for event in private_events],
             "transcript": [message.model_dump(mode="json") for message in transcript],
-            "provider_messages": [
-                message.model_dump(mode="json") for message in provider_requests[1].messages
-            ],
         }
     )
     captured = capsys.readouterr()
+    model_calls = [
+        part
+        for message in provider_requests[1].messages
+        for part in message.content
+        if isinstance(part, ToolCallPart)
+    ]
+    assert len(model_calls) == 2
+    assert all(part.arguments == arguments for part in model_calls)
     for canary in canaries.values():
         assert canary not in rendered
         assert canary not in repr([str(warning.message) for warning in caught_warnings])
@@ -1425,12 +1430,17 @@ def test_private_tool_arguments_cannot_reenter_terminal_output_through_extension
             "public": [event.model_dump(mode="json") for event in events],
             "private": [event.model_dump(mode="json") for event in private_events],
             "transcript": [message.model_dump(mode="json") for message in transcript],
-            "followup_requests": [
-                request.model_dump(mode="json") for request in provider_requests[1:]
-            ],
         }
     )
     captured = capsys.readouterr()
+    followup_requests = [request.model_dump(mode="json") for request in provider_requests[1:]]
+    assert canaries["decision"] not in repr(followup_requests)
+    assert [
+        part.arguments
+        for message in provider_requests[1].messages
+        for part in message.content
+        if isinstance(part, ToolCallPart)
+    ] == [{"text": canaries["text"]}]
     for canary in canaries.values():
         assert canary not in rendered
         assert canary not in repr([str(warning.message) for warning in caught_warnings])

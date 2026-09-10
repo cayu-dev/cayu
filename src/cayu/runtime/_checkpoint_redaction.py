@@ -161,6 +161,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     "components",
     "assistant_publication",
+    "argument_continuity",
     "approval_resolution_intent",
     "user_input_resolution_intent",
     "user_input_supersession_intent",
@@ -720,6 +721,14 @@ def durable_value_contains_secret(
             or _is_workspace_observation_identity_path(path)
             or _is_pending_tool_round_execution_identity_path(path)
             or _is_tool_exposure_authority_identity_path(path)
+            or (
+                len(path) == 4
+                and path[0] in {"pending_tool_round", "pending_user_input"}
+                and path[1:3] == ("assistant_publication", "argument_continuity")
+                and path[3] in {"nonce", "profile", "scope"}
+                and len(value) == (32 if path[3] == "nonce" else 64)
+                and all(character in "0123456789abcdef" for character in value)
+            )
         ):
             # These checkpoint roots are runtime-owned typed authority. Active
             # profiles cross their dedicated admission boundary; workspace
@@ -806,6 +815,10 @@ def durable_value_contains_secret(
                     or _is_active_invocation_build_provenance_structural_key(path, key)
                     or (path, key) in _trusted_lifecycle_receipt_keys
                     or _is_quarantined_assistant_message_structural_key(path, key)
+                    or (
+                        path[-2:] == ("assistant_publication", "argument_continuity")
+                        and key in {"nonce", "profile", "scope"}
+                    )
                     or _is_staged_terminal_event_payload(path)
                 )
                 and _path_has_typed_schema(path)

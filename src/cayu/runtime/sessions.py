@@ -39,6 +39,7 @@ from cayu.deadlines import (
     deadline_from_metadata,
     effective_deadline,
 )
+from cayu.runtime._argument_continuity import ArgumentContinuity
 
 if TYPE_CHECKING:
     from cayu.runtime._invocation_lifecycle import (
@@ -5639,7 +5640,7 @@ def _copy_runtime_publication_mutation_value(
 class RuntimePublicationRequest(BaseModel):
     """Immutable input bundle for one logical model-step or tool-round publication."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     publication_id: str = Field(max_length=256)
     kind: RuntimePublicationKind
@@ -5648,6 +5649,7 @@ class RuntimePublicationRequest(BaseModel):
     mutation: RuntimePublicationMutation
     transcript_messages: tuple[Message, ...]
     events: tuple[Event, ...]
+    argument_continuity: ArgumentContinuity | None = Field(default=None, repr=False)
     operation_record_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = Field(
         default_factory=tuple
     )
@@ -5657,6 +5659,22 @@ class RuntimePublicationRequest(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("argument_continuity", mode="before")
+    @classmethod
+    def copy_argument_continuity(
+        cls, value: ArgumentContinuity | dict[str, Any] | None
+    ) -> ArgumentContinuity | None:
+        if value is None:
+            return None
+        if type(value) is ArgumentContinuity:
+            value = {
+                "nonce": value.nonce,
+                "profile": value.profile,
+                "scope": value.scope,
+                "arguments": value.arguments,
+            }
+        return ArgumentContinuity.model_validate(value)
 
     @field_validator("interaction_id")
     @classmethod
@@ -9691,6 +9709,7 @@ class SessionStore(ABC):
     # Custom stores must opt into optional capabilities explicitly. Conservative
     # defaults keep discovery truthful for inherited methods that fail closed.
     supports_usage_aggregates: ClassVar[bool] = False
+    supports_private_argument_continuity: ClassVar[bool] = False
     supports_mcp_manifest_history: ClassVar[bool] = False
     supports_session_topology: ClassVar[bool] = False
     supports_session_lineage: ClassVar[bool] = False
@@ -12495,6 +12514,7 @@ class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
 
     supports_usage_aggregates: ClassVar[bool] = True
+    supports_private_argument_continuity: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
@@ -18683,6 +18703,18 @@ class InMemorySessionStore(SessionStore):
             )
         )
 
+        private_record = None
+        if request.argument_continuity is not None:
+            from cayu.runtime._argument_continuity import STORAGE_KEY, append_record
+
+            private_record = append_record(
+                operation_records.get(STORAGE_KEY),
+                continuity=request.argument_continuity,
+                request_digest=prepared.request_digest,
+                session=session,
+                messages=request.transcript_messages,
+            )
+
         _assert_session_run_epoch(session_id, session)
         if (
             prepared.expected_statuses is not None
@@ -18839,6 +18871,8 @@ class InMemorySessionStore(SessionStore):
         )
         if prepared_checkpoint is not None:
             self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
+        if private_record is not None:
+            mutated_operation_records[STORAGE_KEY] = private_record
         mutated_operation_records[prepared.storage_key] = receipt_record
         if model_completion_stage is not None:
             assert winner_record is not None
@@ -23952,9 +23986,11 @@ def validate_profiled_fork_evidence(
 def _reject_reserved_runtime_publication_key(
     value: str, field_name: str, *, browser_control_read: bool = False
 ) -> str:
+    from cayu.runtime._argument_continuity import require_private_key_access
     from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
 
     value = require_clean_nonblank(value, field_name)
+    require_private_key_access(value, read=browser_control_read)
     if not browser_control_read:
         require_browser_control_operation_owner(value)
     if value == ZERO_WORK_INTERRUPTION_OPERATION_KEY:
@@ -24667,6 +24703,7 @@ def runtime_publication_request_digest(
             events=request.events,
             operation_record_mutations=request.operation_record_mutations,
             referenced_events=request.referenced_events,
+            argument_continuity=request.argument_continuity,
         )
     return _prepare_runtime_publication(
         session_id,
@@ -25721,6 +25758,31 @@ def _validate_tool_round_checkpoint_mutation(
             "A tool-round publication requires its durable pending round marker."
         )
     raw_calls = marker.get("tool_calls")
+    assistant_publication = marker.get("assistant_publication")
+    expected_continuity = (
+        assistant_publication.get("argument_continuity")
+        if type(assistant_publication) is dict and assistant_publication.get("state") == "ready"
+        else None
+    )
+    actual_continuity = (
+        None
+        if request.argument_continuity is None
+        else request.argument_continuity.model_dump(mode="json")
+    )
+    if actual_continuity != expected_continuity:
+        raise SessionRuntimePublicationConflict(
+            "Private argument continuity conflicts with sealed evidence."
+        )
+    if request.argument_continuity is not None:
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            active_profile is None
+            or active_profile.profile.fingerprint != request.argument_continuity.profile
+            or marker.get("execution_profile_fingerprint") != request.argument_continuity.profile
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Private argument continuity lost its profile authority."
+            )
     if type(raw_calls) is not list or any(type(call) is not dict for call in raw_calls):
         raise SessionRuntimePublicationConflict(
             "The durable pending tool round call list is malformed."
@@ -28159,11 +28221,14 @@ def _prepare_runtime_publication(
             events=request.events,
             operation_record_mutations=request.operation_record_mutations,
             referenced_events=request.referenced_events,
+            argument_continuity=request.argument_continuity,
         )
     except AttributeError as exc:
         raise ValueError("Runtime publication request is malformed.") from exc
 
     _validate_workspace_observation_publication(copied_request, session_id=session_id)
+    if copied_request.argument_continuity is not None and copied_request.kind != "tool-round":
+        raise ValueError("Private argument continuity requires a tool-round publication.")
     _validate_session_operation_record_keys(
         {mutation.key: mutation.value for mutation in copied_request.operation_record_mutations}
     )
@@ -28218,6 +28283,11 @@ def _prepare_runtime_publication(
             "referenced_events": [
                 reference.model_dump(mode="json") for reference in copied_request.referenced_events
             ],
+            **(
+                {"argument_continuity": copied_request.argument_continuity.model_dump(mode="json")}
+                if copied_request.argument_continuity is not None
+                else {}
+            ),
         }
     )
     return _PreparedRuntimePublication(

@@ -1921,6 +1921,7 @@ class SQLiteSessionStore(SessionStore):
     """SQLite-backed session store for durable local runtime state."""
 
     supports_usage_aggregates: ClassVar[bool] = True
+    supports_private_argument_continuity: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_targeted_tool_grants: ClassVar[bool] = True
@@ -9985,6 +9986,22 @@ class SQLiteSessionStore(SessionStore):
                             request.operation_record_mutations,
                             current_mutation_records,
                         )
+                    )
+
+                if request.argument_continuity is not None:
+                    from cayu.runtime._argument_continuity import STORAGE_KEY, append_record
+
+                    private_row = connection.execute(
+                        "SELECT record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, STORAGE_KEY),
+                    ).fetchone()
+                    operation_mutation_records[STORAGE_KEY] = append_record(
+                        None if private_row is None else json.loads(private_row["record_json"]),
+                        continuity=request.argument_continuity,
+                        request_digest=prepared.request_digest,
+                        session=loaded,
+                        messages=request.transcript_messages,
                     )
 
                 if locked_stage is not None:

@@ -22252,6 +22252,12 @@ class SessionEngine:
                     secret_resolution_scope=invocation_secrets.registered_environment_secret_resolution_scope(
                         registered_environment
                     ),
+                    continuity_tool_names=frozenset(
+                        tool.name
+                        for tool in registered_agent.tools.values()
+                        if tool.retain_arguments_for_model and not tool.publish_arguments
+                    ),
+                    continuity_knowledge_scope=_knowledge_access_scope(registered_environment),
                     structured_output=structured_output,
                     thinking=thinking,
                     max_steps=max_steps,
@@ -22269,6 +22275,12 @@ class SessionEngine:
                     structured_output_validation=(publication.structured_output_validation),
                 )
             )
+            if (
+                _pending_round.assistant_publication is not None
+                and _pending_round.assistant_publication.argument_continuity is not None
+                and not self.session_store.supports_private_argument_continuity
+            ):
+                raise RuntimeError("Session store does not support private argument continuity.")
         target_checkpoint = (
             {}
             if target_checkpoint is None

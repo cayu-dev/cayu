@@ -1,0 +1,14 @@
+{
+  "measurement": "local provider-free overlay microbenchmark",
+  "python": "3.11.15",
+  "iterations": 200,
+  "warmup_iterations": 20,
+  "scope": "Includes a copied bounded read, validation and overlay; excludes database latency, fixture construction and other runtime work. Allocation peak is measured separately from timing. No model-quality claim or pass/fail latency threshold.",
+  "cases": [
+    {"case": "disabled_10000_messages", "median_us": 0.25, "p95_us": 0.29, "peak_allocated_bytes": 712, "reads_per_step": 0, "retained_bytes": 0},
+    {"case": "enabled_no_calls_10000_messages", "median_us": 279.35, "p95_us": 373.46, "peak_allocated_bytes": 712, "reads_per_step": 0, "retained_bytes": 0},
+    {"case": "one_record", "median_us": 636.73, "p95_us": 707.79, "peak_allocated_bytes": 8773, "reads_per_step": 1, "retained_bytes": 2868},
+    {"case": "one_record_10000_messages", "median_us": 1135.48, "p95_us": 1393.88, "peak_allocated_bytes": 91062, "reads_per_step": 1, "retained_bytes": 2868},
+    {"case": "full_cache_10000_messages", "median_us": 12578.94, "p95_us": 13103.21, "peak_allocated_bytes": 109708, "reads_per_step": 1, "retained_bytes": 69769}
+  ]
+}

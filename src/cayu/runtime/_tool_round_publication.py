@@ -590,6 +590,12 @@ def _build_tool_round_publication_request(
         mutation=mutation,
         transcript_messages=transcript_messages,
         events=(),
+        argument_continuity=(
+            copied_pending_round.assistant_publication.argument_continuity
+            if copied_pending_round.assistant_publication is not None
+            and copied_pending_round.assistant_publication.state == "ready"
+            else None
+        ),
         referenced_events=tuple(
             runtime_publication_event_reference(event) for event in evidence.lifecycle_events
         ),
@@ -694,6 +700,8 @@ def _validate_extended_request(
         raise ValueError("Tool-round extension cannot replace the publication kind.")
     if extended_request.interaction_id != ordinary_request.interaction_id:
         raise ValueError("Tool-round extension cannot replace the interaction identity.")
+    if extended_request.argument_continuity != ordinary_request.argument_continuity:
+        raise ValueError("Tool-round extension cannot replace private argument continuity.")
     if not _durable_json_equal(
         extended_request.mutation.model_dump(mode="json"),
         ordinary_request.mutation.model_dump(mode="json"),
@@ -841,6 +849,7 @@ def _copy_publication_request(
         events=request.events,
         operation_record_mutations=request.operation_record_mutations,
         referenced_events=request.referenced_events,
+        argument_continuity=request.argument_continuity,
     )
 
 

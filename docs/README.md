@@ -23,6 +23,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Memory foundation](memory-foundation.md)
 - [Search when automatic recall is insufficient](knowledge-search-fallback.md)
 - [Opt-in knowledge offers](knowledge-offers.md)
+- [Private tool-argument continuity](private-argument-continuity.md)
 - [Model catalog](model-catalog.md)
 - [Operation outcomes](operation-outcomes.md)
 - [Named checks](named-checks.md)

@@ -764,6 +764,10 @@ class RememberKnowledgeTool(Tool):
 
         return False
 
+    @property
+    def retain_arguments_for_model(self) -> bool:
+        return True
+
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(

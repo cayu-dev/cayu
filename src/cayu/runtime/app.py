@@ -8418,6 +8418,7 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         parallel_safe=tool.parallel_safe,
         effect=tool.effect,
         publish_arguments=tool.publish_arguments,
+        retain_arguments_for_model=tool.retain_arguments_for_model,
         workspace_mutation=tool.workspace_mutation,
         execution_contract=copy_json_value(
             tool.execution_contract,
@@ -8708,6 +8709,9 @@ def _validate_registered_tool(
     if type(schema) is not dict:
         raise TypeError(f"{type(tool).__name__}.schema must return a JSON Schema object.")
     publish_arguments = tool._publish_arguments
+    retain_arguments_for_model = tool.retain_arguments_for_model
+    if type(retain_arguments_for_model) is not bool:
+        raise TypeError("Tool model argument retention policy must be a bool.")
     if type(publish_arguments) is not bool:
         raise TypeError(f"{type(tool).__name__} argument publication policy must be a bool.")
     validated_spec = ToolSpec(
@@ -8749,6 +8753,7 @@ def _validate_registered_tool(
         parallel_safe=validated_spec.parallel_safe,
         effect=validated_spec.effect,
         publish_arguments=publish_arguments,
+        retain_arguments_for_model=retain_arguments_for_model,
         workspace_mutation=validated_spec.workspace_mutation,
         execution_contract=execution_contract,
         execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(

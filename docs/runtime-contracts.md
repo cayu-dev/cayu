@@ -13808,7 +13808,7 @@ activation receipt and durable revision material is not accepted as a curator ou
 `remember_knowledge` also disables terminal argument publication. Its raw
 knowledge arguments and stored entry metadata remain in the private
 invocation/store boundary; approval and terminal events, pending-action views,
-policy and hook decisions, and the durable provider-facing tool-call projection
+policy and hook decisions, and the durable public tool-call projection
 retain only fixed or bounded operational classifications. Argument-derived
 policy reasons, metadata, hook results, hook diagnostics, and hook actions are
 quarantined rather than treated as safe merely because normal secret redaction
@@ -13816,6 +13816,16 @@ did not recognize the knowledge content. Approval checkpoints carry required,
 explicit two-state publication authority. Checkpoints without that field fail
 closed as invalid across this prerelease contract boundary; public approval
 events never supply executable checkpoint authority.
+
+Audit exclusion is independent of model continuity. `remember_knowledge` enables
+bounded `Tool.retain_arguments_for_model` retention of redacted original inputs.
+After context selection, the same authorized execution profile can receive those
+inputs without changing the public transcript, events or exports. This does not
+read or activate knowledge, preserve hook-enriched effective arguments, or change
+the authentic outcome of a failed or pending write. Native stores commit the
+private record atomically with tool-round publication; forks and changed authority
+do not inherit it. See [private argument continuity](private-argument-continuity.md)
+for limits, lifecycle behavior and targeted-gateway exclusions.
 
 Filters are retrieval hints, not an authorization boundary. Production apps
 should attach a store already scoped to the active tenant/user/project, or
