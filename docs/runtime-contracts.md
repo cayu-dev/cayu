@@ -1164,6 +1164,15 @@ Receipt-manifest artifact writes use the same 30-second owned-operation ceiling.
 
 Each workspace mutation window also owns a versioned `workspace_observations` checkpoint record. Its first transition stamps the current root checkpoint schema in the same atomic publication, and ordinary `SessionStore.checkpoint(...)` or generic transform callbacks cannot replace or delete the runtime-owned observation root; only the scoped recovery path may advance it outside a typed publication. Its immutable authority tuple binds the session and source run epoch, binding generation, workspace and observer identities, artifact-store identity, model step and attempt, tool round and call, and stable window ID. Before the initial intent is persisted, configured workspace, artifact-store, and extension-observer identities cross a private secret-admission boundary. Dynamic environments retain configurable identities only as field- and session-scoped keyed aliases because their complete invocation secret set is not yet available; exact built-in observer identities carry an explicit `runtime_builtin` provenance discriminator rather than being reclassified from string equality. Fresh-process recovery requires that discriminator to match the current binding's exact built-in type, while configured extensions cannot inherit it by using the same class name. An unmaterialized factory registration is not evidence about its previous concrete workspace or binding: recovery authenticates the retained session/profile/tool-round tuple, does not call the factory or any observation extension merely to reconstruct evidence, and closes the lifecycle with bounded incomplete or ambiguous evidence when the historical authority is unavailable. Persistent stores therefore require the same public-authority alias keyring used by all workers before a dynamic workspace-mutation intent can be admitted. Compare-and-set `workspace-observation` publications advance that record through intent, before capture, durably staged tool outcome, after capture, delta/artifact publication, and terminal removal. Every phase has a stable publication ID and the store checks the current run epoch and prior root digest atomically, so acknowledgement replay converges and a stale worker cannot publish for a replacement run or binding. A malformed or lost acknowledgement is reconciled only through the immutable exact receipt and retained request; caller cancellation is preserved across committed-result validation and persisted-event fan-out, so it cannot turn a committed transition into missing public evidence. If both the initial publication and reconciliation fail, their ordered original exceptions remain attached exactly once to the authoritative cancellation or failure. The authoritative tool terminal event is content-bound independently of its mutable capture-status fields: revision failure never erases or changes the tool outcome, and observation recovery never reruns the tool, runner command, provider request, hook, or other external effect.
 
+An external tool whose overall outcome remains unknown can still have a positively
+settled workspace mutation. Its observation lifecycle binds the exact durable
+`tool.effect.outcome_unknown` event as its content-bound outcome evidence, instead
+of inventing a terminal tool result. Workspace capture and finalization retain
+their existing settlement, redaction, and attribution requirements. Recovery can
+finalize a retained complete workspace delta without changing the unknown effect,
+re-executing the tool, or retiring its pending round. Capture-failure details belong
+to `workspace.observation.finalized` when there is no terminal tool event.
+
 Tool-terminal publication timing and pending-round retirement wait until all workspace observations have settled durably. If cancellation interrupts observation publication, Cayu retains the original content-bound stage and its pending round for recovery; it does not retimestamp the stage or remove the round after publishing only the delta. The interaction may pause for tool recovery while the session records interruption. Caller cancellation and supervisory signals still propagate. Recovery settles observation evidence before publishing the tool terminal and retiring the round, without replaying the mutation.
 
 Fresh-process incomplete-session recovery closes every surviving observation record before ordinary tool-round repair. Intent or before-only records become `workspace.observation.finalized` with `ambiguous`; a durable tool outcome without complete after/delta evidence becomes `incomplete`; a complete durable delta is verified and finalized without observing the current workspace or assigning later changes to the original tool. A terminal recovery event without a verified mutation receipt carries explicit `external_or_unknown` (or `concurrent_ambiguity` for an ambiguous lifecycle) attribution with unknown isolation and no direct-operation claim. When an unmaterialized factory leaves the historical concrete observation authority unavailable, even complete retained delta evidence is finalized as incomplete rather than being upgraded through a replacement environment. The recovery action is `repaired_workspace_observation`. Competing workers use the session recovery claim plus run-epoch/CAS transitions and therefore converge on one terminal event. Missing or conflicting content-bound tool evidence fails closed as ambiguous rather than authorizing reconstructed causality.
@@ -2264,7 +2273,7 @@ Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positi
 
 `ToolSpec.max_terminal_payload_bytes` is an optional immutable declaration of
 the largest durable result payload a tool may produce. It participates in the
-catalogue and execution-profile identity. For a deferred multi-call round,
+catalogue and execution-profile identity. For a deferred round,
 Cayu reserves the sum of those result declarations, published model-argument
 sizes, and fixed runtime-envelope headroom before dispatching any tool effect.
 A round whose hooks may modify published arguments receives an exclusive lease
@@ -2274,6 +2283,18 @@ whose complete declaration exceeds that domain, receives an exclusive oversize
 lease. The lease remains owned until every durable staged terminal has been
 published. This whole-round admission prevents sibling results from deadlocking
 after their effects have executed.
+
+Related rounds use the same capacity family, identified from their durable
+invocation root after validating the current session incarnation and run epoch.
+An inline subagent therefore does not wait behind its parent's exclusive lease.
+Each round retains its own payload declaration and release ownership; releasing
+the parent does not release an active child's reservation or vice versa.
+Bounded declarations aggregate across the family and unrelated families. If a
+related round cannot fit, or needs exclusivity while another family is active,
+admission fails before that round dispatches tools instead of waiting on its
+parent. An already exclusive family permits its related rounds to enter ahead
+of unrelated waiters; unrelated families remain excluded until that ownership
+has drained. Caller-supplied parent metadata does not establish this grouping.
 
 A tool that exceeds its declaration receives one bounded authoritative
 `invalid_tool_output` failure; Cayu does not truncate a successful result or
@@ -7199,9 +7220,16 @@ report = await runtime_evidence(
 ```
 
 `RuntimeEvidenceReport.schema_version` is
-`RUNTIME_EVIDENCE_SCHEMA_VERSION == 4`. Version 4 adds the versioned
-`MemoryAttribution` section to each session; older report shapes are not inferred or
-migrated. Sessions are ordered parent before child,
+`RUNTIME_EVIDENCE_SCHEMA_VERSION == 5`. Version 5 adds an optional typed
+`receipt_evidence` envelope to receipt summaries: validated receipt schema and
+identity, outcome, source, observation time, digest, and bounded allowlisted
+integrity/resource versions. It excludes receipt messages, structured tool results
+and raw external responses. Malformed or conflicting envelopes produce a fixed
+`malformed_receipt` warning and cannot replace previously accepted receipt evidence.
+Identically shaped values inside tool-result content do not supply this envelope.
+The digest identifies the validated redacted receipt, not universal authenticity
+or permission to retry. The versioned `MemoryAttribution` section remains present;
+older report shapes are not inferred or migrated. Sessions are ordered parent before child,
 then by durable creation time and session id. The scope records the exact
 descendant ids and, when requested, causal-budget ids. Session records retain
 only structural identity, terminal state, last durable event cursor, origin
@@ -10958,6 +10986,16 @@ Both cleanup fields accept the same three modes:
 - `"none"`: do not try to stop the command or sandbox. Cayu records a skipped cleanup diagnostic and leaves the runner reusable for ordinary cancellations where command state is already known. If command submission may have succeeded but start acknowledgement never arrived, the runner exec path remains closed because Cayu cannot prove that no late command is still running. This is for callers that own cleanup outside Cayu.
 
 If cleanup fails or times out, Cayu includes a structured `cayu.runner_cleanup.v1` artifact with adapter, action, status, timeout, and error details when available.
+
+When an interrupted tool round retains unresolved external effects, cleanup
+artifacts are published separately as `tool.effect.cleanup.observed`, not as a
+fabricated tool terminal result. Positively attributed diagnostics name their
+tool call; unscoped diagnostics remain round-scoped. The event retains a bounded,
+redacted artifact prefix and a `truncated` marker. Its content-bound identity
+includes the complete redacted report before truncation, so different omitted
+details do not collapse into one replay. Repeated publication reuses the first
+committed timestamp only when all other event material matches. This diagnostic
+does not settle an effect, close the pending round, or authorize another dispatch.
 
 Microsandbox sandbox cleanup preserves its remote kill artifact when owned transport
 finalization also fails. A following `close_transports` failure artifact reports

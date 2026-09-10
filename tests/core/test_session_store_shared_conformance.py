@@ -1566,6 +1566,17 @@ class _WorkspaceObservationProcessLossStoreMixin:
             session_id,
             checkpoint_transform,
         )
+        await self._fail_after_workspace_terminal_stage(session_id)
+        return result
+
+    async def publish_session_operation(self, session_id: str, **kwargs):
+        result = await cast("Any", super()).publish_session_operation(session_id, **kwargs)
+        # External-effect selection and its staged terminal share this atomic
+        # operation; they no longer pass through transform_checkpoint.
+        await self._fail_after_workspace_terminal_stage(session_id)
+        return result
+
+    async def _fail_after_workspace_terminal_stage(self, session_id: str) -> None:
         if (
             self._workspace_observation_crash_phase == "terminal-stage"
             and not self._workspace_observation_process_lost
@@ -1582,7 +1593,6 @@ class _WorkspaceObservationProcessLossStoreMixin:
             ):
                 self._workspace_observation_process_lost = True
                 raise _SimulatedProcessLoss(self._workspace_observation_crash_phase)
-        return result
 
 
 class _WorkspaceObservationProcessLossInMemorySessionStore(

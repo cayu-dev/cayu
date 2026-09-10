@@ -93,7 +93,12 @@ continuation context and ignores the denied analysis. Both child sessions remain
 durable and auditable; this is selection, not deletion or a runtime-level branch
 commit. Cayu then rejects stale external state, revalidates the actual state,
 and performs exactly one mutation. The example reconstructs `CayuApp` around the
-same store and recovers the external receipt without replaying the side effect.
+same store and reconciles the external receipt through the public
+`reconcile_tool_effect` protocol without replaying the side effect. A separate
+downstream SQLite fixture owns the mutation and receipt; its registered validator
+checks the exact logical call. Real SIGKILL tests reuse that adapter across five
+crash windows for ordinary and approval-gated calls. This demonstrates recovery
+with authoritative downstream evidence, not universal exactly-once execution.
 
 The product improvement is useful computation during human latency while
 approval semantics remain unchanged. The current evidence proves authority and

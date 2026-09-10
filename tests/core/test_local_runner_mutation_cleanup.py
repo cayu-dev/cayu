@@ -21,6 +21,7 @@ from cayu import (
     LocalWorkspace,
     Message,
     ModelStreamEvent,
+    ResumeRequest,
     RunRequest,
     ScriptedModelProvider,
     Tool,
@@ -201,6 +202,8 @@ def test_native_local_runner_cleanup_preserves_mutation_authority(tmp_path, mode
                         release_kill.set()
                     with pytest.raises(asyncio.CancelledError):
                         await task
+                    assert task.cancelled()
+                    assert task.cancelling() == (2 if mode == "repeat_cancel" else 1)
                 else:
                     await task
             pid = int((tmp_path / "child.pid").read_text())
@@ -218,6 +221,51 @@ def test_native_local_runner_cleanup_preserves_mutation_authority(tmp_path, mode
                     "tool.call.failed",
                 }
             ]
+            if cancelled:
+                # Caller cancellation cannot turn an externally dispatched
+                # mutation into a synthetic terminal result, even after the
+                # runner proves its local child has stopped.
+                assert terminals == []
+                unknown = [
+                    event for event in events if str(event.type) == "tool.effect.outcome_unknown"
+                ]
+                assert len(unknown) == 1
+                assert unknown[0].payload["state"] == "outcome_unknown"
+                assert "result" not in unknown[0].payload
+                checkpoint = await store.load_checkpoint("cleanup-test")
+                assert checkpoint is not None and "pending_tool_round" in checkpoint
+                assert probe.result is None
+                assert probe.cancellation_artifacts[0]["status"] == (
+                    "failed" if uncertain else "completed"
+                )
+                if uncertain:
+                    assert probe.cleanup_error is not None
+                    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+                        await runner.exec(ExecCommand.process(sys.executable, "-c", "pass"))
+                else:
+                    assert probe.cleanup_error is None
+                    resumed = [
+                        event
+                        async for event in app.resume(
+                            ResumeRequest(
+                                session_id="cleanup-test",
+                                messages=[Message.text("user", "Continue after cleanup")],
+                            )
+                        )
+                    ]
+                    assert str(resumed[-1].type) == "session.interrupted"
+                    durable = await store.load_events("cleanup-test")
+                    for kind in (
+                        "tool.call.started",
+                        "tool.effect.outcome_unknown",
+                        "model.started",
+                    ):
+                        assert sum(str(event.type) == kind for event in durable) == 1
+                    assert not any(
+                        str(event.type) in {"tool.call.completed", "tool.call.failed"}
+                        for event in durable
+                    )
+                return
             assert len(terminals) == 1
             terminal = terminals[0]
             if uncertain:
@@ -227,12 +275,10 @@ def test_native_local_runner_cleanup_preserves_mutation_authority(tmp_path, mode
                     == "mutation_settlement_unproven"
                 )
                 assert probe.cleanup_error is not None
-                artifacts = probe.cancellation_artifacts if cancelled else probe.result.artifacts
-                assert artifacts[0]["status"] == "failed"
+                assert probe.result.artifacts[0]["status"] == "failed"
                 with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
                     await runner.exec(ExecCommand.process(sys.executable, "-c", "pass"))
-                if not cancelled:
-                    assert any(str(event.type) == "session.failed" for event in events)
+                assert any(str(event.type) == "session.failed" for event in events)
                 return
             assert (
                 terminal.payload.get("workspace_mutation_capture_detail_code")
@@ -240,23 +286,18 @@ def test_native_local_runner_cleanup_preserves_mutation_authority(tmp_path, mode
             )
             assert terminal.payload["workspace_mutation_capture_status"] == "recorded"
             assert not any(str(event.type) == "session.failed" for event in events)
-            if cancelled:
-                assert str(terminal.type) == "tool.call.failed"
-                assert probe.result is None
-                assert probe.cancellation_artifacts[0]["status"] == "completed"
-            else:
-                assert probe.result is not None
-                assert probe.result.timed_out is (mode == "timeout")
-                assert probe.result.exit_code == (
-                    0 if mode == "success" else 7 if mode == "nonzero" else -9
-                )
-                assert str(terminal.type) == (
-                    "tool.call.completed" if mode == "success" else "tool.call.failed"
-                )
-                assert terminal.payload["result"]["is_error"] is (mode != "success")
-                if mode == "timeout":
-                    assert probe.result.artifacts[0]["status"] == "completed"
-                    assert terminal.payload["result"]["artifacts"] == probe.result.artifacts
+            assert probe.result is not None
+            assert probe.result.timed_out is (mode == "timeout")
+            assert probe.result.exit_code == (
+                0 if mode == "success" else 7 if mode == "nonzero" else -9
+            )
+            assert str(terminal.type) == (
+                "tool.call.completed" if mode == "success" else "tool.call.failed"
+            )
+            assert terminal.payload["result"]["is_error"] is (mode != "success")
+            if mode == "timeout":
+                assert probe.result.artifacts[0]["status"] == "completed"
+                assert terminal.payload["result"]["artifacts"] == probe.result.artifacts
 
         finally:
             release_kill.set()

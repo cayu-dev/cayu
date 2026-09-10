@@ -18,6 +18,9 @@ from tests.core.test_session_store_shared_conformance import (
 )
 
 from cayu import EventType, PostgresSessionStore, SessionStatus, SQLiteSessionStore
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
@@ -96,19 +99,40 @@ def test_process_control_settles_current_round_then_fresh_resume(
                 try:
                     events = await store.load_events("process-safe-steering")
                     assert sum(e.type is EventType.TOOL_CALL_STARTED for e in events) == 1
-                    failed = [e for e in events if e.type is EventType.TOOL_CALL_FAILED]
-                    assert len(failed) == 1
-                    assert failed[0].payload["result"]["structured"]["outcome_unknown"] is True
-                    assert failed[0].payload["recovered"] is True
+                    unknown = [e for e in events if e.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN]
+                    assert len(unknown) == 1
+                    session = await store.load("process-safe-steering")
+                    assert session is not None and session.status is SessionStatus.INTERRUPTED
+                    checkpoint_store = runtime_checkpoint_session_store(store)
+                    pending = pending_tool_round_from_checkpoint(
+                        await checkpoint_store.load_checkpoint(session.id)
+                    )
+                    assert pending is not None and not pending.staged_terminals
+                    record = await ToolEffectStateOwner(checkpoint_store).resolve_call(
+                        session,
+                        tool_round_id=pending.tool_round_id,
+                        tool_call_id="current-tool",
+                    )
+                    assert record is not None and record.state == "outcome_unknown"
+                    assert record.terminal is None
+                    assert unknown[0].payload["dispatch_id"] == record.dispatch_id
                     assert not any(
                         e.type
-                        in {EventType.TOOL_CALL_COMPLETED, EventType.SESSION_MESSAGE_DELIVERED}
+                        in {
+                            EventType.TOOL_CALL_COMPLETED,
+                            EventType.TOOL_CALL_FAILED,
+                            EventType.SESSION_MESSAGE_DELIVERED,
+                        }
                         for e in events
                     )
+                    return record
                 finally:
                     await store.close()
 
-            asyncio.run(inspect_unknown())
+            retained = asyncio.run(inspect_unknown())
+            resumed = subprocess.run(command("resume"), env=env, capture_output=True, timeout=40)
+            assert resumed.returncode == 0, resumed.stderr.decode()
+            assert asyncio.run(inspect_unknown()) == retained
             assert (tmp_path / "provider-calls").read_text().splitlines() == ["dispatch"]
             assert not (tmp_path / "tool-effects").exists()
             return

@@ -176,9 +176,30 @@ def test_worker_settles_expired_applied_rejection_without_successor(
                 application_idempotency_key=application.idempotency_key,
                 stop_reason="work_contract_elapsed_limit",
             )
-            assert not predecessor.run_semantics.deadline.expired
-            with pytest.raises(WorkAttemptAdmissionConflict):
-                await original_settle(tasks, expected_stop)
+            # The negative probe must observe unexpired authority *inside* the
+            # transaction. A wall-clock assertion before awaited PostgreSQL locks
+            # races expiry and can legitimately allow the settlement instead.
+            from cayu.runtime import _work_attempt_lifecycle_policy as lifecycle_policy
+            from cayu.storage import _postgres_verified_work, sqlite
+
+            original_plan = lifecycle_policy.plan_work_attempt_lifecycle_settlement
+            probe_observed = False
+
+            def unexpired_plan(request, **values):
+                nonlocal probe_observed
+                assert request == expected_stop
+                probe_observed = True
+                values["now"] = predecessor.run_semantics.deadline_expires_at - timedelta(seconds=1)
+                return original_plan(request, **values)
+
+            with monkeypatch.context() as clock_patch:
+                for owner in (lifecycle_policy, sqlite, _postgres_verified_work):
+                    clock_patch.setattr(
+                        owner, "plan_work_attempt_lifecycle_settlement", unexpired_plan
+                    )
+                with pytest.raises(WorkAttemptAdmissionConflict):
+                    await original_settle(tasks, expected_stop)
+            assert probe_observed
             assert await tasks.load_task(predecessor.task_id) == application.task
             if restart:
                 raise ConnectionError("restart before successor admission")

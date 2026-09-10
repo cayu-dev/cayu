@@ -2591,7 +2591,9 @@ def test_approval_close_cancellation_materializes_deferred_input_before_propagat
             ]
 
         resolution_task = asyncio.create_task(resolve())
-        await asyncio.wait_for(store.close_committed.wait(), timeout=5)
+        # This is setup for cancellation at the committed-close barrier, not
+        # a five-second approval-throughput contract under parallel CI load.
+        await asyncio.wait_for(store.close_committed.wait(), timeout=30)
         assert resolution_task.cancelling() == 0
         resolution_task.cancel("cancel after approval close commit")
         assert resolution_task.cancelling() == 1

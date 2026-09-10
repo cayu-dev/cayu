@@ -29770,8 +29770,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     ) -> None:
         """Append events and their delivery outbox rows in the caller's transaction."""
 
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
-
         # Serialize with every competing session writer before sampling the
         # liveness timestamp. Sampling database time before this row lock can
         # backdate activity by the duration of a blocked write and let recovery
@@ -29804,10 +29802,25 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if not events:
             return
 
+        await self._insert_event_rows_with_cursor(
+            cur, session_id, events, next_order=order_row[0] - len(events), activity_at=activity_at
+        )
+
+    async def _insert_event_rows_with_cursor(
+        self,
+        cur: Any,
+        session_id: str,
+        events: Sequence[Event],
+        *,
+        next_order: int,
+        activity_at: datetime,
+    ) -> None:
+        """Insert prepared events after their transaction owner assigns order."""
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
         copied_events = list(events)
         await self._register_event_public_authorities(cur, session_id, copied_events)
         await self._publish_budget_reservation_identities(cur, copied_events)
-        next_order = order_row[0] - len(copied_events)
         rows = []
         for event in copied_events:
             next_order += 1
@@ -29956,6 +29969,62 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     ) from exc
                 raise
             except Exception:
+                await conn.rollback()
+                raise
+
+    async def append_tool_effect_conflict(self, request: object) -> Event:
+        from cayu.runtime._tool_effect_conflicts import (
+            copy_tool_effect_conflict_audit,
+            reconcile_tool_effect_conflict_event,
+        )
+
+        audit = copy_tool_effect_conflict_audit(request)
+        session_id = audit.executing.intent.session_id
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    session = await self._load_for_update(cur, session_id)
+                    if session is None:
+                        raise KeyError("Tool effect audit session is unavailable.")
+                    await cur.execute(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, audit.storage_key),
+                    )
+                    row = await cur.fetchone()
+                    current = None if row is None else _json_obj(row[0])
+                    event = audit.prepare_event(
+                        session, current, now=await self._session_store_now(cur)
+                    )
+                    await cur.execute(
+                        "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                        (session_id, event.id),
+                    )
+                    existing = await cur.fetchone()
+                    if existing is not None:
+                        event = reconcile_tool_effect_conflict_event(
+                            event, Event(**_json_obj(existing[0]))
+                        )
+                    else:
+                        await cur.execute(
+                            "UPDATE cayu_sessions SET event_seq = event_seq + 1 "
+                            "WHERE id = %s RETURNING event_seq",
+                            (session_id,),
+                        )
+                        order_row = await cur.fetchone()
+                        if order_row is None:
+                            raise KeyError("Tool effect audit session is unavailable.")
+                        await self._insert_event_rows_with_cursor(
+                            cur,
+                            session_id,
+                            [event],
+                            next_order=order_row[0] - 1,
+                            activity_at=event.timestamp,
+                        )
+                await conn.commit()
+                return event
+            except BaseException:
                 await conn.rollback()
                 raise
 

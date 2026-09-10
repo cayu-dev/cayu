@@ -11,8 +11,10 @@ from cayu import ApplyPatchTool
 from cayu.core import AgentSpec, Event, EventType, Message, ToolCallPart, ToolResultPart
 from cayu.core.tools import (
     DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
 )
@@ -28,6 +30,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
 from cayu.runtime.execution_units import ToolRoundIdentity
 
 
@@ -67,6 +70,10 @@ class _RecordingTool(Tool):
 
 
 class _DurableRecoveryRecordingTool(_RecordingTool):
+    # This test double only records values in a process-local list. Its recovery
+    # authority contract does not require a durable external-effect intent.
+    spec = _RecordingTool.spec.model_copy(update={"effect": ToolEffect.NONE})
+
     def __init__(self) -> None:
         super().__init__()
         self.recovery_calls: list[dict[str, Any]] = []
@@ -88,7 +95,7 @@ class _DurableRecoveryRecordingTool(_RecordingTool):
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
         recovery_authority: Any = None,
-    ) -> ToolResult | None:
+    ) -> DurableToolRecoveryEvidence | None:
         assert await load_operation("missing-browser-operation") is None
         self.recovery_calls.append(
             {
@@ -107,9 +114,9 @@ class _DurableRecoveryRecordingTool(_RecordingTool):
                 "recovery_authority": recovery_authority,
             }
         )
-        return ToolResult(
-            content="Recovered from durable evidence.",
-            structured={"recovered": True},
+        return DurableToolRecoveryEvidence(
+            "confirmed",
+            ToolResult(content="Recovered from durable evidence.", structured={"recovered": True}),
         )
 
 
@@ -777,7 +784,7 @@ def test_pending_round_recovery_supplies_bounded_durable_tool_authority() -> Non
     asyncio.run(scenario())
 
 
-def test_pending_round_recovery_calls_apply_patch_with_runtime_authority() -> None:
+def test_pending_round_recovery_fences_apply_patch_without_effect_identity() -> None:
     async def scenario() -> None:
         session_id = "sess_apply_patch_durable_recovery"
         identity = _tool_round_identity("e")
@@ -876,32 +883,36 @@ def test_pending_round_recovery_calls_apply_patch_with_runtime_authority() -> No
         )
         assert claim is not None
 
+        events_before = await store.load_events(session_id)
         try:
-            recovered_events = [
-                event
-                async for event in app._recovery_coordinator.recover_pending_tool_round(
+            with pytest.raises(ToolEffectReconciliationRequired):
+                async for _event in app._recovery_coordinator.recover_pending_tool_round(
                     session=claim.session,
                     registered_agent=app._get_registered_agent("assistant"),
                     registered_environment=None,
                     messages=messages,
                     incomplete_recovery_claimed=True,
-                )
-            ]
+                ):
+                    pass
         finally:
             await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
                 authority=claim.require_authority(),
                 authoritative_failure=None,
             )
 
-        assert all(isinstance(event, Event) for event in recovered_events)
+        assert await store.load_events(session_id) == events_before
+        retained = tool_round_recovery.pending_tool_round_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert retained is not None
+        assert retained.tool_round_id == identity.tool_round_id
         result_parts = [
             part
             for message in await store.load_transcript(session_id)
             for part in message.content
             if isinstance(part, ToolResultPart)
         ]
-        assert len(result_parts) == 1
-        assert result_parts[0].tool_name == "apply_patch"
+        assert result_parts == []
 
     asyncio.run(scenario())
 

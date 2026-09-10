@@ -57,6 +57,7 @@ from cayu.browser_profiles import (
 from cayu.browser_recording import BrowserRecordingConfig
 from cayu.core.tools import (
     DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
     Tool,
     ToolContext,
     ToolEffect,
@@ -2706,7 +2707,7 @@ class BrowserSessionTool(Tool):
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
         recovery_authority: DurableToolRecoveryAuthority | None = None,
-    ) -> ToolResult | None:
+    ) -> DurableToolRecoveryEvidence | None:
         """Reconcile browser evidence without dispatching or replaying an action."""
 
         del started, recovery_authority
@@ -2718,12 +2719,16 @@ class BrowserSessionTool(Tool):
                 max_upload_files=self.max_upload_files,
             )
         except (TypeError, ValueError):
-            return _error_result("authority_expired", dispatch="not_started")
+            return DurableToolRecoveryEvidence(
+                "unresolved", _error_result("authority_expired", dispatch="not_started")
+            )
         operation_id = request.get("operation_id")
         if type(operation_id) is not str:
             return None
         if execution_profile_fingerprint is None:
-            return _error_result("incompatible_profile", dispatch="not_started")
+            return DurableToolRecoveryEvidence(
+                "unresolved", _error_result("incompatible_profile", dispatch="not_started")
+            )
         locator_key = _durable_browser_operation_locator_key(
             parent_session_id=parent_session_id,
             parent_run_epoch=parent_run_epoch,
@@ -2737,14 +2742,18 @@ class BrowserSessionTool(Tool):
         locator: dict[str, Any] | None = None
         if raw_locator is not None:
             if type(raw_locator) is not dict:
-                return _error_result("authority_expired", dispatch="not_started")
+                return DurableToolRecoveryEvidence(
+                    "unresolved", _error_result("authority_expired", dispatch="not_started")
+                )
             try:
                 locator = copy_durable_json_object(
                     raw_locator,
                     "browser_operation_locator_recovery",
                 )
             except (TypeError, ValueError):
-                return _error_result("authority_expired", dispatch="not_started")
+                return DurableToolRecoveryEvidence(
+                    "unresolved", _error_result("authority_expired", dispatch="not_started")
+                )
             expected_locator = {
                 "record_type": _DURABLE_BROWSER_OPERATION_LOCATOR_RECORD_TYPE,
                 "schema_version": 1,
@@ -2776,18 +2785,26 @@ class BrowserSessionTool(Tool):
                 )
             ):
                 if locator.get("execution_profile_fingerprint") != execution_profile_fingerprint:
-                    return _error_result("incompatible_profile", dispatch="not_started")
-                return _error_result("authority_expired", dispatch="not_started")
+                    return DurableToolRecoveryEvidence(
+                        "unresolved", _error_result("incompatible_profile", dispatch="not_started")
+                    )
+                return DurableToolRecoveryEvidence(
+                    "unresolved", _error_result("authority_expired", dispatch="not_started")
+                )
         else:
             operation_storage_key = _durable_browser_operation_key(operation_id)
         record = await load_operation(operation_storage_key)
         if record is None:
             if environment_allocation_fingerprint is None:
-                return _error_result("restoration_required", dispatch="not_started")
+                return DurableToolRecoveryEvidence(
+                    "unresolved", _error_result("restoration_required", dispatch="not_started")
+                )
             return None
         if locator is None:
             if type(environment_allocation_fingerprint) is not str:
-                return _error_result("restoration_required", dispatch="not_started")
+                return DurableToolRecoveryEvidence(
+                    "unresolved", _error_result("restoration_required", dispatch="not_started")
+                )
             operation_id_sha256 = _browser_operation_id_sha256(operation_id)
             operation_fingerprint = _request_fingerprint(request)
             operation = request["operation"]
@@ -2840,12 +2857,18 @@ class BrowserSessionTool(Tool):
                 type(record) is dict
                 and record.get("execution_profile_fingerprint") != execution_profile_fingerprint
             ):
-                return _error_result("incompatible_profile", dispatch="not_started")
-            return _error_result("authority_expired", dispatch="not_started")
+                return DurableToolRecoveryEvidence(
+                    "unresolved", _error_result("incompatible_profile", dispatch="not_started")
+                )
+            return DurableToolRecoveryEvidence(
+                "unresolved", _error_result("authority_expired", dispatch="not_started")
+            )
         copied, terminal_result = validated
         state = copied.get("state")
         if state == "intent":
-            return _error_result("operation_not_dispatched", dispatch="not_started")
+            return DurableToolRecoveryEvidence(
+                "not_started", _error_result("operation_not_dispatched", dispatch="not_started")
+            )
         if state == "dispatched":
             result = _error_result(
                 "outcome_ambiguous",
@@ -2859,10 +2882,22 @@ class BrowserSessionTool(Tool):
                     "page_id": copied.get("page_id"),
                 }
             )
-            return result.model_copy(update={"structured": structured}, deep=True)
+            return DurableToolRecoveryEvidence(
+                "unresolved", result.model_copy(update={"structured": structured}, deep=True)
+            )
         if state != "terminal" or terminal_result is None:
-            return _error_result("authority_expired", dispatch="not_started")
-        return terminal_result
+            return DurableToolRecoveryEvidence(
+                "unresolved", _error_result("authority_expired", dispatch="not_started")
+            )
+        execution = (terminal_result.structured or {}).get("execution")
+        confirmed = (
+            isinstance(execution, Mapping)
+            and execution.get("terminal") == "settled"
+            and execution.get("dispatch") in {"completed", "not_started"}
+        )
+        return DurableToolRecoveryEvidence(
+            "confirmed" if confirmed else "unresolved", terminal_result
+        )
 
     def _reclaim_inactive_parent_state(self) -> None:
         if len(self._states) < self.max_parent_sessions:

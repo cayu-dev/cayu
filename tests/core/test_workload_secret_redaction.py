@@ -2642,7 +2642,7 @@ def test_runtime_fails_closed_when_secret_resolves_after_bounded_runner_completi
     )
     transcript = asyncio.run(store.load_transcript(session_id))
     durable_events = asyncio.run(store.load_events(session_id))
-    failed = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+    unknown = next(event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN)
     runner_events = [
         event
         for event in durable_events
@@ -2653,7 +2653,11 @@ def test_runtime_fails_closed_when_secret_resolves_after_bounded_runner_completi
             [event.model_dump(mode="json") for event in events],
             [event.model_dump(mode="json") for event in durable_events],
             [message.model_dump(mode="json") for message in transcript],
-            [message.model_dump(mode="json") for message in provider.requests[1].messages],
+            [
+                message.model_dump(mode="json")
+                for request in provider.requests
+                for message in request.messages
+            ],
         )
     )
 
@@ -2666,8 +2670,10 @@ def test_runtime_fails_closed_when_secret_resolves_after_bounded_runner_completi
         }
         for event in runner_events
     )
-    assert failed.payload["terminal_outcome"] == "invalid_tool_output"
-    assert failed.payload["result"]["is_error"] is True
+    assert unknown.payload["state"] == "outcome_unknown"
+    assert "result" not in unknown.payload
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    assert len(provider.requests) == 1
     assert "late-registered-" not in rendered
     assert secret not in rendered
 
@@ -2752,15 +2758,26 @@ def test_runtime_runner_failure_omits_opaque_diagnostic_at_every_publication(
         (
             [event.model_dump(mode="json") for event in events],
             [message.model_dump(mode="json") for message in transcript],
-            [message.model_dump(mode="json") for message in provider.requests[1].messages],
+            [
+                message.model_dump(mode="json")
+                for request in provider.requests
+                for message in request.messages
+            ],
         )
     )
 
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    assert len(provider.requests) == 1
     assert failure_message not in rendered
     assert secret[:16] not in rendered
-    assert "Runner command execution failed." in rendered
-    assert "'error': 'runner_execution_failed'" in rendered
-    assert "'error_type': 'RuntimeError'" in rendered
+    completed = next(event for event in events if event.type is EventType.RUNNER_EXEC_COMPLETED)
+    assert completed.payload["error_type"] == "RuntimeError"
+    unknown = next(event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN)
+    assert unknown.payload["failure_evidence"]["classification"] == "failure"
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in events
+    )
 
 
 @pytest.mark.parametrize(
@@ -2776,6 +2793,7 @@ def test_operator_interrupt_runner_cleanup_omits_opaque_diagnostic(
 ) -> None:
     secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
     session_id = f"sess_runner_cleanup_{len(cleanup_message)}"
+    caller_cleanup_artifacts: list[dict] = []
 
     class CleanupFailureRunner(Runner):
         isolation = "microsandbox"
@@ -2819,7 +2837,11 @@ def test_operator_interrupt_runner_cleanup_omits_opaque_diagnostic(
             assert ctx.runner is not None
             assert ctx.vault is not None
             await ctx.vault.resolve(SecretRef(name="api_key"))
-            await ctx.runner.exec(ExecCommand.process("blocked"))
+            try:
+                await ctx.runner.exec(ExecCommand.process("blocked"))
+            except asyncio.CancelledError as exc:
+                caller_cleanup_artifacts.extend(exc.artifacts)
+                raise
             return ToolResult(content="unexpected")
 
     runner = CleanupFailureRunner()
@@ -2891,8 +2913,38 @@ def test_operator_interrupt_runner_cleanup_omits_opaque_diagnostic(
     assert run_events[-1].type is EventType.SESSION_INTERRUPTED
     assert cleanup_message not in rendered
     assert secret[:16] not in rendered
-    assert "'error_type': 'RuntimeError'" in rendered
     assert "'error':" not in rendered
+    # Cleanup diagnostics reach the actual runner caller, not a fabricated
+    # terminal tool result for an external effect whose outcome is unknown.
+    assert caller_cleanup_artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "failed",
+            "timeout_s": 5.0,
+            "error_type": "RuntimeError",
+        }
+    ]
+    completed = [event for event in stored_events if event.type is EventType.RUNNER_EXEC_COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].payload["cancelled"] is True
+    for events in (run_events, stored_events):
+        unknown = [event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN]
+        # Recovery may redeliver the same durable event; it must not create
+        # a second logical unknown outcome. Public linkage can be aliased.
+        assert len({event.id for event in unknown}) == 1
+        assert unknown[0].payload["state"] == "outcome_unknown"
+        assert "result" not in unknown[0].payload
+        assert not any(
+            event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+            for event in events
+        )
+    stored_unknown = [
+        event for event in stored_events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    ]
+    assert len(stored_unknown) == 1
+    assert stored_unknown[0].payload["tool_call_id"] == "call_cancelled_runner"
 
 
 def test_tool_failure_redacts_dynamically_resolved_secret_before_diagnostic_bound() -> None:
@@ -2952,12 +3004,18 @@ def test_tool_failure_redacts_dynamically_resolved_secret_before_diagnostic_boun
             ),
         )
     )
-    failed = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
-    rendered = repr(failed.payload)
+    unknown = next(event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN)
+    durable = asyncio.run(store.load_events("sess_dynamic_failure_boundary"))
+    rendered = repr([event.model_dump(mode="json") for event in [*events, *durable]])
 
     assert secret not in rendered
     assert secret[: len(secret) // 2] not in rendered
-    assert len(failed.payload["result"]["content"].encode("utf-8")) <= (MAX_DIAGNOSTIC_UTF8_BYTES)
+    assert "result" not in unknown.payload
+    assert (
+        len(repr(unknown.payload["failure_evidence"]).encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
+    )
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    assert len(provider.requests) == 1
 
 
 def test_short_secret_in_message_argument_key_fails_closed() -> None:
@@ -4378,14 +4436,20 @@ def test_runtime_sanitizes_grouped_runner_failure_from_real_caller_cancellation(
     assert isinstance(failure.__cause__.exceptions[0], RunnerExecutionError)
     assert [event.type for event in stored_events].count(EventType.SESSION_INTERRUPTED) == 1
     assert all(event.type is not EventType.SESSION_COMPLETED for event in stored_events)
-    interrupted_events = [
+    unknown_events = [
         event
         for event in stored_events
-        if event.type is EventType.TOOL_CALL_FAILED
+        if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
         and event.payload.get("tool_call_id") == "call_grouped_cancellation"
     ]
-    assert len(interrupted_events) == 1
-    assert interrupted_events[0].payload["result"]["artifacts"] == failure.artifacts
+    assert len(unknown_events) == 1
+    assert unknown_events[0].payload["state"] == "outcome_unknown"
+    assert not any(
+        event.type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_COMPLETED}
+        for event in stored_events
+    )
+    checkpoint = asyncio.run(store.load_checkpoint("sess_grouped_runner_cancel"))
+    assert checkpoint is not None and "pending_tool_round" in checkpoint
     rendered = repr(
         (
             failure,
@@ -4414,8 +4478,6 @@ def test_caller_cancellation_cannot_spoof_runtime_cleanup_artifacts() -> None:
 
 
 def test_operator_interrupt_redacts_secret_resolved_during_cancelled_tool() -> None:
-    from cayu.vaults import REDACTED_SECRET
-
     secret_value = "cancelled-tool-dynamic-vault-secret-canary"
 
     class DynamicallySecretTool(Tool):
@@ -4516,7 +4578,16 @@ def test_operator_interrupt_redacts_secret_resolved_during_cancelled_tool() -> N
 
     assert run_events[-1].type is EventType.SESSION_INTERRUPTED
     assert secret_value not in rendered
-    assert REDACTED_SECRET in rendered
+    unknown = [
+        event for event in stored_events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    ]
+    assert len(unknown) == 1
+    assert unknown[0].payload["tool_call_id"] == "call_dynamic_secret_cancel"
+    assert "result" not in unknown[0].payload
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in stored_events
+    )
 
 
 @pytest.mark.parametrize(
@@ -5562,8 +5633,6 @@ def test_business_approval_rejects_legacy_secret_before_routing_or_traceback_exp
 
 
 def test_parallel_operator_interrupt_keeps_each_invocation_secret_scope() -> None:
-    from cayu.vaults import REDACTED_SECRET
-
     secret_values = {
         "secret_a": "parallel-cancel-secret-a-canary",
         "secret_b": "parallel-cancel-secret-b-canary",
@@ -5669,13 +5738,22 @@ def test_parallel_operator_interrupt_keeps_each_invocation_secret_scope() -> Non
         return await store.load_events("sess_parallel_dynamic_secret_cancel")
 
     stored_events = asyncio.run(scenario())
-    failed_events = [event for event in stored_events if event.type is EventType.TOOL_CALL_FAILED]
+    unknown_events = [
+        event for event in stored_events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    ]
 
-    assert [event.payload["tool_call_id"] for event in failed_events] == [
+    assert sorted(event.payload["tool_call_id"] for event in unknown_events) == [
         "call_a",
         "call_b",
     ]
-    for event in failed_events:
+    assert tool.arrivals == 2
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in stored_events
+    )
+    assert all(secret not in repr(stored_events) for secret in secret_values.values())
+    for event in unknown_events:
         rendered = repr(event.payload)
         assert all(secret not in rendered for secret in secret_values.values())
-        assert REDACTED_SECRET in rendered
+        assert event.payload["state"] == "outcome_unknown"
+        assert "result" not in event.payload

@@ -39,6 +39,7 @@ from cayu.runtime import (
     InMemorySessionStore,
     InMemoryTaskStore,
     InterruptSessionRequest,
+    ResumeRequest,
     RunRequest,
     RuntimeBuildArtifactKind,
     RuntimeBuildProvenance,
@@ -2110,7 +2111,18 @@ def test_parent_recovery_finishes_marker_committed_before_child_creation() -> No
                 reason="fresh worker restart",
             )
         )
-        assert result.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert result.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+        )
+        terminals = [
+            event
+            for event in await sessions.load_events("durable-recovery-parent")
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ]
+        assert len(terminals) == 1
+        assert terminals[0].type is EventType.TOOL_CALL_COMPLETED
+        assert terminals[0].payload["result"]["structured"]["status"] == "queued"
         children = (
             await sessions.list_sessions(SessionQuery(parent_session_id="durable-recovery-parent"))
         ).sessions
@@ -2418,6 +2430,43 @@ def test_worker_rejects_incomplete_or_conflicting_parent_intent(
     asyncio.run(run())
 
 
+async def _resume_unknown_durable_parent(app: CayuApp, session_id: str) -> dict:
+    store = app.session_store
+    before = await store.load_checkpoint(session_id)
+    assert before is not None
+    assert "pending_tool_round" in before
+    assert "durable_subagent_submission_seeds" in before
+    events = await store.load_events(session_id)
+    assert sum(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in events) == 1
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in events
+    )
+    resumed = await _collect(
+        app.resume(
+            ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", "Continue the original durable submission.")],
+            )
+        )
+    )
+    assert resumed[-1].type is EventType.SESSION_COMPLETED
+    after = await store.load_checkpoint(session_id)
+    assert after is not None
+    assert "pending_tool_round" not in after
+    assert "durable_subagent_submission_seeds" not in after
+    events = await store.load_events(session_id)
+    for kind in (
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_EFFECT_OUTCOME_UNKNOWN,
+    ):
+        assert sum(event.type is kind for event in events) == 1
+    assert not any(event.type is EventType.TOOL_CALL_FAILED for event in events)
+    assert sum(event.type is EventType.MODEL_STARTED for event in events) == 2
+    return after
+
+
 def test_cancellation_reconciles_marker_committed_before_failed_child_creation() -> None:
     async def run() -> None:
         sessions = _BlockingFailOnceDurableChildCreationStore()
@@ -2450,6 +2499,7 @@ def test_cancellation_reconciles_marker_committed_before_failed_child_creation()
             await asyncio.wait_for(parent, timeout=2)
         assert parent.cancelling() == 1
         assert parent.cancelled() is True
+        await _resume_unknown_durable_parent(app, "durable-cancel-marker-parent")
         children = (
             await sessions.list_sessions(
                 SessionQuery(parent_session_id="durable-cancel-marker-parent")
@@ -2602,7 +2652,7 @@ def test_parent_recovery_uses_durable_effective_arguments_after_hook_modificatio
                 reason="recover hook-modified durable submission",
             )
         )
-        assert recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
         queued = (await tasks.list_tasks(TaskQuery()))[0]
         intent = queued.input["dispatch"]["prepared_subagent"]
         assert intent["authority"]["request"]["messages"][0]["content"][0]["text"] == (
@@ -2640,7 +2690,7 @@ def test_parent_recovery_uses_durable_effective_arguments_after_hook_modificatio
                 reason="reattach hook-modified durable child",
             )
         )
-        assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
+        assert recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
         completed_events = [
             event
             for event in await sessions.load_events("durable-hook-recovery-parent")
@@ -2649,7 +2699,9 @@ def test_parent_recovery_uses_durable_effective_arguments_after_hook_modificatio
         ]
         assert len(completed_events) == 1
         recovered_result = completed_events[0].payload["result"]
-        assert recovered_result["structured"]["status"] == SessionStatus.COMPLETED.value
+        # The immutable parent result acknowledges the exact queue handoff;
+        # later child completion is read through SubagentResultTool below.
+        assert recovered_result["structured"]["status"] == "queued"
         child_session_id = recovered_result["structured"]["child_session_id"]
         fetched = await SubagentResultTool(sessions, task_store=tasks).run(
             ToolContext(session_id="durable-hook-recovery-parent"),
@@ -2731,7 +2783,18 @@ def test_modified_handoff_receipt_retains_arguments_until_recovery_publication()
                 reason="recover modified handoff receipt",
             )
         )
-        assert pending.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert pending.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+        )
+        terminal_before = [
+            event
+            for event in await sessions.load_events(parent_session_id)
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ]
+        assert len(terminal_before) == 1
+        assert terminal_before[0].type is EventType.TOOL_CALL_COMPLETED
+        assert terminal_before[0].payload["result"]["structured"]["status"] == "queued"
         handle = await restarted_dispatcher.process_next(
             restarted,
             worker_id="modified-handoff-worker",
@@ -2743,7 +2806,12 @@ def test_modified_handoff_receipt_retains_arguments_until_recovery_publication()
                 reason="publish recovered modified handoff",
             )
         )
-        assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovered.actions
+        assert recovered.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+        assert [
+            event
+            for event in await sessions.load_events(parent_session_id)
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ] == terminal_before
 
         compacted = await sessions.load_checkpoint(parent_session_id)
         assert compacted is not None
@@ -3075,7 +3143,18 @@ def test_parent_recovery_finishes_child_committed_before_queue_task() -> None:
                 reason="fresh worker restart",
             )
         )
-        assert result.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert result.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+        )
+        terminals = [
+            event
+            for event in await sessions.load_events("durable-task-gap-parent")
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ]
+        assert len(terminals) == 1
+        assert terminals[0].type is EventType.TOOL_CALL_COMPLETED
+        assert terminals[0].payload["result"]["structured"]["status"] == "queued"
         queued = await tasks.list_tasks(TaskQuery())
         assert len(queued) == 1
         assert queued[0].status is TaskStatus.PENDING
@@ -3151,7 +3230,18 @@ def test_transient_task_read_after_seed_preserves_parent_round_for_recovery() ->
                 reason="recover transient durable submission failure",
             )
         )
-        assert result.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert result.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+        )
+        terminals = [
+            event
+            for event in await sessions.load_events(parent_session_id)
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ]
+        assert len(terminals) == 1
+        assert terminals[0].type is EventType.TOOL_CALL_COMPLETED
+        assert terminals[0].payload["result"]["structured"]["status"] == "queued"
         children = (
             await sessions.list_sessions(SessionQuery(parent_session_id=parent_session_id))
         ).sessions
@@ -3214,7 +3304,21 @@ def test_parent_recovery_settles_terminal_durable_queue_task(
                 reason="repair durable submission",
             )
         )
-        assert first.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert first.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+        )
+        # Recovery has confirmed the handoff, not completion of the child.
+        # A later queue failure must not rewrite this selected tool outcome.
+        selected = [
+            event
+            for event in await sessions.load_events(parent_session_id)
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+            and event.payload.get("tool_call_id") == "durable-child-call"
+        ]
+        assert len(selected) == 1
+        assert selected[0].type is EventType.TOOL_CALL_COMPLETED
+        assert selected[0].payload["result"]["structured"]["status"] == "queued"
         queued = await tasks.list_tasks(TaskQuery())
         assert len(queued) == 1
         if terminal_task_status is TaskStatus.FAILED:
@@ -3255,20 +3359,31 @@ def test_parent_recovery_settles_terminal_durable_queue_task(
                 reason="settle cancelled durable child",
             )
         )
-        assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in second.actions
+        assert second.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
         children = (
             await sessions.list_sessions(SessionQuery(parent_session_id=parent_session_id))
         ).sessions
         assert len(children) == 1
-        assert children[0].status is SessionStatus.INTERRUPTED
+        assert children[0].status is SessionStatus.PENDING
+        child_recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=children[0].id,
+                reason="settle terminal durable queue owner",
+            )
+        )
+        assert child_recovery.status is SessionStatus.INTERRUPTED
+        assert child_recovery.actions == (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,)
+        assert len(await tasks.list_tasks(TaskQuery())) == 1
+        settled_task = await tasks.load_task(queued[0].id)
+        assert settled_task is not None and settled_task.status is terminal_task_status
         parent_events = await sessions.load_events(parent_session_id)
         recovered = [
             event
             for event in parent_events
-            if event.type is EventType.TOOL_CALL_FAILED
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
             and event.payload.get("tool_call_id") == "durable-child-call"
         ]
-        assert len(recovered) == 1
+        assert recovered == selected
 
     asyncio.run(reconcile_then_cancel())
 
@@ -3518,7 +3633,18 @@ def test_parent_recovery_preserves_paused_durable_queue_task() -> None:
                 reason="inspect paused durable child",
             )
         )
-        assert recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert recovery.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+        )
+        terminals = [
+            event
+            for event in await sessions.load_events("durable-paused-task-parent")
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ]
+        assert len(terminals) == 1
+        assert terminals[0].type is EventType.TOOL_CALL_COMPLETED
+        assert terminals[0].payload["result"]["structured"]["status"] == "queued"
         child_id = queued.input["dispatch"]["prepared_subagent"]["authority"]["child_session_id"]
         child = await sessions.load(child_id)
         assert child is not None
@@ -4009,7 +4135,18 @@ def test_sqlite_submission_crash_boundaries_reconcile_one_child_and_task(
             child_id = children[0].id
             queue_task_id = queued[0].id
             if children[0].status is not SessionStatus.COMPLETED:
-                assert first.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+                assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in first.actions
+                queued_ack = [
+                    event
+                    for event in await sessions.load_events(parent_session_id)
+                    if event.type is EventType.TOOL_CALL_COMPLETED
+                    and event.payload.get("tool_call_id") == "durable-child-call"
+                ]
+                assert len(queued_ack) == 1
+                assert queued_ack[0].payload["result"]["structured"]["status"] == "queued"
+                assert (
+                    queued_ack[0].payload["result"]["structured"]["queue_task_id"] == queue_task_id
+                )
                 handle = await dispatcher.process_next(
                     app,
                     worker_id=f"{crash_phase}-replacement-worker",
@@ -4022,7 +4159,7 @@ def test_sqlite_submission_crash_boundaries_reconcile_one_child_and_task(
                         reason="attach terminal durable child",
                     )
                 )
-                assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in second.actions
+                assert second.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
                 assert len(provider.requests) == 1
             else:
                 assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in first.actions
@@ -5028,7 +5165,10 @@ def test_tool_timeout_reports_queued_child_when_durable_submission_commits_late(
         await asyncio.sleep(0.02)
         sessions.release_child_creation.set()
 
-        events = await asyncio.wait_for(parent, timeout=2)
+        # The 10ms tool deadline above is the behavior under test. This wait
+        # only bounds the remaining full runtime loop after the durable commit;
+        # allow the same CI scheduling headroom as the readiness wait.
+        events = await asyncio.wait_for(parent, timeout=10)
 
         queued_results = [
             event.payload["result"]
@@ -5122,7 +5262,7 @@ def test_tool_timeout_preserves_unsettled_submission_for_exact_recovery() -> Non
                 reason="recover timeout during ambiguous durable publication",
             )
         )
-        assert recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
         children = (
             await sessions.list_sessions(
                 SessionQuery(parent_session_id="durable-timeout-unsettled-parent")
@@ -5200,9 +5340,9 @@ def test_external_cancellation_remains_authoritative_over_unsettled_timeout(
         assert parent.cancelling() == 1
         assert parent.cancelled() is True
         assert str(raised.value) == "external cancellation during unsettled durable submission"
-        checkpoint = await sessions.load_checkpoint("durable-timeout-unsettled-cancel-parent")
-        assert checkpoint is not None
-        assert "durable_subagent_submission_seeds" not in checkpoint
+        checkpoint = await _resume_unknown_durable_parent(
+            app, "durable-timeout-unsettled-cancel-parent"
+        )
         assert "durable_subagent_submissions" in checkpoint
         submissions = checkpoint["durable_subagent_submissions"]
         receipt = durable_subagent_submission_receipt_from_checkpoint(
@@ -5210,13 +5350,17 @@ def test_external_cancellation_remains_authoritative_over_unsettled_timeout(
             idempotency_key=next(iter(submissions)),
         )
         assert receipt is not None and receipt.outcome == "submitted"
-        failed = [
-            event
-            for event in await sessions.load_events("durable-timeout-unsettled-cancel-parent")
-            if event.type is EventType.TOOL_CALL_FAILED
-        ]
-        assert len(failed) == 1
-        assert failed[0].payload["interrupted"] is True
+        children = (
+            await sessions.list_sessions(
+                SessionQuery(parent_session_id="durable-timeout-unsettled-cancel-parent")
+            )
+        ).sessions
+        queued = await tasks.list_tasks(TaskQuery())
+        assert len(children) == len(queued) == 1
+        assert (
+            queued[0].input["dispatch"]["prepared_subagent"]["authority"]["child_session_id"]
+            == children[0].id
+        )
 
     asyncio.run(run())
 
@@ -5327,7 +5471,18 @@ def test_cancelled_queue_worker_settles_child_without_second_provider_dispatch()
                 reason="inspect claimed running durable child",
             )
         )
-        assert pending_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+        assert pending_recovery.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+        )
+        terminal_before = [
+            event
+            for event in await sessions.load_events("durable-worker-cancel-parent")
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ]
+        assert len(terminal_before) == 1
+        assert terminal_before[0].type is EventType.TOOL_CALL_COMPLETED
+        assert terminal_before[0].payload["result"]["structured"]["status"] == "queued"
         processing.cancel("worker shutdown")
         await asyncio.sleep(0)
         assert not processing.done()
@@ -5361,7 +5516,12 @@ def test_cancelled_queue_worker_settles_child_without_second_provider_dispatch()
                 reason="attach interrupted durable child",
             )
         )
-        assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in (terminal_recovery.actions)
+        assert terminal_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+        assert [
+            event
+            for event in await sessions.load_events("durable-worker-cancel-parent")
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ] == terminal_before
         assert (
             len(
                 [

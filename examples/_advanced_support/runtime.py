@@ -221,6 +221,10 @@ async def runtime_evidence_for_roles(
                 recovery_state=(
                     "manually-reconciled"
                     if session.recovery.manual_reconciliation_count
+                    else "receipt-reconciled"
+                    if any(
+                        receipt.reconciliation_state == "reconciled" for receipt in session.receipts
+                    )
                     else "resumed-after-interruption"
                     if session.recovery.interruption_count
                     else "not-required"

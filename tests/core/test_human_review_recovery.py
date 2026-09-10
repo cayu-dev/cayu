@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+from hashlib import sha256
 
 import pytest
+from pydantic import SecretStr
 from tests.core.test_approval_lifecycle_execution_identities import (
     _FailingTerminalToolEventStore,
 )
@@ -21,16 +24,28 @@ from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
+    ExecutionProfileBehaviorIdentity,
+    IncompleteSessionRecoveryRequest,
     SQLiteSessionStore,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     UserInputRecoveryRequest,
+    UserInputResponse,
 )
+from cayu._validation import canonical_durable_json_bytes
 from cayu.runtime.human_review import (
     HumanReviewConflict,
     HumanReviewDenied,
     HumanReviewDisclosure,
     HumanReviewField,
+)
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.runtime.tool_effects import (
+    ToolEffectReceipt,
+    ToolEffectReconcilerSpec,
+    ToolEffectReconciliationRegistration,
+    ToolEffectReconciliationRequest,
+    ToolEffectReconciliationResult,
 )
 from cayu.runtime.user_input import (
     user_input_answer_request_digest,
@@ -57,7 +72,68 @@ class RecoveryPolicy(ReviewPolicy):
         )
 
 
-def make_recovery_app(*, approval, store=None, resumed=False):
+class RecordedReviewEffectReconciler:
+    def __init__(self, tool):
+        self.tool = tool
+
+    async def reconcile(self, *, context, receipt):
+        assert receipt is None
+        matches = [
+            arguments
+            for recorded, arguments in zip(self.tool.contexts, self.tool.calls, strict=True)
+            if recorded.idempotency_key == context.idempotency_key
+            and recorded.session_id == context.session_id
+            and recorded.metadata.get("tool_call_id") == context.tool_call_id
+        ]
+        assert len(matches) == 1
+        assert context.tool_name == self.tool.spec.name
+        assert (
+            context.arguments_digest
+            == sha256(canonical_durable_json_bytes(matches[0], "effect_arguments")).hexdigest()
+        )
+        return ToolEffectReconciliationResult(
+            outcome="completed",
+            observation="sent",
+            receipt=ToolEffectReceipt(
+                receipt_id=f"review-effect:{context.tool_call_id}",
+                receipt_schema="review-effect",
+                receipt_schema_version=1,
+                tool_call_id=context.tool_call_id,
+                idempotency_key=context.idempotency_key,
+                tool_name=context.tool_name,
+                outcome="completed",
+                message="Completed externally.",
+                structured={},
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                source="reconciler",
+            ),
+        )
+
+
+async def receipt_recovery_request(app, recovery):
+    view = await app.inspect_human_review(recovery.session_id, context=CONTEXT)
+    target = await app.inspect_tool_effect(
+        recovery.session_id,
+        tool_round_id=view.tool_round_id,
+        tool_call_id=recovery.tool_call_id,
+    )
+    response = None
+    if isinstance(recovery, UserInputRecoveryRequest):
+        response = UserInputResponse(
+            session_id=recovery.session_id,
+            input_id=recovery.input_id,
+            answer=recovery.answer,
+            review_reference=recovery.answer_review_reference,
+        )
+    return ToolEffectReconciliationRequest(
+        **target.model_dump(),
+        lookup=True,
+        review_reference=recovery.review_reference,
+        user_input_response=response,
+    )
+
+
+def make_recovery_app(*, approval, store=None, resumed=False, receipt_source=None):
     store = _FailingTerminalToolEventStore() if store is None else store
     policy = RecoveryPolicy()
     app = CayuApp(session_store=store, human_review_policy=policy, enable_logging=False)
@@ -76,6 +152,22 @@ def make_recovery_app(*, approval, store=None, resumed=False):
         AgentSpec(name="assistant", model="fake-model"),
         tools=[tool] if approval else [tool, UserInputTool()],
         tool_policy=ApprovalPolicy() if approval else None,
+        tool_effect_reconcilers={
+            "side_effect": ToolEffectReconciliationRegistration(
+                reconciler=RecordedReviewEffectReconciler(receipt_source or tool),
+                spec=ToolEffectReconcilerSpec(
+                    execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                        name="review-effect-reconciler",
+                        behavior_version="1",
+                        implementation_version="1",
+                    ),
+                    receipt_schema="review-effect",
+                    receipt_schema_version=1,
+                    supports_lookup=True,
+                    result_schema={"type": "object", "additionalProperties": False},
+                ),
+            )
+        },
     )
     return app, store, policy, tool
 
@@ -88,6 +180,12 @@ async def interrupted_decision(*, approval, store=None):
     request = decision(view, approval=approval)
     events = await resolve(app, request)
     assert events[-1].type is EventType.SESSION_INTERRUPTED
+    assert tool.calls == [{"value": "first"}]
+    # Classify the interrupted dispatch through its recovery owner before
+    # inspecting the version-bound receipt target and human-review reference.
+    await app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(session_id="review-session")
+    )
     assert tool.calls == [{"value": "first"}]
     recovery_view = await app.inspect_human_review("review-session", context=CONTEXT)
     assert recovery_view.status == "unavailable"
@@ -125,7 +223,8 @@ def test_interrupted_review_recovers_without_replaying_the_effect(approval):
                         recovery.model_copy(update={"review_reference": original.review_reference})
                     )
                 ]
-            recovered = [event async for event in app.recover_tool_approval(recovery)]
+            receipt_request = await receipt_recovery_request(app, recovery)
+            recovered = [event async for event in app.reconcile_tool_effect(receipt_request)]
             assert recovered[-1].type is EventType.SESSION_INTERRUPTED
             assert "cannot authorize pending sibling execution" in recovered[-1].payload["error"]
             assert tool.calls == [{"value": "first"}]
@@ -156,9 +255,10 @@ def test_interrupted_review_recovers_without_replaying_the_effect(approval):
             with pytest.raises((ValueError, RuntimeError)):
                 _ = [event async for event in app.recover_user_input(missing_answer_reference)]
             assert await store.load_checkpoint("review-session") == checkpoint
-            completed = [event async for event in app.recover_user_input(recovery)]
+            receipt_request = await receipt_recovery_request(app, recovery)
+            completed = [event async for event in app.reconcile_tool_effect(receipt_request)]
             # Lost-ack replay uses the accepted recovery request, not a new view.
-            replay = [event async for event in app.recover_user_input(recovery)]
+            replay = [event async for event in app.reconcile_tool_effect(receipt_request)]
             assert replay
 
         assert completed[-1].type is EventType.SESSION_COMPLETED
@@ -168,7 +268,8 @@ def test_interrupted_review_recovers_without_replaying_the_effect(approval):
 
 
 @pytest.mark.parametrize("approval", [False, True])
-def test_recovery_view_rejects_policy_drift_and_permission_revocation(approval):
+@pytest.mark.parametrize("entrance", ["manual", "receipt"])
+def test_recovery_view_rejects_policy_drift_and_permission_revocation(approval, entrance):
     async def scenario():
         app, store, policy, tool, original, view = await interrupted_decision(approval=approval)
         checkpoint = await store.load_checkpoint("review-session")
@@ -192,6 +293,9 @@ def test_recovery_view_rejects_policy_drift_and_permission_revocation(approval):
                 answer_review_reference=original.review_reference,
             )
             recover = app.recover_user_input
+        if entrance == "receipt":
+            request = await receipt_recovery_request(app, request)
+            recover = app.reconcile_tool_effect
         policy.can_decide = False
         with pytest.raises(HumanReviewDenied):
             _ = [event async for event in recover(request)]
@@ -299,55 +403,74 @@ class FailingSQLiteStore(SQLiteSessionStore):
             raise RuntimeError("terminal tool event unavailable")
         await super().append_events(session_id, events)
 
+    async def publish_session_operation(self, session_id, **kwargs):
+        transform = kwargs["operation_transform"]
+
+        def fail_terminal(*args):
+            publication = transform(*args)
+            if not self.failed_terminal_once and any(
+                record.get("state") == "completed" and record.get("terminal") is not None
+                for record in publication.operation_records.values()
+            ):
+                self.failed_terminal_once = True
+                raise RuntimeError("terminal tool event unavailable")
+            return publication
+
+        kwargs["operation_transform"] = fail_terminal
+        return await super().publish_session_operation(session_id, **kwargs)
+
 
 @pytest.mark.parametrize("approval", [False, True])
 def test_sqlite_restart_recovers_with_fresh_reference_and_original_decision(tmp_path, approval):
     async def scenario():
         path = tmp_path / "sessions.sqlite"
-        first_store = FailingSQLiteStore(path)
+        codec = PublicAuthorityAliasCodec(
+            PublicAuthorityAliasKeyring(active_key_id="test", keys={"test": SecretStr("A" * 43)})
+        )
+        first_store = FailingSQLiteStore(path, public_authority_alias_codec=codec)
         _app, _, _, first_tool, original, previous = await interrupted_decision(
             approval=approval, store=first_store
         )
         await first_store.close()
-        store = SQLiteSessionStore(path)
+        store = SQLiteSessionStore(path, public_authority_alias_codec=codec)
         try:
-            app, _, _, tool = make_recovery_app(approval=approval, store=store, resumed=True)
+            app, _, _, tool = make_recovery_app(
+                approval=approval, store=store, resumed=True, receipt_source=first_tool
+            )
             view = await app.inspect_human_review("review-session", context=CONTEXT)
             assert view == previous
             if approval:
-                recovered = [
-                    event
-                    async for event in app.recover_tool_approval(
-                        ToolApprovalRecoveryRequest(
-                            session_id=view.session_id,
-                            approval_id=view.interaction_id,
-                            tool_round_id=view.tool_round_id,
-                            tool_call_id="call_first",
-                            outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                            message="Completed externally.",
-                            review_reference=view.reference,
-                        )
-                    )
-                ]
+                receipt_request = await receipt_recovery_request(
+                    app,
+                    ToolApprovalRecoveryRequest(
+                        session_id=view.session_id,
+                        approval_id=view.interaction_id,
+                        tool_round_id=view.tool_round_id,
+                        tool_call_id="call_first",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="Completed externally.",
+                        review_reference=view.reference,
+                    ),
+                )
+                recovered = [event async for event in app.reconcile_tool_effect(receipt_request)]
                 assert recovered[-1].type is EventType.SESSION_INTERRUPTED
                 assert not tool.calls
                 completed = await resolve(app, original)
             else:
-                completed = [
-                    event
-                    async for event in app.recover_user_input(
-                        UserInputRecoveryRequest(
-                            session_id=view.session_id,
-                            input_id=view.interaction_id,
-                            answer=original.answer,
-                            tool_call_id="call_first",
-                            outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                            message="Completed externally.",
-                            review_reference=view.reference,
-                            answer_review_reference=original.review_reference,
-                        )
-                    )
-                ]
+                receipt_request = await receipt_recovery_request(
+                    app,
+                    UserInputRecoveryRequest(
+                        session_id=view.session_id,
+                        input_id=view.interaction_id,
+                        answer=original.answer,
+                        tool_call_id="call_first",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="Completed externally.",
+                        review_reference=view.reference,
+                        answer_review_reference=original.review_reference,
+                    ),
+                )
+                completed = [event async for event in app.reconcile_tool_effect(receipt_request)]
             assert completed[-1].type is EventType.SESSION_COMPLETED
             assert first_tool.calls == [{"value": "first"}]
             assert tool.calls == [{"value": "second"}]
@@ -357,7 +480,7 @@ def test_sqlite_restart_recovers_with_fresh_reference_and_original_decision(tmp_
     asyncio.run(scenario())
 
 
-def test_user_input_recovery_route_preserves_answer_identity_and_checks_recipient():
+def test_user_input_recovery_route_checks_recipient_and_cannot_settle_unknown_effect():
     from fastapi.testclient import TestClient
 
     from cayu.server import AuthContext, ServerConfig, create_server
@@ -412,4 +535,7 @@ def test_user_input_recovery_route_preserves_answer_identity_and_checks_recipien
         assert tool.calls == [{"value": "first"}]
         recovered = client.post("/api/user-input/recover", json=body, headers=headers)
         assert recovered.status_code == 200, recovered.text
-        assert tool.calls == [{"value": "first"}, {"value": "second"}]
+        # Authentication permits the request, not an unverified external outcome.
+        # The accepted SSE stream must report the need for receipt reconciliation.
+        assert "ToolEffectReconciliationRequired" in recovered.text, recovered.text
+        assert tool.calls == [{"value": "first"}]

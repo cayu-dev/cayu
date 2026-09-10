@@ -251,9 +251,14 @@ def resolve_execution_profile_identity(
                 redactor=redactor,
             ),
         )
-        tool_implementations.append({"implementation": entry})
+        implementation_material = {"implementation": entry}
+        if tool.effect_reconciler is not None:
+            implementation_material["effect_reconciler"] = tool.effect_reconciler.material()
+        tool_implementations.append(implementation_material)
         tool_implementations_process_local |= process_local
-        tool_implementations_application_versioned |= tool.execution_profile_identity is not None
+        tool_implementations_application_versioned |= (
+            tool.execution_profile_identity is not None or tool.effect_reconciler is not None
+        )
 
     command_policy_material = []
     execution_policies_process_local = False

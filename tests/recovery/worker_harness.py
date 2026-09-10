@@ -27,6 +27,7 @@ from cayu.runtime import (
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
     EventSink,
+    IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     RecoveryDecision,
     RecoveryExecutionRequest,
@@ -41,6 +42,7 @@ from cayu.runtime import (
     RuntimeHookContext,
     Session,
     SessionQuery,
+    SessionStatus,
     Task,
     TaskCreate,
     TaskHandlerOutcome,
@@ -51,6 +53,7 @@ from cayu.runtime import (
     ToolRoundRecoveryRequest,
     run_task_worker,
 )
+from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
@@ -83,6 +86,7 @@ class RecoveryScenario(StrEnum):
     BACKGROUND_SUBAGENT = "background_subagent"
     TASK_CLAIM = "task_claim"
     TERMINAL_RACE = "terminal_race"
+    TOOL_EFFECT = "tool_effect"
 
 
 class RecoveryAction(StrEnum):
@@ -128,6 +132,7 @@ _SCENARIO_ACTIONS = {
         }
     ),
     RecoveryScenario.TERMINAL_RACE: frozenset({RecoveryAction.RUN}),
+    RecoveryScenario.TOOL_EFFECT: frozenset({RecoveryAction.START, RecoveryAction.RECOVER}),
 }
 
 
@@ -230,9 +235,9 @@ class WorkerHandle:
                 f"{self._diagnostics()}"
             )
 
-    def wait_success(self) -> dict[str, Any]:
+    def wait_success(self, *, timeout: float = _WORKER_TIMEOUT_S) -> dict[str, Any]:
         try:
-            returncode = self.process.wait(timeout=_WORKER_TIMEOUT_S)
+            returncode = self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             self.terminate_if_running()
             raise AssertionError(f"worker timed out\n{self._diagnostics()}") from None
@@ -334,10 +339,12 @@ class RecoveryHarness:
         env = os.environ.copy()
         source_root = Path(__file__).resolve().parents[2] / "src"
         inherited_pythonpath = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = (
-            str(source_root)
-            if not inherited_pythonpath
-            else os.pathsep.join((str(source_root), inherited_pythonpath))
+        env["PYTHONPATH"] = os.pathsep.join(
+            (
+                str(source_root),
+                str(source_root.parent),
+                *(() if not inherited_pythonpath else (inherited_pythonpath,)),
+            )
         )
         process = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "--config", str(config_path)],
@@ -1006,22 +1013,39 @@ async def _run_ordinary_tool(config: dict[str, Any]) -> dict[str, Any]:
         if action == "manual":
             checkpoint = await app.session_store.load_checkpoint(session_id) or {}
             pending = checkpoint["pending_tool_round"]
-            async for _ in app.recover_tool_round(
-                ToolRoundRecoveryRequest(
+            try:
+                async for _ in app.recover_tool_round(
+                    ToolRoundRecoveryRequest(
+                        session_id=session_id,
+                        round_id=pending["tool_round_id"],
+                        tool_call_id="call_side_effect",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="External marker verified the side effect.",
+                        structured={"marker_verified": True},
+                        resolved_by=ResolutionActor(
+                            subject="recovery-operator",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    )
+                ):
+                    pass
+            except ToolEffectReconciliationRequired:
+                # The marker is real, but an operator assertion is not a
+                # registered receipt validator. No terminal may be fabricated.
+                pass
+            else:
+                raise AssertionError("manual recovery replaced an ambiguous external effect")
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+            async for _ in app.resume(
+                ResumeRequest(
                     session_id=session_id,
-                    round_id=pending["tool_round_id"],
-                    tool_call_id="call_side_effect",
-                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                    message="External marker verified the side effect.",
-                    structured={"marker_verified": True},
-                    resolved_by=ResolutionActor(
-                        subject="recovery-operator",
-                        source=ResolutionActorSource.REQUEST,
-                    ),
+                    messages=[Message.text("user", "Continue after rejected manual recovery.")],
                 )
             ):
                 pass
-            return {"manual_recovery": True}
+            return {"manual_recovery_rejected": True}
         if action == "plan_manual":
             plan = await app.plan_recovery(
                 RecoveryPlanRequest(selection=RecoveryPlanSelection(session_ids=(session_id,)))
@@ -1029,9 +1053,17 @@ async def _run_ordinary_tool(config: dict[str, Any]) -> dict[str, Any]:
             if len(plan.items) != 1:
                 raise AssertionError("registered recovery plan did not select one session")
             item = plan.items[0]
-            if RecoveryPlanAction.TOOL_MARK_COMPLETED not in item.allowed_actions:
+            if not any(blocker.code == "tool_effect_outcome_unknown" for blocker in item.blockers):
+                raise AssertionError("registered recovery plan lost the unknown-effect blocker")
+            if any(
+                action in item.allowed_actions
+                for action in (
+                    RecoveryPlanAction.TOOL_MARK_COMPLETED,
+                    RecoveryPlanAction.TOOL_MARK_FAILED,
+                )
+            ):
                 raise AssertionError(
-                    "registered recovery plan omitted the explicit tool decision: "
+                    "registered recovery plan offered an unvalidated external outcome: "
                     f"{item.model_dump(mode='json')}"
                 )
             request = RecoveryExecutionRequest(
@@ -1183,10 +1215,25 @@ async def _run_background_subagent(config: dict[str, Any]) -> dict[str, Any]:
         parent_recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=parent_session_id)
         )
+        assert IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT in parent_recovery.actions
+        assert "pending_tool_round" in (
+            await app.session_store.load_checkpoint(parent_session_id) or {}
+        )
+        assert not any(
+            event.payload.get("tool_call_id") == "call_background_subagent"
+            and event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+            for event in await app.session_store.load_events(parent_session_id)
+        )
         child_session_id = config["child_session_id"]
+        child_before_recovery = await app.session_store.load(child_session_id)
+        assert child_before_recovery is not None
+        assert child_before_recovery.status is SessionStatus.RUNNING
         child_recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=child_session_id)
         )
+        child_after_recovery = await app.session_store.load(child_session_id)
+        assert child_after_recovery is not None
+        assert child_after_recovery.status is SessionStatus.INTERRUPTED
         async for _ in app.resume(
             ResumeRequest(
                 session_id=parent_session_id,
@@ -1320,6 +1367,10 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
                     )
                 ):
                     pass
+                session = await recovery_app.session_store.load(session_id)
+                if session is None or session.status.value != "interrupted":
+                    raise AssertionError("unknown external effect lost its session fence")
+                return TaskHandlerOutcome.SESSION_INTERRUPTED
 
             handled = await asyncio.wait_for(
                 run_task_worker(
@@ -1336,10 +1387,11 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
                 timeout=_WORKER_TIMEOUT_S,
             )
             if handled != 1:
-                raise AssertionError("The elected continuation did not complete exactly one task")
+                raise AssertionError("The elected continuation did not handle exactly one task")
         elif action == "plan_attached_manual":
             if worker_b_claim is not None:
                 raise AssertionError("an attached task was incorrectly returned to the free queue")
+            task_before = await task_store.load_task(task_id)
             plan = await app.plan_recovery(
                 RecoveryPlanRequest(selection=RecoveryPlanSelection(session_ids=(session_id,)))
             )
@@ -1349,10 +1401,14 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
             if (
                 len(item.task_claims) != 1
                 or item.task_claims[0].ownership_status != "expired"
-                or RecoveryPlanAction.TOOL_MARK_COMPLETED not in item.allowed_actions
+                or not any(
+                    blocker.code == "tool_effect_outcome_unknown" for blocker in item.blockers
+                )
+                or RecoveryPlanAction.TOOL_MARK_COMPLETED in item.allowed_actions
+                or RecoveryPlanAction.TOOL_MARK_FAILED in item.allowed_actions
             ):
                 raise AssertionError(
-                    "registered recovery plan did not expose expired task recovery: "
+                    "registered recovery plan did not fence the expired task's external effect: "
                     f"{item.model_dump(mode='json')}"
                 )
             request = RecoveryExecutionRequest(
@@ -1369,6 +1425,8 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
             receipt = await app.execute_recovery(request)
             replay = await app.execute_recovery(request)
             current_task = await task_store.load_task(task_id)
+            if current_task != task_before:
+                raise AssertionError("rejected manual recovery mutated the attached task")
             return {
                 "receipt": receipt.model_dump(mode="json"),
                 "replay": replay.model_dump(mode="json"),
@@ -1469,6 +1527,12 @@ async def _run_terminal_race(config: dict[str, Any]) -> dict[str, Any]:
         await task_store.close()
 
 
+async def _run_tool_effect(config: dict[str, Any]) -> dict[str, Any]:
+    from tool_effect_worker import run_tool_effect_worker
+
+    return await run_tool_effect_worker(config)
+
+
 async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
     scenario = RecoveryScenario(config["scenario"])
     action = RecoveryAction(config["action"])
@@ -1481,6 +1545,7 @@ async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
         RecoveryScenario.BACKGROUND_SUBAGENT: _run_background_subagent,
         RecoveryScenario.TASK_CLAIM: _run_task_claim,
         RecoveryScenario.TERMINAL_RACE: _run_terminal_race,
+        RecoveryScenario.TOOL_EFFECT: _run_tool_effect,
     }
     return await handlers[scenario](config)
 

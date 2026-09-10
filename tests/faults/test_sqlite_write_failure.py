@@ -13,6 +13,7 @@ from cayu import (
     ExecutionProfileBehaviorIdentity,
     Message,
     ModelStreamEvent,
+    ResumeRequest,
     RunRequest,
     ScriptedModelProvider,
     Tool,
@@ -23,6 +24,7 @@ from cayu import (
     ToolSpec,
 )
 from cayu.runtime import SessionStatus
+from cayu.runtime.tool_effects import ToolEffectConflict
 from cayu.storage import SQLiteSessionStore
 
 
@@ -89,7 +91,7 @@ def _effect_count(path: Path) -> int:
 
 
 @pytest.mark.anyio
-async def test_sqlite_terminal_write_failure_requires_manual_recovery_without_reexecution(
+async def test_sqlite_terminal_write_failure_recovers_staged_result_without_reexecution(
     tmp_path: Path,
 ) -> None:
     store_path = tmp_path / "sessions.sqlite"
@@ -165,7 +167,7 @@ async def test_sqlite_terminal_write_failure_requires_manual_recovery_without_re
     reopened = SQLiteSessionStore(store_path)
     recovery_provider = ScriptedModelProvider(
         [
-            ModelStreamEvent.text_delta("recovered after operator reconciliation"),
+            ModelStreamEvent.text_delta("recovered original result"),
             ModelStreamEvent.completed({"finish_reason": "stop"}),
         ],
         name="sqlite-fault-provider",
@@ -188,17 +190,30 @@ async def test_sqlite_terminal_write_failure_requires_manual_recovery_without_re
         assert failed_events[-1].type == EventType.SESSION_FAILED
         assert _effect_count(effect_path) == 1
 
+        # The terminal append rolled back, but its original result was already
+        # selected durably. An operator cannot substitute a different result.
+        with pytest.raises(ToolEffectConflict, match="cannot replace durable"):
+            _ = [
+                event
+                async for event in recovery_app.recover_tool_round(
+                    ToolRoundRecoveryRequest(
+                        session_id="sqlite-terminal-write-failure",
+                        round_id=pending_round["tool_round_id"],
+                        tool_call_id="call_external_effect",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="operator verified the external effect",
+                        structured={"verified": True},
+                        reason="terminal event transaction failed after execution",
+                    )
+                )
+            ]
+        assert _effect_count(effect_path) == 1
         recovery_events = [
             event
-            async for event in recovery_app.recover_tool_round(
-                ToolRoundRecoveryRequest(
+            async for event in recovery_app.resume(
+                ResumeRequest(
                     session_id="sqlite-terminal-write-failure",
-                    round_id=pending_round["tool_round_id"],
-                    tool_call_id="call_external_effect",
-                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                    message="operator verified the external effect",
-                    structured={"verified": True},
-                    reason="terminal event transaction failed after execution",
+                    messages=[Message.text("user", "Continue using the recorded result.")],
                 )
             )
         ]
@@ -212,21 +227,26 @@ async def test_sqlite_terminal_write_failure_requires_manual_recovery_without_re
     assert any(
         event
         for event in recovery_events
-        if event.type == EventType.TOOL_CALL_COMPLETED
-        and event.payload.get("manual_recovery") is True
+        if event.type == EventType.TOOL_CALL_COMPLETED and "manual_recovery" not in event.payload
     )
-    manual_terminal = next(
+    recovered_terminal = next(
         event
         for event in durable_events
-        if event.type == EventType.TOOL_CALL_COMPLETED
-        and event.payload.get("manual_recovery") is True
+        if event.type == EventType.TOOL_CALL_COMPLETED and "manual_recovery" not in event.payload
     )
-    assert manual_terminal.payload["tool_call_id"] == "call_external_effect"
-    assert manual_terminal.payload["result"]["structured"] == {"verified": True}
+    assert recovered_terminal.payload["tool_call_id"] == "call_external_effect"
+    assert recovered_terminal.payload["result"]["content"] == "external effect recorded"
+    assert sum(event.type is EventType.TOOL_CALL_COMPLETED for event in durable_events) == 1
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
     assert durable_events[-1].type == EventType.SESSION_COMPLETED
-    assert [message.role for message in transcript] == ["user", "assistant", "tool", "assistant"]
+    assert [message.role for message in transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        "assistant",
+    ]
     with sqlite3.connect(store_path) as connection:
         durable_sequences = [
             row[0]

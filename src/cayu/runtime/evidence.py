@@ -12,11 +12,13 @@ from heapq import heappop, heappush
 from typing import Literal, cast
 
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
     StrictBool,
     StrictInt,
+    StrictStr,
     field_validator,
     model_validator,
 )
@@ -47,6 +49,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
 )
 from cayu.runtime.tasks import TaskTopologyQuery
+from cayu.runtime.tool_effects import _bounded_text, _copy_string_map
 from cayu.runtime.tool_policy import taint_labels_from_metadata
 from cayu.runtime.usage import AggregateCount, UsageMetrics, usage_metrics_from_event_payload
 from cayu.runtime.workspace_observation_recovery import (
@@ -54,7 +57,7 @@ from cayu.runtime.workspace_observation_recovery import (
     workspace_observation_terminal_from_delta_status,
 )
 
-RUNTIME_EVIDENCE_SCHEMA_VERSION = 4
+RUNTIME_EVIDENCE_SCHEMA_VERSION = 5
 
 _HARD_MAX_SESSIONS = 500
 _HARD_MAX_EVENTS = 100_000
@@ -618,6 +621,35 @@ class RuntimeEvidenceTask(BaseModel):
     ]
 
 
+class RuntimeEvidenceToolEffectReceipt(BaseModel):
+    """Validated, redacted receipt envelope; never external response content."""
+
+    model_config = _MODEL_CONFIG
+
+    schema_version: StrictInt = Field(ge=1, le=1)
+    receipt_id: StrictStr
+    receipt_schema: StrictStr
+    receipt_schema_version: StrictInt = Field(ge=1, le=2**31 - 1)
+    outcome: Literal["completed", "failed"]
+    source: Literal["adapter", "reconciler", "operator"]
+    observed_at: AwareDatetime
+    receipt_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    integrity: dict[str, str]
+    resource_versions: dict[str, str]
+
+    @field_validator("receipt_id", "receipt_schema")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_text(value, info.field_name, maximum=256, identifier=True)
+
+    @field_validator("integrity", "resource_versions", mode="before")
+    @classmethod
+    def copy_maps(cls, value: object, info) -> dict[str, str]:
+        return _copy_string_map(
+            value, info.field_name, maximum_items=16 if info.field_name == "integrity" else 32
+        )
+
+
 class RuntimeEvidenceReceipt(BaseModel):
     """External-effect receipt identity without body or tool result."""
 
@@ -627,6 +659,20 @@ class RuntimeEvidenceReceipt(BaseModel):
     tool_call_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
     reconciliation_state: Literal["recorded", "reconciled", "unknown"]
     source_ref: RuntimeEvidenceSourceRef
+    receipt_evidence: RuntimeEvidenceToolEffectReceipt | None = None
+
+    @field_validator("receipt_evidence", mode="before")
+    @classmethod
+    def copy_receipt_evidence(cls, value: object):
+        if value is None:
+            return None
+        if type(value) is RuntimeEvidenceToolEffectReceipt:
+            value = {
+                name: getattr(value, name) for name in RuntimeEvidenceToolEffectReceipt.model_fields
+            }
+        if type(value) is not dict:
+            raise ValueError("Receipt evidence requires an exact envelope.")
+        return RuntimeEvidenceToolEffectReceipt.model_validate(value)
 
 
 class RuntimeEvidencePolicyDecision(BaseModel):
@@ -1014,7 +1060,7 @@ class RuntimeEvidenceReport(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    schema_version: Literal[4] = RUNTIME_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[5] = RUNTIME_EVIDENCE_SCHEMA_VERSION
     root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     scope: RuntimeEvidenceScope
     sessions: tuple[RuntimeEvidenceSession, ...] = Field(max_length=_HARD_MAX_SESSIONS)
@@ -2642,6 +2688,7 @@ def _project_receipts(
     for record in records:
         if record.event.type not in {
             EventType.TOOL_CALL_COMPLETED,
+            EventType.TOOL_CALL_FAILED,
             EventType.PROVIDER_OPERATION_RECONCILED,
         }:
             continue
@@ -2659,7 +2706,11 @@ def _project_receipts(
             or structured.get("receipt_id")
             or portable_structured.get("receipt_id")
         )
-        if raw_receipt_id is None:
+        if (
+            raw_receipt_id is None
+            and "receipt_evidence" not in payload
+            and payload.get("effect_reconciled") is not True
+        ):
             continue
         receipt_id = _optional_text(raw_receipt_id)
         if receipt_id is None:
@@ -2677,12 +2728,45 @@ def _project_receipts(
             or structured.get("reconciliation_state")
             or portable_structured.get("reconciliation_state")
         )
-        state = raw_state if raw_state in {"recorded", "reconciled", "unknown"} else "recorded"
+        state = (
+            raw_state
+            if type(raw_state) is str and raw_state in {"recorded", "reconciled", "unknown"}
+            else "recorded"
+        )
+        evidence = None
+        if "receipt_evidence" in payload or payload.get("effect_reconciled") is True:
+            try:
+                raw_evidence = payload.get("receipt_evidence")
+                if (
+                    type(raw_evidence) is not dict
+                    or payload.get("effect_reconciled") is not True
+                    or payload.get("reconciliation_state") != "reconciled"
+                ):
+                    raise ValueError("Missing positive receipt evidence.")
+                evidence = RuntimeEvidenceToolEffectReceipt(**raw_evidence)
+                expected_type = (
+                    EventType.TOOL_CALL_COMPLETED
+                    if evidence.outcome == "completed"
+                    else EventType.TOOL_CALL_FAILED
+                )
+                if evidence.receipt_id != receipt_id or record.event.type is not expected_type:
+                    raise ValueError("Receipt evidence conflicts with its terminal.")
+            except (TypeError, ValueError):
+                warnings.append(
+                    RuntimeEvidenceWarning(
+                        code=RuntimeEvidenceWarningCode.MALFORMED_RECEIPT,
+                        session_id=session_id,
+                        event_id=record.event.id,
+                        sequence=record.sequence,
+                    )
+                )
+                continue
         receipt = RuntimeEvidenceReceipt(
             receipt_id=receipt_id,
             tool_call_id=_optional_text(payload.get("tool_call_id")),
             reconciliation_state=state,
             source_ref=_source_ref(record),
+            receipt_evidence=evidence,
         )
         prior = projected.get(receipt_id)
         if prior is None:
@@ -2703,6 +2787,22 @@ def _project_receipts(
             )
             continue
         if (
+            prior.receipt_evidence is not None
+            and receipt.receipt_evidence is not None
+            and prior.receipt_evidence != receipt.receipt_evidence
+        ):
+            warnings.append(
+                RuntimeEvidenceWarning(
+                    code=RuntimeEvidenceWarningCode.MALFORMED_RECEIPT,
+                    session_id=session_id,
+                    event_id=record.event.id,
+                    sequence=record.sequence,
+                )
+            )
+            continue
+        if prior.receipt_evidence is not None and receipt.receipt_evidence is None:
+            continue
+        if (
             prior.reconciliation_state == "reconciled"
             and receipt.reconciliation_state != "reconciled"
         ):
@@ -2712,6 +2812,7 @@ def _project_receipts(
             tool_call_id=prior.tool_call_id or receipt.tool_call_id,
             reconciliation_state=receipt.reconciliation_state,
             source_ref=receipt.source_ref,
+            receipt_evidence=receipt.receipt_evidence,
         )
     return tuple(projected.values())
 

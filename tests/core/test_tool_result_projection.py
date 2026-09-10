@@ -2514,13 +2514,14 @@ def test_mcp_tool_results_cross_the_same_projection_boundary(tmp_path) -> None:
     assert provider_result.structured["mcp_structured_content"] == {"receipt_id": "mcp-receipt"}
 
 
-def test_effectful_terminal_failure_crosses_projection_before_observational_hooks(
+def test_invalid_external_result_projection_does_not_authorize_terminal_publication(
     tmp_path,
 ) -> None:
+    projection_checks: list[tuple[int, int]] = []
+
     class AlwaysExternalize(ArtifactExternalizingToolResultPolicy):
-        # Exercise short fixed terminal errors through publication independently
-        # of the minimum inline capacity needed for bounded readback pages.
         def _exceeds_threshold(self, *, byte_count: int, token_estimate: int) -> bool:
+            projection_checks.append((byte_count, token_estimate))
             return True
 
     store = LocalArtifactStore(tmp_path / "effectful-artifacts", store_id="effectful-artifacts")
@@ -2570,15 +2571,23 @@ def test_effectful_terminal_failure_crosses_projection_before_observational_hook
         )
     )
 
-    terminal = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["tool_effect"] == "external"
-    assert terminal.payload["outcome_unknown"] is True
-    assert terminal.payload["manual_reconciliation_required"] is True
-    assert terminal.payload["tool_result_projection"]["status"] == "externalized"
-    artifact = asyncio.run(
-        store.read_bytes(terminal.payload["tool_result_projection"]["artifact_id"])
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    persisted = asyncio.run(app.session_store.load_events("sess_effectful_failure_projection"))
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in persisted
     )
-    assert artifact.content == b"Tool returned a non-portable result after execution."
+    unknown = [event for event in persisted if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN]
+    assert len(unknown) == 1
+    assert unknown[0].payload["tool_call_id"] == "call_effectful_failure"
+    # Projecting the bounded diagnostic is not proof of a terminal external
+    # outcome and cannot authorize a tool transcript or model continuation.
+    diagnostic = "Tool returned a non-portable result after execution."
+    assert len(projection_checks) == 1
+    assert projection_checks[0][0] == len(diagnostic.encode())
+    assert len(provider.requests) == 1
+    transcript = asyncio.run(app.session_store.load_transcript("sess_effectful_failure_projection"))
+    assert not any(message.role == "tool" for message in transcript)
 
 
 def test_interruption_during_artifact_persistence_does_not_repeat_tool_or_store(
@@ -2796,7 +2805,7 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
     def blocked_rename(*args, **kwargs) -> None:
         started.set()
         try:
-            if not release.wait(timeout=5):
+            if not release.wait(timeout=30):
                 raise TimeoutError("test did not release local artifact publication")
             rename(*args, **kwargs)
         finally:
@@ -2861,9 +2870,12 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
                         )
                     )
                 ),
-                timeout=1,
+                timeout=10,
             )
-            run_events = await asyncio.wait_for(run_task, timeout=1)
+            run_events = await asyncio.wait_for(run_task, timeout=10)
+            # The external writer must still be held when interruption returns;
+            # extra observation headroom must not let it settle before this check.
+            assert not finished.is_set()
             return interrupt_events, run_events
         finally:
             release.set()

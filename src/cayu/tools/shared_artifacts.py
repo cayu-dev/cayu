@@ -39,6 +39,7 @@ from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import (
     DurableToolOperationConflict,
     DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
     Tool,
     ToolContext,
     ToolEffect,
@@ -940,7 +941,7 @@ class PublishWorkspaceArtifactTool(Tool):
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
         recovery_authority: DurableToolRecoveryAuthority | None = None,
-    ) -> ToolResult | None:
+    ) -> DurableToolRecoveryEvidence | None:
         del environment_allocation_fingerprint, started
         return await _recover_shared_artifact_call(
             kind="publication",
@@ -1124,7 +1125,7 @@ class MaterializeSharedArtifactTool(Tool):
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
         recovery_authority: DurableToolRecoveryAuthority | None = None,
-    ) -> ToolResult | None:
+    ) -> DurableToolRecoveryEvidence | None:
         del environment_allocation_fingerprint, started
         return await _recover_shared_artifact_call(
             kind="materialization",
@@ -1887,9 +1888,11 @@ async def _recover_shared_artifact_call(
     environment_name: str | None,
     load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
     recovery_authority: DurableToolRecoveryAuthority | None,
-) -> ToolResult | None:
+) -> DurableToolRecoveryEvidence | None:
     if execution_profile_fingerprint is None:
-        return _shared_artifact_error_result("recovery_authority_unavailable")
+        return DurableToolRecoveryEvidence(
+            "unresolved", _shared_artifact_error_result("recovery_authority_unavailable")
+        )
     key = _call_locator_storage_key(
         session_id=parent_session_id,
         parent_run_epoch=parent_run_epoch,
@@ -1909,7 +1912,9 @@ async def _recover_shared_artifact_call(
             canonical_durable_json_bytes(arguments, "effective_arguments")
         ).hexdigest()
     except Exception:
-        return _shared_artifact_error_result("recovery_evidence_invalid")
+        return DurableToolRecoveryEvidence(
+            "unresolved", _shared_artifact_error_result("recovery_evidence_invalid")
+        )
     if (
         locator.kind != kind
         or locator.session_id != parent_session_id
@@ -1923,7 +1928,9 @@ async def _recover_shared_artifact_call(
         or locator.effective_arguments_sha256 != arguments_sha256
         or locator.execution_profile_fingerprint != execution_profile_fingerprint
     ):
-        return _shared_artifact_error_result("recovery_evidence_invalid")
+        return DurableToolRecoveryEvidence(
+            "unresolved", _shared_artifact_error_result("recovery_evidence_invalid")
+        )
     raw_state = await load_operation(locator.state_storage_key)
     if raw_state is None:
         return None
@@ -1958,7 +1965,9 @@ async def _recover_shared_artifact_call(
                 if recovered is None:
                     return None
                 receipt = recovered
-            return _publication_result(receipt, recovered=True)
+            return DurableToolRecoveryEvidence(
+                "confirmed", _publication_result(receipt, recovered=True)
+            )
         if type(arguments) is not dict or set(arguments) != {"ref", "destination"}:
             raise ValueError("materialization recovery arguments are invalid")
         reference = SharedArtifactRef.from_opaque_ref(arguments["ref"])
@@ -1992,9 +2001,13 @@ async def _recover_shared_artifact_call(
             if recovered is None:
                 return None
             receipt = recovered
-        return _materialization_result(receipt, recovered=True)
+        return DurableToolRecoveryEvidence(
+            "confirmed", _materialization_result(receipt, recovered=True)
+        )
     except Exception:
-        return _shared_artifact_error_result("recovery_evidence_invalid")
+        return DurableToolRecoveryEvidence(
+            "unresolved", _shared_artifact_error_result("recovery_evidence_invalid")
+        )
 
 
 async def _recover_prepared_publication(

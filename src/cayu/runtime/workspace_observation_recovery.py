@@ -634,7 +634,7 @@ class WorkspaceObservationLifecycle(BaseModel):
         if (self.tool_outcome_event_id is None) != (self.tool_outcome_event_digest is None):
             raise ValueError("Tool outcome event identity and digest must be present together.")
         if phase_order[self.phase] >= 2 and self.tool_outcome_event_id is None:
-            raise ValueError("A staged-outcome phase requires content-bound terminal evidence.")
+            raise ValueError("A staged-outcome phase requires content-bound outcome evidence.")
         if phase_order[self.phase] < 2 and self.tool_outcome_event_id is not None:
             raise ValueError("Tool outcome evidence cannot precede its staged-outcome phase.")
         if (

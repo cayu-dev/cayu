@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 import cayu.runtime.execution_profiles as execution_profiles
-from cayu import CayuConfig, RunDefaults
+from cayu import CayuConfig, RunDefaults, SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.events import (
     event_with_runtime_envelope_authority,
@@ -153,14 +153,28 @@ class _CrashAfterPendingToolRoundStore(InMemorySessionStore):
         return checkpoint
 
 
-class _CrashAfterStagedTerminalStore(InMemorySessionStore):
+class _CrashAfterStagedTerminalMixin:
     """Lose one acknowledgement after the first private terminal is staged."""
 
     invocation_lifecycle_command_version = 1
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.crashed = False
+        self.lose_pause_acknowledgement = False
+        self.pause_acknowledgement_lost = False
+
+    async def publish_interaction_transition(self, session_id: str, **kwargs):
+        result = await super().publish_interaction_transition(session_id, **kwargs)
+        if (
+            self.lose_pause_acknowledgement
+            and not self.pause_acknowledgement_lost
+            and kwargs["event"].type is EventType.INTERACTION_PAUSED
+            and kwargs["to_status"] is SessionStatus.INTERRUPTED
+        ):
+            self.pause_acknowledgement_lost = True
+            raise ConnectionError("recovery pause acknowledgement lost after commit")
+        return result
 
     async def load_checkpoint(self, session_id: str) -> dict | None:
         checkpoint = await super().load_checkpoint(session_id)
@@ -172,6 +186,14 @@ class _CrashAfterStagedTerminalStore(InMemorySessionStore):
             self.crashed = True
             raise RuntimeError("simulated crash after terminal staging")
         return checkpoint
+
+
+class _CrashAfterStagedTerminalStore(_CrashAfterStagedTerminalMixin, InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
+
+class _CrashAfterStagedTerminalSQLiteStore(_CrashAfterStagedTerminalMixin, SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
 
 
 class _InterleavedCompletedExposureStore(InMemorySessionStore):
@@ -1406,9 +1428,19 @@ def test_unexposed_call_stays_blocked_during_ordinary_tool_round_recovery() -> N
     assert "arguments" not in blocked.payload
 
 
-def test_staged_unexposed_call_stays_blocked_when_sibling_scope_is_incomplete() -> None:
-    async def scenario() -> tuple[list[Event], _RecordingTool, _RecordingToolHook]:
-        store = _CrashAfterStagedTerminalStore()
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("lose_acknowledgement", [False, True])
+def test_staged_unexposed_call_stays_blocked_when_sibling_scope_is_incomplete(
+    tmp_path,
+    backend,
+    lose_acknowledgement,
+) -> None:
+    async def scenario():
+        store = (
+            _CrashAfterStagedTerminalStore()
+            if backend == "memory"
+            else _CrashAfterStagedTerminalSQLiteStore(tmp_path / "exposure-pause.sqlite")
+        )
         provider = _ScriptedProvider(
             [
                 [
@@ -1464,25 +1496,45 @@ def test_staged_unexposed_call_stays_blocked_when_sibling_scope_is_incomplete() 
         assert staged["event"]["type"] == EventType.TOOL_CALL_BLOCKED.value
 
         await _reopen_failed_session_for_recovery(store, session_id)
+        store.lose_pause_acknowledgement = lose_acknowledgement
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
         assert len(provider.requests) == 1
+        assert store.pause_acknowledgement_lost is lose_acknowledgement
         assert visible.calls == []
-        return await store.load_events(session_id), hidden, hook
+        retained = await store.load_checkpoint(session_id)
+        [retained_stage] = retained["pending_tool_round"]["staged_terminals"]
+        pauses = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.INTERACTION_PAUSED
+        ]
+        # The original FAILED pause cannot settle this INTERRUPTED recovery.
+        # A second recovery of the same paused status must remain idempotent.
+        assert len(pauses) == 2
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        events = await store.load_events(session_id)
+        assert [event for event in events if event.type is EventType.INTERACTION_PAUSED] == pauses
+        assert visible.calls == []
+        if backend == "sqlite":
+            await store.close()
+        return events, retained_stage, hidden, hook
 
-    events, hidden, hook = asyncio.run(scenario())
+    events, retained_stage, hidden, hook = asyncio.run(scenario())
 
     assert events[-1].type is EventType.SESSION_INTERRUPTED
     assert hidden.calls == []
     assert "hidden" not in hook.before_calls
     assert "hidden" not in hook.after_calls
-    [blocked] = [
-        event
-        for event in events
-        if event.type is EventType.TOOL_CALL_BLOCKED and event.tool_name == "hidden"
-    ]
-    assert blocked.payload["reason"] == "not_exposed_in_request"
+    # The unresolved external sibling fences the whole round. Preserve the
+    # private blocked terminal without falsely publishing a completed round.
+    blocked = retained_stage["event"]
+    assert blocked["type"] == EventType.TOOL_CALL_BLOCKED.value
+    assert blocked["tool_name"] == "hidden"
+    assert blocked["payload"]["reason"] == "not_exposed_in_request"
     assert not any(
         event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
         and event.tool_name == "hidden"

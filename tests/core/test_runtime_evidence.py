@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -25,7 +26,10 @@ from cayu import (
     RuntimeEvidenceError,
     RuntimeEvidenceErrorCode,
     RuntimeEvidenceOperation,
+    RuntimeEvidenceReceipt,
     RuntimeEvidenceRequest,
+    RuntimeEvidenceSourceRef,
+    RuntimeEvidenceToolEffectReceipt,
     RuntimeEvidenceWarningCode,
     SessionIdentity,
     SessionLineageNode,
@@ -240,7 +244,17 @@ def test_runtime_evidence_labels_missing_tool_call_identity_as_malformed() -> No
     }
 
 
-def test_runtime_evidence_receipt_reconciliation_supersedes_recorded_state() -> None:
+@pytest.mark.parametrize(
+    "reconciled_event_type",
+    [
+        EventType.PROVIDER_OPERATION_RECONCILED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+    ],
+)
+def test_runtime_evidence_receipt_reconciliation_supersedes_recorded_state(
+    reconciled_event_type,
+) -> None:
     async def scenario():
         store = InMemorySessionStore()
         await _create_session(store, "root")
@@ -263,7 +277,7 @@ def test_runtime_evidence_receipt_reconciliation_supersedes_recorded_state() -> 
                 ),
                 Event(
                     id="receipt-reconciled",
-                    type=EventType.PROVIDER_OPERATION_RECONCILED,
+                    type=reconciled_event_type,
                     session_id="root",
                     payload={
                         "receipt_id": "receipt-1",
@@ -286,6 +300,214 @@ def test_runtime_evidence_receipt_reconciliation_supersedes_recorded_state() -> 
     assert RuntimeEvidenceWarningCode.MALFORMED_RECEIPT not in {
         warning.code for warning in report.warnings
     }
+
+
+def _effect_receipt_envelope():
+    return {
+        "schema_version": 1,
+        "receipt_id": "receipt-1",
+        "receipt_schema": "deployment",
+        "receipt_schema_version": 1,
+        "outcome": "completed",
+        "source": "adapter",
+        "observed_at": "2026-09-08T00:00:00Z",
+        "receipt_digest": "a" * 64,
+        "integrity": {"intent": "b" * 64},
+        "resource_versions": {"service": "v2"},
+    }
+
+
+@pytest.mark.parametrize("order", ["valid-invalid", "invalid-valid", "invalid-only"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("schema_version", True),
+        ("receipt_schema_version", True),
+        ("receipt_id", "other-receipt"),
+        ("outcome", "failed"),
+        ("source", {"secret": "receipt-canary"}),
+        ("receipt_digest", "receipt-canary"),
+        ("resource_versions", {"service": False}),
+        ("integrity", {str(i): "v" for i in range(17)}),
+        ("observed_at", "2026-09-08T00:00:00"),
+        ("raw_response", "receipt-canary"),
+    ],
+)
+def test_runtime_evidence_rejects_invalid_effect_envelopes_without_replacing_positive_evidence(
+    order, field, value, caplog, capsys
+):
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "root")
+        for kind in ["invalid"] if order == "invalid-only" else order.split("-"):
+            envelope = _effect_receipt_envelope()
+            if kind == "invalid":
+                envelope[field] = value
+            await store.append_event(
+                "root",
+                Event(
+                    id=kind,
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id="root",
+                    payload={
+                        "receipt_id": "receipt-1",
+                        "tool_call_id": "call-1",
+                        "effect_reconciled": True,
+                        "reconciliation_state": "reconciled",
+                        "receipt_evidence": envelope,
+                    },
+                ),
+            )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(root_session_id="root", max_sessions=10, max_events=20),
+        )
+
+    report = asyncio.run(scenario())
+    receipts = report.sessions[0].receipts
+    assert len(receipts) == int(order != "invalid-only")
+    if receipts:
+        assert receipts[0].source_ref.event_id == "valid"
+        assert receipts[0].receipt_evidence.receipt_digest == "a" * 64
+    assert RuntimeEvidenceWarningCode.MALFORMED_RECEIPT in {w.code for w in report.warnings}
+    captured = capsys.readouterr()
+    assert (
+        "receipt-canary" not in report.model_dump_json() + caplog.text + captured.out + captured.err
+    )
+
+
+@pytest.mark.parametrize("location", ["nested", "missing-identity", "missing-marker"])
+def test_runtime_evidence_does_not_promote_ambiguous_receipt_envelope(location):
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "root")
+        payload = {
+            "receipt_evidence": _effect_receipt_envelope(),
+            "reconciliation_state": "reconciled",
+        }
+        if location == "missing-identity":
+            payload["effect_reconciled"] = True
+        else:
+            payload["receipt_id"] = "receipt-1"
+        if location == "nested":
+            payload["effect_reconciled"] = True
+            payload = {"result": {"structured": payload}}
+        await store.append_event(
+            "root",
+            Event(
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="root",
+                payload=payload,
+            ),
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(root_session_id="root", max_sessions=10, max_events=20),
+        )
+
+    report = asyncio.run(scenario())
+    if location == "nested":
+        receipt = report.sessions[0].receipts[0]
+        assert receipt.receipt_evidence is None
+    else:
+        assert report.sessions[0].receipts == ()
+        assert RuntimeEvidenceWarningCode.MALFORMED_RECEIPT in {w.code for w in report.warnings}
+
+
+def test_runtime_evidence_receipt_envelope_is_detached_and_revalidated():
+    source = _effect_receipt_envelope()
+    envelope = RuntimeEvidenceToolEffectReceipt(**source)
+    source["resource_versions"]["service"] = "changed"
+    receipt = RuntimeEvidenceReceipt(
+        receipt_id="receipt-1",
+        reconciliation_state="reconciled",
+        source_ref=RuntimeEvidenceSourceRef(event_id="event", sequence=1),
+        receipt_evidence=envelope,
+    )
+    envelope.resource_versions["service"] = "changed"
+    assert receipt.receipt_evidence.resource_versions == {"service": "v2"}
+    envelope.integrity["invalid"] = False
+    with pytest.raises(ValueError):
+        RuntimeEvidenceReceipt(
+            receipt_id="receipt-1",
+            reconciliation_state="reconciled",
+            source_ref=receipt.source_ref,
+            receipt_evidence=envelope,
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source", "operator"),
+        ("receipt_schema", "other-schema"),
+        ("receipt_schema_version", 2),
+        ("observed_at", "2026-09-09T00:00:00Z"),
+        ("receipt_digest", "c" * 64),
+        ("integrity", {"intent": "c" * 64}),
+        ("resource_versions", {"service": "v3"}),
+    ],
+)
+def test_runtime_evidence_conflicting_receipt_identity_preserves_first_evidence(field, value):
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "root")
+        for event_id in ("first", "conflicting"):
+            envelope = _effect_receipt_envelope()
+            if event_id == "conflicting":
+                envelope[field] = value
+            await store.append_event(
+                "root",
+                Event(
+                    id=event_id,
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id="root",
+                    payload={
+                        "receipt_id": "receipt-1",
+                        "tool_call_id": "call-1",
+                        "effect_reconciled": True,
+                        "reconciliation_state": "reconciled",
+                        "receipt_evidence": envelope,
+                    },
+                ),
+            )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(root_session_id="root", max_sessions=10, max_events=20),
+        )
+
+    report = asyncio.run(scenario())
+    receipt = report.sessions[0].receipts[0]
+    assert receipt.source_ref.event_id == "first"
+    assert receipt.receipt_evidence == RuntimeEvidenceToolEffectReceipt(
+        **_effect_receipt_envelope()
+    )
+    assert RuntimeEvidenceWarningCode.MALFORMED_RECEIPT in {w.code for w in report.warnings}
+
+
+def test_runtime_evidence_rejects_mutated_envelope_without_serializer_diagnostics(caplog, capsys):
+    class Hostile:
+        def __repr__(self):
+            return "receipt-secret-canary"
+
+        __str__ = __repr__
+
+    envelope = RuntimeEvidenceToolEffectReceipt(**_effect_receipt_envelope())
+    envelope.resource_versions["service"] = Hostile()
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError) as caught:
+            RuntimeEvidenceReceipt(
+                receipt_id="receipt-1",
+                reconciliation_state="reconciled",
+                source_ref=RuntimeEvidenceSourceRef(event_id="event", sequence=1),
+                receipt_evidence=envelope,
+            )
+    assert not captured_warnings
+    captured = capsys.readouterr()
+    assert "receipt-secret-canary" not in (
+        str(caught.value) + repr(caught.value) + caplog.text + captured.out + captured.err
+    )
 
 
 def test_runtime_evidence_projects_safe_workspace_mutation_and_finalization() -> None:
@@ -432,7 +654,7 @@ def test_runtime_evidence_projects_safe_workspace_mutation_and_finalization() ->
     report = asyncio.run(scenario())
     session = report.sessions[0]
 
-    assert report.schema_version == 4
+    assert report.schema_version == 5
     assert len(session.workspace_mutations) == 1
     mutation = session.workspace_mutations[0]
     assert mutation.window_id == "window-1"
@@ -1498,7 +1720,7 @@ def test_runtime_evidence_projects_bounded_lineage_attempts_and_safe_totals() ->
 
     report = asyncio.run(scenario())
 
-    assert report.schema_version == 4
+    assert report.schema_version == 5
     assert report.scope.descendant_session_ids == ("root", "child")
     assert [session.session_id for session in report.sessions] == ["root", "child"]
     assert report.sessions[1].parent_session_id == "root"
@@ -2489,7 +2711,7 @@ async def _minimal_golden_report(
     )
 
 
-def test_runtime_evidence_sqlite_restart_and_v4_golden_are_exact(tmp_path: Path) -> None:
+def test_runtime_evidence_sqlite_restart_and_v5_golden_are_exact(tmp_path: Path) -> None:
     async def scenario():
         database = tmp_path / "runtime-evidence.sqlite"
         first_store = SQLiteSessionStore(database)
@@ -2505,7 +2727,7 @@ def test_runtime_evidence_sqlite_restart_and_v4_golden_are_exact(tmp_path: Path)
 
     first, second = asyncio.run(scenario())
     assert first == second
-    golden_path = Path(__file__).parents[1] / "fixtures" / "runtime_evidence_v4.json"
+    golden_path = Path(__file__).parents[1] / "fixtures" / "runtime_evidence_v5.json"
     assert first.model_dump(mode="json") == json.loads(golden_path.read_text())
 
 

@@ -1203,10 +1203,14 @@ def test_durable_reconciler_reattaches_terminal_receipts_without_replay(
         )
 
         assert recovered_publication is not None
+        assert recovered_publication.disposition == "confirmed"
+        recovered_publication = recovered_publication.result
         assert recovered_publication.content == published.content
         assert recovered_publication.structured is not None
         assert recovered_publication.structured["recovered_from_durable_receipt"] is True
         assert recovered_materialization is not None
+        assert recovered_materialization.disposition == "confirmed"
+        recovered_materialization = recovered_materialization.result
         assert recovered_materialization.structured is not None
         assert (
             recovered_materialization.structured["materialization_receipt"]
@@ -1324,6 +1328,8 @@ def test_durable_reconciler_finalizes_a_proven_materialization_preparation(
         )
 
         assert recovered is not None
+        assert recovered.disposition == "confirmed"
+        recovered = recovered.result
         assert recovered.is_error is False
         assert recovered.structured is not None
         receipt = recovered.structured["materialization_receipt"]

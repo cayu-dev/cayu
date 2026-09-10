@@ -79,6 +79,7 @@ from cayu import (
     ToolCapabilityCeiling,
     ToolContext,
     ToolEffect,
+    ToolEffectReconciliationRequest,
     ToolResult,
     ToolRoundRecoveryRequest,
     ToolSpec,
@@ -5366,6 +5367,7 @@ def test_resume_rejects_stale_or_missing_worker_authority_before_provider(
         "tool_approval",
         "tool_approval_recovery",
         "tool_round_recovery",
+        "tool_effect_reconciliation",
         "provider_operation",
     ],
 )
@@ -5423,6 +5425,21 @@ def test_typed_continuations_require_elected_worker_authority_before_execution(
                     tool_call_id="tool-call-id",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="completed externally",
+                )
+            )
+        elif continuation_kind == "tool_effect_reconciliation":
+            stream = app.reconcile_tool_effect(
+                ToolEffectReconciliationRequest(
+                    session_id="typed-continuation-session",
+                    session_instance_id="session-instance",
+                    task_worker_id=worker_id,
+                    tool_round_id="tool-round-id",
+                    tool_call_id="tool-call-id",
+                    tool_name="external-tool",
+                    idempotency_key="stable-key",
+                    expected_run_epoch=0,
+                    expected_revision=0,
+                    lookup=True,
                 )
             )
         elif continuation_kind == "tool_round_recovery":
@@ -5485,8 +5502,13 @@ def test_typed_continuations_require_elected_worker_authority_before_execution(
         ).task
         assert elected is not None
 
+        before_session = await app.session_store.load("typed-continuation-session")
+        before_events = await app.session_store.load_events("typed-continuation-session")
         with pytest.raises(TaskClaimLost):
             await invoke_continuation()
+        assert await app.session_store.load("typed-continuation-session") == before_session
+        assert await app.session_store.load_events("typed-continuation-session") == before_events
+        assert await task_store.load_task("typed-continuation-task") == elected
         return await task_store.load_task("typed-continuation-task")
 
     task = asyncio.run(scenario())

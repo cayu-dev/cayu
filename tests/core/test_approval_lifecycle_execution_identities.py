@@ -118,6 +118,24 @@ class _FailingTerminalToolEventStore(InMemorySessionStore):
             raise RuntimeError("terminal tool event unavailable")
         await super().append_events(session_id, events)
 
+    async def publish_session_operation(self, session_id: str, **kwargs):
+        # Staging now binds the effect outcome in an atomic operation before
+        # event fanout. Fail inside that transaction, before it commits.
+        transform = kwargs["operation_transform"]
+
+        def fail_terminal(*args):
+            publication = transform(*args)
+            if not self.failed_terminal_once and any(
+                record.get("state") == "completed" and record.get("terminal") is not None
+                for record in publication.operation_records.values()
+            ):
+                self.failed_terminal_once = True
+                raise RuntimeError("terminal tool event unavailable")
+            return publication
+
+        kwargs["operation_transform"] = fail_terminal
+        return await super().publish_session_operation(session_id, **kwargs)
+
 
 def test_approval_and_tool_evidence_reference_the_admitted_execution_profile() -> None:
     async def scenario() -> None:
@@ -436,7 +454,10 @@ def test_approval_request_drift_is_rejected_while_a_mixed_round_can_still_execut
         with pytest.raises(SimulatedProcessLoss):
             _ = [event async for event in app.resolve_tool_approval(request)]
         assert sink.failed is True
-        assert tool.calls == []
+        # Terminal publication is deferred until admitted calls have staged
+        # their results. The authorized sibling may already have run; the
+        # ambiguous call must remain blocked and no retry may execute it.
+        assert tool.calls == [{"value": "may execute after acknowledgement"}]
         blocked_events = [
             event
             for event in await store.load_events(session_id)
@@ -466,7 +487,7 @@ def test_approval_request_drift_is_rejected_while_a_mixed_round_can_still_execut
             EventType.SESSION_INTERRUPTED,
         ]
         assert "different resolution request" in conflicting[-1].payload["error"]
-        assert tool.calls == []
+        assert tool.calls == [{"value": "may execute after acknowledgement"}]
 
         completed = [event async for event in app.resolve_tool_approval(request)]
         assert completed[-1].type is EventType.SESSION_COMPLETED
@@ -578,10 +599,16 @@ def test_expired_pre_digest_approval_grant_retry_fails_closed_without_coercion()
 
 
 def test_tool_approval_recovery_does_not_authorize_unstarted_sibling() -> None:
+    class PureRecordingTool(_RecordingTool):
+        # Exercise the supported manual-result recovery entrance. This fixture
+        # only records in-memory calls; external effects require receipts and
+        # reject this entrance before sibling-authorization checks.
+        spec = _RecordingTool.spec.model_copy(update={"effect": "none"})
+
     async def scenario() -> None:
         session_id = "sess_approval_recovery_pending_sibling"
         store = _FailingTerminalToolEventStore()
-        tool = _RecordingTool()
+        tool = PureRecordingTool()
         provider = ScriptedModelProvider(
             [
                 [

@@ -1563,7 +1563,9 @@ spec.loader.exec_module(worker)
 
 async def main():
     owner = await worker._start_temporary_profile_owner(timeout_seconds=1.0)
-    Path(sys.argv[1]).write_text(
+    marker = Path(sys.argv[1])
+    staging = marker.with_suffix(".pending")
+    staging.write_text(
         json.dumps(
             {
                 "worker_pid": os.getpid(),
@@ -1573,6 +1575,7 @@ async def main():
         ),
         encoding="utf-8",
     )
+    staging.replace(marker)
     await asyncio.Event().wait()
 
 asyncio.run(main())

@@ -564,10 +564,17 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
         assert len(provider.requests) == 1
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        assert "pending_tool_round" not in checkpoint
+        # Cancellation settles the waiter, not the external effect. Keep the
+        # original round available for exact reconciliation instead of inventing
+        # failed tool outcomes and allowing the round to be retired.
+        assert "pending_tool_round" in checkpoint
         assert "pending_session_interrupt" not in checkpoint
         terminals = [e for e in persisted if e.type == EventType.TOOL_CALL_FAILED]
-        assert len(terminals) == tool_count
+        assert terminals == []
+        uncertain = [e for e in persisted if e.type == EventType.TOOL_EFFECT_OUTCOME_UNKNOWN]
+        assert {e.payload["tool_call_id"] for e in uncertain} == {
+            f"call-{index}" for index in range(tool_count)
+        }
         assert not any(e.type == EventType.TOOL_CALL_COMPLETED for e in persisted)
         assert timeout.execution_deadline["remaining_seconds"] == 0.0
         assert isinstance(timeout.__cause__, asyncio.CancelledError)

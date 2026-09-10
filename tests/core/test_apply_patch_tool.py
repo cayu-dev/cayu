@@ -1020,6 +1020,8 @@ def test_apply_patch_durable_recovery_reconstructs_without_replay_and_refuses_dr
     }
     recovered = asyncio.run(tool.reconcile_durable_tool_call(**recovery_arguments))
     assert recovered is not None
+    assert recovered.disposition == "confirmed"
+    recovered = recovered.result
     assert recovered.structured["outcome"] == "applied"
     assert recovered.structured["recovered"] is True
     assert recovered.structured["operations"][0]["replacement_count"] == 101
@@ -1038,6 +1040,8 @@ def test_apply_patch_durable_recovery_reconstructs_without_replay_and_refuses_dr
         )
     )
     assert drifted is not None
+    assert drifted.disposition == "unresolved"
+    drifted = drifted.result
     assert drifted.structured["outcome"] == "unsupported"
     assert drifted.structured["failure_category"] == "execution_profile_drift"
 

@@ -95,9 +95,13 @@ class _EchoTool(Tool):
 
 @pytest.mark.parametrize("unfinished_sibling", [False, True])
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("effect", ["external", "idempotent"])
 def test_cancellation_publishes_completed_stage_without_reexecuting_tool(
-    tmp_path, unfinished_sibling, backend
+    tmp_path, unfinished_sibling, backend, effect
 ):
+    from cayu.core.tools import ToolEffect
+    from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+
     class PausedTerminalMixin:
         def __init__(self, *args):
             super().__init__(*args)
@@ -121,7 +125,11 @@ def test_cancellation_publishes_completed_stage_without_reexecuting_tool(
 
     class StagedEcho(_EchoTool):
         spec = _EchoTool.spec.model_copy(
-            update={"workspace_mutation": True, "parallel_safe": False}
+            update={
+                "workspace_mutation": True,
+                "parallel_safe": False,
+                "effect": ToolEffect(effect),
+            }
         )
         calls = 0
 
@@ -185,14 +193,30 @@ def test_cancellation_publishes_completed_stage_without_reexecuting_tool(
         assert len(terminals) == 1
         assert terminals[0].payload["result"]["content"] == "finished"
         assert tool.calls == (2 if unfinished_sibling else 1)
-        if unfinished_sibling:
-            failures = [e for e in events if e.type == EventType.TOOL_CALL_FAILED]
-            assert len(failures) == 1
-            assert failures[0].payload["tool_call_id"] == "unfinished-call"
-            assert failures[0].payload["interrupted"] is True
         checkpoint = await store.load_checkpoint("cancel-staged-result")
         assert checkpoint is not None
-        assert "pending_tool_round" not in checkpoint
+        if unfinished_sibling:
+            failures = [e for e in events if e.type == EventType.TOOL_CALL_FAILED]
+            if effect == "external":
+                # A staged sibling is authoritative, but cannot prove the outcome
+                # of the other dispatched external call or authorize its replay.
+                assert failures == []
+                pending = checkpoint["pending_tool_round"]
+                session = await store.load("cancel-staged-result")
+                unresolved = await ToolEffectStateOwner(store).resolve_call(
+                    session,
+                    tool_round_id=pending["tool_round_id"],
+                    tool_call_id="unfinished-call",
+                )
+                assert unresolved is not None
+                assert unresolved.state == "outcome_unknown"
+                assert unresolved.terminal is None
+            else:
+                assert len(failures) == 1
+                assert failures[0].payload["tool_call_id"] == "unfinished-call"
+                assert failures[0].payload["interrupted"] is True
+        if not unfinished_sibling or effect == "idempotent":
+            assert "pending_tool_round" not in checkpoint
         if isinstance(store, SQLiteSessionStore):
             await store.close()
 

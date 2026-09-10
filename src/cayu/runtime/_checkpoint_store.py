@@ -271,6 +271,10 @@ class _RuntimeCheckpointSessionStore:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
 
+    async def append_tool_effect_conflict(self, request: object) -> Any:
+        """Evidence-only append has no checkpoint to decode, project, or stamp."""
+        return await self._store.append_tool_effect_conflict(request)
+
     @property
     def supports_owned_off_thread_session_commit_guards(self) -> bool:
         """Preserve the wrapped store's guarded-mutation capability exactly."""

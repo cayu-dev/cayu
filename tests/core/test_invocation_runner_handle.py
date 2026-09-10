@@ -2296,6 +2296,71 @@ def test_parallel_runner_cleanup_failures_cross_task_group_cancellation() -> Non
     assert secret not in repr(events)
 
 
+@pytest.mark.parametrize("trusted", [False, True])
+def test_admission_cancellation_snapshot_does_not_trust_raw_causes(trusted) -> None:
+    from cayu.environments.admission import (
+        ExecutionAdmissionError,
+        ExecutionRequirements,
+        evaluate_execution_admission,
+    )
+
+    secret = "admission-cancellation-secret-canary"
+    refusal = ExecutionAdmissionError(
+        evaluate_execution_admission(
+            candidate="unverified",
+            requirements=ExecutionRequirements.trusted(cleanup="confirmed"),
+            evidence=None,
+        )
+    )
+    cancellation = asyncio.CancelledError()
+    cancellation.__cause__ = refusal
+    if trusted:
+        invocation_secrets_module.retain_admission_refusal(cancellation, refusal)
+    assert not invocation_secrets_module.has_cancellation_evidence(cancellation)
+    refusal.add_note(secret)
+    refusal.__cause__ = RuntimeError(secret)
+    for _ in range(2):
+        invocation_secrets_module.sanitize_external_cancellation(cancellation)
+        published = cancellation.__cause__
+        if trusted:
+            assert type(published) is ExecutionAdmissionError
+            assert published is not refusal
+            assert published.__cause__ is None
+            assert published.__context__ is None
+            assert published.__traceback__ is None
+            assert not getattr(published, "__notes__", None)
+            published.add_note(secret)
+        else:
+            assert published is None
+        assert secret not in repr(cancellation.__dict__)
+
+
+def test_admission_cancellation_transfer_deduplicates_identity_not_content() -> None:
+    from cayu.environments.admission import (
+        ExecutionAdmissionError,
+        ExecutionRequirements,
+        evaluate_execution_admission,
+    )
+
+    decision = evaluate_execution_admission(
+        candidate="unverified",
+        requirements=ExecutionRequirements.trusted(cleanup="confirmed"),
+        evidence=None,
+    )
+    first, second, target = (asyncio.CancelledError() for _ in range(3))
+    for source in (first, second):
+        invocation_secrets_module.retain_admission_refusal(
+            source, ExecutionAdmissionError(decision)
+        )
+    for _ in range(2):
+        invocation_secrets_module.transfer_admission_refusals(target, [first, first, second])
+        invocation_secrets_module.sanitize_external_cancellation(target)
+        assert isinstance(target.__cause__, BaseExceptionGroup)
+        assert len(target.__cause__.exceptions) == 2
+        assert all(type(error) is ExecutionAdmissionError for error in target.__cause__.exceptions)
+        assert not invocation_secrets_module.has_cancellation_evidence(target)
+
+
 def test_external_cancellation_resanitizes_mutated_authenticated_runner_failure() -> None:
     secret = "mutated-runner-cause-secret-canary-ABCDEFGHIJKLMNOP"
     runner = _CleanupReplacingCancellationRunner()

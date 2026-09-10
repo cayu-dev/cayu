@@ -190,6 +190,15 @@ def _isolated_cancellation_cause(
     return None
 
 
+class ToolDispatchAdmissionRefusal(ExecutionAdmissionError):
+    """Internal proof that the runtime callback refused before Tool.run."""
+
+    def __init__(self, refusal: ExecutionAdmissionError, *, owner: object) -> None:
+        super().__init__(refusal.decision)
+        self.refusal = refusal
+        self.owner = owner
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ToolExecutionOutcome:
     """Runtime-owned result plus terminal controls a tool cannot supply.
@@ -434,6 +443,7 @@ async def _run_tool(
     grouped_failure: BaseExceptionGroup | None = None
     current_task = asyncio.current_task()
     cancellation_baseline = 0 if current_task is None else current_task.cancelling()
+    dispatch_owner = object()
     if type(effect) is not ToolEffect:
         raise TypeError("effect must be a ToolEffect.")
     if not callable(redactor):
@@ -442,7 +452,10 @@ async def _run_tool(
 
         async def invoke_registered_tool() -> ToolResult:
             if before_dispatch is not None:
-                await before_dispatch()
+                try:
+                    await before_dispatch()
+                except ExecutionAdmissionError as refusal:
+                    raise ToolDispatchAdmissionRefusal(refusal, owner=dispatch_owner) from None
             current_execution_deadline().require_admission("tool")
             if type(tool) is not ProcessIsolatedTool:
                 return await tool.run(ctx, arguments)
@@ -681,12 +694,12 @@ async def _run_tool(
             redactor=active_redactor,
         )
         return _execution_outcome(result, controls)
-    except ExecutionAdmissionError:
-        # This is a runtime-owned authorization refusal at the final dispatch
-        # seam, not an extension failure that may be returned to the model as
-        # an ordinary tool error.
-        raise
     except Exception as exc:
+        # Only this invocation's runtime callback proves that Tool.run was
+        # never entered. Identical tool-authored errors remain ordinary tool
+        # failures, ambiguous for external effects.
+        if type(exc) is ToolDispatchAdmissionRefusal and exc.owner is dispatch_owner:
+            raise
         committed_cancellation = durable_subagent_committed_cancellation_outcome(exc)
         unsettled_cancellation = durable_subagent_unsettled_cancellation_outcome(exc)
         if committed_cancellation is not None:

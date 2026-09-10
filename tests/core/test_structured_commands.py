@@ -28,6 +28,7 @@ from cayu import (
     SecretRedactor,
     StructuredCommandToolPolicy,
     ToolContext,
+    ToolExecutableRequirement,
     ToolPolicyDecision,
     ToolPolicyRequest,
 )
@@ -212,6 +213,9 @@ class _AdmittedRunner:
             ExecutionExecutableEvidence(
                 executable=executable,
                 state="live_verified",
+                requirement_fingerprint=ToolExecutableRequirement(
+                    executable=executable
+                ).fingerprint,
                 observed_at=now,
                 valid_until=now + timedelta(minutes=1),
             )
@@ -898,6 +902,8 @@ def test_structured_command_durable_recovery_never_replays_forced_interruption(
     )
 
     assert recovered is not None
+    assert recovered.disposition == "unresolved"
+    recovered = recovered.result
     assert recovered.structured["status"] == "ambiguous"
     assert recovered.structured["error"] == "command_acknowledgement_lost"
     assert recovered.structured["replayed"] is False
@@ -908,16 +914,35 @@ def test_structured_command_durable_recovery_never_replays_forced_interruption(
 
 @pytest.mark.parametrize("recovery_source", ("journal", "runner"))
 @pytest.mark.parametrize("output", ["ok", "a\0b"])
+@pytest.mark.parametrize("cleanup_uncertain", [False, True], ids=["settled", "uncertain"])
 def test_structured_command_recovery_projects_checkpointed_runner_terminal(
     tmp_path: Path,
     output: str,
     monkeypatch: pytest.MonkeyPatch,
     recovery_source: str,
+    cleanup_uncertain: bool,
 ) -> None:
     (tmp_path / "uv.lock").write_bytes(b"locked\n")
     workspace = LocalWorkspace(tmp_path, workspace_id="workspace")
     profile = _profile()
-    runner = _AdmittedRunner(profile, result=ExecResult(stdout=output, stderr=output))
+    runner = _AdmittedRunner(
+        profile,
+        result=ExecResult(
+            stdout=output,
+            stderr=output,
+            artifacts=[
+                {
+                    "type": "cayu.runner_cleanup.v1",
+                    "adapter": "docker",
+                    "action": "kill_command",
+                    "status": "failed",
+                    "timeout_s": 1.0,
+                }
+            ]
+            if cleanup_uncertain
+            else [],
+        ),
+    )
     tool = RunCommandTool(toolchain_profile=profile)
     arguments = {"selector": "focused-test", "args": ["tests/test_unit.py"]}
     records: dict[str, dict[str, object]] = {}
@@ -1025,11 +1050,14 @@ def test_structured_command_recovery_projects_checkpointed_runner_terminal(
     )
 
     assert recovered is not None
+    assert recovered.disposition == ("unresolved" if cleanup_uncertain else "confirmed")
+    recovered = recovered.result
     for stream in ("stdout", "stderr"):
         encoding = recovered.structured[f"{stream}_encoding"]
         value = recovered.structured[stream]
         assert (json.loads(value) if encoding == "json-string" else value) == output
-    assert recovered.structured["status"] == "succeeded"
+    assert recovered.structured["status"] == ("ambiguous" if cleanup_uncertain else "succeeded")
+    assert recovered.structured["cleanup_uncertain"] is cleanup_uncertain
     assert recovered.structured["process_status"] == "succeeded"
     assert recovered.structured["dispatch"] == "runner_terminal_evidence"
     assert recovered.structured["recovered"] is True
@@ -1042,14 +1070,33 @@ def test_structured_command_recovery_projects_checkpointed_runner_terminal(
 @pytest.mark.parametrize(
     "output", ["ok", "a\0b", "\0" * 2_000], ids=["text", "encoded", "encoded-preview"]
 )
+@pytest.mark.parametrize("cleanup_uncertain", [False, True], ids=["settled", "uncertain"])
 def test_structured_command_durable_recovery_reconstructs_terminal_result(
     tmp_path: Path,
     output: str,
+    cleanup_uncertain: bool,
 ) -> None:
     (tmp_path / "uv.lock").write_bytes(b"locked\n")
     workspace = LocalWorkspace(tmp_path, workspace_id="workspace")
     profile = _profile()
-    runner = _AdmittedRunner(profile, result=ExecResult(stdout=output, stderr=output))
+    runner = _AdmittedRunner(
+        profile,
+        result=ExecResult(
+            stdout=output,
+            stderr=output,
+            artifacts=[
+                {
+                    "type": "cayu.runner_cleanup.v1",
+                    "adapter": "docker",
+                    "action": "kill_command",
+                    "status": "failed",
+                    "timeout_s": 1.0,
+                }
+            ]
+            if cleanup_uncertain
+            else [],
+        ),
+    )
     tool = RunCommandTool(toolchain_profile=profile)
     arguments = {"selector": "focused-test", "args": ["tests/test_unit.py"]}
     records: dict[str, dict[str, object]] = {}
@@ -1112,6 +1159,11 @@ def test_structured_command_durable_recovery_reconstructs_terminal_result(
 
     assert next(iter(records.values()))["state"] == "terminal"
     assert recovered is not None
+    if cleanup_uncertain:
+        assert completed.structured["status"] == "ambiguous"
+        assert completed.structured["cleanup_uncertain"] is True
+    assert recovered.disposition == ("unresolved" if cleanup_uncertain else "confirmed")
+    recovered = recovered.result
     for stream in ("stdout", "stderr"):
         encoding = recovered.structured[f"{stream}_encoding"]
         value = recovered.structured[stream]
@@ -1131,6 +1183,43 @@ def test_structured_command_durable_recovery_reconstructs_terminal_result(
     assert recovered.structured["replayed"] is False
     assert recovered.structured["dispatch"] == "terminal_evidence"
     assert len(runner.commands) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "settlement", "cleanup_uncertain", "expected"),
+    [
+        ("partial", "complete", False, "confirmed"),
+        ("timed_out", "runner_quiescent", False, "confirmed"),
+        ("cancelled", "runner_quiescent", False, "confirmed"),
+        ("failed", "complete", False, "confirmed"),
+        ("partial", "deferred", True, "unresolved"),
+        ("timed_out", "uncertain", True, "unresolved"),
+        ("cancelled", "uncertain", True, "unresolved"),
+        ("failed", "uncertain", True, "unresolved"),
+        ("ambiguous", "complete", False, "unresolved"),
+        ("future", "complete", False, "unresolved"),
+        ("succeeded", "future", False, "unresolved"),
+        ("succeeded", None, False, "unresolved"),
+        ("succeeded", True, False, "unresolved"),
+        ("succeeded", "complete", None, "unresolved"),
+        ("succeeded", "complete", 0, "unresolved"),
+    ],
+)
+def test_command_terminal_evidence_requires_positive_settlement(
+    status, settlement, cleanup_uncertain, expected
+):
+    from cayu.core.tools import ToolResult
+    from cayu.tools.structured_commands import _command_terminal_recovery_evidence
+
+    structured = {"status": status}
+    if settlement is not None:
+        structured["workspace_mutation_settlement"] = settlement
+    if cleanup_uncertain is not None:
+        structured["cleanup_uncertain"] = cleanup_uncertain
+    result = ToolResult(structured=structured)
+    evidence = _command_terminal_recovery_evidence(result)
+    assert evidence.disposition == expected
+    assert evidence.result == result
 
 
 def test_structured_command_refuses_success_with_uncertain_cleanup(tmp_path: Path) -> None:

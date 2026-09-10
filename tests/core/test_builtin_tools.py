@@ -5513,7 +5513,7 @@ def test_allowed_nonzero_command_remains_completed_and_not_policy_blocked():
     assert runner.command == ExecCommand.process("missing-command")
 
 
-def test_command_policy_exception_remains_tool_failure_not_policy_block():
+def test_command_policy_exception_retains_unknown_effect_not_policy_block():
     runner = RecordingRunner()
 
     class RaisingCommandPolicy(CommandPolicy):
@@ -5556,11 +5556,33 @@ def test_command_policy_exception_remains_tool_failure_not_policy_block():
         )
     )
 
-    failed = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
-    assert len(failed) == 1
-    assert failed[0].payload["result"]["content"] == "command policy crashed"
+    # The policy runs inside the external tool, not the runtime's authenticated
+    # pre-dispatch boundary. Its exception proves neither denial nor settlement.
+    unknown = [event for event in events if event.type == EventType.TOOL_EFFECT_OUTCOME_UNKNOWN]
+    assert len(unknown) == 1
+    durable_events = asyncio.run(app.session_store.load_events("sess_command_policy_error"))
+    durable_unknown = [
+        event for event in durable_events if event.type == EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    ]
+    started = [event for event in durable_events if event.type == EventType.TOOL_CALL_STARTED]
+    assert len(started) == 1
+    assert len(durable_unknown) == 1
+    assert durable_unknown[0].payload["tool_call_id"] == started[0].payload["tool_call_id"]
+    assert durable_unknown[0].payload["tool_call_id"] == "call_policy_error"
+    assert all(
+        event.type not in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in events
+    )
     assert all(event.type != EventType.TOOL_CALL_BLOCKED for event in events)
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    assert len(provider.requests) == 1
     assert runner.command is None
+    checkpoint = asyncio.run(app.session_store.load_checkpoint("sess_command_policy_error"))
+    assert checkpoint is not None and checkpoint.get("pending_tool_round") is not None
+    assert [
+        message.role
+        for message in asyncio.run(app.session_store.load_transcript("sess_command_policy_error"))
+    ] == ["user"]
 
 
 def test_command_policy_denial_resolves_once_inside_mixed_tool_round():

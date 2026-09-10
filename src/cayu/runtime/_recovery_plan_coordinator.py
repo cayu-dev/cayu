@@ -21,6 +21,7 @@ from cayu.core.events import (
     event_with_runtime_generated_id,
 )
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._durable_operation_ownership import (
     DurableOperationOwnership,
     DurableOperationOwnershipAction,
@@ -51,6 +52,7 @@ from cayu.runtime._recovery_coordinator import (
 from cayu.runtime._task_store_operation_boundary import (
     task_store_exact_interrupted_handoff_capability_is_complete,
 )
+from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.approvals import ToolApprovalRecoveryOutcome
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
@@ -720,18 +722,34 @@ class RecoveryPlanCoordinator:
         )
         for action, evidence in zip(pending_records, pending_actions, strict=True):
             if action.kind is PendingActionKind.MANUAL_RECOVERY:
+                if action.round_id is None or action.tool_call_id is None:
+                    blockers.append(
+                        RecoveryPlanBlocker(code=RecoveryBlockerCode.INVALID_DURABLE_STATE)
+                    )
+                    continue
+                effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+                    session,
+                    tool_round_id=action.round_id,
+                    tool_call_id=action.tool_call_id,
+                )
+                if effect is not None and effect.terminal is not None:
+                    # The effect owner already selected an immutable result.
+                    # Existing automatic recovery publishes/repairs that evidence;
+                    # an operator must not replace it with a manual result.
+                    continue
                 blockers.append(
                     RecoveryPlanBlocker(
                         code=RecoveryBlockerCode.TOOL_EFFECT_OUTCOME_UNKNOWN,
                         action_ref=evidence.action_ref,
                     )
                 )
-                allowed_actions.extend(
-                    (
-                        RecoveryPlanAction.TOOL_MARK_COMPLETED,
-                        RecoveryPlanAction.TOOL_MARK_FAILED,
+                if effect is None:
+                    allowed_actions.extend(
+                        (
+                            RecoveryPlanAction.TOOL_MARK_COMPLETED,
+                            RecoveryPlanAction.TOOL_MARK_FAILED,
+                        )
                     )
-                )
             elif action.kind is PendingActionKind.TOOL_APPROVAL:
                 blockers.append(
                     RecoveryPlanBlocker(
@@ -748,6 +766,34 @@ class RecoveryPlanCoordinator:
                 )
         if pending_source_invalid:
             blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.INVALID_DURABLE_STATE))
+
+        # A selected receipt or non-dispatched preparation has a terminal event, so it disappears
+        # from the unresolved-action index before its round is consumed.
+        # Inspect the retained round as well; incomplete recovery cannot own
+        # the explicit continuation required by either selected outcome.
+        try:
+            pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        except (TypeError, ValueError):
+            pending_round = None
+            blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.INVALID_DURABLE_STATE))
+        if pending_round is not None:
+            for call in pending_round.tool_calls:
+                effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+                    session,
+                    tool_round_id=pending_round.tool_round_id,
+                    tool_call_id=call.tool_call_id,
+                )
+                if (
+                    effect is not None
+                    and effect.terminal is not None
+                    and (effect.terminal.receipt is not None or effect.dispatch_id is None)
+                ):
+                    blockers.append(
+                        RecoveryPlanBlocker(
+                            code=RecoveryBlockerCode.TOOL_EFFECT_CONTINUATION_REQUIRED
+                        )
+                    )
+                    break
 
         active = await self._session_store.load_active_model_completion_stage(session.id)
         model_evidence: RecoveryModelStageEvidence | None = None
@@ -910,6 +956,7 @@ class RecoveryPlanCoordinator:
             decision_blockers = {
                 RecoveryBlockerCode.MODEL_EFFECT_OUTCOME_UNKNOWN,
                 RecoveryBlockerCode.TOOL_EFFECT_OUTCOME_UNKNOWN,
+                RecoveryBlockerCode.TOOL_EFFECT_CONTINUATION_REQUIRED,
             }
             if (preflight is None or cascade is not None) and not any(
                 blocker.code in decision_blockers for blocker in blockers

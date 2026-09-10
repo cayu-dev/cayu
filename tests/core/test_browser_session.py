@@ -892,6 +892,7 @@ def _run_fresh_cayu_browser_recovery(
                 load_operation=load,
             )
             assert result is not None
+            result = result.result
             Path(result_path).write_text(
                 json.dumps(result.model_dump(mode="json")),
                 encoding="utf-8",
@@ -1517,6 +1518,7 @@ async def _recover_durable_browser_result(
     tool_call_id: str = "tool-call-1",
     parent_run_epoch: int = 1,
     allocation_fingerprint: str | None = "a" * 64,
+    expected_disposition: str | None = None,
 ) -> ToolResult:
     async def load(key: str) -> dict[str, Any] | None:
         record = records.get(key)
@@ -1538,7 +1540,9 @@ async def _recover_durable_browser_result(
         load_operation=load,
     )
     assert result is not None
-    return result
+    if expected_disposition is not None:
+        assert result.disposition == expected_disposition
+    return result.result
 
 
 def _tool(backend: _FakeBrowserBackend) -> BrowserSessionTool:
@@ -12890,6 +12894,7 @@ def test_browser_session_pending_recovery_reads_receipt_without_dispatch(tmp_pat
             tool,
             args=args,
             records=records,
+            expected_disposition="confirmed",
         )
         assert recovered == result
         assert len(backend.calls) == 1
@@ -12903,9 +12908,57 @@ def test_browser_session_pending_recovery_reads_receipt_without_dispatch(tmp_pat
             tool,
             args=args,
             records=records,
+            expected_disposition="unresolved",
         )
         assert ambiguous.structured["error"] == "outcome_ambiguous"
         assert ambiguous.structured["browser_session_id"] == result.structured["session_id"]
+        assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        None,
+        {},
+        {"terminal": "settled"},
+        {"dispatch": "completed"},
+        {"terminal": "future", "dispatch": "completed"},
+        {"terminal": "settled", "dispatch": "acknowledgement_lost"},
+    ],
+)
+def test_browser_native_recovery_needs_positive_terminal_execution_evidence(
+    tmp_path: Path, execution: dict[str, str] | None
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        tool = _tool(backend)
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "native-terminal-proof",
+        }
+        original = await tool.run(_durable_context(tmp_path, args=args, records=records), args)
+        assert not original.is_error
+        operation = next(
+            record
+            for record in records.values()
+            if record.get("record_type") == "cayu.browser-operation"
+        )
+        assert operation["state"] == "terminal"
+        original_execution = operation["result"]["structured"].pop("execution")
+        if execution is not None:
+            operation["result"]["structured"]["execution"] = execution
+        await _recover_durable_browser_result(
+            tool, args=args, records=records, expected_disposition="unresolved"
+        )
+        operation["result"]["structured"]["execution"] = original_execution
+        recovered = await _recover_durable_browser_result(
+            tool, args=args, records=records, expected_disposition="confirmed"
+        )
+        assert recovered == original
         assert len(backend.calls) == 1
 
     asyncio.run(scenario())

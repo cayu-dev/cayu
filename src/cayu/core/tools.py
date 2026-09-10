@@ -809,9 +809,43 @@ class DurableToolRecovery(Protocol):
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
         recovery_authority: DurableToolRecoveryAuthority | None = None,
-    ) -> ToolResult | None:
-        """Return authenticated durable evidence, or ``None`` for generic recovery."""
+    ) -> DurableToolRecoveryEvidence | None:
+        """Return an explicit evidence disposition, or None when no journal exists.
+
+        Only confirmed evidence authenticates a terminal outcome. Missing,
+        mismatched or incomplete journal evidence is unresolved, never proof
+        that an external mutation did not start. not_started requires positive
+        journal-owned preparation evidence and does not authorize automatic retry.
+        """
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class DurableToolRecoveryEvidence:
+    """Journal-owned classification, separate from its model-facing diagnostic.
+
+    The registered recovery implementation produces this value only after
+    validating the complete operation identity. The result alone, including an
+    identical caller-supplied ToolResult, carries no recovery authority.
+    """
+
+    disposition: Literal["confirmed", "not_started", "unresolved"]
+    result: ToolResult
+
+    def __post_init__(self) -> None:
+        if type(self.disposition) is not str or self.disposition not in {
+            "confirmed",
+            "not_started",
+            "unresolved",
+        }:
+            raise ValueError("Durable recovery has an invalid evidence disposition.")
+        if type(self.result) is not ToolResult:
+            raise TypeError("Durable recovery requires an exact ToolResult.")
+        object.__setattr__(
+            self,
+            "result",
+            ToolResult(**{name: getattr(self.result, name) for name in ToolResult.model_fields}),
+        )
 
 
 @dataclass(frozen=True, slots=True)

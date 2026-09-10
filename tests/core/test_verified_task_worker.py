@@ -63,6 +63,7 @@ from cayu import (
     SessionStatus,
     SQLiteSessionStore,
     SQLiteTaskStore,
+    TaskClaimLost,
     TaskCreate,
     TaskQuery,
     TaskStatus,
@@ -85,6 +86,7 @@ from cayu.providers import (
 from cayu.runtime import EventQuery
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._recovery_coordinator import RecoveryCoordinator
+from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.hooks import RuntimeHook
 from cayu.runtime.loop_policies import BeforeStopDecision, LoopPolicy
 from cayu.runtime.verified_task_worker import (
@@ -1062,6 +1064,19 @@ def _crash_worker_tool_publication(
         app.register_completion_result_resolver(contract.result_resolver, _Resolver(_task_result()))
         publish = sessions.publish_runtime_publication
         append = sessions.append_events
+        publish_operation = sessions.publish_session_operation
+
+        async def crash_at_unknown_effect(*args, **kwargs):
+            if execution_error and any(
+                event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+                for event in kwargs.get("events", ())
+            ):
+                if after_publication:
+                    await publish_operation(*args, **kwargs)
+                os._exit(75)
+            return await publish_operation(*args, **kwargs)
+
+        sessions.publish_session_operation = crash_at_unknown_effect
 
         async def crash_at_staged_terminal(session_id, events):
             if (
@@ -2669,19 +2684,38 @@ def test_worker_keeps_unknown_model_dispatch_fenced_after_process_exit(
             checkpoint = await sessions.load_checkpoint(admission.session_id)
             if execution_error:
                 assert active is None
-                [terminal] = await sessions.query_events(
+                pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+                assert pending is not None
+                session = await sessions.load(admission.session_id)
+                effect = await ToolEffectStateOwner(sessions).resolve_call(
+                    session,
+                    tool_round_id=pending.tool_round_id,
+                    tool_call_id="record-effect",
+                )
+                assert effect is not None
+                assert effect.state == ("outcome_unknown" if after_publication else "executing")
+                assert effect.terminal is None
+                assert effect.intent.effect == ToolEffect.EXTERNAL.value
+                unknown = await sessions.query_events(
                     EventQuery(
-                        session_id=admission.session_id, event_types={EventType.TOOL_CALL_FAILED}
+                        session_id=admission.session_id,
+                        event_types={EventType.TOOL_EFFECT_OUTCOME_UNKNOWN},
                     )
                 )
-                assert terminal.event.payload["tool_call_id"] == "record-effect"
-                assert terminal.event.payload["outcome_unknown"] is True
-                assert terminal.event.payload["manual_reconciliation_required"] is True
-                assert terminal.event.payload["tool_effect"] == ToolEffect.EXTERNAL.value
-                receipt = await sessions.load_runtime_publication_receipt(
-                    admission.session_id, f"tool-round:{terminal.event.payload['tool_round_id']}"
+                assert len(unknown) == int(after_publication)
+                if unknown:
+                    assert unknown[0].event.payload["tool_call_id"] == "record-effect"
+                    assert unknown[0].event.payload["state"] == "outcome_unknown"
+                assert not await sessions.query_events(
+                    EventQuery(
+                        session_id=admission.session_id,
+                        event_types={EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
+                    )
                 )
-                assert (receipt is not None) is after_publication
+                receipt = await sessions.load_runtime_publication_receipt(
+                    admission.session_id, f"tool-round:{pending.tool_round_id}"
+                )
+                assert receipt is None
                 assert (tmp_path / "effects.txt").read_text(encoding="utf-8") == "effect\n"
             elif tool_effect:
                 assert active is None
@@ -2928,8 +2962,24 @@ def test_worker_recovers_preparing_source_without_repeating_handler(
                     lease_seconds=5 if continuing else 3,
                     callback_timeout_seconds=0.5,
                 ) as worker:
-                    with pytest.raises(ConnectionError):
+                    with pytest.raises((ConnectionError, ExceptionGroup)) as caught:
                         await worker.run(max_tasks=1)
+                    leaves = [
+                        error
+                        for error in iter_exception_tree(caught.value)
+                        if not isinstance(error, BaseExceptionGroup)
+                    ]
+                    assert sum(isinstance(error, ConnectionError) for error in leaves) == 1
+                    assert len(leaves) in (1, 2)
+                    # Activation transfers the task lease before our injected
+                    # acknowledgement loss. A queued preparation heartbeat can
+                    # then correctly reject its old task authority; preserve
+                    # that secondary error rather than requiring it to vanish.
+                    assert all(
+                        isinstance(error, ConnectionError)
+                        or (fault == "activate" and isinstance(error, TaskClaimLost))
+                        for error in leaves
+                    )
             prepared = await tasks.load_latest_work_attempt_admission(task.id)
             assert prepared.state.value == ("active" if fault == "activate" else "preparing")
             assert prepared.source_request is not None

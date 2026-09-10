@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from hmac import compare_digest
 from typing import Any, cast
@@ -515,6 +515,27 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     EventType,
     Mapping[tuple[str, ...], frozenset[Any]],
 ] = {
+    EventType.TOOL_EFFECT_RECEIPT_VALIDATED: {
+        ("receipt_evidence", "outcome"): frozenset({"completed", "failed"}),
+        ("receipt_evidence", "source"): frozenset({"adapter", "reconciler", "operator"}),
+    },
+    EventType.TOOL_EFFECT_RECONCILIATION_OBSERVED: {
+        ("result", "outcome"): frozenset({"not_found", "unsupported"}),
+        ("result", "observation"): frozenset({"sent", "not_sent", "outcome_unknown", "partial"}),
+    },
+    EventType.TOOL_EFFECT_RECONCILIATION_CONFLICT: {
+        ("kind",): frozenset({"validator_rejected", "late_dispatch", "reconciliation_superseded"}),
+        ("result", "outcome"): frozenset({"conflict"}),
+        ("result", "observation"): frozenset({"sent", "not_sent", "outcome_unknown", "partial"}),
+    },
+    EventType.TOOL_EFFECT_OUTCOME_UNKNOWN: {
+        ("state",): frozenset({"outcome_unknown"}),
+        ("failure_evidence", "classification"): frozenset(
+            {"deadline", "timeout", "interruption", "failure", "unknown"}
+        ),
+        ("failure_evidence", "settlement"): frozenset({"unknown"}),
+        ("failure_evidence", "deadline_phase"): frozenset({None, "admission", "in_flight"}),
+    },
     **{
         event_type: {
             ("schema_version",): frozenset({3}),
@@ -642,7 +663,20 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         }
     },
     **{
-        event_type: {("arguments_state",): tool_argument_publication.TERMINAL_ARGUMENT_STATES}
+        event_type: {
+            ("arguments_state",): tool_argument_publication.TERMINAL_ARGUMENT_STATES,
+            **(
+                {
+                    ("reconciliation_state",): frozenset({"reconciled"}),
+                    ("receipt_evidence", "outcome"): frozenset({"completed", "failed"}),
+                    ("receipt_evidence", "source"): frozenset(
+                        {"adapter", "reconciler", "operator"}
+                    ),
+                }
+                if event_type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+                else {}
+            ),
+        }
         for event_type in {
             EventType.TOOL_CALL_COMPLETED,
             EventType.TOOL_CALL_FAILED,
@@ -2532,6 +2566,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "workspace_mutation_capture_status",
     }
     tool_terminal = tool_common | {
+        "effect_reconciled",
+        "reconciliation_state",
+        "receipt_id",
+        "receipt_evidence",
         "arguments_exact",
         "durable_value_error_code",
         "durable_value_error_path",
@@ -2550,6 +2588,117 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         *_TOOL_TERMINAL_TIMING_KEYS,
     }
     tool_actor_paths = _resolution_actor_nested_paths("resolved_by")
+    policies[EventType.TOOL_EFFECT_OUTCOME_UNKNOWN] = _policy(
+        "schema_version",
+        "failure_evidence",
+        "state",
+        "record_revision",
+        "intent_digest",
+        "dispatch_id",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "tool_call_id",
+        "approval_id",
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"tool_call_id", "approval_id"},
+        aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
+    )
+    policies[EventType.TOOL_EFFECT_CLEANUP_OBSERVED] = _policy(
+        "schema_version",
+        "artifacts",
+        "truncated",
+        "scope_digest",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "tool_call_id",
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"tool_call_id"},
+        aliased_authority_keys={"tool_call_id", "tool_round_id"},
+    )
+    policies[EventType.TOOL_EFFECT_RECONCILIATION_STARTED] = _policy(
+        "schema_version",
+        "request_digest",
+        "intent_digest",
+        "dispatch_id",
+        "expected_revision",
+        "expected_run_epoch",
+        "lookup",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "tool_call_id",
+        "approval_id",
+        "execution_profile_fingerprint",
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"tool_call_id", "approval_id"},
+        aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
+    )
+    receipt_evidence_paths = {
+        ("receipt_evidence", name)
+        for name in (
+            "schema_version",
+            "receipt_id",
+            "receipt_schema",
+            "receipt_schema_version",
+            "outcome",
+            "source",
+            "observed_at",
+            "receipt_digest",
+            "integrity",
+            "resource_versions",
+        )
+    }
+    policies[EventType.TOOL_EFFECT_RECEIPT_VALIDATED] = _policy(
+        "schema_version",
+        "request_digest",
+        "receipt_evidence",
+        "execution_profile_fingerprint",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "tool_call_id",
+        "approval_id",
+        owned_nested_paths=receipt_evidence_paths,
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"tool_call_id", "approval_id"},
+        aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
+    )
+    policies[EventType.TOOL_EFFECT_RECONCILIATION_OBSERVED] = _policy(
+        "approval_id",
+        "schema_version",
+        "request_digest",
+        "resource_versions",
+        "result",
+        "execution_profile_fingerprint",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "tool_call_id",
+        "idempotency_key",
+        owned_nested_paths={
+            ("result", name)
+            for name in ("outcome", "observation", "retryable", "receipt", "resource_versions")
+        },
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS
+        | {"approval_id", "tool_call_id", "idempotency_key", "request_digest"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS | {"request_digest"},
+        aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
+        untrusted_container_keys={"result", "resource_versions"},
+    )
+    # Validator rejection carries the same untrusted observation envelope.
+    # A late-dispatch loser instead carries only the store-owned identity digests.
+    observation_policy = policies[EventType.TOOL_EFFECT_RECONCILIATION_OBSERVED]
+    policies[EventType.TOOL_EFFECT_RECONCILIATION_CONFLICT] = replace(
+        observation_policy,
+        owned_keys=observation_policy.owned_keys
+        | {
+            "kind",
+            "intent_digest",
+            "dispatch_digest",
+            "winner_digest",
+            "source_run_epoch",
+            "attempt_digest",
+            "selection_digest",
+        },
+    )
     policies[EventType.TOOL_CALL_STARTED] = _policy(
         *tool_common,
         owned_nested_paths=_TOOL_RESULT_NESTED_PATHS | tool_actor_paths,
@@ -2587,7 +2736,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "reason",
             "resolved_by",
             "tool_result_projection",
-            owned_nested_paths=_TOOL_EVENT_NESTED_PATHS | tool_actor_paths,
+            owned_nested_paths=_TOOL_EVENT_NESTED_PATHS | tool_actor_paths | receipt_evidence_paths,
             authority_keys={
                 *_TOOL_LINKAGE_AUTHORITY_KEYS,
                 *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
@@ -3051,6 +3200,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "truncated",
         )
     } | {("failure_evidence", "deadline", key) for key in ("expires_at", "source", "scope")}
+    policies[EventType.TOOL_EFFECT_OUTCOME_UNKNOWN] = replace(
+        policies[EventType.TOOL_EFFECT_OUTCOME_UNKNOWN],
+        owned_nested_paths=frozenset(failure_evidence_owned_paths),
+    )
     policies[EventType.SESSION_STARTED] = _observed_policy(
         "agent_name input_contract parent_session_id prompt_contribution_manifest run_epoch "
         "traceparent tracestate",

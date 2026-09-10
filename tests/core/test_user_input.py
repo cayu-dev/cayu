@@ -79,6 +79,7 @@ from cayu.runtime.user_input import (
     user_input_answer_request_digest,
     user_input_resolution_request_digest,
 )
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor, StaticVault
 
@@ -2711,12 +2712,12 @@ def test_fork_of_paused_session_is_rejected() -> None:
     assert asyncio.run(store.load_checkpoint("s_forksrc")) == checkpoint
 
 
-class _FailOnceAppendStore(InMemorySessionStore):
+class _FailOnceAppendStoreMixin:
     invocation_lifecycle_command_version = 1
 
     # Fails the next atomic user-input close before commit once armed.
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.armed = False
 
     async def publish_runtime_publication(self, session_id: str, **kwargs):
@@ -2724,6 +2725,14 @@ class _FailOnceAppendStore(InMemorySessionStore):
             self.armed = False
             raise RuntimeError("simulated append failure")
         return await super().publish_runtime_publication(session_id, **kwargs)
+
+
+class _FailOnceAppendStore(_FailOnceAppendStoreMixin, InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
+
+class _FailOnceSQLiteAppendStore(_FailOnceAppendStoreMixin, SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
 
 
 class _CountingTool(Tool):
@@ -2742,11 +2751,16 @@ class _CountingTool(Tool):
         return ToolResult(content=f"call-{self.calls}")
 
 
-def test_retry_after_append_failure_does_not_re_execute_sibling() -> None:
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_retry_after_append_failure_does_not_re_execute_sibling(backend, tmp_path) -> None:
     # Mixed round [count, ask_user]. First resolve runs `count`, then the atomic append fails ->
     # the session returns to INTERRUPTED (terminal event emitted). A retry must reuse the recorded
     # `count` outcome and NOT run it again.
-    store = _FailOnceAppendStore()
+    store = (
+        _FailOnceAppendStore()
+        if backend == "memory"
+        else _FailOnceSQLiteAppendStore(tmp_path / "user-input-retry.sqlite")
+    )
     counting = _CountingTool()
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(
@@ -2783,6 +2797,13 @@ def test_retry_after_append_failure_does_not_re_execute_sibling() -> None:
     # The re-interrupt carries the failure so a caller can tell it apart from a fresh pause.
     assert attempt1[-1].payload.get("error_type")
     assert "error" in attempt1[-1].payload
+    assert store.armed is False  # The injected round-close failure was actually reached.
+    assert attempt1[-1].payload["error"] == "simulated append failure"
+    evidence = attempt1[-1].payload["failure_evidence"]
+    assert evidence["session_id"] == attempt1[-1].session_id
+    assert evidence["run_epoch"] > 0
+    assert evidence["classification"] == "failure"
+    assert attempt1[-1].payload["error_type"] in evidence["exception_types"]
     assert counting.calls == 1
     reloaded = asyncio.run(store.load("s_retry"))
     assert reloaded is not None and reloaded.status == SessionStatus.INTERRUPTED
@@ -2794,7 +2815,12 @@ def test_retry_after_append_failure_does_not_re_execute_sibling() -> None:
             )
         )
     )
-    assert attempt2[-1].type == EventType.SESSION_COMPLETED
+    if isinstance(store, SQLiteSessionStore):
+        asyncio.run(store.close())
+    assert attempt2[-1].type == EventType.SESSION_COMPLETED, (
+        attempt1[-1].payload.get("error"),
+        attempt2[-1].payload.get("error"),
+    )
     assert counting.calls == 1  # reused recorded outcome; not re-executed
 
 

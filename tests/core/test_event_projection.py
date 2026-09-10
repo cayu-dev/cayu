@@ -2773,6 +2773,89 @@ def test_malformed_fixed_control_rejects_new_write_and_loses_public_authority() 
     assert public.payload == {}
 
 
+@pytest.mark.parametrize("value", [True, 1, "completed", "secret-invalid-state"])
+@pytest.mark.parametrize("field", ["state", "classification", "settlement", "deadline_phase"])
+def test_unknown_effect_state_rejects_malformed_controls(value, field) -> None:
+    event = Event(
+        type=EventType.TOOL_EFFECT_OUTCOME_UNKNOWN,
+        session_id="session",
+        payload={"state": value} if field == "state" else {"failure_evidence": {field: value}},
+    )
+    with pytest.raises((TypeError, ValueError)):
+        prepare_new_runtime_event(event, redactor=SecretRedactor())
+    public = project_runtime_event(event, sequence=8, redactor=SecretRedactor())
+    container = public.payload if field == "state" else public.payload.get("failure_evidence", {})
+    assert field not in container
+
+
+@pytest.mark.parametrize("value", [True, 1, "completed", "secret-invalid-control"])
+@pytest.mark.parametrize(
+    "event_type",
+    [EventType.TOOL_EFFECT_RECONCILIATION_OBSERVED, EventType.TOOL_EFFECT_RECONCILIATION_CONFLICT],
+)
+@pytest.mark.parametrize("field", ["outcome", "observation"])
+def test_effect_observation_rejects_malformed_controls(value, event_type, field) -> None:
+    event = Event(type=event_type, session_id="session", payload={"result": {field: value}})
+    with pytest.raises((TypeError, ValueError)):
+        prepare_new_runtime_event(event, redactor=SecretRedactor())
+    public = project_runtime_event(event, sequence=8, redactor=SecretRedactor())
+    assert field not in public.payload.get("result", {})
+
+
+@pytest.mark.parametrize("value", [True, 1, "unknown", "secret-invalid-control"])
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.TOOL_EFFECT_RECEIPT_VALIDATED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+    ],
+)
+@pytest.mark.parametrize("field", ["outcome", "source"])
+def test_receipt_evidence_rejects_malformed_controls(value, event_type, field) -> None:
+    event = Event(
+        type=event_type, session_id="session", payload={"receipt_evidence": {field: value}}
+    )
+    with pytest.raises((TypeError, ValueError)):
+        prepare_new_runtime_event(event, redactor=SecretRedactor())
+    public = project_runtime_event(event, sequence=8, redactor=SecretRedactor())
+    assert field not in public.payload.get("receipt_evidence", {})
+
+
+@pytest.mark.parametrize("value", [True, 1, "unknown", "secret-invalid-control"])
+@pytest.mark.parametrize("event_type", [EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED])
+def test_receipt_terminal_rejects_malformed_reconciliation_state(value, event_type) -> None:
+    event = Event(type=event_type, session_id="session", payload={"reconciliation_state": value})
+    with pytest.raises((TypeError, ValueError)):
+        prepare_new_runtime_event(event, redactor=SecretRedactor())
+    public = project_runtime_event(event, sequence=8, redactor=SecretRedactor())
+    assert "reconciliation_state" not in public.payload
+
+
+def test_unknown_effect_classification_projection_matches_failure_evidence_schema() -> None:
+    from typing import get_args
+
+    from cayu.failure_evidence import FailureEvidence
+
+    for classification in get_args(FailureEvidence.model_fields["classification"].annotation):
+        event = Event(
+            type=EventType.TOOL_EFFECT_OUTCOME_UNKNOWN,
+            session_id="session",
+            payload={
+                "state": "outcome_unknown",
+                "failure_evidence": {"classification": classification, "settlement": "unknown"},
+            },
+        )
+        public = project_runtime_event(
+            event,
+            sequence=8,
+            redactor=SecretRedactor(["outcome_unknown", classification, "unknown"]),
+        )
+        assert public.payload["state"] == "outcome_unknown"
+        assert public.payload["failure_evidence"]["classification"] == classification
+        assert public.payload["failure_evidence"]["settlement"] == "unknown"
+
+
 def test_nested_control_addresses_never_become_flat_payload_keys() -> None:
     event = Event(
         type=EventType.TOOL_CALL_BLOCKED,
@@ -3061,6 +3144,7 @@ def test_run_epoch_key_survives_workload_secret_collision(event_type: EventType)
         EventType.SESSION_COMPLETED,
         EventType.SESSION_FAILED,
         EventType.SESSION_INTERRUPTED,
+        EventType.TOOL_EFFECT_OUTCOME_UNKNOWN,
     ],
 )
 def test_terminal_failure_evidence_keys_survive_secret_collisions(event_type: EventType) -> None:
@@ -3080,17 +3164,33 @@ def test_terminal_failure_evidence_keys_survive_secret_collisions(event_type: Ev
         "terminal_event_id": "private-value",
         "truncated": False,
     }
+    fixed_controls = (
+        {"classification": "failure", "deadline_phase": "in_flight", "settlement": "unknown"}
+        if event_type == EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+        else {}
+    )
+    evidence.update(fixed_controls)
     redactor = SecretRedactor(
-        ["failure_evidence", *evidence, "expires_at", "source", "scope", "private-value"]
+        [
+            "failure_evidence",
+            *evidence,
+            "expires_at",
+            "source",
+            "scope",
+            "private-value",
+            *fixed_controls.values(),
+        ]
     )
     event = Event(
-        type=event_type, session_id="failure-collision", payload={"failure_evidence": evidence}
+        type=event_type, session_id="collision-session", payload={"failure_evidence": evidence}
     )
     prepared = prepare_new_runtime_event(event, redactor=redactor)
     projected = project_runtime_event(prepared, sequence=1, redactor=redactor)
     actual = projected.payload["failure_evidence"]
     assert set(actual) == set(evidence)
     assert set(actual["deadline"]) == {"expires_at", "source", "scope"}
-    assert actual["classification"] == REDACTED_SECRET
+    assert actual["classification"] == fixed_controls.get("classification", REDACTED_SECRET)
+    for key, value in fixed_controls.items():
+        assert actual[key] == value
     assert actual["deadline"]["source"] == REDACTED_SECRET
     assert actual["run_epoch"] == 7

@@ -337,6 +337,10 @@ from cayu.runtime._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
+from cayu.runtime._tool_effect_state import (
+    ToolEffectReconciliationCleanupFailure,
+    ToolEffectReconciliationRequired,
+)
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolApprovalRequired,
@@ -7868,6 +7872,7 @@ class SessionEngine:
         recovered_active_through: datetime | None = None,
         observed_at: datetime | None = None,
         event_id: str | None = None,
+        settlement_status: SessionStatus | None = None,
     ) -> Event | None:
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is None:
@@ -7903,7 +7908,21 @@ class SessionEngine:
             and latest.event.type == EventType.INTERACTION_PAUSED
             and prior_evidence.pending_action_kind == pending_action_kind
         ):
-            return None
+            if settlement_status is None:
+                return None
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if active_profile is not None:
+                settlement = await self.session_store.load_invocation_settlement_transition(
+                    session.id,
+                    expected_session_instance_id=session.instance_id,
+                    expected_active_invocation_profile=active_profile,
+                )
+                if settlement is not None and settlement.to_status is settlement_status:
+                    return None
+            # An equal pause reason does not prove equal session settlement.
+            # Recovery may retain the same round while changing FAILED to
+            # INTERRUPTED; publish new exact evidence before releasing it.
         usage_pages: list[SessionUsageSummary] = []
         after_sequence: int | None = None
         while True:
@@ -8847,6 +8866,7 @@ class SessionEngine:
             environment_name=environment_name,
             event_type=event_type,
             status=interaction_status,
+            settlement_status=to_status,
             pending_action_kind=pending_action_kind,
             recovered_active_through=recovered_active_through,
             observed_at=observed_at,
@@ -24919,6 +24939,34 @@ class SessionEngine:
                 invocation_context=invocation_context,
             ):
                 yield event
+        except ToolEffectReconciliationRequired as unresolved:
+            authoritative_failure = (
+                unresolved.failures
+                if isinstance(unresolved, ToolEffectReconciliationCleanupFailure)
+                else unresolved
+            )
+            events, propagated = await self._handle_session_interrupted_preserving_failure(
+                authoritative_failure=authoritative_failure,
+                prepare_interruption=lambda: (
+                    self._recovery_coordinator.deliver_pending_tool_effect_uncertainty(session)
+                ),
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
+            for event in events:
+                yield event
+            if propagated is not authoritative_failure:
+                raise propagated from None
+            if isinstance(unresolved, ToolEffectReconciliationCleanupFailure):
+                raise authoritative_failure from None
+            return
         except SessionInterruptedByRequest as interruption:
             from cayu.runtime._session_steering import SessionSteeringBoundaryReached
 

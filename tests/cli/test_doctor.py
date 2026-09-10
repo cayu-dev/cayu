@@ -25,6 +25,7 @@ from cayu.cli import main
 from cayu.cli.doctor import _run_bounded_worker
 from cayu.runtime.sessions import MAX_SESSION_ID_BYTES, SessionIdentity
 from cayu.support_bundles import (
+    DEFAULT_SUPPORT_BUNDLE_LIMITS,
     CollectorDisposition,
     SupportBundleOutcome,
     SupportBundleReport,
@@ -1209,6 +1210,10 @@ def build_app():
     assert collectors["tasks"]["disposition"] == "timed_out"
     assert collectors["tasks"]["reason_code"] == "collector_deadline_elapsed"
     assert collectors["artifacts"]["disposition"] == "collected"
+    assert (
+        document["collection_duration_ms"]
+        < DEFAULT_SUPPORT_BUNDLE_LIMITS.worker_timeout_seconds * 1000
+    )
 
 
 def test_doctor_explicit_session_uses_sqlite_bounded_safe_tail(

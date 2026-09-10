@@ -632,10 +632,13 @@ def test_remember_knowledge_timeout_returns_while_owned_publication_finishes() -
 
     events, receipt = asyncio.run(run())
 
-    timed_out = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
-    assert timed_out.payload["terminal_outcome"] == "tool_execution_timeout"
-    assert timed_out.payload["result"]["content"] == "Tool call timed out after 0.05 seconds."
-    assert timed_out.payload["arguments_state"] == "unavailable"
+    timed_out = next(
+        event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    )
+    assert timed_out.payload["failure_evidence"]["classification"] == "timeout"
+    assert not any(event.type is EventType.TOOL_CALL_FAILED for event in events)
+    assert "arguments" not in timed_out.payload
+    assert "result" not in timed_out.payload
     assert receipt is not None
 
 
@@ -681,7 +684,9 @@ def test_remember_knowledge_operator_interrupt_returns_while_publication_finishe
                     reason="operator interrupt",
                 ),
             ),
-            timeout=5,
+            # Include durable effect/interruption publication overhead. The
+            # assertions below prove return precedes external settlement.
+            timeout=10,
         )
         run_events = await asyncio.wait_for(run_task, timeout=5)
         assert knowledge_store.settled.is_set() is False
@@ -885,9 +890,12 @@ def test_remember_knowledge_timeout_abandons_cancellation_resistant_read(
 
     events = asyncio.run(run())
 
-    timed_out = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
-    assert timed_out.payload["terminal_outcome"] == "tool_execution_timeout"
-    assert timed_out.payload["arguments_state"] == "unavailable"
+    timed_out = next(
+        event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    )
+    assert timed_out.payload["failure_evidence"]["classification"] == "timeout"
+    assert not any(event.type is EventType.TOOL_CALL_FAILED for event in events)
+    assert "arguments" not in timed_out.payload
 
 
 @pytest.mark.parametrize("read_phase", ["receipt", "entry"])
@@ -2039,13 +2047,16 @@ class _CancelTool(Tool):
         raise asyncio.CancelledError()
 
 
-def test_parallel_spontaneous_cancel_does_not_brick_the_round() -> None:
+@pytest.mark.parametrize("effect", [ToolEffect.NONE, ToolEffect.EXTERNAL])
+def test_parallel_spontaneous_cancel_does_not_brick_the_round(effect: ToolEffect) -> None:
     # A parallel tool that raises CancelledError with no session interrupt must not leave the round
     # half-open (a dangling assistant tool-call with no tool_result bricks every later step). Each
     # un-terminated call is completed with a synthesized error result so the session stays runnable.
     recorder = _Recorder()
+    cancelled_tool = _CancelTool()
+    cancelled_tool.spec = cancelled_tool.spec.model_copy(update={"effect": effect})
     app = _build(
-        tools=[_CancelTool(), _RecordingTool(recorder, name="safe_tool")],
+        tools=[cancelled_tool, _RecordingTool(recorder, name="safe_tool")],
         tool_calls=[
             ("call_1", "cancel_tool", {}),
             ("call_2", "safe_tool", {"tag": "b"}),
@@ -2061,6 +2072,23 @@ def test_parallel_spontaneous_cancel_does_not_brick_the_round() -> None:
             ),
         )
     )
+    if effect is ToolEffect.EXTERNAL:
+        from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+
+        assert events[-1].type is EventType.SESSION_INTERRUPTED, events[-1].payload
+        assert any(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in events)
+        assert not any(
+            event.type is EventType.TOOL_CALL_FAILED
+            and event.payload.get("tool_call_id") == "call_1"
+            for event in asyncio.run(app.session_store.load_events("s_cancel"))
+        )
+        checkpoint = asyncio.run(
+            runtime_checkpoint_session_store(app.session_store).load_checkpoint("s_cancel")
+        )
+        assert checkpoint is not None
+        staged = checkpoint["pending_tool_round"]["staged_terminals"]
+        assert [item["tool_call_id"] for item in staged] == ["call_2"]
+        return
     assert events[-1].type == EventType.SESSION_COMPLETED  # not bricked
     transcript = asyncio.run(app.session_store.load_transcript("s_cancel"))
     tool_message = next(m for m in transcript if m.role == "tool")

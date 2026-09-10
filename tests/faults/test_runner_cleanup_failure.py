@@ -196,7 +196,7 @@ def test_runner_cleanup_failure_latches_exec_and_preserves_a_coherent_session(
         os.kill(child_pid, 0)
 
     failed_calls = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
-    assert len(failed_calls) == 2
+    assert len(failed_calls) == 1
     timeout_result = failed_calls[0].payload["result"]
     cleanup_artifact = {
         "type": "cayu.runner_cleanup.v1",
@@ -208,18 +208,19 @@ def test_runner_cleanup_failure_latches_exec_and_preserves_a_coherent_session(
     }
     assert timeout_result["artifacts"] == [cleanup_artifact]
     assert timeout_result["structured"]["artifacts"] == [cleanup_artifact]
-    assert failed_calls[1].payload["result"]["content"] == "Runner command execution failed."
-    assert failed_calls[1].payload["result"]["structured"]["error"] == ("runner_execution_failed")
+    durable = asyncio.run(app.session_store.load_events("runner-cleanup-failure"))
+    unknown = [event for event in durable if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN]
+    assert len(unknown) == 1
+    assert unknown[0].payload["tool_call_id"] == "call_after_unknown_cleanup"
+    checkpoint = asyncio.run(app.session_store.load_checkpoint("runner-cleanup-failure"))
+    assert checkpoint is not None and "pending_tool_round" in checkpoint
     assert runner.exec_attempts == 1
-    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
 
     validate_context_messages(transcript)
     assert [message.role for message in transcript] == [
         "user",
         "assistant",
         "tool",
-        "assistant",
-        "tool",
-        "assistant",
     ]
     assert transcript[2].content[0].artifacts == [cleanup_artifact]

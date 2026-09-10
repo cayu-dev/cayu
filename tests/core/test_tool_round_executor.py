@@ -19,7 +19,7 @@ from cayu.core.events import (
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners import RunnerExecutionError, attach_cancellation_artifacts
 from cayu.runtime import (
@@ -40,20 +40,26 @@ from cayu.runtime import (
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime import sessions as sessions_module
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
+from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired, ToolEffectStateOwner
 from cayu.runtime._tool_round_executor import (
     ToolRoundExecutor,
     ToolRoundRun,
     _copy_agent_spec,
     _durable_payload_utf8_size,
+    _prepare_tool_result_event,
     _project_staged_terminal_event,
     _restore_targeted_tool_invocation_event_authority,
     _ToolRoundPublicationCoordinator,
 )
 from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
-from cayu.runtime.execution_profiles import build_execution_profile_identity
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+    build_execution_profile_identity,
+)
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.runtime.tool_exposure import (
@@ -69,6 +75,41 @@ from cayu.tools.web import WebFetchTool
 from cayu.vaults import SecretRedactor
 
 _CATALOGUE_REVISION = f"sha256:{'c' * 64}"
+
+
+@pytest.mark.parametrize("trusted", [False, True])
+@pytest.mark.parametrize("denied", [False, True])
+def test_terminal_result_redaction_preserves_only_attested_timing(trusted, denied):
+    timestamp = datetime(2026, 9, 9, tzinfo=UTC)
+    timing = dict.fromkeys(
+        (
+            "tool_effect_completed_at",
+            "tool_terminal_staged_at",
+            "tool_terminal_publication_started_at",
+        ),
+        timestamp.isoformat(),
+    )
+    result = ToolResult(content="private-value", is_error=denied)
+    payload = {**timing, "result": result.model_dump()}
+    if denied:
+        payload.update(denied_by="tool_policy", decision="deny", reason="private-value")
+    event = Event(
+        type=EventType.TOOL_CALL_BLOCKED if denied else EventType.TOOL_CALL_COMPLETED,
+        session_id="session",
+        timestamp=timestamp,
+        payload=payload,
+    )
+    if trusted:
+        event = event_with_runtime_payload_authority(event, *timing)
+    projected, projected_result = _prepare_tool_result_event(
+        event=event, result=result, redactor=SecretRedactor("-")
+    )
+    for field, value in timing.items():
+        assert projected.payload[field] == (
+            value if trusted else SecretRedactor("-").redact_text(value)
+        )
+    assert "private-value" not in projected_result.content
+
 
 _TARGETED_AUTHORITY_CONFLICTS = (
     ("dispatch_kind", None),
@@ -486,7 +527,20 @@ async def _tool_round_run(
     limits: RunLimits,
     budget_limits: tuple[BudgetLimit, ...] = (),
 ) -> ToolRoundRun:
-    interaction_id = f"interaction-{session.id}"
+    active = active_invocation_execution_profile_from_checkpoint(
+        await runtime_checkpoint_session_store(app.session_store).load_checkpoint(session.id)
+    )
+    assert active is not None
+    interaction_id = active.interaction_id
+    registered_agent = app._get_registered_agent("assistant")
+    context = app._recovery_coordinator._reconstruct_invocation_context(
+        session=session,
+        execution_profile_snapshot=active,
+        registered_agent=registered_agent,
+        registered_provider=app._get_registered_provider(session.provider_name),
+        registered_environment=None,
+        budget_policy=app.budget_policy,
+    )
     started_at = datetime.now(UTC)
     start_event_id = f"{session.id}:interaction-started"
     await app.session_store.append_event(
@@ -511,7 +565,7 @@ async def _tool_round_run(
     )
     return app._tool_round_executor.create_run(
         session=session,
-        registered_agent=app._get_registered_agent("assistant"),
+        registered_agent=registered_agent,
         registered_environment=None,
         environment_name=None,
         limit_gate=_limit_gate(
@@ -531,6 +585,8 @@ async def _tool_round_run(
         run_started_at=time.monotonic(),
         turn_usage_tracker=None,
         active_run=None,
+        execution_profile=context.profile,
+        invocation_context=context,
     )
 
 
@@ -559,6 +615,8 @@ def test_staged_terminal_profile_authority_is_owned_by_the_active_round() -> Non
     )
     coordinator = _ToolRoundPublicationCoordinator(
         session_id="session-staged-profile-authority",
+        run_epoch=0,
+        session_instance_id="test-instance",
         tool_round_identity=identity,
         session_store=InMemorySessionStore(),
         redactor=SecretRedactor(),
@@ -611,6 +669,8 @@ def test_staged_terminal_exposure_authority_is_owned_by_the_frozen_snapshot() ->
     )
     coordinator = _ToolRoundPublicationCoordinator(
         session_id="session-staged-exposure-authority",
+        run_epoch=0,
+        session_instance_id="test-instance",
         tool_round_identity=identity,
         session_store=InMemorySessionStore(),
         redactor=SecretRedactor(),
@@ -663,6 +723,8 @@ def test_staged_terminal_exposure_authority_is_owned_by_the_frozen_snapshot() ->
 
     unowned_coordinator = _ToolRoundPublicationCoordinator(
         session_id="session-staged-exposure-authority",
+        run_epoch=0,
+        session_instance_id="test-instance",
         tool_round_identity=identity,
         session_store=InMemorySessionStore(),
         redactor=SecretRedactor(),
@@ -723,6 +785,8 @@ def test_staged_web_access_authority_survives_only_owned_durable_reconstruction(
 
     coordinator = _ToolRoundPublicationCoordinator(
         session_id="session-staged-web-access-authority",
+        run_epoch=0,
+        session_instance_id="test-instance",
         tool_round_identity=identity,
         session_store=InMemorySessionStore(),
         redactor=redactor,
@@ -1096,7 +1160,8 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
     assert transcript[-1].role == "tool"
 
 
-def test_tool_result_over_declared_terminal_limit_is_bounded_effect_authority() -> None:
+@pytest.mark.parametrize("effect", [ToolEffect.IDEMPOTENT, ToolEffect.EXTERNAL])
+def test_tool_result_over_declared_terminal_limit_is_bounded_effect_authority(effect) -> None:
     store = InMemorySessionStore()
     provider = _FakeProvider(
         [
@@ -1104,12 +1169,16 @@ def test_tool_result_over_declared_terminal_limit_is_bounded_effect_authority() 
             ModelStreamEvent.completed({"finish_reason": "stop"}),
         ]
     )
-    tool = _OversizedBoundedResultTool()
+
+    class ClassifiedOversizedTool(_OversizedBoundedResultTool):
+        spec = _OversizedBoundedResultTool.spec.model_copy(update={"effect": effect})
+
+    tool = ClassifiedOversizedTool()
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
 
-    async def scenario() -> Event:
+    async def scenario() -> Event | None:
         session_id = "sess_declared_terminal_overflow"
         async for _ in app.run(
             RunRequest(
@@ -1133,6 +1202,24 @@ def test_tool_result_over_declared_terminal_limit_is_bounded_effect_authority() 
             tool_round_identity=_tool_round_identity(),
         )
         await store.checkpoint(session.id, checkpoint)
+        if effect is ToolEffect.EXTERNAL:
+            with pytest.raises(ToolEffectReconciliationRequired):
+                _ = [
+                    event
+                    async for event in runner.run(
+                        messages=await store.load_transcript(session.id),
+                        tool_calls=tool_calls,
+                        tool_round_identity=_tool_round_identity(),
+                    )
+                ]
+            record = await ToolEffectStateOwner(store).resolve_call(
+                session,
+                tool_round_id=_tool_round_identity().tool_round_id,
+                tool_call_id=tool_calls[0].id,
+            )
+            assert record is not None and record.state == "outcome_unknown"
+            assert record.terminal is None
+            return None
         events = [
             event
             async for event in runner.run(
@@ -1146,10 +1233,14 @@ def test_tool_result_over_declared_terminal_limit_is_bounded_effect_authority() 
     terminal = asyncio.run(scenario())
 
     assert tool.calls == 1
+    if effect is ToolEffect.EXTERNAL:
+        assert terminal is None
+        return
+    assert terminal is not None
     assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
-    assert terminal.payload["tool_effect"] == "external"
+    assert terminal.payload["tool_effect"] == "idempotent"
     assert terminal.payload["outcome_unknown"] is True
-    assert terminal.payload["manual_reconciliation_required"] is True
+    assert terminal.payload["manual_reconciliation_required"] is False
     assert terminal.payload["result"]["is_error"] is True
     assert len(terminal.payload["result"]["content"].encode("utf-8")) < 1024
 
@@ -1223,7 +1314,8 @@ def test_large_arguments_do_not_consume_the_declared_result_payload_limit() -> N
     assert publication.active_round_reservations == 0
 
 
-def test_after_hook_result_rewrite_is_rebounded_before_staged_publication() -> None:
+@pytest.mark.parametrize("effect", [ToolEffect.IDEMPOTENT, ToolEffect.EXTERNAL])
+def test_after_hook_result_rewrite_respects_effect_terminal_authority(effect) -> None:
     class OversizedRewriteHook(RuntimeHook):
         async def after_tool_call(
             self,
@@ -1242,7 +1334,11 @@ def test_after_hook_result_rewrite_is_rebounded_before_staged_publication() -> N
             ModelStreamEvent.completed({"finish_reason": "stop"}),
         ]
     )
-    tool = _BoundedWorkspaceResultTool()
+
+    class ClassifiedResultTool(_BoundedWorkspaceResultTool):
+        spec = _BoundedWorkspaceResultTool.spec.model_copy(update={"effect": effect})
+
+    tool = ClassifiedResultTool()
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(
@@ -1283,6 +1379,8 @@ def test_after_hook_result_rewrite_is_rebounded_before_staged_publication() -> N
                 tool_round_identity=_tool_round_identity(),
             )
         ]
+        # A successful real result is modifiable for either effect class.
+        # This is not a receipt-reconciled or runtime-owned failure result.
         return next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
 
     terminal = asyncio.run(scenario())

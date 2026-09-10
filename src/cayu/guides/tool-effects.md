@@ -65,6 +65,25 @@ proposed -> authorized -> intent_recorded -> completed
 - `manual_review` is required when reconciliation is unavailable, inconclusive,
   contradictory, or cannot bind its evidence to the same operation identity.
 
+When a runtime-classified tool timeout becomes an unknown external outcome, the
+`tool.effect.outcome_unknown` event retains bounded `failure_evidence` with a
+`timeout` classification. This diagnostic contains neither tool arguments nor
+result content and does not authorize retry or prove the external operation stopped.
+
+An invalid tool result is not a reconciliation receipt. Its raw response fields,
+including a field named `receipt_id`, are not copied into the default unknown-effect
+event. Reconcile the retained logical call using the registered adapter's lookup
+or a separately supplied receipt accepted by that adapter's validator.
+
+Interruption after the runtime persists a preparation but before dispatch consumes
+it is different from an unknown external outcome. Recovery atomically settles the
+exact unconsumed preparation as `tool.call.failed`, with `executed=false` and
+`outcome_unknown=false` in the structured result. The effect record retains no
+dispatch identity or external receipt. This settlement competes with dispatch on
+the same durable comparison; it never reruns the tool. After
+`recover_incomplete_session`, use normal resume or the existing approval/user-input
+resolution entrance to continue. Approval and answer requirements are unchanged.
+
 A terminal receipt and fresh verification answer different questions. The
 receipt is downstream evidence about the attempted operation. Verification is a
 new read of the resulting state. Neither can be replaced by the durable intent,
@@ -191,6 +210,151 @@ This is an act-once-or-stop application protocol. It does not create generic
 exactly-once execution for arbitrary external systems. `ToolEffect` classifies
 replay risk; it does not authorize execution. Policy, authenticated approval,
 durable ownership, and downstream reconciliation remain separate controls.
+
+## Inspect a receipt-reconciliation target
+
+For an external call interrupted while resolving a user-input pause, include the
+original `UserInputResponse` as `ToolEffectReconciliationRequest.user_input_response`.
+The runtime compares the answer and continuation digests with the retained pause
+authority before admitting recovery. Re-supply the same answer, structured data,
+artifacts, metadata, actor, and review reference; a receipt does not authorize a
+different answer. The response's session and task identities must match the receipt
+request. Ordinary and approval-owned calls do not accept this field. Continuation
+retains the paused invocation's frozen configuration; an explicit receipt
+`max_steps` must agree with it. The existing user-input closure receipt proves
+consumption, so identical reconciliation replay does not run the model again.
+
+
+Incomplete-session recovery can report `pending_tool_effect`. It retains the
+unknown call and finishes any pending session interruption without invoking the
+tool or receipt validator. Inspect that call and submit an explicit receipt or
+lookup request to continue; this recovery action is not a completed tool result.
+
+After receipt selection, an abandoned reconciliation stream still needs its
+explicit continuation. For ordinary tool rounds, recovery plans report
+`tool_effect_continuation_required`
+and do not offer generic repair or manual outcome replacement for that pending
+round. Incomplete-session recovery retains the selected receipt and pending round;
+replay the original reconciliation request to continue without revalidating the
+receipt or executing the tool again.
+
+For an existing external call, `CayuApp.inspect_tool_effect` supplies the exact
+identity and version fields needed by `ToolEffectReconciliationRequest`. Use the
+round and call identifiers from public runtime events:
+
+```python
+from cayu import ToolEffectReconciliationRequest
+
+target = await app.inspect_tool_effect(
+    session_id,
+    tool_round_id=tool_event.payload["tool_round_id"],
+    tool_call_id=tool_event.payload["tool_call_id"],
+)
+request = ToolEffectReconciliationRequest(**target.model_dump(), lookup=True)
+async for event in app.reconcile_tool_effect(request):
+    handle_event(event)
+```
+
+Inspection requires a public-authority alias codec shared by the app and store.
+The memory store supplies an ephemeral keyring by default. Persistent deployments
+must configure their store's keyring and keep it available across reconstruction;
+inspection fails read-only when no codec is available.
+The target uses field- and session-scoped aliases for the private idempotency key
+and session incarnation. These are public references, not downstream keys to send
+to an external system. A registered lookup receives the original stable key.
+
+Inspection is read-only: it does not claim the session, invoke a reconciler,
+reconnect an environment, or authorize execution. It can describe an already
+terminal call, but only an eligible unresolved call may receive a new settlement.
+Its versions may become stale; submission checks them rather than refreshing them.
+Keep the original request for exact replay after acknowledgement loss. A newly
+inspected target is not a replacement for that original request.
+
+Once durable consumption is proven, exact replay returns the selected terminal
+event without renewing task execution authority, even if continuation completed
+the linked task. The original worker and handoff identities remain part of request
+equality; changing them is a conflict, not a new authorization. Any recovery that
+still requires execution retains the normal live task-authority checks.
+
+For supplied receipts, request and receipt identity fields must use matching
+representations. Resolving an alias does not authenticate external evidence:
+the registered application validator must still verify the receipt. Never treat
+a raw third-party response or an operator assertion as a validated receipt.
+
+The selected `tool.call.completed` or `tool.call.failed` event includes a
+versioned `receipt_evidence` envelope: receipt/schema identities, outcome, source,
+observation time, content digest, and the registered integrity/resource fields.
+The digest identifies the validated, redacted receipt stored by Cayu, not the raw
+third-party response. This envelope is audit evidence, not an authorization token
+or a replacement for application receipt validation. It is committed atomically
+with the receipt-bound terminal outcome and retained on exact replay.
+
+`tool.effect.reconciliation.started` is versioned attempt evidence, emitted after
+exact request preflight and before application reconciliation. It records the
+logical call, dispatch identity, intent/request hashes, expected versions, and
+lookup mode, not the supplied receipt. It is neither receipt authentication nor
+proof of an external mutation. Replaying an already selected reconciliation does
+not emit another start; a new explicit attempt after interruption can do so.
+The SDK stream yields this event before entering the reconciliation callback.
+Closing the stream at that point leaves the effect unresolved without invoking
+the callback; a later attempt still requires an explicit reconciliation request.
+Admission stores the start event and its bounded attempt identity atomically in
+the existing effect record, advancing that record's revision. Cancellation,
+timeout, or stream closure does not erase this admission evidence. Inspect the
+current target before making a new explicit request after an interrupted attempt.
+An older observation cannot regain replay authority once a newer request has
+been admitted.
+
+If a new request or a native terminal outcome supersedes an admitted attempt,
+that successor transaction also commits `tool.effect.reconciliation.conflict`
+with `kind=reconciliation_superseded`. This event identifies the losing attempt
+and successor using bounded digests; it does not assert that the old callback
+returned or validated a receipt. The audit therefore does not depend on the old
+caller remaining alive. Selecting an observation or receipt for the admitted
+request itself consumes admission without creating a supersession conflict.
+
+`tool.effect.receipt.validated` contains the bounded receipt evidence envelope,
+without the result body or raw external response. Cayu commits it atomically with
+the receipt-bound terminal result, then yields it before the terminal event.
+Closing the stream at this validation event preserves the selected receipt and
+resource versions. Resubmitting the exact original request resumes from that
+selection without invoking the validator or protected tool again.
+
+An application validator's `conflict` outcome emits a version1
+`tool.effect.reconciliation.conflict` event with `kind=validator_rejected`.
+It is committed with the unresolved observation, not a terminal tool result.
+The effect stays `outcome_unknown`, retaining accepted partial resource evidence.
+Exact request replay returns that observation and raises `ToolEffectConflict`
+without another validator call. `not_found` and `unsupported` instead use
+`tool.effect.reconciliation.observed` and also leave the effect unresolved.
+
+## Native durable recovery evidence
+
+Tools with an existing operation journal can implement the narrow
+`DurableToolRecovery.reconcile_durable_tool_call` extension from
+`cayu.core.tools`. It returns `DurableToolRecoveryEvidence` or `None`, not a
+bare `ToolResult`. The evidence pairs a diagnostic result with one explicit
+disposition:
+
+- `confirmed`: the journal owner validated the complete call identity and has
+  positive terminal evidence. Ordinary session recovery can select that result
+  atomically with the external-effect record without calling the tool again.
+- `not_started`: validated preparation evidence proves this journal's dispatch
+  did not start. This is not a generic retry authorization.
+- `unresolved`: evidence is incomplete, invalid, conflicting, or ambiguous.
+  Its diagnostic result must not be interpreted as a terminal external outcome.
+
+`None` means there is no usable journal evidence; it does not prove the effect
+was absent. For an unresolved `EXTERNAL` call, only `confirmed` native evidence
+may select a terminal result. The other dispositions retain the unresolved
+call. Existing `NONE` and `IDEMPOTENT` recovery still use their diagnostic
+result semantics. A caller-supplied result with identical text does not become
+trusted journal evidence.
+
+The registered journal implementation owns identity validation and disposition.
+Recovery provides bounded observation and fenced journal settlement authority;
+the extension must not dispatch the protected mutation. A stored state label
+alone is insufficient when its result still describes an ambiguous operation.
 
 ## Check a `NONE` declaration before deployment
 

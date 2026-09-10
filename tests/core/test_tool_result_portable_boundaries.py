@@ -73,6 +73,34 @@ from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, StaticVault
 _HOSTILE_DURABLE_ERROR_SECRET = "workload-secret-durable-error-accessor"
 
 
+def _assert_unknown_external_call_retained(app, provider, session_id, events):
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    resumed = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(session_id=session_id, messages=[Message.text("user", "continue")]),
+        )
+    )
+    assert resumed[-1].type is EventType.SESSION_INTERRUPTED
+    durable = asyncio.run(app.session_store.load_events(session_id))
+    for kind in (EventType.TOOL_CALL_STARTED, EventType.TOOL_EFFECT_OUTCOME_UNKNOWN):
+        assert sum(event.type is kind for event in durable) == 1
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in durable
+    )
+    unknown = next(
+        event for event in durable if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    )
+    assert unknown.payload["state"] == "outcome_unknown"
+    assert unknown.payload["failure_evidence"]["classification"] == "failure"
+    assert "result" not in unknown.payload
+    checkpoint = asyncio.run(app.session_store.load_checkpoint(session_id))
+    assert checkpoint is not None and "pending_tool_round" in checkpoint
+    assert len(provider.requests) == 1
+    return durable
+
+
 class _HostileDurableValueError(DurableValueError):
     def __init__(self) -> None:
         object.__setattr__(self, "_armed", False)
@@ -163,16 +191,13 @@ def test_cayu_app_rejects_nonportable_proxy_result_before_tool_external_effect()
 
     assert tool.external_effects == 0
     assert EventType.CREDENTIAL_PROXY_CHECKED not in [event.type for event in events]
-    terminal = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["terminal_outcome"] == "tool_execution_error"
-    assert terminal.payload["tool_effect"] == "external"
-    assert terminal.payload["outcome_unknown"] is True
-    assert terminal.payload["manual_reconciliation_required"] is True
-    assert terminal.payload["durable_value_error_code"] == "nul_character"
-    rendered = json.dumps([event.model_dump(mode="json") for event in events])
+    durable = _assert_unknown_external_call_retained(
+        app, provider, "sess_nonportable_proxy_result", events
+    )
+    assert tool.external_effects == 0
+    rendered = json.dumps([event.model_dump(mode="json") for event in [*events, *durable]])
     assert "workload-secret" not in rendered
     assert "invalid\\u0000metadata" not in rendered
-    assert events[-1].type == EventType.SESSION_COMPLETED
 
 
 def test_cayu_app_isolates_completion_payload_from_billing_hook_mutation() -> None:
@@ -1318,7 +1343,7 @@ def test_portable_tool_result_evidence_prioritizes_receipt_without_hostile_key_l
     assert evidence.value["receipt_id"] == "receipt-within-scan-limit"
 
 
-def test_external_invalid_tool_output_ignores_hostile_field_keys_and_replays_terminal_evidence():
+def test_external_invalid_tool_output_ignores_hostile_field_keys_and_retains_uncertainty():
     class HostileKey(str):
         armed = False
 
@@ -1380,32 +1405,14 @@ def test_external_invalid_tool_output_ignores_hostile_field_keys_and_replays_ter
         )
     )
 
+    durable = _assert_unknown_external_call_retained(app, provider, session_id, initial_events)
     assert tool.external_effects == 1
-    terminal = next(event for event in initial_events if event.type == EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
-    assert terminal.payload["manual_reconciliation_required"] is True
-    evidence = terminal.payload["result"]["structured"]["portable_result_evidence"]
-    assert evidence["structured"]["receipt_id"] == "receipt-hostile-fields"
-    assert initial_events[-1].type == EventType.SESSION_FAILED
-
-    resumed_events = asyncio.run(
-        collect_resume_events(
-            app,
-            ResumeRequest(
-                session_id=session_id,
-                messages=[Message.text("user", "continue")],
-            ),
-        )
-    )
-
-    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
-    assert tool.external_effects == 1
-    stored_events = asyncio.run(store.load_events(session_id))
-    assert sum(event.type == EventType.TOOL_CALL_STARTED for event in stored_events) == 1
-    assert sum(event.type == EventType.TOOL_CALL_FAILED for event in stored_events) == 1
+    rendered = json.dumps([event.model_dump(mode="json") for event in [*initial_events, *durable]])
+    assert "receipt-hostile-fields" not in rendered
+    assert "provider_owned_key" not in rendered
 
 
-def test_external_invalid_tool_output_preserves_priority_receipt_across_replay():
+def test_external_invalid_tool_output_does_not_publish_unvalidated_receipt_across_resume():
     class InvalidExternalReceiptTool(Tool):
         spec = ToolSpec(
             name="invalid_external_receipt",
@@ -1454,50 +1461,21 @@ def test_external_invalid_tool_output_preserves_priority_receipt_across_replay()
         )
     )
 
-    assert initial_events[-1].type == EventType.SESSION_FAILED
+    durable = _assert_unknown_external_call_retained(app, provider, session_id, initial_events)
     assert tool.calls == 1
-    started = next(event for event in initial_events if event.type == EventType.TOOL_CALL_STARTED)
-    failed = next(event for event in initial_events if event.type == EventType.TOOL_CALL_FAILED)
-    assert failed.payload["idempotency_key"] == started.payload["idempotency_key"]
-    assert failed.payload["terminal_outcome"] == "invalid_tool_output"
-    assert failed.payload["tool_effect"] == "external"
-    assert failed.payload["outcome_unknown"] is True
-    assert failed.payload["manual_reconciliation_required"] is True
-    structured = failed.payload["result"]["structured"]
-    assert structured["tool_effect"] == failed.payload["tool_effect"]
-    assert structured["outcome_unknown"] == failed.payload["outcome_unknown"]
-    assert structured["manual_reconciliation_required"] is True
-    assert structured["portable_result_evidence"]["structured"]["receipt_id"] == ("receipt-123")
-    assert structured["portable_result_evidence_incomplete"] is True
-    json.dumps(failed.model_dump(mode="json"), ensure_ascii=False, allow_nan=False)
-
-    resumed_events = asyncio.run(
-        collect_resume_events(
-            app,
-            ResumeRequest(
-                session_id=session_id,
-                messages=[Message.text("user", "continue")],
-            ),
-        )
+    rendered = json.dumps(
+        [event.model_dump(mode="json") for event in [*initial_events, *durable]],
+        ensure_ascii=False,
+        allow_nan=False,
     )
-
-    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
-    assert tool.calls == 1
-    stored_events = asyncio.run(store.load_events(session_id))
-    assert sum(event.type == EventType.TOOL_CALL_STARTED for event in stored_events) == 1
-    assert sum(event.type == EventType.TOOL_CALL_FAILED for event in stored_events) == 1
+    assert "receipt-123" not in rendered
+    assert "junk_" not in rendered
     transcript = asyncio.run(store.load_transcript(session_id))
-    tool_part = next(message for message in transcript if message.role == "tool").content[0]
-    assert tool_part.structured["portable_result_evidence"]["structured"]["receipt_id"] == (
-        "receipt-123"
-    )
-    replay_tool_part = next(
-        message for message in provider.requests[1].messages if message.role == "tool"
-    ).content[0]
-    assert replay_tool_part.structured == tool_part.structured
+    assert not any(message.role == "tool" for message in transcript)
+    assert "receipt-123" not in repr(transcript)
 
 
-def test_external_tool_nonportable_exception_persists_manual_terminal_outcome():
+def test_external_tool_nonportable_exception_retains_unknown_effect():
     class NonPortableExceptionTool(Tool):
         spec = ToolSpec(
             name="nonportable_exception",
@@ -1538,18 +1516,10 @@ def test_external_tool_nonportable_exception_persists_manual_terminal_outcome():
     )
 
     assert tool.calls == 1
-    failed = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
-    assert len(failed) == 1
-    terminal = failed[0]
-    assert terminal.payload["terminal_outcome"] == "tool_execution_error"
-    assert terminal.payload["tool_effect"] == "external"
-    assert terminal.payload["outcome_unknown"] is True
-    assert terminal.payload["manual_reconciliation_required"] is True
-    assert terminal.payload["durable_value_error_code"] == "nul_character"
-    assert terminal.payload["result"]["structured"]["tool_effect"] == "external"
-    assert events[-1].type == EventType.SESSION_COMPLETED
+    durable = _assert_unknown_external_call_retained(app, provider, session_id, events)
+    assert tool.calls == 1
     rendered = json.dumps(
-        [event.model_dump(mode="json") for event in events],
+        [event.model_dump(mode="json") for event in [*events, *durable]],
         ensure_ascii=False,
         allow_nan=False,
     )
@@ -1596,33 +1566,11 @@ def test_external_tool_hostile_exception_rendering_replays_without_reexecution()
         )
     )
 
-    assert initial_events[-1].type == EventType.SESSION_FAILED
-    terminal = next(event for event in initial_events if event.type == EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["terminal_outcome"] == "tool_execution_error"
-    assert terminal.payload["manual_reconciliation_required"] is True
-    assert terminal.payload["result"]["content"] == (
-        "HostileDiagnosticError: tool execution failed"
-    )
+    _assert_unknown_external_call_retained(app, provider, session_id, initial_events)
     assert tool.effects == 1
 
-    resumed_events = asyncio.run(
-        collect_resume_events(
-            app,
-            ResumeRequest(
-                session_id=session_id,
-                messages=[Message.text("user", "continue")],
-            ),
-        )
-    )
 
-    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
-    assert tool.effects == 1
-    stored_events = asyncio.run(store.load_events(session_id))
-    assert sum(event.type == EventType.TOOL_CALL_STARTED for event in stored_events) == 1
-    assert sum(event.type == EventType.TOOL_CALL_FAILED for event in stored_events) == 1
-
-
-def test_external_tool_hostile_durable_error_persists_manual_terminal_outcome():
+def test_external_tool_hostile_durable_error_retains_unknown_effect():
     class HostileDurableErrorTool(Tool):
         spec = ToolSpec(
             name="hostile_durable_error",
@@ -1657,34 +1605,11 @@ def test_external_tool_hostile_durable_error_persists_manual_terminal_outcome():
         )
     )
 
-    assert initial_events[-1].type == EventType.SESSION_FAILED
-    terminal = next(event for event in initial_events if event.type == EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["terminal_outcome"] == "tool_execution_error"
-    assert terminal.payload["tool_effect"] == "external"
-    assert terminal.payload["outcome_unknown"] is True
-    assert terminal.payload["manual_reconciliation_required"] is True
-    assert terminal.payload["durable_value_error_code"] == "invalid_json_type"
-    assert terminal.payload["durable_value_error_path"] == "$"
+    durable = _assert_unknown_external_call_retained(app, provider, session_id, initial_events)
     assert _HOSTILE_DURABLE_ERROR_SECRET not in json.dumps(
-        [event.model_dump(mode="json") for event in initial_events]
+        [event.model_dump(mode="json") for event in [*initial_events, *durable]]
     )
     assert tool.effects == 1
-
-    resumed_events = asyncio.run(
-        collect_resume_events(
-            app,
-            ResumeRequest(
-                session_id=session_id,
-                messages=[Message.text("user", "continue")],
-            ),
-        )
-    )
-
-    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
-    assert tool.effects == 1
-    stored_events = asyncio.run(store.load_events(session_id))
-    assert sum(event.type == EventType.TOOL_CALL_STARTED for event in stored_events) == 1
-    assert sum(event.type == EventType.TOOL_CALL_FAILED for event in stored_events) == 1
 
 
 def test_invalid_tool_output_uses_registered_effect_after_tool_mutates_live_spec():
@@ -1736,14 +1661,9 @@ def test_invalid_tool_output_uses_registered_effect_after_tool_mutates_live_spec
     assert tool.external_effects == 1
     assert tool.spec.effect is ToolEffect.NONE
     started = next(event for event in events if event.type == EventType.TOOL_CALL_STARTED)
-    terminal = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
     assert started.payload["effect"] == "external"
-    assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
-    assert terminal.payload["tool_effect"] == "external"
-    assert terminal.payload["outcome_unknown"] is True
-    assert terminal.payload["manual_reconciliation_required"] is True
-    assert terminal.payload["result"]["structured"]["tool_effect"] == "external"
-    assert events[-1].type == EventType.SESSION_COMPLETED
+    _assert_unknown_external_call_retained(app, provider, "sess_registered_external_effect", events)
+    assert tool.external_effects == 1
 
 
 def test_nonportable_after_tool_hook_failure_keeps_original_terminal_result():
@@ -1876,7 +1796,7 @@ def test_forged_invalid_after_tool_modification_is_failed_closed():
 
 
 def test_invalid_tool_output_evidence_is_redacted_before_hooks_and_publication():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults import SecretRedactor
 
     secret = "receipt-workload-secret"
     observed: list[dict[str, Any] | None] = []
@@ -1929,22 +1849,19 @@ def test_invalid_tool_output_evidence_is_redacted_before_hooks_and_publication()
         )
     )
 
-    assert len(observed) == 1
-    assert observed[0]["portable_result_evidence"]["structured"]["receipt_id"] == (REDACTED_SECRET)
-    terminal = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["result"]["structured"] == observed[0]
+    durable = _assert_unknown_external_call_retained(
+        app, provider, "sess_invalid_secret_receipt", events
+    )
+    assert observed == []
     transcript = asyncio.run(store.load_transcript("sess_invalid_secret_receipt"))
-    tool_part = next(message for message in transcript if message.role == "tool").content[0]
-    assert tool_part.structured == observed[0]
-    assert provider.requests[1].messages[-1].content[0].structured == observed[0]
+    assert not any(message.role == "tool" for message in transcript)
+    assert secret not in repr(transcript)
     rendered = json.dumps(
-        [event.model_dump(mode="json") for event in events],
+        [event.model_dump(mode="json") for event in [*events, *durable]],
         ensure_ascii=False,
         allow_nan=False,
     )
     assert secret not in rendered
-    assert REDACTED_SECRET in rendered
-    assert events[-1].type == EventType.SESSION_COMPLETED
 
 
 def test_terminal_tool_diagnostics_and_evidence_remain_bounded_after_expanding_redaction():
@@ -2003,20 +1920,25 @@ def test_terminal_tool_diagnostics_and_evidence_remain_bounded_after_expanding_r
         )
     )
 
-    terminal = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
-    structured = terminal.payload["result"]["structured"]
-    assert "portable_result_evidence" in structured
-    assert structured["portable_result_evidence_incomplete"] is True
+    durable = _assert_unknown_external_call_retained(
+        app, provider, "sess_expanding_terminal_evidence", events
+    )
+    unknown = next(
+        event for event in durable if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    )
+    assert "portable_result_evidence" not in unknown.payload
     evidence_bytes = len(
         json.dumps(
-            structured["portable_result_evidence"],
+            unknown.payload,
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
         ).encode("utf-8")
     )
     assert evidence_bytes <= tool_results_module._MAX_PORTABLE_EVIDENCE_UTF8_BYTES
-    assert secret not in json.dumps(terminal.model_dump(mode="json"), ensure_ascii=False)
+    assert secret not in json.dumps(
+        [event.model_dump(mode="json") for event in [*events, *durable]], ensure_ascii=False
+    )
 
 
 def test_terminal_diagnostic_and_evidence_redact_secret_crossing_byte_boundaries() -> None:
@@ -2098,7 +2020,7 @@ def test_exception_type_name_is_redacted_before_its_byte_bound() -> None:
     assert len(diagnostic.error_type.encode("utf-8")) <= (MAX_DIAGNOSTIC_TYPE_UTF8_BYTES)
 
 
-def test_external_invalid_tool_output_is_durable_before_blocking_after_hook() -> None:
+def test_external_invalid_tool_output_is_durable_without_entering_blocking_after_hook() -> None:
     class InvalidExternalTool(Tool):
         spec = ToolSpec(
             name="invalid_external_before_hook",
@@ -2156,27 +2078,29 @@ def test_external_invalid_tool_output_is_durable_before_blocking_after_hook() ->
                 ),
             )
         )
-        await asyncio.wait_for(hook.started.wait(), timeout=10)
-
-        stored_while_hook_blocked = await store.load_events(session_id)
-        stored_types = [event.type for event in stored_while_hook_blocked]
-        terminal = next(
-            event for event in stored_while_hook_blocked if event.type == EventType.TOOL_CALL_FAILED
-        )
+        try:
+            events = await asyncio.wait_for(run_task, timeout=10)
+            assert not hook.started.is_set()
+            resumed = await collect_resume_events(
+                app,
+                ResumeRequest(session_id=session_id, messages=[Message.text("user", "continue")]),
+            )
+            assert resumed[-1].type is EventType.SESSION_INTERRUPTED
+            assert not hook.started.is_set()
+        finally:
+            hook.release.set()
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
         assert tool.external_effects == 1
-        assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
-        assert terminal.payload["tool_effect"] == "external"
-        assert terminal.payload["outcome_unknown"] is True
-        assert terminal.payload["manual_reconciliation_required"] is True
-        assert stored_types.index(EventType.TOOL_CALL_FAILED) < stored_types.index(
-            EventType.HOOK_STARTED
+        assert events[-1].type is EventType.SESSION_INTERRUPTED
+        durable = await store.load_events(session_id)
+        assert sum(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in durable) == 1
+        assert not any(
+            event.type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_COMPLETED}
+            for event in durable
         )
-
-        hook.release.set()
-        events = await asyncio.wait_for(run_task, timeout=5)
-        assert tool.external_effects == 1
-        assert sum(event.type == EventType.TOOL_CALL_FAILED for event in events) == 1
-        assert events[-1].type == EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 1
 
     asyncio.run(scenario())
 
@@ -2244,7 +2168,6 @@ def test_external_invalid_tool_output_survives_swallowed_interruption_without_re
             )
         ]
         run_events = await run_task
-        stored_after_interrupt = await store.load_events(session_id)
         resumed_events = await collect_resume_events(
             app,
             ResumeRequest(
@@ -2252,21 +2175,30 @@ def test_external_invalid_tool_output_survives_swallowed_interruption_without_re
                 messages=[Message.text("user", "continue")],
             ),
         )
-        return tool, interrupt_events, run_events, stored_after_interrupt, resumed_events
+        assert len(provider.requests) == 1
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None and "pending_tool_round" in checkpoint
+        return (
+            tool,
+            interrupt_events,
+            run_events,
+            await store.load_events(session_id),
+            resumed_events,
+        )
 
     tool, interrupt_events, run_events, stored_events, resumed_events = asyncio.run(scenario())
 
     assert tool.external_effects == 1
     assert interrupt_events[-1].type == EventType.SESSION_INTERRUPTED
     assert run_events[-1].type == EventType.SESSION_INTERRUPTED
-    terminal_events = [event for event in stored_events if event.type == EventType.TOOL_CALL_FAILED]
-    assert len(terminal_events) == 1
-    terminal = terminal_events[0]
-    assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
-    assert terminal.payload["manual_reconciliation_required"] is True
-    evidence = terminal.payload["result"]["structured"]["portable_result_evidence"]
-    assert evidence["structured"]["receipt_id"] == "receipt-after-cancellation"
-    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+    assert not any(
+        event.type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_COMPLETED}
+        for event in stored_events
+    )
+    assert sum(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in stored_events) == 1
+    assert sum(event.type is EventType.TOOL_CALL_STARTED for event in stored_events) == 1
+    assert "receipt-after-cancellation" not in repr(stored_events)
+    assert resumed_events[-1].type is EventType.SESSION_INTERRUPTED
     assert tool.external_effects == 1
 
 
@@ -2345,9 +2277,11 @@ def test_external_invalid_tool_output_precedes_proxy_telemetry_failure_and_repla
     )
 
     assert initial_events[-1].type == EventType.SESSION_FAILED
-    terminal = next(event for event in initial_events if event.type == EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
-    assert terminal.payload["manual_reconciliation_required"] is True
+    assert store.failed is True
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in initial_events
+    )
     assert tool.external_effects == 1
 
     resumed_events = asyncio.run(
@@ -2360,15 +2294,23 @@ def test_external_invalid_tool_output_precedes_proxy_telemetry_failure_and_repla
         )
     )
 
-    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+    assert resumed_events[-1].type is EventType.SESSION_INTERRUPTED
     assert tool.external_effects == 1
     stored_events = asyncio.run(store.load_events(session_id))
     assert sum(event.type == EventType.TOOL_CALL_STARTED for event in stored_events) == 1
-    assert sum(event.type == EventType.TOOL_CALL_FAILED for event in stored_events) == 1
+    assert sum(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in stored_events) == 1
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in stored_events
+    )
+    assert len(provider.requests) == 1
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    assert checkpoint is not None and "pending_tool_round" in checkpoint
+    assert "proxy-secret" not in repr(stored_events)
 
 
-def test_terminal_tool_controls_survive_matching_secret_redaction():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+def test_unknown_tool_controls_survive_matching_secret_redaction():
+    from cayu.vaults import SecretRedactor
 
     error_path = "$/#1"
     control_values = [
@@ -2376,6 +2318,8 @@ def test_terminal_tool_controls_survive_matching_secret_redaction():
         "invalid_tool_output",
         "non_finite_number",
         error_path,
+        "outcome_unknown",
+        "failure",
     ]
     observed: list[dict[str, Any] | None] = []
 
@@ -2427,25 +2371,19 @@ def test_terminal_tool_controls_survive_matching_secret_redaction():
         )
     )
 
-    terminal = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
-    expected_controls = {
-        "terminal_outcome": "invalid_tool_output",
-        "tool_effect": "external",
-        "outcome_unknown": True,
-        "manual_reconciliation_required": True,
-        "durable_value_error_code": "non_finite_number",
-        "durable_value_error_path": error_path,
-    }
-    assert {key: terminal.payload[key] for key in expected_controls} == expected_controls
-    structured = terminal.payload["result"]["structured"]
-    assert {key: structured[key] for key in expected_controls} == expected_controls
-    assert structured["portable_result_evidence"]["structured"]["receipt_id"] == (REDACTED_SECRET)
-    assert observed == [structured]
+    durable = _assert_unknown_external_call_retained(
+        app, provider, "sess_terminal_control_redaction", events
+    )
+    for source in (events, durable):
+        unknown = next(
+            event for event in source if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+        )
+        assert unknown.payload["state"] == "outcome_unknown"
+        assert unknown.payload["failure_evidence"]["classification"] == "failure"
+        assert "receipt_id" not in json.dumps(unknown.payload)
+    assert observed == []
     transcript = asyncio.run(store.load_transcript("sess_terminal_control_redaction"))
-    tool_part = next(message for message in transcript if message.role == "tool").content[0]
-    assert tool_part.structured == structured
-    assert provider.requests[1].messages[-1].content[0].structured == structured
-    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert not any(message.role == "tool" for message in transcript)
 
 
 def test_secret_bearing_provider_call_id_fails_closed_before_tool_execution() -> None:

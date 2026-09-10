@@ -1614,9 +1614,20 @@ def _append_events_in_transaction(
 
     if not events:
         return
+    _touch_session_activity(connection, session_id, activity_at)
+    _insert_event_rows_in_transaction(connection, session_id, events, activity_at=activity_at)
+
+
+def _insert_event_rows_in_transaction(
+    connection: sqlite3.Connection,
+    session_id: str,
+    events: Sequence[Event],
+    *,
+    activity_at: datetime,
+) -> None:
+    """Insert prepared events after the transaction owner has authorized them."""
     from cayu.runtime.pending_actions import pending_action_event_storage_values
 
-    _touch_session_activity(connection, session_id, activity_at)
     _publish_budget_reservation_identities(connection, list(events))
     rows = []
     for event in events:
@@ -6993,6 +7004,48 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
         await self._run_write(statement)
+
+    async def append_tool_effect_conflict(self, request: object) -> Event:
+        from cayu.runtime._tool_effect_conflicts import (
+            copy_tool_effect_conflict_audit,
+            reconcile_tool_effect_conflict_event,
+        )
+
+        audit = copy_tool_effect_conflict_audit(request)
+        session_id = audit.executing.intent.session_id
+
+        def statement(connection: sqlite3.Connection) -> Event:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    raise KeyError("Tool effect audit session is unavailable.")
+                row = connection.execute(
+                    "SELECT record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, audit.storage_key),
+                ).fetchone()
+                current = None if row is None else json.loads(row["record_json"])
+                event = audit.prepare_event(session, current, now=self._ownership_clock())
+                existing = connection.execute(
+                    "SELECT * FROM cayu_events WHERE session_id = ? AND event_id = ?",
+                    (session_id, event.id),
+                ).fetchone()
+                if existing is not None:
+                    event = reconcile_tool_effect_conflict_event(event, _event_from_row(existing))
+                else:
+                    # Evidence authority was established above; do not touch the
+                    # current run's liveness or weaken the ordinary append fence.
+                    _insert_event_rows_in_transaction(
+                        connection, session_id, [event], activity_at=event.timestamp
+                    )
+                connection.commit()
+                return event
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
 
     async def append_workflow_step_started(
         self,

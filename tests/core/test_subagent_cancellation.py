@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 
 import pytest
 
@@ -13,7 +12,6 @@ from cayu.tools import subagents
 from cayu.tools.subagents import (
     SubagentSpec,
     SubagentTool,
-    _uncancel_current_task,
 )
 
 
@@ -83,21 +81,21 @@ async def _cancel_tool_run(
     return task, captured["exc"]
 
 
-def test_uncancel_current_task_consumes_only_one_pending_request():
+def test_subagent_cleanup_preserves_enclosing_timeout_classification():
     async def run():
+        runtime = _BlockingChildRuntime()
+        tool = _foreground_tool(runtime)
         task = asyncio.current_task()
         assert task is not None
-        task.cancel()
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.sleep(0)
-        assert task.cancelling() == 2
-        _uncancel_current_task()
-        assert task.cancelling() == 1
-        # Second call keeps consuming one at a time and stays guarded at zero.
-        _uncancel_current_task()
-        _uncancel_current_task()
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await tool.run(
+                    ToolContext(session_id="timeout-parent"),
+                    {"agent": "reviewer", "task": "review"},
+                )
         assert task.cancelling() == 0
+        assert runtime.interrupt_started.is_set()
+        assert runtime.child_cancelled.is_set()
 
     asyncio.run(run())
 
@@ -112,9 +110,9 @@ def test_subagent_cancellation_keeps_outer_cancellation_requests():
 
     task, exc = asyncio.run(run())
     assert task.cancelled()
-    # The tool consumed exactly the one cancellation it caught; the second,
-    # outer-owned request must survive (the old drain loop stripped it too).
-    assert task.cancelling() == 1
+    # Neither the delivered request nor the additional request is consumed by
+    # this re-raising cleanup boundary.
+    assert task.cancelling() == 2
     assert getattr(exc, "artifacts", []) == []
     assert runtime.interrupt_started.is_set()
     assert runtime.child_cancelled.is_set()
@@ -129,7 +127,7 @@ def test_subagent_cancellation_cleanup_interrupts_child_and_reraises():
 
     task, exc = asyncio.run(run())
     assert task.cancelled()
-    assert task.cancelling() == 0
+    assert task.cancelling() == 1
     assert getattr(exc, "artifacts", []) == []
     assert runtime.interrupt_started.is_set()
     assert runtime.child_cancelled.is_set()
@@ -145,6 +143,7 @@ def test_subagent_cancellation_cleanup_is_bounded_when_interrupt_hangs(monkeypat
 
     task, exc = asyncio.run(run())
     assert task.cancelled()
+    assert task.cancelling() == 1
     artifacts = getattr(exc, "artifacts", [])
     assert len(artifacts) == 1
     assert artifacts[0]["type"] == "cayu.subagent_cleanup_error.v1"

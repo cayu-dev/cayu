@@ -157,7 +157,11 @@ def test_patch_input_evidence_survives_sqlite_reopen(tmp_path: Path, case: str) 
                     await invocation
             else:
                 live = await invocation
-                assert live[-1].type is EventType.SESSION_COMPLETED
+                assert live[-1].type is (
+                    EventType.SESSION_INTERRUPTED
+                    if case == "read_failure"
+                    else EventType.SESSION_COMPLETED
+                )
         finally:
             await store.close()
 
@@ -165,6 +169,34 @@ def test_patch_input_evidence_survives_sqlite_reopen(tmp_path: Path, case: str) 
         try:
             events = await reopened.load_events("patch-evidence")
             transcript = await reopened.load_transcript("patch-evidence")
+            if case in {"read_failure", "cancel", "secret_cancel"}:
+                # The runtime has dispatched the external tool before its
+                # preflight read. An exception is not a settled tool result;
+                # retain the recovery fence and unpublished argument scope.
+                assert not any(
+                    event.type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_COMPLETED}
+                    for event in events
+                )
+                unknown = [
+                    event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+                ]
+                assert len(unknown) == 1
+                assert unknown[0].payload["tool_call_id"] == "patch-call"
+                started = [event for event in events if event.type is EventType.TOOL_CALL_STARTED]
+                assert len(started) == 1
+                assert started[0].payload["arguments_state"] == "quarantined"
+                assert "arguments" not in started[0].payload
+                checkpoint = await reopened.load_checkpoint("patch-evidence")
+                assert checkpoint is not None and checkpoint.get("pending_tool_round") is not None
+                assert not any(
+                    part.type in {"tool_call", "tool_result"}
+                    for message in transcript
+                    for part in message.content
+                )
+                assert (root / "source.txt").read_bytes() == original
+                public = json.dumps([event.model_dump(mode="json") for event in events])
+                assert "diagnostic-secret-value" not in public
+                return
             terminal = next(
                 event
                 for event in events
@@ -174,13 +206,6 @@ def test_patch_input_evidence_survives_sqlite_reopen(tmp_path: Path, case: str) 
             assert terminal.payload["arguments_state"] == "finalized"
             assert terminal.payload["arguments_exact"] is (not case.startswith("secret"))
             assert terminal.payload["arguments"] == expected
-            if case in {"cancel", "secret_cancel"}:
-                # The read was cancelled before dispatch and its scope settled.
-                # Retention is allowed; incomplete scopes are covered by the
-                # shared argument-quarantine recovery tests.
-                assert terminal.type is EventType.TOOL_CALL_FAILED
-                assert (root / "source.txt").read_bytes() == original
-                return
             call = next(
                 part
                 for message in transcript
@@ -199,7 +224,7 @@ def test_patch_input_evidence_survives_sqlite_reopen(tmp_path: Path, case: str) 
                 )
                 assert result["mutated"] is False
                 assert (root / "source.txt").read_bytes() == original
-            elif case in {"malformed", "freeform", "read_failure"}:
+            elif case in {"malformed", "freeform"}:
                 assert terminal.type is EventType.TOOL_CALL_FAILED
                 assert (root / "source.txt").read_bytes() == original
             else:

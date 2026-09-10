@@ -1050,10 +1050,12 @@ def test_exact_replay_clears_receipt_after_settlement_acknowledgement_loss(
             request=request,
         )
         assert replayed.attempt.quiescence is LocalExecutionAttemptQuiescence.QUIESCENT
+        assert replayed.attempt.effect_outcome is LocalExecutionAttemptEffectOutcome.SUCCEEDED
         assert replayed.attempt.receipt is not None
         assert (
             replayed.attempt.receipt.effect_outcome is LocalExecutionAttemptEffectOutcome.SUCCEEDED
         )
+        assert replayed.attempt.receipt.terminal_reason == "root_exit"
         assert replayed.stdout == ""
         assert replayed.stderr == ""
         assert replayed.stdout_truncated is True

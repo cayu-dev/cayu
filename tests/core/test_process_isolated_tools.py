@@ -73,6 +73,7 @@ from cayu.runtime import (
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRequest,
+    ToolEffectConflict,
     ToolExecutionContract,
     ToolRoundRecoveryRequest,
     run_task_worker,
@@ -4183,39 +4184,26 @@ def test_public_hard_timeout_preserves_external_effect_uncertainty_and_no_replay
     events = asyncio.run(_run_public(app, session_id=session_id))
 
     assert started_path.read_text(encoding="utf-8") == "started"
-    failed = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    unknown = next(event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN)
+    assert unknown.payload["failure_evidence"]["classification"] == "timeout"
+    assert "result" not in unknown.payload
+    resumed = asyncio.run(_resume_public(app, session_id=session_id))
+    assert resumed[-1].type is EventType.SESSION_INTERRUPTED
+    durable = asyncio.run(app.session_store.load_events(session_id))
+    checkpoint = asyncio.run(app.session_store.load_checkpoint(session_id))
+    assert checkpoint is not None and "pending_tool_round" in checkpoint
     transcript = asyncio.run(app.session_store.load_transcript(session_id))
-    transcript_result = next(
-        part
-        for message in transcript
-        for part in message.content
-        if isinstance(part, ToolResultPart)
+    assert not any(
+        isinstance(part, ToolResultPart) for message in transcript for part in message.content
     )
-    provider_result = next(
-        part
-        for message in provider.requests[1].messages
-        for part in message.content
-        if isinstance(part, ToolResultPart)
+    assert len(provider.requests) == 1
+    for kind in (EventType.TOOL_CALL_STARTED, EventType.TOOL_EFFECT_OUTCOME_UNKNOWN):
+        assert sum(event.type is kind for event in durable) == 1
+    assert not any(
+        event.type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_COMPLETED}
+        for event in durable
     )
-    assert failed.payload["terminal_outcome"] == "tool_execution_timeout"
-    assert failed.payload["outcome_unknown"] is True
-    assert failed.payload["manual_reconciliation_required"] is True
-    assert failed.payload["isolated_tool_failure_code"] == "hard_process_deadline_exceeded"
-    assert failed.payload["tool_execution_boundary"] == "posix_process"
-    assert failed.payload["tool_timeout_strength"] == "hard_process_deadline"
-    for structured in (
-        failed.payload["result"]["structured"],
-        transcript_result.structured,
-        provider_result.structured,
-    ):
-        assert structured["terminal_outcome"] == "tool_execution_timeout"
-        assert structured["outcome_unknown"] is True
-        assert structured["manual_reconciliation_required"] is True
-        assert structured["isolated_tool_failure_code"] == "hard_process_deadline_exceeded"
-        assert structured["tool_execution_boundary"] == "posix_process"
-        assert structured["tool_timeout_strength"] == "hard_process_deadline"
-    assert sum(event.type == EventType.TOOL_CALL_STARTED for event in events) == 1
-    assert sum(event.type == EventType.TOOL_CALL_FAILED for event in events) == 1
 
 
 @pytest.mark.process
@@ -4274,19 +4262,20 @@ def test_recovery_of_started_isolated_call_never_launches_a_duplicate_child(
     assert initial[-1].type == EventType.SESSION_FAILED
     assert recovered[-1].type == EventType.SESSION_COMPLETED
     assert count_path.read_text(encoding="utf-8").splitlines() == ["started"]
-    recovered_failure = next(
-        event
-        for event in recovered
-        if event.type == EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
+    recovered_success = next(
+        event for event in recovered if event.type is EventType.TOOL_CALL_COMPLETED
     )
-    assert recovered_failure.payload["result"]["is_error"] is True
+    assert recovered_success.payload["result"]["is_error"] is False
+    assert recovered_success.payload["result"]["content"] == "hook-modified execution"
     terminal_events = [
         event
         for event in durable_events
         if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
     ]
     assert len(terminal_events) == 1
-    assert terminal_events[0].payload["result"]["structured"]["outcome_unknown"] is True
+    assert terminal_events[0].payload["result"] == recovered_success.payload["result"]
+    assert not any(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in durable_events)
+    assert len(provider.requests) == 2
 
 
 @pytest.mark.process
@@ -4323,18 +4312,26 @@ def test_factory_backed_recovery_authenticates_original_isolated_dispatch(
             checkpoint = await store.load_checkpoint(session_id)
             assert checkpoint is not None
             pending_round = checkpoint["pending_tool_round"]
-            recovered = [
-                event
-                async for event in app.recover_tool_round(
-                    ToolRoundRecoveryRequest(
-                        session_id=session_id,
-                        round_id=pending_round["tool_round_id"],
-                        tool_call_id="isolated-call-1",
-                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                        message="operator reconciled the isolated effect",
+            # The isolated tool already selected a durable result before its
+            # event publication failed. An operator cannot replace that result.
+            with pytest.raises(ToolEffectConflict, match="durable external-effect evidence"):
+                _ = [
+                    event
+                    async for event in app.recover_tool_round(
+                        ToolRoundRecoveryRequest(
+                            session_id=session_id,
+                            round_id=pending_round["tool_round_id"],
+                            tool_call_id="isolated-call-1",
+                            outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                            message="operator reconciled the isolated effect",
+                        )
                     )
-                )
-            ]
+                ]
+            assert not any(
+                event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+                for event in await store.load_events(session_id)
+            )
+            recovered = await _resume_public(app, session_id=session_id)
         return recovered, await store.load_events(session_id)
 
     recovered, durable_events = asyncio.run(scenario())
@@ -4379,21 +4376,20 @@ def test_recovery_prefers_exact_zero_dispatch_settlement_after_final_fence_rejec
     initial, recovered, durable = asyncio.run(scenario())
 
     assert store.dispatch_published is True
-    assert store.failed_terminal_once is True
+    assert store.failed_terminal_once is True, initial[-1].payload
     assert initial[-1].type is EventType.SESSION_FAILED
     assert recovered[-1].type is EventType.SESSION_COMPLETED
     recovered_failure = next(
-        event
-        for event in recovered
-        if event.type is EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
+        event for event in recovered if event.type is EventType.TOOL_CALL_FAILED
     )
     structured = recovered_failure.payload["result"]["structured"]
-    assert structured["started"] is False
-    assert structured["executed"] is False
+    # Atomic effect staging already selected the original pre-dispatch
+    # rejection. Resume must publish it, not synthesize a different result.
+    assert structured["isolated_tool_failure_code"] == "prior_process_cleanup_pending"
+    assert structured["tool_execution_boundary"] == "posix_process"
     assert structured.get("outcome_unknown", False) is False
-    assert "was not executed" in recovered_failure.payload["result"]["content"]
+    assert "rejected before child dispatch" in recovered_failure.payload["result"]["content"]
     assert "manual_reconciliation_required" not in structured
-    assert "isolated_tool_failure_code" not in structured
     terminal_events = [
         event
         for event in durable
@@ -4401,9 +4397,8 @@ def test_recovery_prefers_exact_zero_dispatch_settlement_after_final_fence_rejec
     ]
     assert len(terminal_events) == 1
     durable_structured = terminal_events[0].payload["result"]["structured"]
-    assert durable_structured["started"] is False
-    assert durable_structured["executed"] is False
-    assert durable_structured["outcome_unknown"] is False
+    assert durable_structured == structured
+    assert not any(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in durable)
 
 
 @pytest.mark.process
@@ -4457,17 +4452,24 @@ def test_manual_recovery_rejects_exact_zero_dispatch_despite_conflicting_ledger(
             outcome=ToolApprovalRecoveryOutcome.COMPLETED,
             message="operator must not override positive zero-dispatch evidence",
         )
-        with pytest.raises(RuntimeError, match="requires a recorded tool.call.started"):
+        with pytest.raises(ToolEffectConflict, match="durable external-effect evidence"):
             _ = [event async for event in app.recover_tool_round(request)]
         session = await store.load(session_id)
         assert session is not None
         checkpoint_after = await store.load_checkpoint(session_id)
         assert checkpoint_after is not None
+        assert checkpoint_after["pending_tool_round"]["tool_round_id"] == request.round_id
+        terminals = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ]
+        assert [event.id for event in terminals] == [malformed_terminal.id]
         return session.status, checkpoint_after
 
     status, checkpoint_after = asyncio.run(scenario())
 
-    assert status is SessionStatus.FAILED
+    assert status is SessionStatus.INTERRUPTED
     assert "pending_tool_round" in checkpoint_after
 
 
@@ -4612,7 +4614,7 @@ def test_public_approval_precedes_child_creation_and_exact_retry_does_not_reexec
     "registered_secret",
     ["UNRELATED_REGISTERED_SECRET", "external", "process_interrupted"],
 )
-def test_public_runtime_interruption_settles_one_child_and_one_provider_result(
+def test_public_runtime_interruption_fences_one_child_without_provider_continuation(
     tmp_path: Path,
     registered_secret: str,
 ) -> None:
@@ -4687,38 +4689,27 @@ def test_public_runtime_interruption_settles_one_child_and_one_provider_result(
     assert interrupted_session.status is SessionStatus.INTERRUPTED
     assert run_events[-1].type is EventType.SESSION_INTERRUPTED
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
-    assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+    assert resumed_events[-1].type is EventType.SESSION_INTERRUPTED
     terminal_events = [
         event
         for event in durable_events
         if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
     ]
-    assert len(terminal_events) == 1
-    assert terminal_events[0].type is EventType.TOOL_CALL_FAILED
-    assert terminal_events[0].payload["interrupted"] is True
-    assert terminal_events[0].payload["result"]["structured"]["interrupted"] is True
-    expected_controls = {
-        "terminal_outcome": "tool_execution_error",
-        "tool_effect": "external",
-        "outcome_unknown": True,
-        "manual_reconciliation_required": True,
-        "isolated_tool_failure_code": "process_interrupted",
-        "tool_execution_boundary": "posix_process",
-        "tool_timeout_strength": "hard_process_deadline",
-    }
-    for key, value in expected_controls.items():
-        assert terminal_events[0].payload[key] == value
-        assert terminal_events[0].payload["result"]["structured"][key] == value
-    provider_results = [
-        part
-        for message in provider.requests[1].messages
-        for part in message.content
-        if isinstance(part, ToolResultPart)
+    assert terminal_events == []
+    unknown_events = [
+        event for event in durable_events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
     ]
-    assert len(provider_results) == 1
-    assert provider_results[0].is_error is True
-    for key, value in expected_controls.items():
-        assert provider_results[0].structured[key] == value
+    assert len(unknown_events) == 1
+    assert unknown_events[0].payload["state"] == "outcome_unknown"
+    assert "result" not in unknown_events[0].payload
+    assert len(provider.requests) == 1
+    assert sum(event.type is EventType.TOOL_CALL_STARTED for event in durable_events) == 1
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    assert checkpoint is not None and "pending_tool_round" in checkpoint
+    transcript = asyncio.run(store.load_transcript(session_id))
+    assert not any(
+        isinstance(part, ToolResultPart) for message in transcript for part in message.content
+    )
 
 
 @pytest.mark.process

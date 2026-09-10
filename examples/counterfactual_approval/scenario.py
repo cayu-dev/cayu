@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -14,27 +13,24 @@ from examples._advanced_support import (
     stable_output_spec,
     validated_output,
 )
+from examples.counterfactual_approval.deployment import (
+    DeploymentState,
+    DeployServiceTool,
+    deployment_reconciliation,
+)
 
 from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
-    Event,
     EventType,
-    ExecutionProfileBehaviorIdentity,
     InMemorySessionStore,
     Message,
     RunRequest,
     SessionStore,
-    Tool,
     ToolApprovalDecision,
-    ToolApprovalRecoveryOutcome,
-    ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
+    ToolEffectReconciliationRequest,
 )
 from cayu.providers import ModelProvider
 
@@ -75,108 +71,6 @@ VERIFIER_SCHEMA: dict[str, Any] = {
 }
 
 
-@dataclass
-class DeploymentState:
-    version: int = 7
-    mutation_count: int = 0
-    deployed_release: str | None = None
-    receipts: dict[str, ToolResult] = field(default_factory=dict)
-
-    def deploy(
-        self,
-        *,
-        service: str,
-        release: str,
-        expected_version: int,
-        idempotency_key: str,
-    ) -> ToolResult:
-        existing = self.receipts.get(idempotency_key)
-        if existing is not None:
-            structured = dict(existing.structured or {})
-            structured["receipt_reused"] = True
-            return existing.model_copy(update={"structured": structured})
-        if expected_version != self.version:
-            return ToolResult(
-                content="External state changed; deployment rejected.",
-                structured={
-                    "expected_version": expected_version,
-                    "actual_version": self.version,
-                },
-                is_error=True,
-            )
-        self.mutation_count += 1
-        self.version += 1
-        self.deployed_release = release
-        result = ToolResult(
-            content=f"Deployed {release} to {service}.",
-            structured={
-                "service": service,
-                "release": release,
-                "version": self.version,
-                "mutation_count": self.mutation_count,
-            },
-        )
-        self.receipts[idempotency_key] = result
-        return result
-
-
-class DeployServiceTool(Tool):
-    spec = ToolSpec(
-        name="deploy_service",
-        description="Deploy a release only when the expected external-state version still matches.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "service": {"type": "string"},
-                "release": {"type": "string"},
-                "expected_version": {"type": "integer"},
-            },
-            "required": ["service", "release", "expected_version"],
-            "additionalProperties": False,
-        },
-        effect=ToolEffect.IDEMPOTENT,
-        execution_profile_identity=ExecutionProfileBehaviorIdentity(
-            name="examples:counterfactual-approval:deploy-service",
-            behavior_version="1",
-            implementation_version="1",
-        ),
-    )
-
-    def __init__(self, state: DeploymentState) -> None:
-        self.state = state
-
-    async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-        if ctx.idempotency_key is None:
-            raise RuntimeError("deploy_service requires a runtime idempotency key")
-        return self.state.deploy(
-            service=args["service"],
-            release=args["release"],
-            expected_version=args["expected_version"],
-            idempotency_key=ctx.idempotency_key,
-        )
-
-
-class CrashAfterPrimaryMutationStore(InMemorySessionStore):
-    """Inject one durable-write failure after the protected external effect."""
-
-    invocation_lifecycle_command_version = 1
-
-    def __init__(self, primary_session_id: str) -> None:
-        super().__init__()
-        self.primary_session_id = primary_session_id
-        self.failed_terminal_once = False
-
-    async def append_events(self, session_id: str, events: list[Event]) -> None:
-        if (
-            session_id == self.primary_session_id
-            and not self.failed_terminal_once
-            and any(event.type == EventType.TOOL_CALL_COMPLETED for event in events)
-        ):
-            self.failed_terminal_once = True
-            raise RuntimeError("simulated crash before the terminal tool receipt was persisted")
-        await super().append_events(session_id, events)
-
-
 async def run_scenario(
     root: Path,
     *,
@@ -184,10 +78,10 @@ async def run_scenario(
     model: str,
     mode: str,
 ) -> ScenarioResult:
-    state = DeploymentState()
+    state = DeploymentState(root / "deployment.sqlite", lose_acknowledgement_once=True)
     causal_budget_id = "advanced-counterfactual-approval-budget"
     primary_id = "approval-primary"
-    store = CrashAfterPrimaryMutationStore(primary_id)
+    store = InMemorySessionStore()
     app = _build_app(provider=provider, model=model, state=state, session_store=store)
     snapshot = json.loads(
         (Path(__file__).with_name("fixtures") / "approval_snapshot.json").read_text(
@@ -260,26 +154,33 @@ async def run_scenario(
         raise RuntimeError("Deployment receipt did not contain structured evidence.")
     tool_call_id = approval_events[0].payload["approval"]["tool_call_id"]
 
-    # Rebuild the application around the same durable store, then reconcile the
-    # unknown result from the external receipt without executing the tool again.
+    # Reconstruct both the application and downstream client. No in-process
+    # receipt cache or caller assertion establishes the external outcome.
+    state = DeploymentState(root / "deployment.sqlite")
     app = _build_app(provider=provider, model=model, state=state, session_store=store)
-    recovered_events = await collect_events(
-        app.recover_tool_approval(
-            ToolApprovalRecoveryRequest(
-                session_id=primary_id,
-                approval_id=approval_id,
-                tool_round_id=approval_events[0].payload["tool_round_id"],
-                tool_call_id=tool_call_id,
-                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                message=receipt.content,
-                structured=receipt_payload,
-                metadata={"receipt_id": receipt_key, "source": "external-reconciliation"},
-                limits=advanced_run_limits(),
-            )
-        )
+    target = await app.inspect_tool_effect(
+        primary_id,
+        tool_round_id=approval_events[0].payload["tool_round_id"],
+        tool_call_id=tool_call_id,
     )
+    reconciliation_request = ToolEffectReconciliationRequest(
+        **target.model_dump(),
+        # Transport uses the inspected public aliases. Cayu resolves them before
+        # the application validator compares with the downstream receipt.
+        receipt=receipt.model_copy(
+            update={
+                "tool_call_id": target.tool_call_id,
+                "idempotency_key": target.idempotency_key,
+            }
+        ),
+    )
+    recovered_events = await collect_events(app.reconcile_tool_effect(reconciliation_request))
     if not any(event.type == EventType.SESSION_COMPLETED for event in recovered_events):
         raise RuntimeError("Recovered approval session did not complete.")
+    before_replay = await store.load_events(primary_id)
+    await collect_events(app.reconcile_tool_effect(reconciliation_request))
+    if await store.load_events(primary_id) != before_replay:
+        raise RuntimeError("Exact reconciliation replay changed durable history.")
 
     # Exercise staleness through a second genuinely paused Cayu approval. The
     # original snapshot expects version 7, but the recovered deployment made it 8.
@@ -400,9 +301,9 @@ async def run_scenario(
             state.mutation_count == 1 and len(state.receipts) == 1
         ),
         "approval_recovered_after_runtime_restart": (
-            store.failed_terminal_once
-            and any(event.payload.get("manual_recovery") is True for event in recovered_events)
+            any(event.payload.get("effect_reconciled") is True for event in recovered_events)
         ),
+        "protected_tool_not_reexecuted": state.invocation_count(receipt_key) == 1,
         "verifier_confirmed_actual_state": (
             verification["confirmed"] is True
             and verification["observed_version"] == state.version
@@ -460,6 +361,7 @@ def _build_app(
         ),
         tools=[DeployServiceTool(state)],
         tool_policy=policy,
+        tool_effect_reconcilers={"deploy_service": deployment_reconciliation(state)},
     )
     app.register_agent(
         AgentSpec(
@@ -472,6 +374,7 @@ def _build_app(
         ),
         tools=[DeployServiceTool(state)],
         tool_policy=policy,
+        tool_effect_reconcilers={"deploy_service": deployment_reconciliation(state)},
     )
     for role in ("approve-future", "deny-future", "explainer"):
         app.register_agent(

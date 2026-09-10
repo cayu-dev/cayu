@@ -189,6 +189,7 @@ class RecoveryBlockerCode(StrEnum):
     ACTIVE_TASK_CLAIM = "active_task_claim"
     MODEL_EFFECT_OUTCOME_UNKNOWN = "model_effect_outcome_unknown"
     TOOL_EFFECT_OUTCOME_UNKNOWN = "tool_effect_outcome_unknown"
+    TOOL_EFFECT_CONTINUATION_REQUIRED = "tool_effect_continuation_required"
     TOOL_APPROVAL_REQUIRED = "tool_approval_required"
     USER_INPUT_REQUIRED = "user_input_required"
     INVALID_DURABLE_STATE = "invalid_durable_state"

@@ -21,13 +21,33 @@ ANTHROPIC_API_KEY=... uv run python -m examples.counterfactual_approval.app --mo
 
 The speculative sessions have no mutation tools. Their output is advisory and
 versioned. A second paused Cayu approval proves stale versions are rejected at
-tool execution. The primary path injects a durable-write failure after the
-external mutation, rebuilds the application around the same session store, and
-uses `recover_tool_approval` plus the external receipt to continue without
-executing the protected action twice. Only `resolve_tool_approval` can authorize
-the first execution.
+tool execution. The primary path loses acknowledgement after the downstream
+mutation and receipt commit, rebuilds the application and downstream client,
+and uses `inspect_tool_effect` followed by `reconcile_tool_effect` to continue
+without executing the protected action twice. The registered application
+reconciler checks the exact call, stable key, arguments and downstream receipt;
+an operator-supplied result alone cannot settle the call. `resolve_tool_approval`
+authorizes the first execution, not its speculative child sessions.
 
-`DeployServiceTool` declares `ToolEffect.IDEMPOTENT` because it passes Cayu's
-stable runtime idempotency key downstream and reuses the receipt for that key.
-Its `AlwaysRequireApprovalToolPolicy` remains independent: replay safety does
-not authorize the first deployment or remove the human approval boundary.
+`DeployServiceTool` deliberately declares `ToolEffect.EXTERNAL`: an ambiguous
+execution must be reconciled, not automatically retried. The example-owned
+downstream SQLite database atomically stores its service mutation and receipt,
+and supports stable-key lookup and conflicting-key rejection. Its invocation counter
+is separate from the mutation counter, so downstream idempotency cannot hide
+an accidental Cayu redispatch. Approval policy remains independent of this
+recovery contract.
+
+The deterministic scenario asserts one original tool invocation, one mutation,
+one receipt and unchanged history on identical reconciliation replay. The real
+process-loss tests in `tests/recovery/test_tool_effect_sigkill.py` use this same
+adapter with a separate durable Cayu SQLite store. They interrupt both ordinary
+and approval execution before invocation, during execution, after the external
+commit, during receipt persistence, and after selection before continuation.
+A fresh worker first recovers the dead invocation, then explicitly reconciles.
+If ordinary recovery already consumed the selected tool result, receipt replay
+is read-only and normal session resume owns the remaining model continuation.
+An absent or pending downstream receipt remains unresolved without tool retry.
+
+These are fixture-backed guarantees, not universal exactly-once delivery.
+Another external system must supply its own authoritative receipt/lookup or
+idempotency contract and validator; an LLM statement is not such evidence.

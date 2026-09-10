@@ -222,6 +222,14 @@ class _CommitFirstStagedTerminalThenRaiseStore(InMemorySessionStore):
 
     async def transform_checkpoint(self, session_id, checkpoint_transform):
         await super().transform_checkpoint(session_id, checkpoint_transform)
+        await self._fail_after_first_stage(session_id)
+
+    async def publish_session_operation(self, session_id, **kwargs):
+        result = await super().publish_session_operation(session_id, **kwargs)
+        await self._fail_after_first_stage(session_id)
+        return result
+
+    async def _fail_after_first_stage(self, session_id):
         checkpoint = await self.load_checkpoint(session_id)
         pending_payload = None
         if checkpoint is not None:
@@ -727,7 +735,9 @@ def test_secret_is_not_returned_to_tool_before_projection_is_durable() -> None:
 
         assert store.failed_projection is True
         assert tool.resolution_returned is False
-        assert events[-1].type is EventType.SESSION_FAILED
+        assert events[-1].type is EventType.SESSION_INTERRUPTED
+        checkpoint = await store.load_checkpoint("projection-write-failure")
+        assert checkpoint is not None and "pending_tool_round" in checkpoint
         assert len(provider.requests) == 1
         assert secret not in repr(events)
         assert secret not in repr(await store.load_events("projection-write-failure"))
@@ -2105,19 +2115,51 @@ async def _run_failed_execution_scenario(*, timed_out: bool) -> None:
         ),
     )
 
-    terminal = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["arguments_state"] == "finalized"
-    assert secret not in repr(terminal.payload["arguments"])
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    unknown = next(event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN)
+    assert unknown.payload["failure_evidence"]["classification"] == (
+        "timeout" if timed_out else "failure"
+    )
+    assert "result" not in unknown.payload
+    assert "arguments" not in unknown.payload
+    resumed = [
+        event
+        async for event in app.resume(
+            ResumeRequest(session_id=session_id, messages=[Message.text("user", "continue")])
+        )
+    ]
+    assert resumed[-1].type is EventType.SESSION_INTERRUPTED
+    assert tool.arguments == [arguments]
+    assert len(provider.requests) == 1
+    durable = await store.load_events(session_id)
+    assert sum(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in durable) == 1
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in durable
+    )
+    transcript = await store.load_transcript(session_id)
+    calls = [
+        part for message in transcript for part in message.content if type(part) is ToolCallPart
+    ]
+    assert calls == []
+    checkpoint = await store.load_checkpoint(session_id)
+    assert checkpoint is not None and "pending_tool_round" in checkpoint
+    started = [event for event in durable if event.type is EventType.TOOL_CALL_STARTED]
+    assert len(started) == 1
+    assert started[0].payload["arguments_state"] == "quarantined"
+    assert "arguments" not in started[0].payload
     assert secret not in repr(events)
-    assert secret not in repr(await store.load_transcript(session_id))
-    assert secret not in repr(provider.requests[1].messages)
+    assert secret not in repr(resumed)
+    assert secret not in repr(durable)
+    assert secret not in repr(transcript)
+    assert secret not in repr(provider.requests)
 
 
-def test_failed_tool_finalizes_late_secret_arguments_before_publication() -> None:
+def test_failed_tool_retains_late_secret_argument_quarantine_without_publication() -> None:
     asyncio.run(_run_failed_execution_scenario(timed_out=False))
 
 
-def test_timed_out_tool_finalizes_late_secret_arguments_before_publication() -> None:
+def test_timed_out_tool_retains_late_secret_argument_quarantine_without_publication() -> None:
     asyncio.run(_run_failed_execution_scenario(timed_out=True))
 
 
@@ -2207,21 +2249,22 @@ def test_tool_timeout_does_not_wait_for_a_nonresponsive_secret_resolver(
             timeout=10,
         )
 
-        assert vault.started.is_set() is True
-        assert vault.finished.is_set() is False
-        assert events[-1].type is EventType.SESSION_FAILED
-        terminal = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
-        assert terminal.payload["result"]["content"] == (
-            "Tool output was omitted because its secret-redaction scope could not be "
-            "finalized safely before publication."
-        )
-        assert terminal.payload["result"]["structured"]["terminal_outcome"] == (
-            "invalid_tool_output"
-        )
-        assert len(provider.requests) == 1
-
-        vault.release.set()
-        await asyncio.wait_for(vault.finished.wait(), timeout=10)
+        try:
+            assert vault.started.is_set() is True
+            assert vault.finished.is_set() is False
+            assert events[-1].type is EventType.SESSION_INTERRUPTED
+            assert not any(
+                event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+                for event in events
+            )
+            unknown = next(
+                event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+            )
+            assert "result" not in unknown.payload
+            assert len(provider.requests) == 1
+        finally:
+            vault.release.set()
+            await asyncio.wait_for(vault.finished.wait(), timeout=10)
         await asyncio.sleep(0)
         durable_events = await store.load_events(f"nonresponsive-secret-resolution-{secret_source}")
         transcript = await store.load_transcript(f"nonresponsive-secret-resolution-{secret_source}")
@@ -2393,10 +2436,13 @@ async def _run_restart_recovery_scenario() -> None:
     recovered_terminal = next(
         event
         for event in durable_events
-        if event.type is EventType.TOOL_CALL_FAILED
+        if event.type is EventType.TOOL_CALL_COMPLETED
         and event.payload.get("tool_call_id") == "call_restart_secret"
     )
+    assert recovered_terminal.payload["result"]["content"] == "done"
     assert recovered_terminal.payload["arguments_state"] == "unavailable"
+    assert "arguments" not in recovered_terminal.payload
+    assert not any(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in durable_events)
     assert secret not in repr(durable_events)
     transcript = await store.load_transcript("late-secret-restart-recovery")
     assert secret not in repr(transcript)
@@ -3419,14 +3465,28 @@ def test_pause_retry_reuses_a_staged_terminal_after_acknowledgement_loss(
         else:
             assert isinstance(store, _CommitFirstTerminalEventThenRaiseStore)
             assert store.lost_terminal_acknowledgement is True
-        assert first_attempt[-1].type is EventType.SESSION_INTERRUPTED
+        reconciled_atomic_stage = loss_boundary == "stage" and pause_kind == "approval"
+        assert first_attempt[-1].type is (
+            EventType.SESSION_COMPLETED
+            if reconciled_atomic_stage
+            else EventType.SESSION_INTERRUPTED
+        )
         assert first_attempt[-1].payload.get("manual_recovery_required") is not True
 
         retry = await resolve()
-        assert retry[-1].type is EventType.SESSION_COMPLETED, retry[-1].payload
+        if reconciled_atomic_stage:
+            # Exact readback already completed the continuation. Repeating
+            # the approval acknowledges its closure without another model run.
+            assert retry[-1].type is EventType.SESSION_CHECKPOINTED
+            assert retry[-1].payload["cleared"] is True
+            completed = await store.load(session_id)
+            assert completed is not None and completed.status.value == "completed"
+            assert len(provider.requests) == 2
+        else:
+            assert retry[-1].type is EventType.SESSION_COMPLETED, retry[-1].payload
         expected_calls = (
             ([{"value": "first"}] if pause_kind == "approval" else [])
-            if loss_boundary == "stage"
+            if loss_boundary == "stage" and not reconciled_atomic_stage
             else (
                 [{"value": "first"}, {"value": "second"}]
                 if pause_kind == "approval"
@@ -3478,7 +3538,7 @@ def test_pause_retry_reuses_a_staged_terminal_after_acknowledgement_loss(
         assert publication_status.maximum_reserved_round_bytes > 0
         assert publication_status.active_round_reservations == 0
         assert publication_status.active_exclusive_rounds == 0
-        if loss_boundary == "stage":
+        if loss_boundary == "stage" and not reconciled_atomic_stage:
             assert sibling_starts == []
             assert sibling_terminals[0].type is EventType.TOOL_CALL_BLOCKED
             assert sibling_terminals[0].payload["result"]["structured"] == {

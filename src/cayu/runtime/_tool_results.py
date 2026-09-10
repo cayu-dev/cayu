@@ -260,6 +260,7 @@ def redact_tool_result_event(
     linkage_fields = _runtime_tool_event_linkage_fields(event.payload)
     profile_attribution = _runtime_execution_profile_attribution(event)
     exposure_attribution = _runtime_tool_exposure_attribution(event)
+    timing_attribution = runtime_terminal_timing_attribution(event)
     payload_to_redact = {
         key: value
         for key, value in event.payload.items()
@@ -267,6 +268,7 @@ def redact_tool_result_event(
         and key not in linkage_fields
         and key not in profile_attribution
         and key not in exposure_attribution
+        and key not in timing_attribution
         and not (event_controls and key in _RUNTIME_TERMINAL_CONTROL_FIELDS)
     }
     payload = redactor.redact_json(payload_to_redact)
@@ -275,6 +277,7 @@ def redact_tool_result_event(
     payload.update(linkage_fields)
     payload.update(profile_attribution)
     payload.update(exposure_attribution)
+    payload.update(timing_attribution)
     if result_controls:
         structured = dict(redacted_result.structured or {})
         structured.update(result_controls)
@@ -297,6 +300,25 @@ def redact_tool_result_event(
         original=result,
         redacted=restored_result,
     )
+
+
+def runtime_terminal_timing_attribution(event: Event) -> dict[str, str]:
+    """Retain only timing values attested by the durable publication owner.
+
+    Shape, ordering, and event timestamp equality remain validated by the event
+    preparation boundary. A caller-provided ISO string is not timing authority.
+    """
+
+    return {
+        field_name: value
+        for field_name in (
+            "tool_effect_completed_at",
+            "tool_terminal_staged_at",
+            "tool_terminal_publication_started_at",
+        )
+        if type(value := event.payload.get(field_name)) is str
+        and event_payload_authority_is_runtime_generated(event, field_name=field_name, value=value)
+    }
 
 
 def _runtime_execution_profile_attribution(event: Event) -> dict[str, str]:

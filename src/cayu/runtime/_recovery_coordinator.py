@@ -64,6 +64,8 @@ from cayu.core.tools import (
     _TOOL_POLICY_DENIAL_SOURCE,
     DurableToolOperationConflict,
     DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
+    ToolEffect,
     ToolResult,
 )
 from cayu.deadlines import (
@@ -73,7 +75,7 @@ from cayu.deadlines import (
 )
 from cayu.environments import EnvironmentFactoryOperation
 from cayu.environments.bindings import _runtime_owned_workspace_observer_name
-from cayu.failure_evidence import FailureEvidence
+from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.memory_evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.providers import (
     ProviderOperationAdapter,
@@ -112,6 +114,7 @@ from cayu.runtime._continuation_task_failure import (
     provider_operation_task_failure_payload,
     runtime_task_terminalization_idempotency_key,
 )
+from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._diagnostics import (
     ExceptionDiagnostic,
     bound_diagnostic_text,
@@ -205,6 +208,23 @@ from cayu.runtime._terminal_evidence import (
     classify_current_terminal_evidence,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
+)
+from cayu.runtime._tool_effect_preparation_recovery import settle_prepared_tool_effects
+from cayu.runtime._tool_effect_reconciliation import (
+    ToolEffectReconciliationOwner,
+    project_accepted_reconciliation,
+    reconciliation_request_digest,
+)
+from cayu.runtime._tool_effect_state import (
+    ToolEffectConflict,
+    ToolEffectObservation,
+    ToolEffectReconciliationRequired,
+    ToolEffectRecord,
+    ToolEffectStateOwner,
+    ToolEffectTerminal,
+    _validate_selected_observation,
+    _validate_selected_terminal,
+    validate_tool_effect_uncertainty_event,
 )
 from cayu.runtime._tool_round_executor import (
     DeferredTerminalStager,
@@ -396,6 +416,11 @@ from cayu.runtime.tasks import (
     copy_task,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_effects import (
+    ToolEffectReconciliationRequest,
+    ToolEffectReconciliationTarget,
+    tool_effect_receipt_digest,
+)
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     NOT_EXPOSED_IN_REQUEST_REASON,
@@ -1105,6 +1130,17 @@ def _authoritative_recovery_ownership_failure(
     return ownership_failure
 
 
+def _continuation_failure_payload(
+    error: BaseException, *, session: Session, redactor: SecretRedactor
+) -> dict[str, Any]:
+    return {
+        **exception_failure_payload(error, redactor=redactor),
+        "failure_evidence": exception_evidence(error)
+        .model_copy(update={"session_id": session.id, "run_epoch": session.run_epoch})
+        .model_dump(mode="json"),
+    }
+
+
 async def _run_recovery_cleanup_steps(
     *,
     authoritative_failure: BaseException | None,
@@ -1736,6 +1772,23 @@ class _RecoveryInvocationSemantics:
     thinking: ThinkingConfig | None
 
 
+@dataclass(frozen=True)
+class _ReconciledToolEffectReplay:
+    record: ToolEffectRecord
+    terminal_event: Event
+    consumption_receipt: RuntimePublicationReceipt | None
+
+
+@dataclass(frozen=True)
+class _ToolEffectObservationReplay:
+    record: ToolEffectRecord
+    event: Event
+
+
+class _FinalizedToolEffectRejection(ToolEffectConflict):
+    """The receipt owner published interruption before rejecting its observation."""
+
+
 RunSession = Callable[[RecoverySessionRunRequest], AsyncGenerator[Event, None]]
 TerminalEventStream = Callable[[RecoveryTerminalEventRequest], AsyncIterator[Event]]
 TerminalHooksSettled = Callable[[RecoveryTerminalEventRequest], Awaitable[bool]]
@@ -1943,6 +1996,7 @@ class RecoveryCoordinator:
         self._workspace_artifact_recovery_operations = BoundedInvocationOperationRegistry(
             max_operations=64
         )
+        self._effect_reconciliation_owner = ToolEffectReconciliationOwner()
 
     def _build_human_review(
         self,
@@ -5272,6 +5326,7 @@ class RecoveryCoordinator:
         *,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        effect_reconciliation: ToolEffectReconciliationRequest | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
@@ -5352,6 +5407,8 @@ class RecoveryCoordinator:
             pending=pending,
         )
         resume_after_manual_recovery = False
+        if effect_reconciliation is not None and candidate_intent is None:
+            raise ToolEffectConflict("Receipt recovery lost the original user-input answer intent.")
         if candidate_intent is not None:
             if candidate_intent.answer_request_digest != answer_request_digest:
                 raise SessionRuntimePublicationConflict(
@@ -5390,6 +5447,11 @@ class RecoveryCoordinator:
             structured_output=effective_structured_output,
             effective_retry_policy=self._effective_retry_policy,
         )
+        if effect_reconciliation is not None and (
+            effect_reconciliation.max_steps is not None
+            and effect_reconciliation.max_steps != invocation_semantics.max_steps
+        ):
+            raise ToolEffectConflict("Receipt continuation conflicts with the frozen step limit.")
         require_secret_free_structured_output_spec(
             effective_structured_output,
             redactor=self._secret_redactor,
@@ -5452,6 +5514,14 @@ class RecoveryCoordinator:
             if current_pending != pending or current_intent != candidate_intent:
                 raise SessionRuntimePublicationConflict(
                     "Pending user-input authority changed before answer claim."
+                )
+            if effect_reconciliation is not None:
+                self._require_human_review_decision(
+                    effect_reconciliation.review_reference,
+                    current_session,
+                    current_checkpoint,
+                    denying=True,
+                    accepted_request=False,
                 )
             self._require_human_review_decision(
                 getattr(response, "review_reference", None),
@@ -5522,6 +5592,7 @@ class RecoveryCoordinator:
             execution_profile_snapshot=execution_profile_snapshot,
             budget_policy=budget_policy_snapshot,
             invocation_context=invocation_context,
+            effect_reconciliation=effect_reconciliation,
         )
         authoritative_failure: BaseException | None = None
         abandoned = False
@@ -7259,9 +7330,32 @@ class RecoveryCoordinator:
                 invocation_context=invocation_context,
             )
 
+    async def inspect_tool_effect_target(
+        self, *, session_id: str, tool_round_id: str, tool_call_id: str
+    ) -> ToolEffectReconciliationTarget:
+        """Read exact durable identity; this does not admit any recovery action."""
+        session = await self._session_store.load(session_id)
+        if session is None:
+            raise ToolEffectConflict("The effect session was not found.")
+        record = await ToolEffectStateOwner(self._session_store).resolve_call(
+            session, tool_round_id=tool_round_id, tool_call_id=tool_call_id
+        )
+        if record is None:
+            raise ToolEffectConflict("The durable external call was not found.")
+        return ToolEffectReconciliationTarget(
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            tool_round_id=record.intent.tool_round_id,
+            tool_call_id=record.intent.tool_call_id,
+            tool_name=record.intent.tool_name,
+            idempotency_key=record.intent.idempotency_key,
+            expected_run_epoch=session.run_epoch,
+            expected_revision=record.revision,
+        )
+
     async def recover_tool_approval_request(
         self,
-        request: ToolApprovalRecoveryRequest,
+        request: ToolApprovalRecoveryRequest | ToolEffectReconciliationRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
@@ -7270,10 +7364,50 @@ class RecoveryCoordinator:
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
 
+        if type(request) is ToolEffectReconciliationRequest:
+            effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+                loaded_session,
+                tool_round_id=request.tool_round_id,
+                tool_call_id=request.tool_call_id,
+            )
+            if effect is None or effect.intent.approval_id is None:
+                raise ToolEffectConflict("Receipt recovery has no durable approval linkage.")
+            approval_id = effect.intent.approval_id
+            await self.require_human_review_resolution_authority(
+                loaded_session.id, request.review_reference
+            )
+            replay = await self._preflight_tool_effect_reconciliation(
+                session=loaded_session, request=request
+            )
+            if (
+                isinstance(replay, _ToolEffectObservationReplay)
+                and loaded_session.status is SessionStatus.INTERRUPTED
+            ):
+                yield copy_event(replay.event)
+                assert replay.record.observation is not None
+                if replay.record.observation.result.outcome == "conflict":
+                    raise ToolEffectConflict("Application reconciliation rejected the receipt.")
+                return
+            if (
+                isinstance(replay, _ReconciledToolEffectReplay)
+                and replay.consumption_receipt is not None
+            ):
+                yield copy_event(replay.terminal_event)
+                return
+            if replay is None and request.expected_run_epoch != loaded_session.run_epoch:
+                raise ToolEffectConflict("Receipt recovery has stale session authority.")
+            request_loop_policies = ()
+            requested_structured_output = None
+        elif type(request) is ToolApprovalRecoveryRequest:
+            approval_id = request.approval_id
+            request_loop_policies = request.loop_policies
+            requested_structured_output = request.structured_output
+        else:
+            raise TypeError("Approval recovery requires an exact recovery action.")
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
         candidate_approval, candidate_round = _pending_approval_and_round_for_atomic_claim(
             checkpoint,
-            approval_id=request.approval_id,
+            approval_id=approval_id,
             tool_round_id=request.tool_round_id,
             recovery_tool_call_id=request.tool_call_id,
             redactor=self._secret_redactor,
@@ -7283,7 +7417,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
         )
         effective_structured_output = _effective_approval_structured_output(
-            structured_output=request.structured_output,
+            structured_output=requested_structured_output,
             pending_approval=candidate_approval,
         )
         invocation_semantics = _effective_approval_invocation_semantics(
@@ -7309,7 +7443,7 @@ class RecoveryCoordinator:
             checkpoint,
             registered_agent,
             registered_provider,
-            request.loop_policies,
+            request_loop_policies,
             budget_policy=budget_policy_snapshot,
             request_budget_limits=invocation_semantics.budget_limits,
             structured_output=invocation_semantics.structured_output,
@@ -7336,7 +7470,7 @@ class RecoveryCoordinator:
             registered_provider=registered_provider,
             registered_environment=registered_environment,
             budget_policy=budget_policy_snapshot,
-            request_loop_policies=request.loop_policies,
+            request_loop_policies=request_loop_policies,
         )
         pending_approval: PendingToolApproval | None = None
         pending_round: tool_round_recovery.PendingToolRound | None = None
@@ -7349,7 +7483,7 @@ class RecoveryCoordinator:
             nonlocal claimed_resolution_intent, pending_approval, pending_round
             pending_approval, pending_round = _pending_approval_and_round_for_atomic_claim(
                 checkpoint,
-                approval_id=request.approval_id,
+                approval_id=approval_id,
                 tool_round_id=request.tool_round_id,
                 recovery_tool_call_id=request.tool_call_id,
                 redactor=self._secret_redactor,
@@ -7449,9 +7583,161 @@ class RecoveryCoordinator:
                 "ToolApprovalRecoveryRequest."
             )
 
+    async def replay_consumed_tool_effect(
+        self, request: ToolEffectReconciliationRequest
+    ) -> Event | None:
+        """Return exact consumed evidence without renewing task execution authority."""
+        session = await self._session_store.load(request.session_id)
+        if session is None:
+            return None
+        record = await ToolEffectStateOwner(self._session_store).resolve_call(
+            session, tool_round_id=request.tool_round_id, tool_call_id=request.tool_call_id
+        )
+        if record is None or record.terminal is None:
+            return None
+        replay = await self._load_reconciled_tool_effect_replay(session=session, request=request)
+        if (
+            not isinstance(replay, _ReconciledToolEffectReplay)
+            or replay.consumption_receipt is None
+        ):
+            return None
+        if record.intent.approval_id is not None:
+            await self.require_human_review_resolution_authority(
+                session.id, request.review_reference
+            )
+        return copy_event(replay.terminal_event)
+
+    async def _load_reconciled_tool_effect_replay(
+        self,
+        *,
+        session: Session,
+        request: ToolEffectReconciliationRequest,
+    ) -> _ReconciledToolEffectReplay | _ToolEffectObservationReplay | None:
+        """Read exact settlement and consumption proof without acquiring execution authority."""
+        from cayu.runtime.sessions import runtime_publication_event_reference
+
+        if request.session_instance_id != session.instance_id:
+            raise ToolEffectConflict("Receipt replay has a different session incarnation.")
+        record = await ToolEffectStateOwner(self._session_store).resolve_call(
+            session,
+            tool_round_id=request.tool_round_id,
+            tool_call_id=request.tool_call_id,
+        )
+        if record is None:
+            return None
+        if record.terminal is None:
+            if record.reconciliation_attempt is not None:
+                # A newer admitted decision supersedes the prior observation's
+                # replay authority even before its callback produces an outcome.
+                return None
+            observation = record.observation
+            if observation is None or observation.request_digest != reconciliation_request_digest(
+                request
+            ):
+                return None
+            records = await self._session_store.query_events(
+                EventQuery(session_id=session.id, event_id=observation.event_id, limit=1)
+            )
+            if len(records) != 1:
+                raise ToolEffectConflict("Receipt replay lost its atomic observation event.")
+            event = records[0].event
+            _validate_selected_observation(record, (event,))
+            return _ToolEffectObservationReplay(record, copy_event(event))
+        if record.state not in {
+            "reconciled_completed",
+            "reconciled_failed",
+        } or record.terminal.reconciliation_request_digest != reconciliation_request_digest(
+            request
+        ):
+            raise ToolEffectConflict("Receipt replay differs from the selected reconciliation.")
+        records = await self._session_store.query_events(
+            EventQuery(session_id=session.id, event_id=record.terminal.event_id, limit=1)
+        )
+        if len(records) != 1:
+            raise ToolEffectConflict("Receipt replay lost its atomically selected terminal event.")
+        event = records[0].event
+        _validate_selected_terminal(record, None, (event,))
+        if event.interaction_id != record.intent.interaction_id:
+            raise ToolEffectConflict("Receipt replay terminal has a different interaction.")
+        if record.intent.approval_id is not None:
+            consumption_kind = "approval-close"
+            consumption_id = f"approval-close:{record.intent.approval_id}"
+        elif record.intent.pause_id is not None:
+            consumption_kind = "user-input-close"
+            consumption_id = f"user-input-close:{record.intent.pause_id}"
+        else:
+            consumption_kind = "tool-round"
+            consumption_id = f"tool-round:{record.intent.tool_round_id}"
+        consumption = await self._session_store.load_runtime_publication_receipt(
+            session.id, consumption_id
+        )
+        if consumption is not None:
+            if record.intent.pause_id is not None:
+                response = request.user_input_response
+                if response is None or response.input_id != record.intent.pause_id:
+                    raise ToolEffectConflict("Receipt replay lacks its exact user-input response.")
+                await self._exact_user_input_close_event(
+                    session=session,
+                    input_id=record.intent.pause_id,
+                    receipt=consumption,
+                    expected_resolution_request_digest=user_input_resolution_request_digest(
+                        response
+                    ),
+                )
+            call_ids = consumption.intent.get("tool_call_ids")
+            if (
+                consumption.kind != consumption_kind
+                or consumption.interaction_id != record.intent.interaction_id
+                or any(
+                    consumption.intent.get(name) != getattr(record.intent, name)
+                    for name in ("tool_round_id", "model_step_id", "model_attempt_id")
+                )
+                or type(call_ids) is not list
+                or record.intent.tool_call_id not in call_ids
+                or runtime_publication_event_reference(event) not in consumption.referenced_events
+            ):
+                raise ToolEffectConflict("Receipt replay has conflicting consumption evidence.")
+            if record.intent.approval_id is not None and (
+                consumption.intent.get("approval_id") != record.intent.approval_id
+                or consumption.intent.get("decision") != "approve"
+                or consumption.intent.get("requested_decision") != "approve"
+            ):
+                raise ToolEffectConflict(
+                    "Receipt replay has conflicting approval closure evidence."
+                )
+        return _ReconciledToolEffectReplay(record, copy_event(event), consumption)
+
+    async def _preflight_tool_effect_reconciliation(
+        self,
+        *,
+        session: Session,
+        request: ToolEffectReconciliationRequest,
+        source_run_epoch: int | None = None,
+    ) -> _ReconciledToolEffectReplay | _ToolEffectObservationReplay | None:
+        """Reject invalid effect authority before claims or extension setup."""
+        replay = await self._load_reconciled_tool_effect_replay(session=session, request=request)
+        if replay is not None:
+            return replay
+        epoch = session.run_epoch if source_run_epoch is None else source_run_epoch
+        if request.expected_run_epoch != epoch:
+            raise ToolEffectConflict("Receipt recovery has stale session authority.")
+        record = await ToolEffectStateOwner(self._session_store).resolve_call(
+            session, tool_round_id=request.tool_round_id, tool_call_id=request.tool_call_id
+        )
+        if record is None:
+            raise ToolEffectConflict("Receipt recovery has no durable effect intent.")
+        registered_agent = self._resolve_registered_agent(session.agent_name)
+        tool = registered_agent.tools.get(record.intent.tool_name)
+        if tool is None or tool.effect is not ToolEffect.EXTERNAL:
+            raise ToolEffectConflict("Receipt recovery has no exact registered external tool.")
+        self._effect_reconciliation_owner.prepare(
+            request=request, record=record, run_epoch=epoch, registered=tool.effect_reconciler
+        )
+        return None
+
     async def recover_tool_round_request(
         self,
-        request: ToolRoundRecoveryRequest,
+        request: ToolRoundRecoveryRequest | ToolEffectReconciliationRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
@@ -7481,6 +7767,96 @@ class RecoveryCoordinator:
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
 
+        if type(request) is ToolEffectReconciliationRequest:
+            effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+                loaded_session,
+                tool_round_id=request.tool_round_id,
+                tool_call_id=request.tool_call_id,
+            )
+            if request.user_input_response is not None and (
+                effect is None or effect.intent.pause_id is None
+            ):
+                raise ToolEffectConflict("Receipt call is not owned by a user-input pause.")
+            if effect is not None and effect.intent.approval_id is not None:
+                async with _close_delegated_event_stream(
+                    self.recover_tool_approval_request(
+                        request, before_mutation=before_mutation, after_admission=after_admission
+                    )
+                ) as approval_stream:
+                    async for event in approval_stream:
+                        yield event
+                return
+            if effect is not None and effect.intent.pause_id is not None:
+                response = request.user_input_response
+                if response is None or (
+                    response.input_id != effect.intent.pause_id
+                    or response.session_id != request.session_id
+                    or response.task_worker_id != request.task_worker_id
+                    or response.task_handoff_id != request.task_handoff_id
+                ):
+                    raise ToolEffectConflict(
+                        "Receipt recovery requires the exact user-input response."
+                    )
+                replay = await self._preflight_tool_effect_reconciliation(
+                    session=loaded_session, request=request
+                )
+                if (
+                    isinstance(replay, _ToolEffectObservationReplay)
+                    and loaded_session.status is SessionStatus.INTERRUPTED
+                ):
+                    yield copy_event(replay.event)
+                    assert replay.record.observation is not None
+                    if replay.record.observation.result.outcome == "conflict":
+                        raise ToolEffectConflict("Application reconciliation rejected the receipt.")
+                    return
+                if (
+                    isinstance(replay, _ReconciledToolEffectReplay)
+                    and replay.consumption_receipt is not None
+                ):
+                    yield copy_event(replay.terminal_event)
+                    return
+                async with _close_delegated_event_stream(
+                    self.resolve_user_input(
+                        response,
+                        before_mutation=before_mutation,
+                        after_admission=after_admission,
+                        effect_reconciliation=request,
+                    )
+                ) as input_stream:
+                    async for event in input_stream:
+                        yield event
+                return
+            replay = await self._preflight_tool_effect_reconciliation(
+                session=loaded_session, request=request
+            )
+            if (
+                isinstance(replay, _ToolEffectObservationReplay)
+                and loaded_session.status is SessionStatus.INTERRUPTED
+            ):
+                yield copy_event(replay.event)
+                assert replay.record.observation is not None
+                if replay.record.observation.result.outcome == "conflict":
+                    raise ToolEffectConflict("Application reconciliation rejected the receipt.")
+                return
+            if (
+                isinstance(replay, _ReconciledToolEffectReplay)
+                and replay.consumption_receipt is not None
+            ):
+                yield copy_event(replay.terminal_event)
+                return
+            if request.session_instance_id != loaded_session.instance_id or (
+                replay is None and request.expected_run_epoch != loaded_session.run_epoch
+            ):
+                raise ToolEffectConflict("Receipt recovery has stale session authority.")
+            requested_round_id = request.tool_round_id
+            requested_structured_output = None
+            request_loop_policies = ()
+        elif type(request) is ToolRoundRecoveryRequest:
+            requested_round_id = request.round_id
+            requested_structured_output = request.structured_output
+            request_loop_policies = request.loop_policies
+        else:
+            raise TypeError("Tool-round recovery requires an exact recovery action.")
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
@@ -7490,10 +7866,10 @@ class RecoveryCoordinator:
         if pending_round is None:
             raise RuntimeError("Session has no pending tool round.")
         self._reject_approval_owned_tool_round_recovery(checkpoint)
-        if pending_round.tool_round_id != request.round_id:
-            raise ValueError(f"Tool round id does not match pending round: {request.round_id}")
+        if pending_round.tool_round_id != requested_round_id:
+            raise ValueError("Tool round id does not match pending round.")
         effective_structured_output = _effective_tool_round_structured_output(
-            structured_output=request.structured_output,
+            structured_output=requested_structured_output,
             pending_round=pending_round,
         )
         invocation_semantics = _effective_tool_round_invocation_semantics(
@@ -7524,7 +7900,7 @@ class RecoveryCoordinator:
             checkpoint,
             registered_agent,
             registered_provider,
-            request.loop_policies,
+            request_loop_policies,
             budget_policy=budget_policy_snapshot,
             request_budget_limits=invocation_semantics.budget_limits,
             structured_output=invocation_semantics.structured_output,
@@ -7606,7 +7982,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 registered_agent,
                 registered_provider,
-                request.loop_policies,
+                request_loop_policies,
                 execution_profile_snapshot.profile,
                 budget_policy=budget_policy_snapshot,
                 request_budget_limits=invocation_semantics.budget_limits,
@@ -7895,6 +8271,7 @@ class RecoveryCoordinator:
         budget_policy: BudgetPolicy | None,
         invocation_context: InvocationContext | None = None,
         emit_resume_event: bool = True,
+        effect_reconciliation: ToolEffectReconciliationRequest | None = None,
     ) -> AsyncGenerator[Event, None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -7946,6 +8323,7 @@ class RecoveryCoordinator:
         effective_budget_limits = invocation_semantics.budget_limits
         effective_retry_policy = invocation_semantics.retry_policy
         continued_run_limit_accounting = pending.run_limit_accounting
+        effect_settlement: _ReconciledToolEffectReplay | _ToolEffectObservationReplay | None = None
         try:
             resolution_intent = await self._admit_user_input_resolution_execution(
                 session=session,
@@ -8009,6 +8387,63 @@ class RecoveryCoordinator:
 
             if factory_resolution.error is not None:
                 raise factory_resolution.error
+            if effect_reconciliation is not None:
+                if invocation_context is None:
+                    raise RuntimeError("Receipt recovery has no user-input invocation authority.")
+                async with contextlib.aclosing(
+                    self._settle_tool_effect_reconciliation(
+                        request=effect_reconciliation,
+                        source_run_epoch=effect_reconciliation.expected_run_epoch,
+                        session=session,
+                        invocation_context=invocation_context,
+                    )
+                ) as settlement_stream:
+                    async for item in settlement_stream:
+                        if isinstance(item, Event):
+                            yield copy_event(item)
+                        else:
+                            effect_settlement = item
+                if effect_settlement is None:
+                    raise RuntimeError("User-input receipt recovery returned no settlement.")
+                if isinstance(effect_settlement, _ToolEffectObservationReplay):
+                    await self._event_writer.fan_out_persisted([effect_settlement.event])
+                    yield copy_event(effect_settlement.event)
+                    async for event in self._interrupt_unresolved_tool_effect(
+                        record=effect_settlement.record,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
+                        invocation_context=invocation_context,
+                    ):
+                        yield event
+                    return
+                await self._event_writer.fan_out_persisted([effect_settlement.terminal_event])
+                yield copy_event(effect_settlement.terminal_event)
+                recovered_call = approval_support.round_tool_call_for_recovery(
+                    pending_calls=pending.tool_calls,
+                    tool_call_id=effect_reconciliation.tool_call_id,
+                )
+                async for event, _modified in self._tool_round_executor.run_tool_call_hooks(
+                    session=session,
+                    tool_event=effect_settlement.terminal_event,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=approval_support.tool_call_request_from_pending(
+                        recovered_call, arguments={}
+                    ),
+                    result=ToolResult.model_validate(
+                        effect_settlement.terminal_event.payload["result"]
+                    ),
+                    task_id=pending.task_id,
+                    execution_profile=execution_profile_snapshot.profile,
+                    invocation_context=invocation_context,
+                    redactor=self._secret_redactor,
+                    output_redactor=self._secret_redactor,
+                    allow_modification=False,
+                ):
+                    yield event
+                resume_events = await self._session_store.load_events(session.id)
             if emit_resume_event:
                 yield await self._event_writer.emit(
                     event_with_execution_profile_authority(
@@ -8087,7 +8522,8 @@ class RecoveryCoordinator:
             defer_round_terminals = (
                 len(round_tool_calls) > 1 and pause_secret_resolution_scope != "static"
             ) or any(
-                registered is not None and registered.workspace_mutation
+                registered is not None
+                and (registered.workspace_mutation or registered.effect is ToolEffect.EXTERNAL)
                 for registered in (
                     registered_agent.executable_tool(tool_call.name)
                     for tool_call in round_tool_calls
@@ -8096,6 +8532,8 @@ class RecoveryCoordinator:
             publication_coordinator = (
                 _ToolRoundPublicationCoordinator(
                     session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    run_epoch=session.run_epoch,
                     tool_round_identity=tool_round_identity,
                     session_store=self._session_store,
                     redactor=base_round_redactor,
@@ -8749,6 +9187,8 @@ class RecoveryCoordinator:
             except GeneratorExit:
                 await forwarded_stream.aclose()
                 raise
+        except _FinalizedToolEffectRejection:
+            raise
         except Exception as exc:
             if not pending_cleared:
                 # The pending_user_input checkpoint is still present, so restore the resumable
@@ -8791,8 +9231,9 @@ class RecoveryCoordinator:
                     )
                 else:
                     payload = {
-                        **exception_failure_payload(
+                        **_continuation_failure_payload(
                             exc,
+                            session=session,
                             redactor=self._secret_redactor,
                         ),
                         **tool_round_identity.payload(),
@@ -9643,7 +10084,8 @@ class RecoveryCoordinator:
             defer_round_terminals = (
                 len(round_tool_calls) > 1 and pause_secret_resolution_scope != "static"
             ) or any(
-                registered is not None and registered.workspace_mutation
+                registered is not None
+                and (registered.workspace_mutation or registered.effect is ToolEffect.EXTERNAL)
                 for registered in (
                     registered_agent.executable_tool(tool_call.name)
                     for tool_call in round_tool_calls
@@ -9652,6 +10094,8 @@ class RecoveryCoordinator:
             publication_coordinator = (
                 _ToolRoundPublicationCoordinator(
                     session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    run_epoch=session.run_epoch,
                     tool_round_identity=tool_round_identity,
                     session_store=self._session_store,
                     redactor=base_round_redactor,
@@ -10310,8 +10754,9 @@ class RecoveryCoordinator:
                             agent_name=registered_agent.spec.name,
                             environment_name=environment_name,
                             payload={
-                                **exception_failure_payload(
+                                **_continuation_failure_payload(
                                     exc,
+                                    session=session,
                                     redactor=self._secret_redactor,
                                 ),
                                 **tool_round_identity.payload(),
@@ -10366,8 +10811,9 @@ class RecoveryCoordinator:
                             agent_name=registered_agent.spec.name,
                             environment_name=environment_name,
                             payload={
-                                **exception_failure_payload(
+                                **_continuation_failure_payload(
                                     exc,
+                                    session=session,
                                     redactor=self._secret_redactor,
                                 ),
                                 **tool_round_identity.payload(),
@@ -10986,6 +11432,11 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None = None
         abandoned = False
         try:
+            await ToolEffectStateOwner(self._session_store).require_unverified_recovery_allowed(
+                session,
+                tool_round_id=pending.tool_round_id,
+                tool_call_id=pending_tool_call.tool_call_id,
+            )
             resolution_intent = await self._admit_user_input_resolution_execution(
                 session=session,
                 pending=pending,
@@ -11380,7 +11831,7 @@ class RecoveryCoordinator:
     async def recover_tool_approval(
         self,
         *,
-        request: ToolApprovalRecoveryRequest,
+        request: ToolApprovalRecoveryRequest | ToolEffectReconciliationRequest,
         loaded_session: Session,
         session: Session,
         pending_approval: PendingToolApproval,
@@ -11415,19 +11866,25 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None = None
         abandoned = False
         try:
-            recovered_result = approval_support.recovered_tool_result(
-                request=request,
-            )
-            recovery_secret_resolution_scope = pending_approval.secret_resolution_scope
-            public_recovered_result = _public_manual_recovery_result(
-                recovered_result,
-                secret_resolution_scope=recovery_secret_resolution_scope,
-            )
-            event_type = (
-                EventType.TOOL_CALL_FAILED
-                if recovered_result.is_error
-                else EventType.TOOL_CALL_COMPLETED
-            )
+            if type(request) is ToolApprovalRecoveryRequest:
+                await ToolEffectStateOwner(self._session_store).require_unverified_recovery_allowed(
+                    session,
+                    tool_round_id=pending_approval.tool_round_id,
+                    tool_call_id=pending_tool_call.tool_call_id,
+                )
+                recovered_result = approval_support.recovered_tool_result(
+                    request=request,
+                )
+                recovery_secret_resolution_scope = pending_approval.secret_resolution_scope
+                public_recovered_result = _public_manual_recovery_result(
+                    recovered_result,
+                    secret_resolution_scope=recovery_secret_resolution_scope,
+                )
+                event_type = (
+                    EventType.TOOL_CALL_FAILED
+                    if recovered_result.is_error
+                    else EventType.TOOL_CALL_COMPLETED
+                )
             # Recovery reconciles an externally executed side effect that was
             # authorized before the crash, so an expired window does not block it
             # (an expired-never-approved approval has no started tool to recover).
@@ -11436,11 +11893,19 @@ class RecoveryCoordinator:
                 pending_approval, self._clock()
             )
             events = await self._session_store.load_events(session.id)
-            approval_support.validate_recovery_target(
-                events=events,
-                approval=pending_approval,
-                tool_call_id=request.tool_call_id,
+            selected_reconciliation = (
+                await self._preflight_tool_effect_reconciliation(
+                    session=session, request=request, source_run_epoch=loaded_session.run_epoch
+                )
+                if type(request) is ToolEffectReconciliationRequest
+                else None
             )
+            if not isinstance(selected_reconciliation, _ReconciledToolEffectReplay):
+                approval_support.validate_recovery_target(
+                    events=events,
+                    approval=pending_approval,
+                    tool_call_id=request.tool_call_id,
+                )
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
                 session=session,
                 registered_agent=registered_agent,
@@ -11504,60 +11969,105 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
-            recovery_tool_event, public_recovered_result = tool_results.redact_tool_result_event(
-                event=Event(
-                    type=event_type,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=pending_tool_call.tool_name,
-                    payload={
-                        **tool_round_identity.payload(),
-                        "approval_id": pending_approval.approval_id,
-                        "tool_call_id": pending_tool_call.tool_call_id,
-                        "idempotency_key": tool_execution.tool_idempotency_key(
-                            session_id=session.id,
-                            tool_round_id=tool_round_identity.tool_round_id,
-                            tool_call_id=pending_tool_call.tool_call_id,
-                            approval_id=pending_approval.approval_id,
-                        ),
-                        "manual_recovery": True,
-                        **tool_argument_publication.unavailable_argument_projection().payload_fields(),
-                        **_public_resolution_audit_fields(
-                            secret_resolution_scope=recovery_secret_resolution_scope,
-                            reason=request.reason,
-                            metadata=request.metadata,
-                            redactor=self._secret_redactor,
-                        ),
-                        "resolved_by": resolution_actor_payload(request.resolved_by),
-                        "expired": recovered_after_expiry,
-                        "result": public_recovered_result.model_dump(),
-                    },
-                ),
-                result=public_recovered_result,
-                redactor=self._secret_redactor,
-            )
-            recovery_tool_event = event_with_execution_profile_authority(
-                recovery_tool_event,
-                execution_profile_snapshot.profile,
-            )
-            recovery_event_to_reconcile = recovery_tool_event
-            recovery_events = [
-                approval_support.resumed_event(
+            if type(request) is ToolEffectReconciliationRequest:
+                if invocation_context is None:
+                    raise RuntimeError(
+                        "Approval receipt recovery has no claimed invocation authority."
+                    )
+                settlement = None
+                settlement_stream = self._settle_tool_effect_reconciliation(
+                    request=request,
+                    source_run_epoch=loaded_session.run_epoch,
                     session=session,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    approval=pending_approval,
-                    decision=ToolApprovalDecision.APPROVE,
-                    resolved_by=request.resolved_by,
-                    expired=recovered_after_expiry,
-                ),
-                recovery_tool_event,
-            ]
-            emitted_recovery_events = await self._event_writer.persist_many(
-                session.id, recovery_events
-            )
-            recovery_persisted = True
+                    invocation_context=invocation_context,
+                )
+                async with contextlib.aclosing(settlement_stream) as owned_settlement:
+                    async for item in owned_settlement:
+                        if isinstance(item, Event):
+                            yield copy_event(item)
+                        else:
+                            settlement = item
+                if settlement is None:
+                    raise RuntimeError("Receipt recovery returned no settlement.")
+                if isinstance(settlement, _ToolEffectObservationReplay):
+                    recovery_event_to_reconcile = settlement.event
+                    recovery_persisted = True
+                    await self._event_writer.fan_out_persisted([settlement.event])
+                    yield copy_event(settlement.event)
+                    async for event in self._interrupt_unresolved_tool_effect(
+                        record=settlement.record,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
+                        invocation_context=invocation_context,
+                    ):
+                        yield event
+                    return
+                recovery_event_to_reconcile = settlement.terminal_event
+                recovery_persisted = True
+                emitted_recovery_events = [settlement.terminal_event]
+                public_recovered_result = ToolResult.model_validate(
+                    settlement.terminal_event.payload["result"]
+                )
+            else:
+                assert isinstance(request, ToolApprovalRecoveryRequest)
+                recovery_tool_event, public_recovered_result = (
+                    tool_results.redact_tool_result_event(
+                        event=Event(
+                            type=event_type,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=pending_tool_call.tool_name,
+                            payload={
+                                **tool_round_identity.payload(),
+                                "approval_id": pending_approval.approval_id,
+                                "tool_call_id": pending_tool_call.tool_call_id,
+                                "idempotency_key": tool_execution.tool_idempotency_key(
+                                    session_id=session.id,
+                                    tool_round_id=tool_round_identity.tool_round_id,
+                                    tool_call_id=pending_tool_call.tool_call_id,
+                                    approval_id=pending_approval.approval_id,
+                                ),
+                                "manual_recovery": True,
+                                **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                                **_public_resolution_audit_fields(
+                                    secret_resolution_scope=recovery_secret_resolution_scope,
+                                    reason=request.reason,
+                                    metadata=request.metadata,
+                                    redactor=self._secret_redactor,
+                                ),
+                                "resolved_by": resolution_actor_payload(request.resolved_by),
+                                "expired": recovered_after_expiry,
+                                "result": public_recovered_result.model_dump(),
+                            },
+                        ),
+                        result=public_recovered_result,
+                        redactor=self._secret_redactor,
+                    )
+                )
+                recovery_tool_event = event_with_execution_profile_authority(
+                    recovery_tool_event,
+                    execution_profile_snapshot.profile,
+                )
+                recovery_event_to_reconcile = recovery_tool_event
+                recovery_events = [
+                    approval_support.resumed_event(
+                        session=session,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        approval=pending_approval,
+                        decision=ToolApprovalDecision.APPROVE,
+                        resolved_by=request.resolved_by,
+                        expired=recovered_after_expiry,
+                    ),
+                    recovery_tool_event,
+                ]
+                emitted_recovery_events = await self._event_writer.persist_many(
+                    session.id, recovery_events
+                )
+                recovery_persisted = True
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
@@ -11590,6 +12100,10 @@ class RecoveryCoordinator:
             raise
         except Exception as exc:
             authoritative_failure = exc
+            if type(request) is ToolEffectReconciliationRequest:
+                # Finish the claimed recovery through its existing cleanup owner.
+                abandoned = True
+                raise
             reconciliation_error: Exception | None = None
             if not recovery_persisted and recovery_event_to_reconcile is not None:
                 try:
@@ -11711,24 +12225,38 @@ class RecoveryCoordinator:
         authoritative_failure = None
         abandoned = False
         try:
-            approval_request = ToolApprovalRequest(
-                session_id=request.session_id,
-                task_worker_id=request.task_worker_id,
-                approval_id=request.approval_id,
-                tool_round_id=request.tool_round_id,
-                tool_call_id=request.tool_call_id,
-                decision=ToolApprovalDecision.APPROVE,
-                reason=request.reason,
-                metadata=request.metadata,
-                resolved_by=request.resolved_by,
-                max_steps=request.max_steps,
-                limits=request.limits,
-                budget_limits=request.budget_limits,
-                retry_policy=request.retry_policy,
-                structured_output=request.structured_output,
-                thinking=request.thinking,
-                loop_policies=request.loop_policies,
-            )
+            if type(request) is ToolEffectReconciliationRequest:
+                approval_request = ToolApprovalRequest(
+                    session_id=request.session_id,
+                    task_worker_id=request.task_worker_id,
+                    task_handoff_id=request.task_handoff_id,
+                    approval_id=pending_approval.approval_id,
+                    tool_round_id=request.tool_round_id,
+                    tool_call_id=request.tool_call_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                    max_steps=request.max_steps,
+                )
+            else:
+                assert isinstance(request, ToolApprovalRecoveryRequest)
+                approval_request = ToolApprovalRequest(
+                    session_id=request.session_id,
+                    task_worker_id=request.task_worker_id,
+                    task_handoff_id=request.task_handoff_id,
+                    approval_id=pending_approval.approval_id,
+                    tool_round_id=request.tool_round_id,
+                    tool_call_id=request.tool_call_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                    reason=request.reason,
+                    metadata=request.metadata,
+                    resolved_by=request.resolved_by,
+                    max_steps=request.max_steps,
+                    limits=request.limits,
+                    budget_limits=request.budget_limits,
+                    retry_policy=request.retry_policy,
+                    structured_output=request.structured_output,
+                    thinking=request.thinking,
+                    loop_policies=request.loop_policies,
+                )
             continuation_stream = self.continue_tool_approval_resolution(
                 request=approval_request,
                 session=session,
@@ -11750,7 +12278,8 @@ class RecoveryCoordinator:
         except BaseException as exc:
             authoritative_failure = exc
             abandoned = (
-                _recovery_abandonment_signal(
+                type(request) is ToolEffectReconciliationRequest
+                or _recovery_abandonment_signal(
                     exc,
                     cancellation_baseline=cancellation_baseline,
                 )
@@ -12439,7 +12968,7 @@ class RecoveryCoordinator:
     async def recover_tool_round(
         self,
         *,
-        request: ToolRoundRecoveryRequest,
+        request: ToolRoundRecoveryRequest | ToolEffectReconciliationRequest,
         loaded_session: Session,
         pending_round: tool_round_recovery.PendingToolRound,
         pending_tool_call: PendingToolCallApproval,
@@ -12466,7 +12995,9 @@ class RecoveryCoordinator:
             registered_environment=registered_environment,
             execution_profile_snapshot=execution_profile_snapshot,
             budget_policy=budget_policy,
-            request_loop_policies=request.loop_policies,
+            request_loop_policies=(
+                request.loop_policies if type(request) is ToolRoundRecoveryRequest else ()
+            ),
             after_admission=after_admission,
         )
         if isinstance(claim, _ManualRecoveryInterruptionReplay):
@@ -12545,7 +13076,12 @@ class RecoveryCoordinator:
                 stop=stop_interruption_watch,
             )
         )
-        recovery_stream = self._recover_tool_round_claimed(
+        recover_claimed = (
+            self._reconcile_tool_effect_claimed
+            if type(request) is ToolEffectReconciliationRequest
+            else self._recover_tool_round_claimed
+        )
+        recovery_stream = recover_claimed(
             request=request,
             loaded_session=claim.session_before_fence,
             session=claim.session,
@@ -12854,7 +13390,7 @@ class RecoveryCoordinator:
     async def _recover_tool_round_claimed(
         self,
         *,
-        request: ToolRoundRecoveryRequest,
+        request: ToolRoundRecoveryRequest | ToolEffectReconciliationRequest,
         loaded_session: Session,
         session: Session,
         run_operation: _SessionRunOperation | None,
@@ -12869,6 +13405,8 @@ class RecoveryCoordinator:
         invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Persist one operator-verified ordinary tool outcome and continue safely."""
+        if type(request) is not ToolRoundRecoveryRequest:
+            raise TypeError("Manual recovery requires an exact operator result request.")
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or invocation_context.registered_agent is not registered_agent
@@ -12880,6 +13418,11 @@ class RecoveryCoordinator:
             raise RuntimeError("Manual tool-round recovery lost frozen invocation authority.")
         if run_operation is None:
             raise RuntimeError("Manual tool-round recovery has no durable run operation.")
+        await ToolEffectStateOwner(self._session_store).require_unverified_recovery_allowed(
+            session,
+            tool_round_id=pending_round.tool_round_id,
+            tool_call_id=pending_tool_call.tool_call_id,
+        )
         recovered_result = ToolResult(
             content=request.message,
             structured=request.structured,
@@ -13310,62 +13853,28 @@ class RecoveryCoordinator:
         session_stream: AsyncGenerator[Event, None] | None = None
         authoritative_failure: BaseException | None = None
         try:
-            transcript = await self._session_store.load_transcript(session.id)
-            continued_run_limit_accounting = pending_round.run_limit_accounting
-            if continued_run_limit_accounting is not None:
-                recovery_events = await self._session_store.load_events(session.id)
-                continued_run_limit_accounting = rebase_run_limit_accounting_context(
-                    continued_run_limit_accounting,
-                    session_id=session.id,
-                    limits=invocation_semantics.limits,
-                    budget_limits=request_budget_limits_for_session(
-                        limits=invocation_semantics.budget_limits,
-                        agent_name=registered_agent.spec.name,
-                        causal_budget_id=session.causal_budget_id,
-                    ),
-                    events=recovery_events,
-                    reset_run_limits=False,
-                    reset_budgets=False,
-                    now=self._clock(),
-                )
-            session_stream = self._run_session(
-                RecoverySessionRunRequest(
-                    session=session,
-                    messages=transcript,
-                    messages_to_append=[],
-                    max_steps=invocation_semantics.max_steps,
-                    limits=invocation_semantics.limits,
-                    budget_limits=invocation_semantics.budget_limits,
-                    retry_policy=invocation_semantics.retry_policy,
-                    structured_output=invocation_semantics.structured_output,
-                    thinking=invocation_semantics.thinking,
-                    request_metadata=request.metadata,
-                    task_id=pending_round.task_id,
-                    task_worker_id=request.task_worker_id,
-                    task_handoff_id=request.task_handoff_id,
-                    start_event_type=None,
-                    start_event_payload={},
-                    start_task_on_enter=False,
-                    release_run_fence_on_exit=False,
-                    run_limit_accounting=continued_run_limit_accounting,
-                    previous_tool_exposure_profile_id=(
-                        _continued_tool_exposure_profile_id(pending_round.tool_exposure)
-                    ),
-                    invocation_context=(
-                        invocation_context
-                        if invocation_context is not None
-                        else self._reconstruct_invocation_context(
-                            session=session,
-                            execution_profile_snapshot=execution_profile_snapshot,
-                            registered_agent=registered_agent,
-                            registered_provider=registered_provider,
-                            registered_environment=registered_environment,
-                            budget_policy=copy_budget_policy(budget_policy),
-                            request_loop_policies=request.loop_policies,
-                        )
-                    ),
-                )
+            continuation = await self._prepare_recovered_tool_round_continuation(
+                session=session,
+                pending_round=pending_round,
+                invocation_semantics=invocation_semantics,
+                invocation_context=(
+                    invocation_context
+                    if invocation_context is not None
+                    else self._reconstruct_invocation_context(
+                        session=session,
+                        execution_profile_snapshot=execution_profile_snapshot,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        registered_environment=registered_environment,
+                        budget_policy=copy_budget_policy(budget_policy),
+                        request_loop_policies=request.loop_policies,
+                    )
+                ),
+                request_metadata=request.metadata,
+                task_worker_id=request.task_worker_id,
+                task_handoff_id=request.task_handoff_id,
             )
+            session_stream = self._run_session(continuation)
             async for event in session_stream:
                 yield event
         except BaseException as exc:
@@ -13390,6 +13899,523 @@ class RecoveryCoordinator:
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
             )
+
+    async def _interrupt_unresolved_tool_effect(
+        self,
+        *,
+        record: ToolEffectRecord,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity,
+        invocation_context: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        """Finish an accepted unresolved decision through the existing interruption owner."""
+        assert record.observation is not None
+        result = record.observation.result
+        async for event in self._interrupt_for_resumable_manual_recovery(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+            payload={
+                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                **{
+                    name: getattr(record.intent, name)
+                    for name in (
+                        "model_step_id",
+                        "model_attempt_id",
+                        "tool_round_id",
+                        "tool_call_id",
+                    )
+                },
+                "tool_effect_reconciliation": {
+                    "schema_version": 1,
+                    "outcome": result.outcome,
+                    "observation": result.observation,
+                    "retryable_lookup": result.retryable,
+                },
+            },
+        ):
+            yield event
+        if result.outcome == "conflict":
+            raise _FinalizedToolEffectRejection("Application reconciliation rejected the receipt.")
+
+    async def _settle_tool_effect_reconciliation(
+        self,
+        *,
+        request: ToolEffectReconciliationRequest,
+        source_run_epoch: int,
+        session: Session,
+        invocation_context: InvocationContext,
+    ) -> AsyncGenerator[Event | _ReconciledToolEffectReplay | _ToolEffectObservationReplay, None]:
+        """Select evidence under an existing recovery claim; never own continuation."""
+        invocation_context._validate()
+        invocation_context.with_admitted_session(session)
+        owner = ToolEffectStateOwner(self._session_store)
+        record = await owner.resolve_call(
+            session, tool_round_id=request.tool_round_id, tool_call_id=request.tool_call_id
+        )
+        if record is None:
+            raise ToolEffectConflict("Receipt recovery has no durable effect intent.")
+        registered_agent = invocation_context.registered_agent
+        registered_tool = registered_agent.tools.get(record.intent.tool_name)
+        if registered_tool is None or registered_tool.effect is not ToolEffect.EXTERNAL:
+            raise ToolEffectConflict("Receipt recovery has no exact registered external tool.")
+        if record.intent.execution_profile_fingerprint != invocation_context.profile.fingerprint:
+            raise ToolEffectConflict("Receipt recovery conflicts with the original profile.")
+        replay = await self._load_reconciled_tool_effect_replay(session=session, request=request)
+        if replay is not None:
+            yield replay
+            return
+        prepared = self._effect_reconciliation_owner.prepare(
+            request=request,
+            record=record,
+            run_epoch=source_run_epoch,
+            registered=registered_tool.effect_reconciler,
+        )
+        started = self._event_writer.prepare(
+            event_with_execution_profile_authority(
+                Event(
+                    type=EventType.TOOL_EFFECT_RECONCILIATION_STARTED,
+                    session_id=session.id,
+                    interaction_id=record.intent.interaction_id,
+                    agent_name=record.intent.agent_name,
+                    environment_name=record.intent.environment_name,
+                    tool_name=record.intent.tool_name,
+                    payload={
+                        "schema_version": 1,
+                        "request_digest": prepared.request_digest,
+                        "intent_digest": prepared.context.intent_digest,
+                        "dispatch_id": record.dispatch_id,
+                        "expected_revision": request.expected_revision,
+                        "expected_run_epoch": request.expected_run_epoch,
+                        "lookup": request.lookup,
+                        **{
+                            name: getattr(record.intent, name)
+                            for name in (
+                                "model_step_id",
+                                "model_attempt_id",
+                                "tool_round_id",
+                                "tool_call_id",
+                                "approval_id",
+                            )
+                        },
+                    },
+                ),
+                invocation_context.profile,
+            )
+        )
+        admitted = await owner.start_reconciliation(
+            record,
+            source_run_epoch=source_run_epoch,
+            run_epoch=session.run_epoch,
+            request_digest=prepared.request_digest,
+            lookup=request.lookup,
+            event=started,
+        )
+        for delivered in await self._event_writer.fan_out_persisted([started]):
+            yield delivered
+        accepted = await self._effect_reconciliation_owner.reconcile(
+            request=request,
+            record=record,
+            run_epoch=source_run_epoch,
+            registered=registered_tool.effect_reconciler,
+        )
+        record = admitted
+        result = project_accepted_reconciliation(
+            accepted,
+            registered=registered_tool.effect_reconciler,
+            redactor=self._tool_round_executor.redactor_for_tool_calls(
+                registered_agent=registered_agent,
+                tool_calls=[
+                    runtime_records.ToolCallRequest(
+                        id=record.intent.tool_call_id,
+                        name=record.intent.tool_name,
+                        arguments={},
+                    )
+                ],
+            ),
+        )
+        identity = {
+            name: getattr(record.intent, name)
+            for name in (
+                "model_step_id",
+                "model_attempt_id",
+                "tool_round_id",
+                "tool_call_id",
+                "idempotency_key",
+            )
+        }
+        if record.intent.approval_id is not None:
+            identity["approval_id"] = record.intent.approval_id
+        if record.intent.pause_id is not None:
+            identity["input_id"] = record.intent.pause_id
+        if result.receipt is None:
+            event = Event(
+                type=(
+                    EventType.TOOL_EFFECT_RECONCILIATION_CONFLICT
+                    if result.outcome == "conflict"
+                    else EventType.TOOL_EFFECT_RECONCILIATION_OBSERVED
+                ),
+                session_id=session.id,
+                interaction_id=record.intent.interaction_id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(invocation_context.registered_environment),
+                tool_name=record.intent.tool_name,
+                payload={
+                    "schema_version": 1,
+                    **({"kind": "validator_rejected"} if result.outcome == "conflict" else {}),
+                    **identity,
+                    "request_digest": accepted.request_digest,
+                    "result": result.model_dump(mode="json"),
+                    "resource_versions": {**record.resource_versions, **result.resource_versions},
+                },
+            )
+        else:
+            receipt = result.receipt
+            receipt_evidence = {
+                "schema_version": 1,
+                "receipt_id": receipt.receipt_id,
+                "receipt_schema": receipt.receipt_schema,
+                "receipt_schema_version": receipt.receipt_schema_version,
+                "outcome": receipt.outcome,
+                "source": receipt.source,
+                "observed_at": receipt.observed_at.isoformat(),
+                "receipt_digest": tool_effect_receipt_digest(receipt),
+                "integrity": dict(receipt.integrity),
+                "resource_versions": dict(receipt.resource_versions),
+            }
+            validation_event = self._event_writer.prepare(
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.TOOL_EFFECT_RECEIPT_VALIDATED,
+                        session_id=session.id,
+                        interaction_id=record.intent.interaction_id,
+                        agent_name=record.intent.agent_name,
+                        environment_name=record.intent.environment_name,
+                        tool_name=record.intent.tool_name,
+                        payload={
+                            **{
+                                key: value
+                                for key, value in identity.items()
+                                if key != "idempotency_key"
+                            },
+                            "schema_version": 1,
+                            "request_digest": accepted.request_digest,
+                            "receipt_evidence": receipt_evidence,
+                        },
+                    ),
+                    invocation_context.profile,
+                )
+            )
+            terminal_result = ToolResult(
+                content=receipt.message,
+                structured=receipt.structured,
+                is_error=receipt.outcome == "failed",
+            )
+            event = Event(
+                type=EventType.TOOL_CALL_FAILED
+                if terminal_result.is_error
+                else EventType.TOOL_CALL_COMPLETED,
+                session_id=session.id,
+                interaction_id=record.intent.interaction_id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(invocation_context.registered_environment),
+                tool_name=record.intent.tool_name,
+                payload={
+                    **identity,
+                    **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                    "effect_reconciled": True,
+                    "reconciliation_state": "reconciled",
+                    "receipt_id": receipt.receipt_id,
+                    "receipt_evidence": receipt_evidence,
+                    "result": terminal_result.model_dump(mode="json"),
+                },
+            )
+        event = self._event_writer.prepare(
+            event_with_execution_profile_authority(event, invocation_context.profile)
+        )
+        if result.receipt is None:
+            observed = await owner.transition(
+                record,
+                state="outcome_unknown",
+                run_epoch=session.run_epoch,
+                observation=ToolEffectObservation(
+                    event_id=event.id,
+                    request_digest=accepted.request_digest,
+                    result=result,
+                ),
+                events=(event,),
+            )
+            yield _ToolEffectObservationReplay(observed, event)
+            return
+        settled = await owner.transition(
+            record,
+            state="reconciled_failed"
+            if result.receipt.outcome == "failed"
+            else "reconciled_completed",
+            run_epoch=session.run_epoch,
+            terminal=ToolEffectTerminal(
+                event_id=event.id,
+                result_digest=sha256(
+                    canonical_durable_json_bytes(event.payload["result"], "effect_terminal_result")
+                ).hexdigest(),
+                receipt=result.receipt,
+                reconciliation_request_digest=accepted.request_digest,
+            ),
+            events=(validation_event, event),
+        )
+        for delivered in await self._event_writer.fan_out_persisted([validation_event]):
+            yield delivered
+        yield _ReconciledToolEffectReplay(settled, event, None)
+
+    async def _reconcile_tool_effect_claimed(
+        self,
+        *,
+        request: ToolRoundRecoveryRequest | ToolEffectReconciliationRequest,
+        loaded_session: Session,
+        session: Session,
+        run_operation: _SessionRunOperation | None,
+        pending_round: tool_round_recovery.PendingToolRound,
+        pending_tool_call: PendingToolCallApproval,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        invocation_semantics: _RecoveryInvocationSemantics,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        budget_policy: BudgetPolicy | None,
+        invocation_context: InvocationContext | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        """Validate and settle a receipt under the existing recovery supervisor."""
+        if type(request) is not ToolEffectReconciliationRequest:
+            raise TypeError("Receipt recovery requires an exact reconciliation request.")
+        if invocation_context is None or run_operation is None:
+            raise RuntimeError("Receipt recovery has no claimed invocation authority.")
+        invocation_context._validate()
+        invocation_context.with_admitted_session(session)
+        if (
+            invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_provider is not registered_provider
+            or invocation_context.registered_environment is not registered_environment
+            or invocation_context.profile is not execution_profile_snapshot.profile
+            or invocation_context.budget_policy is not budget_policy
+        ):
+            raise RuntimeError("Receipt recovery substituted frozen invocation authority.")
+        stream: AsyncGenerator[Event, None] | None = None
+        failure: BaseException | None = None
+        cancellation_baseline = _task_cancellation_count()
+        try:
+            await self._preflight_tool_effect_reconciliation(
+                session=session, request=request, source_run_epoch=loaded_session.run_epoch
+            )
+            factory_started_event = await self._environment_lifecycle.emit_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
+            factory_resolution = await self._environment_lifecycle.resolve_factory(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                started_event=factory_started_event,
+                operation=EnvironmentFactoryOperation.RECONNECT,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+            )
+            registered_environment = factory_resolution.registered_environment
+            if registered_environment is not None:
+                invocation_context = invocation_context.with_registered_environment(
+                    registered_environment,
+                    validated_profile=execution_profile_snapshot.profile,
+                )
+            for event in factory_resolution.events:
+                yield event
+            if factory_resolution.error is not None:
+                async for event in self._interrupt_for_resumable_manual_recovery(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile_snapshot.profile,
+                    invocation_context=invocation_context,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
+                        **_environment_factory_resolution_error_payload(
+                            factory_resolution.error,
+                            redactor=self._secret_redactor,
+                        ),
+                    },
+                ):
+                    yield event
+                return
+            settlement = None
+            settlement_stream = self._settle_tool_effect_reconciliation(
+                request=request,
+                source_run_epoch=loaded_session.run_epoch,
+                session=session,
+                invocation_context=invocation_context,
+            )
+            async with contextlib.aclosing(settlement_stream) as owned_settlement:
+                async for item in owned_settlement:
+                    if isinstance(item, Event):
+                        yield copy_event(item)
+                    else:
+                        settlement = item
+            if settlement is None:
+                raise RuntimeError("Receipt recovery returned no settlement.")
+            if isinstance(settlement, _ToolEffectObservationReplay):
+                await self._event_writer.fan_out_persisted([settlement.event])
+                yield copy_event(settlement.event)
+                async for event in self._interrupt_unresolved_tool_effect(
+                    record=settlement.record,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile_snapshot.profile,
+                    invocation_context=invocation_context,
+                ):
+                    yield event
+                return
+            await self._event_writer.fan_out_persisted([settlement.terminal_event])
+            yield copy_event(settlement.terminal_event)
+            if settlement.consumption_receipt is not None:
+                return
+            # Receipt selection is already durable. Hooks observe the selected
+            # result through the existing hook owner and cannot replace it.
+            async for event, _modified in self._tool_round_executor.run_tool_call_hooks(
+                session=session,
+                tool_event=settlement.terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=approval_support.tool_call_request_from_pending(
+                    pending_tool_call, arguments={}
+                ),
+                result=ToolResult.model_validate(settlement.terminal_event.payload["result"]),
+                task_id=pending_round.task_id,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+                redactor=self._secret_redactor,
+                output_redactor=self._secret_redactor,
+                allow_modification=False,
+            ):
+                yield event
+            continuation = await self._prepare_recovered_tool_round_continuation(
+                session=session,
+                pending_round=pending_round,
+                invocation_semantics=invocation_semantics,
+                invocation_context=invocation_context,
+                request_metadata={},
+                task_worker_id=request.task_worker_id,
+                task_handoff_id=request.task_handoff_id,
+            )
+            stream = self._run_session(continuation)
+            async for event in stream:
+                yield event
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            await self._cleanup_recovery_handoff(
+                stream=stream,
+                session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                authoritative_failure=failure,
+                finalize_abandoned=(
+                    _recovery_abandonment_signal(
+                        failure, cancellation_baseline=cancellation_baseline
+                    )
+                    is not None
+                ),
+                release_run_fence=False,
+                abort_environment_setup=False,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+            )
+
+    async def _prepare_recovered_tool_round_continuation(
+        self,
+        *,
+        session: Session,
+        pending_round: tool_round_recovery.PendingToolRound,
+        invocation_semantics: _RecoveryInvocationSemantics,
+        invocation_context: InvocationContext,
+        request_metadata: dict[str, Any],
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+    ) -> RecoverySessionRunRequest:
+        """Restore a claimed round without deciding its outcome or acquiring a new owner.
+
+        Receipt settlement and operator recovery share continuation preparation.
+        The caller retains the recovery claim, stream supervision, and cleanup.
+        """
+        if type(invocation_context) is not InvocationContext:
+            raise TypeError("Recovered continuation requires authenticated invocation authority.")
+        invocation_context._validate()
+        invocation_context.with_admitted_session(session)
+        if pending_round.agent_name != invocation_context.registered_agent.spec.name:
+            raise RuntimeError("Recovered continuation belongs to another agent.")
+        transcript = await self._session_store.load_transcript(session.id)
+        continued_run_limit_accounting = pending_round.run_limit_accounting
+        if continued_run_limit_accounting is not None:
+            recovery_events = await self._session_store.load_events(session.id)
+            continued_run_limit_accounting = rebase_run_limit_accounting_context(
+                continued_run_limit_accounting,
+                session_id=session.id,
+                limits=invocation_semantics.limits,
+                budget_limits=request_budget_limits_for_session(
+                    limits=invocation_semantics.budget_limits,
+                    agent_name=invocation_context.registered_agent.spec.name,
+                    causal_budget_id=session.causal_budget_id,
+                ),
+                events=recovery_events,
+                reset_run_limits=False,
+                reset_budgets=False,
+                now=self._clock(),
+            )
+        return RecoverySessionRunRequest(
+            session=session,
+            invocation_context=invocation_context,
+            messages=transcript,
+            messages_to_append=[],
+            max_steps=invocation_semantics.max_steps,
+            limits=invocation_semantics.limits,
+            budget_limits=invocation_semantics.budget_limits,
+            retry_policy=invocation_semantics.retry_policy,
+            structured_output=invocation_semantics.structured_output,
+            thinking=invocation_semantics.thinking,
+            request_metadata=copy_json_value(request_metadata, "recovery.request_metadata"),
+            task_id=pending_round.task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            start_event_type=None,
+            start_event_payload={},
+            start_task_on_enter=False,
+            release_run_fence_on_exit=False,
+            run_limit_accounting=continued_run_limit_accounting,
+            previous_tool_exposure_profile_id=(
+                _continued_tool_exposure_profile_id(pending_round.tool_exposure)
+            ),
+        )
+
+    async def deliver_pending_tool_effect_uncertainty(self, session: Session) -> list[Event]:
+        """Deliver already-committed uncertainty through the existing event writer."""
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if pending is None:
+            return []
+        events = await ToolEffectStateOwner(self._session_store).load_uncertainty_events(
+            session,
+            tool_round_id=pending.tool_round_id,
+            tool_call_ids=tuple(call.tool_call_id for call in pending.tool_calls),
+        )
+        return await self._event_writer.fan_out_persisted(events)
 
     async def close_interrupted_tool_round(
         self,
@@ -13433,6 +14459,61 @@ class RecoveryCoordinator:
             (tool_call.id, tool_call.name) for tool_call in pending_tool_calls
         ]:
             raise RuntimeError("Interrupted tool calls conflict with the durable pending round.")
+        if await ToolEffectStateOwner(self._session_store).preserve_unresolved(
+            request.session,
+            tool_round_id=tool_round_identity.tool_round_id,
+            tool_call_ids=tuple(call.id for call in pending_tool_calls),
+        ):
+            from cayu.runtime._tool_effect_diagnostics import persist_cleanup_diagnostics
+
+            effect_owner = ToolEffectStateOwner(self._session_store)
+            dispatched = {}
+            for call in pending_tool_calls:
+                record = await effect_owner.resolve_call(
+                    request.session,
+                    tool_round_id=tool_round_identity.tool_round_id,
+                    tool_call_id=call.id,
+                )
+                if record is not None and record.dispatch_id is not None:
+                    dispatched[call.id] = record
+            redactors = request.cancellation_redactors_by_id or {}
+            artifacts_by_id = request.cancellation_artifacts_by_id
+            if artifacts_by_id is not None:
+                for call_id, artifacts in artifacts_by_id.items():
+                    if not artifacts:
+                        continue
+                    record = dispatched.get(call_id)
+                    diagnostic = await persist_cleanup_diagnostics(
+                        store=self._session_store,
+                        writer=self._event_writer,
+                        records=(record,) if record is not None else tuple(dispatched.values()),
+                        artifacts=artifacts,
+                        redactor=self._secret_redactor.merged_with(
+                            redactors.get(call_id, self._secret_redactor)
+                        ),
+                        attributed=record is not None,
+                    )
+                    if diagnostic is not None:
+                        for event in await self._event_writer.fan_out_persisted([diagnostic]):
+                            yield event
+            elif request.cancellation_artifacts:
+                redactor = self._secret_redactor
+                for invocation_redactor in redactors.values():
+                    redactor = redactor.merged_with(invocation_redactor)
+                diagnostic = await persist_cleanup_diagnostics(
+                    store=self._session_store,
+                    writer=self._event_writer,
+                    records=tuple(dispatched.values()),
+                    artifacts=request.cancellation_artifacts,
+                    redactor=redactor,
+                    attributed=False,
+                )
+                if diagnostic is not None:
+                    for event in await self._event_writer.fan_out_persisted([diagnostic]):
+                        yield event
+            for event in await self.deliver_pending_tool_effect_uncertainty(request.session):
+                yield event
+            return
         if any(call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls):
             async for event in self._recover_structured_output_tool_round(
                 session=request.session,
@@ -14421,6 +15502,69 @@ class RecoveryCoordinator:
         )
         if pending_round is None:
             return
+        if workspace_observations_from_checkpoint(checkpoint):
+            snapshot = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if (
+                snapshot is None
+                or execution_profile is None
+                or snapshot.profile != execution_profile
+            ):
+                raise RuntimeError("Workspace recovery lost the admitted execution profile.")
+            # Use the already admitted profile object after exact durable comparison.
+            # Workspace settlement owns its observation and stage; native receipt
+            # reconstruction must not retire their pending round first.
+            snapshot = snapshot.model_copy(update={"profile": execution_profile})
+            for event in await self._recover_workspace_observations(
+                session=session,
+                registered_environment=registered_environment,
+                execution_profile_snapshot=snapshot,
+                invocation_context=invocation_context,
+            ):
+                yield event
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            recovered_pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+                checkpoint, redactor=self._secret_redactor, consume_on_rejection=True
+            )
+            if recovered_pending is None or (
+                tool_round_recovery.pending_tool_round_identity(recovered_pending)
+                != tool_round_recovery.pending_tool_round_identity(pending_round)
+            ):
+                raise RuntimeError("Workspace recovery lost its pending tool round.")
+            pending_round = recovered_pending
+        for event in await settle_prepared_tool_effects(
+            store=self._session_store,
+            writer=self._event_writer,
+            session=session,
+            pending=pending_round,
+            profile=execution_profile,
+        ):
+            yield event
+        await ToolEffectStateOwner(self._session_store).preserve_unresolved(
+            session,
+            tool_round_id=pending_round.tool_round_id,
+            tool_call_ids=tuple(call.tool_call_id for call in pending_round.tool_calls),
+        )
+        for event in await self.deliver_pending_tool_effect_uncertainty(session):
+            yield event
+        if incomplete_recovery_claimed:
+            for call in pending_round.tool_calls:
+                effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+                    session,
+                    tool_round_id=pending_round.tool_round_id,
+                    tool_call_id=call.tool_call_id,
+                )
+                if (
+                    effect is not None
+                    and effect.terminal is not None
+                    and (effect.terminal.receipt is not None or effect.dispatch_id is None)
+                ):
+                    # Incomplete recovery does not run the model continuation.
+                    # Closing this round would make exact receipt replay appear
+                    # consumed before its explicit continuation has started.
+                    # A recovered unconsumed preparation likewise waits for
+                    # ordinary continuation; do not rejoin its targeted grant
+                    # under this interruption-only recovery claim.
+                    raise ToolEffectReconciliationRequired()
         if expected_transcript_cursor is None:
             expected_transcript_cursor = await self._session_store.load_transcript_cursor(
                 session.id
@@ -14685,9 +15829,14 @@ class RecoveryCoordinator:
             subagent_children = await self._subagent_children_by_idempotency_key(session.id)
             subagent_recovery_checkpoint = await self._session_store.load_checkpoint(session.id)
         synthesized_outcomes: list[runtime_records.ToolCallOutcome] = []
+        confirmed_native_effect_records: dict[str, ToolEffectRecord] = {}
+        staged_call_ids = {
+            staged.tool_call_id
+            for staged in tool_round_recovery.staged_terminal_records(pending_round)
+        }
         for pending_tool_call in pending_round.tool_calls:
             recorded_outcome = recorded_outcomes.get(pending_tool_call.tool_call_id)
-            if recorded_outcome is not None:
+            if recorded_outcome is not None or pending_tool_call.tool_call_id in staged_call_ids:
                 continue
 
             tool_call = approval_support.tool_call_request_from_pending(pending_tool_call)
@@ -14730,6 +15879,36 @@ class RecoveryCoordinator:
                 fallback=tool_call.arguments,
             )
             registered_tool = registered_agent.executable_tool(pending_tool_call.tool_name)
+            effect_record = None
+            if registered_tool is not None and registered_tool.effect is ToolEffect.EXTERNAL:
+                effect_record = await ToolEffectStateOwner(self._session_store).resolve_call(
+                    session,
+                    tool_round_id=pending_round.tool_round_id,
+                    tool_call_id=pending_tool_call.tool_call_id,
+                )
+                if effect_record is None:
+                    if (
+                        ambiguous_interrupt_close_intent
+                        and pending_tool_call.tool_call_id not in effective_started_ids
+                    ):
+                        # The exact approval-close intent is written by the
+                        # approval-pause publisher before round dispatch. It
+                        # positively proves this round was stopped at that gate;
+                        # absence of a journal alone is never sufficient proof.
+                        # A start or effect record would contradict that proof
+                        # and must retain the ordinary reconciliation fence.
+                        synthesized_outcomes.append(
+                            runtime_records.ToolCallOutcome(
+                                call=tool_call,
+                                result=tool_round_recovery.unknown_recovered_tool_result(
+                                    pending_tool_call=pending_tool_call,
+                                    pending_round=pending_round,
+                                    started=False,
+                                ),
+                            )
+                        )
+                        continue
+                    raise ToolEffectReconciliationRequired()
             result: ToolResult | None = None
             if registered_tool is not None and registered_tool.durable_tool_recovery is not None:
 
@@ -14834,9 +16013,13 @@ class RecoveryCoordinator:
                     reconcile_runner_operation=reconcile_runner_operation,
                 )
 
-                result = await registered_tool.durable_tool_recovery.reconcile_durable_tool_call(
+                evidence = await registered_tool.durable_tool_recovery.reconcile_durable_tool_call(
                     parent_session_id=session.id,
-                    parent_run_epoch=(pending_round.source_run_epoch or session.run_epoch),
+                    parent_run_epoch=(
+                        pending_round.source_run_epoch
+                        if pending_round.source_run_epoch is not None
+                        else session.run_epoch
+                    ),
                     execution_profile_fingerprint=(
                         None if execution_profile is None else execution_profile.fingerprint
                     ),
@@ -14859,8 +16042,20 @@ class RecoveryCoordinator:
                     load_operation=load_durable_tool_operation,
                     recovery_authority=recovery_authority,
                 )
-                if result is not None and type(result) is not ToolResult:
-                    raise TypeError("Durable tool recovery must return ToolResult or None.")
+                if evidence is not None:
+                    if type(evidence) is not DurableToolRecoveryEvidence:
+                        raise TypeError("Durable tool recovery requires explicit typed evidence.")
+                    evidence = DurableToolRecoveryEvidence(evidence.disposition, evidence.result)
+                    if (
+                        registered_tool.effect is ToolEffect.EXTERNAL
+                        and evidence.disposition != "confirmed"
+                    ):
+                        raise ToolEffectReconciliationRequired()
+                    result = evidence.result
+                    if effect_record is not None:
+                        confirmed_native_effect_records[pending_tool_call.tool_call_id] = (
+                            effect_record
+                        )
             reconciled_result = None
             if result is None:
                 reconciled_result = await self._reconcile_subagent_child(
@@ -14874,6 +16069,10 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                 )
                 result = reconciled_result
+                if result is not None and effect_record is not None:
+                    # The child recovery contract returns a ToolResult only for
+                    # a durably settled submission, not an unverified child.
+                    confirmed_native_effect_records[pending_tool_call.tool_call_id] = effect_record
             if result is None:
                 result = self._reattached_subagent_result(
                     subagent_children,
@@ -14885,7 +16084,21 @@ class RecoveryCoordinator:
                     parent_session=session,
                     registered_agent=registered_agent,
                 )
+                if result is not None and effect_record is not None:
+                    child = subagent_children.get(expected_idempotency_key)
+                    if (
+                        child is None
+                        or child.status
+                        not in tool_round_recovery._SUBAGENT_RECOVERY_TERMINAL_STATUSES
+                    ):
+                        raise ToolEffectReconciliationRequired()
+                    confirmed_native_effect_records[pending_tool_call.tool_call_id] = effect_record
             if result is None:
+                if registered_tool is not None and registered_tool.effect is ToolEffect.EXTERNAL:
+                    # Neither a missing journal nor an unsuccessful lookup proves
+                    # an external call safe to synthesize or redispatch. Only the
+                    # typed journal confirmation above can supply its terminal.
+                    raise ToolEffectReconciliationRequired()
                 result = tool_round_recovery.unknown_recovered_tool_result(
                     pending_tool_call=pending_tool_call,
                     pending_round=pending_round,
@@ -14911,6 +16124,7 @@ class RecoveryCoordinator:
             expected_transcript_cursor=expected_transcript_cursor,
             execution_profile=execution_profile,
             invocation_context=invocation_context,
+            confirmed_native_effect_records=confirmed_native_effect_records,
         ):
             yield event
 
@@ -14929,6 +16143,7 @@ class RecoveryCoordinator:
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None,
         interrupted: bool = False,
+        confirmed_native_effect_records: Mapping[str, ToolEffectRecord] | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Publish safe staged outcomes and synthesized results without replaying tools."""
 
@@ -15103,6 +16318,8 @@ class RecoveryCoordinator:
         tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
         recovery_publication_coordinator = _ToolRoundPublicationCoordinator(
             session_id=session.id,
+            session_instance_id=session.instance_id,
+            run_epoch=session.run_epoch,
             tool_round_identity=tool_round_identity,
             session_store=self._session_store,
             redactor=self._tool_round_executor.redactor_for_tool_calls(
@@ -15160,6 +16377,30 @@ class RecoveryCoordinator:
             )
             return copy_event(event)
 
+        async def emit_confirmed_native_terminal(event: Event) -> Event:
+            if confirmed_native_effect_records is None:
+                raise RuntimeError("Native terminal publication lost its evidence owner.")
+            record = confirmed_native_effect_records[event.payload["tool_call_id"]]
+            prepared_event = self._event_writer.prepare(event)
+            await ToolEffectStateOwner(self._session_store).transition(
+                record,
+                state="failed"
+                if prepared_event.type is EventType.TOOL_CALL_FAILED
+                else "completed",
+                run_epoch=session.run_epoch,
+                terminal=ToolEffectTerminal(
+                    event_id=prepared_event.id,
+                    result_digest=sha256(
+                        canonical_durable_json_bytes(
+                            prepared_event.payload["result"], "native_result"
+                        )
+                    ).hexdigest(),
+                ),
+                events=(prepared_event,),
+            )
+            await self._event_writer.fan_out_persisted([prepared_event])
+            return copy_event(prepared_event)
+
         for expected_outcome, terminal_event, hooks_state in zip(
             planned_outcomes,
             planned_terminal_events,
@@ -15216,6 +16457,9 @@ class RecoveryCoordinator:
                 terminal_event_emitter=(
                     self._tool_round_executor._emit_staged_terminal_fairly
                     if expected_outcome.call.id in staged_events_by_id
+                    else emit_confirmed_native_terminal
+                    if confirmed_native_effect_records is not None
+                    and expected_outcome.call.id in confirmed_native_effect_records
                     else None
                 ),
                 hooks_already_completed=hooks_state == "completed",
@@ -19474,6 +20718,12 @@ class RecoveryCoordinator:
 
         if lifecycle.tool_outcome_event_id is None or lifecycle.tool_outcome_event_digest is None:
             return None
+        if await self._workspace_observation_uncertainty_evidence_valid(
+            session=session, lifecycle=lifecycle
+        ):
+            # An immutable unknown event has no tool result or capture metadata
+            # to rewrite. Workspace finalization owns the observation status.
+            return durable_lifecycle
         checkpoint = await await_workspace_observation_store_read(
             lambda: self._session_store.load_checkpoint(session.id),
             operation="Workspace observation terminal-stage checkpoint read",
@@ -19652,6 +20902,51 @@ class RecoveryCoordinator:
             return None
         return staged_event
 
+    async def _workspace_observation_uncertainty_evidence_valid(
+        self,
+        *,
+        session: Session,
+        lifecycle: WorkspaceObservationLifecycle,
+    ) -> bool:
+        if lifecycle.tool_outcome_event_id is None:
+            return False
+        rows = await await_workspace_observation_store_read(
+            lambda: self._session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_id=lifecycle.tool_outcome_event_id,
+                    limit=2,
+                )
+            ),
+            operation="Workspace observation uncertainty evidence read",
+        )
+        if len(rows) != 1 or rows[0].event.type is not EventType.TOOL_EFFECT_OUTCOME_UNKNOWN:
+            return False
+        event = rows[0].event
+        record = await ToolEffectStateOwner(self._session_store).resolve_call(
+            session,
+            tool_round_id=lifecycle.tool_round_id,
+            tool_call_id=lifecycle.tool_call_id,
+        )
+        if (
+            record is None
+            or event.session_id != lifecycle.session_id
+            or event.interaction_id != lifecycle.interaction_id
+            or event.agent_name != lifecycle.agent_name
+            or event.environment_name != lifecycle.environment_name
+            or event.tool_name != lifecycle.tool_name
+            or any(
+                event.payload.get(name) != getattr(lifecycle, name)
+                for name in ("model_step_id", "model_attempt_id", "tool_round_id", "tool_call_id")
+            )
+            or workspace_observation_event_digest(event) != lifecycle.tool_outcome_event_digest
+        ):
+            raise workspace_observation_recovery_rejected(
+                "Workspace observation uncertainty conflicts with its owner."
+            )
+        validate_tool_effect_uncertainty_event(event, record)
+        return True
+
     async def _workspace_observation_tool_outcome_evidence_valid(
         self,
         *,
@@ -19661,6 +20956,10 @@ class RecoveryCoordinator:
     ) -> bool:
         """Validate exact tool evidence before any extension-owned artifact read."""
 
+        if await self._workspace_observation_uncertainty_evidence_valid(
+            session=session, lifecycle=lifecycle
+        ):
+            return True
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -21274,6 +22573,34 @@ class RecoveryCoordinator:
                     expected_transcript_cursor=expected_transcript_cursor,
                 ):
                     events.append(event)
+            except ToolEffectReconciliationRequired:
+                # Unknown external effects are a retained recovery pause. Finish
+                # this owner's interruption before exposing the next explicit
+                # receipt action; do not make that action drain our old marker.
+                session = await self._require_session(session.id)
+                session = await self._finalize_interrupting_for_recovery(
+                    recovery_claim_id=claim_id,
+                    preserve_interaction_id=preserve_interaction_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    events=events,
+                    execution_profile=(
+                        None
+                        if execution_profile_snapshot is None
+                        else execution_profile_snapshot.profile
+                    ),
+                    invocation_context=invocation_context,
+                )
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(*actions, IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT),
+                    events=tuple(events),
+                    message="External effect requires explicit receipt reconciliation or continuation.",
+                )
             except ToolApprovalRequired:
                 # Fail-closed planning of an ambiguous crash boundary may
                 # atomically restore the human gate. Incomplete-session
@@ -21325,6 +22652,29 @@ class RecoveryCoordinator:
             consume_on_rejection=True,
         )
         if pending_approval is not None:
+            # Approval recovery deliberately skips ordinary/native round
+            # recovery, but a consumed external call still needs the same
+            # durable uncertainty transition after worker loss. Keep the
+            # human gate and selected terminals intact; never dispatch here.
+            events.extend(
+                await settle_prepared_tool_effects(
+                    store=self._session_store,
+                    writer=self._event_writer,
+                    session=session,
+                    pending=pending_approval,
+                    profile=None
+                    if execution_profile_snapshot is None
+                    else execution_profile_snapshot.profile,
+                )
+            )
+            unresolved_effect = await ToolEffectStateOwner(self._session_store).preserve_unresolved(
+                session,
+                tool_round_id=pending_approval.tool_round_id,
+                tool_call_ids=tuple(call.tool_call_id for call in pending_approval.tool_calls),
+            )
+            if unresolved_effect:
+                events.extend(await self.deliver_pending_tool_effect_uncertainty(session))
+                actions.append(IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT)
             if session.status == SessionStatus.FAILED:
                 interrupt_payload = {
                     "model_step_id": pending_approval.model_step_id,
@@ -21372,7 +22722,11 @@ class RecoveryCoordinator:
                 actions=tuple(actions),
                 events=tuple(events),
                 pending_approval_id=pending_approval.approval_id,
-                message="Session has a pending tool approval; resolve it with ToolApprovalRequest.",
+                message=(
+                    "External effect remains unresolved; explicit receipt reconciliation is required."
+                    if unresolved_effect
+                    else "Session has a pending tool approval; resolve it with ToolApprovalRequest."
+                ),
             )
 
         pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
@@ -21394,6 +22748,28 @@ class RecoveryCoordinator:
                 raise SessionRuntimePublicationConflict(
                     "Pending user-input recovery authority changed before finalization."
                 )
+            # Like approval-owned rounds, a user-input pause bypasses ordinary
+            # round recovery. Classify dispatched sibling effects without
+            # consuming the answer or authorizing another tool invocation.
+            events.extend(
+                await settle_prepared_tool_effects(
+                    store=self._session_store,
+                    writer=self._event_writer,
+                    session=session,
+                    pending=pending_user_input,
+                    profile=None
+                    if execution_profile_snapshot is None
+                    else execution_profile_snapshot.profile,
+                )
+            )
+            unresolved_effect = await ToolEffectStateOwner(self._session_store).preserve_unresolved(
+                session,
+                tool_round_id=pending_user_input.tool_round_id,
+                tool_call_ids=tuple(call.tool_call_id for call in pending_user_input.tool_calls),
+            )
+            if unresolved_effect:
+                events.extend(await self.deliver_pending_tool_effect_uncertainty(session))
+                actions.append(IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT)
             session = await self._finalize_interrupting_for_recovery(
                 recovery_claim_id=claim_id,
                 preserve_interaction_id=preserve_interaction_id,
@@ -21417,7 +22793,11 @@ class RecoveryCoordinator:
                 actions=tuple(actions),
                 events=tuple(events),
                 pending_user_input_id=pending_user_input.input_id,
-                message="Session is awaiting user input; answer it with UserInputResponse.",
+                message=(
+                    "External effect remains unresolved; explicit receipt reconciliation is required."
+                    if unresolved_effect
+                    else "Session is awaiting user input; answer it with UserInputResponse."
+                ),
             )
 
         if session.status == SessionStatus.INTERRUPTING:
@@ -21604,7 +22984,7 @@ class RecoveryCoordinator:
                 idempotency_key=idempotency_key,
                 fallback=call.arguments,
             )
-            await self._reconcile_subagent_child(
+            reconciled_result = await self._reconcile_subagent_child(
                 children,
                 idempotency_key=idempotency_key,
                 tool_call_id=call.tool_call_id,
@@ -21614,6 +22994,11 @@ class RecoveryCoordinator:
                 parent_session=session,
                 registered_agent=registered_agent,
             )
+            if reconciled_result is not None:
+                # The child recovery owner has confirmed the exact handoff.
+                # Its queued child need not finish before the parent can settle;
+                # normal round recovery below revalidates and publishes the result.
+                continue
             child = children.get(idempotency_key)
             if child is None:
                 continue
@@ -22019,11 +23404,23 @@ def _effective_tool_round_structured_output(
 
 def _effective_tool_round_invocation_semantics(
     *,
-    request: ToolRoundRecoveryRequest,
+    request: ToolRoundRecoveryRequest | ToolEffectReconciliationRequest,
     pending_round: tool_round_recovery.PendingToolRound,
     structured_output: StructuredOutputSpec | None,
     effective_retry_policy: EffectiveRetryPolicy,
 ) -> _RecoveryInvocationSemantics:
+    if type(request) is ToolEffectReconciliationRequest:
+        recorded_max_steps = _require_recovery_max_steps(pending_round.max_steps)
+        if request.max_steps is not None and request.max_steps > recorded_max_steps:
+            raise ValueError("Receipt continuation cannot increase the recorded step limit.")
+        return _RecoveryInvocationSemantics(
+            max_steps=recorded_max_steps if request.max_steps is None else request.max_steps,
+            limits=copy_run_limits(pending_round.limits or RunLimits()),
+            budget_limits=copy_request_budget_limits(pending_round.budget_limits or ()),
+            retry_policy=effective_retry_policy(pending_round.retry_policy),
+            structured_output=copy_structured_output_spec(structured_output),
+            thinking=pending_round.thinking,
+        )
     if type(request) is not ToolRoundRecoveryRequest:
         raise TypeError("Tool-round recovery requires a ToolRoundRecoveryRequest.")
     if type(pending_round) is not tool_round_recovery.PendingToolRound:
@@ -22237,13 +23634,31 @@ def _effective_approval_structured_output(
 
 def _effective_approval_invocation_semantics(
     *,
-    request: ToolApprovalRequest | ToolApprovalRecoveryRequest,
+    request: ToolApprovalRequest | ToolApprovalRecoveryRequest | ToolEffectReconciliationRequest,
     pending_approval: PendingToolApproval,
     structured_output: StructuredOutputSpec | None,
     effective_retry_policy: EffectiveRetryPolicy,
 ) -> _RecoveryInvocationSemantics:
+    if type(request) is ToolEffectReconciliationRequest:
+        return _RecoveryInvocationSemantics(
+            max_steps=_effective_approval_max_steps(
+                max_steps=request.max_steps, pending_approval=pending_approval
+            ),
+            limits=_effective_approval_run_limits(limits=None, pending_approval=pending_approval),
+            budget_limits=_effective_approval_budget_limits(
+                budget_limits=None, pending_approval=pending_approval
+            ),
+            retry_policy=effective_retry_policy(
+                _effective_approval_retry_policy(
+                    retry_policy=None, pending_approval=pending_approval
+                )
+            ),
+            structured_output=copy_structured_output_spec(structured_output),
+            thinking=_effective_approval_thinking(thinking=None, pending_approval=pending_approval),
+        )
     if type(request) not in (ToolApprovalRequest, ToolApprovalRecoveryRequest):
         raise TypeError("Tool-approval continuation requires a validated request.")
+    assert isinstance(request, (ToolApprovalRequest, ToolApprovalRecoveryRequest))
     return _RecoveryInvocationSemantics(
         max_steps=_effective_approval_max_steps(
             max_steps=request.max_steps,

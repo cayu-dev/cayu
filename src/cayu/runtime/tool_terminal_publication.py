@@ -14,6 +14,7 @@ from time import process_time
 from typing import TypeVar, cast
 
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
+from cayu.runtime.invocation import SessionInvocation, copy_session_invocation
 
 TOOL_TERMINAL_PUBLICATION_SLICE_BYTES = 256 * 1024
 TOOL_TERMINAL_PUBLICATION_CAPACITY_BYTES = 4 * 1024 * 1024
@@ -62,6 +63,7 @@ class _RoundReservation:
     maximum_bytes: int | None
     weight: int
     exclusive: bool
+    group: tuple[str, ...]
 
 
 class ToolTerminalPublicationGovernor:
@@ -129,6 +131,56 @@ class ToolTerminalPublicationGovernor:
         deadlock behind unrelated rounds.
         """
 
+        await self._reserve_round(
+            session_id=session_id,
+            tool_round_id=tool_round_id,
+            maximum_bytes=maximum_bytes,
+            group=("round", session_id, tool_round_id),
+        )
+
+    async def _reserve_invocation_round(
+        self,
+        *,
+        session_id: str,
+        tool_round_id: str,
+        maximum_bytes: int | None,
+        invocation: SessionInvocation,
+    ) -> None:
+        """Reserve using provenance resolved by the runtime's session owner.
+
+        This internal entrance does not accept caller-provided parent metadata.
+        Related rounds share an exclusive domain, not execution authority.
+        """
+        invocation = copy_session_invocation(invocation)
+        await self._reserve_round(
+            session_id=session_id,
+            tool_round_id=tool_round_id,
+            maximum_bytes=maximum_bytes,
+            group=("invocation", invocation.root_invocation_id, invocation.root_session_id),
+        )
+
+    def _group_usage(self) -> dict[tuple[str, ...], tuple[int, bool]]:
+        grouped: dict[tuple[str, ...], list[_RoundReservation]] = {}
+        for reservation in self._round_reservations.values():
+            grouped.setdefault(reservation.group, []).append(reservation)
+        return {
+            group: (
+                self.staged_capacity_bytes
+                if any(member.maximum_bytes is None for member in members)
+                else sum(member.weight for member in members),
+                any(member.exclusive for member in members),
+            )
+            for group, members in grouped.items()
+        }
+
+    async def _reserve_round(
+        self,
+        *,
+        session_id: str,
+        tool_round_id: str,
+        maximum_bytes: int | None,
+        group: tuple[str, ...],
+    ) -> None:
         if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes <= 0):
             raise ValueError("maximum_bytes must be a positive integer or None.")
         key = (session_id, tool_round_id)
@@ -138,6 +190,7 @@ class ToolTerminalPublicationGovernor:
             maximum_bytes=maximum_bytes,
             weight=weight,
             exclusive=exclusive,
+            group=group,
         )
         token = object()
         async with self._condition:
@@ -149,21 +202,50 @@ class ToolTerminalPublicationGovernor:
             self._round_waiters.append(token)
             try:
                 while True:
-                    no_exclusive = not any(
-                        reservation.exclusive for reservation in self._round_reservations.values()
+                    existing = self._round_reservations.get(key)
+                    if existing is not None:
+                        if existing != requested:
+                            raise RuntimeError("Tool-round capacity reservation conflicts.")
+                        self._round_waiters.remove(token)
+                        self._condition.notify_all()
+                        return
+                    groups = self._group_usage()
+                    previous_group = groups.get(group)
+                    related = previous_group is not None
+                    prior_weight, prior_exclusive = previous_group or (0, False)
+                    members = [
+                        reservation
+                        for reservation in self._round_reservations.values()
+                        if reservation.group == group
+                    ]
+                    group_weight = (
+                        self.staged_capacity_bytes
+                        if maximum_bytes is None
+                        or any(member.maximum_bytes is None for member in members)
+                        else prior_weight + weight
                     )
+                    group_exclusive = prior_exclusive or exclusive
+                    others = [usage for identity, usage in groups.items() if identity != group]
                     admissible = (
-                        not self._round_reservations
-                        if exclusive
+                        not others
+                        if group_exclusive
                         else (
-                            no_exclusive
-                            and self._reserved_round_bytes + weight <= self.staged_capacity_bytes
+                            not any(is_exclusive for _, is_exclusive in others)
+                            and sum(amount for amount, _ in others) + group_weight
+                            <= self.staged_capacity_bytes
                         )
                     )
-                    if self._round_waiters[0] is token and admissible:
-                        self._round_waiters.popleft()
+                    if related and not admissible:
+                        # Waiting could deadlock a parent that already owns a
+                        # reservation and is awaiting this child. Refuse before
+                        # this round dispatches, without releasing that parent.
+                        raise RuntimeError(
+                            "Related tool round exceeds available publication capacity."
+                        )
+                    if (related or self._round_waiters[0] is token) and admissible:
+                        self._round_waiters.remove(token)
                         self._round_reservations[key] = requested
-                        self._reserved_round_bytes += weight
+                        self._reserved_round_bytes += group_weight - prior_weight
                         self._maximum_reserved_round_bytes = max(
                             self._maximum_reserved_round_bytes,
                             self._reserved_round_bytes,
@@ -183,7 +265,7 @@ class ToolTerminalPublicationGovernor:
         reservation = self._round_reservations.pop((session_id, tool_round_id), None)
         if reservation is None:
             return
-        self._reserved_round_bytes -= reservation.weight
+        self._reserved_round_bytes = sum(amount for amount, _ in self._group_usage().values())
         self._round_staged_bytes.pop((session_id, tool_round_id), None)
         try:
             loop = asyncio.get_running_loop()

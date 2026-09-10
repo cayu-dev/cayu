@@ -532,7 +532,10 @@ def test_runtime_contract_replay_supports_rounds_above_the_default_call_bound() 
             app,
             RuntimeReplayRequest(
                 trajectory=trajectory,
-                bounds=RuntimeReplayBounds(max_tool_calls=len(cities)),
+                # Exercise the call-count bound independently of the default
+                # wall-clock bound: this round validates durable effect evidence
+                # for every call on both capture and replay.
+                bounds=RuntimeReplayBounds(max_tool_calls=len(cities), timeout_seconds=120.0),
             ),
         )
         return tool, report

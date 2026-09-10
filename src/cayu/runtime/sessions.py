@@ -7739,6 +7739,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     REPAIRED_TERMINAL_EVIDENCE = "repaired_terminal_evidence"
     PENDING_APPROVAL = "pending_approval"
     PENDING_USER_INPUT = "pending_user_input"
+    PENDING_TOOL_EFFECT = "pending_tool_effect"
     AMBIGUOUS_PENDING_USER_INPUT = "ambiguous_pending_user_input"
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
     REPAIRED_WORKSPACE_OBSERVATION = "repaired_workspace_observation"
@@ -10704,6 +10705,17 @@ class SessionStore(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not support atomic workflow step reservation."
         )
+
+    async def append_tool_effect_conflict(self, request: object) -> Event:
+        """Append exact late-dispatch evidence without granting run authority.
+
+        Implementations compare the retained winner and session incarnation in
+        the append transaction. This narrow operation accepts only an internal
+        ToolEffectConflictAudit, constructs its own event, preserves liveness
+        and all execution state, and returns original evidence on exact replay.
+        A stale run context is permitted only for this evidence-only operation.
+        """
+        raise NotImplementedError("SessionStore does not support tool effect conflict audit.")
 
     async def load_mcp_manifest_baselines(
         self,
@@ -16466,6 +16478,29 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             self._sessions[session_id] = self._append_events_unlocked(session, copied_events)
+
+    async def append_tool_effect_conflict(self, request: object) -> Event:
+        from cayu.runtime._tool_effect_conflicts import (
+            copy_tool_effect_conflict_audit,
+            reconcile_tool_effect_conflict_event,
+        )
+
+        audit = copy_tool_effect_conflict_audit(request)
+        session_id = audit.executing.intent.session_id
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError("Tool effect audit session is unavailable.")
+            current = self._session_operation_records.get(session_id, {}).get(audit.storage_key)
+            event = audit.prepare_event(session, current, now=self._ownership_clock())
+            existing = self._event_records_by_id.get((session_id, event.id))
+            if existing is not None:
+                return reconcile_tool_effect_conflict_event(event, existing.event)
+            prepared = self._prepare_event_append_unlocked(session, [event])
+            self._sessions[session_id] = self._apply_event_append_unlocked(
+                session, prepared, activity_at=session.last_activity_at
+            )
+            return copy_event(event)
 
     async def append_workflow_step_started(
         self,

@@ -29,6 +29,7 @@ from cayu import (
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
+    ToolEffect,
     ToolExecutableRequirement,
     ToolExecutionRequirement,
     ToolResult,
@@ -72,6 +73,9 @@ class _IdentityTool(Tool):
         super().__init__(
             ToolSpec(
                 name="search",
+                # This fixture returns text only. Manual recovery here tests
+                # requirement identity, not replacement of external-effect evidence.
+                effect=ToolEffect.NONE,
                 execution_profile_identity=_identity("requirement-identity-tool"),
                 execution_requirements=(_requirement(change),),
             )

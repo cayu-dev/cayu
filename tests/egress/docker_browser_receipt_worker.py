@@ -166,6 +166,14 @@ async def main(mode, root):
             load_operation=load,
         )
         assert recovered is not None
+        receipt_persisted = any(
+            record.get("record_type") == "cayu.browser-operation"
+            and record.get("tool_call_id") == "mutation"
+            and record.get("state") == "terminal"
+            for record in records.values()
+        )
+        assert recovered.disposition == ("confirmed" if receipt_persisted else "unresolved")
+        recovered = recovered.result
         persist(
             root / "click-result.json",
             {"error": recovered.is_error, "value": recovered.model_dump(mode="json")["structured"]},

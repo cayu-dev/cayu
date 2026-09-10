@@ -228,7 +228,9 @@ class _FailingGatewayRememberTool(_GatewayRememberTool):
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         del ctx
         self.calls.append(dict(args))
-        raise RuntimeError("expected targeted tool failure")
+        # Report a known negative outcome. An exception from an EXTERNAL tool
+        # would instead leave its effect unknown and require reconciliation.
+        return ToolResult(content="expected targeted tool failure", is_error=True)
 
 
 class _GatewayOtherTool(Tool):
@@ -3017,6 +3019,13 @@ def test_context_overflow_reuses_one_prepared_targeted_grant_snapshot(targeted_s
 def test_approval_continuation_reconstructs_the_same_targeted_grant_snapshot(
     targeted_store,
 ) -> None:
+    calls: list[dict] = []
+
+    class ApprovedRememberTool(_RememberTool):
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            calls.append(dict(args))
+            return ToolResult(content="reviewed fact recorded")
+
     async def run() -> None:
         provider = _ApprovalProvider()
         app = CayuApp(session_store=targeted_store, enable_logging=False)
@@ -3024,7 +3033,7 @@ def test_approval_continuation_reconstructs_the_same_targeted_grant_snapshot(
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             targeted_tool_mode="call_tool",
-            tools=(_RememberTool(),),
+            tools=(ApprovedRememberTool(),),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
         )
 
@@ -3064,6 +3073,7 @@ def test_approval_continuation_reconstructs_the_same_targeted_grant_snapshot(
         ]
 
         assert len(provider.requests) == 2
+        assert calls == [{"fact": "Keep the retry identity stable."}]
         [record] = await targeted_store.list_targeted_tool_grants(
             "targeted-grant-approval-continuation"
         )
@@ -3095,6 +3105,13 @@ def test_approval_continuation_reconstructs_the_same_targeted_grant_snapshot(
 def test_approval_continuation_omits_a_naturally_expired_targeted_grant(
     targeted_store,
 ) -> None:
+    class ApprovedRememberTool(_RememberTool):
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            calls.append(dict(args))
+            return ToolResult(content="reviewed fact recorded")
+
+    calls: list[dict] = []
+
     async def run() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         provider = _ApprovalProvider()
@@ -3107,7 +3124,7 @@ def test_approval_continuation_omits_a_naturally_expired_targeted_grant(
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             targeted_tool_mode="call_tool",
-            tools=(_RememberTool(),),
+            tools=(ApprovedRememberTool(),),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
         )
 
@@ -3152,6 +3169,7 @@ def test_approval_continuation_omits_a_naturally_expired_targeted_grant(
         ]
 
         assert len(provider.requests) == 2
+        assert calls == [{"fact": "Keep the retry identity stable."}]
         footprint_events = [
             event
             for event in (*initial_events, *resumed_events)

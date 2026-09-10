@@ -87,6 +87,7 @@ from cayu.runners import (
     RunnerExecutionAdmissionObserver,
 )
 from cayu.runtime import CheckpointCompactionContextPolicy, ModelCompactor
+from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 
 _DOCKER_PROBE_COMPLETION_TOKEN = re.compile(r"cayu-admission-probe-complete-[0-9a-f]{32}")
 
@@ -2166,10 +2167,40 @@ def test_docker_final_probe_settles_guest_before_factory_release(
     assert factory.release_actions
 
 
+@pytest.mark.parametrize(
+    ("expiry_phase", "acknowledgement_loss", "cancel_settlement", "readback_failure"),
+    [
+        ("before_consumption", False, False, False),
+        ("after_consumption", False, False, False),
+        ("after_consumption", True, False, False),
+        ("after_consumption", False, True, False),
+        ("after_consumption", True, True, False),
+        pytest.param("after_consumption", True, False, True, id="failed-readback"),
+        pytest.param("after_consumption", True, True, True, id="cancelled-failed-readback"),
+    ],
+)
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("approval_gate", [False, True], ids=["ordinary", "approval"])
 def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
     evidence_clock: type[_EvidenceClock],
     monkeypatch: pytest.MonkeyPatch,
+    expiry_phase: str,
+    acknowledgement_loss: bool,
+    cancel_settlement: bool,
+    readback_failure: bool,
+    backend: str,
+    approval_gate: bool,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    from tests.core._workload_secret_support import RequireApprovalPolicy
+
+    from cayu.runtime.approvals import ToolApprovalDecision, ToolApprovalRequest
+
+    storage_error_secret = "admission-storage-error-secret-canary"
+
+    # Drive the evidence clock at the intended durable boundary, not while a
+    # loaded worker is still publishing the model/tool intent.
     class ExpiringEvidenceRunner(_EvidenceRunner):
         current_candidate: ExecutionAdmissionCandidate | None = None
 
@@ -2179,7 +2210,7 @@ def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
         async def collect_execution_admission_candidate(
             self,
         ) -> ExecutionAdmissionCandidate:
-            observed_at = datetime.now(UTC)
+            observed_at = evidence_clock.now(UTC)
             self.current_candidate = ExecutionAdmissionCandidate(
                 candidate="hosted",
                 evidence=ExecutionCapabilityEvidence(
@@ -2230,7 +2261,12 @@ def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
     async def run() -> tuple[list[Event], ToolProvider, EffectTool]:
         provider = ToolProvider()
         tool = EffectTool()
-        app = CayuApp(enable_logging=False)
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "admission-refusal.sqlite")
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_environment_factory(
             EnvironmentSpec(name="hosted"),
@@ -2243,6 +2279,7 @@ def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[tool],
+            tool_policy=RequireApprovalPolicy() if approval_gate else None,
             execution_requirements=ExecutionRequirements.trusted(
                 cleanup="confirmed",
                 minimum_evidence="live_verified",
@@ -2252,18 +2289,179 @@ def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
 
         async def delay_after_tool_intent(event: Event) -> Event:
             persisted = await original_emit(event)
-            if event.type is EventType.TOOL_CALL_STARTED:
-                evidence_clock.advance(seconds=1.1)
+            if event.type is EventType.TOOL_CALL_STARTED and expiry_phase == "before_consumption":
+                evidence_clock.advance(seconds=2)
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", delay_after_tool_intent)
-        return await _run(app, "sess_expired_before_tool_dispatch"), provider, tool
+        original_publish = app.session_store.publish_session_operation
+        terminal_committed = asyncio.Event()
+        release_settlement = asyncio.Event()
+        fail_next_readback = False
+        original_load_operation = app.session_store.load_session_operation
+
+        class RefusalAcknowledgementError(OSError):
+            pass
+
+        class RefusalReadbackError(OSError):
+            pass
+
+        async def read_effect_with_failure(session_id, idempotency_key, **kwargs):
+            nonlocal fail_next_readback
+            if fail_next_readback and idempotency_key.startswith("tool-effect:v1:"):
+                fail_next_readback = False
+                raise RefusalReadbackError(storage_error_secret)
+            return await original_load_operation(session_id, idempotency_key, **kwargs)
+
+        monkeypatch.setattr(app.session_store, "load_session_operation", read_effect_with_failure)
+
+        async def delay_after_effect_consumption(session_id, **kwargs):
+            nonlocal fail_next_readback
+            published = await original_publish(session_id, **kwargs)
+            if expiry_phase == "after_consumption" and kwargs["idempotency_key"].startswith(
+                "tool-effect:v1:"
+            ):
+                effect = await app.session_store.load_session_operation(
+                    session_id, kwargs["idempotency_key"]
+                )
+                if effect["state"] == "executing":
+                    evidence_clock.advance(seconds=2)
+                elif effect["state"] == "failed":
+                    if cancel_settlement:
+                        terminal_committed.set()
+                        await release_settlement.wait()
+                    if acknowledgement_loss:
+                        fail_next_readback = readback_failure
+                        raise RefusalAcknowledgementError(storage_error_secret)
+            return published
+
+        monkeypatch.setattr(
+            app.session_store, "publish_session_operation", delay_after_effect_consumption
+        )
+
+        async def execute():
+            initial = await _run(app, "sess_expired_before_tool_dispatch")
+            if not approval_gate:
+                return initial
+            approval = next(
+                event for event in initial if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+            )
+            return [
+                event
+                async for event in app.resolve_tool_approval(
+                    ToolApprovalRequest(
+                        session_id="sess_expired_before_tool_dispatch",
+                        approval_id=approval.payload["approval"]["approval_id"],
+                        tool_round_id=approval.payload["tool_round_id"],
+                        tool_call_id=approval.payload["tool_call_id"],
+                        decision=ToolApprovalDecision.APPROVE,
+                    )
+                )
+            ]
+
+        task = asyncio.create_task(execute())
+        if cancel_settlement:
+            try:
+                await asyncio.wait_for(terminal_committed.wait(), timeout=10)
+                task.cancel("cancel during refusal settlement")
+                assert task.cancelling() == 1
+                await asyncio.sleep(0)
+            finally:
+                release_settlement.set()
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await task
+            assert task.cancelled()
+            assert task.cancelling() == 1
+            assert "exception in shielded future" not in caplog.text
+            causes = []
+            pending = [cancelled.value]
+            while pending:
+                cause = pending.pop()
+                if any(cause is prior for prior in causes):
+                    continue
+                causes.append(cause)
+                if isinstance(cause, BaseExceptionGroup):
+                    pending.extend(cause.exceptions)
+                if cause.__cause__ is not None:
+                    pending.append(cause.__cause__)
+                elif not cause.__suppress_context__ and cause.__context__ is not None:
+                    pending.append(cause.__context__)
+            refusals = [cause for cause in causes if isinstance(cause, ExecutionAdmissionError)]
+            assert len(refusals) == 1, [(type(cause).__name__, str(cause)) for cause in causes]
+            assert refusals[0].decision.refusals[0].code == "stale_evidence"
+            assert storage_error_secret not in caplog.text
+            assert storage_error_secret not in repr(cancelled.value.__dict__)
+            assert all(storage_error_secret not in str(cause) for cause in causes)
+            if readback_failure:
+                evidence = [
+                    cause.failure_evidence for cause in causes if hasattr(cause, "failure_evidence")
+                ]
+                assert len(evidence) == 1
+                assert {"RefusalAcknowledgementError", "RefusalReadbackError"} <= set(
+                    evidence[0].exception_types
+                )
+            events = await app.session_store.load_events("sess_expired_before_tool_dispatch")
+        else:
+            events = await task
+        session = await app.session_store.load("sess_expired_before_tool_dispatch")
+        assert session is not None
+        started = next(
+            event
+            for event in await app.session_store.load_events(session.id)
+            if event.type is EventType.TOOL_CALL_STARTED
+        )
+        effect = await ToolEffectStateOwner(app.session_store).resolve_call(
+            session,
+            tool_round_id=started.payload["tool_round_id"],
+            tool_call_id=started.payload["tool_call_id"],
+        )
+        if expiry_phase == "before_consumption":
+            assert effect is None
+        else:
+            assert effect is not None
+            assert effect.state == "failed"
+            assert effect.terminal is not None
+            terminals = [
+                event
+                for event in await app.session_store.load_events(session.id)
+                if event.type is EventType.TOOL_CALL_FAILED
+            ]
+            assert len(terminals) == 1
+            terminal = terminals[0]
+            assert terminal.id == effect.terminal.event_id
+            for field in (
+                "model_step_id",
+                "model_attempt_id",
+                "tool_round_id",
+                "tool_call_id",
+                "idempotency_key",
+                "execution_profile_fingerprint",
+            ):
+                assert terminal.payload[field] == getattr(effect.intent, field)
+        if isinstance(store, SQLiteSessionStore):
+            await store.close()
+        return events, provider, tool
 
     events, provider, tool = asyncio.run(run())
 
     assert len(provider.requests) == 1
     assert tool.calls == 0
-    failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    if cancel_settlement:
+        return
+    terminal_type = EventType.SESSION_INTERRUPTED if approval_gate else EventType.SESSION_FAILED
+    failed = next(event for event in events if event.type is terminal_type)
+    if readback_failure:
+        types = failed.payload["failure_evidence"]["exception_types"]
+        assert {
+            "ExecutionAdmissionError",
+            "RefusalAcknowledgementError",
+            "RefusalReadbackError",
+        } <= set(types)
+        return
+    if approval_gate:
+        assert failed.payload["error_type"] == "ExecutionAdmissionError"
+        return
+    assert "execution_admission" in failed.payload, failed.payload
     assert failed.payload["execution_admission"]["refusals"][0]["code"] == "stale_evidence"
 
 

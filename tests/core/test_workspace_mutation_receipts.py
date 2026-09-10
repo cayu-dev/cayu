@@ -39,6 +39,7 @@ from cayu.core import (
     Message,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
 )
@@ -1216,6 +1217,15 @@ class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
             ):
                 self.recovery_projection_failed = True
                 raise _WorkspaceObservationProcessLoss("recovery-terminal-stage")
+        await self._fail_after_terminal_stage(session_id)
+        return result
+
+    async def publish_session_operation(self, session_id, **kwargs):
+        result = await super().publish_session_operation(session_id, **kwargs)
+        await self._fail_after_terminal_stage(session_id)
+        return result
+
+    async def _fail_after_terminal_stage(self, session_id):
         if not self.failed and self.phase == "terminal-stage":
             checkpoint = await self.load_checkpoint(session_id)
             observations = None if checkpoint is None else checkpoint.get("workspace_observations")
@@ -1229,7 +1239,6 @@ class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
             ):
                 self.failed = True
                 raise _WorkspaceObservationProcessLoss(self.phase)
-        return result
 
     async def query_events(self, query):
         records = await super().query_events(query)
@@ -2727,6 +2736,11 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
 ) -> None:
     secret_identity = "PRIVATE_DYNAMIC_WORKSPACE_ID_CANARY"
 
+    class IdempotentNoop(_NoopWorkspaceMutationTool):
+        # This test exercises abandoned observation identity, not unknown
+        # external effects. The no-op remains workspace-ordered but is replay-safe.
+        spec = _NoopWorkspaceMutationTool.spec.model_copy(update={"effect": ToolEffect.IDEMPOTENT})
+
     class AbortAfterIntentBinding(NativeBinding):
         async def observe_revision(self, bound):
             del bound
@@ -2753,7 +2767,7 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
             )
             app.register_agent(
                 AgentSpec(name="assistant", model="scripted-model"),
-                tools=[_NoopWorkspaceMutationTool()],
+                tools=[IdempotentNoop()],
             )
             return app, provider
 
@@ -4181,11 +4195,18 @@ def test_timed_out_runner_mutation_returns_promptly_and_fences_reuse(
 
     assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
     assert (tmp_path / "deferred-runner.txt").read_bytes() == b"settled"
-    terminal = next(event for event in public_events if event.type is EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["terminal_outcome"] == "tool_execution_timeout"
-    assert (
-        terminal.payload["workspace_mutation_capture_detail_code"] == "mutation_settlement_unproven"
+    unknown = next(
+        event for event in public_events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
     )
+    assert unknown.payload["failure_evidence"]["classification"] == "timeout"
+    assert not any(
+        event.type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_COMPLETED}
+        for event in durable_events
+    )
+    observation = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert observation.payload["detail_code"] == "mutation_settlement_unproven"
     assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
     assert following.started.is_set() is False
     assert provider.requests == 2
@@ -4885,16 +4906,16 @@ def test_hostile_runner_artifact_fails_closed_without_diagnostic_leakage(
 
     assert runner.discriminator.compared is False
     assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
-    terminal = next(
-        event
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
         for event in durable_events
-        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
     )
-    assert terminal.payload["workspace_mutation_capture_status"] == "failed"
-    assert (
-        terminal.payload["workspace_mutation_capture_detail_code"] == "mutation_settlement_unproven"
-    )
-    assert any(event.type is EventType.SESSION_FAILED for event in public_events)
+    unknown = [
+        event for event in durable_events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    ]
+    assert len(unknown) == 1
+    assert not any(message.role == "tool" for message in transcript)
+    assert any(event.type is EventType.SESSION_INTERRUPTED for event in public_events)
     assert following.started.is_set() is False
     assert binding.finalize_calls == 0
     assert binding.abandon_calls == 0
@@ -6119,13 +6140,15 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
         assert checkpoint is not None and checkpoint.get("workspace_observations")
         pending = tool_round_recovery_module.pending_tool_round_from_checkpoint(checkpoint)
         assert pending is not None
-        assert any(
-            stage.event.type is EventType.TOOL_CALL_FAILED
-            and stage.tool_call_id == "call-workspace"
-            and stage.publication_started_at is None
-            for stage in pending.staged_terminals
-        )
+        assert not pending.staged_terminals
         durable = await store.query_events(EventQuery(session_id=session_id))
+        unknown = [
+            record.event
+            for record in durable
+            if record.event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+        ]
+        assert len(unknown) == 1
+        assert unknown[0].payload["tool_call_id"] == "call-workspace"
         persisted = await store.load(session_id)
         assert persisted is not None
         return raised.value, consumer, persisted.status, [record.event for record in durable]
@@ -6174,8 +6197,8 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
     paused_events = [
         event for event in durable_events if event.type is EventType.INTERACTION_PAUSED
     ]
-    # Artifact publication was interrupted: recovery retains the exact failed
-    # tool stage until workspace settlement permits its terminal publication.
+    # Artifact publication was interrupted: retain the workspace observation
+    # and unknown external call without inventing a failed tool result.
     assert len(paused_events) == 1
     assert paused_events[0].payload["pending_action_kind"] == "tool_recovery"
     assert not any(
@@ -6272,13 +6295,15 @@ def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
         assert checkpoint is not None and checkpoint.get("workspace_observations")
         pending = tool_round_recovery_module.pending_tool_round_from_checkpoint(checkpoint)
         assert pending is not None
-        assert any(
-            stage.event.type is EventType.TOOL_CALL_FAILED
-            and stage.tool_call_id == "call-workspace"
-            and stage.publication_started_at is None
-            for stage in pending.staged_terminals
-        )
+        assert pending.staged_terminals == []
         durable = await store.query_events(EventQuery(session_id=session_id))
+        unknown = [
+            record.event
+            for record in durable
+            if record.event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+        ]
+        assert len(unknown) == 1
+        assert unknown[0].payload["tool_call_id"] == "call-workspace"
         return (
             delivered_events,
             failure,
@@ -6321,8 +6346,8 @@ def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
     paused_events = [
         event for event in durable_events if event.type is EventType.INTERACTION_PAUSED
     ]
-    # Artifact publication was interrupted: recovery retains the exact failed
-    # tool stage until workspace settlement permits its terminal publication.
+    # Artifact publication was interrupted: recovery retains the unknown effect
+    # and workspace observation without synthesizing a failed tool terminal.
     assert len(paused_events) == 1
     assert paused_events[0].payload["pending_action_kind"] == "tool_recovery"
     assert not any(
@@ -7802,13 +7827,10 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
         IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
         for recovery in recoveries
     ) == (1 if checkpoint_phase is not None else 0)
-    assert (
-        sum(
-            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
-            for recovery in recoveries
-        )
-        == 1
-    )
+    assert sum(
+        IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
+        for recovery in recoveries
+    ) == (1 if tool_ran else 0)
 
     finalized = [
         event for event in durable_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
@@ -7816,6 +7838,21 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
     assert len(finalized) == 1
     assert finalized[0].payload["status"] == terminal_status
     assert finalized[0].payload["execution_profile_fingerprint"] == profile_fingerprint
+    assert checkpoint is not None
+    assert "workspace_observations" not in checkpoint
+    if not tool_ran:
+        # An incomplete observation is not positive tool-outcome evidence.
+        # Recovery must not invent a terminal or abandon the external round.
+        assert any(
+            IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT in recovery.actions
+            for recovery in recoveries
+        )
+        assert "pending_tool_round" in checkpoint
+        assert not any(
+            event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+            for event in durable_events
+        )
+        return
     terminal_type = EventType.TOOL_CALL_COMPLETED if tool_ran else EventType.TOOL_CALL_FAILED
     terminal = next(event for event in durable_events if event.type == terminal_type)
     if (crash_phase == "delta-publication" and not hide_workspace_delta) or (
@@ -7953,10 +7990,13 @@ def test_fresh_process_factory_observation_recovery_closes_without_reconnect(
     assert checkpoint is not None
     assert "workspace_observations" not in checkpoint
     if crash_phase == "intent":
-        assert recovery.actions[-1] is IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
-        assert "pending_tool_round" not in checkpoint
-        assert "last_model_step_publication" not in checkpoint
-        assert "abandoned_unreplayable_tool_round" in checkpoint
+        assert recovery.actions[-1] is IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT
+        assert "pending_tool_round" in checkpoint
+        assert "abandoned_unreplayable_tool_round" not in checkpoint
+        assert not any(
+            event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+            for event in durable_events
+        )
 
 
 @pytest.mark.parametrize(
@@ -9424,8 +9464,12 @@ def test_workspace_receipt_waits_for_cancellation_opaque_mutation_after_timeout(
     assert receipt.payload["paths"] == [
         {"path": "settled.txt", "change": "added", "renamed_from": None}
     ]
-    terminal = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
-    assert terminal.payload["terminal_outcome"] == "tool_execution_timeout"
+    unknown = next(event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN)
+    assert unknown.payload["failure_evidence"]["classification"] == "timeout"
+    assert not any(
+        event.type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_COMPLETED}
+        for event in durable_events
+    )
 
 
 def test_workspace_receipt_waits_for_cancellation_opaque_mutation_after_task_cancel(

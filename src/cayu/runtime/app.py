@@ -57,6 +57,7 @@ from cayu.core.tools import (
     DurableToolRecovery,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
 )
@@ -217,6 +218,7 @@ from cayu.runtime._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVENT_TYPES,
 )
+from cayu.runtime._tool_effect_reconciliation import register_tool_effect_reconciler
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolRoundExecutor,
@@ -515,6 +517,13 @@ from cayu.runtime.tool_discovery import (
     current_tool_discovery_view,
     tool_discovery_generation_id,
     tool_discovery_view_inspection,
+)
+from cayu.runtime.tool_effects import (
+    ToolEffectConflict,
+    ToolEffectReceipt,
+    ToolEffectReconciliationRegistration,
+    ToolEffectReconciliationRequest,
+    ToolEffectReconciliationTarget,
 )
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
@@ -2126,6 +2135,7 @@ class CayuApp:
         spec: AgentSpec,
         *,
         tools: Iterable[Tool] | None = None,
+        tool_effect_reconcilers: Mapping[str, ToolEffectReconciliationRegistration] | None = None,
         mcp_toolsets: Iterable[McpToolset] | None = None,
         hosted_tools: Iterable[OpenAIWebSearch] | None = None,
         context_policy: ContextPolicy | None = None,
@@ -2315,6 +2325,24 @@ class CayuApp:
             if registered_tool.name in tools_by_name:
                 raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
             tools_by_name[registered_tool.name] = registered_tool
+
+        if tool_effect_reconcilers is not None:
+            if not isinstance(tool_effect_reconcilers, Mapping):
+                raise TypeError(
+                    "tool_effect_reconcilers must map exact tool names to registrations."
+                )
+            for tool_name, registration in tool_effect_reconcilers.items():
+                if type(tool_name) is not str or tool_name not in tools_by_name:
+                    raise ValueError("Effect reconciler targets an unregistered tool.")
+                registered_tool = tools_by_name[tool_name]
+                tools_by_name[tool_name] = replace(
+                    registered_tool,
+                    effect_reconciler=register_tool_effect_reconciler(
+                        registration,
+                        effect=registered_tool.effect,
+                        redactor=self._secret_redactor,
+                    ),
+                )
 
         runtime_tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
         if stored_tool_discovery_mode is not None:
@@ -7778,6 +7806,134 @@ class CayuApp:
             async for event in owned_stream:
                 yield event
 
+    async def inspect_tool_effect(
+        self, session_id: str, *, tool_round_id: str, tool_call_id: str
+    ) -> ToolEffectReconciliationTarget:
+        """Inspect an external call without claiming work or validating a receipt.
+
+        Use round/call identifiers from public events. The snapshot may become
+        stale; submission never refreshes its versions or grants retry authority.
+        """
+        private_session_id = await self._resolve_public_session_id(session_id)
+        public_ids = {
+            "tool_round_id": require_clean_nonblank(tool_round_id, "tool_round_id"),
+            "tool_call_id": require_clean_nonblank(tool_call_id, "tool_call_id"),
+        }
+        if any(self._secret_redactor.redact_text(value) != value for value in public_ids.values()):
+            raise ToolEffectConflict("Inspection requires safe public event identifiers.")
+        private_ids = {
+            name: await self._resolve_public_action_linkage(
+                session_id=private_session_id, value=value, field_name=name
+            )
+            for name, value in public_ids.items()
+        }
+        target = await self._recovery_coordinator.inspect_tool_effect_target(
+            session_id=private_session_id, **private_ids
+        )
+        if self._secret_redactor.redact_text(target.tool_name) != target.tool_name:
+            raise ToolEffectConflict("The tool identity cannot be safely exposed.")
+        codec = self._require_public_authority_alias_codec()
+        return ToolEffectReconciliationTarget.model_validate(
+            {
+                **target.model_dump(),
+                **public_ids,
+                "session_id": self.project_session_id_for_exposure(private_session_id),
+                **{
+                    name: codec.encode(
+                        getattr(target, name), field_name=name, session_id=private_session_id
+                    )
+                    for name in ("session_instance_id", "idempotency_key")
+                },
+            }
+        )
+
+    async def reconcile_tool_effect(
+        self,
+        request: ToolEffectReconciliationRequest,
+    ) -> AsyncIterator[Event]:
+        """Validate external evidence and continue an existing uncertain tool call."""
+        if type(request) is not ToolEffectReconciliationRequest:
+            raise TypeError("Effect reconciliation requires an exact reconciliation request.")
+        request = ToolEffectReconciliationRequest(
+            **{
+                name: getattr(request, name)
+                for name in ToolEffectReconciliationRequest.model_fields
+            }
+        )
+        session_id = await self._resolve_public_session_id(request.session_id)
+        round_id = await self._resolve_public_action_linkage(
+            session_id=session_id, value=request.tool_round_id, field_name="tool_round_id"
+        )
+        call_id = await self._resolve_public_action_linkage(
+            session_id=session_id, value=request.tool_call_id, field_name="tool_call_id"
+        )
+        resolved_identities = {}
+        response = request.user_input_response
+        if response is not None:
+            if response.session_id != request.session_id or (
+                response.task_worker_id != request.task_worker_id
+                or response.task_handoff_id != request.task_handoff_id
+            ):
+                raise ToolEffectConflict(
+                    "User-input continuation has different session/task authority."
+                )
+            response = copy_user_input_response(response).model_copy(
+                update={
+                    "session_id": session_id,
+                    "input_id": await self._resolve_public_action_linkage(
+                        session_id=session_id, value=response.input_id, field_name="input_id"
+                    ),
+                }
+            )
+        aliased_fields = [
+            name
+            for name in ("session_instance_id", "idempotency_key")
+            if parse_public_authority_alias(getattr(request, name)) is not None
+        ]
+        if aliased_fields:
+            target = await self._recovery_coordinator.inspect_tool_effect_target(
+                session_id=session_id, tool_round_id=round_id, tool_call_id=call_id
+            )
+            codec = self._require_public_authority_alias_codec()
+            for name in aliased_fields:
+                if not codec.matches(
+                    getattr(request, name),
+                    getattr(target, name),
+                    field_name=name,
+                    session_id=session_id,
+                ):
+                    raise ToolEffectConflict("Effect identity alias conflicts with its call.")
+                resolved_identities[name] = getattr(target, name)
+        receipt = request.receipt
+        if receipt is not None:
+            receipt = ToolEffectReceipt.model_validate(
+                {
+                    name: call_id
+                    if name == "tool_call_id"
+                    else resolved_identities.get(name, getattr(receipt, name))
+                    for name in ToolEffectReceipt.model_fields
+                }
+            )
+        request = ToolEffectReconciliationRequest.model_validate(
+            {
+                **{
+                    name: getattr(request, name)
+                    for name in ToolEffectReconciliationRequest.model_fields
+                },
+                "session_id": session_id,
+                "tool_round_id": round_id,
+                "tool_call_id": call_id,
+                **resolved_identities,
+                "receipt": receipt,
+                "user_input_response": response,
+            }
+        )
+        stream = self._recover_tool_round_private(request)
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
     async def recover_tool_round(
         self,
         request: ToolRoundRecoveryRequest,
@@ -7808,7 +7964,7 @@ class CayuApp:
 
     async def _recover_tool_round_private(
         self,
-        request: ToolRoundRecoveryRequest,
+        request: ToolRoundRecoveryRequest | ToolEffectReconciliationRequest,
     ) -> AsyncGenerator[Event, None]:
         """Recover a crashed ordinary tool round with an operator-verified outcome.
 
@@ -7831,9 +7987,22 @@ class CayuApp:
         durable, the evidence remains authoritative: do not retry the same
         `tool_call_id` — `resume(...)` finishes the round from the persisted outcome.
         """
-        if type(request) is not ToolRoundRecoveryRequest:
+        if type(request) is ToolEffectReconciliationRequest:
+            request = ToolEffectReconciliationRequest(
+                **{
+                    name: getattr(request, name)
+                    for name in ToolEffectReconciliationRequest.model_fields
+                }
+            )
+        elif type(request) is ToolRoundRecoveryRequest:
+            request = copy_tool_round_recovery_request(request)
+        else:
             raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
-        request = copy_tool_round_recovery_request(request)
+        if type(request) is ToolEffectReconciliationRequest:
+            replay = await self._recovery_coordinator.replay_consumed_tool_effect(request)
+            if replay is not None:
+                yield replay
+                return
         (
             task_id,
             task_session_instance_id,
@@ -8262,6 +8431,7 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         ).execution_requirements,
         child_session_recovery=tool.child_session_recovery,
         durable_tool_recovery=tool.durable_tool_recovery,
+        effect_reconciler=tool.effect_reconciler,
     )
 
 
@@ -8455,7 +8625,22 @@ def _registered_agent_after_mcp_refresh(
                 raise ValueError(
                     f"Refreshed MCP tool collides with registered tool: {registered.name}"
                 )
+            previous = registered_agent.tools.get(registered.name)
+            if previous is not None and previous.effect_reconciler is not None:
+                if (
+                    not isinstance(previous.tool, McpToolAdapter)
+                    or previous.tool.toolset._refresh_source is not toolset._refresh_source
+                    or registered.effect is not ToolEffect.EXTERNAL
+                ):
+                    raise ValueError("MCP refresh conflicts with a registered effect reconciler.")
+                registered = replace(registered, effect_reconciler=previous.effect_reconciler)
             tools_by_name[registered.name] = registered
+
+    if any(
+        previous.effect_reconciler is not None and name not in tools_by_name
+        for name, previous in registered_agent.tools.items()
+    ):
+        raise ValueError("MCP refresh removed a tool with a registered effect reconciler.")
 
     executable_names = frozenset((*tools_by_name, *registered_agent.runtime_tools))
     missing_workflow_tools = tuple(

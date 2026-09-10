@@ -632,7 +632,9 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         try:
             result = await asyncio.shield(child_task)
         except asyncio.CancelledError:
-            _uncancel_current_task()
+            # The delivered request must remain visible to the enclosing
+            # runtime/timeout owner. Awaiting cleanup does not require uncancel;
+            # its own timeout accounts only for the request it introduces.
             cleanup_error: Exception | None = None
             try:
                 async with asyncio.timeout(SUBAGENT_CANCEL_CLEANUP_TIMEOUT_S):
@@ -2047,16 +2049,3 @@ async def _drain_background_subagent(
         if not first_event.done():
             first_event.set_exception(exc)
         raise
-
-
-def _uncancel_current_task() -> None:
-    """Consume exactly the cancellation request this handler caught.
-
-    Draining every pending request (``while cancelling(): uncancel()``) would
-    strip cancellations owned by enclosing scopes such as ``asyncio.timeout``
-    or ``TaskGroup`` and corrupt their bookkeeping, so at most one guarded
-    ``uncancel`` is performed.
-    """
-    current_task = asyncio.current_task()
-    if current_task is not None and current_task.cancelling() > 0:
-        current_task.uncancel()

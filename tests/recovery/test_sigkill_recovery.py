@@ -106,7 +106,7 @@ def test_worker_failure_reports_durable_state_and_cleans_control_artifacts(tmp_p
 
 
 @pytest.mark.parametrize("recovery_action", ["automatic", "manual"])
-def test_sigkill_during_ordinary_tool_execution_recovers_without_reexecution(
+def test_sigkill_during_ordinary_tool_execution_retains_unknown_effect_without_reexecution(
     tmp_path: Path,
     recovery_backend: BackendConfig,
     recovery_action: str,
@@ -151,12 +151,12 @@ def test_sigkill_during_ordinary_tool_execution_recovers_without_reexecution(
             action=recovery_action,
             session_id=session_id,
         )
-        recovery_worker.wait_success()
+        result = recovery_worker.wait_success()
+        if recovery_action == "manual":
+            assert result["manual_recovery_rejected"] is True
 
         recovered = asyncio.run(harness.load_session_state(session_id))
         assert recovered.session is not None
-        assert recovered.session.status == SessionStatus.COMPLETED
-        _assert_only_model_step_publication(recovered.checkpoint)
         assert harness.read_marker() == marker
 
         started = [event for event in recovered.events if event.type == EventType.TOOL_CALL_STARTED]
@@ -167,27 +167,24 @@ def test_sigkill_during_ordinary_tool_execution_recovers_without_reexecution(
             and event.payload.get("tool_call_id") == "call_side_effect"
         ]
         assert len(started) == 1
-        assert len(terminals) == 1
-        assert terminals[0].payload["idempotency_key"] == marker[0]["idempotency_key"]
-
-        if recovery_action == "automatic":
-            assert terminals[0].type == EventType.TOOL_CALL_FAILED
-            assert terminals[0].payload["recovered"] is True
-            assert terminals[0].payload["result"]["structured"]["outcome_unknown"] is True
-        else:
-            assert terminals[0].type == EventType.TOOL_CALL_COMPLETED
-            assert terminals[0].payload["manual_recovery"] is True
-            assert terminals[0].payload["result"]["content"] == (
-                "External marker verified the side effect."
-            )
-
         tool_results = [
             part
             for message in recovered.transcript
             for part in message.content
             if isinstance(part, ToolResultPart) and part.tool_call_id == "call_side_effect"
         ]
-        assert len(tool_results) == 1
+        # Neither process loss nor an unvalidated operator assertion proves an
+        # external outcome. Recovery followed by resume must keep it fenced.
+        assert recovered.session.status == SessionStatus.INTERRUPTED
+        assert "pending_tool_round" in recovered.checkpoint
+        assert terminals == []
+        assert tool_results == []
+        assert any(
+            event.type == EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+            and event.payload.get("tool_call_id") == "call_side_effect"
+            for event in recovered.events
+        )
+        assert not any(event.type == EventType.SESSION_COMPLETED for event in recovered.events)
 
     assert list(tmp_path.iterdir()) == []
 
@@ -235,7 +232,7 @@ def test_sigkill_during_model_dispatch_recovers_through_registered_application_p
     assert list(tmp_path.iterdir()) == []
 
 
-def test_sigkill_tool_effect_recovers_through_registered_application_plan(
+def test_sigkill_tool_effect_rejects_unvalidated_registered_application_plan(
     tmp_path: Path,
     recovery_backend: BackendConfig,
 ) -> None:
@@ -252,6 +249,8 @@ def test_sigkill_tool_effect_recovers_through_registered_application_plan(
         assert len(marker) == 1
         killed_worker.sigkill()
 
+        before = asyncio.run(harness.load_session_state(session_id))
+
         recovery_worker = harness.launch(
             scenario="ordinary_tool",
             action="plan_manual",
@@ -260,16 +259,18 @@ def test_sigkill_tool_effect_recovers_through_registered_application_plan(
         result = recovery_worker.wait_success()
 
         receipt_item = result["receipt"]["items"][0]
-        assert receipt_item["status"] == "executed", receipt_item
+        assert receipt_item["status"] == "blocked", receipt_item
+        assert receipt_item["error_code"] == "action_not_allowed"
         assert receipt_item["replayed"] is False
-        assert result["replay"]["items"][0]["replayed"] is True
+        assert result["replay"]["items"][0] == receipt_item
         recovered = asyncio.run(harness.load_session_state(session_id))
         assert recovered.session is not None
-        assert recovered.session.status is SessionStatus.COMPLETED
+        assert recovered == before
+        assert "pending_tool_round" in recovered.checkpoint
         assert harness.read_marker() == marker
         assert (
             sum(event.type is EventType.RECOVERY_PLAN_ITEM_EXECUTED for event in recovered.events)
-            == 1
+            == 0
         )
         assert (
             sum(
@@ -277,7 +278,7 @@ def test_sigkill_tool_effect_recovers_through_registered_application_plan(
                 and event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
                 for event in recovered.events
             )
-            == 1
+            == 0
         )
 
     assert list(tmp_path.iterdir()) == []
@@ -461,7 +462,11 @@ def test_sigkill_during_background_subagent_spawn_reattaches_one_child(
         assert structured["recovery_reason"] == "pending_tool_round_reattached_subagent"
         assert structured["child_session_id"] == child.id
         assert structured["parent_session_id"] == parent_session_id
-        assert structured["outcome_unknown"] is True
+        # Recovery retains the parent fence while the child is running. Only
+        # after child recovery durably settles interruption can it attach this
+        # known outcome, without creating another child.
+        assert structured["status"] == SessionStatus.INTERRUPTED.value
+        assert structured["outcome_unknown"] is False
 
         tool_results = [
             part
@@ -471,6 +476,8 @@ def test_sigkill_during_background_subagent_spawn_reattaches_one_child(
         ]
         assert len(tool_results) == 1
         assert tool_results[0].structured["child_session_id"] == child.id
+        assert tool_results[0].structured["status"] == SessionStatus.INTERRUPTED.value
+        assert tool_results[0].structured["outcome_unknown"] is False
 
 
 def test_sigkill_reclaims_only_an_unattached_expired_task_claim(
@@ -535,7 +542,7 @@ def test_sigkill_reclaims_only_an_unattached_expired_task_claim(
         assert asyncio.run(harness.list_causal_sessions(task_id)) == [recovered_session.session]
 
 
-def test_sigkill_preserves_attached_task_ownership_and_recovers_linked_session(
+def test_sigkill_preserves_attached_task_handoff_while_external_effect_remains_unknown(
     tmp_path: Path,
     recovery_backend: BackendConfig,
 ) -> None:
@@ -581,18 +588,15 @@ def test_sigkill_preserves_attached_task_ownership_and_recovers_linked_session(
         recovered_task = asyncio.run(harness.load_task(task_id))
         recovered_session = asyncio.run(harness.load_session_state(session_id))
         assert recovered_task is not None
-        assert recovered_task.status == TaskStatus.COMPLETED
+        assert recovered_task.status == TaskStatus.RUNNING
         assert recovered_task.session_id == session_id
         assert recovered_task.worker_id is None
         assert recovered_task.lease_expires_at is None
-        assert recovered_task.result == {
-            "session_id": session_id,
-            "agent_name": "recovery-agent",
-            "environment_name": None,
-        }
+        assert recovered_task.result is None
+        assert recovered_task.interrupted_handoff_id is not None
         assert recovered_session.session is not None
-        assert recovered_session.session.status == SessionStatus.COMPLETED
-        _assert_only_model_step_publication(recovered_session.checkpoint)
+        assert recovered_session.session.status == SessionStatus.INTERRUPTED
+        assert "pending_tool_round" in recovered_session.checkpoint
         assert len(harness.read_marker()) == 1
         assert asyncio.run(harness.list_causal_sessions(task_id)) == [recovered_session.session]
 
@@ -602,30 +606,22 @@ def test_sigkill_preserves_attached_task_ownership_and_recovers_linked_session(
             if event.payload.get("tool_call_id") == "call_side_effect"
             and event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
         ]
-        assert len(tool_terminals) == 1
-        assert tool_terminals[0].type == EventType.TOOL_CALL_FAILED
-        assert tool_terminals[0].payload["result"]["structured"]["outcome_unknown"] is True
+        assert tool_terminals == []
 
         event_types = [event.type for event in recovered_session.events]
-        for event_type in (
-            EventType.TASK_STARTED,
-            EventType.TASK_COMPLETED,
-            EventType.SESSION_INTERRUPTED,
-            EventType.SESSION_RESUMED,
-            EventType.SESSION_COMPLETED,
-        ):
-            assert event_types.count(event_type) == 1
-        assert (
-            event_types.index(EventType.TASK_STARTED)
-            < event_types.index(EventType.TOOL_CALL_FAILED)
-            < event_types.index(EventType.SESSION_INTERRUPTED)
-            < event_types.index(EventType.SESSION_RESUMED)
-            < event_types.index(EventType.TASK_COMPLETED)
-            < event_types.index(EventType.SESSION_COMPLETED)
+        assert event_types.count(EventType.TASK_STARTED) == 1
+        assert EventType.TASK_COMPLETED not in event_types
+        assert EventType.SESSION_COMPLETED not in event_types
+        assert EventType.SESSION_INTERRUPTED in event_types
+        assert EventType.TOOL_EFFECT_OUTCOME_UNKNOWN in event_types
+        assert any(
+            event.type == EventType.TASK_INTERRUPTED_HANDOFF
+            and event.payload["handoff_id"] == recovered_task.interrupted_handoff_id
+            for event in recovered_session.events
         )
 
 
-def test_sigkill_recovers_attached_tool_through_registered_application_plan(
+def test_sigkill_attached_tool_rejects_unvalidated_registered_application_plan(
     tmp_path: Path,
     recovery_backend: BackendConfig,
 ) -> None:
@@ -647,6 +643,7 @@ def test_sigkill_recovers_attached_tool_through_registered_application_plan(
         assert len(marker) == 1
         killed_worker.sigkill()
 
+        before = asyncio.run(harness.load_session_state(session_id))
         recovery_worker = harness.launch(
             scenario="task_claim",
             action="plan_attached_manual",
@@ -657,13 +654,24 @@ def test_sigkill_recovers_attached_tool_through_registered_application_plan(
         result = recovery_worker.wait_success()
 
         receipt_item = result["receipt"]["items"][0]
-        assert receipt_item["status"] == "executed", receipt_item
-        assert receipt_item["final_session_status"] == "completed"
-        assert result["replay"]["items"][0]["replayed"] is True
-        assert result["task"]["status"] == "completed"
-        assert result["task"]["worker_id"] is None
-        assert result["task"]["lease_expires_at"] is None
-        assert result["task"]["interrupted_handoff_id"] is None
+        assert receipt_item["status"] == "blocked", receipt_item
+        assert receipt_item["error_code"] == "action_not_allowed"
+        assert result["replay"]["items"][0] == receipt_item
+        assert result["task"]["status"] != "completed"
+        assert result["task"]["session_id"] == session_id
+        recovered = asyncio.run(harness.load_session_state(session_id))
+        assert recovered == before
+        assert "pending_tool_round" in recovered.checkpoint
+        assert not any(
+            event.type
+            in {
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+                EventType.SESSION_COMPLETED,
+                EventType.RECOVERY_PLAN_ITEM_EXECUTED,
+            }
+            for event in recovered.events
+        )
         assert harness.read_marker() == marker
 
     assert list(tmp_path.iterdir()) == []

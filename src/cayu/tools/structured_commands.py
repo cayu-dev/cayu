@@ -14,6 +14,7 @@ from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import (
     DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
     Tool,
     ToolContext,
     ToolEffect,
@@ -696,6 +697,7 @@ class RunCommandTool(Tool):
                 status="unavailable",
                 error=runner_failure,
                 content=("Structured command admission changed at dispatch; no command was run."),
+                extra={"workspace_mutation_settlement": "complete", "cleanup_uncertain": False},
             )
             return await self._finish_durable_result(journal, result)
         started_at = datetime.now(UTC)
@@ -907,7 +909,7 @@ class RunCommandTool(Tool):
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
         recovery_authority: DurableToolRecoveryAuthority | None = None,
-    ) -> ToolResult | None:
+    ) -> DurableToolRecoveryEvidence | None:
         """Reconcile durable command evidence without ever replaying the command."""
 
         del started
@@ -961,7 +963,11 @@ class RunCommandTool(Tool):
                 status=("denied" if error == "command_denied" else "approval_required"),
                 error=str(error),
                 content=raw_result.content,
-                extra={} if structured is None else dict(structured),
+                extra={
+                    **({} if structured is None else dict(structured)),
+                    "workspace_mutation_settlement": "complete",
+                    "cleanup_uncertain": False,
+                },
                 artifacts=raw_result.artifacts,
             )
         if error == "runner_unavailable" or structured is None:
@@ -1573,7 +1579,7 @@ async def _recover_command_journal_result(
     idempotency_key: str,
     arguments: dict[str, Any],
     recovery_authority: DurableToolRecoveryAuthority | None,
-) -> ToolResult:
+) -> DurableToolRecoveryEvidence:
     try:
         record = _copy_command_journal_record(raw_record)
     except (TypeError, ValueError, _CommandJournalError):
@@ -1649,7 +1655,7 @@ async def _recover_command_journal_result(
                 "reconstruction_required": True,
             },
         )
-        return result
+        return DurableToolRecoveryEvidence("not_started", result)
     if state != "dispatching" or record.get("terminal_result") is not None:
         return _command_recovery_refusal("durable_command_journal_invalid")
 
@@ -1738,7 +1744,7 @@ async def _recover_command_journal_result(
         "unexpected_paths_identity": None,
         "workspace_changed": workspace_changed,
     }
-    return tool._error_result(
+    result = tool._error_result(
         authority,
         status="ambiguous",
         error="command_acknowledgement_lost",
@@ -1764,6 +1770,7 @@ async def _recover_command_journal_result(
             "reconstruction_required": True,
         },
     )
+    return DurableToolRecoveryEvidence("unresolved", result)
 
 
 def _raw_command_tool_result(result: ExecResult) -> ToolResult:
@@ -1865,7 +1872,7 @@ async def _recover_runner_terminal_command_result(
     idempotency_key: str,
     execution_profile_fingerprint: str,
     recovery_authority: DurableToolRecoveryAuthority | None,
-) -> ToolResult:
+) -> DurableToolRecoveryEvidence:
     if recovery_authority is None or recovery_authority.workspace is None:
         return _command_recovery_refusal("durable_runner_recovery_authority_unavailable")
     try:
@@ -1983,7 +1990,7 @@ async def _recover_runner_terminal_command_result(
         return _command_recovery_refusal("durable_command_recovery_settlement_failed")
     if persisted != desired:
         return _command_recovery_refusal("durable_command_recovery_settlement_failed")
-    return result
+    return _command_terminal_recovery_evidence(result)
 
 
 def _recover_terminal_command_result(
@@ -1991,7 +1998,7 @@ def _recover_terminal_command_result(
     *,
     authority: DockerCodingCommandAuthority,
     profile: DockerCodingToolchainProfile,
-) -> ToolResult:
+) -> DurableToolRecoveryEvidence:
     raw_result = record.get("terminal_result")
     try:
         result = ToolResult.model_validate(raw_result)
@@ -2024,11 +2031,41 @@ def _recover_terminal_command_result(
             stderr=structured["stderr"],
             maximum=profile.result_publication_max_bytes,
         )
-    return recovered
+    return _command_terminal_recovery_evidence(recovered)
 
 
-def _command_recovery_refusal(error: str) -> ToolResult:
-    return ToolResult(
+def _command_terminal_recovery_evidence(result: ToolResult) -> DurableToolRecoveryEvidence:
+    """A terminal journal row does not itself prove command cleanup settled.
+
+    Both reconstruction paths use the command owner's positive settlement
+    evidence. Output-only partial results remain usable; uncertain cleanup,
+    absent evidence, and unknown future classifications do not gain authority.
+    """
+    structured = result.structured
+    confirmed = (
+        structured is not None
+        and type(structured.get("status")) is str
+        and structured["status"]
+        in {
+            "succeeded",
+            "nonzero",
+            "timed_out",
+            "cancelled",
+            "failed",
+            "partial",
+            "denied",
+            "approval_required",
+            "unavailable",
+        }
+        and type(structured.get("workspace_mutation_settlement")) is str
+        and structured["workspace_mutation_settlement"] in {"complete", "runner_quiescent"}
+        and structured.get("cleanup_uncertain") is False
+    )
+    return DurableToolRecoveryEvidence("confirmed" if confirmed else "unresolved", result)
+
+
+def _command_recovery_refusal(error: str) -> DurableToolRecoveryEvidence:
+    result = ToolResult(
         content=(
             "Structured command recovery could not authenticate complete durable evidence; "
             "the command was not replayed."
@@ -2043,6 +2080,7 @@ def _command_recovery_refusal(error: str) -> ToolResult:
         },
         is_error=True,
     )
+    return DurableToolRecoveryEvidence("unresolved", result)
 
 
 def _command_mutation_evidence(

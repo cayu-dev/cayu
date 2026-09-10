@@ -21,6 +21,7 @@ from cayu._validation import (
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.tools import (
     DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
     Tool,
     ToolContext,
     ToolEffect,
@@ -481,7 +482,7 @@ class ApplyPatchTool(Tool):
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
         recovery_authority: DurableToolRecoveryAuthority | None = None,
-    ) -> ToolResult | None:
+    ) -> DurableToolRecoveryEvidence | None:
         """Reconstruct durable patch boundaries without dispatching mutations."""
 
         del started
@@ -1252,7 +1253,7 @@ async def _recover_patch_journal_result(
     storage_key: str,
     max_file_bytes: int,
     protected_entry_names: tuple[str, ...],
-) -> ToolResult:
+) -> DurableToolRecoveryEvidence:
     if type(raw_record) is not dict:
         return _patch_recovery_refusal("durable_journal_invalid")
     try:
@@ -1350,7 +1351,7 @@ async def _recover_patch_journal_result(
             max_file_bytes=max_file_bytes,
             expected_workspace_id_sha256=workspace_id_sha256,
         )
-        if isinstance(reconciled, ToolResult):
+        if isinstance(reconciled, DurableToolRecoveryEvidence):
             return reconciled
         record = reconciled
         operations = _validated_recovery_operations(record)
@@ -1421,7 +1422,24 @@ async def _recover_patch_journal_result(
     )
     if requires_fresh_read:
         content += " Re-read every affected path before proposing a repair."
-    return ToolResult(content=content, structured=structured, is_error=outcome != "applied")
+    result = ToolResult(content=content, structured=structured, is_error=outcome != "applied")
+    disposition: Literal["confirmed", "not_started", "unresolved"] = "unresolved"
+    if (
+        record.get("state") == "prepared"
+        and statuses
+        and all(status == "not_started" for status in statuses)
+    ):
+        disposition = "not_started"
+    elif (
+        "unknown" not in statuses
+        and (
+            record.get("state") == "terminal"
+            or (statuses and all(status == "applied" for status in statuses))
+        )
+        and outcome != "ambiguous"
+    ):
+        disposition = "confirmed"
+    return DurableToolRecoveryEvidence(disposition, result)
 
 
 def _recovery_intents_match_journal(
@@ -1457,7 +1475,7 @@ async def _reconcile_unknown_recovery_operation(
     storage_key: str,
     max_file_bytes: int,
     expected_workspace_id_sha256: str | None,
-) -> dict[str, Any] | ToolResult:
+) -> dict[str, Any] | DurableToolRecoveryEvidence:
     if recovery_authority is None or not isinstance(recovery_authority.workspace, Workspace):
         return _patch_recovery_refusal("workspace_recovery_capability_unavailable")
     workspace = recovery_authority.workspace
@@ -1725,8 +1743,8 @@ def _safe_recovery_failure_category(value: object) -> str | None:
     return None
 
 
-def _patch_recovery_refusal(category: str) -> ToolResult:
-    return ToolResult(
+def _patch_recovery_refusal(category: str) -> DurableToolRecoveryEvidence:
+    result = ToolResult(
         content=(
             "Patch recovery refused because its durable identity or execution profile no "
             "longer matches. The patch was not replayed."
@@ -1740,6 +1758,7 @@ def _patch_recovery_refusal(category: str) -> ToolResult:
         },
         is_error=True,
     )
+    return DurableToolRecoveryEvidence("unresolved", result)
 
 
 def _validate_patch_intents(

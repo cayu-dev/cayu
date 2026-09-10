@@ -57,6 +57,7 @@ from cayu.browser_profiles import (
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import TextPart, ToolResultPart
+from cayu.core.tools import DurableToolRecoveryEvidence
 from cayu.egress import HttpxUpstream
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.evals._memory_attribution import (
@@ -1577,6 +1578,13 @@ async def _recovered_browser_tool_calls(
         )
         if result is None:
             raise RuntimeError("Browser acceptance durable browser result is unavailable.")
+        if type(result) is not DurableToolRecoveryEvidence:
+            raise TypeError("Browser acceptance requires typed durable recovery evidence.")
+        # This read-only evaluator projects diagnostics, not runtime terminals.
+        # Its recovery corpus deliberately expects not-started and ambiguous
+        # outcomes; the scorecard validates their explicit execution/error
+        # classification. Only runtime settlement requires confirmed evidence.
+        result = result.result
         structured = dict(result.structured or {})
         portable = structured.get("portable_result_evidence")
         portable_structured = portable.get("structured") if isinstance(portable, Mapping) else None
@@ -1645,7 +1653,10 @@ async def _interrupted_trajectory(
         session_id,
         observed_events=tuple(ordered),
         limits=TerminalSessionEvidenceLimits(
-            max_events=evidence.boundary.event_count,
+            # The observation proof covers the full journal, including events
+            # outside the terminal evidence boundary. Bound that proof by its
+            # already validated size; equality below still checks the snapshot.
+            max_events=len(ordered),
             max_transcript_records=evidence.boundary.transcript_count,
             max_record_bytes=limits.max_record_bytes,
             max_total_bytes=limits.max_total_bytes,

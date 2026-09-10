@@ -5999,11 +5999,15 @@ def test_crashed_queued_run_recovery_preserves_terminal_identity_and_does_not_re
     assert completed_task.status is TaskStatus.COMPLETED
 
 
-def test_stalled_dispatch_recovery_recognizes_provider_resolution_repair() -> None:
-    assert (
-        IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION
-        in _STALLED_RECOVERED_ACTIONS
-    )
+@pytest.mark.parametrize(
+    "action",
+    [
+        IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION,
+        IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT,
+    ],
+)
+def test_stalled_dispatch_recovery_recognizes_retained_recovery_actions(action) -> None:
+    assert action in _STALLED_RECOVERED_ACTIONS
 
 
 def test_recover_stalled_sessions_after_seconds_must_be_non_negative() -> None:

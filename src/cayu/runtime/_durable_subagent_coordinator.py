@@ -1153,7 +1153,7 @@ class DurableSubagentCoordinator:
                     recovery_parent=parent_session,
                 )
                 return durable_subagent_preparation_rejection_result(receipt)
-        child, _handle = await self.ensure_submission(intent)
+        child, handle = await self.ensure_submission(intent)
         await self._persist_committed_durable_subagent_submission(
             intent,
             recovery_parent=parent_session,
@@ -1202,7 +1202,30 @@ class DurableSubagentCoordinator:
                     "Durable subagent queue task is terminal but its child did not settle."
                 )
             child = refreshed
-        return child
+        if child.status in terminal_child_statuses:
+            return child
+        # The protected operation is the durable handoff, not execution of
+        # the queued child. Only this owner has validated both the submission
+        # receipt and the exact child/task pair; a discovered child alone is
+        # insufficient evidence for this acknowledgement.
+        return ToolResult(
+            content=f"Subagent {intent.agent_alias} was durably queued as {child.id}.",
+            structured={
+                "recovered": True,
+                "recovery_reason": "pending_tool_round_reconciled_durable_submission",
+                "tool_round_id": tool_round_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "child_session_id": child.id,
+                "parent_session_id": parent_session.id,
+                "mode": "durable",
+                "status": "queued",
+                "dispatch_id": handle.dispatch_id,
+                "queue_task_id": intent.queue_task_id,
+                "dispatch_status": handle.status.value,
+                "outcome_unknown": False,
+            },
+        )
 
     def prepare_queued_child_run(
         self,

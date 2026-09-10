@@ -17,6 +17,8 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_text,
 )
+from cayu.environments.admission import ExecutionAdmissionDecision, ExecutionAdmissionError
+from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.proxies import (
     CredentialProxy,
     ProxyAuthorizationResult,
@@ -39,6 +41,8 @@ if TYPE_CHECKING:
 
 _CANCELLATION_EVIDENCE_ATTRIBUTE = "_cayu_tool_cancellation_evidence"
 _CANCELLATION_EVIDENCE_TOKEN = object()
+_ADMISSION_REFUSALS_ATTRIBUTE = "_cayu_runtime_admission_refusals"
+_ADMISSION_REFUSALS_TOKEN = object()
 _LEGACY_CANCELLATION_TOOL_CALL_ID_ATTRIBUTE = "_cayu_cancellation_tool_call_id"
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
 _BASE_EXCEPTION_TRACEBACK_DESCRIPTOR = BaseException.__dict__["__traceback__"]
@@ -746,6 +750,74 @@ def cancellation_artifacts(
     return []
 
 
+@dataclass(frozen=True, slots=True)
+class _AdmissionRefusalSnapshot:
+    identity: object
+    decision_json: str
+    settlement_failure_json: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmissionRefusals:
+    token: object
+    decisions: tuple[_AdmissionRefusalSnapshot, ...]
+
+
+def _admission_refusals(
+    cancellation: asyncio.CancelledError,
+) -> tuple[_AdmissionRefusalSnapshot, ...]:
+    evidence = exception_state(cancellation, _ADMISSION_REFUSALS_ATTRIBUTE)
+    if type(evidence) is _AdmissionRefusals and evidence.token is _ADMISSION_REFUSALS_TOKEN:
+        return evidence.decisions
+    return ()
+
+
+def retain_admission_refusal(
+    cancellation: asyncio.CancelledError,
+    refusal: ExecutionAdmissionError,
+    *,
+    settlement_failure: BaseException | None = None,
+) -> None:
+    """Retain only a runtime-owned pre-dispatch decision, not its traceback."""
+    if type(refusal) is not ExecutionAdmissionError:
+        raise TypeError("Expected a runtime admission refusal.")
+    decision = _AdmissionRefusalSnapshot(
+        object(),
+        refusal.decision.model_dump_json(),
+        None
+        if settlement_failure is None
+        else exception_evidence(settlement_failure).model_dump_json(),
+    )
+    decisions = tuple(dict.fromkeys((*_admission_refusals(cancellation), decision)))
+    set_exception_state(
+        cancellation,
+        _ADMISSION_REFUSALS_ATTRIBUTE,
+        _AdmissionRefusals(_ADMISSION_REFUSALS_TOKEN, decisions),
+    )
+
+
+def transfer_admission_refusals(
+    target: asyncio.CancelledError, sources: list[asyncio.CancelledError]
+) -> None:
+    decisions = tuple(
+        dict.fromkeys(
+            decision for source in [target, *sources] for decision in _admission_refusals(source)
+        )
+    )
+    if decisions:
+        set_exception_state(
+            target,
+            _ADMISSION_REFUSALS_ATTRIBUTE,
+            _AdmissionRefusals(_ADMISSION_REFUSALS_TOKEN, decisions),
+        )
+
+
+class _AdmissionSettlementFailure(RuntimeError):
+    def __init__(self, evidence: FailureEvidence) -> None:
+        super().__init__("Execution admission refusal settlement failed; see failure_evidence.")
+        self.failure_evidence = evidence
+
+
 def sanitize_external_cancellation(cancellation: asyncio.CancelledError) -> None:
     """Scrub runtime-only evidence before ordinary cancellation escapes Cayu."""
 
@@ -805,6 +877,28 @@ def sanitize_external_cancellation(cancellation: asyncio.CancelledError) -> None
     _BASE_EXCEPTION_CONTEXT_DESCRIPTOR.__set__(cancellation, None)
     if runner_failure is not None:
         _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__set__(cancellation, runner_failure)
+    refusals: list[BaseException] = []
+    for decision in _admission_refusals(cancellation):
+        refusals.append(
+            ExecutionAdmissionError(
+                ExecutionAdmissionDecision.model_validate_json(decision.decision_json)
+            )
+        )
+        if decision.settlement_failure_json is not None:
+            refusals.append(
+                _AdmissionSettlementFailure(
+                    FailureEvidence.model_validate_json(decision.settlement_failure_json)
+                )
+            )
+    if refusals:
+        if runner_failure is not None:
+            refusals.append(runner_failure)
+        retained = (
+            refusals[0]
+            if len(refusals) == 1
+            else BaseExceptionGroup("Execution admission and cancellation failures.", refusals)
+        )
+        _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__set__(cancellation, retained)
 
 
 def _cancellation_evidence(

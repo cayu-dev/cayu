@@ -16,6 +16,7 @@ from cayu.core.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.runtime._event_projection import prepare_new_runtime_event
+from cayu.runtime.invocation import InvocationOrigin, SessionExecutionSource, SessionInvocation
 from cayu.runtime.tool_terminal_publication import ToolTerminalPublicationGovernor
 from cayu.vaults import SecretRedactor
 
@@ -24,6 +25,185 @@ _TIMING_FIELDS = (
     "tool_terminal_staged_at",
     "tool_terminal_publication_started_at",
 )
+
+
+def _invocation_root():
+    return SessionInvocation(
+        origin=InvocationOrigin(trust="unattributed"),
+        root_invocation_id="00000000-0000-4000-8000-000000000001",
+        root_session_id="parent",
+        source=SessionExecutionSource.SDK_RUN,
+    )
+
+
+@pytest.mark.parametrize("second_limit", [20, 21])
+def test_queued_related_reservation_rechecks_exact_existing_identity(second_limit):
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor(staged_capacity_bytes=100)
+        await governor.reserve_round(
+            session_id="blocker",
+            tool_round_id="blocker",
+            maximum_bytes=None,
+        )
+        pending = [
+            asyncio.create_task(
+                governor._reserve_invocation_round(
+                    session_id="parent",
+                    tool_round_id="parent-round",
+                    maximum_bytes=limit,
+                    invocation=_invocation_root(),
+                )
+            )
+            for limit in (20, second_limit)
+        ]
+        try:
+            await asyncio.sleep(0)
+            assert all(not task.done() for task in pending)
+            governor.release_round(session_id="blocker", tool_round_id="blocker")
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=0.5,
+            )
+            assert outcomes[0] is None
+            if second_limit == 20:
+                assert outcomes[1] is None
+            else:
+                assert type(outcomes[1]) is RuntimeError
+                assert "reservation conflicts" in str(outcomes[1])
+            assert governor.snapshot().reserved_round_bytes == 20
+            assert governor.snapshot().active_round_reservations == 1
+            assert governor.snapshot().round_reservation_waiters == 0
+            governor.release_round(session_id="parent", tool_round_id="parent-round")
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("parent_limit", [None, 200])
+def test_nested_round_keeps_ownership_without_waiting_behind_parent(parent_limit):
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor(staged_capacity_bytes=100)
+        invocation = _invocation_root()
+        await governor._reserve_invocation_round(
+            session_id="parent",
+            tool_round_id="parent-round",
+            maximum_bytes=parent_limit,
+            invocation=invocation,
+        )
+        unrelated = asyncio.create_task(
+            governor.reserve_round(
+                session_id="other",
+                tool_round_id="other-round",
+                maximum_bytes=100,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            assert not unrelated.done()
+            # Reconstruction of the same durable root, not object identity.
+            child_invocation = SessionInvocation.model_validate_json(invocation.model_dump_json())
+            await asyncio.wait_for(
+                governor._reserve_invocation_round(
+                    session_id="child",
+                    tool_round_id="child-round",
+                    maximum_bytes=30,
+                    invocation=child_invocation,
+                ),
+                timeout=0.5,
+            )
+            with pytest.raises(RuntimeError, match="reservation conflicts"):
+                await governor.reserve_round(
+                    session_id="child",
+                    tool_round_id="child-round",
+                    maximum_bytes=30,
+                )
+            with pytest.raises(RuntimeError, match="reservation conflicts"):
+                await governor._reserve_invocation_round(
+                    session_id="child",
+                    tool_round_id="child-round",
+                    maximum_bytes=31,
+                    invocation=child_invocation,
+                )
+            governor.stage(
+                session_id="child",
+                tool_round_id="child-round",
+                event_id="child-event",
+                payload_bytes=30,
+                effect_completed_at=datetime.now(UTC),
+            )
+            governor.release_round(session_id="parent", tool_round_id="parent-round")
+            await asyncio.sleep(0)
+            assert not unrelated.done()
+            assert governor.snapshot().reserved_round_bytes == 30
+            governor.published(
+                session_id="child",
+                event_id="child-event",
+                published_at=datetime.now(UTC),
+            )
+            governor.release_round(session_id="child", tool_round_id="child-round")
+            await asyncio.wait_for(unrelated, timeout=0.5)
+            governor.release_round(session_id="other", tool_round_id="other-round")
+            assert governor.snapshot().active_round_reservations == 0
+            assert governor.snapshot().reserved_round_bytes == 0
+        finally:
+            unrelated.cancel()
+            await asyncio.gather(unrelated, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("child_limit", [20, 21, None])
+def test_nested_bounded_admission_aggregates_and_rejects_before_wait(child_limit):
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor(staged_capacity_bytes=100)
+        invocation = _invocation_root()
+        await governor._reserve_invocation_round(
+            session_id="parent",
+            tool_round_id="parent-round",
+            maximum_bytes=60,
+            invocation=invocation,
+        )
+        await governor.reserve_round(
+            session_id="other",
+            tool_round_id="other-round",
+            maximum_bytes=20,
+        )
+        governor.stage(
+            session_id="parent",
+            tool_round_id="parent-round",
+            event_id="parent-event",
+            payload_bytes=60,
+            effect_completed_at=datetime.now(UTC),
+        )
+        admission = governor._reserve_invocation_round(
+            session_id="child",
+            tool_round_id="child-round",
+            maximum_bytes=child_limit,
+            invocation=invocation,
+        )
+        if child_limit == 20:
+            await asyncio.wait_for(admission, timeout=0.5)
+            assert governor.snapshot().reserved_round_bytes == 100
+            governor.release_round(session_id="child", tool_round_id="child-round")
+        else:
+            with pytest.raises(RuntimeError, match="available publication capacity"):
+                await asyncio.wait_for(admission, timeout=0.5)
+        assert governor.snapshot().reserved_round_bytes == 80
+        assert governor.snapshot().staged_bytes == 60
+        assert governor.snapshot().round_reservation_waiters == 0
+        governor.published(
+            session_id="parent",
+            event_id="parent-event",
+            published_at=datetime.now(UTC),
+        )
+        governor.release_round(session_id="parent", tool_round_id="parent-round")
+        governor.release_round(session_id="other", tool_round_id="other-round")
+        assert governor.snapshot().reserved_round_bytes == 0
+
+    asyncio.run(scenario())
 
 
 def test_copy_event_reuses_validated_text_but_revalidates_mutation(monkeypatch) -> None:

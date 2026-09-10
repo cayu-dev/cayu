@@ -37,6 +37,7 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     JsonUtf8SizeCounter,
+    canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
     copy_json_value,
@@ -78,6 +79,7 @@ from cayu.core.tools import (
 )
 from cayu.environments import BoundWorkspace
 from cayu.environments.bindings import _runtime_owned_workspace_observer_name
+from cayu.failure_evidence import FailureEvidence
 from cayu.mcp import McpToolAdapter, McpToolset
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
@@ -139,6 +141,15 @@ from cayu.runtime._session_control import (
     clear_current_task_cancellation,
 )
 from cayu.runtime._session_queries import query_all_event_records
+from cayu.runtime._tool_effect_state import (
+    ToolEffectIntent,
+    ToolEffectReconciliationCleanupFailure,
+    ToolEffectReconciliationRequired,
+    ToolEffectRecord,
+    ToolEffectStateOwner,
+    ToolEffectTerminal,
+    is_command_policy_refusal_terminal,
+)
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -200,6 +211,7 @@ from cayu.runtime.sessions import (
     _mcp_manifest_session_ref,
     _McpManifestBaselineEvidenceInvalid,
     resolve_interaction_attribution,
+    runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -693,6 +705,8 @@ class _ToolRoundPublicationCoordinator:
         self,
         *,
         session_id: str,
+        session_instance_id: str,
+        run_epoch: int,
         tool_round_identity: ToolRoundIdentity,
         session_store: SessionStore,
         redactor: SecretRedactor,
@@ -703,6 +717,12 @@ class _ToolRoundPublicationCoordinator:
         terminal_payload_limits: Mapping[str, int | None] | None = None,
     ) -> None:
         self._session_id = require_clean_nonblank(session_id, "session_id")
+        self._session_instance_id = require_clean_nonblank(
+            session_instance_id, "session_instance_id"
+        )
+        if type(run_epoch) is not int or run_epoch < 0:
+            raise ValueError("Terminal staging requires an exact run epoch.")
+        self._run_epoch = run_epoch
         self._tool_round_identity = copy_tool_round_identity(tool_round_identity)
         self._session_store = session_store
         self._redactor = redactor
@@ -767,11 +787,27 @@ class _ToolRoundPublicationCoordinator:
     async def reserve_capacity(self) -> None:
         """Acquire this complete round's byte lease before tool dispatch."""
 
-        await self._publication_governor.reserve_round(
-            session_id=self._session_id,
-            tool_round_id=self._tool_round_identity.tool_round_id,
-            maximum_bytes=self._capacity_maximum_bytes,
-        )
+        session = await self._session_store.load(self._session_id)
+        if (
+            session is None
+            or session.instance_id != self._session_instance_id
+            or session.run_epoch != self._run_epoch
+        ):
+            raise RuntimeError("Tool-round reservation lost its session authority.")
+        if session.invocation is None:
+            # Missing provenance cannot join another round's capacity domain.
+            await self._publication_governor.reserve_round(
+                session_id=self._session_id,
+                tool_round_id=self._tool_round_identity.tool_round_id,
+                maximum_bytes=self._capacity_maximum_bytes,
+            )
+        else:
+            await self._publication_governor._reserve_invocation_round(
+                session_id=self._session_id,
+                tool_round_id=self._tool_round_identity.tool_round_id,
+                maximum_bytes=self._capacity_maximum_bytes,
+                invocation=session.invocation,
+            )
         self._capacity_reserved = True
 
     async def restore_staged_capacity(
@@ -1082,16 +1118,87 @@ class _ToolRoundPublicationCoordinator:
             )
             self._stage_attempted_event_ids.add(projected.id)
             try:
-                await self._session_store.transform_checkpoint(
-                    self._session_id,
-                    self._checkpoint_transform(
-                        tool_call_id=tool_call_id,
-                        cover_call=True,
-                        unsafe_scope=snapshot.secret_scope_incomplete,
-                        staged_terminal=staged,
-                        reproject_existing=not previous_redactor.has_same_registry(self._redactor),
-                    ),
+                transform = self._checkpoint_transform(
+                    tool_call_id=tool_call_id,
+                    cover_call=True,
+                    unsafe_scope=snapshot.secret_scope_incomplete,
+                    staged_terminal=staged,
+                    reproject_existing=not previous_redactor.has_same_registry(self._redactor),
                 )
+                session = await self._session_store.load(self._session_id)
+                if session is None:
+                    raise RuntimeError("Terminal staging lost its session.")
+                if (
+                    session.instance_id != self._session_instance_id
+                    or session.run_epoch != self._run_epoch
+                ):
+                    raise RuntimeError("Terminal staging lost its original session authority.")
+                effect_owner = ToolEffectStateOwner(self._session_store)
+                effect_record = await effect_owner.resolve_call(
+                    session,
+                    tool_round_id=self._tool_round_identity.tool_round_id,
+                    tool_call_id=tool_call_id,
+                )
+                if (
+                    effect_record is not None
+                    and (
+                        projected.payload.get("outcome_unknown") is True
+                        or projected.payload.get("interrupted") is True
+                    )
+                    and await effect_owner.preserve_unresolved(
+                        session,
+                        tool_round_id=self._tool_round_identity.tool_round_id,
+                        tool_call_ids=(tool_call_id,),
+                        failure_evidence=FailureEvidence(
+                            classification=(
+                                "timeout"
+                                if projected.payload.get("terminal_outcome")
+                                == "tool_execution_timeout"
+                                else "interruption"
+                                if projected.payload.get("interrupted") is True
+                                else "failure"
+                            ),
+                            session_id=session.id,
+                            run_epoch=session.run_epoch,
+                        ),
+                    )
+                ):
+                    self._stage_attempted_event_ids.discard(projected.id)
+                    raise ToolEffectReconciliationRequired()
+                if (
+                    effect_record is not None
+                    and (
+                        projected.type
+                        in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+                        or is_command_policy_refusal_terminal(projected)
+                    )
+                    and projected.payload.get("outcome_unknown") is not True
+                    and projected.payload.get("interrupted") is not True
+                ):
+                    source_checkpoint = await self._session_store.load_checkpoint(self._session_id)
+                    mutation = runtime_publication_checkpoint_mutation(
+                        source_checkpoint,
+                        transform(session, source_checkpoint),
+                    )
+                    await effect_owner.transition(
+                        effect_record,
+                        state="completed"
+                        if projected.type is EventType.TOOL_CALL_COMPLETED
+                        else "failed",
+                        run_epoch=self._run_epoch,
+                        terminal=ToolEffectTerminal(
+                            event_id=projected.id,
+                            result_digest=hashlib.sha256(
+                                canonical_durable_json_bytes(
+                                    projected.payload["result"],
+                                    "effect_terminal_result",
+                                )
+                            ).hexdigest(),
+                        ),
+                        mutation=mutation,
+                    )
+                else:
+                    await self._session_store.transform_checkpoint(self._session_id, transform)
             except BaseException:
                 # A transform error may be either a definite rejection or a
                 # lost acknowledgement after commit. Reconcile from the
@@ -4884,165 +4991,297 @@ class ToolRoundExecutor:
                 nonlocal post_tool_cancellation
                 nonlocal workspace_events, workspace_lifecycle, workspace_capture_payload
 
-                if registered_environment is not None and workspace_window_id is not None:
-                    await complete_workspace_checkpoint_mutation(
-                        self._session_store,
-                        session,
-                        registered_environment,
-                        window_id=workspace_window_id,
-                        window_exclusive=lambda: not workspace_attribution_window.overlap_detected,
-                        successful=(
-                            event.type is EventType.TOOL_CALL_COMPLETED
-                            and not outcome.result.is_error
-                            and not snapshot.unsafe_output
-                            and workspace_settlement_failure is None
-                        ),
-                    )
-                staged_event = await deferred_terminal_stager(
-                    event,
-                    outcome,
-                    allow_modification,
-                    publish_before_hooks,
-                    snapshot,
-                )
-                current_workspace_lifecycle = workspace_lifecycle
-                if current_workspace_lifecycle is None:
-                    raise RuntimeError(
-                        "Workspace observation lifecycle disappeared before staging."
-                    )
-                staged_lifecycle = WorkspaceObservationLifecycle.model_validate(
-                    {
-                        **current_workspace_lifecycle.model_dump(mode="json"),
-                        "phase": WorkspaceObservationPhase.TOOL_OUTCOME_STAGED.value,
-                        "tool_outcome_event_id": staged_event.id,
-                        "tool_outcome_event_digest": workspace_observation_event_digest(
-                            staged_event
-                        ),
-                    }
-                )
-                await publish_workspace_observation_transition(
-                    session_store=self._session_store,
-                    event_writer=self._event_writer,
-                    session=session,
-                    previous=current_workspace_lifecycle,
-                    current=staged_lifecycle,
-                    phase="tool-outcome",
-                )
-                workspace_lifecycle = staged_lifecycle
-
-                capture: _WorkspaceCaptureResult | None = None
-                capture_failure_detail: str | None = None
-                workspace_evidence_available = (
-                    not snapshot.unsafe_output and not publish_arguments_as_unavailable
-                )
-                if workspace_settlement_failure is not None:
-                    capture_failure_detail = "mutation_settlement_unproven"
-                elif workspace_capture_failure_detail is not None:
-                    capture_failure_detail = workspace_capture_failure_detail
-                else:
-                    try:
-                        capture = await _record_workspace_mutation_after(
-                            session_store=self._session_store,
-                            event_writer=self._event_writer,
-                            registered_environment=registered_environment,
-                            artifact_store=workspace_receipt_artifact_store,
-                            artifact_unavailable_detail_code=(
-                                workspace_receipt_artifact_unavailable_detail
-                            ),
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                            tool_call=tool_call,
-                            tool_round_identity=tool_round_identity,
-                            execution_profile=execution_profile,
-                            model_step=model_step,
+                uncertainty_error: ToolEffectReconciliationRequired | None = None
+                try:
+                    if registered_environment is not None and workspace_window_id is not None:
+                        await complete_workspace_checkpoint_mutation(
+                            self._session_store,
+                            session,
+                            registered_environment,
                             window_id=workspace_window_id,
-                            lifecycle=workspace_lifecycle,
-                            before_observation=before_workspace_observation,
-                            authority_projection=workspace_authority,
-                            attribution_window=workspace_attribution_window,
-                            writer_isolation_before=writer_isolation_before,
-                            direct_mutations=direct_workspace_mutations,
-                            redactor=snapshot.redactor,
-                            evidence_available=workspace_evidence_available,
-                            operation_registry=self._workspace_capture_operations,
+                            window_exclusive=lambda: (
+                                not workspace_attribution_window.overlap_detected
+                            ),
+                            successful=(
+                                event.type is EventType.TOOL_CALL_COMPLETED
+                                and not outcome.result.is_error
+                                and not snapshot.unsafe_output
+                                and workspace_settlement_failure is None
+                            ),
                         )
-                    except (KeyboardInterrupt, SystemExit, GeneratorExit):
-                        raise
-                    except asyncio.CancelledError as exc:
-                        observed_cancellation = await consume_post_tool_cancellation(exc)
-                        if observed_cancellation is None:
+                    try:
+                        staged_event = await deferred_terminal_stager(
+                            event,
+                            outcome,
+                            allow_modification,
+                            publish_before_hooks,
+                            snapshot,
+                        )
+                    except ToolEffectReconciliationRequired as exc:
+                        uncertainty_error = exc
+                        effect_owner = ToolEffectStateOwner(self._session_store)
+                        effect = await effect_owner.resolve_call(
+                            session,
+                            tool_round_id=tool_round_identity.tool_round_id,
+                            tool_call_id=tool_call.id,
+                        )
+                        if effect is not None and effect.state == "prepared":
+                            # No dispatch was consumed, hence no uncertainty event
+                            # exists to bind to this observation. Keep the durable
+                            # lifecycle for recovery, which owns prepared settlement.
+                            workspace_attribution_window.close(discard_history=True)
                             raise
-                        publication_failure = exception_cause(observed_cancellation)
-                        if publication_failure is not None:
-                            # The parallel tool-round boundary deliberately
-                            # severs ordinary exception causes before it
-                            # rebuilds the caller cancellation. Carry this
-                            # runtime-owned publication failure through its
-                            # authenticated cleanup channel so both the
-                            # initial and reconciliation failures survive in
-                            # bounded form on the final cancellation.
-                            prior_failure = runner_cancellation_failure(observed_cancellation)
-                            cancellation_failure = publication_failure
-                            if (
-                                prior_failure is not None
-                                and prior_failure is not publication_failure
-                            ):
-                                cancellation_failure = BaseExceptionGroup(
-                                    "Tool cancellation and workspace publication failures.",
-                                    [prior_failure, publication_failure],
-                                )
-                            attach_runner_cancellation_failure(
-                                observed_cancellation,
-                                cancellation_failure,
-                            )
-                        invocation_secrets.initialize_cancellation_evidence(observed_cancellation)
-                        invocation_secrets.set_cancellation_redactor(
-                            observed_cancellation,
-                            snapshot.redactor,
+                        uncertain_events = await effect_owner.load_uncertainty_events(
+                            session,
+                            tool_round_id=tool_round_identity.tool_round_id,
+                            tool_call_ids=(tool_call.id,),
                         )
-                        invocation_secrets.set_cancellation_tool_call_id(
-                            observed_cancellation,
-                            tool_call.id,
+                        if len(uncertain_events) != 1:
+                            raise RuntimeError(
+                                "Workspace capture lost exact uncertainty evidence."
+                            ) from exc
+                        staged_event = uncertain_events[0]
+                    current_workspace_lifecycle = workspace_lifecycle
+                    if current_workspace_lifecycle is None:
+                        raise RuntimeError(
+                            "Workspace observation lifecycle disappeared before staging."
                         )
-                        post_tool_cancellation = observed_cancellation
-                        capture_failure_detail = "receipt_publication_interrupted"
-                    except Exception:
-                        capture_failure_detail = "receipt_publication_failed"
-                    finally:
-                        if workspace_attribution_window is not None:
-                            workspace_attribution_window.close(
-                                discard_history=not workspace_evidence_available
-                            )
-
-                if workspace_attribution_window is not None:
-                    workspace_attribution_window.close(
-                        discard_history=not workspace_evidence_available
-                    )
-
-                if capture is None:
-                    if capture_failure_detail == "receipt_publication_interrupted":
-                        workspace_capture_payload = {
-                            "workspace_mutation_capture_status": "interrupted",
-                            "workspace_mutation_capture_detail_code": capture_failure_detail,
+                    staged_lifecycle = WorkspaceObservationLifecycle.model_validate(
+                        {
+                            **current_workspace_lifecycle.model_dump(mode="json"),
+                            "phase": WorkspaceObservationPhase.TOOL_OUTCOME_STAGED.value,
+                            "tool_outcome_event_id": staged_event.id,
+                            "tool_outcome_event_digest": workspace_observation_event_digest(
+                                staged_event
+                            ),
                         }
+                    )
+                    await publish_workspace_observation_transition(
+                        session_store=self._session_store,
+                        event_writer=self._event_writer,
+                        session=session,
+                        previous=current_workspace_lifecycle,
+                        current=staged_lifecycle,
+                        phase="tool-outcome",
+                    )
+                    workspace_lifecycle = staged_lifecycle
+
+                    capture: _WorkspaceCaptureResult | None = None
+                    capture_failure_detail: str | None = None
+                    workspace_evidence_available = (
+                        not snapshot.unsafe_output and not publish_arguments_as_unavailable
+                    )
+                    if workspace_settlement_failure is not None:
+                        capture_failure_detail = "mutation_settlement_unproven"
+                    elif workspace_capture_failure_detail is not None:
+                        capture_failure_detail = workspace_capture_failure_detail
+                    else:
+                        try:
+                            capture = await _record_workspace_mutation_after(
+                                session_store=self._session_store,
+                                event_writer=self._event_writer,
+                                registered_environment=registered_environment,
+                                artifact_store=workspace_receipt_artifact_store,
+                                artifact_unavailable_detail_code=(
+                                    workspace_receipt_artifact_unavailable_detail
+                                ),
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                tool_call=tool_call,
+                                tool_round_identity=tool_round_identity,
+                                execution_profile=execution_profile,
+                                model_step=model_step,
+                                window_id=workspace_window_id,
+                                lifecycle=workspace_lifecycle,
+                                before_observation=before_workspace_observation,
+                                authority_projection=workspace_authority,
+                                attribution_window=workspace_attribution_window,
+                                writer_isolation_before=writer_isolation_before,
+                                direct_mutations=direct_workspace_mutations,
+                                redactor=snapshot.redactor,
+                                evidence_available=workspace_evidence_available,
+                                operation_registry=self._workspace_capture_operations,
+                            )
+                        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                            raise
+                        except asyncio.CancelledError as exc:
+                            observed_cancellation = await consume_post_tool_cancellation(exc)
+                            if observed_cancellation is None:
+                                raise
+                            publication_failure = exception_cause(observed_cancellation)
+                            if publication_failure is not None:
+                                # The parallel tool-round boundary deliberately
+                                # severs ordinary exception causes before it
+                                # rebuilds the caller cancellation. Carry this
+                                # runtime-owned publication failure through its
+                                # authenticated cleanup channel so both the
+                                # initial and reconciliation failures survive in
+                                # bounded form on the final cancellation.
+                                prior_failure = runner_cancellation_failure(observed_cancellation)
+                                cancellation_failure = publication_failure
+                                if (
+                                    prior_failure is not None
+                                    and prior_failure is not publication_failure
+                                ):
+                                    cancellation_failure = BaseExceptionGroup(
+                                        "Tool cancellation and workspace publication failures.",
+                                        [prior_failure, publication_failure],
+                                    )
+                                attach_runner_cancellation_failure(
+                                    observed_cancellation,
+                                    cancellation_failure,
+                                )
+                            invocation_secrets.initialize_cancellation_evidence(
+                                observed_cancellation
+                            )
+                            invocation_secrets.set_cancellation_redactor(
+                                observed_cancellation,
+                                snapshot.redactor,
+                            )
+                            invocation_secrets.set_cancellation_tool_call_id(
+                                observed_cancellation,
+                                tool_call.id,
+                            )
+                            post_tool_cancellation = observed_cancellation
+                            capture_failure_detail = "receipt_publication_interrupted"
+                        except Exception:
+                            capture_failure_detail = "receipt_publication_failed"
+                        finally:
+                            if workspace_attribution_window is not None:
+                                workspace_attribution_window.close(
+                                    discard_history=not workspace_evidence_available
+                                )
+
+                    if workspace_attribution_window is not None:
+                        workspace_attribution_window.close(
+                            discard_history=not workspace_evidence_available
+                        )
+
+                    if capture is None:
+                        if capture_failure_detail == "receipt_publication_interrupted":
+                            workspace_capture_payload = {
+                                "workspace_mutation_capture_status": "interrupted",
+                                "workspace_mutation_capture_detail_code": capture_failure_detail,
+                            }
+                        else:
+                            workspace_capture_payload = {
+                                "workspace_mutation_capture_status": "failed",
+                                "workspace_mutation_capture_detail_code": (
+                                    capture_failure_detail or "receipt_publication_failed"
+                                ),
+                            }
                     else:
                         workspace_capture_payload = {
-                            "workspace_mutation_capture_status": "failed",
-                            "workspace_mutation_capture_detail_code": (
+                            "workspace_mutation_capture_status": "recorded",
+                        }
+
+                    if capture is None:
+                        final_payload = dict(staged_event.payload)
+                        final_payload.update(workspace_capture_payload)
+                        finalized_stage = (
+                            staged_event
+                            if uncertainty_error is not None
+                            else await deferred_terminal_capture_recorder(
+                                staged_event.model_copy(
+                                    update={"payload": final_payload}, deep=True
+                                )
+                            )
+                        )
+                        if (
+                            finalized_stage.id != staged_event.id
+                            or workspace_observation_event_digest(finalized_stage)
+                            != staged_lifecycle.tool_outcome_event_digest
+                        ):
+                            raise RuntimeError(
+                                "Workspace capture changed the authoritative tool outcome."
+                            )
+                        checkpoint = await await_workspace_observation_store_read(
+                            lambda: self._session_store.load_checkpoint(session.id),
+                            operation="Workspace observation failure-closure checkpoint read",
+                        )
+                        current_lifecycle = workspace_observations_from_checkpoint(checkpoint).get(
+                            workspace_window_id
+                        )
+                        if current_lifecycle is None:
+                            raise RuntimeError(
+                                "Workspace observation lifecycle disappeared before failure closure."
+                            )
+                        terminal_lifecycle = _workspace_observation_terminal_view(current_lifecycle)
+                        incomplete_event = prepare_runtime_event(
+                            _workspace_mutation_incomplete_event(
+                                lifecycle=terminal_lifecycle,
+                                session=session,
+                                execution_profile=execution_profile,
+                                status=(
+                                    WorkspaceObservationTerminalStatus.INCOMPLETE
+                                    if capture_failure_detail == "receipt_publication_interrupted"
+                                    else WorkspaceObservationTerminalStatus.FAILED
+                                ),
+                                detail_code=(
+                                    capture_failure_detail or "receipt_publication_failed"
+                                ),
+                            ),
+                            redactor=snapshot.redactor,
+                        )
+                        published = await publish_workspace_observation_transition(
+                            session_store=self._session_store,
+                            event_writer=self._event_writer,
+                            session=session,
+                            previous=current_lifecycle,
+                            current=None,
+                            phase="terminal",
+                            terminal_status=(
+                                WorkspaceObservationTerminalStatus.INCOMPLETE
+                                if capture_failure_detail == "receipt_publication_interrupted"
+                                else WorkspaceObservationTerminalStatus.FAILED
+                            ),
+                            terminal_detail_code=(
                                 capture_failure_detail or "receipt_publication_failed"
                             ),
-                        }
-                else:
-                    workspace_capture_payload = {
-                        "workspace_mutation_capture_status": "recorded",
-                    }
+                            terminal_artifacts=terminal_lifecycle.artifacts,
+                            events=(incomplete_event,),
+                        )
+                        workspace_events = published
+                        workspace_lifecycle = current_lifecycle
+                        if uncertainty_error is not None:
+                            raise uncertainty_error
+                        return finalized_stage
 
-                if capture is None:
+                    workspace_lifecycle = capture.lifecycle
+                    delta_state = (
+                        WorkspaceObservationEvidenceState.PUBLISHED
+                        if capture.terminal_status is not WorkspaceObservationTerminalStatus.FAILED
+                        else WorkspaceObservationEvidenceState.FAILED
+                    )
+                    delta_published = WorkspaceObservationLifecycle.model_validate(
+                        {
+                            **capture.delta_lifecycle.model_dump(mode="json"),
+                            "phase": WorkspaceObservationPhase.DELTA_PUBLISHED.value,
+                            "delta_state": delta_state.value,
+                            "mutation_event_id": capture.receipt_event.id,
+                            "mutation_event_digest": workspace_observation_event_digest(
+                                capture.receipt_event
+                            ),
+                        }
+                    )
+                    (receipt_event,) = await publish_workspace_observation_transition(
+                        session_store=self._session_store,
+                        event_writer=self._event_writer,
+                        session=session,
+                        previous=capture.lifecycle,
+                        current=delta_published,
+                        phase="delta-publication",
+                        events=(capture.receipt_event,),
+                    )
                     final_payload = dict(staged_event.payload)
                     final_payload.update(workspace_capture_payload)
-                    finalized_stage = await deferred_terminal_capture_recorder(
-                        staged_event.model_copy(update={"payload": final_payload}, deep=True)
+                    finalized_stage = (
+                        staged_event
+                        if uncertainty_error is not None
+                        else await deferred_terminal_capture_recorder(
+                            staged_event.model_copy(update={"payload": final_payload}, deep=True)
+                        )
                     )
                     if (
                         finalized_stage.id != staged_event.id
@@ -5052,117 +5291,41 @@ class ToolRoundExecutor:
                         raise RuntimeError(
                             "Workspace capture changed the authoritative tool outcome."
                         )
-                    checkpoint = await await_workspace_observation_store_read(
-                        lambda: self._session_store.load_checkpoint(session.id),
-                        operation="Workspace observation failure-closure checkpoint read",
-                    )
-                    current_lifecycle = workspace_observations_from_checkpoint(checkpoint).get(
-                        workspace_window_id
-                    )
-                    if current_lifecycle is None:
-                        raise RuntimeError(
-                            "Workspace observation lifecycle disappeared before failure closure."
-                        )
-                    terminal_lifecycle = _workspace_observation_terminal_view(current_lifecycle)
-                    incomplete_event = prepare_runtime_event(
+                    terminal_lifecycle = _workspace_observation_terminal_view(delta_published)
+                    finalized_event = prepare_runtime_event(
                         _workspace_mutation_incomplete_event(
                             lifecycle=terminal_lifecycle,
                             session=session,
                             execution_profile=execution_profile,
-                            status=(
-                                WorkspaceObservationTerminalStatus.INCOMPLETE
-                                if capture_failure_detail == "receipt_publication_interrupted"
-                                else WorkspaceObservationTerminalStatus.FAILED
-                            ),
-                            detail_code=(capture_failure_detail or "receipt_publication_failed"),
+                            status=capture.terminal_status,
+                            detail_code=capture.terminal_detail_code,
                         ),
                         redactor=snapshot.redactor,
                     )
-                    published = await publish_workspace_observation_transition(
+                    (finalized_event,) = await publish_workspace_observation_transition(
                         session_store=self._session_store,
                         event_writer=self._event_writer,
                         session=session,
-                        previous=current_lifecycle,
+                        previous=delta_published,
                         current=None,
                         phase="terminal",
-                        terminal_status=(
-                            WorkspaceObservationTerminalStatus.INCOMPLETE
-                            if capture_failure_detail == "receipt_publication_interrupted"
-                            else WorkspaceObservationTerminalStatus.FAILED
-                        ),
-                        terminal_detail_code=(
-                            capture_failure_detail or "receipt_publication_failed"
-                        ),
+                        terminal_status=capture.terminal_status,
+                        terminal_detail_code=capture.terminal_detail_code,
                         terminal_artifacts=terminal_lifecycle.artifacts,
-                        events=(incomplete_event,),
+                        events=(finalized_event,),
                     )
-                    workspace_events = published
-                    workspace_lifecycle = current_lifecycle
+                    workspace_lifecycle = delta_published
+                    workspace_events = (*capture.events, receipt_event, finalized_event)
+                    if uncertainty_error is not None:
+                        raise uncertainty_error
                     return finalized_stage
-
-                workspace_lifecycle = capture.lifecycle
-                delta_state = (
-                    WorkspaceObservationEvidenceState.PUBLISHED
-                    if capture.terminal_status is not WorkspaceObservationTerminalStatus.FAILED
-                    else WorkspaceObservationEvidenceState.FAILED
-                )
-                delta_published = WorkspaceObservationLifecycle.model_validate(
-                    {
-                        **capture.delta_lifecycle.model_dump(mode="json"),
-                        "phase": WorkspaceObservationPhase.DELTA_PUBLISHED.value,
-                        "delta_state": delta_state.value,
-                        "mutation_event_id": capture.receipt_event.id,
-                        "mutation_event_digest": workspace_observation_event_digest(
-                            capture.receipt_event
-                        ),
-                    }
-                )
-                (receipt_event,) = await publish_workspace_observation_transition(
-                    session_store=self._session_store,
-                    event_writer=self._event_writer,
-                    session=session,
-                    previous=capture.lifecycle,
-                    current=delta_published,
-                    phase="delta-publication",
-                    events=(capture.receipt_event,),
-                )
-                final_payload = dict(staged_event.payload)
-                final_payload.update(workspace_capture_payload)
-                finalized_stage = await deferred_terminal_capture_recorder(
-                    staged_event.model_copy(update={"payload": final_payload}, deep=True)
-                )
-                if (
-                    finalized_stage.id != staged_event.id
-                    or workspace_observation_event_digest(finalized_stage)
-                    != staged_lifecycle.tool_outcome_event_digest
-                ):
-                    raise RuntimeError("Workspace capture changed the authoritative tool outcome.")
-                terminal_lifecycle = _workspace_observation_terminal_view(delta_published)
-                finalized_event = prepare_runtime_event(
-                    _workspace_mutation_incomplete_event(
-                        lifecycle=terminal_lifecycle,
-                        session=session,
-                        execution_profile=execution_profile,
-                        status=capture.terminal_status,
-                        detail_code=capture.terminal_detail_code,
-                    ),
-                    redactor=snapshot.redactor,
-                )
-                (finalized_event,) = await publish_workspace_observation_transition(
-                    session_store=self._session_store,
-                    event_writer=self._event_writer,
-                    session=session,
-                    previous=delta_published,
-                    current=None,
-                    phase="terminal",
-                    terminal_status=capture.terminal_status,
-                    terminal_detail_code=capture.terminal_detail_code,
-                    terminal_artifacts=terminal_lifecycle.artifacts,
-                    events=(finalized_event,),
-                )
-                workspace_lifecycle = delta_published
-                workspace_events = (*capture.events, receipt_event, finalized_event)
-                return finalized_stage
+                except Exception as cleanup_error:
+                    if uncertainty_error is None or cleanup_error is uncertainty_error:
+                        raise
+                    raise ToolEffectReconciliationCleanupFailure(
+                        uncertainty_error,
+                        cast("Exception", sanitize_runner_failure(cleanup_error)),
+                    ) from None
 
             effective_terminal_stager = stage_workspace_terminal
 
@@ -5227,6 +5390,12 @@ class ToolRoundExecutor:
                     snapshot,
                 )
             except BaseException as closure_error:
+                if isinstance(closure_error, ToolEffectReconciliationCleanupFailure):
+                    closure_error = closure_error.cleanup
+                elif isinstance(closure_error, ToolEffectReconciliationRequired):
+                    # Closure completed or prepared observation awaits recovery;
+                    # neither case adds a failure to the original cancellation.
+                    return
                 if _contains_process_signal(closure_error):
                     interrupt_nodes = {
                         id(candidate) for candidate in iter_exception_tree(interrupt)
@@ -5242,18 +5411,24 @@ class ToolRoundExecutor:
                     ) from None
                 # The original interruption remains authoritative. Recovery
                 # can reconcile an intent or partial phase without rerunning
-                # the tool, so attach only a fixed bounded diagnostic here.
-                failure: BaseException = RuntimeError(
-                    "Workspace observation closure failed during tool interruption."
-                )
+                # the tool. Retain bounded typed failure evidence, never raw
+                # extension messages, tracebacks, or mutable exception state.
+                failure: BaseException = sanitize_runner_failure(closure_error)
                 prior = exception_cause(interrupt)
                 if prior is not None:
                     failure = BaseExceptionGroup(
                         "Tool interruption and workspace observation closure failures.",
                         [prior, failure],
                     )
+                # TaskGroup reconstruction clears unauthenticated causal
+                # chains. Carry this fixed, runtime-owned diagnostic through
+                # the same channel used by mutation settlement cleanup.
+                for candidate in iter_exception_tree(interrupt):
+                    if isinstance(candidate, asyncio.CancelledError):
+                        attach_runner_cancellation_failure(candidate, failure)
                 set_exception_cause(interrupt, failure)
 
+        effect_dispatch: ToolEffectRecord | None = None
         try:
 
             async def require_live_environment_exposure() -> None:
@@ -5270,6 +5445,69 @@ class ToolRoundExecutor:
                     redactor=invocation_secret_scope.redactor,
                 )
 
+            # Refuse missing/stale environment authority before consuming a
+            # protected effect. The exact dispatch seam below still performs
+            # main's independent freshness check after durable preparation.
+            await require_live_environment_exposure()
+            if registered_tool.effect is ToolEffect.EXTERNAL:
+                if invocation_context is None or execution_profile is None:
+                    raise RuntimeError(
+                        "External tool dispatch requires frozen invocation authority."
+                    )
+                targeted_material = _targeted_tool_invocation_payload(effective_tool_call)
+                effect_intent = ToolEffectIntent(
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    source_run_epoch=session.run_epoch,
+                    interaction_id=invocation_context.active_profile.interaction_id,
+                    model_step_id=tool_round_identity.model_step_id,
+                    model_attempt_id=tool_round_identity.model_attempt_id,
+                    tool_round_id=tool_round_identity.tool_round_id,
+                    agent_name=registered_agent.spec.name,
+                    tool_name=effective_tool_call.name,
+                    tool_call_id=effective_tool_call.id,
+                    idempotency_key=idempotency_key,
+                    execution_profile_fingerprint=execution_profile.fingerprint,
+                    schema_digest=hashlib.sha256(
+                        canonical_durable_json_bytes(
+                            registered_tool.schema,
+                            "effect_schema",
+                        )
+                    ).hexdigest(),
+                    arguments_digest=hashlib.sha256(
+                        canonical_durable_json_bytes(
+                            effective_tool_call.arguments,
+                            "effect_arguments",
+                        )
+                    ).hexdigest(),
+                    approval_id=approval_id,
+                    pause_id=input_id,
+                    environment_name=environment_name,
+                    allocation_fingerprint=(
+                        None
+                        if registered_environment is None
+                        else registered_environment.live_allocation_fingerprint
+                    ),
+                    reconciler_fingerprint=(
+                        None
+                        if registered_tool.effect_reconciler is None
+                        else registered_tool.effect_reconciler.fingerprint
+                    ),
+                    targeted_invocation_digest=(
+                        None
+                        if not targeted_material
+                        else hashlib.sha256(
+                            canonical_durable_json_bytes(
+                                targeted_material,
+                                "effect_targeted_invocation",
+                            )
+                        ).hexdigest()
+                    ),
+                )
+                effect_dispatch = await ToolEffectStateOwner(self._session_store).begin(
+                    effect_intent,
+                    run_epoch=session.run_epoch,
+                )
             execution_outcome = await tool_execution.run_tool(
                 tool=registered_tool.tool,
                 effect=registered_tool.effect,
@@ -5282,6 +5520,93 @@ class ToolRoundExecutor:
                 timeout_seconds=self._tool_timeout_seconds,
                 before_dispatch=require_live_environment_exposure,
             )
+        except tool_execution.ToolDispatchAdmissionRefusal as refused:
+            refusal = refused.refusal
+            if effect_dispatch is not None:
+                try:
+                    # This proof comes from the runtime callback, never a
+                    # tool-authored result or exception. Selection and its
+                    # evidence share the existing effect transaction.
+                    intent = effect_dispatch.intent
+                    event = event_with_execution_profile_authority(
+                        Event(
+                            type=EventType.TOOL_CALL_FAILED,
+                            session_id=intent.session_id,
+                            interaction_id=intent.interaction_id,
+                            agent_name=intent.agent_name,
+                            environment_name=intent.environment_name,
+                            tool_name=intent.tool_name,
+                            payload={
+                                **{
+                                    name: getattr(intent, name)
+                                    for name in (
+                                        "model_step_id",
+                                        "model_attempt_id",
+                                        "tool_round_id",
+                                        "tool_call_id",
+                                        "idempotency_key",
+                                    )
+                                },
+                                **(
+                                    {"approval_id": intent.approval_id}
+                                    if intent.approval_id is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"input_id": intent.pause_id}
+                                    if intent.pause_id is not None
+                                    else {}
+                                ),
+                                "result": ToolResult(
+                                    content="Tool was not invoked because execution admission was refused.",
+                                    is_error=True,
+                                ).model_dump(mode="json"),
+                            },
+                        ),
+                        execution_profile,
+                    )
+                    event = self._event_writer.prepare(
+                        _event_with_tool_round_authority(
+                            event,
+                            tool_round_identity,
+                            *(
+                                field
+                                for field in ("approval_id", "input_id")
+                                if field in event.payload
+                            ),
+                        )
+                    )
+                    await ToolEffectStateOwner(self._session_store).transition(
+                        effect_dispatch,
+                        state="failed",
+                        run_epoch=session.run_epoch,
+                        terminal=ToolEffectTerminal(
+                            event_id=event.id,
+                            result_digest=hashlib.sha256(
+                                canonical_durable_json_bytes(
+                                    event.payload["result"], "effect_terminal_result"
+                                )
+                            ).hexdigest(),
+                        ),
+                        events=(event,),
+                    )
+                    await self._event_writer.fan_out_persisted([event])
+                except asyncio.CancelledError as cancellation:
+                    secondary = exception_cause(cancellation)
+                    invocation_secrets.retain_admission_refusal(
+                        cancellation, refusal, settlement_failure=secondary
+                    )
+                    # Approval and user-input continuations do not cross the
+                    # ordinary round's final sanitizer. Publish the same safe
+                    # diagnostic snapshot at this shared refusal boundary.
+                    invocation_secrets.sanitize_external_cancellation(cancellation)
+                    raise cancellation from exception_cause(cancellation)
+                except BaseException as settlement_failure:
+                    raise BaseExceptionGroup(
+                        "Execution admission refusal and settlement failure.",
+                        [refusal, settlement_failure],
+                    ) from None
+            raise refusal from None
         except BaseExceptionGroup as exc:
             if any(
                 isinstance(candidate, (KeyboardInterrupt, SystemExit, GeneratorExit))
@@ -5358,7 +5683,7 @@ class ToolRoundExecutor:
                     idempotency_key=idempotency_key,
                     redactor=invocation_secret_scope.redactor,
                     output_redactor=invocation_secret_scope.redactor,
-                    quarantine_output=deferred_terminal_stager is not None,
+                    quarantine_output=publish_arguments_as_unavailable,
                 ):
                     yield event, None
             raise
@@ -5367,278 +5692,394 @@ class ToolRoundExecutor:
                 workspace_mutation_owner.seal_and_transfer_pending()
             raise
 
-        result = execution_outcome.result
-        redactor = invocation_secret_scope.redactor
-        output_redactor = redactor
-        if workspace_window_id is not None:
-            try:
-                await close_workspace_mutation_window()
-            except BaseExceptionGroup as exc:
-                if _contains_process_signal(exc) or is_current_runner_cancellation_group(exc):
-                    raise
-                workspace_capture_failure_detail = "receipt_publication_failed"
-                workspace_capture_payload = {
-                    "workspace_mutation_capture_status": "failed",
-                    "workspace_mutation_capture_detail_code": workspace_capture_failure_detail,
-                }
-            except asyncio.CancelledError as exc:
-                post_tool_cancellation = await consume_post_tool_cancellation(exc)
-                if post_tool_cancellation is not None:
-                    invocation_secrets.initialize_cancellation_evidence(post_tool_cancellation)
-                    invocation_secrets.set_cancellation_redactor(
-                        post_tool_cancellation,
-                        invocation_secret_scope.redactor,
-                    )
-                    invocation_secrets.set_cancellation_tool_call_id(
-                        post_tool_cancellation,
-                        tool_call.id,
-                    )
-                workspace_capture_payload = {
-                    "workspace_mutation_capture_status": "interrupted",
-                    "workspace_mutation_capture_detail_code": "receipt_publication_interrupted",
-                }
-            except Exception as exc:
-                if any(
-                    isinstance(candidate, WorkspaceMutationSettlementError)
-                    for candidate in iter_exception_tree(exc)
-                ):
-                    workspace_settlement_failure = WorkspaceMutationSettlementError(
-                        "Workspace mutation settlement could not be proven."
-                    )
-                    workspace_capture_payload = {
-                        "workspace_mutation_capture_status": "failed",
-                        "workspace_mutation_capture_detail_code": "mutation_settlement_unproven",
-                    }
-                else:
+        result_event: Event | None = None
+        try:
+            result = execution_outcome.result
+            redactor = invocation_secret_scope.redactor
+            output_redactor = redactor
+            if workspace_window_id is not None:
+                try:
+                    await close_workspace_mutation_window()
+                except BaseExceptionGroup as exc:
+                    if _contains_process_signal(exc) or is_current_runner_cancellation_group(exc):
+                        raise
                     workspace_capture_failure_detail = "receipt_publication_failed"
                     workspace_capture_payload = {
                         "workspace_mutation_capture_status": "failed",
                         "workspace_mutation_capture_detail_code": workspace_capture_failure_detail,
                     }
-            else:
-                workspace_capture_payload = {
-                    "workspace_mutation_capture_status": "pending",
-                }
-        publication_snapshot = invocation_secret_scope.seal_for_publication()
-        await _await_post_tool_operation(
-            persist_sealed_invocation_evidence(publication_snapshot),
-            cancellation=post_tool_cancellation,
-            restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-        )
+                except asyncio.CancelledError as exc:
+                    post_tool_cancellation = await consume_post_tool_cancellation(exc)
+                    if post_tool_cancellation is not None:
+                        invocation_secrets.initialize_cancellation_evidence(post_tool_cancellation)
+                        invocation_secrets.set_cancellation_redactor(
+                            post_tool_cancellation,
+                            invocation_secret_scope.redactor,
+                        )
+                        invocation_secrets.set_cancellation_tool_call_id(
+                            post_tool_cancellation,
+                            tool_call.id,
+                        )
+                    workspace_capture_payload = {
+                        "workspace_mutation_capture_status": "interrupted",
+                        "workspace_mutation_capture_detail_code": "receipt_publication_interrupted",
+                    }
+                except Exception as exc:
+                    if any(
+                        isinstance(candidate, WorkspaceMutationSettlementError)
+                        for candidate in iter_exception_tree(exc)
+                    ):
+                        workspace_settlement_failure = WorkspaceMutationSettlementError(
+                            "Workspace mutation settlement could not be proven."
+                        )
+                        workspace_capture_payload = {
+                            "workspace_mutation_capture_status": "failed",
+                            "workspace_mutation_capture_detail_code": "mutation_settlement_unproven",
+                        }
+                    else:
+                        workspace_capture_failure_detail = "receipt_publication_failed"
+                        workspace_capture_payload = {
+                            "workspace_mutation_capture_status": "failed",
+                            "workspace_mutation_capture_detail_code": workspace_capture_failure_detail,
+                        }
+                else:
+                    workspace_capture_payload = {
+                        "workspace_mutation_capture_status": "pending",
+                    }
+            publication_snapshot = invocation_secret_scope.seal_for_publication()
+            await _await_post_tool_operation(
+                persist_sealed_invocation_evidence(publication_snapshot),
+                cancellation=post_tool_cancellation,
+                restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+            )
 
-        hook_argument_projection = (
-            tool_argument_publication.unavailable_argument_projection()
-            if publish_arguments_as_unavailable
-            else tool_argument_publication.finalized_argument_projection(
-                effective_tool_call.arguments,
-                redactor=publication_snapshot.redactor,
-                scope_finalized=not publication_snapshot.unsafe_output,
-            )
-        )
-        argument_projection = (
-            tool_argument_publication.unavailable_argument_projection()
-            if publish_arguments_as_unavailable
-            else tool_argument_publication.finalized_argument_projection(
-                model_arguments,
-                redactor=publication_snapshot.redactor,
-                scope_finalized=not publication_snapshot.unsafe_output,
-            )
-        )
-        policy_denial = tool_context._policy_denial_for(registered_tool.tool)
-        if policy_denial is not None:
-            # Command-policy refusal occurs before the tool owns a publishable
-            # result boundary. Command arguments can contain credentials even
-            # when they were not resolved through the invocation secret
-            # registry, so retain only explicit unavailability.
-            argument_projection = tool_argument_publication.unavailable_argument_projection()
-            hook_argument_projection = argument_projection
-        result_event: Event | None = None
-        published_terminal_event: Event | None = None
-        projection_cancellation: asyncio.CancelledError | None = None
-        if policy_denial is None:
-            event_type = (
-                EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
-            )
-            payload = {
-                "tool_call_id": tool_call.id,
-                "idempotency_key": idempotency_key,
-                **argument_projection.payload_fields(),
-                tool_argument_publication.ARGUMENTS_EXACT_FIELD: (
-                    tool_argument_publication.argument_projection_is_exact(
-                        argument_projection,
-                        private_arguments=model_arguments,
-                    )
-                ),
-                "result": result.model_dump(),
-                **effective_arguments_payload,
-                **execution_outcome.terminal_payload_fields(),
-                **workspace_capture_payload,
-                **identity_payload,
-            }
-            if approval_id is not None:
-                payload["approval_id"] = approval_id
-            if input_id is not None:
-                payload["input_id"] = input_id
-            result_event = Event(
-                type=event_type,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                tool_name=tool_call.name,
-                payload=payload,
-            )
-            result_event = _restore_targeted_tool_invocation_event_authority(
-                result_event,
-                effective_tool_call,
-                redactor=publication_snapshot.redactor,
-            )
-            if execution_outcome.publish_before_hooks and deferred_terminal_stager is None:
-                result_event, result = _prepare_tool_result_event(
-                    event=result_event,
-                    result=result,
-                    redactor=output_redactor,
-                    runtime_tool=registered_tool.tool,
+            hook_argument_projection = (
+                tool_argument_publication.unavailable_argument_projection()
+                if publish_arguments_as_unavailable
+                else tool_argument_publication.finalized_argument_projection(
+                    effective_tool_call.arguments,
+                    redactor=publication_snapshot.redactor,
+                    scope_finalized=not publication_snapshot.unsafe_output,
                 )
-                if not output_redactor.has_same_registry(redactor):
-                    result_event, result = _prepare_tool_result_event(
-                        event=result_event,
-                        result=result,
-                        redactor=redactor,
-                    )
-                (
-                    result_event,
-                    result,
-                    projection_cancellation,
-                ) = await _await_post_tool_operation(
-                    self._project_terminal_tool_result(
-                        event=result_event,
-                        result=result,
-                        session=session,
-                        registered_environment=registered_environment,
-                        tool_call=effective_tool_call,
+            )
+            argument_projection = (
+                tool_argument_publication.unavailable_argument_projection()
+                if publish_arguments_as_unavailable
+                else tool_argument_publication.finalized_argument_projection(
+                    model_arguments,
+                    redactor=publication_snapshot.redactor,
+                    scope_finalized=not publication_snapshot.unsafe_output,
+                )
+            )
+            policy_denial = tool_context._policy_denial_for(registered_tool.tool)
+            if policy_denial is not None:
+                # Command-policy refusal occurs before the tool owns a publishable
+                # result boundary. Command arguments can contain credentials even
+                # when they were not resolved through the invocation secret
+                # registry, so retain only explicit unavailability.
+                argument_projection = tool_argument_publication.unavailable_argument_projection()
+                hook_argument_projection = argument_projection
+            published_terminal_event: Event | None = None
+            projection_cancellation: asyncio.CancelledError | None = None
+            if policy_denial is None:
+                event_type = (
+                    EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
+                )
+                payload = {
+                    "tool_call_id": tool_call.id,
+                    "idempotency_key": idempotency_key,
+                    **argument_projection.payload_fields(),
+                    tool_argument_publication.ARGUMENTS_EXACT_FIELD: (
+                        tool_argument_publication.argument_projection_is_exact(
+                            argument_projection,
+                            private_arguments=model_arguments,
+                        )
                     ),
-                    cancellation=post_tool_cancellation,
-                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                    "result": result.model_dump(),
+                    **effective_arguments_payload,
+                    **execution_outcome.terminal_payload_fields(),
+                    **workspace_capture_payload,
+                    **identity_payload,
+                }
+                if approval_id is not None:
+                    payload["approval_id"] = approval_id
+                if input_id is not None:
+                    payload["input_id"] = input_id
+                result_event = Event(
+                    type=event_type,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=tool_call.name,
+                    payload=payload,
                 )
                 result_event = _restore_targeted_tool_invocation_event_authority(
                     result_event,
                     effective_tool_call,
                     redactor=publication_snapshot.redactor,
                 )
-                published_terminal_event = await _await_post_tool_operation(
-                    self._event_writer.emit(result_event),
-                    cancellation=post_tool_cancellation,
-                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-                )
-                published_terminal_outcome = runtime_records.ToolCallOutcome(
-                    call=replace(
+                if execution_outcome.publish_before_hooks and deferred_terminal_stager is None:
+                    result_event, result = _prepare_tool_result_event(
+                        event=result_event,
+                        result=result,
+                        redactor=output_redactor,
+                        runtime_tool=registered_tool.tool,
+                    )
+                    if not output_redactor.has_same_registry(redactor):
+                        result_event, result = _prepare_tool_result_event(
+                            event=result_event,
+                            result=result,
+                            redactor=redactor,
+                        )
+                    (
+                        result_event,
+                        result,
+                        projection_cancellation,
+                    ) = await _await_post_tool_operation(
+                        self._project_terminal_tool_result(
+                            event=result_event,
+                            result=result,
+                            session=session,
+                            registered_environment=registered_environment,
+                            tool_call=effective_tool_call,
+                        ),
+                        cancellation=post_tool_cancellation,
+                        restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                    )
+                    result_event = _restore_targeted_tool_invocation_event_authority(
+                        result_event,
                         effective_tool_call,
-                        arguments=argument_projection.transcript_arguments(),
-                    ),
-                    result=result,
-                )
-                # This terminal is already durable. Expose it before proxy
-                # telemetry so a later telemetry failure cannot erase the
-                # authoritative tool outcome from the public stream. Receipt
-                # events remain ordered immediately before that terminal.
-                for runner_event in runner_events:
-                    yield runner_event, None
-                for workspace_event in workspace_events:
-                    yield workspace_event, None
-                yield published_terminal_event, published_terminal_outcome
-        proxy_events: list[Event] = []
-        async for event in _iterate_post_tool_events(
-            self._emit_proxy_authorization_events(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                records=proxy_authorizations,
-                tool_round_identity=tool_round_identity,
-                execution_profile=execution_profile,
-                approval_id=approval_id,
-                input_id=input_id,
-                idempotency_key=idempotency_key,
-                redactor=redactor,
-                output_redactor=output_redactor,
-                quarantine_output=deferred_terminal_stager is not None,
-            ),
-            cancellation=post_tool_cancellation,
-            restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-        ):
-            if published_terminal_event is not None:
-                yield event, None
-            else:
-                proxy_events.append(event)
-        if projection_cancellation is not None:
-            _raise_preserved_post_tool_cancellation(
-                post_tool_cancellation,
-                projection_cancellation,
-                restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-            )
-        current_task = asyncio.current_task()
-        tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
-        if tool_swallowed_cancellation and await _await_post_tool_operation(
-            self._session_control.is_interrupting(session.id),
-            cancellation=post_tool_cancellation,
-            restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-        ):
-            raise SessionInterruptedByRequest(session.id)
-        if policy_denial is not None:
-            public_policy_denial_reason = output_redactor.redact_text(policy_denial.reason)
-            terminal_events: list[tuple[Event, runtime_records.ToolCallOutcome | None]] = []
-            terminal_recorded = False
+                        redactor=publication_snapshot.redactor,
+                    )
+                    published_terminal_event = await _await_post_tool_operation(
+                        self._event_writer.emit(result_event),
+                        cancellation=post_tool_cancellation,
+                        restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                    )
+                    published_terminal_outcome = runtime_records.ToolCallOutcome(
+                        call=replace(
+                            effective_tool_call,
+                            arguments=argument_projection.transcript_arguments(),
+                        ),
+                        result=result,
+                    )
+                    # This terminal is already durable. Expose it before proxy
+                    # telemetry so a later telemetry failure cannot erase the
+                    # authoritative tool outcome from the public stream. Receipt
+                    # events remain ordered immediately before that terminal.
+                    for runner_event in runner_events:
+                        yield runner_event, None
+                    for workspace_event in workspace_events:
+                        yield workspace_event, None
+                    yield published_terminal_event, published_terminal_outcome
+            proxy_events: list[Event] = []
             async for event in _iterate_post_tool_events(
-                self._emit_terminal_tool_result(
+                self._emit_proxy_authorization_events(
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
-                    tool_call=effective_tool_call,
-                    event_type=EventType.TOOL_CALL_BLOCKED,
-                    result=policy_denial.result,
-                    extra_payload={
-                        "idempotency_key": idempotency_key,
-                        **workspace_capture_payload,
-                        **policy_denial_payload_fields(
-                            tool_name=effective_tool_call.name,
-                            denied_by=policy_denial.denied_by,
-                            decision=policy_denial.decision,
-                            reason=public_policy_denial_reason,
-                            metadata={},
-                        ),
-                    },
-                    task_id=task_id,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
+                    tool_call=tool_call,
+                    records=proxy_authorizations,
                     tool_round_identity=tool_round_identity,
+                    execution_profile=execution_profile,
                     approval_id=approval_id,
                     input_id=input_id,
-                    allow_modification=False,
+                    idempotency_key=idempotency_key,
                     redactor=redactor,
                     output_redactor=output_redactor,
-                    argument_projection=argument_projection,
-                    deferred_terminal_stager=effective_terminal_stager,
-                    publication_snapshot=publication_snapshot,
+                    quarantine_output=publish_arguments_as_unavailable,
                 ),
                 cancellation=post_tool_cancellation,
                 restore_cancellation_requests=post_tool_cancellation_requests_consumed,
             ):
-                if terminal_recorded:
-                    yield event
-                    continue
-                terminal_events.append(event)
-                if event[1] is None:
-                    continue
-                terminal_recorded = True
-                for runner_event in runner_events:
-                    yield runner_event, None
-                for workspace_event in workspace_events:
-                    yield workspace_event, None
-                for proxy_event in proxy_events:
-                    yield proxy_event, None
-                for terminal_event in terminal_events:
-                    yield terminal_event
-                terminal_events.clear()
+                if published_terminal_event is not None:
+                    yield event, None
+                else:
+                    proxy_events.append(event)
+            if projection_cancellation is not None:
+                _raise_preserved_post_tool_cancellation(
+                    post_tool_cancellation,
+                    projection_cancellation,
+                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                )
+            current_task = asyncio.current_task()
+            tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
+            if tool_swallowed_cancellation and await _await_post_tool_operation(
+                self._session_control.is_interrupting(session.id),
+                cancellation=post_tool_cancellation,
+                restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+            ):
+                raise SessionInterruptedByRequest(session.id)
+            if policy_denial is not None:
+                public_policy_denial_reason = output_redactor.redact_text(policy_denial.reason)
+                terminal_events: list[tuple[Event, runtime_records.ToolCallOutcome | None]] = []
+                terminal_recorded = False
+                async for event in _iterate_post_tool_events(
+                    self._emit_terminal_tool_result(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=effective_tool_call,
+                        event_type=EventType.TOOL_CALL_BLOCKED,
+                        result=policy_denial.result,
+                        extra_payload={
+                            "idempotency_key": idempotency_key,
+                            **workspace_capture_payload,
+                            **policy_denial_payload_fields(
+                                tool_name=effective_tool_call.name,
+                                denied_by=policy_denial.denied_by,
+                                decision=policy_denial.decision,
+                                reason=public_policy_denial_reason,
+                                metadata={},
+                            ),
+                        },
+                        task_id=task_id,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                        tool_round_identity=tool_round_identity,
+                        approval_id=approval_id,
+                        input_id=input_id,
+                        allow_modification=False,
+                        redactor=redactor,
+                        output_redactor=output_redactor,
+                        argument_projection=argument_projection,
+                        deferred_terminal_stager=effective_terminal_stager,
+                        publication_snapshot=publication_snapshot,
+                    ),
+                    cancellation=post_tool_cancellation,
+                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                ):
+                    if terminal_recorded:
+                        yield event
+                        continue
+                    terminal_events.append(event)
+                    if event[1] is None:
+                        continue
+                    terminal_recorded = True
+                    for runner_event in runner_events:
+                        yield runner_event, None
+                    for workspace_event in workspace_events:
+                        yield workspace_event, None
+                    for proxy_event in proxy_events:
+                        yield proxy_event, None
+                    for terminal_event in terminal_events:
+                        yield terminal_event
+                    terminal_events.clear()
+                if not terminal_recorded:
+                    for runner_event in runner_events:
+                        yield runner_event, None
+                    for workspace_event in workspace_events:
+                        yield workspace_event, None
+                    for proxy_event in proxy_events:
+                        yield proxy_event, None
+                    for terminal_event in terminal_events:
+                        yield terminal_event
+                if post_tool_cancellation is not None:
+                    _raise_restored_post_tool_cancellation(
+                        post_tool_cancellation,
+                        restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                    )
+                if workspace_settlement_failure is not None:
+                    raise workspace_settlement_failure from None
+                return
+            if published_terminal_event is not None:
+                hook_tool_call = _project_tool_call_for_hook(
+                    effective_tool_call,
+                    argument_projection=hook_argument_projection,
+                    redactor=redactor,
+                )
+                async for hook_event, modified in _iterate_post_tool_events(
+                    self.run_tool_call_hooks(
+                        session=session,
+                        tool_event=published_terminal_event,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=hook_tool_call,
+                        result=result,
+                        task_id=task_id,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                        redactor=redactor,
+                        output_redactor=output_redactor,
+                        allow_modification=False,
+                        quarantine_output=not registered_tool.publish_arguments,
+                    ),
+                    cancellation=post_tool_cancellation,
+                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                ):
+                    if modified is not None:
+                        raise AssertionError(
+                            "Observational after-tool hook modified terminal evidence."
+                        )
+                    yield hook_event, None
+                if await _await_post_tool_operation(
+                    self._session_control.is_interrupting(session.id),
+                    cancellation=post_tool_cancellation,
+                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                ):
+                    raise SessionInterruptedByRequest(session.id)
+                if post_tool_cancellation is not None:
+                    _raise_restored_post_tool_cancellation(
+                        post_tool_cancellation,
+                        restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                    )
+                if workspace_settlement_failure is not None:
+                    raise workspace_settlement_failure from None
+                return
+            if result_event is None:
+                raise AssertionError("Ordinary tool result event was not constructed.")
+            terminal_events: list[tuple[Event, runtime_records.ToolCallOutcome | None]] = []
+            terminal_recorded = False
+            try:
+                async for event in _iterate_post_tool_events(
+                    self.emit_tool_call_result_with_hooks(
+                        event=result_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=effective_tool_call,
+                        result=result,
+                        task_id=task_id,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                        redactor=redactor,
+                        output_redactor=output_redactor,
+                        argument_projection=argument_projection,
+                        hook_argument_projection=hook_argument_projection,
+                        allow_modification=execution_outcome.allows_hook_modification,
+                        publish_before_hooks=execution_outcome.publish_before_hooks,
+                        deferred_terminal_stager=effective_terminal_stager,
+                        publication_snapshot=publication_snapshot,
+                        executed_runtime_tool=registered_tool.tool,
+                    ),
+                    cancellation=post_tool_cancellation,
+                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                ):
+                    if terminal_recorded:
+                        yield event
+                        continue
+                    terminal_events.append(event)
+                    if event[1] is None:
+                        continue
+                    terminal_recorded = True
+                    for runner_event in runner_events:
+                        yield runner_event, None
+                    for workspace_event in workspace_events:
+                        yield workspace_event, None
+                    for proxy_event in proxy_events:
+                        yield proxy_event, None
+                    for terminal_event in terminal_events:
+                        yield terminal_event
+                    terminal_events.clear()
+            except ToolEffectReconciliationRequired:
+                # These diagnostic events were already persisted after sealing
+                # the invocation's secret scope. Uncertainty replaces the tool
+                # terminal, not delivery of its preceding runner/proxy evidence.
+                if not terminal_recorded:
+                    for diagnostics in (runner_events, workspace_events, proxy_events):
+                        for diagnostic_event in diagnostics:
+                            yield diagnostic_event, None
+                raise
             if not terminal_recorded:
                 for runner_event in runner_events:
                     yield runner_event, None
@@ -5653,119 +6094,25 @@ class ToolRoundExecutor:
                     post_tool_cancellation,
                     restore_cancellation_requests=post_tool_cancellation_requests_consumed,
                 )
-            if workspace_settlement_failure is not None:
-                raise workspace_settlement_failure from None
-            return
-        if published_terminal_event is not None:
-            hook_tool_call = _project_tool_call_for_hook(
-                effective_tool_call,
-                argument_projection=hook_argument_projection,
-                redactor=redactor,
-            )
-            async for hook_event, modified in _iterate_post_tool_events(
-                self.run_tool_call_hooks(
-                    session=session,
-                    tool_event=published_terminal_event,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=hook_tool_call,
-                    result=result,
-                    task_id=task_id,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                    redactor=redactor,
-                    output_redactor=output_redactor,
-                    allow_modification=False,
-                    quarantine_output=not registered_tool.publish_arguments,
-                ),
-                cancellation=post_tool_cancellation,
-                restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-            ):
-                if modified is not None:
-                    raise AssertionError(
-                        "Observational after-tool hook modified terminal evidence."
-                    )
-                yield hook_event, None
             if await _await_post_tool_operation(
                 self._session_control.is_interrupting(session.id),
                 cancellation=post_tool_cancellation,
                 restore_cancellation_requests=post_tool_cancellation_requests_consumed,
             ):
                 raise SessionInterruptedByRequest(session.id)
-            if post_tool_cancellation is not None:
-                _raise_restored_post_tool_cancellation(
-                    post_tool_cancellation,
-                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-                )
             if workspace_settlement_failure is not None:
                 raise workspace_settlement_failure from None
-            return
-        if result_event is None:
-            raise AssertionError("Ordinary tool result event was not constructed.")
-        terminal_events: list[tuple[Event, runtime_records.ToolCallOutcome | None]] = []
-        terminal_recorded = False
-        async for event in _iterate_post_tool_events(
-            self.emit_tool_call_result_with_hooks(
-                event=result_event,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=effective_tool_call,
-                result=result,
-                task_id=task_id,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-                redactor=redactor,
-                output_redactor=output_redactor,
-                argument_projection=argument_projection,
-                hook_argument_projection=hook_argument_projection,
-                allow_modification=execution_outcome.allows_hook_modification,
-                publish_before_hooks=execution_outcome.publish_before_hooks,
-                deferred_terminal_stager=effective_terminal_stager,
-                publication_snapshot=publication_snapshot,
-                executed_runtime_tool=registered_tool.tool,
-            ),
-            cancellation=post_tool_cancellation,
-            restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-        ):
-            if terminal_recorded:
-                yield event
-                continue
-            terminal_events.append(event)
-            if event[1] is None:
-                continue
-            terminal_recorded = True
-            for runner_event in runner_events:
-                yield runner_event, None
-            for workspace_event in workspace_events:
-                yield workspace_event, None
-            for proxy_event in proxy_events:
-                yield proxy_event, None
-            for terminal_event in terminal_events:
-                yield terminal_event
-            terminal_events.clear()
-        if not terminal_recorded:
-            for runner_event in runner_events:
-                yield runner_event, None
-            for workspace_event in workspace_events:
-                yield workspace_event, None
-            for proxy_event in proxy_events:
-                yield proxy_event, None
-            for terminal_event in terminal_events:
-                yield terminal_event
-        if post_tool_cancellation is not None:
-            _raise_restored_post_tool_cancellation(
-                post_tool_cancellation,
-                restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-            )
-        if await _await_post_tool_operation(
-            self._session_control.is_interrupting(session.id),
-            cancellation=post_tool_cancellation,
-            restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-        ):
-            raise SessionInterruptedByRequest(session.id)
-        if workspace_settlement_failure is not None:
-            raise workspace_settlement_failure from None
+        except BaseException as publication_failure:
+            if effect_dispatch is not None:
+                from cayu.runtime._tool_effect_conflicts import raise_after_tool_dispatch_audit
+
+                await raise_after_tool_dispatch_audit(
+                    self._session_store,
+                    effect_dispatch,
+                    publication_failure,
+                    candidate_event_id=None if result_event is None else result_event.id,
+                )
+            raise
 
     async def emit_mcp_manifest_checks(
         self,
@@ -6519,7 +6866,12 @@ class ToolRoundExecutor:
         if hooks_already_completed and (publish_before_hooks or allow_modification):
             raise ValueError("Completed terminal hooks cannot be scheduled again.")
         if publish_before_hooks and "terminal_outcome" not in event.payload:
-            raise ValueError("Pre-hook tool-result publication requires terminal controls.")
+            # A runtime-owned isolated pre-dispatch rejection has boundary
+            # controls, not a post-dispatch terminal outcome. Its evidence
+            # must also precede observational hooks without becoming mutable.
+            boundary_controls = tool_results.runtime_tool_execution_boundary_controls(event.payload)
+            if "isolated_tool_failure_code" not in boundary_controls:
+                raise ValueError("Pre-hook tool-result publication requires terminal controls.")
         if deferred_terminal_stager is not None and publication_snapshot is None:
             raise ValueError("Deferred terminal staging requires a publication snapshot.")
         if deferred_terminal_projection_recorder is not None and not publish_before_hooks:
@@ -7515,7 +7867,8 @@ class ToolRoundRun:
         defer_round_terminals = (
             len(tool_calls) > 1 and policy_output_secret_resolution_scope != "static"
         ) or any(
-            registered is not None and registered.workspace_mutation
+            registered is not None
+            and (registered.workspace_mutation or registered.effect is ToolEffect.EXTERNAL)
             for registered in (
                 self._registered_agent.executable_tool(tool_call.name) for tool_call in tool_calls
             )
@@ -7523,6 +7876,8 @@ class ToolRoundRun:
         publication_coordinator = (
             _ToolRoundPublicationCoordinator(
                 session_id=session.id,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
                 tool_round_identity=tool_round_identity,
                 session_store=executor._session_store,
                 redactor=_redactor_for_tool_calls(
@@ -7628,13 +7983,18 @@ class ToolRoundRun:
                 prepared_event.type is EventType.TOOL_CALL_BLOCKED
                 and prepared_event.payload.get("blocked_by") == "tool_exposure"
             )
+            pre_execution_authority_rejected = (
+                prepared_event.type is EventType.TOOL_CALL_FAILED
+                and prepared_event.payload.get("blocked_by")
+                in {"mcp_catalogue_authority", "targeted_tool_gateway", "targeted_tool_native"}
+            )
             staged_event = await publication_coordinator.stage_terminal(
                 tool_call_id=outcome.call.id,
                 event=prepared_event,
                 snapshot=snapshot,
                 hooks_state=(
                     "completed"
-                    if exposure_blocked
+                    if exposure_blocked or pre_execution_authority_rejected
                     else (
                         "pending"
                         if interrupted_terminal
@@ -7689,6 +8049,17 @@ class ToolRoundRun:
                 raise RuntimeError("Staged terminal publication lost its pending tool round.")
             staged_by_id = {item.tool_call_id: item for item in staged_round.staged_terminals}
             if set(staged_by_id) != expected_stage_ids:
+                missing = expected_stage_ids - set(staged_by_id)
+                if (
+                    set(staged_by_id).issubset(expected_stage_ids)
+                    and expected_stage_ids.issubset({call.id for call in tool_calls})
+                    and await ToolEffectStateOwner(executor._session_store).preserve_unresolved(
+                        session,
+                        tool_round_id=tool_round_identity.tool_round_id,
+                        tool_call_ids=tuple(call.id for call in tool_calls if call.id in missing),
+                    )
+                ):
+                    raise ToolEffectReconciliationRequired()
                 raise RuntimeError(
                     "Dynamic multi-call publication has an unexpected staged-terminal set."
                 )
@@ -7820,7 +8191,7 @@ class ToolRoundRun:
         # rounds stay quarantined until the coordinator has merged every sealed
         # scope, then publish through that cumulative redactor.
         publish_arguments_as_unavailable = len(tool_calls) > 1 and (
-            publication_coordinator is not None
+            policy_output_secret_resolution_scope != "static"
         )
         round_task = asyncio.current_task()
         round_cancellation_baseline = 0 if round_task is None else round_task.cancelling()
@@ -8748,6 +9119,10 @@ def _transfer_cancellation_evidence(
     tool_calls: list[runtime_records.ToolCallRequest],
 ) -> None:
     """Move authenticated cleanup evidence onto one authoritative cancellation."""
+
+    invocation_secrets.transfer_admission_refusals(
+        target, [source for source, _tool_call_id in sources]
+    )
 
     artifacts_by_id: dict[str, list[dict[str, Any]]] = {}
     redactors_by_id: dict[str, SecretRedactor] = {}
@@ -11346,7 +11721,7 @@ def _project_tool_call_for_hook(
     if argument_projection.state == "unavailable":
         arguments: dict[str, Any] = {}
     else:
-        projected = redactor.redact_json(tool_call.arguments)
+        projected = redactor.redact_json(argument_projection.transcript_arguments())
         if type(projected) is not dict:
             raise AssertionError("Hook argument projection returned a non-object.")
         arguments = projected
@@ -11431,6 +11806,7 @@ def _redact_policy_denial_event(
     )
     if not redactor.has_values:
         return event, redacted_result
+    timing_attribution = tool_results.runtime_terminal_timing_attribution(event)
     payload: dict[str, Any] = {}
     for key, value in event.payload.items():
         if key == "result":
@@ -11445,6 +11821,8 @@ def _redact_policy_denial_event(
             )
         ):
             payload[key] = value
+        elif key in timing_attribution:
+            payload[key] = timing_attribution[key]
         elif key in _POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS:
             payload[key] = copy_json_value(value, key)
         else:
