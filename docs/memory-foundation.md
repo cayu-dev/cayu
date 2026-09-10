@@ -404,7 +404,7 @@ settles; later reads and shutdown cannot reuse that connection in the meantime.
 
 Recall is retrieval only. `AutomaticRecallPolicy` is a separate calibrated
 admission primitive that classifies the fused head as strong memory focus,
-reference-only offers, or silent candidates under explicit count and byte
+bounded preview offers, or silent candidates under explicit count and byte
 bounds. `AutomaticRecallContextPolicy` runs that boundary once for a real user
 interaction, freezes the redacted provider-neutral contribution through retries,
 tool rounds, repair, compaction, and recovery, and expires it at the next real
@@ -413,6 +413,8 @@ user message. It never mutates the durable transcript.
 Silent automatic recall does not prove that knowledge is absent. Applications
 can combine it with [explicit search when evidence is insufficient](knowledge-search-fallback.md),
 using existing scoped tools without loosening the admission gate.
+Alternatively, [opt-in knowledge offers](knowledge-offers.md) demonstrate bounded
+rank-only previews with read/search tools, without changing strong-injection defaults.
 
 Applications whose knowledge store supports bounded change/readiness streams and
 frontier-restricted revision search can opt into `MemoryDeltaPolicy`. The base
