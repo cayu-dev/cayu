@@ -4139,11 +4139,28 @@ def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
                 ),
             )
         )
-        await asyncio.wait_for(body_created.wait(), timeout=1)
+
+        async def wait_for_progress(marker: asyncio.Event, description: str) -> None:
+            # Startup/scheduling watchdog, not a provider deadline. Surface an
+            # early run failure instead of hiding it behind a marker timeout.
+            waiter = asyncio.create_task(marker.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    (waiter, task), timeout=10, return_when=asyncio.FIRST_COMPLETED
+                )
+                if task in done:
+                    early_events = await task
+                    pytest.fail(f"Run ended before {description}: {early_events!r}")
+                assert waiter in done, f"Timed out waiting for {description}"
+            finally:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
+        await wait_for_progress(body_created, "HTTP request startup")
         body = BlockingHttpClient.bodies[0]
-        await asyncio.wait_for(body.tail_started.wait(), timeout=10)
+        await wait_for_progress(body.tail_started, "HTTP completion tail")
         # HTTP read-ahead can enter the tail before the translator observes usage.
-        await asyncio.wait_for(usage_observed.wait(), timeout=1)
+        await wait_for_progress(usage_observed, "translated usage")
         task.cancel("cancel after Chat Completions finish reason")
         assert task.cancelling() == 1
         with pytest.raises(

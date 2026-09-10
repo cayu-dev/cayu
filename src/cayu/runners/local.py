@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 
-from cayu._validation import require_durable_nonblank
+from cayu._validation import canonical_durable_json_bytes, require_durable_nonblank
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.runners._secrets import (
     merge_secret_env_values,
@@ -51,6 +54,7 @@ if TYPE_CHECKING:
     from cayu.environments.admission import (
         ExecutionAdmissionCandidate,
         ExecutionCapabilityEvidence,
+        ExecutionRequirements,
     )
 
 # Non-secret operational host variables forwarded when inherit_env is False so
@@ -152,6 +156,106 @@ class LocalRunner(Runner, RunnerBinaryStreamCapability):
             candidate="local",
             evidence=self.execution_capability_evidence(),
         )
+
+    def execution_admission_candidate_for(
+        self,
+        requirements: ExecutionRequirements,
+    ) -> ExecutionAdmissionCandidate:
+        """Observe availability in this local workload's own execution namespace."""
+        from cayu.environments.admission import (
+            ExecutionAdmissionCandidate,
+            ExecutionCapabilityEvidence,
+            ExecutionExecutableEvidence,
+            ExecutionRequirements,
+            ExecutionToolRequirementEvidence,
+        )
+
+        requirements = ExecutionRequirements.model_validate(
+            requirements.model_dump(mode="python", warnings=False)
+        )
+        candidate = self.execution_admission_candidate()
+        if not requirements.executable_names():
+            return candidate
+        assert candidate.evidence is not None
+        self._ensure_exec_open()
+        observed_at = datetime.now(UTC)
+        root_stat = self.root.stat()
+        # LocalRunner deliberately forwards these operational values even when
+        # inherit_env is false. Resolve relative PATH components against the
+        # workload root, not the controller process's working directory.
+        search_path = os.pathsep.join(
+            str(Path(entry) if Path(entry).is_absolute() else self.root / entry)
+            for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
+        )
+        fingerprint = (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {
+                        # Native capability evidence retains its own identity
+                        # when composed with local executable observations.
+                        "candidate_environment_fingerprint": candidate.evidence.environment_fingerprint,
+                        "root": str(self.root),
+                        "device": root_stat.st_dev,
+                        "inode": root_stat.st_ino,
+                        "path": search_path,
+                        "platform": os.name,
+                        "pathext": os.environ.get("PATHEXT"),
+                    },
+                    "local_execution_identity",
+                )
+            ).hexdigest()
+        )
+        probes = {probe.executable: probe for probe in requirements.executable_probes()}
+        secret_search_path = any(name.upper() in {"PATH", "PATHEXT"} for name in self.secret_env)
+        claims = []
+        for executable in requirements.executable_names():
+            probe = probes.get(executable)
+            unverified = (
+                probe is not None and probe.probe_arguments is not None
+            ) or secret_search_path
+            lookup = (
+                str(self.root / executable)
+                if not os.path.isabs(executable) and os.path.dirname(executable)
+                else executable
+            )
+            found = False if unverified else shutil.which(lookup, path=search_path) is not None
+            claims.append(
+                ExecutionExecutableEvidence(
+                    executable=executable,
+                    state="unverified"
+                    if unverified
+                    else "live_verified"
+                    if found
+                    else "unavailable",
+                    observed_at=observed_at if found else None,
+                    valid_until=observed_at + timedelta(seconds=300) if found else None,
+                    requirement_fingerprint=None if probe is None else probe.fingerprint,
+                    reason_code=None
+                    if found
+                    else "probe_unverified"
+                    if unverified
+                    else "executable_unavailable",
+                    remediation_code=None if found else "verify_executable",
+                )
+            )
+        evidence = ExecutionCapabilityEvidence.model_validate(
+            {
+                **candidate.evidence.model_dump(mode="python", warnings=False),
+                "environment_fingerprint": fingerprint,
+                "tool_requirements": ExecutionToolRequirementEvidence(
+                    environment_fingerprint=fingerprint,
+                    executables=tuple(claims),
+                ),
+            }
+        )
+        return ExecutionAdmissionCandidate(candidate=candidate.candidate, evidence=evidence)
+
+    async def collect_execution_admission_candidate_for(
+        self,
+        requirements: ExecutionRequirements,
+    ) -> ExecutionAdmissionCandidate:
+        return self.execution_admission_candidate_for(requirements)
 
     def __init__(
         self,

@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from cayu.environments.admission import (
         ExecutionAdmissionCandidate,
         ExecutionEnvironmentAuthority,
+        ExecutionRequirements,
     )
     from cayu.vaults import SecretRedactor
 
@@ -834,6 +835,47 @@ def runner_workspace_mutation_settlement(
     return "uncertain"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class RunnerExecutionAdmissionObserver:
+    """One exact runner/requirement observation lifetime, never admission authority.
+
+    Extensions may retain bounded evidence in a request-local state object.
+    Every dispatched observation must settle or transfer authenticated cleanup
+    ownership before returning or raising, including cancellation and timeout.
+    """
+
+    runner: Runner
+    requirements: ExecutionRequirements
+
+    def __post_init__(self) -> None:
+        from cayu.environments.admission import ExecutionRequirements
+
+        if not isinstance(self.runner, Runner):
+            raise TypeError("Admission observer requires a Runner.")
+        owned = ExecutionRequirements.model_validate(
+            self.requirements.model_dump(mode="python", warnings=False)
+        )
+        object.__setattr__(self, "requirements", owned)
+
+    def snapshot(self) -> ExecutionAdmissionCandidate | None:
+        """Read exact evidence without dispatching an external operation."""
+        return self.runner.execution_admission_candidate_for(self.requirements)
+
+    async def collect(self) -> ExecutionAdmissionCandidate | None:
+        """Observe after binding/setup has selected the exact final runner."""
+        return await self.runner.collect_execution_admission_candidate_for(self.requirements)
+
+    async def refresh(self) -> None:
+        """Renew evidence without replacing this observer's runner or requirements."""
+        await self.runner.refresh_execution_admission()
+
+    def __repr__(self) -> str:
+        return "RunnerExecutionAdmissionObserver(<request-scoped>)"
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("Live admission observers cannot be serialized.")
+
+
 class Runner(ABC):
     """Executes commands/code in a workspace or sandbox.
 
@@ -1104,6 +1146,41 @@ class Runner(ABC):
         """
 
         return self.execution_admission_candidate()
+
+    def execution_admission_candidate_for(
+        self,
+        requirements: ExecutionRequirements,
+    ) -> ExecutionAdmissionCandidate | None:
+        """Read evidence for an explicit, caller-owned requirement set.
+
+        This snapshot must not dispatch work or mutate a shared probe plan.
+        The default reads the runner's existing candidate and makes no new
+        claim from the supplied requirements alone.
+        """
+        return self.execution_admission_candidate()
+
+    def execution_admission_observer(
+        self,
+        requirements: ExecutionRequirements,
+    ) -> RunnerExecutionAdmissionObserver:
+        """Create a request-scoped evidence owner for this exact runner.
+
+        Creation is side-effect-free. The lifecycle owns collection, renewal,
+        and any transferred settlement tasks; the observer cannot admit work.
+        """
+        return RunnerExecutionAdmissionObserver(self, requirements)
+
+    async def collect_execution_admission_candidate_for(
+        self,
+        requirements: ExecutionRequirements,
+    ) -> ExecutionAdmissionCandidate | None:
+        """Collect final request-bound evidence under lifecycle ownership.
+
+        Requirements are input, never proof. Implementations must isolate
+        concurrent requirement sets and settle or positively transfer every
+        dispatched probe under the same contract as the ordinary collector.
+        """
+        return await self.collect_execution_admission_candidate()
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:

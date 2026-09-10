@@ -223,7 +223,13 @@ def test_worker_settles_expired_applied_rejection_without_successor(
             with monkeypatch.context() as patch:
                 patch.setattr(CayuApp, "_continue_verified_task", delay_continuation)
                 async with VerifiedTaskWorker(
-                    make_app(), handler, worker_id="original", max_elapsed_seconds=5
+                    # Setup must reach the pre-expiry conflict assertion even
+                    # on a loaded persistent backend. _wait_past still crosses
+                    # the real deadline before testing settlement and recovery.
+                    make_app(),
+                    handler,
+                    worker_id="original",
+                    max_elapsed_seconds=30,
                 ) as worker:
                     if restart:
                         with pytest.raises(ConnectionError, match="restart before successor"):
@@ -247,7 +253,7 @@ def test_worker_settles_expired_applied_rejection_without_successor(
                         with pytest.raises(ConnectionError, match="continuation acknowledgement"):
                             await worker.run(max_tasks=1)
                     else:
-                        assert await asyncio.wait_for(worker.run(max_tasks=1), 30) == 1
+                        assert await asyncio.wait_for(worker.run(max_tasks=1), 60) == 1
             assert predecessor is not None and application is not None
             if boundary == "successor_ack_loss":
                 assert successor is not None

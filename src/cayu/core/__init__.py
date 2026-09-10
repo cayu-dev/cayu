@@ -29,7 +29,16 @@ from cayu.core.messages import (
     WebSearchSource,
 )
 from cayu.core.thinking import ThinkingConfig
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    ToolResult,
+    ToolRunnerCapabilityRequirement,
+    ToolSpec,
+)
 from cayu.core.workflows import Workflow, WorkflowSpec
 
 __all__ = [
@@ -59,9 +68,12 @@ __all__ = [
     "ToolCallPart",
     "ToolContext",
     "ToolEffect",
+    "ToolExecutableRequirement",
     "ToolExecutionBoundary",
+    "ToolExecutionRequirement",
     "ToolResult",
     "ToolResultPart",
+    "ToolRunnerCapabilityRequirement",
     "ToolSpec",
     "ToolTimeoutStrength",
     "WebSearchAPISource",

@@ -4,11 +4,17 @@ import asyncio
 from datetime import UTC, datetime
 
 import pytest
+from tests._tool_admission_fixtures import (
+    SimulatedToolFactory,
+    simulated_tool_executables,  # noqa: F401
+)
 from tests.core.test_browser_control import identity, operator_purpose
 
 from cayu.runtime._browser_control_authorization import BrowserControlPermissionDenied
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
 from cayu.runtime.browser_control import BrowserControlAllocation
+
+pytestmark = pytest.mark.usefixtures("simulated_tool_executables")
 
 
 @pytest.mark.parametrize("durable_allocation", [False, True])
@@ -42,6 +48,7 @@ def _run_runtime_allocation(
         Environment,
         EnvironmentSpec,
         LocalArtifactStore,
+        LocalRunner,
         Message,
         ModelStreamEvent,
         RunRequest,
@@ -204,17 +211,20 @@ def _run_runtime_allocation(
     )
     if durable_allocation:
         from tests.core.test_environment_allocation_recovery import (
-            _FakeRemoteFactory,
             _FakeRemoteProvider,
         )
 
         app.register_environment_factory(
-            EnvironmentSpec(name="browser"), _FakeRemoteFactory(_FakeRemoteProvider()), default=True
+            EnvironmentSpec(name="browser"),
+            SimulatedToolFactory(_FakeRemoteProvider()),
+            default=True,
         )
     else:
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="browser"), artifact_store=LocalArtifactStore(tmp_path)
+                EnvironmentSpec(name="browser"),
+                artifact_store=LocalArtifactStore(tmp_path),
+                runner=LocalRunner(tmp_path),
             ),
             default=True,
         )
@@ -265,7 +275,9 @@ def _run_runtime_allocation(
                 await store.close()
 
     outcome = asyncio.run(scenario())
-    assert outcome.ok
+    assert outcome.ok, str(
+        [event.payload for event in outcome.events if event.type == "session.failed"]
+    )
     assert captured == [True], "\n".join(
         str(event.payload) for event in outcome.events if "result" in event.payload
     )

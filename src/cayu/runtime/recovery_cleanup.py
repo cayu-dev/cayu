@@ -41,6 +41,15 @@ class RecoveryCleanupStep:
 
 RecoveryCleanupStepInput = tuple[str, RecoveryCleanup] | RecoveryCleanupStep
 
+
+@dataclass(frozen=True)
+class RecoveryCleanupOutcome:
+    """Ordered failures and the caller signal observed by their supervising await."""
+
+    failures: tuple[tuple[str, BaseException], ...]
+    caller_cancellation: asyncio.CancelledError | None
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -346,6 +355,21 @@ class RecoveryCleanupSupervisor:
         steps: tuple[RecoveryCleanupStepInput, ...],
         shield_caller_cancellation: bool,
     ) -> tuple[tuple[str, BaseException], ...]:
+        """Return ordered step failures, including any observed caller signal."""
+
+        return (
+            await self.run_steps_with_control(
+                steps=steps,
+                shield_caller_cancellation=shield_caller_cancellation,
+            )
+        ).failures
+
+    async def run_steps_with_control(
+        self,
+        *,
+        steps: tuple[RecoveryCleanupStepInput, ...],
+        shield_caller_cancellation: bool,
+    ) -> RecoveryCleanupOutcome:
         """Run dependency phases within finite bounds and retain uncertain owners."""
 
         self._harvest_completed()
@@ -760,7 +784,10 @@ class RecoveryCleanupSupervisor:
                 sequence_context = phase_states[0].context
 
         self._install_context(sequence_context)
-        return tuple(failures)
+        return RecoveryCleanupOutcome(
+            failures=tuple(failures),
+            caller_cancellation=None if caller_cancellation is None else caller_cancellation.error,
+        )
 
     def _admit_phase_after_overall_deadline(
         self,

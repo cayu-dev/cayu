@@ -5,6 +5,7 @@ import re
 import warnings
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +16,8 @@ from cayu import (
     AgentSpec,
     CayuApp,
     CayuConfig,
+    DockerCodingCommandAuthority,
+    DockerCodingToolchainProfile,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
@@ -30,17 +33,27 @@ from cayu import (
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionEnvironmentAuthority,
+    ExecutionProfileBehaviorIdentity,
     ExecutionRequirements,
+    ExecutionToolRequirement,
     InMemorySessionStore,
     LocalRunner,
     Message,
+    NamedCheck,
     OperationsConfig,
     PostgresSessionStore,
+    ProcessCommandPolicy,
     ResumeRequest,
+    RunCheckTool,
+    RunCommandTool,
     RunRequest,
+    SearchTextTool,
     SQLiteSessionStore,
     Tool,
+    ToolCapabilityCeiling,
     ToolContext,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
     ToolResult,
     ToolSpec,
     Workspace,
@@ -71,6 +84,7 @@ from cayu.runners import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerExecutionAdmissionObserver,
 )
 from cayu.runtime import CheckpointCompactionContextPolicy, ModelCompactor
 
@@ -433,6 +447,665 @@ async def _run(app: CayuApp, session_id: str) -> list[Event]:
     ]
 
 
+@pytest.mark.parametrize(
+    "proof, admitted",
+    [
+        ("rg", True),
+        ("rg_changed", False),
+        ("native", True),
+        ("native_caller_rg_missing", False),
+        ("native_caller_rg_verified", True),
+        ("native_changed", False),
+        ("missing", False),
+        ("declared", False),
+        ("stale", False),
+        ("wrong_probe", False),
+        ("unverified", False),
+    ],
+)
+def test_tool_alternatives_use_common_public_run_admission(
+    monkeypatch: pytest.MonkeyPatch, proof: str, admitted: bool
+) -> None:
+    # #860 owns admission of the real public declaration. Native dispatch and
+    # conformance belong to #555; this bounded evidence fixture does not claim
+    # to execute a production native backend.
+    executable = ToolExecutableRequirement(executable="rg")
+
+    class ToolEvidenceRunner(_EvidenceRunner):
+        capability_identity = "sha256:" + "1" * 64
+        image_identity = "sha256:" + "3" * 64
+
+        def execution_admission_candidate(self):
+            now = datetime.now(UTC)
+            observed = now - timedelta(seconds=400) if proof == "stale" else now
+            claims = ()
+            if proof in {
+                "native",
+                "native_changed",
+                "native_caller_rg_missing",
+                "native_caller_rg_verified",
+            }:
+                claims = (
+                    ExecutionCapabilityClaim.live_verified(
+                        "workspace_text_search_v1",
+                        observation="supported",
+                        observed_at=now,
+                        valid_until=now + timedelta(seconds=60),
+                    ),
+                )
+            elif proof == "declared":
+                claims = (ExecutionCapabilityClaim.declared("workspace_text_search_v1"),)
+            elif proof == "unverified":
+                claims = (
+                    ExecutionCapabilityClaim.unverified(
+                        "workspace_text_search_v1",
+                        reason_code="not_probed",
+                        remediation_code="verify_support",
+                    ),
+                )
+            executables = ()
+            if proof in {"rg", "rg_changed", "stale", "wrong_probe", "native_caller_rg_verified"}:
+                executables = (
+                    admission_module.ExecutionExecutableEvidence(
+                        executable="rg",
+                        state="live_verified",
+                        observed_at=observed,
+                        valid_until=observed + timedelta(seconds=60),
+                        requirement_fingerprint=(
+                            "sha256:" + "0" * 64
+                            if proof == "wrong_probe"
+                            else executable.fingerprint
+                        ),
+                    ),
+                )
+            return ExecutionAdmissionCandidate(
+                candidate="hosted",
+                evidence=ExecutionCapabilityEvidence(
+                    subject="hosted",
+                    claims=claims,
+                    environment_fingerprint=self.capability_identity,
+                    image_fingerprint=self.image_identity,
+                    unclaimed_reason_code="security_unclaimed" if not claims else None,
+                    tool_requirements=admission_module.ExecutionToolRequirementEvidence(
+                        environment_fingerprint=self.capability_identity,
+                        image_fingerprint=self.image_identity,
+                        executables=executables,
+                    ),
+                ),
+            )
+
+    async def run():
+        provider = _RecordingProvider()
+        runner = ToolEvidenceRunner("hosted")
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="hosted"), runner=runner),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SearchTextTool()],
+            execution_requirements=ExecutionRequirements(
+                required_executables=("rg",) if proof.startswith("native_caller_rg_") else (),
+            ),
+        )
+        if proof in {"native_changed", "rg_changed"}:
+            emit = app._event_writer.emit
+
+            async def replace_identity_after_observation(event):
+                persisted = await emit(event)
+                if (
+                    event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
+                    and event.payload.get("phase") == "final_evidence"
+                ):
+                    if proof == "native_changed":
+                        runner.capability_identity = "sha256:" + "2" * 64
+                    else:
+                        runner.image_identity = "sha256:" + "4" * 64
+                return persisted
+
+            monkeypatch.setattr(app._event_writer, "emit", replace_identity_after_observation)
+        events = await _run(app, "tool_alternative")
+        if proof == "native_changed":
+            assert runner.capability_identity == "sha256:" + "2" * 64
+        elif proof == "rg_changed":
+            assert runner.image_identity == "sha256:" + "4" * 64
+        return events, provider
+
+    events, provider = asyncio.run(run())
+    assert bool(provider.requests) is admitted, [
+        event.payload for event in events if event.type is EventType.SESSION_FAILED
+    ]
+    if not admitted:
+        assert any(event.type is EventType.SESSION_FAILED for event in events)
+        assert not any(event.type is EventType.SESSION_COMPLETED for event in events)
+        assert not any(str(event.type).startswith("model.") for event in events)
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        refusals = failed.payload["execution_admission"]["refusals"]
+        if proof in {"native_changed", "rg_changed"}:
+            assert {refusal["code"] for refusal in refusals} == {"environment_authority_mismatch"}
+        elif proof == "native_caller_rg_missing":
+            assert all(refusal.get("tool_name") is None for refusal in refusals)
+            assert any(refusal["executable"] == "rg" for refusal in refusals)
+        else:
+            assert any(refusal["tool_name"] == "search_text" for refusal in refusals)
+
+
+@pytest.mark.parametrize("builtin", ["named_check", "structured_command"])
+@pytest.mark.parametrize("proof", ["exact", "basename", "missing"])
+def test_command_builtins_require_exact_executable_evidence_before_provider(builtin, proof):
+    executable = "/opt/tools/python"
+    if builtin == "named_check":
+        tool = RunCheckTool(
+            checks=(
+                NamedCheck(
+                    name="tests",
+                    description="Run tests.",
+                    command=ExecCommand.process(executable, "-m", "unittest"),
+                    execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                        name="tests", behavior_version="1", implementation_version="1"
+                    ),
+                ),
+            ),
+            command_policy=ProcessCommandPolicy(allowed_executables=(executable,)),
+        )
+    else:
+        tool = RunCommandTool(
+            toolchain_profile=DockerCodingToolchainProfile(
+                profile_id="tests",
+                revision="1",
+                image_identity=DockerImageIdentity(
+                    reference="registry.example/python@sha256:" + "b" * 64
+                ),
+                platform_architecture="amd64",
+                command_authorities=(
+                    DockerCodingCommandAuthority(
+                        selector="tests",
+                        description="Run tests.",
+                        revision="1",
+                        exposure="structured_command",
+                        executable=executable,
+                        fixed_arguments=("-m", "unittest"),
+                    ),
+                ),
+            )
+        )
+
+    class CommandEvidenceRunner(_EvidenceRunner):
+        def execution_admission_candidate(self):
+            now = datetime.now(UTC)
+            observed_executable = "python" if proof == "basename" else executable
+            claims = (
+                ()
+                if proof == "missing"
+                else (
+                    admission_module.ExecutionExecutableEvidence(
+                        executable=observed_executable,
+                        state="live_verified",
+                        observed_at=now,
+                        valid_until=now + timedelta(seconds=60),
+                        requirement_fingerprint=ToolExecutableRequirement(
+                            executable=observed_executable
+                        ).fingerprint,
+                    ),
+                )
+            )
+            return ExecutionAdmissionCandidate(
+                candidate="hosted",
+                evidence=ExecutionCapabilityEvidence(
+                    subject="hosted",
+                    unclaimed_reason_code="security_unclaimed",
+                    environment_fingerprint="sha256:" + "1" * 64,
+                    tool_requirements=admission_module.ExecutionToolRequirementEvidence(
+                        environment_fingerprint="sha256:" + "1" * 64,
+                        executables=claims,
+                    ),
+                ),
+            )
+
+    async def run():
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="hosted"), runner=CommandEvidenceRunner("hosted")),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+        return await _run(app, f"sess_{builtin}_{proof}"), provider
+
+    events, provider = asyncio.run(run())
+    assert len(provider.requests) == (1 if proof == "exact" else 0)
+    if proof != "exact":
+        assert EventType.SESSION_COMPLETED not in {event.type for event in events}
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        assert any(
+            refusal["tool_name"] == tool.spec.name and refusal["executable"] == executable
+            for refusal in failed.payload["execution_admission"]["refusals"]
+        )
+
+
+@pytest.mark.parametrize("exclude_tool", [True, False])
+def test_tool_ceiling_excludes_requirements_of_unavailable_tools(exclude_tool: bool) -> None:
+    class UnavailableTool(Tool):
+        spec = ToolSpec(
+            name="unavailable",
+            execution_requirements=(
+                ToolExecutionRequirement(
+                    name="executable",
+                    alternatives=(ToolExecutableRequirement(executable="missing"),),
+                ),
+            ),
+        )
+
+        async def run(self, ctx, args):
+            raise AssertionError("Excluded tool must not execute.")
+
+    async def run():
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"), tools=[UnavailableTool()]
+        )
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="narrowed_tools",
+                    messages=[Message.text("user", "run")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(
+                        tool_names=() if exclude_tool else ("unavailable",)
+                    ),
+                )
+            )
+        ]
+        return events, provider
+
+    events, provider = asyncio.run(run())
+    assert len(provider.requests) == (1 if exclude_tool else 0)
+    assert any(event.type is EventType.SESSION_FAILED for event in events) is not exclude_tool
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "case, admitted",
+    [
+        ("executables_below", True),
+        ("executables_at", True),
+        ("executables_above", False),
+        ("executables_overlap", True),
+        ("clauses_below", True),
+        ("clauses_at", True),
+        ("clauses_above", False),
+        ("clauses_overlap", True),
+        ("clauses_conflict", False),
+    ],
+)
+def test_public_tool_requirement_aggregation_bounds_and_overlap(backend, case, admitted, tmp_path):
+    executable_bound = case.startswith("executables_")
+    caller_count = 33 if case.endswith("above") else 32
+    tool_count = 31 if case.endswith("below") else 32
+
+    def clause(index):
+        return ToolExecutionRequirement(
+            name=f"requirement_{index:02}",
+            alternatives=(
+                ToolExecutableRequirement(
+                    executable=f"tool_{index:02}" if executable_bound else "shared"
+                ),
+            ),
+        )
+
+    class DeclaredTool(Tool):
+        spec = ToolSpec(
+            name="declared",
+            execution_requirements=tuple(clause(index) for index in range(tool_count)),
+        )
+
+        async def run(self, ctx, args):
+            raise AssertionError("The scripted provider must not dispatch a tool.")
+
+    if executable_bound:
+        caller_names = tuple(f"caller_{index:02}" for index in range(caller_count))
+        if case == "executables_overlap":
+            caller_names = tuple(sorted((*caller_names[:-1], "tool_00")))
+        base = ExecutionRequirements(required_executables=caller_names)
+    else:
+        overlap = case in {"clauses_overlap", "clauses_conflict"}
+        caller_clauses = [
+            ExecutionToolRequirement(
+                tool_name="declared" if overlap else "caller",
+                requirement=clause(index),
+            )
+            for index in range(caller_count)
+        ]
+        if case == "clauses_conflict":
+            caller_clauses[0] = ExecutionToolRequirement(
+                tool_name="declared",
+                requirement=ToolExecutionRequirement(
+                    name="requirement_00",
+                    alternatives=(ToolExecutableRequirement(executable="caller_only"),),
+                ),
+            )
+        base = ExecutionRequirements(tool_requirements=tuple(caller_clauses))
+
+    observed_requirements = []
+
+    class AggregateRunner(_EvidenceRunner):
+        def execution_admission_candidate_for(self, requirements):
+            observed_requirements.append(requirements)
+            now = datetime.now(UTC)
+            fingerprint = "sha256:" + "1" * 64
+            probes = {probe.executable: probe for probe in requirements.executable_probes()}
+            return ExecutionAdmissionCandidate(
+                candidate="hosted",
+                evidence=ExecutionCapabilityEvidence(
+                    subject="hosted",
+                    unclaimed_reason_code="security_unclaimed",
+                    environment_fingerprint=fingerprint,
+                    tool_requirements=admission_module.ExecutionToolRequirementEvidence(
+                        environment_fingerprint=fingerprint,
+                        executables=tuple(
+                            admission_module.ExecutionExecutableEvidence(
+                                executable=name,
+                                state="live_verified",
+                                observed_at=now,
+                                valid_until=now + timedelta(seconds=60),
+                                requirement_fingerprint=(
+                                    probes[name].fingerprint if name in probes else None
+                                ),
+                            )
+                            for name in requirements.executable_names()
+                        ),
+                    ),
+                ),
+            )
+
+        async def collect_execution_admission_candidate_for(self, requirements):
+            return self.execution_admission_candidate_for(requirements)
+
+    async def run():
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "aggregation.sqlite")
+        )
+        try:
+            provider = _RecordingProvider()
+            app = CayuApp(enable_logging=False, session_store=store)
+            app.register_provider(provider, default=True)
+            app.register_environment(
+                Environment(EnvironmentSpec(name="hosted"), runner=AggregateRunner("hosted")),
+                default=True,
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[DeclaredTool()],
+                execution_requirements=base,
+            )
+            events = await _run(app, "aggregation")
+            durable = await store.load_events("aggregation")
+            return events, durable, provider
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+
+    events, durable, provider = asyncio.run(run())
+    assert len(provider.requests) == int(admitted)
+    for recorded in (events, durable):
+        kinds = {event.type for event in recorded}
+        assert (EventType.SESSION_COMPLETED in kinds) is admitted
+        assert (EventType.SESSION_FAILED in kinds) is not admitted
+        if not admitted:
+            assert EventType.MODEL_STARTED not in kinds
+    if admitted:
+        assert observed_requirements
+        for requirements in observed_requirements:
+            assert requirements.required_executables == base.required_executables
+            expected_clauses = (
+                tool_count
+                if executable_bound or case == "clauses_overlap"
+                else caller_count + tool_count
+            )
+            assert len(requirements.tool_requirements) == expected_clauses
+            expected_names = (
+                caller_count + tool_count - int(case == "executables_overlap")
+                if executable_bound
+                else 1
+            )
+            assert len(requirements.executable_names()) == expected_names
+    else:
+        assert observed_requirements == []
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("reconstruct", [False, True])
+@pytest.mark.parametrize("narrow", [False, True])
+@pytest.mark.parametrize("caller_requires_rg", [False, True])
+def test_resume_recomputes_tool_requirements_without_weakening_caller_policy(
+    backend, reconstruct, narrow, caller_requires_rg, tmp_path
+):
+    def identity(name):
+        return ExecutionProfileBehaviorIdentity(
+            name=name, behavior_version="1", implementation_version="1"
+        )
+
+    class StableProvider(_RecordingProvider):
+        @property
+        def execution_profile_identity(self):
+            return identity("resume-admission-provider")
+
+    class ResumeRunner(_EvidenceRunner):
+        present = True
+
+        def __init__(self):
+            super().__init__("hosted")
+            self.requirements = []
+            self.observers = []
+
+        @property
+        def execution_profile_identity(self):
+            return identity("resume-admission-runner")
+
+        def execution_admission_observer(self, requirements):
+            observer = super().execution_admission_observer(requirements)
+            self.observers.append(observer)
+            return observer
+
+        def execution_admission_candidate_for(self, requirements):
+            self.requirements.append(requirements)
+            now = datetime.now(UTC)
+            fingerprint = "sha256:" + "1" * 64
+            return ExecutionAdmissionCandidate(
+                candidate="hosted",
+                evidence=ExecutionCapabilityEvidence(
+                    subject="hosted",
+                    unclaimed_reason_code="security_unclaimed",
+                    environment_fingerprint=fingerprint,
+                    tool_requirements=admission_module.ExecutionToolRequirementEvidence(
+                        environment_fingerprint=fingerprint,
+                        executables=(
+                            (
+                                admission_module.ExecutionExecutableEvidence(
+                                    executable="rg",
+                                    state="live_verified",
+                                    observed_at=now,
+                                    valid_until=now + timedelta(seconds=60),
+                                    requirement_fingerprint=ToolExecutableRequirement(
+                                        executable="rg"
+                                    ).fingerprint,
+                                ),
+                            )
+                            if self.present
+                            else ()
+                        ),
+                    ),
+                ),
+            )
+
+        async def collect_execution_admission_candidate_for(self, requirements):
+            return self.execution_admission_candidate_for(requirements)
+
+    def composition(store, runner, provider):
+        app = CayuApp(enable_logging=False, session_store=store)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="hosted", execution_profile_identity=identity("resume-env")),
+                runner=runner,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SearchTextTool()],
+            execution_requirements=ExecutionRequirements(
+                required_executables=("rg",) if caller_requires_rg else (),
+            ),
+        )
+        return app
+
+    async def run():
+        database = tmp_path / "resume-admission.sqlite"
+        store = InMemorySessionStore() if backend == "memory" else SQLiteSessionStore(database)
+        try:
+            runner, provider = ResumeRunner(), StableProvider()
+            app = composition(store, runner, provider)
+            initial = await _run(app, "resume-admission")
+            assert initial[-1].type is EventType.SESSION_COMPLETED
+            assert len(provider.requests) == 1
+            assert len(runner.observers) == 1
+            initial_observer = runner.observers[0]
+            if reconstruct:
+                if isinstance(store, SQLiteSessionStore):
+                    await store.close()
+                    store = SQLiteSessionStore(database)
+                runner, provider = ResumeRunner(), StableProvider()
+                app = composition(store, runner, provider)
+            runner.present = False
+            runner.requirements.clear()
+            runner.observers.clear()
+            provider.requests.clear()
+            before = await store.load_events("resume-admission")
+            resumed = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id="resume-admission",
+                        messages=[Message.text("user", "continue")],
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=())
+                        if narrow
+                        else None,
+                    )
+                )
+            ]
+            durable = await store.load_events("resume-admission")
+            new_events = [
+                event for event in durable if event.id not in {item.id for item in before}
+            ]
+            return resumed, new_events, runner, provider, initial_observer
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+
+    events, durable, runner, provider, initial_observer = asyncio.run(run())
+    admitted = narrow and not caller_requires_rg
+    assert len(provider.requests) == int(admitted)
+    if admitted:
+        assert len(runner.observers) == 1
+        assert runner.observers[0] is not initial_observer
+        assert runner.observers[0].runner is runner
+        assert runner.observers[0].requirements.tool_requirements == ()
+    assert runner.requirements
+    for requirements in runner.requirements:
+        assert requirements.required_executables == (("rg",) if caller_requires_rg else ())
+        assert {item.tool_name for item in requirements.tool_requirements} == (
+            set() if narrow else {"search_text"}
+        )
+    for recorded in (events, durable):
+        kinds = {event.type for event in recorded}
+        assert (EventType.SESSION_COMPLETED in kinds) is admitted
+        assert (EventType.SESSION_FAILED in kinds) is not admitted
+        if not admitted:
+            assert not any(str(kind).startswith("model.") for kind in kinds)
+            failed = next(event for event in recorded if event.type is EventType.SESSION_FAILED)
+            refusals = failed.payload["execution_admission"]["refusals"]
+            if caller_requires_rg:
+                assert any(
+                    item.get("tool_name") is None and item.get("executable") == "rg"
+                    for item in refusals
+                )
+            if not narrow:
+                assert any(item.get("tool_name") == "search_text" for item in refusals)
+
+
+def test_documented_hosted_runner_supplies_collection_and_dispatch_snapshot():
+    documentation = (Path(__file__).parents[2] / "docs/environment-factories.md").read_text()
+    source = next(
+        block.split("```", 1)[0]
+        for block in documentation.split("```python\n")[1:]
+        if "class HostedRunner(Runner):" in block.split("```", 1)[0]
+    )
+    namespace = {}
+    exec(compile(source, "docs/environment-factories.md", "exec"), namespace)
+    snapshots = []
+    observations = []
+
+    class HostedRunner(namespace["HostedRunner"]):
+        exec = _EvidenceRunner.exec
+
+        def _snapshot_exact_runtime_evidence(self, requirements):
+            snapshots.append(requirements)
+            now = datetime.now(UTC)
+            fingerprint = "sha256:" + "1" * 64
+            return ExecutionCapabilityEvidence(
+                subject="acme-sandbox",
+                unclaimed_reason_code="security_unclaimed",
+                environment_fingerprint=fingerprint,
+                tool_requirements=admission_module.ExecutionToolRequirementEvidence(
+                    environment_fingerprint=fingerprint,
+                    executables=(
+                        admission_module.ExecutionExecutableEvidence(
+                            executable="rg",
+                            state="live_verified",
+                            observed_at=now,
+                            valid_until=now + timedelta(seconds=60),
+                            requirement_fingerprint=ToolExecutableRequirement(
+                                executable="rg"
+                            ).fingerprint,
+                        ),
+                    ),
+                ),
+            )
+
+        async def _observe_exact_runtime_evidence(self, requirements):
+            observations.append(requirements)
+            return self._snapshot_exact_runtime_evidence(requirements)
+
+    async def run():
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="hosted"), runner=HostedRunner()), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"), tools=[SearchTextTool()]
+        )
+        return await _run(app, "documented-hosted-runner"), provider
+
+    events, provider = asyncio.run(run())
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    assert len(provider.requests) == 1
+    assert len(observations) == 1
+    assert len(snapshots) > len(observations)
+    assert all(requirements == observations[0] for requirements in snapshots)
+    assert {item.tool_name for item in observations[0].tool_requirements} == {"search_text"}
+
+
 def _requirements() -> ExecutionRequirements:
     return ExecutionRequirements.trusted(
         cleanup="confirmed",
@@ -484,6 +1157,57 @@ def _bound_factory_app(
         execution_requirements=_requirements(),
     )
     return app, factory, binding, source_runner, bound_runner, lifecycle
+
+
+@pytest.mark.parametrize("backend", ["e2b", "lambda_microvm"])
+@pytest.mark.parametrize("requires_executable", [False, True])
+def test_unobserved_remote_runner_fails_closed_only_for_required_dependencies(
+    backend,
+    requires_executable,
+):
+    from types import SimpleNamespace
+
+    from cayu.runners import E2BRunner, LambdaMicroVMRunner
+
+    class PythonOnlyTool(Tool):
+        spec = ToolSpec(name="python_only", input_schema={"type": "object"})
+
+        async def run(self, ctx, args):
+            return ToolResult(content="local Python result")
+
+    async def scenario():
+        # No SDK or endpoint methods exist: admission must not dispatch remotely
+        # or infer executable support from a backend's identity.
+        if backend == "e2b":
+            runner = E2BRunner(SimpleNamespace(sandbox_id="admission-860"))
+        else:
+            runner = LambdaMicroVMRunner(
+                object(),
+                microvm_id="admission-860",
+                endpoint="https://invalid.example",
+                endpoint_transport=object(),
+            )
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="remote"), runner=runner), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SearchTextTool()] if requires_executable else [PythonOnlyTool()],
+        )
+        events = await _run(app, f"unobserved-{backend}-{requires_executable}")
+        assert len(provider.requests) == int(not requires_executable)
+        assert (EventType.SESSION_COMPLETED in {event.type for event in events}) is (
+            not requires_executable
+        )
+        if requires_executable:
+            assert EventType.SESSION_FAILED in {event.type for event in events}
+            assert not any(str(event.type).startswith("model.") for event in events)
+        await runner.close()
+
+    asyncio.run(scenario())
 
 
 def test_static_local_runner_is_refused_for_untrusted_workload(tmp_path) -> None:
@@ -765,6 +1489,17 @@ def test_final_runner_requires_exact_factory_environment_authority(
 def test_expired_exposure_is_refused_again_at_actual_provider_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import cayu.environments.admission as admission_module
+
+    class AdmissionClock(datetime):
+        current = datetime.now(UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    monkeypatch.setattr(admission_module, "datetime", AdmissionClock)
+
     class ExpiringEvidenceRunner(_EvidenceRunner):
         current_candidate: ExecutionAdmissionCandidate | None = None
 
@@ -774,7 +1509,7 @@ def test_expired_exposure_is_refused_again_at_actual_provider_dispatch(
         async def collect_execution_admission_candidate(
             self,
         ) -> ExecutionAdmissionCandidate:
-            observed_at = datetime.now(UTC)
+            observed_at = AdmissionClock.now(UTC)
             self.current_candidate = ExecutionAdmissionCandidate(
                 candidate="hosted",
                 evidence=ExecutionCapabilityEvidence(
@@ -802,9 +1537,8 @@ def test_expired_exposure_is_refused_again_at_actual_provider_dispatch(
             if self.delay_next_dispatch:
                 self.delay_next_dispatch = False
                 self.dispatch_delay_applied = True
-                import time
-
-                time.sleep(1.1)
+                # Expire proof at this exact boundary, not during CI setup.
+                AdmissionClock.current += timedelta(seconds=2)
             return super().provider_operation_mode
 
     async def run() -> tuple[list[Event], _RecordingProvider]:
@@ -852,6 +1586,234 @@ def test_expired_exposure_is_refused_again_at_actual_provider_dispatch(
         if event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
     ]
     assert phases[-1] == "exposure"
+
+
+@pytest.mark.parametrize(
+    "change_phase",
+    [
+        None,
+        "after_collection",
+        "during_collection",
+        "unsupported",
+        "unverified",
+        "missing",
+        "malformed",
+    ],
+)
+def test_public_docker_native_identity_invalidates_cached_tool_evidence(
+    monkeypatch: pytest.MonkeyPatch, change_phase: str | None
+) -> None:
+    class NativeDockerRunner(DockerRunner):
+        native_identity = "sha256:" + "1" * 64
+        native_state = "live_verified"
+
+        def execution_capability_evidence(self):
+            base = super().execution_capability_evidence()
+            now = datetime.now(UTC)
+            claim = ExecutionCapabilityClaim.live_verified(
+                "workspace_text_search_v1",
+                observation="supported",
+                observed_at=now,
+                valid_until=now + timedelta(seconds=300),
+            )
+            if self.native_state in {"unsupported", "unverified"}:
+                claim = getattr(ExecutionCapabilityClaim, self.native_state)(
+                    "workspace_text_search_v1",
+                    reason_code="native_withdrawn",
+                    remediation_code="verify_native_support",
+                )
+            elif self.native_state == "malformed":
+                claim = claim.model_copy(update={"state": "invalid-state"})
+            return base.model_copy(
+                update={
+                    "environment_fingerprint": self.native_identity,
+                    "claims": (
+                        *base.claims,
+                        *((claim,) if self.native_state != "missing" else ()),
+                    ),
+                }
+            )
+
+    runner = NativeDockerRunner(
+        "native",
+        image="test-image",
+        default_cwd="/workspace",
+        close_action="none",
+        docker_path="/usr/bin/docker",
+        credential_mode="trusted_tool",
+        allow_raw_secret_env=False,
+        cancellation_cleanup="sandbox",
+        timeout_cleanup="sandbox",
+        _container_id="a" * 64,
+    )
+    probe_calls = []
+
+    async def inspect(*args, **kwargs):
+        return {
+            "Id": runner.container_id,
+            "Image": "sha256:" + "b" * 64,
+            "State": {"Running": True},
+        }
+
+    async def probe(*args, **kwargs):
+        probe_calls.append(kwargs["required_executables"])
+        if change_phase == "during_collection":
+            runner.native_identity = "sha256:" + "2" * 64
+        return (("rg", False),)
+
+    monkeypatch.setattr(docker_module, "_inspect_strict_container", inspect)
+    monkeypatch.setattr(docker_module, "_probe_container_executables", probe)
+
+    async def run():
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="docker"), runner=runner), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"), tools=[SearchTextTool()]
+        )
+        emit = app._event_writer.emit
+        observed = []
+
+        async def replace_after_collection(event):
+            persisted = await emit(event)
+            if (
+                event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
+                and event.payload.get("phase") == "final_evidence"
+            ):
+                observed.append(runner.native_identity)
+                if change_phase == "after_collection":
+                    runner.native_identity = "sha256:" + "2" * 64
+                elif change_phase in {"unsupported", "unverified", "missing", "malformed"}:
+                    runner.native_state = change_phase
+            return persisted
+
+        monkeypatch.setattr(app._event_writer, "emit", replace_after_collection)
+        events = await _run(app, "docker_native_identity")
+        persisted = await app.session_store.load_events("docker_native_identity")
+        assert probe_calls == [("rg",)]
+        if change_phase != "during_collection":
+            assert observed == ["sha256:" + "1" * 64]
+        if change_phase is None:
+            assert len(provider.requests) == 1
+            assert any(event.type is EventType.SESSION_COMPLETED for event in persisted)
+        else:
+            assert provider.requests == []
+            assert not any(
+                event.type is EventType.SESSION_COMPLETED for event in (*events, *persisted)
+            )
+            failed = next(event for event in persisted if event.type is EventType.SESSION_FAILED)
+            assert failed.payload["execution_admission"]["refusals"]
+            if change_phase in {"unsupported", "unverified", "missing"}:
+                assert runner.native_identity == "sha256:" + "1" * 64
+                expected = {
+                    "unsupported": "unsupported_capability",
+                    "unverified": "unverified_capability",
+                    "missing": "missing_capability",
+                }[change_phase]
+                assert any(
+                    refusal["code"] == expected
+                    and refusal.get("capability") == "workspace_text_search_v1"
+                    for refusal in failed.payload["execution_admission"]["refusals"]
+                )
+
+    asyncio.run(run())
+
+
+def test_docker_snapshot_preserves_cached_executable_observation_lifetime(monkeypatch):
+    runner = DockerRunner(
+        "cached",
+        image="test-image",
+        default_cwd="/workspace",
+        close_action="none",
+        docker_path="/usr/bin/docker",
+        credential_mode="trusted_tool",
+        allow_raw_secret_env=False,
+        cancellation_cleanup="sandbox",
+        timeout_cleanup="sandbox",
+        _container_id="a" * 64,
+    )
+    requirements = ExecutionRequirements(required_executables=("rg",))
+    observer = runner.execution_admission_observer(requirements)
+    probe_calls = []
+
+    async def inspect(*args, **kwargs):
+        return {
+            "Id": runner.container_id,
+            "Image": "sha256:" + "b" * 64,
+            "State": {"Running": True},
+        }
+
+    async def probe(*args, **kwargs):
+        probe_calls.append(kwargs["required_executables"])
+        return (("rg", True),)
+
+    monkeypatch.setattr(docker_module, "_inspect_strict_container", inspect)
+    monkeypatch.setattr(docker_module, "_probe_container_executables", probe)
+
+    async def run():
+        collected = await observer.collect()
+        original = collected.evidence.tool_requirements
+        expired_at = original.executables[0].valid_until + timedelta(seconds=1)
+
+        class LaterClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return expired_at.replace(tzinfo=None) if tz is None else expired_at.astimezone(tz)
+
+        monkeypatch.setattr(docker_module, "datetime", LaterClock)
+        for _ in range(2):
+            snapshot = observer.snapshot()
+            assert snapshot is not collected
+            assert snapshot.evidence.tool_requirements == original
+            decision = admission_module.evaluate_execution_admission(
+                candidate=snapshot.candidate,
+                requirements=requirements,
+                evidence=snapshot.evidence,
+                now=expired_at,
+            )
+            assert decision.status == "refused"
+            assert {refusal.code for refusal in decision.refusals} == {"stale_evidence"}
+        assert probe_calls == [("rg",)]
+
+    asyncio.run(run())
+
+
+def test_docker_tool_observer_composes_native_identity_into_fingerprint():
+    runner = DockerRunner(
+        "native",
+        image="test-image",
+        default_cwd="/workspace",
+        close_action="none",
+        docker_path="/usr/bin/docker",
+        credential_mode="trusted_tool",
+        allow_raw_secret_env=False,
+        cancellation_cleanup="sandbox",
+        timeout_cleanup="sandbox",
+        _container_id="a" * 64,
+    )
+    observer = runner.execution_admission_observer(
+        ExecutionRequirements(required_executables=("rg",))
+    )
+    base = runner.execution_capability_evidence()
+    candidates = [
+        observer._candidate(
+            base.model_copy(update={"environment_fingerprint": "sha256:" + digit * 64}),
+            image_id="sha256:" + "b" * 64,
+        )
+        for digit in ("1", "2")
+    ]
+    assert (
+        candidates[0].evidence.environment_fingerprint
+        != candidates[1].evidence.environment_fingerprint
+    )
+    for candidate in candidates:
+        assert (
+            candidate.evidence.tool_requirements.environment_fingerprint
+            == candidate.evidence.environment_fingerprint
+        )
 
 
 def test_slow_docker_final_evidence_is_refused_before_provider_dispatch(
@@ -952,10 +1914,13 @@ def test_slow_docker_final_evidence_is_refused_before_provider_dispatch(
     assert failed.payload["execution_admission"]["refusals"][0]["code"] == "stale_evidence"
 
 
-@pytest.mark.parametrize("failure_mode", ["cancel", "nonzero_result"])
+@pytest.mark.parametrize("failure_mode", ["cancel", "nonzero_result", "timeout", "transport"])
+@pytest.mark.parametrize("runner_kind", ["strict", "tool_observer", "egress_owned"])
 def test_docker_final_probe_settles_guest_before_factory_release(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     failure_mode: str,
+    runner_kind: str,
 ) -> None:
     container_id = "a" * 64
     image_id = "sha256:" + "b" * 64
@@ -979,7 +1944,17 @@ def test_docker_final_probe_settles_guest_before_factory_release(
         observed_at=observed_at,
         valid_until=observed_at + timedelta(seconds=300),
     )
-    runner = DockerRunner(
+    from tests.egress.test_docker_reconnect import setup as setup_reconnect
+
+    from cayu.egress._docker_reconnect import DockerEgressReconnectError, _OwnedDockerRunner
+
+    claim = None
+    if runner_kind == "egress_owned":
+        reconnect_docker, reconnect_adapter, manager, identity = setup_reconnect(tmp_path)
+        claim = manager.claim(identity["allocation_id"])
+        claim.read()
+    runner_type = _OwnedDockerRunner if runner_kind == "egress_owned" else DockerRunner
+    runner = runner_type(
         "strict",
         image=image_reference,
         default_cwd="/workspace",
@@ -990,8 +1965,14 @@ def test_docker_final_probe_settles_guest_before_factory_release(
         cancellation_cleanup="sandbox",
         timeout_cleanup="sandbox",
         _container_id=container_id,
-        _runtime_evidence=evidence,
+        _runtime_evidence=evidence if runner_kind == "strict" else None,
+        env_overlay={"CAYU_TEST_PRIVATE": "private-probe-860"} if runner_kind != "strict" else None,
+        _env_overlay_secret_values_present=runner_kind != "strict",
     )
+    if claim is not None:
+        runner._owner, runner._manager = claim, manager
+        claim.runner = runner
+    probe_env_files = []
     probe_dispatched = asyncio.Event()
     probe_finished = asyncio.Event()
     cleanup_dispatched = asyncio.Event()
@@ -1000,7 +1981,7 @@ def test_docker_final_probe_settles_guest_before_factory_release(
 
     async def inspect(*args: Any, **kwargs: Any) -> dict[str, Any]:
         del args, kwargs
-        return {}
+        return {"Id": container_id, "Image": image_id, "State": {"Running": True}}
 
     def verify(*args: Any, **kwargs: Any) -> tuple[str, str]:
         del args, kwargs
@@ -1008,7 +1989,6 @@ def test_docker_final_probe_settles_guest_before_factory_release(
 
     async def dispatch(command, **kwargs):
         nonlocal guest_active
-        del kwargs
         args = command.argv[1:]
         if any("read pid process_group" in value for value in args):
             cleanup_dispatched.set()
@@ -1016,11 +1996,25 @@ def test_docker_final_probe_settles_guest_before_factory_release(
             guest_active = False
             probe_finished.set()
             return ExecResult()
-        if args[0] == "exec" and any("id -u" in value for value in args):
+        probe_marker = "id -u" if runner_kind == "strict" else "name=$1"
+        if args[0] == "exec" and any(probe_marker in value for value in args):
+            if runner_kind != "strict":
+                path = Path(args[args.index("--env-file") + 1])
+                probe_env_files.append(path)
+                assert path.exists()
+                assert "private-probe-860" not in repr(command.argv)
+                assert "private-probe-860" not in kwargs["output_redactor"].redact_text(
+                    "private-probe-860"
+                )
+                assert "private-probe-860" not in repr(kwargs["env"])
             guest_active = True
             probe_dispatched.set()
             if failure_mode == "cancel":
                 await probe_finished.wait()
+            elif failure_mode == "timeout":
+                return ExecResult(exit_code=1, timed_out=True)
+            elif failure_mode == "transport":
+                raise ConnectionError("Docker probe transport disconnected")
             else:
                 return ExecResult(exit_code=1, stderr="Docker stream disconnected")
             guest_active = False
@@ -1032,6 +2026,7 @@ def test_docker_final_probe_settles_guest_before_factory_release(
     monkeypatch.setattr(docker_module, "_inspect_strict_container", inspect)
     monkeypatch.setattr(docker_module, "_verify_strict_container_inspection", verify)
     monkeypatch.setattr(docker_module, "run_subprocess", dispatch)
+    monkeypatch.setattr(docker_module, "_require_docker", lambda path=None: "/usr/bin/docker")
 
     class ReleasingDockerFactory(EnvironmentFactory):
         def __init__(self) -> None:
@@ -1042,6 +2037,8 @@ def test_docker_final_probe_settles_guest_before_factory_release(
             self,
             request: EnvironmentFactoryRequest,
         ) -> ExecutionAdmissionCandidate:
+            if runner_kind != "strict":
+                return runner.execution_admission_candidate_for(request.execution_requirements)
             del request
             return _candidate("docker", state="declared")
 
@@ -1052,6 +2049,8 @@ def test_docker_final_probe_settles_guest_before_factory_release(
             async def release(action: EnvironmentFactoryReleaseAction) -> None:
                 self.release_actions.append(action)
                 self.release_guest_states.append(guest_active)
+                if claim is not None:
+                    claim.close()
 
             return EnvironmentFactoryResult(
                 environment=Environment(
@@ -1074,9 +2073,14 @@ def test_docker_final_probe_settles_guest_before_factory_release(
         )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            execution_requirements=ExecutionRequirements.trusted(
-                cleanup="confirmed",
-                minimum_evidence="live_verified",
+            tools=[SearchTextTool()] if runner_kind != "strict" else [],
+            execution_requirements=(
+                ExecutionRequirements.trusted()
+                if runner_kind != "strict"
+                else ExecutionRequirements.trusted(
+                    cleanup="confirmed",
+                    minimum_evidence="live_verified",
+                )
             ),
         )
         task = asyncio.create_task(_run(app, "sess_cancel_docker_final_probe"))
@@ -1088,7 +2092,35 @@ def test_docker_final_probe_settles_guest_before_factory_release(
         assert guest_active is True
         assert factory.release_actions == []
         assert provider.requests == []
-        allow_cleanup.set()
+        if runner_kind != "strict" and failure_mode == "cancel":
+            # Caller cancellation must not unlink the still-running CLI's file.
+            assert probe_env_files and all(path.exists() for path in probe_env_files)
+        try:
+            with pytest.raises(RuntimeError, match="acquisition or rollback is still pending"):
+                runner._ensure_exec_open()
+            with pytest.raises(RuntimeError, match="acquisition or rollback is still pending"):
+                await DockerRunner.reconnect_strict(
+                    "strict",
+                    container_id=container_id,
+                    image_identity=DockerImageIdentity(reference=image_reference),
+                    workload_restrictions=restrictions,
+                    docker_path="/usr/bin/docker",
+                )
+            if claim is not None:
+                journal_before = dict(claim.journal)
+                with pytest.raises(DockerEgressReconnectError, match="ownership_conflict"):
+                    await reconnect_adapter.prepare_reconnect(
+                        session_id=identity["session_id"],
+                        environment_name=identity["environment_name"],
+                        grants=(),
+                        broker=None,
+                        reconnect_metadata=identity,
+                    )
+                assert claim.journal == journal_before
+                assert not claim.closed
+                assert all(args[:2] == ["context", "inspect"] for args in reconnect_docker.commands)
+        finally:
+            allow_cleanup.set()
         if failure_mode == "cancel":
             with pytest.raises(asyncio.CancelledError) as raised:
                 await task
@@ -1106,6 +2138,13 @@ def test_docker_final_probe_settles_guest_before_factory_release(
         }
         assert factory.release_guest_states
         assert not any(factory.release_guest_states)
+        assert all(not path.exists() for path in probe_env_files)
+        if claim is not None:
+            assert claim.closed
+            replacement_claim = manager.claim(identity["allocation_id"])
+            replacement_claim.read()
+            assert replacement_claim.journal == journal_before
+            replacement_claim.close()
         assert provider.requests == []
         return task, factory
 
@@ -1407,6 +2446,204 @@ def test_runtime_renews_expired_evidence_without_changing_exact_environment_iden
         )
 
 
+@pytest.mark.parametrize("renewed_proof", ["verified", "unavailable", "wrong_probe"])
+def test_search_text_renews_stale_executable_with_missing_native_alternative(
+    monkeypatch: pytest.MonkeyPatch,
+    renewed_proof: str,
+) -> None:
+    class SearchRunner(_RenewingEvidenceRunner):
+        def _live_candidate(self, *, valid_for_seconds, drift_field=None):
+            candidate = super()._live_candidate(
+                valid_for_seconds=valid_for_seconds, drift_field=drift_field
+            )
+            evidence = candidate.evidence
+            assert evidence is not None
+            now = datetime.now(UTC)
+            proof = renewed_proof if self.refresh_calls else "verified"
+            executable = admission_module.ExecutionExecutableEvidence(
+                executable="rg",
+                state="unavailable" if proof == "unavailable" else "live_verified",
+                observed_at=now if proof != "unavailable" else None,
+                valid_until=(
+                    now + timedelta(seconds=valid_for_seconds) if proof != "unavailable" else None
+                ),
+                reason_code="executable_unavailable" if proof == "unavailable" else None,
+                remediation_code="install_executable" if proof == "unavailable" else None,
+                requirement_fingerprint=(
+                    "sha256:" + "0" * 64
+                    if proof == "wrong_probe"
+                    else ToolExecutableRequirement(executable="rg").fingerprint
+                ),
+            )
+            return candidate.model_copy(
+                update={
+                    "evidence": evidence.model_copy(
+                        update={
+                            "tool_requirements": admission_module.ExecutionToolRequirementEvidence(
+                                environment_fingerprint=evidence.environment_fingerprint,
+                                image_fingerprint=evidence.image_fingerprint,
+                                executables=(executable,),
+                            )
+                        }
+                    )
+                }
+            )
+
+    async def run():
+        provider = _RecordingProvider()
+        runner = SearchRunner()
+        runner.current_candidate = runner._live_candidate(valid_for_seconds=60)
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="hosted"), runner=runner), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"), tools=[SearchTextTool()]
+        )
+        original_emit = app._event_writer.emit
+
+        async def expire_after_exposure(event):
+            persisted = await original_emit(event)
+            if (
+                event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
+                and event.payload["phase"] == "exposure"
+            ):
+                await asyncio.sleep(1.1)
+            return persisted
+
+        monkeypatch.setattr(app._event_writer, "emit", expire_after_exposure)
+        events = await _run(app, f"sess_search_renewal_{renewed_proof}")
+        return events, provider, runner
+
+    events, provider, runner = asyncio.run(run())
+    assert runner.refresh_calls == 1, [(event.type, event.payload) for event in events]
+    if renewed_proof == "verified":
+        assert len(provider.requests) == 1
+        assert EventType.SESSION_COMPLETED in {event.type for event in events}
+    else:
+        assert provider.requests == []
+        assert EventType.SESSION_COMPLETED not in {event.type for event in events}
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        assert any(
+            refusal["tool_name"] == "search_text" and refusal["executable"] == "rg"
+            for refusal in failed.payload["execution_admission"]["refusals"]
+        )
+
+
+@pytest.mark.parametrize("mismatch", ["runner", "requirements", "type"])
+def test_public_admission_rejects_mismatched_observer_before_provider(mismatch):
+    class MismatchedRunner(_EvidenceRunner):
+        def execution_admission_observer(self, requirements):
+            if mismatch == "type":
+                return object()
+            return RunnerExecutionAdmissionObserver(
+                _EvidenceRunner("hosted") if mismatch == "runner" else self,
+                ExecutionRequirements.trusted() if mismatch == "requirements" else requirements,
+            )
+
+    async def run():
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="hosted"),
+            _HostedFactory(pre_create_candidate="hosted", runner=MismatchedRunner("hosted")),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            execution_requirements=ExecutionRequirements.trusted(cleanup="confirmed"),
+        )
+        return await _run(app, f"observer_mismatch_{mismatch}"), provider
+
+    events, provider = asyncio.run(run())
+    assert provider.requests == []
+    assert EventType.SESSION_COMPLETED not in {event.type for event in events}
+    assert EventType.SESSION_FAILED in {event.type for event in events}
+
+
+def test_shared_runner_preserves_distinct_observer_state_through_public_renewal(monkeypatch):
+    class Observer(RunnerExecutionAdmissionObserver):
+        def __post_init__(self):
+            super().__post_init__()
+            object.__setattr__(self, "state", {"candidate": None, "collections": 0, "refreshes": 0})
+
+        def snapshot(self):
+            assert self.state["candidate"] is not None
+            return self.state["candidate"]
+
+        async def collect(self):
+            self.state["collections"] += 1
+            self.state["candidate"] = self.runner._live_candidate(valid_for_seconds=1)
+            return self.snapshot()
+
+        async def refresh(self):
+            self.state["refreshes"] += 1
+            self.state["candidate"] = self.runner._live_candidate(valid_for_seconds=60)
+
+    class SharedRunner(_RenewingEvidenceRunner):
+        def __init__(self):
+            super().__init__()
+            self.observers = []
+
+        def execution_admission_observer(self, requirements):
+            observer = Observer(self, requirements)
+            self.observers.append(observer)
+            return observer
+
+        async def refresh_execution_admission(self):
+            raise AssertionError("Renewal must use the request-scoped observer.")
+
+        async def collect_execution_admission_candidate(self):
+            raise AssertionError("Collection must use the request-scoped observer.")
+
+    async def exercise():
+        runner = SharedRunner()
+
+        async def run(index):
+            provider = _RecordingProvider()
+            app = CayuApp(enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_environment_factory(
+                EnvironmentSpec(name="hosted"),
+                _HostedFactory(pre_create_candidate="hosted", runner=runner),
+                default=True,
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                execution_requirements=ExecutionRequirements.trusted(
+                    cleanup="confirmed", minimum_evidence="live_verified"
+                ),
+            )
+            original_emit = app._event_writer.emit
+
+            async def expire_after_exposure(event):
+                persisted = await original_emit(event)
+                if (
+                    event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
+                    and event.payload["phase"] == "exposure"
+                ):
+                    await asyncio.sleep(1.1)
+                return persisted
+
+            monkeypatch.setattr(app._event_writer, "emit", expire_after_exposure)
+            return await _run(app, f"observer_session_{index}"), provider
+
+        return await asyncio.gather(run(0), run(1)), runner
+
+    outcomes, runner = asyncio.run(exercise())
+    assert len(runner.observers) == 2
+    assert runner.observers[0] is not runner.observers[1]
+    assert runner.observers[0].state is not runner.observers[1].state
+    for observer in runner.observers:
+        assert observer.state["collections"] == 1
+        assert observer.state["refreshes"] == 1
+    for events, provider in outcomes:
+        assert len(provider.requests) == 1
+        assert EventType.SESSION_COMPLETED in {event.type for event in events}
+
+
 def test_runtime_renews_expired_evidence_at_exact_tool_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1483,24 +2720,101 @@ def test_runtime_renews_expired_evidence_at_exact_tool_dispatch(
     assert EventType.SESSION_COMPLETED in {event.type for event in events}
 
 
-def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch() -> None:
+@pytest.mark.parametrize("delay_seam", ["billing", "provider_child"])
+@pytest.mark.parametrize("renewal_outcome", ["verified", "identity_drift", "cancel"])
+def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    delay_seam: str,
+    renewal_outcome: str,
+) -> None:
+    refreshes_at_dispatch: list[int] = []
+
     class CompactionRunner(_RenewingEvidenceRunner):
+        def __init__(self) -> None:
+            super().__init__(
+                drift_field="image_fingerprint" if renewal_outcome == "identity_drift" else None
+            )
+            self.refresh_started = asyncio.Event()
+
+        def _live_candidate(self, *, valid_for_seconds, drift_field=None):
+            candidate = super()._live_candidate(
+                valid_for_seconds=valid_for_seconds, drift_field=drift_field
+            )
+            evidence = candidate.evidence
+            assert evidence is not None
+            now = datetime.now(UTC)
+            return candidate.model_copy(
+                update={
+                    "evidence": evidence.model_copy(
+                        update={
+                            "tool_requirements": admission_module.ExecutionToolRequirementEvidence(
+                                environment_fingerprint=evidence.environment_fingerprint,
+                                image_fingerprint=evidence.image_fingerprint,
+                                executables=(
+                                    admission_module.ExecutionExecutableEvidence(
+                                        executable="rg",
+                                        state="live_verified",
+                                        observed_at=now,
+                                        valid_until=now + timedelta(seconds=valid_for_seconds),
+                                        requirement_fingerprint=ToolExecutableRequirement(
+                                            executable="rg"
+                                        ).fingerprint,
+                                    ),
+                                ),
+                            )
+                        }
+                    )
+                }
+            )
+
         async def collect_execution_admission_candidate(
             self,
         ) -> ExecutionAdmissionCandidate:
             self.current_candidate = self._live_candidate(valid_for_seconds=2)
             return self.current_candidate
 
+        async def refresh_execution_admission(self) -> None:
+            if renewal_outcome == "cancel":
+                self.refresh_calls += 1
+                self.refresh_started.set()
+                await asyncio.Event().wait()
+            await super().refresh_execution_admission()
+
     class CompactionProvider(_RecordingProvider):
         async def billing_identity_for_request(self, request: ModelRequest) -> None:
             del request
-            await asyncio.sleep(2.1)
+            if delay_seam == "billing":
+                await asyncio.sleep(2.1)
             return None
 
         async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            refreshes_at_dispatch.append(runner.refresh_calls)
             self.requests.append(request)
             yield ModelStreamEvent.text_delta("compacted context")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    runner = CompactionRunner()
+    runner.current_candidate = runner._live_candidate(valid_for_seconds=60)
+    original_ensure_future = asyncio.ensure_future
+
+    def delayed_provider_child(operation, *, loop=None):
+        code = getattr(operation, "cr_code", None)
+        if (
+            delay_seam == "provider_child"
+            and code is not None
+            and code.co_qualname.endswith(
+                "_await_owned_compaction_provider_stream.<locals>.capture_provider_abandonment"
+            )
+        ):
+
+            async def delayed():
+                await asyncio.sleep(2.1)
+                return await operation
+
+            return original_ensure_future(delayed(), loop=loop)
+        return original_ensure_future(operation, loop=loop)
+
+    monkeypatch.setattr(asyncio, "ensure_future", delayed_provider_child)
 
     async def run() -> tuple[
         list[Event],
@@ -1510,16 +2824,15 @@ def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch() -> No
     ]:
         provider = _RecordingProvider()
         compaction_provider = CompactionProvider()
-        runner = CompactionRunner()
         app = CayuApp(enable_logging=False)
         app.register_provider(provider, default=True)
-        app.register_environment_factory(
-            EnvironmentSpec(name="hosted"),
-            _HostedFactory(pre_create_candidate="hosted", runner=runner),
+        app.register_environment(
+            Environment(EnvironmentSpec(name="hosted"), runner=runner),
             default=True,
         )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            tools=[SearchTextTool()],
             context_policy=CheckpointCompactionContextPolicy(
                 compactor=ModelCompactor(
                     provider=compaction_provider,
@@ -1533,8 +2846,9 @@ def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch() -> No
                 minimum_evidence="live_verified",
             ),
         )
-        events = [
-            event
+        events: list[Event] = []
+
+        async def consume_run() -> None:
             async for event in app.run(
                 RunRequest(
                     agent_name="assistant",
@@ -1545,13 +2859,37 @@ def test_runtime_renews_expired_evidence_at_compaction_provider_dispatch() -> No
                         Message.text("user", "current request"),
                     ],
                 )
-            )
-        ]
+            ):
+                events.append(event)
+
+        task = asyncio.create_task(consume_run())
+        if renewal_outcome == "cancel":
+            await asyncio.wait_for(runner.refresh_started.wait(), timeout=10)
+            task.cancel("cancel compaction admission renewal")
+            assert task.cancelling() == 1
+            try:
+                await task
+            except asyncio.CancelledError as exc:
+                assert exc.args == ("cancel compaction admission renewal",)
+            else:
+                pytest.fail("Public run swallowed compaction admission cancellation")
+            assert task.cancelled()
+        else:
+            await task
         return events, provider, compaction_provider, runner
 
     events, provider, compaction_provider, runner = asyncio.run(run())
 
     assert runner.refresh_calls == 1
+    if renewal_outcome != "verified":
+        assert refreshes_at_dispatch == []
+        assert compaction_provider.requests == []
+        assert provider.requests == []
+        if renewal_outcome == "identity_drift":
+            assert EventType.SESSION_FAILED in {event.type for event in events}
+        assert EventType.SESSION_COMPLETED not in {event.type for event in events}
+        return
+    assert refreshes_at_dispatch == [1]
     assert len(compaction_provider.requests) == 1
     assert len(provider.requests) == 1
     assert EventType.SESSION_COMPLETED in {event.type for event in events}
@@ -1622,9 +2960,28 @@ def test_environment_admission_renewal_preserves_real_task_cancellation(
     assert runner.refresh_calls == 1
 
 
+@pytest.mark.parametrize("failure", ["cancel", "timeout", "cancel_settlement", "cancel_lock"])
 def test_cancelled_environment_admission_renewal_fences_binding_cleanup(
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
+    from cayu.runtime import _environment_exposure as exposure_module
+    from cayu.runtime import _environment_lifecycle as lifecycle_module
+
+    monkeypatch.setattr(exposure_module, "_EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setattr(
+        lifecycle_module, "_PRE_EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS", 0.03
+    )
+    settlement_started = asyncio.Event()
+    original_wait = exposure_module._await_exposure_admission_settlement
+
+    async def observe_wait(exposure, **kwargs):
+        if exposure.admission.settlement_task is not None and not kwargs.get("background", False):
+            settlement_started.set()
+        return await original_wait(exposure, **kwargs)
+
+    monkeypatch.setattr(exposure_module, "_await_exposure_admission_settlement", observe_wait)
+
     class TransferringCancellationRunner(_RenewingEvidenceRunner):
         def __init__(self) -> None:
             super().__init__()
@@ -1649,8 +3006,9 @@ def test_cancelled_environment_admission_renewal_fences_binding_cleanup(
             settlement = asyncio.create_task(settle_dispatched_probe())
             self.refresh_started.set()
             try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError as cancellation:
+                async with asyncio.timeout(0.03):
+                    await asyncio.Event().wait()
+            except BaseException as cancellation:
                 attach_environment_factory_cleanup_settlement_task(
                     cancellation,
                     settlement,
@@ -1703,23 +3061,79 @@ def test_cancelled_environment_admission_renewal_fences_binding_cleanup(
             return persisted
 
         monkeypatch.setattr(app._event_writer, "emit", expire_after_exposure)
+        lock_holders = []
+        original_terminal_wait = lifecycle_module.await_environment_exposure_settlement
+
+        async def hold_terminal_lock(registered_environment):
+            if failure == "cancel_lock" and not lock_holders:
+                exposure = registered_environment.environment_exposure
+                locked = asyncio.Event()
+
+                async def hold():
+                    async with exposure.admission.renewal_lock:
+                        locked.set()
+                        await renewal_runner.allow_settlement.wait()
+
+                lock_holders.append(asyncio.create_task(hold()))
+                await locked.wait()
+            return await original_terminal_wait(registered_environment)
+
+        monkeypatch.setattr(
+            lifecycle_module, "await_environment_exposure_settlement", hold_terminal_lock
+        )
         task = asyncio.create_task(_run(app, "sess_cancelled_renewal_settlement"))
         await asyncio.wait_for(renewal_runner.refresh_started.wait(), timeout=10)
-        task.cancel("cancel renewal with transferred owner")
-        assert task.cancelling() == 1
-        await asyncio.sleep(0)
-        assert task.done() is False
-        assert binding.finalize_calls == 0
-        renewal_runner.allow_settlement.set()
-        with pytest.raises(asyncio.CancelledError) as raised:
-            await asyncio.wait_for(task, timeout=10)
-        assert raised.value.args == ("cancel renewal with transferred owner",)
-        assert task.cancelled() is True
+        try:
+            if failure == "cancel_settlement":
+                await asyncio.wait_for(settlement_started.wait(), timeout=5)
+            if failure != "timeout":
+                task.cancel("cancel renewal with transferred owner")
+                assert task.cancelling() == 1
+            done, _ = await asyncio.wait((task,), timeout=2)
+            assert task in done, "Caller must exit while settlement is still blocked"
+            if failure != "timeout":
+                with pytest.raises(asyncio.CancelledError) as raised:
+                    await task
+                assert raised.value.args == ("cancel renewal with transferred owner",)
+                assert task.cancelled() is True
+                assert task.cancelling() == 1
+            else:
+                events = await task
+                assert any(event.type is EventType.SESSION_FAILED for event in events)
+            assert binding.finalize_calls == 0
+            assert not renewal_runner.settled
+            assert factory.release_actions == []
+            owner = app._environment_lifecycle._active_environment_setups[
+                "sess_cancelled_renewal_settlement"
+            ]
+            assert owner.admission_settlement_task is not None
+            assert not owner.admission_settlement_task.done()
+            assert owner.cleanup_ready_for_retry
+            with pytest.raises(RuntimeError, match="incomplete environment cleanup"):
+                app._environment_lifecycle._require_no_retained_cleanup_for_session(
+                    "sess_cancelled_renewal_settlement"
+                )
+            assert not await app.drain_environment_cleanups(timeout_s=0.01)
+            persisted = await app.session_store.load_events("sess_cancelled_renewal_settlement")
+            assert not any(event.type is EventType.SESSION_COMPLETED for event in persisted)
+        finally:
+            renewal_runner.allow_settlement.set()
+            await asyncio.gather(*lock_holders)
+            await asyncio.gather(task, return_exceptions=True)
+            assert await app.drain_environment_cleanups(timeout_s=5)
+            # Binding adoption transferred release ownership; cleanup belongs
+            # to its finalizer, not the factory's unclaimed-result callback.
+            assert factory.release_actions == []
+            assert binding.finalize_calls == 1
+            assert (
+                "sess_cancelled_renewal_settlement"
+                not in app._environment_lifecycle._active_environment_setups
+            )
         return task, provider, renewal_runner, binding
 
     task, provider, runner, binding = asyncio.run(run())
 
-    assert task.cancelled() is True
+    assert task.cancelled() is (failure != "timeout")
     assert provider.requests == []
     assert runner.refresh_calls == 1
     assert runner.settled is True
@@ -2202,6 +3616,304 @@ def test_binding_cannot_switch_the_admitted_execution_candidate() -> None:
     assert "environment_factory_release" not in failed.payload
 
 
+@pytest.mark.parametrize("result_present", [False, True])
+@pytest.mark.parametrize("publication_failure", ["none", "error", "cancel"])
+@pytest.mark.parametrize("group_source", ["none", "primary", "progress", "primary_cancel"])
+def test_factory_failure_progress_preserves_real_caller_cancellation(
+    monkeypatch,
+    result_present,
+    publication_failure,
+    group_source,
+):
+    import sys
+
+    primary = RuntimeError("admission probe transport failed")
+    if group_source == "primary":
+        primary = ExceptionGroup(
+            "primary probe failures",
+            [primary, ExceptionGroup("nested", [ValueError("probe detail")])],
+        )
+    secondary = RuntimeError("factory failure event persistence failed")
+    progress_detail = ExceptionGroup("progress detail", [RuntimeError("diagnostic failure")])
+    releases = []
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    later_publication_started = asyncio.Event()
+    progress_cancellations = []
+    progress_errors = []
+    observed_primary = []
+
+    class FailingFactory(_HostedFactory):
+        async def create(self, request):
+            if result_present:
+
+                async def release(action):
+                    releases.append(action)
+                    release_started.set()
+                    await allow_release.wait()
+
+                return EnvironmentFactoryResult(
+                    environment=Environment(EnvironmentSpec(name="hosted"), runner=self.runner),
+                    release=release,
+                )
+            raise primary
+
+    async def scenario():
+        nonlocal primary
+        if group_source == "primary_cancel":
+            child_started = asyncio.Event()
+
+            async def failed_child():
+                child_started.set()
+                await asyncio.Event().wait()
+
+            child = asyncio.create_task(failed_child())
+            await child_started.wait()
+            child.cancel("earlier child cancellation")
+            try:
+                await child
+            except asyncio.CancelledError as earlier:
+                primary = BaseExceptionGroup("primary failures", [primary, earlier])
+            assert child.cancelled() and child.cancelling() == 1
+        factory = FailingFactory(pre_create_candidate="hosted", runner=_EvidenceRunner("hosted"))
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="hosted", lifecycle_policy=EnvironmentLifecyclePolicy()),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        progress_started = asyncio.Event()
+        original_emit = app._event_writer.emit
+
+        async def block_failure_progress(event):
+            if result_present and event.type is EventType.ENVIRONMENT_FACTORY_COMPLETED:
+                raise primary
+            if event.type is EventType.ENVIRONMENT_FACTORY_FAILED:
+                if publication_failure == "error":
+                    raise secondary
+                if publication_failure == "cancel":
+                    later_publication_started.set()
+                    await asyncio.Event().wait()
+            if (
+                event.type is EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+                and event.payload["operation"] == "factory"
+                and event.payload["status"] == "failed"
+            ):
+                observed_primary.append(sys.exception())
+                progress_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as cancellation:
+                    progress_cancellations.append(cancellation)
+                    if group_source == "progress":
+                        aggregate = BaseExceptionGroup(
+                            "progress failures", [cancellation, progress_detail]
+                        )
+                        progress_errors.append(aggregate)
+                        raise aggregate from None
+                    progress_errors.append(cancellation)
+                    raise
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", block_failure_progress)
+        task = asyncio.create_task(_run(app, "factory-failure-progress-cancel"))
+        await asyncio.wait_for(progress_started.wait(), timeout=10)
+        accepted_primary = observed_primary[0]
+        assert isinstance(accepted_primary, BaseException)
+        if group_source == "primary_cancel" and not result_present:
+            # The opaque factory boundary safely reconstructs cancellation
+            # groups before the lifecycle accepts them. Preserve that exact
+            # accepted object, not the provider-owned pre-boundary wrapper.
+            assert isinstance(accepted_primary, BaseExceptionGroup)
+            assert len(accepted_primary.exceptions) == 2
+            assert isinstance(accepted_primary.exceptions[0], RuntimeError)
+            assert isinstance(accepted_primary.exceptions[1], asyncio.CancelledError)
+        else:
+            assert accepted_primary is primary
+        task.cancel("cancel failure progress")
+        assert task.cancelling() == 1
+        if result_present:
+            try:
+                await asyncio.wait_for(release_started.wait(), timeout=10)
+                assert not task.done()
+                assert len(releases) == 1
+            finally:
+                allow_release.set()
+        if publication_failure == "cancel":
+            await asyncio.wait_for(later_publication_started.wait(), timeout=10)
+            task.cancel("cancel later failure publication")
+            assert task.cancelling() == 2
+        try:
+            await task
+        except asyncio.CancelledError as cancellation:
+            if publication_failure == "cancel":
+                assert cancellation.args == ("cancel later failure publication",)
+                assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+                assert cancellation.__cause__.exceptions == (accepted_primary, progress_errors[0])
+            elif publication_failure == "error":
+                assert cancellation.args == ("cancel failure progress",)
+                assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+                assert cancellation.__cause__.exceptions == (
+                    (accepted_primary, progress_detail, secondary)
+                    if group_source == "progress"
+                    else (accepted_primary, secondary)
+                )
+            else:
+                assert cancellation.args == ("cancel failure progress",)
+                if group_source == "progress":
+                    assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+                    assert cancellation.__cause__.exceptions == (accepted_primary, progress_detail)
+                else:
+                    assert cancellation.__cause__ is accepted_primary
+        else:
+            pytest.fail("Factory failure progress swallowed caller cancellation")
+        assert task.cancelled()
+        assert provider.requests == []
+        assert len(releases) == int(result_present)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "publication_failure,release_fails",
+    [("none", False), ("error", False), ("cancel", False), ("none", True)],
+)
+@pytest.mark.parametrize("grouped_progress", [False, True])
+def test_binding_failure_progress_preserves_real_caller_cancellation(
+    monkeypatch, publication_failure, release_fails, grouped_progress
+):
+    async def scenario():
+        primary = RuntimeError("binding preparation failed")
+        progress_started = asyncio.Event()
+        release_started = asyncio.Event()
+        allow_release = asyncio.Event()
+        releases = []
+        publication_started = asyncio.Event()
+        secondary = RuntimeError("binding failure publication failed")
+        release_error = RuntimeError("factory release failed")
+        detail = ExceptionGroup("progress detail", [ValueError("diagnostic failure")])
+        progress_errors = []
+
+        class FailingBinding(_FailingBinding):
+            async def bind(self, workspace, runner, **kwargs):
+                raise primary
+
+        class Factory(_HostedFactory):
+            async def create(self, request):
+                async def release(action):
+                    releases.append(action)
+                    release_started.set()
+                    await allow_release.wait()
+                    await self.runner.close()
+                    if release_fails:
+                        raise release_error
+
+                return EnvironmentFactoryResult(
+                    environment=Environment(
+                        EnvironmentSpec(name="hosted"),
+                        runner=self.runner,
+                        binding=FailingBinding(),
+                    ),
+                    release=release,
+                )
+
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="hosted", lifecycle_policy=EnvironmentLifecyclePolicy()),
+            Factory(pre_create_candidate="hosted", runner=_EvidenceRunner("hosted")),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        original_emit = app._event_writer.emit
+
+        async def block_failure_progress(event):
+            if event.type is EventType.ENVIRONMENT_BINDING_FAILED:
+                if publication_failure == "error":
+                    raise secondary
+                if publication_failure == "cancel":
+                    publication_started.set()
+                    await asyncio.Event().wait()
+            if (
+                event.type is EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+                and event.payload["operation"] == "binding"
+                and event.payload["status"] == "failed"
+            ):
+                progress_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as cancellation:
+                    if grouped_progress:
+                        aggregate = BaseExceptionGroup("progress failures", [cancellation, detail])
+                        progress_errors.append(aggregate)
+                        raise aggregate from None
+                    progress_errors.append(cancellation)
+                    raise
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", block_failure_progress)
+        task = asyncio.create_task(_run(app, "binding-failure-progress-cancel"))
+        await asyncio.wait_for(progress_started.wait(), timeout=10)
+        task.cancel("cancel binding failure progress")
+        assert task.cancelling() == 1
+        try:
+            await asyncio.wait_for(release_started.wait(), timeout=10)
+            assert not task.done()
+            assert len(releases) == 1
+        finally:
+            allow_release.set()
+        if publication_failure == "cancel":
+            await asyncio.wait_for(publication_started.wait(), timeout=10)
+            task.cancel("cancel later binding publication")
+            assert task.cancelling() == 2
+        try:
+            await task
+        except asyncio.CancelledError as cancellation:
+            if publication_failure == "cancel":
+                assert cancellation.args == ("cancel later binding publication",)
+                assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+                assert cancellation.__cause__.exceptions == (primary, progress_errors[0])
+            else:
+                assert cancellation.args == ("cancel binding failure progress",)
+                expected = [primary]
+                if grouped_progress:
+                    expected.append(detail)
+                if release_fails:
+                    expected.append(release_error)
+                if publication_failure == "error":
+                    expected.append(secondary)
+                if len(expected) == 1:
+                    assert cancellation.__cause__ is primary
+                else:
+                    assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+                    assert cancellation.__cause__.exceptions == tuple(expected)
+        else:
+            pytest.fail("Binding failure progress swallowed caller cancellation")
+        assert task.cancelled()
+        assert task.cancelling() == (2 if publication_failure == "cancel" else 1)
+        assert releases == [EnvironmentFactoryReleaseAction.PRESERVE]
+        assert provider.requests == []
+        if release_fails:
+            from cayu.core.runtime_authority import SessionRunFenced
+
+            with pytest.raises(SessionRunFenced, match="previous invocation still owns"):
+                async for _event in app.resume(
+                    ResumeRequest(
+                        session_id="binding-failure-progress-cancel",
+                        messages=[Message.text("user", "retry")],
+                    )
+                ):
+                    pass
+            assert releases == [EnvironmentFactoryReleaseAction.PRESERVE]
+            assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
 def test_bind_failure_releases_unadopted_factory_result_once() -> None:
     async def run() -> tuple[
         list[Event],
@@ -2340,13 +4052,24 @@ def test_bind_cancellation_releases_unadopted_factory_result_once() -> None:
     }
 
 
-def test_cancellation_during_successful_factory_release_does_not_redispatch() -> None:
+@pytest.mark.parametrize("release_fails", [False, True])
+@pytest.mark.parametrize("cancel_terminal_progress", [False, True])
+def test_cancellation_during_successful_factory_release_does_not_redispatch(
+    monkeypatch, release_fails, cancel_terminal_progress
+) -> None:
+    binding_error = RuntimeError("binding failed before cancelled release")
+    release_error = RuntimeError("release callback failed after cancellation")
+
+    class ExactFailingBinding(_FailingBinding):
+        async def bind(self, workspace, runner, **kwargs):
+            raise binding_error
+
     class BlockingReleaseFactory(_ReleasableHostedFactory):
         def __init__(self) -> None:
             super().__init__(
                 pre_create_candidate="hosted",
                 runner=_EvidenceRunner("hosted"),
-                binding=_FailingBinding(),
+                binding=ExactFailingBinding(),
                 lifecycle=[],
             )
             self.release_started = asyncio.Event()
@@ -2361,6 +4084,8 @@ def test_cancellation_during_successful_factory_release_does_not_redispatch() ->
                 self.release_started.set()
                 await self.allow_release.wait()
                 await self.runner.close()
+                if release_fails:
+                    raise release_error
 
             return EnvironmentFactoryResult(
                 environment=Environment(
@@ -2377,7 +4102,7 @@ def test_cancellation_during_successful_factory_release_does_not_redispatch() ->
         app = CayuApp(enable_logging=False)
         app.register_provider(_RecordingProvider(), default=True)
         app.register_environment_factory(
-            EnvironmentSpec(name="hosted"),
+            EnvironmentSpec(name="hosted", lifecycle_policy=EnvironmentLifecyclePolicy()),
             factory,
             default=True,
         )
@@ -2386,6 +4111,21 @@ def test_cancellation_during_successful_factory_release_does_not_redispatch() ->
             execution_requirements=_requirements(),
         )
         session_id = "sess_cancel_during_successful_factory_release"
+        terminal_progress_started = asyncio.Event()
+        original_emit = app._event_writer.emit
+
+        async def block_terminal_progress(event):
+            if (
+                cancel_terminal_progress
+                and event.type is EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+                and event.payload["operation"] == "release"
+                and event.payload["status"] in {"completed", "retained", "failed"}
+            ):
+                terminal_progress_started.set()
+                await asyncio.Event().wait()
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", block_terminal_progress)
         task = asyncio.create_task(_run(app, session_id))
         await asyncio.wait_for(factory.release_started.wait(), timeout=10)
         assert factory.release_actions == [EnvironmentFactoryReleaseAction.PRESERVE]
@@ -2394,10 +4134,36 @@ def test_cancellation_during_successful_factory_release_does_not_redispatch() ->
         await asyncio.sleep(0)
         assert task.done() is False
         factory.allow_release.set()
+        if cancel_terminal_progress:
+            await asyncio.wait_for(terminal_progress_started.wait(), timeout=10)
+            task.cancel("cancel release terminal progress")
+            assert task.cancelling() == 2
         with pytest.raises(asyncio.CancelledError) as raised:
             await task
-        assert raised.value.args == ("cancel while factory release is running",)
+        assert raised.value.args == (
+            "cancel release terminal progress"
+            if cancel_terminal_progress
+            else "cancel while factory release is running",
+        )
+        if cancel_terminal_progress:
+            assert isinstance(raised.value.__cause__, BaseExceptionGroup)
+            leaves = []
+            pending = [raised.value.__cause__]
+            while pending:
+                current = pending.pop()
+                if isinstance(current, BaseExceptionGroup):
+                    pending.extend(reversed(current.exceptions))
+                else:
+                    leaves.append(current)
+            assert leaves[0] is binding_error
+            assert isinstance(leaves[1], asyncio.CancelledError)
+            assert leaves[1].args == ("cancel while factory release is running",)
+            assert leaves[2:] == ([release_error] if release_fails else [])
+        elif release_fails:
+            assert isinstance(raised.value.__cause__, BaseExceptionGroup)
+            assert raised.value.__cause__.exceptions == (binding_error, release_error)
         assert task.cancelled() is True
+        assert task.cancelling() == (2 if cancel_terminal_progress else 1)
         assert factory.release_actions == [EnvironmentFactoryReleaseAction.PRESERVE]
         assert factory.lifecycle == ["factory.release:preserve"]
         events = await app.session_store.load_events(session_id)
@@ -2407,14 +4173,85 @@ def test_cancellation_during_successful_factory_release_does_not_redispatch() ->
             if event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
             and event.payload["phase"] == "release"
         ]
-        assert release_transitions
-        assert release_transitions[-1].payload["outcome"] == "released"
+        if not cancel_terminal_progress:
+            assert release_transitions
+            assert release_transitions[-1].payload["outcome"] == (
+                "deferred" if release_fails else "released"
+            )
         return task, factory
 
     task, factory = asyncio.run(run())
 
     assert task.cancelled() is True
     assert factory.release_actions == [EnvironmentFactoryReleaseAction.PRESERVE]
+
+
+def test_cancelled_factory_release_timeout_retains_owner_until_settlement():
+    async def scenario():
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        completed = asyncio.Event()
+        actions = []
+
+        class Factory(_HostedFactory):
+            async def create(self, request):
+                self.requests.append(request)
+
+                async def release(action):
+                    actions.append(action)
+                    started.set()
+                    await finish.wait()
+                    await self.runner.close()
+                    completed.set()
+
+                return EnvironmentFactoryResult(
+                    environment=Environment(
+                        EnvironmentSpec(name="hosted"),
+                        runner=self.runner,
+                        binding=_FailingBinding(),
+                    ),
+                    release=release,
+                    release_timeout_s=0.1,
+                )
+
+        factory = Factory(pre_create_candidate="hosted", runner=_EvidenceRunner("hosted"))
+        provider = _RecordingProvider()
+        app = CayuApp(
+            enable_logging=False,
+            config=CayuConfig(operations=OperationsConfig(max_environment_lifecycle_owners=1)),
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(EnvironmentSpec(name="hosted"), factory, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        task = asyncio.create_task(_run(app, "cancel-release-timeout"))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=10)
+            task.cancel("cancel release before deadline")
+            assert task.cancelling() == 1
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await asyncio.wait_for(task, timeout=10)
+            assert raised.value.args == ("cancel release before deadline",)
+            assert task.cancelled() and task.cancelling() == 1
+            assert isinstance(raised.value.__cause__, BaseExceptionGroup)
+            assert isinstance(raised.value.__cause__.exceptions[-1], TimeoutError)
+            assert not completed.is_set()
+            assert "cancel-release-timeout" in (
+                app._environment_lifecycle._deferred_factory_cleanup_tasks
+            )
+            competing = await _run(app, "cancel-release-timeout-contender")
+            assert any(event.type is EventType.SESSION_FAILED for event in competing)
+            assert len(factory.requests) == 1
+            assert len(actions) == 1
+            assert provider.requests == []
+        finally:
+            finish.set()
+            assert await app.drain_environment_cleanups(timeout_s=1) is True
+        assert completed.is_set()
+        assert actions == [EnvironmentFactoryReleaseAction.PRESERVE]
+        assert app._environment_lifecycle._deferred_factory_cleanup_tasks == {}
+        assert app._environment_lifecycle._pending_environment_owner_admissions == set()
+
+    asyncio.run(scenario())
 
 
 def test_abandoned_factory_result_is_released_before_binding() -> None:
@@ -2516,6 +4353,136 @@ def test_active_factory_setups_consume_one_capacity_slot_each() -> None:
         "sess_factory_capacity_second",
     }
     assert pending_at_capacity == set()
+
+
+@pytest.mark.parametrize(
+    ("cancel_at", "cancel_cleanup"), [("started", False), ("failed", False), ("started", True)]
+)
+def test_aborted_setup_cleanup_progress_preserves_caller_cancellation(
+    monkeypatch, cancel_at, cancel_cleanup
+):
+    async def scenario():
+        binding_error = RuntimeError("binding completion publication failed")
+        preflight_error = RuntimeError("setup failure preflight read failed")
+        cleanup_error = RuntimeError("aborted binding cleanup failed")
+        publication_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        publishers = []
+        progress_events = []
+        binding_publication_failed = False
+
+        class Binding(_SwitchingBinding):
+            async def finalize(self, bound, *, outcome=None, metadata=None):
+                await super().finalize(bound, outcome=outcome, metadata=metadata)
+                if cancel_cleanup:
+                    cleanup_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError as cancellation:
+                        raise BaseExceptionGroup(
+                            "Cleanup failed during a new cancellation.",
+                            [cleanup_error, cancellation],
+                        ) from None
+                raise cleanup_error
+
+        runner = _EvidenceRunner("hosted")
+        binding = Binding(runner)
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="hosted", lifecycle_policy=EnvironmentLifecyclePolicy()),
+            _HostedFactory(pre_create_candidate="hosted", runner=runner, binding=binding),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        emit = app._event_writer.emit
+
+        async def fail_then_block(event):
+            nonlocal binding_publication_failed
+            if event.type is EventType.ENVIRONMENT_LIFECYCLE_PROGRESS:
+                progress_events.append((event.payload["operation"], event.payload["status"]))
+            if event.type is EventType.ENVIRONMENT_BINDING_COMPLETED:
+                binding_publication_failed = True
+                raise binding_error
+            if (
+                event.type is EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+                and event.payload["operation"] == "retained_cleanup"
+                and event.payload["status"] == cancel_at
+            ):
+                publishers.append(asyncio.current_task())
+                publication_started.set()
+                await asyncio.Event().wait()
+            return await emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", fail_then_block)
+
+        query_events = app.session_store.query_events
+
+        async def fail_failure_preflight(query):
+            if binding_publication_failed and query.event_types == (EventType.INTERACTION_STARTED,):
+                raise preflight_error
+            return await query_events(query)
+
+        monkeypatch.setattr(app.session_store, "query_events", fail_failure_preflight)
+        task = asyncio.create_task(_run(app, "abort-cleanup-progress"))
+        try:
+            publication_waiter = asyncio.create_task(publication_started.wait())
+            done, _ = await asyncio.wait(
+                (publication_waiter, task), timeout=10, return_when=asyncio.FIRST_COMPLETED
+            )
+            if publication_waiter not in done:
+                publication_waiter.cancel()
+                await asyncio.gather(publication_waiter, return_exceptions=True)
+            assert publication_started.is_set(), "\n".join(map(str, progress_events))
+            assert publishers == [task]
+            assert task.cancelling() == 0 and not task.done()
+            assert binding.finalize_calls == (0 if cancel_at == "started" else 1)
+            task.cancel("cancel aborted setup diagnostics")
+            assert task.cancelling() == 1
+            if cancel_cleanup:
+                await asyncio.wait_for(cleanup_started.wait(), timeout=10)
+                assert not task.done() and task.cancelling() == 1
+                task.cancel("cancel aborted setup cleanup")
+                assert task.cancelling() == 2
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await task
+            assert raised.value.args == (
+                "cancel aborted setup cleanup"
+                if cancel_cleanup
+                else "cancel aborted setup diagnostics",
+            )
+            assert isinstance(raised.value.__cause__, BaseExceptionGroup)
+            if cancel_cleanup:
+                leaves = []
+                pending = [raised.value.__cause__]
+                while pending:
+                    current = pending.pop()
+                    if isinstance(current, BaseExceptionGroup):
+                        pending.extend(reversed(current.exceptions))
+                    else:
+                        leaves.append(current)
+                assert leaves[0] is binding_error
+                assert isinstance(leaves[1], asyncio.CancelledError)
+                assert leaves[1].args == ("cancel aborted setup diagnostics",)
+                assert leaves[2:] == [cleanup_error]
+            else:
+                assert raised.value.__cause__.exceptions == (binding_error, cleanup_error)
+            assert binding_error.__cause__ is preflight_error
+            assert task.cancelled() and task.cancelling() == (2 if cancel_cleanup else 1)
+            assert provider.requests == []
+            assert binding.finalize_calls == 1
+            assert runner.is_closed
+            assert (
+                "abort-cleanup-progress"
+                not in app._environment_lifecycle._active_environment_setups
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 def test_binding_completion_publication_failure_finalizes_adopted_binding(
@@ -2665,8 +4632,10 @@ def test_binding_completion_publication_cancellation_finalizes_adopted_binding(
     assert bound_runner.is_closed is True
 
 
+@pytest.mark.parametrize("cancellation_phase", ["release", "failed_progress"])
 def test_release_publication_cancellation_after_finalize_failure_remains_cancellation(
     monkeypatch: pytest.MonkeyPatch,
+    cancellation_phase: str,
 ) -> None:
     finalization_error = RuntimeError("binding finalize failed")
 
@@ -2701,7 +4670,7 @@ def test_release_publication_cancellation_after_finalize_failure_remains_cancell
         app = CayuApp(enable_logging=False)
         app.register_provider(_RecordingProvider(), default=True)
         app.register_environment_factory(
-            EnvironmentSpec(name="hosted"),
+            EnvironmentSpec(name="hosted", lifecycle_policy=EnvironmentLifecyclePolicy()),
             factory,
             default=True,
         )
@@ -2714,8 +4683,14 @@ def test_release_publication_cancellation_after_finalize_failure_remains_cancell
 
         async def block_failed_release(event: Event) -> Event:
             if (
-                event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
+                cancellation_phase == "release"
+                and event.type is EventType.ENVIRONMENT_LIFECYCLE_TRANSITION
                 and event.payload["phase"] == "release"
+            ) or (
+                cancellation_phase == "failed_progress"
+                and event.type is EventType.ENVIRONMENT_LIFECYCLE_PROGRESS
+                and event.payload["operation"] == "finalization"
+                and event.payload["status"] == "failed"
             ):
                 release_publication_started.set()
                 await asyncio.Event().wait()
@@ -2729,13 +4704,9 @@ def test_release_publication_cancellation_after_finalize_failure_remains_cancell
         durable_events = await app.session_store.load_events(
             "sess_release_publication_cancel_after_finalize_failure"
         )
-        assert (
-            sum(
-                event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED
-                for event in durable_events
-            )
-            == 1
-        )
+        assert sum(
+            event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED for event in durable_events
+        ) == (1 if cancellation_phase == "release" else 0)
         task.cancel("cancel failed binding release publication")
         assert task.cancelling() == 1
         with pytest.raises(asyncio.CancelledError) as raised:
@@ -2743,6 +4714,18 @@ def test_release_publication_cancellation_after_finalize_failure_remains_cancell
         assert raised.value.args == ("cancel failed binding release publication",)
         assert raised.value.__cause__ is finalization_error
         assert task.cancelled() is True
+        assert task.cancelling() == 1
+        durable_events = await app.session_store.load_events(
+            "sess_release_publication_cancel_after_finalize_failure"
+        )
+        assert (
+            sum(
+                event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED
+                for event in durable_events
+            )
+            == 1
+        )
+        assert binding.finalize_calls == 1
         return task, durable_events
 
     task, durable_events = asyncio.run(run())
@@ -3309,6 +5292,8 @@ def test_missing_final_runner_evidence_returns_structured_refusal() -> None:
     assert decision["refusals"] == [
         {
             "code": "missing_final_evidence",
+            "tool_name": None,
+            "requirement_name": None,
             "capability": None,
             "executable": None,
             "required_state": None,

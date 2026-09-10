@@ -140,6 +140,64 @@ def iter_exception_tree(error: BaseException) -> Iterator[BaseException]:
                 pending.extend(reversed(children))
 
 
+def failure_control_cause(
+    errors: list[BaseException],
+    signal: BaseException,
+) -> BaseException | None:
+    """Retain ordered original trees once, excluding the propagated signal.
+
+    Untouched groups retain their exact identity. A later group overlapping an
+    earlier tree is rebuilt only where needed. Causal history is not interpreted
+    as a new control signal or a new explicit failure.
+    """
+    seen = {id(signal)}
+    retained: list[BaseException] = []
+    for error in errors:
+        rebuilt: list[BaseException | None] = []
+        pending: list[tuple[BaseException, int | None]] = [(error, None)]
+        while pending:
+            node, child_count = pending.pop()
+            identity = id(node)
+            if child_count is not None:
+                assert isinstance(node, BaseExceptionGroup)
+                children_results = rebuilt[-child_count:] if child_count else []
+                if child_count:
+                    del rebuilt[-child_count:]
+                remainder = [child for child in children_results if child is not None]
+                rebuilt.append(
+                    None
+                    if not remainder
+                    else remainder[0]
+                    if len(remainder) == 1
+                    else BaseExceptionGroup("Retained failure group.", remainder)
+                )
+                seen.add(identity)
+                continue
+            if identity in seen:
+                rebuilt.append(None)
+                continue
+            nodes = tuple(iter_exception_tree(node))
+            if not any(id(item) in seen for item in nodes):
+                rebuilt.append(node)
+                seen.update(id(item) for item in nodes)
+                continue
+            if isinstance(node, BaseExceptionGroup):
+                children = exception_group_children(node) or ()
+                pending.append((node, len(children)))
+                pending.extend((child, None) for child in reversed(children))
+            else:
+                rebuilt.append(None)
+        assert len(rebuilt) == 1
+        result = rebuilt[0]
+        if result is not None:
+            retained.append(result)
+    if not retained:
+        return None
+    if len(retained) == 1:
+        return retained[0]
+    return BaseExceptionGroup("Failures preceding the control signal.", retained)
+
+
 def rebuild_exception_group(
     error: BaseExceptionGroup,
     *,

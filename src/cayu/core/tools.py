@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 from weakref import ReferenceType, ref
 
 from pydantic import (
@@ -66,6 +67,233 @@ class ToolEffect(StrEnum):
     NONE = "none"
     IDEMPOTENT = "idempotent"
     EXTERNAL = "external"
+
+
+MAX_TOOL_EXECUTION_REQUIREMENTS = 32
+MAX_TOOL_EXECUTION_ALTERNATIVES = 16
+MAX_TOOL_EXECUTABLE_PROBE_ARGUMENTS = 8
+MAX_TOOL_EXECUTABLE_PROBE_EXIT_CODES = 16
+
+
+def _copy_bounded_iterable(
+    value: object,
+    *,
+    field_name: str,
+    maximum: int,
+) -> tuple[Any, ...]:
+    if isinstance(value, str | bytes | bytearray | Mapping | BaseModel):
+        raise TypeError(f"{field_name} must be an iterable, not text, a mapping, or a model.")
+    try:
+        iterator = iter(cast("Iterable[Any]", value))
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable.") from exc
+    copied: list[Any] = []
+    for index, item in enumerate(iterator):
+        if index >= maximum:
+            raise ValueError(f"{field_name} cannot contain more than {maximum} items.")
+        copied.append(item)
+    return tuple(copied)
+
+
+class ToolExecutableRequirement(BaseModel):
+    """An exact executable dependency, with an optional bounded process probe.
+
+    ``probe_arguments=None`` asks for executable availability without invoking
+    the workload. Explicit arguments select a process-form probe and become
+    part of its evidence identity; no shell command string is accepted.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    kind: Literal["executable"] = "executable"
+    executable: str = Field(max_length=4096)
+    probe_arguments: tuple[str, ...] | None = Field(
+        default=None,
+        max_length=MAX_TOOL_EXECUTABLE_PROBE_ARGUMENTS,
+    )
+    accepted_exit_codes: tuple[StrictInt, ...] = Field(
+        default=(0,),
+        min_length=1,
+        max_length=MAX_TOOL_EXECUTABLE_PROBE_EXIT_CODES,
+    )
+
+    @field_validator("executable")
+    @classmethod
+    def validate_executable(cls, value: str) -> str:
+        value = require_durable_clean_nonblank(value, "executable")
+        path = PurePosixPath(value)
+        if (
+            value == "/"
+            or value.startswith("//")
+            or ".." in path.parts
+            or str(path) != value
+            or ("/" in value and not path.is_absolute())
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._+-"
+                for character in value
+            )
+            or (not path.is_absolute() and not value[0].isalnum())
+        ):
+            raise ValueError(
+                "Executable must be a portable basename or normalized absolute guest path."
+            )
+        return value
+
+    @property
+    def fingerprint(self) -> str:
+        """Bind executable availability to the exact bounded probe contract."""
+
+        return (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(self.model_dump(mode="json"), "executable_requirement")
+            ).hexdigest()
+        )
+
+    @field_validator("probe_arguments", mode="before")
+    @classmethod
+    def copy_probe_arguments(cls, value: object) -> tuple[Any, ...] | None:
+        if value is None:
+            return None
+        return _copy_bounded_iterable(
+            value,
+            field_name="probe_arguments",
+            maximum=MAX_TOOL_EXECUTABLE_PROBE_ARGUMENTS,
+        )
+
+    @field_validator("probe_arguments")
+    @classmethod
+    def validate_probe_arguments(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        owned: list[str] = []
+        for argument in value:
+            argument = require_durable_text(argument, "probe_arguments item")
+            if len(argument.encode("utf-8")) > 256:
+                raise ValueError("Executable probe arguments cannot exceed 256 bytes each.")
+            owned.append(argument)
+        return tuple(owned)
+
+    @field_validator("accepted_exit_codes", mode="before")
+    @classmethod
+    def copy_accepted_exit_codes(cls, value: object) -> tuple[Any, ...]:
+        return _copy_bounded_iterable(
+            value,
+            field_name="accepted_exit_codes",
+            maximum=MAX_TOOL_EXECUTABLE_PROBE_EXIT_CODES,
+        )
+
+    @field_validator("accepted_exit_codes")
+    @classmethod
+    def validate_accepted_exit_codes(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(code < 0 or code > 125 for code in value):
+            raise ValueError(
+                "Executable probes cannot accept signal, launch, or missing-command exits."
+            )
+        if value != tuple(sorted(value)) or len(value) != len(set(value)):
+            raise ValueError("Executable probe exit codes must be unique and sorted.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_availability_probe(self):
+        if self.probe_arguments is None and self.accepted_exit_codes != (0,):
+            raise ValueError("Availability probes require successful executable lookup.")
+        return self
+
+
+class ToolRunnerCapabilityRequirement(BaseModel):
+    """One typed runner-native alternative owned by a tool contract."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    kind: Literal["runner_capability"] = "runner_capability"
+    capability: str = Field(max_length=96, pattern=r"^[a-z][a-z0-9_]{0,95}$")
+    minimum_evidence: Literal["available", "live_verified"] = "live_verified"
+
+
+def copy_tool_executable_probes(value: object) -> tuple[ToolExecutableRequirement, ...]:
+    """Own a bounded executable probe plan before any runner operation."""
+
+    items = _copy_bounded_iterable(value, field_name="executable_probes", maximum=64)
+    probes: dict[str, ToolExecutableRequirement] = {}
+    for item in items:
+        probe = ToolExecutableRequirement.model_validate(
+            item.model_dump(mode="python", warnings=False)
+            if isinstance(item, ToolExecutableRequirement)
+            else item
+        )
+        previous = probes.setdefault(probe.executable, probe)
+        if previous != probe:
+            raise ValueError("Executable probe declarations conflict.")
+    return tuple(probes[name] for name in sorted(probes))
+
+
+ToolExecutionRequirementAlternative = ToolExecutableRequirement | ToolRunnerCapabilityRequirement
+
+
+class ToolExecutionRequirement(BaseModel):
+    """One required tool facility represented by ordered compatible alternatives."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    name: str = Field(max_length=96, pattern=r"^[a-z][a-z0-9_]{0,95}$")
+    alternatives: tuple[ToolExecutionRequirementAlternative, ...] = Field(
+        min_length=1,
+        max_length=MAX_TOOL_EXECUTION_ALTERNATIVES,
+    )
+
+    @field_validator("alternatives", mode="before")
+    @classmethod
+    def copy_alternatives(cls, value: object) -> tuple[Any, ...]:
+        return _copy_bounded_iterable(
+            value,
+            field_name="alternatives",
+            maximum=MAX_TOOL_EXECUTION_ALTERNATIVES,
+        )
+
+    @model_validator(mode="after")
+    def validate_unique_alternatives(self) -> ToolExecutionRequirement:
+        identities = tuple(
+            (alternative.kind, alternative.executable)
+            if isinstance(alternative, ToolExecutableRequirement)
+            else (alternative.kind, alternative.capability)
+            for alternative in self.alternatives
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("Tool execution requirement alternatives must be unique.")
+        return self
+
+
+def copy_tool_execution_requirements(
+    value: object,
+) -> tuple[ToolExecutionRequirement, ...]:
+    """Return a bounded, detached, canonically ordered requirement set."""
+
+    items = _copy_bounded_iterable(
+        value,
+        field_name="execution_requirements",
+        maximum=MAX_TOOL_EXECUTION_REQUIREMENTS,
+    )
+    copied = tuple(
+        ToolExecutionRequirement.model_validate(
+            item.model_dump(mode="python", warnings=False)
+            if isinstance(item, ToolExecutionRequirement)
+            else item
+        )
+        for item in items
+    )
+    names = tuple(item.name for item in copied)
+    if names != tuple(sorted(names)) or len(names) != len(set(names)):
+        raise ValueError("Tool execution requirements must have unique names in sorted order.")
+    executable_count = sum(
+        isinstance(alternative, ToolExecutableRequirement)
+        for requirement in copied
+        for alternative in requirement.alternatives
+    )
+    if executable_count > 64:
+        raise ValueError("Tool execution requirements cannot name more than 64 executables.")
+    return copied
 
 
 @dataclass(frozen=True)
@@ -136,6 +364,15 @@ class _ToolSpecInput(BaseModel):
         le=MAX_DURABLE_JSON_INTEGER,
     )
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
+    execution_requirements: tuple[ToolExecutionRequirement, ...] = Field(
+        default_factory=tuple,
+        max_length=MAX_TOOL_EXECUTION_REQUIREMENTS,
+    )
+
+    @field_validator("execution_requirements", mode="before")
+    @classmethod
+    def copy_execution_requirements(cls, value: object) -> tuple[ToolExecutionRequirement, ...]:
+        return copy_tool_execution_requirements(value)
 
     @field_validator("input_schema", mode="before")
     @classmethod
@@ -182,6 +419,7 @@ class ToolSpec(BaseModel):
         le=MAX_DURABLE_JSON_INTEGER,
     )
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
+    execution_requirements: tuple[ToolExecutionRequirement, ...] = ()
     _input_schema: Any = PrivateAttr(default_factory=dict)
 
     def __init__(
@@ -195,6 +433,7 @@ class ToolSpec(BaseModel):
         workspace_mutation: bool = False,
         max_terminal_payload_bytes: int | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+        execution_requirements: Iterable[ToolExecutionRequirement] = (),
         **data: Any,
     ) -> None:
         parsed = _ToolSpecInput.model_validate(
@@ -207,6 +446,7 @@ class ToolSpec(BaseModel):
                 "workspace_mutation": workspace_mutation,
                 "max_terminal_payload_bytes": max_terminal_payload_bytes,
                 "execution_profile_identity": execution_profile_identity,
+                "execution_requirements": execution_requirements,
                 **data,
             }
         )
@@ -220,6 +460,7 @@ class ToolSpec(BaseModel):
             execution_profile_identity=copy_execution_profile_behavior_identity(
                 parsed.execution_profile_identity
             ),
+            execution_requirements=copy_tool_execution_requirements(parsed.execution_requirements),
         )
         object.__setattr__(self, "_input_schema", _freeze_value(parsed.input_schema))
 

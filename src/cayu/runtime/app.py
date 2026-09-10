@@ -2235,7 +2235,7 @@ class CayuApp:
             stored_execution_requirements = ExecutionRequirements.trusted()
         elif isinstance(execution_requirements, ExecutionRequirements):
             stored_execution_requirements = ExecutionRequirements.model_validate(
-                execution_requirements.model_dump(mode="python")
+                execution_requirements.model_dump(mode="python", warnings=False)
             )
         else:
             raise TypeError("execution_requirements must be ExecutionRequirements or None.")
@@ -8257,6 +8257,9 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
             tool.command_policy_execution_profile_identity
         ),
         tool=tool.tool,
+        execution_requirements=ToolSpec(
+            name=tool.name, execution_requirements=tool.execution_requirements
+        ).execution_requirements,
         child_session_recovery=tool.child_session_recovery,
         durable_tool_recovery=tool.durable_tool_recovery,
     )
@@ -8526,6 +8529,7 @@ def _validate_registered_tool(
         effect=spec.effect,
         workspace_mutation=spec.workspace_mutation,
         max_terminal_payload_bytes=spec.max_terminal_payload_bytes,
+        execution_requirements=spec.execution_requirements,
     )
     command_policy = getattr(tool, "command_policy", None)
     if isinstance(tool, ProcessIsolatedTool):
@@ -8573,6 +8577,7 @@ def _validate_registered_tool(
             )
         ),
         tool=tool,
+        execution_requirements=validated_spec.execution_requirements,
         child_session_recovery=(
             tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None
         ),
@@ -8605,6 +8610,7 @@ def _registered_tool_descriptor(
         publishes_arguments=tool.publish_arguments,
         workspace_mutation=tool.workspace_mutation,
         execution_contract=ToolExecutionContract.model_validate(tool.execution_contract),
+        execution_requirements=tool.execution_requirements,
         provenance=provenance,
     )
 

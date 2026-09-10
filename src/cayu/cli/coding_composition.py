@@ -3972,6 +3972,7 @@ from cayu import (
     RunCheckTool,
     RunCommandTool,
     RunRequest,
+    RunnerExecutionAdmissionObserver,
     RunnerWorkspace,
     ScriptedModelProvider,
     ToolContext,
@@ -4380,6 +4381,18 @@ class _LocalDockerRunner(DockerRunner):
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
         return self.candidate
 
+    def execution_admission_observer(self, requirements):
+        # This test runner owns local execution, not a real Docker container.
+        return RunnerExecutionAdmissionObserver(self, requirements)
+
+    def execution_admission_candidate_for(self, requirements):
+        return self.candidate
+
+    async def collect_execution_admission_candidate_for(self, requirements):
+        # Return only the fixture's explicit evidence, never infer new proof
+        # from requested dependencies or invoke Docker's production collector.
+        return self.candidate
+
     def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
         return self.authority
 
@@ -4434,8 +4447,9 @@ class _LocalDockerRunner(DockerRunner):
 
 def _live_candidate(
     factory: DockerCodingEnvironmentFactory,
+    request,
 ) -> ExecutionAdmissionCandidate:
-    configured = factory.construction_admission_candidate()
+    configured = factory.execution_admission_candidate(request)
     evidence = configured.evidence
     assert evidence is not None
     now = datetime.now(UTC)
@@ -4470,6 +4484,7 @@ def _live_candidate(
         executables=tuple(
             ExecutionExecutableEvidence(
                 executable=item.executable,
+                requirement_fingerprint=item.requirement_fingerprint,
                 state="live_verified",
                 observed_at=now,
                 valid_until=valid_until,
@@ -4606,7 +4621,7 @@ def _install_fake_docker_factory(
     created_runners: list[_LocalDockerRunner],
 ) -> None:
     async def fake_create(factory, request):
-        candidate = _live_candidate(factory)
+        candidate = _live_candidate(factory, request)
         runner = _LocalDockerRunner(
             target, candidate, factory.execution_environment_authority()
         )

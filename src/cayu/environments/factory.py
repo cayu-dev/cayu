@@ -634,7 +634,7 @@ class EnvironmentFactoryRequest:
             self,
             "execution_requirements",
             ExecutionRequirements.model_validate(
-                self.execution_requirements.model_dump(mode="python")
+                self.execution_requirements.model_dump(mode="python", warnings=False)
             ),
         )
 

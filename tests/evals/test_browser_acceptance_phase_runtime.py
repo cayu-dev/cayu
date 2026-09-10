@@ -10,8 +10,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from tests._tool_admission_fixtures import (
+    SimulatedToolFactory,
+    simulated_tool_executables,  # noqa: F401
+)
 from tests.core.test_browser_session import _FakeBrowserBackend
-from tests.core.test_environment_allocation_recovery import _FakeRemoteFactory, _FakeRemoteProvider
+from tests.core.test_environment_allocation_recovery import _FakeRemoteProvider
 from tests.evals.test_browser_acceptance_operator_oracle import (
     _project_operator_record,
     _settled_record,
@@ -42,6 +46,8 @@ from cayu.tools.browser_session import (
     _durable_browser_operation_key,
     _RunnerBrowserSessionBackend,
 )
+
+pytestmark = pytest.mark.usefixtures("simulated_tool_executables")
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -109,7 +115,9 @@ def test_runtime_phase_samples_cannot_assign_first_browser_requests_to_restorati
 
         app.register_provider(Provider([]), default=True)
         app.register_environment_factory(
-            EnvironmentSpec(name="browser"), _FakeRemoteFactory(_FakeRemoteProvider()), default=True
+            EnvironmentSpec(name="browser"),
+            SimulatedToolFactory(_FakeRemoteProvider()),
+            default=True,
         )
         app.register_agent(AgentSpec(name="agent", model="model"), tools=[BrowserSessionTool()])
         collector._begin()

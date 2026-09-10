@@ -38,6 +38,7 @@ from cayu.environments.admission import (
     ExecutionCapabilityEvidence,
     ExecutionEnvironmentAuthority,
     ExecutionExecutableEvidence,
+    ExecutionRequirements,
     ExecutionToolRequirementEvidence,
 )
 from cayu.environments.base import Environment, EnvironmentSpec
@@ -907,7 +908,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         if not isinstance(request, EnvironmentFactoryRequest):
             raise TypeError("Docker coding admission requires EnvironmentFactoryRequest.")
         self._validate_request(request)
-        return self._configured_candidate()
+        return self._configured_candidate(request.execution_requirements)
 
     def create_workspace_binding(
         self,
@@ -1179,15 +1180,16 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         allocation: EnvironmentAllocationContext | None,
     ) -> EnvironmentFactoryResult:
         self._validate_request(request)
-        effective_requirements = request.execution_requirements.model_copy(
-            update={
+        effective_requirements = ExecutionRequirements.model_validate(
+            {
+                **request.execution_requirements.model_dump(mode="python", warnings=False),
                 "required_executables": tuple(
                     sorted(
                         set(request.execution_requirements.required_executables).union(
                             self.required_executables
                         )
                     )
-                )
+                ),
             }
         )
         verify_local_docker_coding_toolchain_dependencies(
@@ -1237,6 +1239,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                         runner = await self._reconnect_runner(
                             container_id,
                             immutable_mounts=immutable_mounts,
+                            requirements=effective_requirements,
                         )
                     elif allocation.state is EnvironmentAllocationState.DISPATCHED:
                         container_name = cast(
@@ -1246,6 +1249,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                         runner = await self._create_or_recover_runner(
                             container_name,
                             immutable_mounts=immutable_mounts,
+                            requirements=effective_requirements,
                             allocation_identity=_docker_allocation_identity(allocation),
                         )
                     else:
@@ -1258,12 +1262,14 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                             allocation_id=allocation_id,
                         ),
                         immutable_mounts=immutable_mounts,
+                        requirements=effective_requirements,
                     )
             else:
                 container_id = cast("str", request.reconnect_metadata.get("container_id"))
                 runner = await self._reconnect_runner(
                     container_id,
                     immutable_mounts=immutable_mounts,
+                    requirements=effective_requirements,
                 )
             exact_container_id = runner.container_id
             if exact_container_id is None:
@@ -1287,7 +1293,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 != self.toolchain_profile.fingerprint
                 or final_evidence.tool_requirements is None
                 or tuple(claim.executable for claim in final_evidence.tool_requirements.executables)
-                != self.required_executables
+                != effective_requirements.executable_names()
                 or (
                     bool(self.immutable_inputs)
                     and (
@@ -1429,6 +1435,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         container_name: str,
         *,
         immutable_mounts: tuple[DockerImmutableInputMount, ...],
+        requirements: ExecutionRequirements,
         allocation_identity: str | None = None,
     ) -> DockerRunner:
         existing_id = await DockerRunner.resolve_container_id(
@@ -1445,6 +1452,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             return await self._reconnect_runner(
                 existing_id,
                 immutable_mounts=immutable_mounts,
+                requirements=requirements,
             )
         try:
             return await DockerRunner.create(
@@ -1463,7 +1471,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 seccomp_profile=self.seccomp_profile,
                 image_identity=self.image_identity,
                 workload_restrictions=self.restrictions,
-                required_executables=self.required_executables,
+                required_executables=requirements.executable_names(),
+                executable_probes=requirements.executable_probes(),
                 toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
                 immutable_input_mounts=immutable_mounts,
                 allocation_identity=allocation_identity,
@@ -1485,6 +1494,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             return await self._reconnect_runner(
                 recovered_id,
                 immutable_mounts=immutable_mounts,
+                requirements=requirements,
             )
 
     async def _reconnect_runner(
@@ -1492,6 +1502,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         container_id: str,
         *,
         immutable_mounts: tuple[DockerImmutableInputMount, ...],
+        requirements: ExecutionRequirements,
     ) -> DockerRunner:
         return await DockerRunner.reconnect_strict(
             f"cayu-coding-reconnect-{container_id[:12]}",
@@ -1502,7 +1513,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             runtime=self.runtime,
             seccomp_profile=self.seccomp_profile,
             docker_path=self.docker_path,
-            required_executables=self.required_executables,
+            required_executables=requirements.executable_names(),
+            executable_probes=requirements.executable_probes(),
             toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
             immutable_input_mounts=immutable_mounts,
             _execution_environment_authority=(self._execution_environment_authority),
@@ -1612,7 +1624,14 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         if request.reconnect_metadata != expected:
             raise ValueError("Docker coding reconnect metadata does not match this factory.")
 
-    def _configured_candidate(self) -> ExecutionAdmissionCandidate:
+    def _configured_candidate(
+        self, requirements: ExecutionRequirements | None = None
+    ) -> ExecutionAdmissionCandidate:
+        requirements = requirements or ExecutionRequirements.trusted()
+        names = tuple(sorted(set(self.required_executables).union(requirements.executable_names())))
+        if len(names) > 64:
+            raise ValueError("Docker execution requirements exceed the executable evidence bound.")
+        probes = {probe.executable: probe.fingerprint for probe in requirements.executable_probes()}
         environment_fingerprint = self._configuration_fingerprint
         image_fingerprint = self.image_identity.fingerprint
         if self.restrictions.supports_strict_privilege_evidence:
@@ -1676,9 +1695,10 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 executables=tuple(
                     ExecutionExecutableEvidence(
                         executable=executable,
+                        requirement_fingerprint=probes.get(executable),
                         state="declared",
                     )
-                    for executable in self.required_executables
+                    for executable in names
                 ),
             ),
         )

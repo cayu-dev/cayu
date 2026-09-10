@@ -3207,7 +3207,8 @@ async def test_timeout_result_survives_lost_journal_acknowledgement_without_redi
         tmp_path,
         provider=provider,
         suffix="timeout-ack-lost",
-        timeout_seconds=1,
+        # Allow normal setup to reach the deliberately blocked provider on CI.
+        timeout_seconds=5,
     )
     executor = _executor_with_execution_store(
         executor,

@@ -4,12 +4,15 @@ import asyncio
 import json
 
 import pytest
+from tests._tool_admission_fixtures import (
+    simulated_tool_app,
+    simulated_tool_executables,  # noqa: F401
+)
 from tests.core.test_runtime import FakeProvider
 from tests.core.test_structured_commands import _policy_request, _profile
 
 from cayu import (
     AgentSpec,
-    CayuApp,
     EventType,
     Message,
     RunCommandTool,
@@ -48,6 +51,8 @@ from cayu.storage import SQLiteSessionStore
         ),
     ],
 )
+@pytest.mark.parametrize("simulated_tool_executables", [("/opt/tools/pytest",)], indirect=True)
+@pytest.mark.usefixtures("simulated_tool_executables")
 def test_command_denial_survives_tool_round_and_sqlite_reload(tmp_path, args, code):
     async def run():
         profile = _profile()
@@ -69,7 +74,7 @@ def test_command_denial_survives_tool_round_and_sqlite_reload(tmp_path, args, co
         )
         path = tmp_path / "denial.sqlite"
         store = SQLiteSessionStore(path)
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = simulated_tool_app(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),

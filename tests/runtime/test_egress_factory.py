@@ -816,6 +816,7 @@ async def _run_virtual_factory_lifecycle(
     *,
     session_id: str,
     requirements: ExecutionRequirements,
+    tools=(),
 ) -> tuple[list[Event], _AdmissionRecordingProvider, CayuApp]:
     provider = _AdmissionRecordingProvider()
     app = CayuApp(enable_logging=False)
@@ -828,6 +829,7 @@ async def _run_virtual_factory_lifecycle(
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         execution_requirements=requirements,
+        tools=tools,
     )
     events = [
         event
@@ -1671,6 +1673,48 @@ def test_factory_does_not_accept_caller_assertions_in_place_of_adapter_evidence(
             runner_kind="docker",
             execution_evidence=evidence,
         )
+
+
+@pytest.mark.parametrize("executable_present", [True, False])
+def test_virtual_egress_combines_adapter_security_with_actual_guest_tool_probes(executable_present):
+    from tests.runners.test_microsandbox_admission import Guest, sdk
+
+    from cayu import MicrosandboxRunner, SearchTextTool
+    from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
+
+    async def create_runner(request):
+        guest = Guest(0 if executable_present else 1)
+        guest.registry_name = request.name
+        guest.running_name = request.name
+        return MicrosandboxRunner(guest, name=request.name, sandbox_module=sdk(guest))
+
+    class ProbeAdapter(_RecordingAdapter):
+        execution_admission_evidence_for = (
+            MicrosandboxEgressAdapter.execution_admission_evidence_for
+        )
+
+        def execution_capability_evidence(self, runner=None):
+            return _available_untrusted_execution_evidence(self.runner_kind)
+
+    adapter = ProbeAdapter("microsandbox", runner_factory=create_runner)
+    events, provider, _ = asyncio.run(
+        _run_virtual_factory_lifecycle(
+            _virtual_factory(adapter=adapter),
+            session_id=f"egress_probe_{executable_present}",
+            requirements=ExecutionRequirements.untrusted(),
+            tools=[SearchTextTool()],
+        )
+    )
+    assert len(provider.requests) == (1 if executable_present else 0)
+    assert adapter.captured["inner_runner"]._sandbox.calls
+    if not executable_present:
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        assert any(
+            refusal["tool_name"] == "search_text" and refusal["executable"] == "rg"
+            for refusal in failed.payload["execution_admission"]["refusals"]
+        )
+        assert EventType.SESSION_COMPLETED not in {event.type for event in events}
+    assert adapter.torn_down == 1
 
 
 def test_runtime_refuses_weakened_egress_evidence_and_cleans_up_before_exposure() -> None:

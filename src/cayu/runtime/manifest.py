@@ -671,7 +671,7 @@ def _describe_agent(
         workflow_tool_names=spec.workflow_tool_names,
         authoring_state=spec.authoring_state,
         execution_requirements=ExecutionRequirements.model_validate(
-            registration.execution_requirements.model_dump(mode="python")
+            registration.execution_requirements.model_dump(mode="python", warnings=False)
         ),
         tools=tuple(
             _describe_tool(

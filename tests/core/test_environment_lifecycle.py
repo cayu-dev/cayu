@@ -1423,10 +1423,12 @@ def test_cancelled_binding_does_not_repeat_deferred_factory_release() -> None:
         )
         await asyncio.wait_for(binding.entered.wait(), timeout=10)
         run_task.cancel("cancel during binding")
-        with pytest.raises(BaseExceptionGroup) as exc_info:
+        assert run_task.cancelling() == 1
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await run_task
-        assert any(isinstance(error, asyncio.CancelledError) for error in exc_info.value.exceptions)
-        assert any(isinstance(error, TimeoutError) for error in exc_info.value.exceptions)
+        assert run_task.cancelled()
+        assert run_task.cancelling() == 1
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
 
         assert factory.release_started.is_set()
         assert factory.release_calls == 1
@@ -1545,6 +1547,10 @@ def test_lazy_environment_cleanup_sweep_rotates_failed_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         execution_profile = None
         invocation_context = None
         cleanup_started = True
@@ -1598,6 +1604,10 @@ def test_lazy_environment_cleanup_does_not_await_unresolved_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         execution_profile = None
         invocation_context = None
         cleanup_started = True
@@ -1659,6 +1669,10 @@ def test_lazy_environment_cleanup_bounds_unresolved_settlement_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         execution_profile = None
         invocation_context = None
         cleanup_started = True
@@ -1712,6 +1726,10 @@ def test_lazy_environment_cleanup_bounds_unresolved_settlement_tasks(
 
 def test_lazy_cleanup_retries_internal_cancellation_from_prior_event_loop() -> None:
     class RetainedCleanup:
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         execution_profile = None
         invocation_context = None
         cleanup_started = True
@@ -1758,6 +1776,10 @@ def test_lazy_cleanup_child_cancellation_does_not_cancel_unrelated_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         execution_profile = None
         invocation_context = None
         cleanup_started = True
@@ -1874,6 +1896,10 @@ def test_unresolved_lazy_cleanup_does_not_block_unrelated_environment_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         execution_profile = None
         invocation_context = None
         cleanup_started = True
@@ -1949,6 +1975,11 @@ def test_unresolved_lazy_cleanup_does_not_block_unrelated_environment_setup(
 
 def test_environment_owner_capacity_fails_before_binding_mutation() -> None:
     class RetainedOwner:
+        cleanup_finished = False
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         cleanup_started = False
         cleanup_settlement_task = None
 
@@ -2001,6 +2032,11 @@ def test_environment_owner_capacity_fails_before_binding_mutation() -> None:
 
 def test_environment_owner_capacity_deduplicates_one_transferred_session() -> None:
     class RetainedOwner:
+        cleanup_finished = False
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         cleanup_started = True
         cleanup_settlement_task = None
 
@@ -3345,6 +3381,10 @@ def test_environment_cleanup_drain_timeout_keeps_mutation_task_owned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         execution_profile = None
         invocation_context = None
         cleanup_started = True
@@ -3406,6 +3446,10 @@ def test_environment_cleanup_drain_cancellation_keeps_mutation_task_owned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        admission_settlement_task = None
+        cleanup_ready_for_retry = (
+            environment_lifecycle_module._ActiveEnvironmentSetup.cleanup_ready_for_retry
+        )
         execution_profile = None
         invocation_context = None
         cleanup_started = True

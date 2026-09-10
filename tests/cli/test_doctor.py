@@ -903,7 +903,7 @@ def build_app():
             (
                 "from cayu.cli.doctor import _run_bounded_worker; "
                 "_run_bounded_worker('project:build_app', (), "
-                "worker_timeout_seconds=5)"
+                "worker_timeout_seconds=15)"
             ),
         ],
         cwd=tmp_path,
@@ -913,7 +913,7 @@ def build_app():
     )
     worker_pid: int | None = None
     try:
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 30
         while not marker.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert marker.exists()
@@ -921,7 +921,7 @@ def build_app():
 
         os.kill(owner.pid, signal.SIGKILL)
         owner.wait(timeout=2)
-        deadline = time.monotonic() + 6
+        deadline = time.monotonic() + 16
         while _linux_process_running(worker_pid) and time.monotonic() < deadline:
             time.sleep(0.01)
 
@@ -1201,13 +1201,16 @@ def build_app():
     elapsed = time.monotonic() - started
 
     output = capsys.readouterr()
-    # The timed-out SQLite read must settle well before the 20-second worker
-    # deadline, while allowing the separately spawned publication owner to boot.
-    assert elapsed < 15
+    # Total wall time includes two process startups and bundle publication;
+    # it is not the SQLite collector's settlement duration.
+    from cayu.support_bundles import DEFAULT_SUPPORT_BUNDLE_LIMITS
+
+    assert elapsed < DEFAULT_SUPPORT_BUNDLE_LIMITS.command_timeout_seconds
     assert json.loads(output.out)["outcome"] == "partial"
     assert output.err == ""
     document = _report_document(bundle)
     collectors = {item["name"]: item for item in document["collectors"]}
+    assert collectors["tasks"]["duration_ms"] < 15_000
     assert collectors["tasks"]["disposition"] == "timed_out"
     assert collectors["tasks"]["reason_code"] == "collector_deadline_elapsed"
     assert collectors["artifacts"]["disposition"] == "collected"

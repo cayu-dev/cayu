@@ -708,6 +708,7 @@ def test_policy_input_contains_no_live_execution_objects() -> None:
         "parallel_safe",
         "effect",
         "execution_contract",
+        "execution_requirements",
         "publishes_arguments",
         "workspace_mutation",
         "schema_fingerprint",

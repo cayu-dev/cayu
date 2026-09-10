@@ -17,7 +17,7 @@ from tests.environments.test_docker_coding import (
 )
 
 import cayu.runners.docker as docker_module
-from cayu import DockerWorkloadRestrictions, ExecResult
+from cayu import DockerWorkloadRestrictions, ExecResult, ToolExecutableRequirement
 from cayu.environments.factory import environment_factory_cleanup_settlement_task
 from cayu.runners.docker import DockerRunner, DockerRuntimeConfigurationError
 
@@ -140,6 +140,110 @@ def test_unverified_runner_cannot_mint_live_evidence():
     assert runner._runtime_evidence is None
 
 
+@pytest.mark.parametrize(
+    "result_kind", ["nonzero", "missing_receipt", "timeout", "cancel", "accepted_nonzero"]
+)
+def test_creation_probe_requires_guest_completion_before_return(monkeypatch, result_kind):
+    restrictions = DockerWorkloadRestrictions()
+    guest_active = False
+    cleanup_started = asyncio.Event()
+    probe_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    async def dispatch(command, **kwargs):
+        nonlocal guest_active
+        args = command.argv[1:]
+        if args[0] == "run":
+            return ExecResult(stdout=_CONTAINER_ID)
+        if args[0] == "inspect":
+            return ExecResult(stdout=json.dumps(_inspection(restrictions)))
+        if args[0] == "rm":
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            guest_active = False
+            return ExecResult()
+        if args[0] == "exec" and "id -u" in args[-1]:
+            return _completed_probe_result(args, stdout=restrictions.user)
+        if args[0] == "exec" and "python3" in args[-1]:
+            if result_kind == "accepted_nonzero":
+                return _completed_probe_result(args, guest_exit_code=1)
+            guest_active = True
+            probe_started.set()
+            if result_kind == "cancel":
+                await asyncio.Event().wait()
+            return ExecResult(
+                exit_code=0 if result_kind == "missing_receipt" else 1,
+                timed_out=result_kind == "timeout",
+            )
+        return _completed_probe_result(args)
+
+    monkeypatch.setattr(docker_module, "run_subprocess", dispatch)
+
+    async def scenario():
+        task = asyncio.create_task(
+            DockerRunner.create(
+                "creation-probe",
+                image=_IMAGE_REFERENCE,
+                image_identity=_image_identity(),
+                workload_restrictions=restrictions,
+                required_executables=("python3",),
+                executable_probes=(
+                    ToolExecutableRequirement(
+                        executable="python3",
+                        probe_arguments=("--version",),
+                        accepted_exit_codes=(1,),
+                    ),
+                ),
+                network="none",
+                replace=False,
+                credential_mode="trusted_tool",
+                cancellation_cleanup="sandbox",
+                timeout_cleanup="sandbox",
+                allow_raw_secret_env=False,
+                docker_path="/usr/bin/docker",
+            )
+        )
+        if result_kind == "accepted_nonzero":
+            runner = await task
+            assert runner._runtime_evidence.executable_availability == (("python3", True),)
+            allow_cleanup.set()
+            await runner.close()
+            return
+        waiter = asyncio.create_task(cleanup_started.wait())
+        try:
+            if result_kind == "cancel":
+                await asyncio.wait_for(probe_started.wait(), timeout=5)
+                task.cancel("cancel creation probe")
+                assert task.cancelling() == 1
+            await asyncio.wait((task, waiter), return_when=asyncio.FIRST_COMPLETED, timeout=5)
+            assert cleanup_started.is_set(), (
+                "Creation returned without settling ambiguous guest work"
+            )
+            assert guest_active
+            assert not task.done()
+        finally:
+            allow_cleanup.set()
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            result = await asyncio.gather(task, return_exceptions=True)
+            if isinstance(result[0], DockerRunner):
+                await result[0].close()
+        if result_kind == "cancel":
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert task.cancelled()
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            else:
+                pytest.fail("Creation cancellation is incompatible with CancelledError handlers")
+        else:
+            assert isinstance(result[0], DockerRuntimeConfigurationError)
+        assert not guest_active
+
+    asyncio.run(scenario())
+
+
 def test_admission_probe_completion_requires_exact_untruncated_receipt() -> None:
     token = "cayu-admission-probe-complete-" + "d" * 32
     marker = f"\n{token}:73\n"
@@ -178,9 +282,11 @@ def test_admission_probe_completion_requires_exact_untruncated_receipt() -> None
     "failure_mode",
     ["cancel", "timeout", "transport_exception", "transport_result"],
 )
+@pytest.mark.parametrize("probe_kind", ["identity", "executable", "process"])
 def test_final_admission_probe_retains_guest_owner_and_fences_reconnect(
     monkeypatch: pytest.MonkeyPatch,
     failure_mode: str,
+    probe_kind: str,
 ) -> None:
     restrictions = DockerWorkloadRestrictions()
     observed_at = datetime.now(UTC)
@@ -195,8 +301,14 @@ def test_final_admission_probe_retains_guest_owner_and_fences_reconnect(
         restrictions=restrictions,
         image_identity=_image_identity(),
         toolchain_profile_fingerprint=None,
-        required_executables=(),
-        executable_availability=(),
+        required_executables=("rg",),
+        executable_probes=(
+            ToolExecutableRequirement(
+                executable="rg",
+                probe_arguments=("--version",) if probe_kind == "process" else None,
+            ),
+        ),
+        executable_availability=(("rg", True),),
         immutable_input_mounts=(),
         observed_at=observed_at,
         valid_until=observed_at + timedelta(seconds=300),
@@ -238,7 +350,12 @@ def test_final_admission_probe_retains_guest_owner_and_fences_reconnect(
             guest_active = False
             probe_finished.set()
             return ExecResult()
-        if args[0] == "exec" and any("id -u" in value for value in args):
+        selected_probe = {
+            "identity": "id -u",
+            "executable": "name=$1",
+            "process": "rg --version",
+        }[probe_kind]
+        if args[0] == "exec" and any(selected_probe in value for value in args):
             guest_active = True
             probe_dispatched.set()
             if failure_active:
@@ -251,6 +368,10 @@ def test_final_admission_probe_retains_guest_owner_and_fences_reconnect(
                 else:
                     return ExecResult(exit_code=1, stderr="Docker stream disconnected")
             guest_active = False
+            return _completed_probe_result(
+                args, stdout=restrictions.user if probe_kind == "identity" else ""
+            )
+        if args[0] == "exec" and any("id -u" in value for value in args):
             return _completed_probe_result(args, stdout=restrictions.user)
         if args[0] == "exec":
             return _completed_probe_result(args)

@@ -292,8 +292,9 @@ app.register_agent(
 
 Omitting `execution_requirements` preserves the permissive
 `ExecutionRequirements.trusted()` default. Existing integrations that make no
-admission claim therefore continue to work for trusted agents, but fail closed
-when an agent requires capabilities for which they provide no evidence.
+admission claim therefore continue to work for trusted agents whose admitted
+tools have no external execution requirements. Agent and tool requirements both
+fail closed when the integration provides no corresponding evidence.
 
 A custom integration supplies evidence at two boundaries. The factory hook
 describes the candidate before allocation; the runner hook describes the exact
@@ -307,7 +308,7 @@ class HostedFactory(EnvironmentFactory):
     def execution_admission_candidate(self, request):
         return ExecutionAdmissionCandidate(
             candidate="acme-sandbox",
-            evidence=self._declared_evidence,
+            evidence=self._declare_candidate_evidence(request.execution_requirements),
         )
 
     async def create(self, request):
@@ -315,15 +316,31 @@ class HostedFactory(EnvironmentFactory):
 
 
 class HostedRunner(Runner):
-    async def collect_execution_admission_candidate(self):
+    def execution_admission_candidate_for(self, requirements):
         return ExecutionAdmissionCandidate(
             candidate="acme-sandbox",
-            evidence=await self._observe_exact_runtime_evidence(),
+            evidence=self._snapshot_exact_runtime_evidence(requirements),
+        )
+
+    async def collect_execution_admission_candidate_for(self, requirements):
+        return ExecutionAdmissionCandidate(
+            candidate="acme-sandbox",
+            evidence=await self._observe_exact_runtime_evidence(requirements),
         )
 ```
 
 Both evidence objects are `ExecutionCapabilityEvidence` whose `subject` is the
-same candidate string. The pre-create hook must be side-effect free: it may
+same candidate string. The example's declaration, snapshot and observation helpers are
+integration-owned: receiving a requirement is not evidence that it is met.
+The snapshot helper must read matching evidence without dispatching work, and
+must reflect the exact runner identity observed by the collection helper. An
+async collector alone is insufficient: dispatch re-reads the synchronous
+snapshot even before evidence expires. If observation requires retained state,
+use the request-local observer described below rather than a shared mutable
+current plan.
+The request includes the exact admitted tools' immutable requirements composed
+with the caller's requirements; an integration must not weaken that policy.
+The pre-create hook must be side-effect free: it may
 publish integration declarations, but it must not allocate a sandbox or claim
 that a live resource was observed. The final runner hook may perform bounded
 asynchronous inspection of the exact runner, but it must preserve caller
@@ -335,6 +352,38 @@ the synchronous `execution_admission_candidate()` hook; the default async
 collector delegates to it. Cayu calls the async collector after
 allocation/reconnect, binding, and setup, so evidence with a validity window
 must still be fresh then and at the later dispatch boundary.
+
+The lifecycle creates one `RunnerExecutionAdmissionObserver` after binding
+selects the final runner. Its default implementation delegates to the
+request-bound collection and snapshot hooks and the runner's refresh hook.
+An integration that retains observations should override
+`execution_admission_observer(requirements)` with request-local state for the
+exact runner and requirements. Do not store a shared mutable current probe
+plan: concurrent sessions may admit different tool sets. The observer is not
+serializable; recovery creates a new observer for the newly bound runner.
+
+For executable requirements, a non-toolchain `DockerRunner` uses a request-local
+observer and the same supervised guest-probe machinery as strict Docker
+admission. It requires the exact container ID supplied by creation or reconnect,
+checks the running container and immutable image before and after collection,
+and timestamps evidence before the first inspection. A name-only runner cannot
+provide this proof. The Docker virtual-egress adapter supplies only planned
+executable declarations before creation; final executable proof comes from the
+bound runner, without strengthening the adapter's security claims.
+
+This non-toolchain Docker collector uses the configured guest working directory
+and environment overlay, including credential-bearing overlays. Overlay values
+travel through a private environment file, not host-visible argv or the Docker
+CLI environment, and participate in output redaction. The owned probe task keeps
+the file until the host CLI is terminal, including when caller cancellation
+transfers guest settlement to a retained owner. For configured `secret_env`, the
+collector uses the same credential-mode validation, read-only secret resolution,
+and overlay precedence as Docker execution. Resolution precedes guest dispatch;
+lookup failure or cancellation does not produce executable proof. Secret values
+and their digests are not published as admission identity. Changing declared
+references or the configured resolver invalidates the request-local snapshot.
+Executable evidence is a time-bounded observation, not proof of credential
+validity or a subscription to changes in an external vault.
 
 A runner may implement `refresh_execution_admission()` to renew only expired
 live observations for that exact admitted runner. The common runtime invokes
@@ -349,6 +398,45 @@ still stale fail closed. A renewal implementation must settle every dispatched
 probe or transfer an authenticated settlement owner on every return and raise
 path; the runtime fences later dispatch and final binding cleanup behind that
 owner.
+
+### Live tool-requirement qualification
+
+`tests/runners/test_tool_admission_live.py` qualifies `SearchTextTool` through
+`CayuApp.run`, using a scripted provider rather than a paid model. Each backend
+has a present-`rg` case that must return an actual guest file match, and a
+missing-`rg` case that must refuse before any provider request or successful
+session. The test driver creates a small uniquely named fixture in the guest.
+Local driver tests and evidence fixtures are not live backend qualification.
+
+Prepare targets explicitly before opting in. Both cases need `python3`, `sh`,
+and a writable `/workspace`; only the positive case may provide `rg`. Do not
+put credentials or valuable data in these disposable targets. The harness does
+not install packages, build images, or request image pulls.
+
+- Docker: set `CAYU_860_DOCKER_PRESENT_IMAGE_ID` and
+  `CAYU_860_DOCKER_MISSING_IMAGE_ID` to already-loaded immutable `sha256:` image
+  IDs. The test checks each exact local image before creating a uniquely named,
+  restricted, network-disabled container and removes its container afterward.
+  Its test-only transport guard adds `--pull=never` to real Docker creation, so
+  a concurrent image prune cannot trigger an implicit download. Guest dispatch
+  and admission evidence still use the production Docker implementation.
+- Microsandbox: set `CAYU_860_MICROSANDBOX_PRESENT_SANDBOX` and
+  `CAYU_860_MICROSANDBOX_MISSING_SANDBOX` to pre-created disposable running
+  sandboxes named `cayu-860-live-*`. The test attaches to the exact provider
+  incarnation and **removes the supplied sandbox afterward**, including on test
+  failure. Re-create these targets before rerunning the qualification.
+
+After exporting the relevant target variables, run one backend at a time:
+
+```sh
+CAYU_RUN_TOOL_ADMISSION_LIVE=1 PYTHONPATH=src pytest -q tests/runners/test_tool_admission_live.py -k docker
+CAYU_RUN_TOOL_ADMISSION_LIVE=1 PYTHONPATH=src pytest -q tests/runners/test_tool_admission_live.py -k microsandbox
+```
+
+Without opt-in, these tests skip. Once opted in, missing configuration or
+infrastructure fails qualification rather than being reported as passing or
+silently skipped. A skipped or unavailable live test does not satisfy the live
+acceptance requirement.
 
 If a binding replaces the factory's runner, the replacement must report the
 same admitted candidate. Missing evidence, a changed candidate, insufficient

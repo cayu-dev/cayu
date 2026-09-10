@@ -3210,7 +3210,7 @@ def test_build_openai_token_count_payload_keeps_only_count_supported_fields() ->
     request = ModelRequest(
         model="gpt-test",
         messages=[Message.text("user", "Count this.")],
-        tools=[EchoTool.spec.model_dump()],
+        tools=[EchoTool.spec.model_dump(mode="json")],
         options={
             "openai": {
                 "parallel_tool_calls": False,

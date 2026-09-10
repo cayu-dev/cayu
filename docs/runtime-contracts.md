@@ -2302,7 +2302,9 @@ Registration derives one frozen `ToolDescriptor` without retaining the live
 `Tool`, runners, vaults, credentials, environments, hooks, or other mutable
 application objects. Its version binds the canonical tool id, registered name,
 description, exact input schema, effect and concurrency declarations,
-workspace-mutation and argument-publication behavior, and provenance. Native
+workspace-mutation and argument-publication behavior, and provenance. Typed
+execution requirements are also part of descriptor schema version 3 and its
+version fingerprint; changing a dependency changes the registered contract. Native
 ids are scoped `cayu:` identities. MCP ids combine the authoritative manifest
 identity with a fixed-size fingerprint of the original MCP name; descriptors do
 not retain potentially sensitive or unbounded source names and reuse the
@@ -2350,7 +2352,7 @@ The public planning substrate consists of:
 - `RegisteredToolCapability`, a deeply immutable, callable-free summary of a
   registered tool's name, description, exact input schema, concurrency and
   effect declarations, argument-publication behavior, and workspace-mutation
-  classification;
+  classification and typed execution requirements (capability schema version 3);
 - `ToolExposurePolicyRequest`, a bounded immutable view of session, agent,
   provider, model, step, transcript cursor, catalogue revision, registered
   capabilities, effective capability ceiling, previous profile, and
@@ -10315,6 +10317,12 @@ keyword, validate before side effects, and apply the same scalar rules and order
 
 ### Execution admission
 
+Completion-only workspace recovery is not a new execution admission. It authenticates
+the exact durable completion marker, live recovery claim, frozen invocation profile,
+and recorded binding/target before reconnecting or settling retained cleanup. Current
+tool declarations do not block that cleanup. The recovered environment is not exposed
+for provider or tool dispatch; ordinary runs still require full execution admission.
+
 `ExecutionRequirements` is the provider-neutral workload policy used to decide
 whether one explicitly selected execution candidate is suitable. It represents
 code trust, real-secret visibility, network access, guest privilege, host
@@ -10353,16 +10361,43 @@ every `EnvironmentFactoryRequest`; it is not accepted from an untrusted run
 request and cannot be weakened per session.
 `EnvironmentFactory.execution_admission_candidate()` exposes explicit,
 side-effect-free pre-create identity and evidence;
-`Runner.collect_execution_admission_candidate()` asynchronously observes the
-corresponding exact final runtime identity and evidence. Its default delegates
-to the synchronous, side-effect-free
-`Runner.execution_admission_candidate()` hook. Missing final evidence fails
+The lifecycle calls `Runner.execution_admission_candidate_for(requirements)`
+for a pre-create snapshot. After binding, it creates a request-scoped
+`RunnerExecutionAdmissionObserver` through
+`Runner.execution_admission_observer(requirements)`. The observer's `collect`,
+`snapshot`, and `refresh` methods own evidence observation, not permission to
+dispatch. The same exact observer, runner, and immutable requirement set are
+retained through exposure and renewal; a mismatched observer is rejected.
+Observers have no serialization form and must be recreated for a newly bound
+runner after recovery. An observer can hold bounded request-local evidence;
+it must not share mutable evidence state across unrelated admitted ceilings.
+
+The default observer delegates collection to
+`Runner.collect_execution_admission_candidate_for(requirements)`, snapshots to
+the request-bound snapshot hook, and refresh to `refresh_execution_admission()`.
+The request-bound base implementations delegate to
+`execution_admission_candidate()` and `collect_execution_admission_candidate()`;
+the latter defaults to the synchronous snapshot. Request-bound hooks must not
+overwrite a shared runner's probe plan: overlapping sessions can have different
+admitted tool ceilings. Requirements are requested proof, not evidence.
+Missing final evidence fails
 closed when the factory selected an explicit candidate; undeclared evidence
 also fails closed whenever the workload requires a capability or executable.
 An asynchronous collector must settle every dispatched inspection or transfer
 an authenticated settlement owner on every return and exception path. The
 runtime preserves a structured refusal and sequences unexposed release behind
 any transferred owner, so teardown cannot overtake an opaque live probe.
+If observation fails after workspace binding but before exposure, the active
+setup owner retains the probe's settlement task. Both terminal finalization and
+setup abort wait for that task before releasing the binding, including static
+environments without a factory release callback.
+If that settlement fails, the binding stays owned even though binding
+finalization has not started. The retained-cleanup sweep and
+`CayuApp.drain_environment_cleanups()` retry this prefix before releasing the
+binding; a failed drain does not authorize reconnect or provider work.
+For a static runner without a binding, the same authenticated probe settlement
+is retained by the deferred-cleanup registry. Operator drain can retry it, but
+this does not grant the runtime ownership to close the caller's static runner.
 
 `evaluate_execution_admission(...)` evaluates only the named candidate and
 returns an `ExecutionAdmissionDecision`; it never selects a provider or falls
@@ -10413,6 +10448,97 @@ it in the exact container and report time-bounded `live_verified` evidence.
 Missing, unavailable, stale, malformed, or fingerprint-mismatched executable
 evidence refuses admission.
 
+Tools declare their dependencies in immutable `ToolSpec.execution_requirements`.
+Each `ToolExecutionRequirement` is mandatory; its ordered `alternatives` are
+an OR of `ToolExecutableRequirement` and `ToolRunnerCapabilityRequirement`.
+Registration copies these declarations into the catalogue and capability
+identity. The lifecycle combines the exact durable tool ceiling with the
+agent's requirements before provider dispatch. Excluding a tool from that
+ceiling excludes its declaration; hiding an eligible tool temporarily does not.
+Tool alternatives cannot weaken an independently required caller capability or
+executable. Refusals attribute unmet alternatives to `tool_name` and
+`requirement_name`.
+
+Executable declarations accept portable basenames or normalized absolute guest
+paths. An absolute dependency is not satisfied by evidence for its basename.
+The default `probe_arguments=None` checks availability without running the
+configured workload or assuming it implements `--version`. Explicit bounded
+process arguments and accepted exit codes are part of the requirement
+fingerprint; evidence for a different probe does not prove that declaration.
+Availability means an executable file in the runner's namespace, not merely a
+shell built-in or function with the same name. Explicit process probes likewise
+execute the external program rather than a shell built-in.
+Negative process exits, launch/missing-command exits, and signal exits cannot
+be accepted as successful probe results. Probe output is not dependency evidence.
+
+`SearchTextTool` declares verified native `workspace_text_search_v1` support OR
+verified `rg`; `GitChangesTool` declares `git`. `RunCheckTool` declares the union
+of its named checks' executable dependencies, including each command's first
+argument. `RunCommandTool` declares its configured command authorities' exact
+executable paths. These declarations describe dependencies, not permission to
+execute any command. Command policy and the existing tool/runtime gates remain
+authoritative for dispatch.
+
+`ScreenshotPageTool` and `WebFetchTool` configured with Cayu's exact built-in
+`BrowserWebFetchAdapter` also declare the configured worker executable, including
+its absolute path. `BrowserSessionTool` with Cayu's built-in runner backend
+declares the pinned worker executable used by its interactive operations and
+receipt reconciliation. Custom browser-session backends, browser adapters and
+adapter subclasses declare their own
+dependencies through the enclosing `ToolSpec`; Cayu does not infer their
+implementation from a base class. Worker executable evidence is not proof that
+the browser workload, Playwright, Chromium, or a public browser invocation works;
+the existing browser workload identity, isolation checks, and end-to-end
+qualification remain necessary. Default HTTP `WebFetchTool` has no guest
+executable dependency. `ExecCommandTool` accepts a command selected at invocation
+time and has no single fixed executable to declare; applications supply hard
+requirements for their workload or use bounded `RunCheckTool`/`RunCommandTool`
+configurations. This does not turn arbitrary model-selected commands into
+verified installed programs.
+
+Registration alone proves neither executable availability nor native capability
+support. Availability proof does not prove a complete public tool invocation
+works. Live end-to-end qualification must call the public tool against the
+selected backend and observe its result; image existence or executable lookup
+alone is insufficient. Native search alternatives can be exercised with a
+compatible admission fixture until native dispatch and the production native
+backend are implemented separately. Such a fixture proves alternative admission,
+not native SearchText execution or backend conformance.
+
+Before tool-dependent provider or tool dispatch, the runtime reads the exact
+request-scoped observer snapshot even while cached evidence is fresh. A changed
+environment, image, or toolchain identity invalidates the admitted proof; a
+fresh validity window cannot authorize a replacement capability. Snapshot reads
+remain side-effect free, and only expired evidence can trigger live renewal.
+
+`LocalRunner` observes executable availability in its own workload namespace,
+using its root for relative PATH entries. This is local availability evidence,
+never evidence for an isolated guest. Explicit process probes that it has not
+executed remain `unverified`; a secret-owned executable search path also cannot
+be proved from the controller's environment. Local snapshots do not retain or
+overwrite another session's requirement plan.
+
+`MicrosandboxRunner` collects request-scoped executable evidence in the guest,
+binding it to the provider allocation's name, incarnation, configuration, root,
+and environment. A probe requires one well-typed guest exit event; ambiguous
+completion transfers settlement ownership and fences reuse until guest stop
+and the dispatched SDK operation both settle. The collector discards guest
+output and bounds observation time and stream-event count.
+
+Virtual-egress adapters may declare planned executable checks through
+`execution_admission_evidence_for(requirements)`. These declarations do not
+prove availability. The managed runner combines its adapter-owned security
+evidence with the inner runner's collected executable evidence under a combined
+environment identity. Inner executable or native-tool evidence cannot replace
+an adapter's security claim. Unsupported adapters do not gain evidence merely
+because a tool requests it.
+
+The built-in E2B and Lambda MicroVM runners currently inherit the no-evidence
+default for tool dependencies. A registered tool requiring executable or native
+capability proof is refused with those defaults; tools without external
+requirements remain compatible. Supporting a dependency requires an integration
+that supplies the explicit evidence contract, not a backend-name exemption.
+
 Cayu applies admission only at its common runtime lifecycle. The `pre_create`
 gate runs before any registered factory's `create()` method. Before creation,
 integrations report positive support only as `declared`; resource/process
@@ -10420,8 +10546,10 @@ availability cannot be claimed until a runner exists. After allocation or
 reconnect is durably owned and binding/setup has selected the exact runner, the
 runtime awaits final evidence and applies the `pre_exposure` gate. It then
 rechecks evidence freshness while minting exposure and again at every actual
-model or tool dispatch. When the only refusal is expired live evidence, the
-runtime may ask the exact admitted runner to renew it. Renewal is serialized
+model or tool dispatch. When every unsatisfied base requirement is stale and
+every unsatisfied tool clause has a stale alternative, the runtime may ask the
+exact admitted runner to renew evidence. Unavailable sibling alternatives do
+not prevent renewal of a stale alternative. Renewal is serialized
 under the private exposure authority and cannot replace the candidate,
 environment, immutable image, toolchain profile, environment authority, or
 binding generation. The runtime re-reads and evaluates the complete candidate;
@@ -10429,7 +10557,12 @@ the hook's return does not authorize execution. Unsupported renewal, a failed
 probe, identity drift, or still-stale evidence fails closed. Every dispatched
 renewal probe must settle or transfer an authenticated settlement owner before
 the hook returns or raises, and terminal binding cleanup is fenced behind that
-owner. Provider- and tool-specific checks may repeat validation defensively but
+owner. Foreground settlement waits are bounded, including terminal cleanup
+waiting for the renewal lock. Timeout or caller cancellation retains unresolved
+settlement with the exact cleanup owner; neither permits binding release or
+reuse. `CayuApp.drain_environment_cleanups()` can finish cleanup after settlement
+without keeping the original caller blocked. Provider- and tool-specific checks
+may repeat validation defensively but
 cannot mint exposure authority. A binding may supply or replace the runner
 during setup, but it may not change the selected candidate, environment
 authority, or binding generation afterward.

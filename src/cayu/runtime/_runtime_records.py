@@ -9,7 +9,13 @@ from cayu._validation import copy_durable_json_object, require_durable_clean_non
 from cayu._workspace_mutation import WorkspaceMutationProcessFence
 from cayu.core.agents import AgentSpec
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.tools import DurableToolRecovery, Tool, ToolEffect, ToolResult
+from cayu.core.tools import (
+    DurableToolRecovery,
+    Tool,
+    ToolEffect,
+    ToolExecutionRequirement,
+    ToolResult,
+)
 from cayu.environments import (
     BoundWorkspace,
     Environment,
@@ -21,6 +27,7 @@ from cayu.environments import (
 )
 from cayu.providers import ModelProvider, UsageDialect
 from cayu.providers.hosted import OpenAIWebSearch
+from cayu.runners.base import RunnerExecutionAdmissionObserver
 from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
 from cayu.runtime._environment_exposure import _EnvironmentExposure
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
@@ -112,6 +119,7 @@ class RegisteredTool:
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     command_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     tool: Tool
+    execution_requirements: tuple[ToolExecutionRequirement, ...] = ()
     child_session_recovery: ChildSessionRecoveryMatcher | None = None
     durable_tool_recovery: DurableToolRecovery | None = None
 
@@ -160,6 +168,11 @@ class RegisteredEnvironment:
     binding_payload: dict[str, Any] | None = None
     execution_candidate: str | None = None
     execution_candidate_declared: bool = False
+    execution_admission_observer: RunnerExecutionAdmissionObserver | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     execution_environment_authority: ExecutionEnvironmentAuthority | None = field(
         default=None,
         compare=False,

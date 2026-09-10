@@ -41,6 +41,30 @@ def _digest(content: bytes) -> str:
     return "sha256:" + sha256(content).hexdigest()
 
 
+@pytest.mark.parametrize("count", [10, 11, 32])
+def test_command_many_executable_requirements_are_canonical(count):
+    executables = tuple(f"/opt/program_{index:02}" for index in range(count))
+    profile = DockerCodingToolchainProfile(
+        profile_id="many",
+        revision="1",
+        image_identity=DockerImageIdentity(reference="registry.example/python@sha256:" + "b" * 64),
+        platform_architecture="amd64",
+        command_authorities=tuple(
+            DockerCodingCommandAuthority(
+                selector=executable.rsplit("/", 1)[-1],
+                revision="1",
+                description="Run command.",
+                exposure="structured_command",
+                executable=executable,
+            )
+            for executable in executables
+        ),
+    )
+    clauses = RunCommandTool(toolchain_profile=profile).spec.execution_requirements
+    assert [item.name for item in clauses] == sorted(item.name for item in clauses)
+    assert {item.alternatives[0].executable for item in clauses} == set(executables)
+
+
 def test_model_catalogue_exposes_each_selectors_actual_input_contract():
     import json
 
@@ -76,6 +100,9 @@ def test_model_catalogue_exposes_each_selectors_actual_input_contract():
         ),
     )
     tool = structured_commands.RunCommandTool(toolchain_profile=profile)
+    assert len(tool.spec.execution_requirements) == 1
+    assert tool.spec.execution_requirements[0].alternatives[0].executable == "/opt/private/python"
+    assert tool.spec.execution_requirements[0].alternatives[0].probe_arguments is None
     schema = tool.spec.input_schema
     assert schema["properties"]["timeoutSeconds"]["maximum"] == 30
     assert schema["properties"]["workingDirectory"]["enum"] == ["."]

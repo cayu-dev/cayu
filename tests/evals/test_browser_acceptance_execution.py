@@ -34,7 +34,9 @@ from cayu import (
     BudgetLimit,
     BudgetReservation,
     CayuApp,
+    Environment,
     EnvironmentSpec,
+    EventType,
     LocalArtifactStore,
     Message,
     ModelPrice,
@@ -43,7 +45,11 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     SQLiteBrowserProfileStore,
+    Tool,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
     ToolResult,
+    ToolSpec,
     VirtualEgressEnvironmentFactory,
     WebBridge,
 )
@@ -59,6 +65,8 @@ from cayu.environments import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
+    ExecutionExecutableEvidence,
+    ExecutionToolRequirementEvidence,
 )
 from cayu.evals import (
     AssertionEvidenceView,
@@ -565,10 +573,28 @@ class _ProtocolBrowserRunner(Runner):
             stream.write(json.dumps(document, sort_keys=True) + "\n")
 
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
+        # This protocol fixture implements the fixed worker below, not arbitrary
+        # requested executables. Its evidence is simulated, never live Docker proof.
+        worker = ToolExecutableRequirement(executable=PINNED_BROWSER_SESSION_WORKLOAD.command[0])
+        now = datetime.now(UTC)
+        fingerprint = "sha256:" + "e" * 64
         return ExecutionAdmissionCandidate(
-            candidate="browser-acceptance-runner",
+            candidate="docker",
             evidence=ExecutionCapabilityEvidence(
-                subject="browser-acceptance-runner",
+                subject="docker",
+                environment_fingerprint=fingerprint,
+                tool_requirements=ExecutionToolRequirementEvidence(
+                    environment_fingerprint=fingerprint,
+                    executables=(
+                        ExecutionExecutableEvidence(
+                            executable=worker.executable,
+                            requirement_fingerprint=worker.fingerprint,
+                            state="live_verified",
+                            observed_at=now,
+                            valid_until=now + timedelta(seconds=300),
+                        ),
+                    ),
+                ),
                 claims=tuple(
                     ExecutionCapabilityClaim.available(capability)
                     for capability in (
@@ -598,6 +624,26 @@ class _ProtocolEgressAdapter(SandboxEgressAdapter):
     def __init__(self, upstream_origin: str, evidence_path: str | None = None) -> None:
         self._upstream_origin = upstream_origin
         self._evidence_path = evidence_path
+
+    def execution_admission_evidence_for(self, requirements):
+        # The fixture supports only the protocol worker, regardless of requests.
+        worker = ToolExecutableRequirement(executable=PINNED_BROWSER_SESSION_WORKLOAD.command[0])
+        fingerprint = "sha256:" + "e" * 64
+        return self.execution_capability_evidence().model_copy(
+            update={
+                "environment_fingerprint": fingerprint,
+                "tool_requirements": ExecutionToolRequirementEvidence(
+                    environment_fingerprint=fingerprint,
+                    executables=(
+                        ExecutionExecutableEvidence(
+                            executable=worker.executable,
+                            requirement_fingerprint=worker.fingerprint,
+                            state="declared",
+                        ),
+                    ),
+                ),
+            }
+        )
 
     async def prepare(self, *, session_id, grants, broker):  # type: ignore[no-untyped-def]
         del session_id, grants, broker
@@ -1061,6 +1107,52 @@ async def _project_scenario_execution(
         fault=result.fault,
         recovered_tool_calls=result.recovered_tool_calls,
     )
+
+
+@pytest.mark.parametrize("requirement_kind", ["worker", "unknown", "different_probe"])
+def test_protocol_browser_fixture_proves_only_its_fixed_worker(requirement_kind: str) -> None:
+    worker = PINNED_BROWSER_SESSION_WORKLOAD.command[0]
+    dependency = ToolExecutableRequirement(
+        executable="unknown_fixture_program" if requirement_kind == "unknown" else worker,
+        probe_arguments=() if requirement_kind == "different_probe" else None,
+    )
+
+    class FixtureTool(Tool):
+        spec = ToolSpec(
+            name="fixture_tool",
+            execution_requirements=(
+                ToolExecutionRequirement(name="worker", alternatives=(dependency,)),
+            ),
+        )
+
+        async def run(self, ctx, args):
+            raise AssertionError("Admission must not execute a fixture tool")
+
+    async def run():
+        runner = _ProtocolBrowserRunner("http://unused.invalid")
+        provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="fixture"), runner=runner), default=True
+        )
+        app.register_agent(AgentSpec(name="fixture", model="scripted"), tools=[FixtureTool()])
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="fixture",
+                    session_id=f"fixed-worker-{requirement_kind}",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        ]
+        admitted = requirement_kind == "worker"
+        assert len(provider.requests) == int(admitted)
+        assert any(event.type is EventType.SESSION_COMPLETED for event in events) is admitted
+        assert runner.operations == []
+
+    asyncio.run(run())
 
 
 def test_browser_acceptance_runs_through_public_app_webbridge_and_runner(tmp_path: Path) -> None:

@@ -13,6 +13,10 @@ from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
+from tests._tool_admission_fixtures import (
+    simulated_tool_app,
+    simulated_tool_executables,  # noqa: F401
+)
 
 import cayu.runtime._execution_profile_admission as execution_profile_admission
 import cayu.runtime._session_engine as session_engine_module
@@ -4488,6 +4492,10 @@ def test_declared_identity_makes_opaque_built_in_tool_adapter_portable() -> None
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    "simulated_tool_executables", [("/usr/local/bin/python", "python", "rg")], indirect=True
+)
+@pytest.mark.usefixtures("simulated_tool_executables")
 def test_browser_adapter_dom_limit_changes_implementation_profile_before_work() -> None:
     async def exercise() -> None:
         session_id = "execution-profile-browser-dom-limit"
@@ -4495,7 +4503,7 @@ def test_browser_adapter_dom_limit_changes_implementation_profile_before_work() 
 
         def configured_app(*, max_dom_nodes: int) -> tuple[CayuApp, ScriptedModelProvider]:
             provider = _completed_provider()
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = simulated_tool_app(session_store=store, enable_logging=False)
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
@@ -4559,6 +4567,10 @@ def test_browser_adapter_dom_limit_changes_implementation_profile_before_work() 
     ),
     ids=("dom-nodes", "page-policy", "per-page-refs"),
 )
+@pytest.mark.parametrize(
+    "simulated_tool_executables", [("/usr/local/bin/python", "python", "rg")], indirect=True
+)
+@pytest.mark.usefixtures("simulated_tool_executables")
 def test_browser_session_configuration_changes_implementation_profile_before_work(
     original_options: dict[str, Any],
     changed_options: dict[str, Any],
@@ -4569,7 +4581,7 @@ def test_browser_session_configuration_changes_implementation_profile_before_wor
 
         def configured_app(options: dict[str, Any]) -> tuple[CayuApp, ScriptedModelProvider]:
             provider = _completed_provider()
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = simulated_tool_app(session_store=store, enable_logging=False)
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
@@ -4618,12 +4630,16 @@ def test_browser_session_configuration_changes_implementation_profile_before_wor
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    "simulated_tool_executables", [("/usr/local/bin/python", "python", "rg")], indirect=True
+)
+@pytest.mark.usefixtures("simulated_tool_executables")
 def test_browser_session_mutated_limit_cannot_claim_shipped_backend_profile() -> None:
     async def exercise() -> None:
         session_id = "execution-profile-mutated-browser-session-limit"
         store = InMemorySessionStore()
         original_provider = _completed_provider()
-        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app = simulated_tool_app(session_store=store, enable_logging=False)
         original_app.register_provider(original_provider, default=True)
         mutated_tool = BrowserSessionTool(max_response_bytes=1024)
         mutated_tool.max_response_bytes = 1025
@@ -4642,7 +4658,7 @@ def test_browser_session_mutated_limit_cannot_claim_shipped_backend_profile() ->
         )
 
         replacement_provider = _completed_provider()
-        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app = simulated_tool_app(session_store=store, enable_logging=False)
         replacement_app.register_provider(replacement_provider, default=True)
         replacement_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
@@ -4663,6 +4679,10 @@ def test_browser_session_mutated_limit_cannot_claim_shipped_backend_profile() ->
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    "simulated_tool_executables", [("/usr/local/bin/python", "python", "rg")], indirect=True
+)
+@pytest.mark.usefixtures("simulated_tool_executables")
 def test_custom_browser_worker_is_app_local_without_declared_identity() -> None:
     async def exercise() -> None:
         session_id = "execution-profile-custom-browser-worker"
@@ -4670,7 +4690,7 @@ def test_custom_browser_worker_is_app_local_without_declared_identity() -> None:
 
         def configured_app() -> tuple[CayuApp, ScriptedModelProvider]:
             provider = _completed_provider()
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = simulated_tool_app(session_store=store, enable_logging=False)
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
@@ -4720,6 +4740,10 @@ def test_custom_browser_worker_is_app_local_without_declared_identity() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    "simulated_tool_executables", [("/usr/local/bin/python", "python", "rg")], indirect=True
+)
+@pytest.mark.usefixtures("simulated_tool_executables")
 def test_cayu_tool_configuration_changes_implementation_profile_before_work() -> None:
     async def exercise() -> None:
         session_id = "execution-profile-built-in-tool-configuration"
@@ -4727,7 +4751,7 @@ def test_cayu_tool_configuration_changes_implementation_profile_before_work() ->
 
         def configured_app(*, max_preview_bytes: int) -> tuple[CayuApp, ScriptedModelProvider]:
             provider = _completed_provider()
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = simulated_tool_app(session_store=store, enable_logging=False)
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),

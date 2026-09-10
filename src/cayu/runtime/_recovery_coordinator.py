@@ -31,6 +31,7 @@ from cayu._exception_groups import (
     exception_context,
     exception_group_children,
     exception_suppresses_context,
+    failure_control_cause,
     iter_exception_tree,
     set_exception_cause,
 )
@@ -1127,10 +1128,33 @@ async def _run_recovery_cleanup_steps(
         cancellation_baseline=cancellation_baseline,
     )
     cleanup_supervisor = supervisor or RecoveryCleanupSupervisor()
-    cleanup_failures = await cleanup_supervisor.run_steps(
+    cleanup_outcome = await cleanup_supervisor.run_steps_with_control(
         steps=steps,
         shield_caller_cancellation=isinstance(abandonment, asyncio.CancelledError),
     )
+    cleanup_failures = cleanup_outcome.failures
+
+    control: BaseException | None = cleanup_outcome.caller_cancellation
+    for _operation, failure in cleanup_failures:
+        fatal = _terminal_finalization_process_control(failure)
+        if fatal is not None:
+            control = fatal
+            break
+    if (
+        control is not None
+        and authoritative_failure is not None
+        and abandonment is None
+        and not _recovery_failure_contains_process_control(authoritative_failure)
+    ):
+        # Fatal signals come from explicit cleanup trees; caller cancellation
+        # comes only from the supervising await, never a child or old cause.
+        cause = failure_control_cause(
+            [authoritative_failure, *(failure for _operation, failure in cleanup_failures)],
+            control,
+        )
+        if cause is not None:
+            _attach_exception_cause_preserving_graph(control, cause)
+        raise control from exception_cause(control)
 
     if not cleanup_failures:
         return ()
@@ -20299,6 +20323,9 @@ class RecoveryCoordinator:
         elif session.status is not SessionStatus.FAILED:
             raise RuntimeError("Pending completion finalization requires a failed session.")
 
+        completion_recovery = await self._environment_lifecycle.authorize_completion_recovery(
+            session=session, invocation_context=invocation_context, marker=marker
+        )
         events: list[Event] = []
         resolved_environment = registered_environment
         resolved_context = invocation_context
@@ -20310,6 +20337,8 @@ class RecoveryCoordinator:
                 registered_environment=resolved_environment,
                 execution_profile=execution_profile,
                 marker=marker,
+                completion_recovery=completion_recovery,
+                invocation_context=resolved_context,
             )
             if not disposal_recovered:
                 factory_started = await self._environment_lifecycle.emit_factory_started(
@@ -20329,6 +20358,7 @@ class RecoveryCoordinator:
                     operation=EnvironmentFactoryOperation.RECONNECT,
                     execution_profile=execution_profile,
                     invocation_context=resolved_context,
+                    completion_recovery=completion_recovery,
                 )
                 events.extend(factory_resolution.events)
                 resolved_environment = factory_resolution.registered_environment
@@ -20356,7 +20386,7 @@ class RecoveryCoordinator:
                     started_event=binding_started,
                     execution_profile=execution_profile,
                     invocation_context=resolved_context,
-                    completion_finalization_recovery_state=marker["binding_state"],
+                    completion_recovery=completion_recovery,
                 )
                 events.extend(binding_result.events)
                 resolved_environment = binding_result.registered_environment

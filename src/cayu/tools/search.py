@@ -15,13 +15,23 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_text,
 )
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    ToolResult,
+    ToolRunnerCapabilityRequirement,
+    ToolSpec,
+)
 from cayu.runners import ExecCommand, ExecResult, RunnerUnavailableError
 from cayu.tools._errors import (
     reject_unknown_tool_arguments,
     structured_invalid_arguments,
     tool_argument_validation,
 )
+from cayu.tools._execution_requirements import with_intrinsic_execution_requirements
 from cayu.vaults import SecretRedactor
 
 DEFAULT_SEARCH_LIMIT = 100
@@ -94,6 +104,15 @@ class _BoundedSearchPage:
 def _search_text_tool_spec(*, default_limit: int, max_limit: int) -> ToolSpec:
     return ToolSpec(
         name="search_text",
+        execution_requirements=(
+            ToolExecutionRequirement(
+                name="workspace_text_search",
+                alternatives=(
+                    ToolRunnerCapabilityRequirement(capability="workspace_text_search_v1"),
+                    ToolExecutableRequirement(executable="rg"),
+                ),
+            ),
+        ),
         effect=ToolEffect.NONE,
         description=(
             "Search text in the active runner workspace with bounded, pageable results. "
@@ -220,11 +239,14 @@ class SearchTextTool(Tool):
         )
         self.exclude_directories = _validate_exclude_directories(exclude_directories)
         self.protected_entry_names = _validate_protected_entry_names(protected_entry_names)
+        default_spec = _search_text_tool_spec(
+            default_limit=self.default_limit,
+            max_limit=self.max_limit,
+        )
         super().__init__(
-            spec
-            or _search_text_tool_spec(
-                default_limit=self.default_limit,
-                max_limit=self.max_limit,
+            with_intrinsic_execution_requirements(
+                default_spec if spec is None else spec,
+                default_spec.execution_requirements,
             )
         )
 

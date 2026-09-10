@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 import tracemalloc
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,10 @@ from cayu import (
     EventType,
     ExecCommand,
     ExecResult,
+    ExecutionAdmissionCandidate,
+    ExecutionCapabilityEvidence,
+    ExecutionExecutableEvidence,
+    ExecutionToolRequirementEvidence,
     InMemorySessionStore,
     LocalWorkspace,
     Message,
@@ -27,6 +32,7 @@ from cayu import (
     ScriptedModelProvider,
     SearchTextTool,
     ToolContext,
+    ToolExecutableRequirement,
 )
 from cayu.providers import ModelRequest, build_openai_payload
 from cayu.runners import LocalRunner, RunnerUnavailableError
@@ -1412,6 +1418,33 @@ def test_search_text_total_byte_budget_honors_exact_boundary() -> None:
 
 
 def test_search_text_durable_event_and_transcript_payloads_remain_bounded(tmp_path) -> None:
+    class AdmittedResultRunner(_ResultRunner):
+        def execution_admission_candidate(self):
+            observed_at = datetime.now(UTC)
+            fingerprint = "sha256:" + "1" * 64
+            return ExecutionAdmissionCandidate(
+                candidate="scripted_search",
+                evidence=ExecutionCapabilityEvidence(
+                    subject="scripted_search",
+                    unclaimed_reason_code="security_unclaimed",
+                    environment_fingerprint=fingerprint,
+                    tool_requirements=ExecutionToolRequirementEvidence(
+                        environment_fingerprint=fingerprint,
+                        executables=(
+                            ExecutionExecutableEvidence(
+                                executable="rg",
+                                state="live_verified",
+                                observed_at=observed_at,
+                                valid_until=observed_at + timedelta(seconds=60),
+                                requirement_fingerprint=ToolExecutableRequirement(
+                                    executable="rg"
+                                ).fingerprint,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
     runner_output = "".join(
         f"src/generated.py\0{line}\x1fneedle {'界' * 100}\n" for line in range(1, 101)
     )
@@ -1438,7 +1471,7 @@ def test_search_text_durable_event_and_transcript_payloads_remain_bounded(tmp_pa
         Environment(
             EnvironmentSpec(name="local"),
             workspace=LocalWorkspace(tmp_path, workspace_id="search-bounds"),
-            runner=_ResultRunner(ExecResult(stdout=runner_output)),
+            runner=AdmittedResultRunner(ExecResult(stdout=runner_output)),
         ),
         default=True,
     )

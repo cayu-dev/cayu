@@ -8673,6 +8673,23 @@ export type ExecutionRequirements = {
      * Required Executables
      */
     required_executables?: Array<string>;
+    /**
+     * Tool Requirements
+     */
+    tool_requirements?: Array<ExecutionToolRequirement>;
+};
+
+/**
+ * ExecutionToolRequirement
+ *
+ * A tool-owned clause composed into the common workload admission policy.
+ */
+export type ExecutionToolRequirement = {
+    requirement: ToolExecutionRequirement;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
 };
 
 /**
@@ -16444,6 +16461,50 @@ export type ToolDiscoveryViewInspection = {
 };
 
 /**
+ * ToolExecutableRequirement
+ *
+ * An exact executable dependency, with an optional bounded process probe.
+ *
+ * ``probe_arguments=None`` asks for executable availability without invoking
+ * the workload. Explicit arguments select a process-form probe and become
+ * part of its evidence identity; no shell command string is accepted.
+ */
+export type ToolExecutableRequirement = {
+    /**
+     * Accepted Exit Codes
+     */
+    accepted_exit_codes?: Array<number>;
+    /**
+     * Executable
+     */
+    executable: string;
+    /**
+     * Kind
+     */
+    kind?: 'executable';
+    /**
+     * Probe Arguments
+     */
+    probe_arguments?: Array<string> | null;
+};
+
+/**
+ * ToolExecutionRequirement
+ *
+ * One required tool facility represented by ordered compatible alternatives.
+ */
+export type ToolExecutionRequirement = {
+    /**
+     * Alternatives
+     */
+    alternatives: Array<ToolExecutableRequirement | ToolRunnerCapabilityRequirement>;
+    /**
+     * Name
+     */
+    name: string;
+};
+
+/**
  * ToolManifest
  */
 export type ToolManifest = {
@@ -16700,6 +16761,26 @@ export type ToolRoundRecoveryBody = {
      * Tool Call Id
      */
     tool_call_id: string;
+};
+
+/**
+ * ToolRunnerCapabilityRequirement
+ *
+ * One typed runner-native alternative owned by a tool contract.
+ */
+export type ToolRunnerCapabilityRequirement = {
+    /**
+     * Capability
+     */
+    capability: string;
+    /**
+     * Kind
+     */
+    kind?: 'runner_capability';
+    /**
+     * Minimum Evidence
+     */
+    minimum_evidence?: 'available' | 'live_verified';
 };
 
 /**

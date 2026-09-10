@@ -29,6 +29,7 @@ from cayu.environments.admission import (
     EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
+    ExecutionRequirements,
 )
 from cayu.runners.base import Runner
 
@@ -818,6 +819,70 @@ class SandboxEgressAdapter(ABC):
 
         del runner
         return ExecutionCapabilityEvidence.unclaimed(self.runner_kind)
+
+    def execution_admission_evidence_for(
+        self, requirements: ExecutionRequirements
+    ) -> ExecutionCapabilityEvidence:
+        """Declare configured admission support before allocation.
+
+        The default adds no executable claims. An adapter with a production
+        probe owner may declare its planned checks; final live evidence is
+        still required and declarations never prove executable availability.
+        """
+        return self.execution_capability_evidence()
+
+    def _execution_admission_executable_declaration(
+        self, requirements: ExecutionRequirements
+    ) -> ExecutionCapabilityEvidence:
+        """Declare bounded planned checks for adapters with owned guest probes."""
+
+        from hashlib import sha256
+
+        from cayu._validation import canonical_durable_json_bytes
+        from cayu.environments.admission import (
+            ExecutionExecutableEvidence,
+            ExecutionToolRequirementEvidence,
+        )
+
+        requirements = ExecutionRequirements.model_validate(
+            requirements.model_dump(mode="python", warnings=False)
+        )
+        evidence = self.execution_capability_evidence()
+        names = requirements.executable_names()
+        if not names:
+            return evidence
+        probes = {probe.executable: probe for probe in requirements.executable_probes()}
+        fingerprint = (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "adapter": self.runner_kind,
+                        "planned_requirements": requirements.model_dump(mode="json"),
+                    },
+                    "execution_admission_declaration",
+                )
+            ).hexdigest()
+        )
+        return ExecutionCapabilityEvidence.model_validate(
+            {
+                **evidence.model_dump(mode="python", warnings=False),
+                "environment_fingerprint": fingerprint,
+                "tool_requirements": ExecutionToolRequirementEvidence(
+                    environment_fingerprint=fingerprint,
+                    executables=tuple(
+                        ExecutionExecutableEvidence(
+                            executable=name,
+                            state="declared",
+                            requirement_fingerprint=(
+                                probes[name].fingerprint if name in probes else None
+                            ),
+                        )
+                        for name in names
+                    ),
+                ),
+            }
+        )
 
     def configuration_metadata(self) -> dict[str, Any]:
         """Return JSON-safe configured intent without claiming runtime proof."""

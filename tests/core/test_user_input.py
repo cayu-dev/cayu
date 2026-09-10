@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from decimal import Decimal
@@ -1270,6 +1272,207 @@ def test_user_input_execution_admission_deduplicates_reused_failure_identity() -
         assert raised.value.__cause__ is not raised.value
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "signal", ["caller", "caller_then_failure", "caller_overlap", "child", "historical_child"]
+)
+def test_resolve_user_input_preserves_new_cancellation_after_continuation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    signal: str,
+) -> None:
+    async def run() -> None:
+        session_id = "s_resolution_failure_then_abort_cancellation"
+        app, _store = _build([("call_input", "ask_user", {"question": "Continue?"})])
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        primary_leaf = RuntimeError("continuation failed before environment abort")
+        primary = (
+            ExceptionGroup("original continuation failures", [primary_leaf, ValueError("sibling")])
+            if signal == "caller_overlap"
+            else primary_leaf
+        )
+        cleanup_failure = OSError("abort diagnostic failed after cancellation")
+        abort_started = asyncio.Event()
+        original_abort = app._environment_lifecycle.abort_environment_setup
+
+        async def fail_continuation(**kwargs):
+            raise primary
+            yield  # pragma: no cover - preserve the async-generator extension shape
+
+        async def block_after_abort(**kwargs):
+            await original_abort(**kwargs)
+            if kwargs.get("original_error") is primary:
+                abort_started.set()
+                if signal in {"child", "historical_child"}:
+                    child = asyncio.current_task()
+                    assert child is not None
+                    child.cancel("child-only abort cancellation")
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if signal == "caller_then_failure":
+                        raise cleanup_failure from None
+                    if signal == "caller_overlap":
+                        raise ExceptionGroup(
+                            "cleanup retains an earlier failure", [primary_leaf, cleanup_failure]
+                        ) from None
+                    raise
+
+        monkeypatch.setattr(
+            app._recovery_coordinator, "continue_user_input_resolution", fail_continuation
+        )
+        monkeypatch.setattr(
+            app._environment_lifecycle, "abort_environment_setup", block_after_abort
+        )
+
+        async def resolve():
+            if signal == "historical_child":
+                owner = asyncio.current_task()
+                assert owner is not None
+                owner.cancel("previously handled caller cancellation")
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.sleep(0)
+            return await _drain(
+                app.resolve_user_input(
+                    UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+                )
+            )
+
+        task = asyncio.create_task(resolve())
+        try:
+            await asyncio.wait_for(abort_started.wait(), timeout=10)
+            caller_cancelled = signal in {"caller", "caller_then_failure", "caller_overlap"}
+            if caller_cancelled:
+                task.cancel("cancel after continuation failure")
+                assert task.cancelling() == 1
+                with pytest.raises(asyncio.CancelledError) as raised:
+                    await task
+                assert raised.value.args == ("cancel after continuation failure",)
+                pending = [raised.value.__cause__]
+                seen: set[int] = set()
+                retained = []
+                while pending:
+                    error = pending.pop()
+                    if error is None or id(error) in seen:
+                        continue
+                    seen.add(id(error))
+                    retained.append(error)
+                    if isinstance(error, BaseExceptionGroup):
+                        pending.extend(error.exceptions)
+                    pending.append(error.__cause__)
+                assert primary in retained
+                if signal in {"caller_then_failure", "caller_overlap"}:
+                    assert cleanup_failure in retained
+                if signal == "caller_overlap":
+                    pending = [raised.value.__cause__]
+                    leaves = []
+                    while pending:
+                        error = pending.pop()
+                        if isinstance(error, BaseExceptionGroup):
+                            pending.extend(reversed(error.exceptions))
+                        elif error is not None:
+                            leaves.append(error)
+                    assert leaves.count(primary_leaf) == 1
+                    assert leaves.count(cleanup_failure) == 1
+            else:
+                with pytest.raises(RuntimeError) as ordinary:
+                    await task
+                assert ordinary.value is primary
+            assert task.cancelled() is caller_cancelled
+            assert task.cancelling() == int(caller_cancelled or signal == "historical_child")
+            assert app._session_control.has_active_tasks(session_id) is False
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancel_first", [False, True])
+def test_user_input_recovery_preserves_process_exit_after_primary_failure(cancel_first) -> None:
+    # Deliver a real exit request in an isolated interpreter so a regression
+    # cannot terminate the pytest owner or other concurrently running checks.
+    script = r"""
+import asyncio
+import sys
+from tests.core.test_user_input import _build, _collect, _drain
+from cayu import EventType, Message, RunRequest, UserInputResponse
+
+async def run():
+    owner = asyncio.current_task()
+    cancel_first = sys.argv[1] == "cancel"
+    app, _store = _build([("input", "ask_user", {"question": "Continue?"})])
+    paused = await _collect(app, RunRequest(
+        agent_name="assistant", session_id="exit-recovery",
+        messages=[Message.text("user", "go")],
+    ))
+    input_id = next(event for event in paused
+        if event.type is EventType.SESSION_AWAITING_USER_INPUT).payload["input_id"]
+    primary = RuntimeError("ordinary continuation failure before process exit")
+    original_abort = app._environment_lifecycle.abort_environment_setup
+
+    async def fail_continuation(**kwargs):
+        raise primary
+        yield
+
+    async def exit_after_abort(**kwargs):
+        await original_abort(**kwargs)
+        if kwargs.get("original_error") is primary:
+            if cancel_first:
+                owner.cancel("caller cancelled before process exit")
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    pass
+            sys.exit(23)
+
+    app._recovery_coordinator.continue_user_input_resolution = fail_continuation
+    app._environment_lifecycle.abort_environment_setup = exit_after_abort
+    try:
+        await _drain(app.resolve_user_input(UserInputResponse(
+            session_id="exit-recovery", input_id=input_id, answer="yes",
+        )))
+    except SystemExit as signal:
+        assert owner.cancelling() == int(cancel_first)
+        pending = [signal.__cause__]
+        seen = set()
+        originals = []
+        while pending:
+            error = pending.pop()
+            if error is None or id(error) in seen:
+                continue
+            seen.add(id(error))
+            originals.append(error)
+            if isinstance(error, BaseExceptionGroup):
+                pending.extend(error.exceptions)
+            pending.append(error.__cause__)
+        assert primary in originals
+        if cancel_first:
+            assert any(isinstance(error, asyncio.CancelledError)
+                and error.args == ("caller cancelled before process exit",)
+                for error in originals)
+        raise
+
+asyncio.run(run())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, "cancel" if cancel_first else "exit"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 23, result.stderr
 
 
 def test_resolve_user_input_repeated_cancellation_cannot_interrupt_finalization() -> None:

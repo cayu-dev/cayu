@@ -22,6 +22,7 @@ from cayu.environments.admission import (
     ExecutionEvidenceOverride,
     ExecutionExecutableEvidence,
     ExecutionRequirements,
+    ExecutionToolRequirement,
     ExecutionToolRequirementEvidence,
     evaluate_execution_admission,
 )
@@ -205,6 +206,7 @@ __all__ = [
     "ExecutionEvidenceOverride",
     "ExecutionExecutableEvidence",
     "ExecutionRequirements",
+    "ExecutionToolRequirement",
     "ExecutionToolRequirementEvidence",
     "GitRepositoryBinding",
     "ImmutableInputAdapterCapability",

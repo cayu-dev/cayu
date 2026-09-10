@@ -17,6 +17,8 @@ from cayu.core.tools import (
     Tool,
     ToolContext,
     ToolEffect,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
     ToolResult,
     ToolSpec,
     WorkspaceHandle,
@@ -524,7 +526,28 @@ class RunCommandTool(Tool):
             + canonical_durable_json_bytes(catalogue, "run_command.catalogue").decode("utf-8")
         )
         super().__init__(
-            type(self).spec.model_copy(update={"input_schema": schema, "description": description})
+            type(self).spec.model_copy(
+                update={
+                    "input_schema": schema,
+                    "description": description,
+                    "execution_requirements": tuple(
+                        sorted(
+                            (
+                                ToolExecutionRequirement(
+                                    name=f"executable_{index}",
+                                    alternatives=(
+                                        ToolExecutableRequirement(executable=executable),
+                                    ),
+                                )
+                                for index, executable in enumerate(
+                                    sorted({item.executable for item in authorities})
+                                )
+                            ),
+                            key=lambda requirement: requirement.name,
+                        )
+                    ),
+                }
+            )
         )
         self._profile = owned_profile
         self._authorities = {item.selector: item for item in authorities}

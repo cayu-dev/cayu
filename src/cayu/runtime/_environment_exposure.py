@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, SupportsIndex
 
@@ -22,8 +23,10 @@ from cayu.environments.factory import (
     attach_environment_factory_cleanup_settlement_task,
     combine_environment_factory_cleanup_settlement_tasks,
     environment_factory_cleanup_settlement_tasks,
+    register_environment_factory_cleanup_retry,
     retry_environment_factory_cleanup_settlement_task,
 )
+from cayu.runners.base import RunnerExecutionAdmissionObserver
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
 from cayu.vaults import SecretRedactor
 
@@ -35,6 +38,11 @@ if TYPE_CHECKING:
 
 
 _ENVIRONMENT_EXPOSURE_AUTHORITY_TOKEN = object()
+_EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS = 1.0
+
+
+class ExposureAdmissionSettlementPending(ExecutionAdmissionError):
+    """Foreground waiting ended; the attached exact cleanup owner is still live."""
 
 
 @dataclass(slots=True, repr=False)
@@ -62,6 +70,7 @@ class _EnvironmentExposure:
     binding_generation_id: str
     environment: Any
     runner: Any
+    observer: RunnerExecutionAdmissionObserver | None
     workspace: Any
     bound_workspace: Any
     binding: Any
@@ -125,6 +134,13 @@ def expose_registered_environment(
         interaction_id = invocation_context.binding.interaction_id
 
     environment = registered_environment.environment
+    observer = registered_environment.execution_admission_observer
+    if environment.runner is not None and (
+        not isinstance(observer, RunnerExecutionAdmissionObserver)
+        or observer.runner is not environment.runner
+        or observer.requirements != decision.requirements
+    ):
+        raise RuntimeError("Environment exposure lost its exact admission observer.")
     exposure = _EnvironmentExposure(
         token=_ENVIRONMENT_EXPOSURE_AUTHORITY_TOKEN,
         session_id=session.id,
@@ -137,6 +153,7 @@ def expose_registered_environment(
         binding_generation_id=registered_environment.binding_generation_id,
         environment=environment,
         runner=environment.runner,
+        observer=registered_environment.execution_admission_observer,
         workspace=environment.workspace,
         bound_workspace=registered_environment.bound_workspace,
         binding=environment.binding,
@@ -203,6 +220,18 @@ def _environment_exposure(
         or exposure.binding_generation_id != registered_environment.binding_generation_id
         or exposure.environment is not environment
         or exposure.runner is not environment.runner
+        or exposure.observer is not registered_environment.execution_admission_observer
+        or (
+            environment.runner is not None
+            and not isinstance(exposure.observer, RunnerExecutionAdmissionObserver)
+        )
+        or (
+            exposure.observer is not None
+            and (
+                exposure.observer.runner is not environment.runner
+                or exposure.observer.requirements != exposure.decision.requirements
+            )
+        )
         or exposure.workspace is not environment.workspace
         or exposure.bound_workspace is not registered_environment.bound_workspace
         or exposure.binding is not environment.binding
@@ -348,7 +377,9 @@ async def _runner_admission_snapshot(
         authority_failed = False
         settlement_tasks: tuple[asyncio.Task[None], ...] = ()
         try:
-            supplied = runner.execution_admission_candidate()
+            if exposure.observer is None:
+                raise RuntimeError("Admission snapshot lost its observer.")
+            supplied = exposure.observer.snapshot()
         except Exception as error:
             settlement_tasks = environment_factory_cleanup_settlement_tasks(error)
             del error
@@ -442,15 +473,27 @@ def _snapshot_decision(
     return decision
 
 
-def _only_stale_refusals(decision: ExecutionAdmissionDecision) -> bool:
-    return (
-        decision.status == "refused"
-        and bool(decision.refusals)
-        and all(refusal.code == "stale_evidence" for refusal in decision.refusals)
-    )
+def _refusals_allow_renewal(decision: ExecutionAdmissionDecision) -> bool:
+    if decision.status != "refused" or not decision.refusals:
+        return False
+    # Base requirements are conjunctive. A tool clause, however, can become
+    # satisfied by renewing any one stale alternative even when its siblings
+    # are unavailable. Renewal is only permission to collect new evidence;
+    # the complete decision and exact identity are checked again afterwards.
+    clauses: dict[tuple[str, str], bool] = {}
+    for refusal in decision.refusals:
+        if refusal.tool_name is None or refusal.requirement_name is None:
+            if refusal.code != "stale_evidence":
+                return False
+            continue
+        key = (refusal.tool_name, refusal.requirement_name)
+        clauses[key] = clauses.get(key, False) or refusal.code == "stale_evidence"
+    return all(clauses.values())
 
 
-async def _await_exposure_admission_settlement(exposure: _EnvironmentExposure) -> None:
+async def _await_exposure_admission_settlement(
+    exposure: _EnvironmentExposure, *, background: bool = False
+) -> None:
     task = exposure.admission.settlement_task
     if task is None:
         return
@@ -468,9 +511,13 @@ async def _await_exposure_admission_settlement(exposure: _EnvironmentExposure) -
         else:
             exposure.admission.settlement_task = None
             return
-    outcome = await await_shielded_task_outcome(task)
+    outcome = await await_shielded_task_outcome(
+        task,
+        timeout_s=None if background else _EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS,
+        timeout_after_cancellation_s=0,
+    )
     cancellation = outcome.cancellation or outcome.subsequent_cancellation
-    if outcome.error is None:
+    if not outcome.timed_out and outcome.error is None:
         exposure.admission.settlement_task = None
     cleanup_failure = (
         None
@@ -478,13 +525,23 @@ async def _await_exposure_admission_settlement(exposure: _EnvironmentExposure) -
         else RuntimeError("Environment admission renewal settlement remains unproven.")
     )
     if cancellation is not None:
+        if exposure.admission.settlement_task is not None:
+            attach_environment_factory_cleanup_settlement_task(cancellation, task)
         restore_task_cancellation_requests(
             outcome.cancellation_requests_consumed,
             cancellation=cancellation,
         )
+        with suppress(asyncio.CancelledError):
+            await asyncio.sleep(0)
         if cleanup_failure is not None:
             raise cancellation from cleanup_failure
         raise cancellation
+    if outcome.timed_out:
+        pending = ExposureAdmissionSettlementPending(
+            _settlement_refusal(exposure, exposure.admission.decision)
+        )
+        attach_environment_factory_cleanup_settlement_task(pending, task)
+        raise pending
     if cleanup_failure is not None:
         raise cleanup_failure from None
 
@@ -503,8 +560,48 @@ async def await_environment_exposure_settlement(
         or type(exposure.admission) is not _EnvironmentExposureAdmission
     ):
         return
-    async with exposure.admission.renewal_lock:
-        await _await_exposure_admission_settlement(exposure)
+    if exposure.admission.settlement_task is None and not exposure.admission.renewal_lock.locked():
+        return
+
+    async def settle() -> None:
+        async with exposure.admission.renewal_lock:
+            await _await_exposure_admission_settlement(exposure, background=True)
+
+    def start() -> asyncio.Task[None]:
+        task = asyncio.create_task(settle(), name="cayu-exposure-terminal-settlement")
+        register_environment_factory_cleanup_retry(task, start)
+        return task
+
+    # The owned task includes lock acquisition: a competing renewal must not
+    # make terminal foreground cleanup unbounded or allow release to overtake it.
+    task = start()
+    outcome = await await_shielded_task_outcome(
+        task,
+        timeout_s=_EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS,
+        timeout_after_cancellation_s=0,
+    )
+    cancellation = outcome.cancellation or outcome.subsequent_cancellation
+    error = outcome.error
+    if cancellation is not None:
+        if outcome.timed_out or error is not None:
+            attach_environment_factory_cleanup_settlement_task(cancellation, task)
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed, cancellation=cancellation
+        )
+        with suppress(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        if error is not None:
+            raise cancellation from error
+        raise cancellation
+    if outcome.timed_out:
+        pending = ExposureAdmissionSettlementPending(
+            _settlement_refusal(exposure, exposure.admission.decision)
+        )
+        attach_environment_factory_cleanup_settlement_task(pending, task)
+        raise pending
+    if error is not None:
+        attach_environment_factory_cleanup_settlement_task(error, task)
+        raise error
 
 
 def _settlement_refusal(
@@ -566,7 +663,7 @@ async def refresh_and_require_environment_exposed(
     execution_profile: ExecutionProfileIdentity,
     redactor: SecretRedactor,
 ) -> None:
-    """Renew stale runner evidence, then authorize one exact dispatch."""
+    """Check tool identity, renew stale evidence, then authorize exact dispatch."""
 
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
@@ -580,9 +677,9 @@ async def refresh_and_require_environment_exposed(
     if exposure is None:
         return
     decision = _evaluate_exposure_decision(exposure)
-    if decision.status == "admitted":
+    if decision.status == "admitted" and not decision.requirements.tool_requirements:
         return
-    if not _only_stale_refusals(decision):
+    if decision.status == "refused" and not _refusals_allow_renewal(decision):
         decision.require_admitted()
 
     async with exposure.admission.renewal_lock:
@@ -596,11 +693,14 @@ async def refresh_and_require_environment_exposed(
         assert exposure is not None
         await _await_exposure_admission_settlement(exposure)
         decision = _evaluate_exposure_decision(exposure)
-        if decision.status == "admitted":
+        if decision.status == "admitted" and not decision.requirements.tool_requirements:
             return
-        if not _only_stale_refusals(decision):
+        if decision.status == "refused" and not _refusals_allow_renewal(decision):
             decision.require_admitted()
 
+        # A fresh TTL does not authenticate a replaced native capability or
+        # selected image. Tool-dependent dispatch reads the exact observer even
+        # before expiry; _snapshot_decision compares the full admitted identity.
         settlement_tasks: tuple[asyncio.Task[None], ...] = ()
         snapshot = await _runner_admission_snapshot(exposure, redactor=redactor)
         settlement_tasks = (*settlement_tasks, *snapshot.settlement_tasks)
@@ -626,12 +726,14 @@ async def refresh_and_require_environment_exposed(
                 execution_profile=execution_profile,
             )
             return
-        if not _only_stale_refusals(current):
+        if not _refusals_allow_renewal(current):
             await _raise_dispatch_refusal(exposure, current, settlement_tasks)
 
         try:
+            if exposure.observer is None:
+                raise RuntimeError("Admission renewal lost its observer.")
             await environment_operation_boundary.await_environment_operation(
-                exposure.runner.refresh_execution_admission,
+                exposure.observer.refresh,
                 operation_name="Environment admission renewal",
                 redactor=redactor,
             )

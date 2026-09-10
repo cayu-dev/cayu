@@ -168,3 +168,225 @@ def test_queued_exposure_transfer_revokes_predecessor(monkeypatch: pytest.Monkey
     )
     test_public_on_idle_preserves_environment_exposure(factory_backed=False, enqueue=True)
     assert len(transfers) == 1
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("proof", ["verified", "expired", "changed_image"])
+@pytest.mark.parametrize("delivery_path", ["queued", "stop_resume"])
+def test_queued_search_tool_preserves_exact_admission(
+    monkeypatch, tmp_path, backend, proof, delivery_path
+):
+    from datetime import UTC, datetime, timedelta
+
+    from cayu import (
+        ExecutionAdmissionCandidate,
+        ExecutionCapabilityEvidence,
+        InMemorySessionStore,
+        ResumeRequest,
+        SearchTextTool,
+        SQLiteSessionStore,
+        StopAfterCurrentToolRoundRequest,
+        ToolExecutableRequirement,
+    )
+    from cayu.environments.admission import (
+        ExecutionExecutableEvidence,
+        ExecutionToolRequirementEvidence,
+    )
+    from cayu.runners import Runner
+    from cayu.runtime import _environment_lifecycle
+    from cayu.runtime._environment_exposure import require_environment_exposed
+    from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+
+    class EvidenceRunner(Runner):
+        def __init__(self):
+            self.observed_at = datetime.now(UTC)
+            self.image = "sha256:" + "1" * 64
+            self.snapshots = 0
+            self.observers = []
+
+        def execution_admission_observer(self, requirements):
+            observer = super().execution_admission_observer(requirements)
+            self.observers.append(observer)
+            return observer
+
+        def execution_admission_candidate(self):
+            self.snapshots += 1
+            fingerprint = "sha256:" + "2" * 64
+            return ExecutionAdmissionCandidate(
+                candidate="local",
+                evidence=ExecutionCapabilityEvidence(
+                    subject="local",
+                    environment_fingerprint=fingerprint,
+                    image_fingerprint=self.image,
+                    unclaimed_reason_code="security_unclaimed",
+                    tool_requirements=ExecutionToolRequirementEvidence(
+                        environment_fingerprint=fingerprint,
+                        image_fingerprint=self.image,
+                        executables=(
+                            ExecutionExecutableEvidence(
+                                executable="rg",
+                                state="live_verified",
+                                observed_at=self.observed_at,
+                                valid_until=self.observed_at
+                                + timedelta(seconds=2 if proof == "expired" else 60),
+                                requirement_fingerprint=ToolExecutableRequirement(
+                                    executable="rg"
+                                ).fingerprint,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
+        async def exec(self, command, **kwargs):
+            raise AssertionError("The scripted provider must not dispatch a tool.")
+
+    async def run():
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "queue.db")
+        )
+        runner = EvidenceRunner()
+        provider = _QueuedProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), runner=runner), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="test-model", provider_name=provider.name),
+            tools=[SearchTextTool()],
+        )
+        transfer = _environment_lifecycle.transfer_queued_environment_exposure
+        transfers = []
+
+        def checked_transfer(*, session, predecessor, successor):
+            exposure = predecessor.registered_environment.environment_exposure
+            observer = exposure.observer
+            decision = exposure.admission.decision
+            settlement = exposure.admission.settlement_task
+            transfer(session=session, predecessor=predecessor, successor=successor)
+            assert successor.registered_environment.environment_exposure is exposure
+            assert exposure.observer is observer
+            assert exposure.admission.decision is decision
+            assert exposure.admission.settlement_task is settlement
+            assert observer.requirements.tool_requirements[0].tool_name == "search_text"
+            with pytest.raises(RuntimeError, match="exact runtime-admitted exposure authority"):
+                require_environment_exposed(
+                    predecessor.registered_environment,
+                    session=session,
+                    invocation_context=predecessor,
+                    registered_agent=predecessor.registered_agent,
+                    execution_profile=predecessor.profile,
+                )
+            transfers.append(runner.snapshots)
+
+        monkeypatch.setattr(
+            _environment_lifecycle, "transfer_queued_environment_exposure", checked_transfer
+        )
+
+        async def consume():
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="queued-search",
+                        messages=[Message.text("user", "Start.")],
+                    )
+                )
+            ]
+
+        task = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(provider.started.wait(), 10)
+            await app.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id="queued-search",
+                    idempotency_key="next",
+                    content="Continue.",
+                    delivery_mode=(
+                        SessionMessageDeliveryMode.NEXT_TURN
+                        if delivery_path == "stop_resume"
+                        else SessionMessageDeliveryMode.ON_IDLE
+                    ),
+                )
+            )
+            if delivery_path == "stop_resume":
+                session = await store.load("queued-search")
+                profile = active_invocation_execution_profile_from_checkpoint(
+                    await store.load_checkpoint("queued-search")
+                )
+                assert session is not None and profile is not None
+                await app.stop_after_current_tool_round(
+                    StopAfterCurrentToolRoundRequest(
+                        session_id=session.id,
+                        session_instance_id=session.instance_id,
+                        interaction_id=profile.interaction_id,
+                        expected_run_epoch=session.run_epoch,
+                        idempotency_key="stop-before-continuation",
+                    )
+                )
+                assert task.cancelling() == 0
+            if proof == "expired":
+                await asyncio.sleep(2.1)
+            elif proof == "changed_image":
+                runner.image = "sha256:" + "3" * 64
+            provider.release.set()
+            events = await asyncio.wait_for(task, 15)
+            if delivery_path == "stop_resume":
+                assert events[-1].type is EventType.SESSION_INTERRUPTED
+                assert len(provider.requests) == 1
+                assert not task.cancelled() and task.cancelling() == 0
+                assert transfers == []
+                initial_observer = runner.observers[-1]
+                events = [
+                    event
+                    async for event in app.resume(
+                        ResumeRequest(
+                            session_id="queued-search",
+                            messages=[Message.text("user", "Resume.")],
+                        )
+                    )
+                ]
+                if proof == "expired":
+                    # Preflight refuses before constructing final observation.
+                    assert runner.observers[-1] is initial_observer
+                else:
+                    assert runner.observers[-1] is not initial_observer
+                assert runner.observers[-1].requirements == initial_observer.requirements
+            else:
+                assert len(transfers) == 1
+                assert runner.snapshots > transfers[0]
+            admitted = proof == "verified" or (
+                delivery_path == "stop_resume" and proof == "changed_image"
+            )
+            assert len(provider.requests) == (2 if admitted else 1)
+            if admitted:
+                assert (
+                    sum(
+                        message.content == Message.text("user", "Continue.").content
+                        for message in provider.requests[1].messages
+                    )
+                    == 1
+                )
+            assert events[-1].type is (
+                EventType.SESSION_COMPLETED if admitted else EventType.SESSION_FAILED
+            )
+            if not admitted:
+                assert events[-1].payload["error_type"] == "ExecutionAdmissionError"
+            durable = await store.load_events("queued-search")
+            assert sum(event.type is EventType.SESSION_MESSAGE_DELIVERED for event in durable) == (
+                0 if delivery_path == "stop_resume" and not admitted else 1
+            )
+        finally:
+            provider.release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await app.drain_environment_cleanups()
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+
+    asyncio.run(run())

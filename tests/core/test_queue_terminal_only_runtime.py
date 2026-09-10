@@ -521,7 +521,18 @@ def test_queued_exposure_transfer_requires_exact_proof(
 def test_queued_exposure_preserves_pending_admission_settlement(
     tmp_path, monkeypatch, cancel: bool
 ) -> None:
+    monkeypatch.setattr(exposure_module, "_EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS", 0.1)
+
     async def run() -> None:
+        finalize_calls = 0
+        original_finalize = SyncBinding.finalize
+
+        async def observe_finalize(binding, *args, **kwargs):
+            nonlocal finalize_calls
+            finalize_calls += 1
+            return await original_finalize(binding, *args, **kwargs)
+
+        monkeypatch.setattr(SyncBinding, "finalize", observe_finalize)
         store = InMemorySessionStore()
         provider = BlockingTwoTurnProvider()
         second_started = asyncio.Event()
@@ -578,10 +589,10 @@ def test_queued_exposure_preserves_pending_admission_settlement(
             assert exposure.admission.settlement_task is settlement
             return successor
 
-        async def observe_settlement(exposure):
+        async def observe_settlement(exposure, *, background=False):
             if settlement is not None and exposure.admission.settlement_task is settlement:
                 waiting.set()
-            await original_wait(exposure)
+            await original_wait(exposure, background=background)
 
         monkeypatch.setattr(EnvironmentLifecycle, "accept_queued_interaction", transfer)
         monkeypatch.setattr(
@@ -654,7 +665,8 @@ def test_queued_exposure_preserves_pending_admission_settlement(
                 assert not owner.done()
                 assert not settlement.done()
                 assert not captured_owner.cleanup_started
-            release.set()
+            done, _ = await asyncio.wait((owner,), timeout=5)
+            assert owner in done, "Foreground must exit while settlement remains blocked"
             if cancel:
                 with pytest.raises(asyncio.CancelledError) as failure:
                     await asyncio.wait_for(owner, 20)
@@ -662,6 +674,19 @@ def test_queued_exposure_preserves_pending_admission_settlement(
                 assert owner.cancelled() and owner.cancelling() == 1
             else:
                 await asyncio.wait_for(owner, 20)
+            assert not settlement.done()
+            assert not captured_owner.cleanup_started
+            assert finalize_calls == 0
+            assert captured_owner.admission_settlement_task is not None
+            with pytest.raises(RuntimeError, match="incomplete environment cleanup"):
+                app._environment_lifecycle._require_no_retained_cleanup_for_session(
+                    "terminal-queue"
+                )
+            assert not await app.drain_environment_cleanups(timeout_s=0.01)
+            release.set()
+            assert await app.drain_environment_cleanups(timeout_s=5)
+            assert finalize_calls == 1
+            assert "terminal-queue" not in app._environment_lifecycle._active_environment_setups
             assert settlement.done() and not settlement.cancelled()
             assert captured_admission is not None
             assert captured_admission.settlement_task is None

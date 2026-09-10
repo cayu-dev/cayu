@@ -179,6 +179,9 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
     egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.ALLOCATION_REPLACEMENT
     supports_reconnect = True
 
+    def execution_admission_evidence_for(self, requirements):
+        return self._execution_admission_executable_declaration(requirements)
+
     def execution_capability_evidence(
         self,
         runner: Runner | None = None,

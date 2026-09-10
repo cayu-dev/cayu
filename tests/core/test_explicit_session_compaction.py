@@ -5348,8 +5348,12 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
             60.0,
         )
         try:
+            # Provider cancellation is the lease-deadline invariant. Returning
+            # also includes bounded heartbeat/store cleanup, so do not make
+            # that cleanup race a second, shorter caller-imposed deadline.
+            await asyncio.wait_for(provider.cancelled.wait(), timeout=2)
             with pytest.raises(RuntimeError, match="not confirmed before its lease deadline"):
-                await asyncio.wait_for(task, timeout=0.4)
+                await asyncio.wait_for(task, timeout=5)
         finally:
             store.release_acknowledgement.set()
             if not task.done():

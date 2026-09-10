@@ -1018,7 +1018,8 @@ def test_exact_replay_clears_receipt_after_settlement_acknowledgement_loss(
         app = CayuApp(task_store=store, enable_logging=False)
         task = await _claimed(store, "settlement-acknowledgement-loss")
         tree_state = tmp_path / "tree-state"
-        request = _request(tree_state, complete=True, deadline_seconds=5)
+        # This tests exact settlement replay, not expiry during child startup.
+        request = _request(tree_state, complete=True, deadline_seconds=30)
         state_dir = tmp_path / "attempt-state"
         coordinator = LocalExecutionAttemptCoordinator(store, state_dir=state_dir)
 

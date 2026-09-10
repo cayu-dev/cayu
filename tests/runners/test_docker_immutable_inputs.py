@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.environments.test_docker_coding import _completed_admission_probe_result
 
 from cayu import (
     DockerImageIdentity,
@@ -133,8 +134,10 @@ def test_100_docker_environments_share_one_verified_materialization(
                 )
             )
         if docker_args[0] == "exec" and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
-        return ExecResult()
+            return _completed_admission_probe_result(
+                docker_args, ExecResult(stdout=restrictions.user)
+            )
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
 
@@ -228,8 +231,8 @@ def test_docker_refuses_exposure_when_root_can_write_immutable_input(
                 )
             )
         if "cayu-immutable-input-probe" in docker_args:
-            return ExecResult(exit_code=73)
-        return ExecResult()
+            return _completed_admission_probe_result(docker_args, ExecResult(exit_code=73))
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
 

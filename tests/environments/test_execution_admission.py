@@ -34,6 +34,7 @@ def test_untrusted_requirements_cover_every_execution_security_dimension() -> No
         "minimum_evidence": "available",
         "evidence_overrides": [],
         "required_executables": [],
+        "tool_requirements": [],
     }
 
 

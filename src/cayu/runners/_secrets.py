@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import cast
 
@@ -155,7 +155,11 @@ def resolved_secret_redactor(
 
 
 @contextmanager
-def runner_env_file(environment: Mapping[str, str]) -> Iterator[str | None]:
+def runner_env_file(
+    environment: Mapping[str, str],
+    *,
+    retain_path: Callable[[str], None] | None = None,
+) -> Iterator[str | None]:
     """Write a runner's container env to a private temp file for ``--env-file``.
 
     Container env values (including the model-supplied ``env`` of a tool call) must never
@@ -166,6 +170,9 @@ def runner_env_file(environment: Mapping[str, str]) -> Iterator[str | None]:
 
     The file is created ``0600`` (``mkstemp`` default) and unlinked on exit. Yields
     ``None`` when there is no env to pass.
+    An optional ``retain_path`` owner receives the exact path before values are
+    written, so a caller with retained cleanup can retry a failed unlink. The
+    callback must not publish the path or secret contents.
     """
 
     validate_runner_env_file_environment(environment)
@@ -180,6 +187,8 @@ def runner_env_file(environment: Mapping[str, str]) -> Iterator[str | None]:
     try:
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                if retain_path is not None:
+                    retain_path(path)
                 for key, value in environment.items():
                     handle.write(f"{key}={value}\n")
         except OSError as error:

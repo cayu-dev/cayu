@@ -245,6 +245,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     """
 
     runner_kind = "docker"
+
+    def execution_admission_evidence_for(self, requirements):
+        return self._execution_admission_executable_declaration(requirements)
+
     process_external_allocation = False
     supports_allocation_fingerprint = True
     egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH

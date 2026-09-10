@@ -7,19 +7,28 @@ import posixpath
 import random
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from math import isfinite
 from types import ModuleType
 from typing import Any, Literal, cast
 
 from cayu._exception_groups import exception_group_children
 from cayu._exception_state import exception_state, set_exception_state
-from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    capture_awaitable_outcome,
+    restore_task_cancellation_requests,
+    unexpected_child_cancellation_error,
+)
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
+from cayu.runners._admission_probes import EXECUTABLE_AVAILABILITY_SCRIPT
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -42,6 +51,8 @@ from cayu.runners._creation_cleanup import (
     drain_acquisition_restorations,
     drain_creation_cleanups,
     register_acquisition_restoration_retry,
+    require_creation_cleanup_settled,
+    retry_acquisition_settlement,
     settle_creation_cleanup,
 )
 from cayu.runners._redacted_output import RedactedOutputCapture
@@ -57,6 +68,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerExecutionAdmissionObserver,
     RunnerExecutionError,
     RunnerUnavailableError,
     RunnerWorkspaceCapability,
@@ -81,6 +93,7 @@ _MICROSANDBOX_SETTLEMENT_MAX_BACKOFF_SECONDS = 30.0
 _MICROSANDBOX_SETTLEMENT_JITTER_RATIO = 0.2
 _MICROSANDBOX_CLEANUP_DIAGNOSTIC_TYPE = "cayu.microsandbox_cleanup.v1"
 MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS = 1.0
+MICROSANDBOX_ADMISSION_PROBE_TIMEOUT_SECONDS = 5.0
 _MICROSANDBOX_NO_EXIT_EVENT_ERROR = "runtime error: exec session ended without exit event"
 _MICROSANDBOX_UNAVAILABLE_REMEDIATION = (
     "Reconnect to or replace the Microsandbox before executing more commands."
@@ -229,6 +242,335 @@ class MicrosandboxUnavailableError(RunnerUnavailableError):
         )
 
 
+@dataclass
+class _MicrosandboxAdmissionState:
+    candidate: Any = None
+    provider_identity: tuple[float, str] | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class _MicrosandboxAdmissionObserver(RunnerExecutionAdmissionObserver):
+    runner: MicrosandboxRunner
+    state: _MicrosandboxAdmissionState = field(default_factory=_MicrosandboxAdmissionState)
+
+    def _identity(self) -> str | None:
+        return (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "name": self.runner.name,
+                        "provider_identity": None
+                        if self.state.provider_identity is None
+                        else list(self.state.provider_identity),
+                        "root": self.runner.default_cwd,
+                        "environment": copy_runner_env(self.runner.env_overlay, inherit_env=False),
+                    },
+                    "microsandbox_execution_identity",
+                )
+            ).hexdigest()
+        )
+
+    async def _read_provider_identity(self):
+        from cayu.environments.factory import (
+            attach_environment_factory_cleanup_settlement_task,
+            register_environment_factory_cleanup_retry,
+        )
+
+        # These SDK reads are non-mutating, but may outlive our deadline. Keep
+        # their acquisition fenced until the actual SDK task has settled.
+        with acquire_creation_lease("microsandbox", self.runner.name) as acquisition:
+            task = asyncio.create_task(capture_awaitable_outcome(self._read_provider_identity_raw))
+            outcome = await await_shielded_task_outcome(
+                task,
+                timeout_s=MICROSANDBOX_ADMISSION_PROBE_TIMEOUT_SECONDS,
+                timeout_after_cancellation_s=0,
+            )
+            captured = outcome.result
+            cancellation = outcome.cancellation or outcome.subsequent_cancellation
+            failure = outcome.error if captured is None else captured.error
+            if cancellation is None and isinstance(failure, asyncio.CancelledError):
+                failure = unexpected_child_cancellation_error(
+                    failure, operation="Microsandbox admission identity"
+                )
+            if cancellation is None and not outcome.timed_out and failure is None:
+                assert captured is not None
+                return captured.result
+            error = (
+                cancellation
+                or failure
+                or TimeoutError("Microsandbox admission identity timed out.")
+            )
+            if not task.done():
+
+                async def settle() -> None:
+                    await asyncio.shield(task)
+
+                settlement = asyncio.create_task(settle())
+                register_acquisition_restoration_retry(settlement, settle)
+                acquisition.retain_until(settlement)
+
+                def retry():
+                    nonlocal settlement
+                    settlement = retry_acquisition_settlement(
+                        settlement,
+                        settle,
+                        name=f"cayu-microsandbox-identity-retry-{self.runner.name}",
+                    )
+                    return settlement
+
+                register_environment_factory_cleanup_retry(settlement, retry)
+                attach_environment_factory_cleanup_settlement_task(error, settlement)
+            if cancellation is not None:
+                if failure is not None:
+                    attach_runner_cancellation_failure(cancellation, failure)
+                restore_task_cancellation_requests(
+                    outcome.cancellation_requests_consumed, cancellation=cancellation
+                )
+            raise error
+
+    async def _read_provider_identity_raw(self):
+        module = _microsandbox_module(self.runner._sandbox_module)
+        running_name = await self.runner._sandbox.name
+        if type(running_name) is not str or running_name != self.runner.name:
+            raise MicrosandboxReconnectIdentityError(
+                "Microsandbox admission running handle mismatch."
+            )
+        handle = await module.Sandbox.get(self.runner.name)
+        name = getattr(handle, "name", None)
+        if type(name) is not str or name != self.runner.name:
+            raise MicrosandboxReconnectIdentityError(
+                "Microsandbox admission allocation name mismatch."
+            )
+        created_at = _validate_provider_created_at(getattr(handle, "created_at", None))
+        configuration = getattr(handle, "config_json", None)
+        if (
+            type(configuration) is not str
+            or not configuration
+            or len(configuration.encode("utf-8")) > 65536
+        ):
+            raise MicrosandboxReconnectIdentityError(
+                "Microsandbox admission configuration is unavailable."
+            )
+        return created_at, sha256(configuration.encode("utf-8")).hexdigest()
+
+    def _candidate(self, claims=()):
+        from cayu.environments.admission import (
+            ExecutionAdmissionCandidate,
+            ExecutionCapabilityEvidence,
+            ExecutionToolRequirementEvidence,
+        )
+
+        identity = self._identity()
+        return ExecutionAdmissionCandidate(
+            candidate="microsandbox",
+            evidence=ExecutionCapabilityEvidence(
+                subject="microsandbox",
+                unclaimed_reason_code="security_unclaimed",
+                environment_fingerprint=identity,
+                tool_requirements=None
+                if identity is None
+                else ExecutionToolRequirementEvidence(
+                    environment_fingerprint=identity,
+                    executables=claims,
+                ),
+            ),
+        )
+
+    def snapshot(self):
+        from cayu.environments.admission import ExecutionExecutableEvidence
+
+        self.runner._ensure_exec_open()
+        require_creation_cleanup_settled("microsandbox", self.runner.name)
+        candidate = self.state.candidate
+        if candidate is not None and candidate.evidence.environment_fingerprint == self._identity():
+            return candidate
+        probes = {probe.executable: probe for probe in self.requirements.executable_probes()}
+        return self._candidate(
+            tuple(
+                ExecutionExecutableEvidence(
+                    executable=name,
+                    state="declared",
+                    requirement_fingerprint=None
+                    if name not in probes
+                    else probes[name].fingerprint,
+                )
+                for name in self.requirements.executable_names()
+            )
+        )
+
+    async def collect(self):
+        from cayu.environments.admission import ExecutionExecutableEvidence
+
+        self.state.candidate = None
+        observed_at = datetime.now(UTC)
+        self.state.provider_identity = await self._read_provider_identity()
+        initial_identity = self._identity()
+        probes = {probe.executable: probe for probe in self.requirements.executable_probes()}
+        claims = []
+        self.state.candidate = None
+        for name in self.requirements.executable_names():
+            probe = probes.get(name)
+            arguments = None if probe is None else probe.probe_arguments
+            command = (
+                ExecCommand.process(
+                    "sh", "-c", EXECUTABLE_AVAILABILITY_SCRIPT, "cayu-admission", name
+                )
+                if arguments is None
+                else ExecCommand.process(name, *arguments)
+            )
+            code = await _run_microsandbox_admission_probe(self.runner, command)
+            available = code in ((0,) if probe is None else probe.accepted_exit_codes)
+            claims.append(
+                ExecutionExecutableEvidence(
+                    executable=name,
+                    state="live_verified" if available else "unavailable",
+                    observed_at=observed_at if available else None,
+                    valid_until=observed_at + timedelta(seconds=300) if available else None,
+                    requirement_fingerprint=None if probe is None else probe.fingerprint,
+                    reason_code=None if available else "executable_unavailable",
+                    remediation_code=None if available else "install_executable",
+                )
+            )
+        if (
+            await self._read_provider_identity()
+        ) != self.state.provider_identity or self._identity() != initial_identity:
+            raise RuntimeError("Microsandbox identity changed during admission observation.")
+        self.state.candidate = self._candidate(tuple(claims))
+        return self.state.candidate
+
+    async def refresh(self):
+        await self.collect()
+
+
+async def _run_microsandbox_admission_probe(
+    runner: MicrosandboxRunner, command: ExecCommand
+) -> int:
+    async with runner._exec_lock:
+        return await _run_microsandbox_admission_probe_locked(runner, command)
+
+
+async def _run_microsandbox_admission_probe_locked(
+    runner: MicrosandboxRunner, command: ExecCommand
+) -> int:
+    """Own SDK dispatch and positive settlement independently of caller waiting."""
+    from cayu.environments.factory import (
+        attach_environment_factory_cleanup_settlement_task,
+        register_environment_factory_cleanup_retry,
+    )
+
+    runner._ensure_exec_open()
+    runner._ensure_agent_available()
+    assert command.argv is not None
+    argv = tuple(command.argv)
+    environment = copy_runner_env(runner.env_overlay, inherit_env=False)
+    working_dir = runner.resolve_cwd(None)
+
+    async def execute() -> int:
+        handle = await runner._sandbox.exec_stream(
+            argv[0],
+            list(argv[1:]),
+            cwd=working_dir,
+            env=environment,
+            timeout=None,
+            stdin=None,
+        )
+        exit_code = None
+        events = 0
+        async for event in handle:
+            events += 1
+            if events > 1024:
+                raise RuntimeError("Microsandbox admission probe exceeded its event bound.")
+            if _exec_event_type(event) == "exited":
+                code = getattr(event, "code", None)
+                if type(code) is not int or exit_code is not None:
+                    raise RuntimeError(
+                        "Microsandbox admission probe has ambiguous guest exit evidence."
+                    )
+                exit_code = code
+        if exit_code is None:
+            raise RuntimeError("Microsandbox admission probe lacks a guest exit event.")
+        return exit_code
+
+    with acquire_creation_lease("microsandbox", runner.name) as acquisition:
+        task = asyncio.create_task(capture_awaitable_outcome(execute))
+        outcome = await await_shielded_task_outcome(
+            task,
+            timeout_s=MICROSANDBOX_ADMISSION_PROBE_TIMEOUT_SECONDS,
+            timeout_after_cancellation_s=0,
+        )
+        captured = outcome.result
+        cancellation = outcome.cancellation or outcome.subsequent_cancellation
+        failure = outcome.error if captured is None else captured.error
+        if cancellation is None and isinstance(failure, asyncio.CancelledError):
+            failure = unexpected_child_cancellation_error(
+                failure, operation="Microsandbox admission probe"
+            )
+        if (
+            cancellation is None
+            and not outcome.timed_out
+            and failure is None
+            and captured is not None
+        ):
+            assert type(captured.result) is int
+            return captured.result
+        runner._poison_exec("Microsandbox admission probe settlement is pending")
+
+        async def settle():
+            module = _microsandbox_module(runner._sandbox_module)
+            try:
+                stopped = await runner._sandbox.stop_and_wait()
+            except Exception as error:
+                if not (
+                    _is_microsandbox_error(module, error, "SandboxNotRunningError")
+                    or _is_microsandbox_error(module, error, "SandboxNotFoundError")
+                ):
+                    raise
+                stopped = (0, True)
+            if not (
+                type(stopped) is tuple
+                and len(stopped) == 2
+                and type(stopped[0]) is int
+                and type(stopped[1]) is bool
+            ):
+                raise RuntimeError(
+                    "Microsandbox admission cleanup lacks positive stopped evidence."
+                )
+            # A dispatched start or stream operation must finish too; stopping
+            # the guest alone cannot prove a delayed SDK request cannot arrive.
+            await asyncio.shield(task)
+
+        settlement = _defer_microsandbox_settlement(
+            _microsandbox_module(runner._sandbox_module),
+            settle,
+            runner.name,
+            operation="admission-probe",
+        )
+        register_acquisition_restoration_retry(settlement, settle)
+        acquisition.retain_until(settlement)
+
+        def retry():
+            nonlocal settlement
+            replacement = retry_acquisition_settlement(
+                settlement,
+                settle,
+                name=f"cayu-microsandbox-admission-retry-{runner.name}",
+            )
+            settlement = replacement
+            return replacement
+
+        register_environment_factory_cleanup_retry(settlement, retry)
+        error = cancellation or failure or TimeoutError("Microsandbox admission probe timed out.")
+        attach_environment_factory_cleanup_settlement_task(error, settlement)
+        if cancellation is not None:
+            if failure is not None:
+                attach_runner_cancellation_failure(cancellation, failure)
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed, cancellation=cancellation
+            )
+        raise error
+
+
 class MicrosandboxRunner(Runner):
     """Executes commands in a Microsandbox microVM sandbox.
 
@@ -240,6 +582,12 @@ class MicrosandboxRunner(Runner):
     """
 
     isolation = "microsandbox"
+
+    def execution_admission_observer(self, requirements):
+        return _MicrosandboxAdmissionObserver(self, requirements)
+
+    def execution_admission_candidate_for(self, requirements):
+        return self.execution_admission_observer(requirements).snapshot()
 
     def __init__(
         self,
@@ -1068,6 +1416,7 @@ class MicrosandboxRunner(Runner):
         stdin = None
         output_limit_bytes = None
         async with self._exec_lock:
+            require_creation_cleanup_settled("microsandbox", self.name)
             return await self._exec_serialized(
                 owned_command,
                 output_redactor=SecretRedactor(),
@@ -1136,6 +1485,7 @@ class MicrosandboxRunner(Runner):
         stdin = None
         output_limit_bytes = None
         async with self._exec_lock:
+            require_creation_cleanup_settled("microsandbox", self.name)
             return await self._exec_serialized(
                 owned_command,
                 output_redactor=redactor,

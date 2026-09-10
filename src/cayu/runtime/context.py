@@ -4960,6 +4960,11 @@ async def _stream_compaction_model(
     observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
     provider_name = require_durable_clean_nonblank(provider_name, "provider.name")
+    # The owned provider child may start after its parent's admission expires.
+    # Reuse the runtime gate inside that child, before invoking provider code.
+    environment_admission = _COMPACTION_ENVIRONMENT_ADMISSION.get()
+    if environment_admission is not None:
+        await environment_admission()
     text_parts: list[str] = []
     completed_payload: dict[str, Any] | None = None
     tool_call_seen = False

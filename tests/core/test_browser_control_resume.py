@@ -10,10 +10,14 @@ import asyncio
 from dataclasses import replace
 
 import pytest
+from tests._tool_admission_fixtures import (
+    SimulatedToolFactory,
+    simulated_tool_executables,  # noqa: F401
+)
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_session import _FakeBrowserBackend
-from tests.core.test_environment_allocation_recovery import _FakeRemoteFactory, _FakeRemoteProvider
+from tests.core.test_environment_allocation_recovery import _FakeRemoteProvider
 from tests.core.test_human_review import (
     CONTEXT,
     QUESTION,
@@ -57,6 +61,8 @@ from cayu.runtime.browser_control_config import BrowserControlConfig
 from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.tools.browser_session import BrowserSessionTool, _RunnerBrowserSessionBackend
 from cayu.tools.user_input import UserInputTool
+
+pytestmark = pytest.mark.usefixtures("simulated_tool_executables")
 
 
 class _ReviewAfterBrowserPolicy(ApprovalPolicy):
@@ -149,7 +155,7 @@ def test_completed_browser_session_ordinary_resume(
                 yield ModelStreamEvent.tool_call(id=f"call-{self.count}", name=name, arguments=args)
                 yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
 
-        class Factory(_FakeRemoteFactory):
+        class Factory(SimulatedToolFactory):
             execution_profile_identity = identity("browser-resume-factory")
 
         def make_app(*, resumed=False):

@@ -1884,7 +1884,9 @@ def test_worker_recovers_recorded_background_operation_after_process_exit(
                         tasks, pending.claim.lease_expires_at
                     )
                     provider.adapter.status = ProviderOperationStatus.COMPLETED
-                assert await asyncio.wait_for(worker.run(max_tasks=1), 15) == 1
+                # Recovery includes durable PostgreSQL publication and
+                # verification; this watchdog is not the worker lease.
+                assert await asyncio.wait_for(worker.run(max_tasks=1), 45) == 1
             current = await tasks.load_latest_work_attempt_admission(original.task_id)
             assert current.attempt_id == original.attempt_id
             assert current.claim.generation == (3 if pending_first else 2)

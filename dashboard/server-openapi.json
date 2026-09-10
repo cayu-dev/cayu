@@ -17778,9 +17778,38 @@
             "maxItems": 64,
             "title": "Required Executables",
             "type": "array"
+          },
+          "tool_requirements": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionToolRequirement"
+            },
+            "maxItems": 64,
+            "title": "Tool Requirements",
+            "type": "array"
           }
         },
         "title": "ExecutionRequirements",
+        "type": "object"
+      },
+      "ExecutionToolRequirement": {
+        "additionalProperties": false,
+        "description": "A tool-owned clause composed into the common workload admission policy.",
+        "properties": {
+          "requirement": {
+            "$ref": "#/components/schemas/ToolExecutionRequirement"
+          },
+          "tool_name": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_name",
+          "requirement"
+        ],
+        "title": "ExecutionToolRequirement",
         "type": "object"
       },
       "ExternalBodyReleaseV1": {
@@ -32586,6 +32615,89 @@
         "title": "ToolDiscoveryViewInspection",
         "type": "object"
       },
+      "ToolExecutableRequirement": {
+        "additionalProperties": false,
+        "description": "An exact executable dependency, with an optional bounded process probe.\n\n``probe_arguments=None`` asks for executable availability without invoking\nthe workload. Explicit arguments select a process-form probe and become\npart of its evidence identity; no shell command string is accepted.",
+        "properties": {
+          "accepted_exit_codes": {
+            "default": [
+              0
+            ],
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Accepted Exit Codes",
+            "type": "array"
+          },
+          "executable": {
+            "maxLength": 4096,
+            "title": "Executable",
+            "type": "string"
+          },
+          "kind": {
+            "const": "executable",
+            "default": "executable",
+            "title": "Kind",
+            "type": "string"
+          },
+          "probe_arguments": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 8,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Probe Arguments"
+          }
+        },
+        "required": [
+          "executable"
+        ],
+        "title": "ToolExecutableRequirement",
+        "type": "object"
+      },
+      "ToolExecutionRequirement": {
+        "additionalProperties": false,
+        "description": "One required tool facility represented by ordered compatible alternatives.",
+        "properties": {
+          "alternatives": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ToolExecutableRequirement"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolRunnerCapabilityRequirement"
+                }
+              ]
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Alternatives",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 96,
+            "pattern": "^[a-z][a-z0-9_]{0,95}$",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "alternatives"
+        ],
+        "title": "ToolExecutionRequirement",
+        "type": "object"
+      },
       "ToolManifest": {
         "additionalProperties": false,
         "properties": {
@@ -33109,6 +33221,38 @@
           "message"
         ],
         "title": "ToolRoundRecoveryBody",
+        "type": "object"
+      },
+      "ToolRunnerCapabilityRequirement": {
+        "additionalProperties": false,
+        "description": "One typed runner-native alternative owned by a tool contract.",
+        "properties": {
+          "capability": {
+            "maxLength": 96,
+            "pattern": "^[a-z][a-z0-9_]{0,95}$",
+            "title": "Capability",
+            "type": "string"
+          },
+          "kind": {
+            "const": "runner_capability",
+            "default": "runner_capability",
+            "title": "Kind",
+            "type": "string"
+          },
+          "minimum_evidence": {
+            "default": "live_verified",
+            "enum": [
+              "available",
+              "live_verified"
+            ],
+            "title": "Minimum Evidence",
+            "type": "string"
+          }
+        },
+        "required": [
+          "capability"
+        ],
+        "title": "ToolRunnerCapabilityRequirement",
         "type": "object"
       },
       "ToolsCalledInOrderAssertionSpec": {

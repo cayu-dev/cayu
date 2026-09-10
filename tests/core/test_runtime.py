@@ -6484,31 +6484,49 @@ def test_environment_factory_fallback_release_is_bounded(tmp_path):
     }
 
 
-def test_cancellation_waits_for_factory_fallback_release_then_propagates(tmp_path):
+@pytest.mark.parametrize(
+    "close_fails,cancellation_target", [(False, "caller"), (True, "caller"), (False, "child")]
+)
+@pytest.mark.parametrize("release_mode", ["fallback", "callback"])
+@pytest.mark.parametrize("historical_cancellation", [False, True])
+def test_cancellation_waits_for_factory_fallback_release_then_propagates(
+    tmp_path, close_fails, cancellation_target, release_mode, historical_cancellation
+):
+    close_error = RuntimeError("fallback close failed after cancellation")
+
     class BlockingRunner(ProvisionedTestRunner):
         def __init__(self) -> None:
             self.close_started = asyncio.Event()
             self.finish_close = asyncio.Event()
             self.close_completed = asyncio.Event()
             self.close_calls = 0
+            self.close_task = None
 
         async def close(self) -> None:
             self.close_calls += 1
+            self.close_task = asyncio.current_task()
             self.close_started.set()
             await self.finish_close.wait()
             self.close_completed.set()
+            if close_fails:
+                raise close_error
 
     async def run() -> None:
         store = InMemorySessionStore()
         runner = BlockingRunner()
         workspace_root = tmp_path / "factory-fallback-cancel"
         workspace_root.mkdir()
+
+        async def release(_action):
+            await runner.close()
+
         factory = RecordingEnvironmentFactory(
             Environment(
                 EnvironmentSpec(name="different"),
                 workspace=LocalWorkspace(workspace_root),
                 runner=runner,
-            )
+            ),
+            release=release if release_mode == "callback" else None,
         )
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(FakeProvider([]), default=True)
@@ -6519,8 +6537,14 @@ def test_cancellation_waits_for_factory_fallback_release_then_propagates(tmp_pat
         )
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        run_task = asyncio.create_task(
-            collect_events(
+        async def consume():
+            if historical_cancellation:
+                current = asyncio.current_task()
+                current.cancel("previously handled cancellation")
+                with pytest.raises(asyncio.CancelledError, match="previously handled cancellation"):
+                    await asyncio.sleep(0)
+                assert current.cancelling() == 1
+            return await collect_events(
                 app,
                 RunRequest(
                     agent_name="assistant",
@@ -6528,17 +6552,41 @@ def test_cancellation_waits_for_factory_fallback_release_then_propagates(tmp_pat
                     messages=[Message.text("user", "run")],
                 ),
             )
-        )
+
+        run_task = asyncio.create_task(consume())
         await asyncio.wait_for(runner.close_started.wait(), timeout=10)
-        run_task.cancel("cancel during factory fallback release")
-        assert run_task.cancelling() == 1
+        target = run_task if cancellation_target == "caller" else runner.close_task
+        assert target is not None
+        target.cancel("cancel during factory fallback release")
+        expected_count = int(historical_cancellation) + int(cancellation_target == "caller")
+        assert target.cancelling() == (expected_count if cancellation_target == "caller" else 1)
+        assert run_task.cancelling() == expected_count
         await asyncio.sleep(0)
         assert run_task.done() is False
         runner.finish_close.set()
+        if cancellation_target == "child":
+            events = await run_task
+            assert not run_task.cancelled() and run_task.cancelling() == expected_count
+            assert events[-1].type is EventType.SESSION_FAILED
+            assert runner.close_task.cancelled() and runner.close_task.cancelling() == 1
+            assert runner.close_calls == 1 and not runner.close_completed.is_set()
+            assert "sess_factory_fallback_cancel" in (
+                app._environment_lifecycle._deferred_factory_cleanup_tasks
+            )
+            return
         with pytest.raises(asyncio.CancelledError) as raised:
             await run_task
         assert raised.value.args == ("cancel during factory fallback release",)
+        if close_fails:
+            from cayu._exception_groups import iter_exception_tree
+
+            assert raised.value.__cause__ is not None
+            assert (
+                sum(item is close_error for item in iter_exception_tree(raised.value.__cause__))
+                == 1
+            )
         assert run_task.cancelled() is True
+        assert run_task.cancelling() == expected_count
         assert runner.close_calls == 1
         assert runner.close_completed.is_set()
 

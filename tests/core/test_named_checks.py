@@ -92,6 +92,41 @@ def _policy(
     )
 
 
+def test_named_check_tool_declares_the_union_of_exact_executable_dependencies() -> None:
+    check = NamedCheck(
+        name="tests",
+        description="Run tests.",
+        command=ExecCommand.process("/opt/tools/uv", "run", "pytest"),
+        execution_profile_identity=_identity(),
+        required_executables=("pytest", "/opt/tools/uv"),
+    )
+    tool = RunCheckTool(checks=(check, _check()), command_policy=_policy())
+    assert [clause.alternatives[0].executable for clause in tool.spec.execution_requirements] == [
+        "/opt/tools/uv",
+        "pytest",
+    ]
+    assert all(
+        clause.alternatives[0].probe_arguments is None
+        for clause in tool.spec.execution_requirements
+    )
+
+
+@pytest.mark.parametrize("count", [10, 11, 32])
+def test_named_check_many_executable_requirements_are_canonical(count):
+    executables = tuple(f"program_{index:02}" for index in range(count))
+    check = NamedCheck(
+        name="many",
+        description="Check dependencies.",
+        command=ExecCommand.process(executables[0]),
+        execution_profile_identity=_identity(),
+        required_executables=executables,
+    )
+    tool = RunCheckTool(checks=(check,), command_policy=_policy(allowed=executables))
+    clauses = tool.spec.execution_requirements
+    assert [item.name for item in clauses] == sorted(item.name for item in clauses)
+    assert {item.alternatives[0].executable for item in clauses} == set(executables)
+
+
 class RecordingRunner:
     def __init__(self, result: object | BaseException | None = None) -> None:
         self.result = ExecResult() if result is None else result
@@ -837,7 +872,7 @@ def test_run_check_uses_runtime_durable_tool_approval_before_execution(tmp_path)
     assert completed.payload["result"]["structured"]["status"] == "passed"
 
 
-def test_resume_rejects_changed_named_check_profile_before_provider_work() -> None:
+def test_resume_rejects_changed_named_check_profile_before_provider_work(tmp_path) -> None:
     store = InMemorySessionStore()
 
     def configured_app(command: ExecCommand) -> tuple[CayuApp, ScriptedModelProvider]:
@@ -849,6 +884,10 @@ def test_resume_rejects_changed_named_check_profile_before_provider_work() -> No
         )
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), runner=LocalRunner(tmp_path)),
+            default=True,
+        )
         app.register_agent(
             AgentSpec(name="coding", model="test-model"),
             tools=[
@@ -862,7 +901,7 @@ def test_resume_rejects_changed_named_check_profile_before_provider_work() -> No
         return app, provider
 
     async def exercise() -> ScriptedModelProvider:
-        original, _ = configured_app(ExecCommand.process("pytest", "-q"))
+        original, _ = configured_app(ExecCommand.process(sys.executable, "-m", "pytest", "-q"))
         _ = [
             event
             async for event in original.run(
@@ -873,7 +912,9 @@ def test_resume_rejects_changed_named_check_profile_before_provider_work() -> No
                 )
             )
         ]
-        replacement, provider = configured_app(ExecCommand.process("pytest", "-q", "tests/core"))
+        replacement, provider = configured_app(
+            ExecCommand.process(sys.executable, "-m", "pytest", "-q", "tests/core")
+        )
         with pytest.raises(ExecutionProfileMismatchError) as caught:
             _ = [
                 event

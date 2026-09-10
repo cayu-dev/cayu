@@ -49,6 +49,7 @@ from cayu.core.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
+from cayu.core.tools import ToolRunnerCapabilityRequirement
 from cayu.egress import (
     ApprovedEgressDestination,
     CredentialKind,
@@ -88,8 +89,12 @@ from cayu.egress.broker import _bounded_response_bytes
 from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.egress.destinations import normalize_egress_hostname, validate_approved_destinations
 from cayu.environments.admission import (
+    _REQUIRED_LIVE_OBSERVATIONS,
     ExecutionAdmissionCandidate,
+    ExecutionCapabilityEvidence,
     ExecutionEnvironmentAuthority,
+    ExecutionToolRequirementEvidence,
+    _copy_execution_admission_candidate,
 )
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import (
@@ -128,6 +133,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerExecutionAdmissionObserver,
     RunnerLifecycleState,
     RunnerWorkspaceCapabilityT,
     _clean_runner_preflight,
@@ -908,11 +914,10 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     ) -> ExecutionAdmissionCandidate:
         """Publish adapter-owned declarations without creating provider resources."""
 
-        del request
         adapter = self._adapter or self._resolve_adapter(asyncio.get_running_loop())
         return ExecutionAdmissionCandidate(
             candidate=adapter.runner_kind,
-            evidence=adapter.execution_capability_evidence(),
+            evidence=adapter.execution_admission_evidence_for(request.execution_requirements),
         )
 
     def construction_admission_candidate(self) -> ExecutionAdmissionCandidate:
@@ -1857,6 +1862,76 @@ def _validated_runner_dispatch_kwargs(
     return kwargs
 
 
+@dataclass(frozen=True, repr=False)
+class _EgressExecutionAdmissionObserver(RunnerExecutionAdmissionObserver):
+    runner: _EgressManagedRunner
+    inner: RunnerExecutionAdmissionObserver
+
+    def _combine(self, supplied):
+        base = self.runner.execution_admission_candidate()
+        candidate = _copy_execution_admission_candidate(supplied)
+        if candidate is None or candidate.evidence is None:
+            return base
+        if candidate.candidate != base.candidate:
+            raise RuntimeError("Managed admission observer received a different runner candidate.")
+        evidence = candidate.evidence
+        if evidence.environment_fingerprint is None:
+            return base
+        fingerprint = (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "managed_environment": self.runner._environment_fingerprint,
+                        "runner_environment": evidence.environment_fingerprint,
+                    },
+                    "managed_execution_identity",
+                )
+            ).hexdigest()
+        )
+        assert base.evidence is not None
+        claims = {claim.capability: claim for claim in base.evidence.claims}
+        native = {
+            alternative.capability
+            for owned in self.requirements.tool_requirements
+            for alternative in owned.requirement.alternatives
+            if isinstance(alternative, ToolRunnerCapabilityRequirement)
+        }
+        # Security evidence belongs to the adapter, including absent claims.
+        # Naming security as a native tool alternative cannot transfer authority.
+        for claim in evidence.claims:
+            if claim.capability in native and claim.capability not in _REQUIRED_LIVE_OBSERVATIONS:
+                claims.setdefault(claim.capability, claim)
+        tool_evidence = evidence.tool_requirements
+        combined = ExecutionCapabilityEvidence.model_validate(
+            {
+                **base.evidence.model_dump(mode="python", warnings=False),
+                "claims": tuple(claims.values()),
+                "unclaimed_reason_code": None if claims else base.evidence.unclaimed_reason_code,
+                "environment_fingerprint": fingerprint,
+                "image_fingerprint": evidence.image_fingerprint,
+                "toolchain_profile_fingerprint": evidence.toolchain_profile_fingerprint,
+                "tool_requirements": None
+                if tool_evidence is None
+                else ExecutionToolRequirementEvidence(
+                    environment_fingerprint=fingerprint,
+                    image_fingerprint=evidence.image_fingerprint,
+                    executables=tool_evidence.executables,
+                ),
+            }
+        )
+        return ExecutionAdmissionCandidate(candidate=base.candidate, evidence=combined)
+
+    def snapshot(self):
+        return self._combine(self.inner.snapshot())
+
+    async def collect(self):
+        return self._combine(await self.inner.collect())
+
+    async def refresh(self):
+        await self.inner.refresh()
+
+
 class _EgressManagedRunner(Runner):
     """Runner wrapper that also owns pre-bind egress resources.
 
@@ -1979,6 +2054,18 @@ class _EgressManagedRunner(Runner):
             candidate=self._adapter.runner_kind,
             evidence=self._adapter.execution_capability_evidence(self._runner),
         )
+
+    def execution_admission_observer(self, requirements):
+        if not requirements.tool_requirements and not requirements.required_executables:
+            return super().execution_admission_observer(requirements)
+        inner = self._runner.execution_admission_observer(requirements)
+        if (
+            not isinstance(inner, RunnerExecutionAdmissionObserver)
+            or inner.runner is not self._runner
+            or inner.requirements != requirements
+        ):
+            raise RuntimeError("Managed runner received a mismatched admission observer.")
+        return _EgressExecutionAdmissionObserver(self, requirements, inner)
 
     def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
         """Return the factory boundary that owns this managed runner."""

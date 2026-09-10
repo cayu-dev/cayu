@@ -34,9 +34,9 @@ from cayu.core.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.core.isolated_tools import ISOLATED_TOOL_PROTOCOL_NAME
-from cayu.core.tools import ToolEffect
+from cayu.core.tools import ToolEffect, ToolExecutionRequirement, copy_tool_execution_requirements
 
-TOOL_DESCRIPTOR_SCHEMA_VERSION = 2
+TOOL_DESCRIPTOR_SCHEMA_VERSION = 3
 TOOL_CATALOGUE_SCHEMA_VERSION = 1
 TOOL_CATALOGUE_MAX_TOOLS = 10_000
 TOOL_CATALOGUE_MAX_BYTES = 32 * 1024 * 1024
@@ -356,7 +356,7 @@ class ToolDescriptor(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[2] = TOOL_DESCRIPTOR_SCHEMA_VERSION
+    schema_version: Literal[3] = TOOL_DESCRIPTOR_SCHEMA_VERSION
     tool_id: str = ""
     name: str
     description: str = ""
@@ -366,15 +366,21 @@ class ToolDescriptor(BaseModel):
     publishes_arguments: StrictBool = True
     workspace_mutation: StrictBool = False
     execution_contract: ToolExecutionContract = Field(default_factory=ToolExecutionContract)
+    execution_requirements: tuple[ToolExecutionRequirement, ...] = ()
     provenance: ToolDescriptorProvenance = Field(default_factory=ToolDescriptorProvenance)
     schema_fingerprint: str = Field(default="", pattern=r"^(?:|sha256:[0-9a-f]{64})$")
     version: str = Field(default="", pattern=r"^(?:|sha256:[0-9a-f]{64})$")
+
+    @field_validator("execution_requirements", mode="before")
+    @classmethod
+    def copy_execution_requirements(cls, value: object) -> tuple[ToolExecutionRequirement, ...]:
+        return copy_tool_execution_requirements(value)
 
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
         if type(value) is not int or value != TOOL_DESCRIPTOR_SCHEMA_VERSION:
-            raise ValueError("Tool descriptor schema_version must be the integer 2.")
+            raise ValueError("Tool descriptor schema_version must be the integer 3.")
         return value
 
     @field_validator("name")
@@ -436,6 +442,9 @@ class ToolDescriptor(BaseModel):
                 "publishes_arguments": self.publishes_arguments,
                 "workspace_mutation": self.workspace_mutation,
                 "execution_contract": self.execution_contract.model_dump(mode="json"),
+                "execution_requirements": [
+                    item.model_dump(mode="json") for item in self.execution_requirements
+                ],
                 "provenance": self.provenance.model_dump(mode="json"),
             },
             "tool_descriptor",
@@ -464,6 +473,9 @@ class ToolDescriptor(BaseModel):
             "publishes_arguments": self.publishes_arguments,
             "workspace_mutation": self.workspace_mutation,
             "execution_contract": self.execution_contract.model_dump(mode="json"),
+            "execution_requirements": [
+                item.model_dump(mode="json") for item in self.execution_requirements
+            ],
         }
 
     def execution_profile_material(self) -> dict[str, Any]:
@@ -485,6 +497,7 @@ def build_tool_descriptor(
     publishes_arguments: bool,
     workspace_mutation: bool,
     execution_contract: ToolExecutionContract | None = None,
+    execution_requirements: tuple[ToolExecutionRequirement, ...] = (),
     provenance: ToolDescriptorProvenance | None = None,
 ) -> ToolDescriptor:
     """Build one descriptor from copied runtime-admitted registration state."""
@@ -497,6 +510,7 @@ def build_tool_descriptor(
         effect=effect,
         publishes_arguments=publishes_arguments,
         workspace_mutation=workspace_mutation,
+        execution_requirements=execution_requirements,
         execution_contract=(
             ToolExecutionContract()
             if execution_contract is None

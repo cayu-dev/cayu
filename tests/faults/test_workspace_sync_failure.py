@@ -40,6 +40,7 @@ from cayu import (
     VerifiedTaskWorker,
 )
 from cayu.runtime import InMemoryEventSink, SessionStatus
+from cayu.runtime import _environment_lifecycle as lifecycle_module
 from cayu.runtime.work_attempt_admission import (
     WorkAttemptExecutionRequest,
     WorkAttemptRecoveryRequest,
@@ -575,7 +576,11 @@ def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(
 
 def test_sync_binding_retains_owner_after_finalize_failure_commit_is_reconciled(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This exercises successful settlement, not the separate bounded-poll case.
+    # Filesystem work need not finish within the production admission's 10ms.
+    monkeypatch.setattr(lifecycle_module, "_LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS", 1.0)
     store = FailingFinalizeEvidenceStore()
     store.commit_finalize_evidence_before_failure = True
     app, binding, source, target, _target_root = _sync_durability_test_app(tmp_path, store)
@@ -1372,8 +1377,20 @@ def test_worker_discovers_stopped_workspace_cleanup_after_lost_ack(tmp_path, mon
     )
 
 
+@pytest.mark.parametrize(
+    "recovery_control",
+    [
+        "normal",
+        "cancel",
+        "cancel_then_clear_failure",
+        "same_app_cancel_then_clear_failure",
+        "same_app_marker_conflict",
+    ],
+)
 def test_cancelled_completion_finalization_remains_failed_and_recoverable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_control: str,
 ) -> None:
     source_root = tmp_path / "cancelled-source"
     target_root = tmp_path / "cancelled-target"
@@ -1383,8 +1400,10 @@ def test_cancelled_completion_finalization_remains_failed_and_recoverable(
 
     class CancelOnceCompletionBinding(SyncBinding):
         cancel_once = True
+        finalize_calls = 0
 
         async def finalize(self, bound, *, outcome=None, metadata=None):
+            self.finalize_calls += 1
             if self.cancel_once:
                 self.cancel_once = False
                 raise asyncio.CancelledError("injected finalization cancellation")
@@ -1437,25 +1456,190 @@ def test_cancelled_completion_finalization_remains_failed_and_recoverable(
         assert checkpoint is not None
         assert "pending_completion_finalization" in checkpoint
 
-        # A child-originated cancellation may leave owned cleanup settling
-        # after the stream returns. Recovery must not race that retained owner.
-        assert await app.drain_environment_cleanups()
-        after_cleanup = await store.load_checkpoint("cancelled-finalize-session")
-        assert after_cleanup is not None
-        expected_action = (
-            IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_FINALIZATION
-            if "pending_completion_finalization" in after_cleanup
-            else IncompleteSessionRecoveryAction.SKIPPED_TERMINAL
+        expected_action = IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_FINALIZATION
+        if recovery_control == "normal":
+            # A child-originated cancellation may leave owned cleanup settling
+            # after the stream returns. Recovery must not race that retained owner.
+            assert await app.drain_environment_cleanups()
+            after_cleanup = await store.load_checkpoint("cancelled-finalize-session")
+            assert after_cleanup is not None
+            if "pending_completion_finalization" not in after_cleanup:
+                expected_action = IncompleteSessionRecoveryAction.SKIPPED_TERMINAL
+        request = IncompleteSessionRecoveryRequest(
+            session_id="cancelled-finalize-session",
+            reason="cancelled_workspace_finalization",
         )
-        recovery = await app.recover_incomplete_session(
-            IncompleteSessionRecoveryRequest(
-                session_id="cancelled-finalize-session",
-                reason="cancelled_workspace_finalization",
+        recovery = None
+        if recovery_control == "normal":
+            # Exercise the settled path independently of filesystem scheduling;
+            # blocked-owner tests cover admission while cleanup is still live.
+            monkeypatch.setattr(
+                lifecycle_module, "_LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS", 1.0
             )
-        )
+            recovery = await app.recover_incomplete_session(request)
+        else:
+            # A fresh app enters durable completion recovery, rather than the
+            # original app's lazy sweep of its retained finalization owner.
+            recovery_app = CayuApp(session_store=store, enable_logging=False)
+            recovery_provider = ScriptedModelProvider([], name="cancelled-finalize-provider")
+            recovery_app.register_provider(recovery_provider, default=True)
+            recovery_app.register_environment(
+                Environment(
+                    EnvironmentSpec(name="cancelled-finalize"),
+                    workspace=LocalWorkspace(source_root, workspace_id="cancelled-source"),
+                    binding=SyncBinding(
+                        target_workspace=LocalWorkspace(
+                            target_root, workspace_id="cancelled-target"
+                        ),
+                        source_conflict_policy="require_revision",
+                        max_file_bytes=1024,
+                    ),
+                ),
+                default=True,
+            )
+            recovery_app.register_agent(
+                AgentSpec(
+                    name="cancelled-finalize-agent",
+                    model="scripted-model",
+                    provider_name="cancelled-finalize-provider",
+                )
+            )
+            retained_owner = None
+            if recovery_control.startswith("same_app"):
+                # Keep this caller inside the bounded poll until cancellation
+                # is delivered; the production 10ms budget is not a test barrier.
+                monkeypatch.setattr(
+                    lifecycle_module, "_LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS", 1.0
+                )
+                recovery_app = app
+                retained_owner = app._environment_lifecycle._active_environment_setups[
+                    "cancelled-finalize-session"
+                ]
+            clear_started = asyncio.Event()
+            allow_clear = asyncio.Event()
+            clear_failure = OSError("completion marker clear failed after caller cancellation")
+            original_clear = recovery_app._environment_lifecycle.clear_completion_finalization
+
+            async def blocked_clear(**kwargs):
+                clear_started.set()
+                await allow_clear.wait()
+                if recovery_control.endswith("cancel_then_clear_failure") or retained_owner:
+                    raise clear_failure
+                return await original_clear(**kwargs)
+
+            monkeypatch.setattr(
+                recovery_app._environment_lifecycle, "clear_completion_finalization", blocked_clear
+            )
+            recovery_task = asyncio.create_task(recovery_app.recover_incomplete_session(request))
+            try:
+                await asyncio.wait_for(clear_started.wait(), timeout=10)
+                settlement = (
+                    None if retained_owner is None else retained_owner.cleanup_settlement_task
+                )
+                if retained_owner is not None:
+                    assert settlement is not None and not settlement.done()
+                    assert binding.finalize_calls == 2
+                recovery_task.cancel("cancel public completion recovery")
+                assert recovery_task.cancelling() == 1
+                await asyncio.sleep(0)
+                assert not recovery_task.done()
+                allow_clear.set()
+                with pytest.raises(asyncio.CancelledError) as raised:
+                    await recovery_task
+                assert raised.value.args == ("cancel public completion recovery",)
+                assert recovery_task.cancelled()
+                assert recovery_task.cancelling() == 1
+                if recovery_control == "cancel_then_clear_failure":
+                    seen: set[int] = set()
+                    pending: list[BaseException] = [raised.value]
+                    originals: list[BaseException] = []
+                    while pending:
+                        error = pending.pop()
+                        if id(error) in seen:
+                            continue
+                        seen.add(id(error))
+                        originals.append(error)
+                        if isinstance(error, BaseExceptionGroup):
+                            pending.extend(error.exceptions)
+                        if error.__cause__ is not None:
+                            pending.append(error.__cause__)
+                    assert clear_failure in originals
+                    retained = await store.load_checkpoint("cancelled-finalize-session")
+                    assert retained is not None
+                    assert "pending_completion_finalization" in retained
+                if retained_owner is not None:
+                    assert settlement is not None
+                    outcome = await asyncio.wait_for(asyncio.shield(settlement), timeout=10)
+                    assert outcome.error is clear_failure
+                    assert retained_owner.cleanup_error is clear_failure
+                    assert retained_owner.cleanup_requires_finalize_retry is False
+                    assert (
+                        app._environment_lifecycle._active_environment_setups[
+                            "cancelled-finalize-session"
+                        ]
+                        is retained_owner
+                    )
+                    retained = await store.load_checkpoint("cancelled-finalize-session")
+                    assert retained is not None
+                    assert "pending_completion_finalization" in retained
+                    assert (
+                        retained_owner.pending_completion_marker_clear
+                        == retained["pending_completion_finalization"]
+                    )
+            finally:
+                allow_clear.set()
+                await asyncio.gather(recovery_task, return_exceptions=True)
+                monkeypatch.setattr(
+                    recovery_app._environment_lifecycle,
+                    "clear_completion_finalization",
+                    original_clear,
+                )
+            if recovery_control == "cancel_then_clear_failure":
+                recovery = await recovery_app.recover_incomplete_session(request)
+            if retained_owner is not None:
+                if recovery_control == "same_app_marker_conflict":
+                    expected_marker = retained_owner.pending_completion_marker_clear
+                    assert expected_marker is not None
+                    conflicting_marker = {
+                        **expected_marker,
+                        "binding_generation_id": "different-binding-generation",
+                    }
+
+                    async def replace_marker(marker):
+                        await store.transform_checkpoint(
+                            "cancelled-finalize-session",
+                            lambda _session, current: {
+                                **(current or {}),
+                                "pending_completion_finalization": marker,
+                            },
+                        )
+
+                    await replace_marker(conflicting_marker)
+                    assert not await app.drain_environment_cleanups(timeout_s=0.1)
+                    assert binding.finalize_calls == 2
+                    conflicted = await store.load_checkpoint("cancelled-finalize-session")
+                    assert conflicted is not None
+                    assert conflicted["pending_completion_finalization"] == conflicting_marker
+                    assert retained_owner.pending_completion_marker_clear == expected_marker
+                    await replace_marker(expected_marker)
+                assert await app.drain_environment_cleanups(timeout_s=10), (
+                    retained_owner.cleanup_error,
+                    retained_owner.cleanup_requires_finalize_retry,
+                    retained_owner.cleanup_release_safe,
+                    tuple(app._environment_lifecycle._active_environment_setups),
+                    tuple(app._environment_lifecycle._deferred_run_fence_release_tasks),
+                )
+                assert binding.finalize_calls == 2
+                assert "cancelled-finalize-session" not in (
+                    app._environment_lifecycle._active_environment_setups
+                )
+                persisted_events = await store.load_events("cancelled-finalize-session")
+                assert sum(event.type is EventType.MODEL_STARTED for event in persisted_events) == 1
+            assert recovery_provider.requests == []
         recovered = await store.load("cancelled-finalize-session")
         checkpoint = await store.load_checkpoint("cancelled-finalize-session")
-        assert recovery.actions == (expected_action,)
+        if recovery is not None:
+            assert recovery.actions == (expected_action,)
         assert recovered is not None
         assert recovered.status is SessionStatus.FAILED
         assert checkpoint is not None

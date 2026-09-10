@@ -33,7 +33,15 @@ from cayu.artifacts import (
     copy_artifact_read_result,
     file_attachment,
 )
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionAdmissionStage,
@@ -278,6 +286,30 @@ class _BrowserScreenshotSuccess(BaseModel):
         return self
 
 
+def _browser_worker_tool_spec(spec: ToolSpec, command: ExecCommand) -> ToolSpec:
+    """Retain caller clauses while requiring the configured worker executable."""
+
+    if not isinstance(spec, ToolSpec):
+        raise TypeError("Browser tool spec must be a ToolSpec.")
+    spec = ToolSpec.model_validate(spec.model_dump(mode="python", warnings=False))
+    assert command.argv
+    requirement = ToolExecutionRequirement(
+        name="browser_worker",
+        alternatives=(ToolExecutableRequirement(executable=command.argv[0]),),
+    )
+    requirements = {item.name: item for item in spec.execution_requirements}
+    previous = requirements.setdefault(requirement.name, requirement)
+    if previous != requirement:
+        raise ValueError(
+            "Browser worker declaration conflicts with the supplied tool requirements."
+        )
+    return spec.model_copy(
+        update={
+            "execution_requirements": tuple(requirements[name] for name in sorted(requirements))
+        }
+    )
+
+
 class BrowserWebFetchAdapter:
     """Execute ``web_fetch`` through a compatible worker in an admitted runner.
 
@@ -304,6 +336,9 @@ class BrowserWebFetchAdapter:
             expected_environment_authority
         )
         self.expected_workload_authority = _expected_workload_authority(expected_workload_authority)
+
+    def _tool_spec_with_execution_requirements(self, spec: ToolSpec) -> ToolSpec:
+        return _browser_worker_tool_spec(spec, self._worker_command)
 
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return material only for Cayu's shipped browser worker."""
@@ -507,7 +542,11 @@ class ScreenshotPageTool(Tool):
         )
         self.expected_workload_authority = _expected_workload_authority(expected_workload_authority)
         self.expected_artifact_store_id = _expected_artifact_store_id(expected_artifact_store_id)
-        super().__init__(spec)
+        super().__init__(
+            _browser_worker_tool_spec(
+                type(self).spec if spec is None else spec, self._worker_command
+            )
+        )
 
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return bounded material only for Cayu's shipped browser worker."""

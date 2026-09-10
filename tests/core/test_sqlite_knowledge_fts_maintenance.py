@@ -491,7 +491,10 @@ def _unrelated_fts_rows(connection: sqlite3.Connection) -> list[tuple[object, ..
 
 
 def _wait_for_file(path: Path, process: subprocess.Popen[bytes]) -> None:
-    for _ in range(500):
+    # Process import and SQLite setup share busy CI hosts; this is a startup
+    # watchdog, not the mutation/interruption boundary under test.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
         if path.exists():
             return
         if process.poll() is not None:

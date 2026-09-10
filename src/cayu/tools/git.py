@@ -7,13 +7,22 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from cayu._validation import require_nonblank, require_unicode_scalar_text
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner, RunnerUnavailableError
 from cayu.tools._errors import (
     reject_unknown_tool_arguments,
     structured_invalid_arguments,
     tool_argument_validation,
 )
+from cayu.tools._execution_requirements import with_intrinsic_execution_requirements
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace
@@ -53,8 +62,22 @@ class _StatusPage:
 class GitChangesTool(Tool):
     """Inspect bounded Git changes without exposing an unrestricted shell."""
 
+    def __init__(self, spec: ToolSpec | None = None) -> None:
+        super().__init__(
+            with_intrinsic_execution_requirements(
+                self.spec if spec is None else spec,
+                GitChangesTool.spec.execution_requirements,
+            )
+        )
+
     spec = ToolSpec(
         name="git_changes",
+        execution_requirements=(
+            ToolExecutionRequirement(
+                name="git",
+                alternatives=(ToolExecutableRequirement(executable="git"),),
+            ),
+        ),
         parallel_safe=True,
         effect=ToolEffect.NONE,
         description=(

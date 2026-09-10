@@ -18,7 +18,15 @@ from cayu.core.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.environments.docker_toolchains import (
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
@@ -248,7 +256,26 @@ class RunCheckTool(Tool):
                     )
         schema = copy_json_value(type(self).spec.input_schema, "run_check.input_schema")
         schema["properties"]["check"]["enum"] = [check.name for check in ordered_checks]
-        super().__init__(type(self).spec.model_copy(update={"input_schema": schema}))
+        executables = sorted(
+            {executable for check in ordered_checks for executable in check.required_executables}
+        )
+        requirements = tuple(
+            sorted(
+                (
+                    ToolExecutionRequirement(
+                        name=f"executable_{index}",
+                        alternatives=(ToolExecutableRequirement(executable=executable),),
+                    )
+                    for index, executable in enumerate(executables)
+                ),
+                key=lambda requirement: requirement.name,
+            )
+        )
+        super().__init__(
+            type(self).spec.model_copy(
+                update={"input_schema": schema, "execution_requirements": requirements}
+            )
+        )
         self._checks = ordered_checks
         self._checks_by_name = {check.name: check for check in ordered_checks}
         self._command_policy = command_policy

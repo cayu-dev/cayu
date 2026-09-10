@@ -85,6 +85,7 @@ from cayu.tools.browser import (
     _AdmissionAwareRunnerHandle,
     _browser_runner_is_admitted,
     _browser_worker_command,
+    _browser_worker_tool_spec,
     _EnvironmentAuthorityAwareRunnerHandle,
     _expected_environment_authority,
     _expected_runner_candidate,
@@ -2289,6 +2290,11 @@ class BrowserSessionTool(Tool):
         )
         self._states: dict[str, _ParentBrowserState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        if type(self._backend) is _RunnerBrowserSessionBackend:
+            spec = _browser_worker_tool_spec(
+                type(self).spec if spec is None else spec,
+                _browser_worker_command(DEFAULT_BROWSER_FETCH_WORKER_COMMAND),
+            )
         super().__init__(spec)
 
     def _page_set_limits(self) -> _BrowserPageSetLimits:

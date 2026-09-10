@@ -38,14 +38,18 @@ from cayu import (
     EventType,
     ExecCommand,
     ExecutionRequirements,
+    ExecutionToolRequirement,
     ImmutableInputProjectionCapability,
     ImmutableInputStore,
     LocalRunner,
     Message,
     NoWorkspaceBinding,
     RunRequest,
+    SearchTextTool,
     SyncBinding,
     SyncBindingSourceConflictError,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
     evaluate_execution_admission,
     inspect_local_immutable_input,
 )
@@ -415,8 +419,10 @@ def test_strict_docker_runner_uses_typed_restrictions_and_exact_live_evidence(
         if docker_args[0] == "inspect":
             return ExecResult(stdout=json.dumps(_inspection(restrictions)))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
-        return ExecResult()
+            return _completed_admission_probe_result(
+                docker_args, ExecResult(stdout=restrictions.user)
+            )
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
 
@@ -484,8 +490,10 @@ def test_weakened_docker_restrictions_do_not_claim_privilege_evidence(
         if docker_args[0] == "inspect":
             return ExecResult(stdout=json.dumps(_inspection(restrictions)))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
-        return ExecResult()
+            return _completed_admission_probe_result(
+                docker_args, ExecResult(stdout=restrictions.user)
+            )
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
 
@@ -880,12 +888,14 @@ def test_explicit_toolchain_platform_drift_cleans_exact_container(
         if docker_args[0] == "inspect":
             return ExecResult(stdout=json.dumps(_inspection(restrictions)))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
+            return _completed_admission_probe_result(
+                docker_args, ExecResult(stdout=restrictions.user)
+            )
         if docker_args[:2] == ["exec", _CONTAINER_ID] and any(
             "platform.system" in item for item in docker_args
         ):
             return ExecResult(stdout="linux/arm64\n")
-        return ExecResult()
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
@@ -1267,8 +1277,10 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
         if docker_args[0] == "inspect":
             return ExecResult(stdout=json.dumps(_inspection(restrictions)))
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
-            return ExecResult(stdout=restrictions.user)
-        return ExecResult()
+            return _completed_admission_probe_result(
+                docker_args, ExecResult(stdout=restrictions.user)
+            )
+        return _completed_admission_probe_result(docker_args, ExecResult())
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
@@ -1290,6 +1302,15 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
             cancellation="confirmed",
             cleanup="confirmed",
             required_executables=("git", "python3"),
+            tool_requirements=(
+                ExecutionToolRequirement(
+                    tool_name="search_text",
+                    requirement=ToolExecutionRequirement(
+                        name="search",
+                        alternatives=(ToolExecutableRequirement(executable="rg"),),
+                    ),
+                ),
+            ),
         ),
     )
 
@@ -1305,6 +1326,17 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
             "sleep",
         ]
         assert result.environment.runner is not None
+        executable = next(
+            item
+            for item in evidence["tool_requirements"]["executables"]
+            if item["executable"] == "rg"
+        )
+        assert executable["state"] == "live_verified"
+        assert (
+            executable["requirement_fingerprint"]
+            == ToolExecutableRequirement(executable="rg").fingerprint
+        )
+        assert any("rg" in call and any("name=$1" in arg for arg in call) for call in calls)
         assert result.environment.binding is not None
         assert result.environment.workspace is factory.source_workspace
         assert result.release is not None
@@ -1641,12 +1673,15 @@ def test_docker_coding_reconnect_releases_interrupted_finalize_reference(
     assert ImmutableInputStore(store.root).inspect()[0].reference_count == 0
 
 
+@pytest.mark.parametrize("tool_owned", [False, True])
 def test_runtime_structurally_refuses_a_missing_final_docker_executable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    tool_owned: bool,
 ) -> None:
     restrictions = DockerWorkloadRestrictions()
     calls: list[list[str]] = []
+    missing_executable = "rg" if tool_owned else "git"
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         del kwargs
@@ -1663,7 +1698,11 @@ def test_runtime_structurally_refuses_a_missing_final_docker_executable(
                 docker_args,
                 ExecResult(stdout=restrictions.user),
             )
-        if docker_args[:2] == ["exec", _CONTAINER_ID] and "command -v git" in docker_args[-1]:
+        if (
+            docker_args[:2] == ["exec", _CONTAINER_ID]
+            and missing_executable in docker_args
+            and any("name=$1" in arg for arg in docker_args)
+        ):
             return _completed_admission_probe_result(
                 docker_args,
                 ExecResult(exit_code=127),
@@ -1720,6 +1759,7 @@ def test_runtime_structurally_refuses_a_missing_final_docker_executable(
         )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            tools=[SearchTextTool()] if tool_owned else [],
             execution_requirements=ExecutionRequirements.trusted(
                 required_executables=factory.required_executables,
             ),
@@ -1740,9 +1780,12 @@ def test_runtime_structurally_refuses_a_missing_final_docker_executable(
     refusal = next(
         item
         for item in failed.payload["execution_admission"]["refusals"]
-        if item["executable"] == "git"
+        if item["executable"] == missing_executable
     )
     assert refusal["code"] == "unsupported_capability"
+    if tool_owned:
+        assert refusal["tool_name"] == "search_text"
+        assert refusal["requirement_name"] == "workspace_text_search"
     transition = next(
         event
         for event in events
@@ -1750,9 +1793,9 @@ def test_runtime_structurally_refuses_a_missing_final_docker_executable(
         and event.payload["phase"] == "admission"
     )
     assert transition.payload["refusal_executable_sha256"] == [
-        "sha256:" + sha256(b"git").hexdigest()
+        "sha256:" + sha256(missing_executable.encode()).hexdigest()
     ]
-    assert "git" not in repr(transition.payload)
+    assert missing_executable not in repr(transition.payload)
     assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
 
 

@@ -6,6 +6,7 @@ import json
 import pytest
 from tests.docker_toolchain import docker_toolchain_profile
 from tests.environments.test_docker_coding import _CONTAINER_ID, _image_identity, _inspection
+from tests.runners.test_docker_admission_renewal import _completed_probe_result
 
 from cayu import (
     DockerCodingEnvironmentFactory,
@@ -61,10 +62,10 @@ async def test_factory_never_reconnects_container_owned_by_rollback(
             inspections += 1
             return ExecResult(stdout=json.dumps(_inspection(restrictions)))
         if any(".cayu-toolchain-write-probe" in arg for arg in args):
-            return ExecResult(stdout="linux/amd64\n")
+            return _completed_probe_result(args, stdout="linux/amd64\n")
         if "id -u" in args[-1]:
-            return ExecResult(stdout=restrictions.user)
-        return ExecResult()
+            return _completed_probe_result(args, stdout=restrictions.user)
+        return _completed_probe_result(args)
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", docker)
     monkeypatch.setattr("cayu.runners.docker.settle_creation_cleanup", bounded_rollback)

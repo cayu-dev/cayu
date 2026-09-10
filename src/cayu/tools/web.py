@@ -430,6 +430,13 @@ class WebFetchTool(Tool):
             effective_spec = type(self).spec.model_copy(
                 update={"execution_profile_identity": execution_profile_identity}
             )
+        if adapter is not None:
+            from cayu.tools.browser import BrowserWebFetchAdapter
+
+            if type(adapter) is BrowserWebFetchAdapter:
+                effective_spec = adapter._tool_spec_with_execution_requirements(
+                    type(self).spec if effective_spec is None else effective_spec
+                )
         super().__init__(effective_spec)
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:

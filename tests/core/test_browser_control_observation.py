@@ -9,11 +9,15 @@ import time
 from dataclasses import replace
 
 import pytest
+from tests._tool_admission_fixtures import (
+    SimulatedToolFactory,
+    simulated_tool_executables,  # noqa: F401
+)
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control import request as takeover_request
 from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_session import _FakeBrowserBackend
-from tests.core.test_environment_allocation_recovery import _FakeRemoteFactory, _FakeRemoteProvider
+from tests.core.test_environment_allocation_recovery import _FakeRemoteProvider
 
 from cayu import (
     AgentSpec,
@@ -49,6 +53,8 @@ from cayu.tools.browser_session import (
     _durable_browser_operation_key,
     _RunnerBrowserSessionBackend,
 )
+
+pytestmark = pytest.mark.usefixtures("simulated_tool_executables")
 
 
 @pytest.mark.parametrize("persistent", [False, True])
@@ -268,7 +274,9 @@ def test_runtime_observation_atomically_releases_handback_fence(
         provider = Provider([])
         app.register_provider(provider, default=True)
         app.register_environment_factory(
-            EnvironmentSpec(name="browser"), _FakeRemoteFactory(_FakeRemoteProvider()), default=True
+            EnvironmentSpec(name="browser"),
+            SimulatedToolFactory(_FakeRemoteProvider()),
+            default=True,
         )
         app.register_agent(AgentSpec(name="agent", model="model"), tools=[BrowserSessionTool()])
         try:

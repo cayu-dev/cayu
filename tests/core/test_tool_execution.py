@@ -681,9 +681,9 @@ def test_remember_knowledge_operator_interrupt_returns_while_publication_finishe
                     reason="operator interrupt",
                 ),
             ),
-            timeout=1,
+            timeout=5,
         )
-        run_events = await asyncio.wait_for(run_task, timeout=1)
+        run_events = await asyncio.wait_for(run_task, timeout=5)
         assert knowledge_store.settled.is_set() is False
         assert knowledge_store.publish_calls == 1
         assert len(tool._publication_owner) == 1

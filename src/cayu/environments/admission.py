@@ -24,6 +24,12 @@ from cayu.capabilities import (
     CapabilityObservation,
     CapabilityState,
 )
+from cayu.core.tools import (
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    _copy_bounded_iterable,
+    copy_tool_executable_probes,
+)
 
 EXECUTION_CAPABILITY_EVIDENCE_SCHEMA = "cayu.execution_capabilities.v1"
 EXECUTION_TOOL_REQUIREMENT_EVIDENCE_SCHEMA = "cayu.execution_tool_requirements.v1"
@@ -175,6 +181,7 @@ class ExecutionExecutableEvidence(BaseModel):
 
     executable: str = Field(max_length=4096)
     state: ExecutionExecutableEvidenceState
+    requirement_fingerprint: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
     observed_at: datetime | None = None
     valid_until: datetime | None = None
     reason_code: str | None = Field(default=None, max_length=96)
@@ -374,10 +381,24 @@ class ExecutionEvidenceOverride(BaseModel):
     minimum_evidence: MinimumExecutionEvidence
 
 
+class ExecutionToolRequirement(BaseModel):
+    """A tool-owned clause composed into the common workload admission policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    tool_name: str = Field(min_length=1, max_length=512)
+    requirement: ToolExecutionRequirement
+
+    @field_validator("tool_name")
+    @classmethod
+    def validate_tool_name(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "tool_name")
+
+
 class ExecutionRequirements(BaseModel):
     """Provider-neutral security and lifecycle requirements for one workload."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     code_trust: ExecutionCodeTrust = "trusted"
     real_secret_visibility: ExecutionSecretVisibility = "allowed"
@@ -393,6 +414,42 @@ class ExecutionRequirements(BaseModel):
         max_length=64,
     )
     required_executables: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+    tool_requirements: tuple[ExecutionToolRequirement, ...] = Field(
+        default_factory=tuple, max_length=64
+    )
+
+    @field_validator("tool_requirements", mode="before")
+    @classmethod
+    def copy_tool_requirements(cls, value: object) -> tuple[ExecutionToolRequirement, ...]:
+        items = _copy_bounded_iterable(value, field_name="tool_requirements", maximum=64)
+        return tuple(
+            ExecutionToolRequirement.model_validate(
+                item.model_dump(mode="python", warnings=False)
+                if isinstance(item, ExecutionToolRequirement)
+                else item
+            )
+            for item in items
+        )
+
+    @model_validator(mode="after")
+    def validate_tool_requirements(self) -> Self:
+        identities = [(item.tool_name, item.requirement.name) for item in self.tool_requirements]
+        if identities != sorted(identities) or len(identities) != len(set(identities)):
+            raise ValueError(
+                "Tool requirements must be unique and sorted by tool and requirement name."
+            )
+        probes: dict[str, str] = {}
+        for item in self.tool_requirements:
+            for alternative in item.requirement.alternatives:
+                if isinstance(alternative, ToolExecutableRequirement):
+                    previous = probes.setdefault(alternative.executable, alternative.fingerprint)
+                    if previous != alternative.fingerprint:
+                        raise ValueError("Tool requirements have conflicting executable probes.")
+        if len(set(self.required_executables).union(probes)) > 64:
+            raise ValueError(
+                "Combined execution requirements cannot name more than 64 executables."
+            )
+        return self
 
     @field_validator("required_executables")
     @classmethod
@@ -472,6 +529,28 @@ class ExecutionRequirements(BaseModel):
             capabilities.append("reconnect")
         return tuple(capabilities)
 
+    def executable_probes(self) -> tuple[ToolExecutableRequirement, ...]:
+        """Return the deduplicated process probes required by executable alternatives."""
+
+        probes = {
+            alternative.executable: alternative
+            for item in self.tool_requirements
+            for alternative in item.requirement.alternatives
+            if isinstance(alternative, ToolExecutableRequirement)
+        }
+        return copy_tool_executable_probes(tuple(probes.values()))
+
+    def executable_names(self) -> tuple[str, ...]:
+        """Return bounded executable evidence inputs without turning OR clauses into AND."""
+
+        return tuple(
+            sorted(
+                set(self.required_executables).union(
+                    probe.executable for probe in self.executable_probes()
+                )
+            )
+        )
+
     def minimum_evidence_for(self, capability: str) -> MinimumExecutionEvidence:
         """Return the configured evidence minimum for one required capability."""
 
@@ -492,6 +571,8 @@ class ExecutionAdmissionRefusal(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     code: ExecutionAdmissionRefusalCode
+    tool_name: str | None = Field(default=None, max_length=512)
+    requirement_name: str | None = Field(default=None, max_length=96)
     capability: CapabilityIdentity | None = None
     executable: str | None = Field(default=None, max_length=4096)
     required_state: MinimumExecutionEvidence | None = None
@@ -600,7 +681,11 @@ def evaluate_execution_admission(
         raise ValueError("stage must be 'pre_create' or 'pre_exposure'.")
     required_capabilities = requirements.required_capabilities()
     if evidence is None:
-        if not required_capabilities and not requirements.required_executables:
+        if (
+            not required_capabilities
+            and not requirements.required_executables
+            and not requirements.tool_requirements
+        ):
             return ExecutionAdmissionDecision(
                 status="admitted",
                 stage=stage,
@@ -618,7 +703,7 @@ def evaluate_execution_admission(
     try:
         if isinstance(evidence, ExecutionCapabilityEvidence):
             validated_evidence = ExecutionCapabilityEvidence.model_validate(
-                evidence.model_dump(mode="python", by_alias=True)
+                evidence.model_dump(mode="python", by_alias=True, warnings=False)
             )
         elif isinstance(evidence, Mapping):
             validated_evidence = ExecutionCapabilityEvidence.model_validate(dict(evidence))
@@ -644,7 +729,11 @@ def evaluate_execution_admission(
             evidence=validated_evidence,
         )
 
-    if not required_capabilities and not requirements.required_executables:
+    if (
+        not required_capabilities
+        and not requirements.required_executables
+        and not requirements.tool_requirements
+    ):
         return ExecutionAdmissionDecision(
             status="admitted",
             stage=stage,
@@ -659,207 +748,89 @@ def evaluate_execution_admission(
         raise ValueError("Admission time must include a timezone.")
     refusals: list[ExecutionAdmissionRefusal] = []
     for capability in required_capabilities:
-        required_state: MinimumExecutionEvidence = (
-            "declared" if stage == "pre_create" else requirements.minimum_evidence_for(capability)
+        refusal = _capability_requirement_refusal(
+            capability=capability,
+            required_state=(
+                "declared"
+                if stage == "pre_create"
+                else requirements.minimum_evidence_for(capability)
+            ),
+            validated_evidence=validated_evidence,
+            checked_at=checked_at,
         )
-        claim = validated_evidence.claim_for(capability)
-        if claim is None:
-            refusals.append(
-                ExecutionAdmissionRefusal(
-                    code=(
-                        "unclaimed_evidence"
-                        if validated_evidence.unclaimed_reason_code is not None
-                        else "missing_capability"
-                    ),
-                    capability=capability,
-                    required_state=required_state,
-                    observed_state=(
-                        "unclaimed"
-                        if validated_evidence.unclaimed_reason_code is not None
-                        else "missing"
-                    ),
-                    reason_code=validated_evidence.unclaimed_reason_code,
-                )
-            )
-            continue
-        if claim.state == "unverified":
-            refusals.append(
-                _claim_refusal(
-                    claim,
-                    code="unverified_capability",
-                    required_state=required_state,
-                )
-            )
-            continue
-        if claim.state == "unsupported":
-            refusals.append(
-                _claim_refusal(
-                    claim,
-                    code="unsupported_capability",
-                    required_state=required_state,
-                )
-            )
-            continue
-        if (
-            claim.state == "live_verified"
-            and claim.observed_at is not None
-            and claim.observed_at > checked_at + _MAX_EVIDENCE_CLOCK_SKEW
-        ):
-            refusals.append(
-                _claim_refusal(
-                    claim,
-                    code="future_evidence",
-                    required_state=required_state,
-                )
-            )
-            continue
-        if (
-            claim.state == "live_verified"
-            and claim.valid_until is not None
-            and claim.valid_until <= checked_at
-        ):
-            refusals.append(
-                _claim_refusal(
-                    claim,
-                    code="stale_evidence",
-                    required_state=required_state,
-                    observed_state="stale",
-                )
-            )
-            continue
-        if (
-            claim.state == "live_verified"
-            and claim.valid_until is not None
-            and claim.observed_at is not None
-            and claim.valid_until - claim.observed_at > _MAX_LIVE_EVIDENCE_TTL
-        ):
-            refusals.append(
-                _claim_refusal(
-                    claim,
-                    code="overlong_evidence",
-                    required_state=required_state,
-                )
-            )
-            continue
-        if claim.state == "available" and claim.observation not in {
-            "available",
-            "supported",
-        }:
-            # Availability proves that an integration path exists; observations
-            # such as reachable or denied assert a concrete runtime condition
-            # and therefore require live-verified evidence. In particular,
-            # reachability cannot prove deny-by-default networking.
-            refusals.append(
-                _claim_refusal(
-                    claim,
-                    code="contradictory_evidence",
-                    required_state=required_state,
-                )
-            )
-            continue
-        required_observation = _REQUIRED_LIVE_OBSERVATIONS[capability]
-        if claim.state == "live_verified" and claim.observation != required_observation:
-            refusals.append(
-                _claim_refusal(
-                    claim,
-                    code="contradictory_evidence",
-                    required_state=required_state,
-                )
-            )
-            continue
-        if _POSITIVE_EVIDENCE_RANK[claim.state] < _POSITIVE_EVIDENCE_RANK[required_state]:
-            refusals.append(
-                _claim_refusal(
-                    claim,
-                    code="insufficient_evidence",
-                    required_state=required_state,
-                )
-            )
+        if refusal is not None:
+            refusals.append(refusal)
 
-    tool_evidence = validated_evidence.tool_requirements
     for executable in requirements.required_executables:
-        executable_claim = (
-            None if tool_evidence is None else tool_evidence.executable_for(executable)
+        refusal = _executable_requirement_refusal(
+            executable=executable,
+            stage=stage,
+            validated_evidence=validated_evidence,
+            checked_at=checked_at,
         )
-        required_state: MinimumExecutionEvidence = (
-            "declared" if stage == "pre_create" else "live_verified"
-        )
-        if executable_claim is None:
-            refusals.append(
-                ExecutionAdmissionRefusal(
-                    code="missing_capability",
-                    executable=executable,
-                    required_state=required_state,
-                    observed_state="missing",
+        if refusal is not None:
+            refusals.append(refusal)
+
+    for owned in requirements.tool_requirements:
+        alternatives: list[ExecutionAdmissionRefusal] = []
+        for alternative in owned.requirement.alternatives:
+            if isinstance(alternative, ToolExecutableRequirement):
+                refusal = _executable_requirement_refusal(
+                    executable=alternative.executable,
+                    stage=stage,
+                    validated_evidence=validated_evidence,
+                    checked_at=checked_at,
                 )
-            )
-            continue
-        if executable_claim.state == "unverified":
-            refusals.append(
-                ExecutionAdmissionRefusal(
-                    code="unverified_capability",
-                    executable=executable,
-                    required_state=required_state,
-                    observed_state="unverified",
-                    reason_code=executable_claim.reason_code,
-                    remediation_code=executable_claim.remediation_code,
+                executable_claim = (
+                    None
+                    if validated_evidence.tool_requirements is None
+                    else validated_evidence.tool_requirements.executable_for(alternative.executable)
                 )
-            )
-            continue
-        if executable_claim.state == "unavailable":
-            refusals.append(
-                ExecutionAdmissionRefusal(
-                    code="unsupported_capability",
-                    executable=executable,
-                    required_state=required_state,
-                    observed_state="unsupported",
-                    reason_code=executable_claim.reason_code,
-                    remediation_code=executable_claim.remediation_code,
-                )
-            )
-            continue
-        if stage == "pre_exposure" and executable_claim.state != "live_verified":
-            refusals.append(
-                ExecutionAdmissionRefusal(
-                    code="insufficient_evidence",
-                    executable=executable,
-                    required_state="live_verified",
-                    observed_state="declared",
-                )
-            )
-            continue
-        if executable_claim.state == "live_verified":
-            assert executable_claim.observed_at is not None
-            assert executable_claim.valid_until is not None
-            if executable_claim.observed_at > checked_at + _MAX_EVIDENCE_CLOCK_SKEW:
-                refusals.append(
-                    ExecutionAdmissionRefusal(
-                        code="future_evidence",
-                        executable=executable,
-                        required_state=required_state,
-                        observed_state="live_verified",
+                if refusal is None and (
+                    executable_claim is None
+                    or executable_claim.requirement_fingerprint != alternative.fingerprint
+                ):
+                    refusal = ExecutionAdmissionRefusal(
+                        code="evidence_candidate_mismatch",
+                        executable=alternative.executable,
+                        observed_state="mismatched",
                     )
+            else:
+                minimum = max(
+                    (
+                        alternative.minimum_evidence,
+                        requirements.minimum_evidence_for(alternative.capability),
+                    ),
+                    key=lambda state: _POSITIVE_EVIDENCE_RANK[state],
                 )
-                continue
-            if executable_claim.valid_until <= checked_at:
-                refusals.append(
-                    ExecutionAdmissionRefusal(
-                        code="stale_evidence",
-                        executable=executable,
-                        required_state=required_state,
-                        observed_state="stale",
+                refusal = _capability_requirement_refusal(
+                    capability=alternative.capability,
+                    required_state="declared" if stage == "pre_create" else minimum,
+                    validated_evidence=validated_evidence,
+                    checked_at=checked_at,
+                )
+                if (
+                    refusal is None
+                    and stage == "pre_exposure"
+                    and validated_evidence.environment_fingerprint is None
+                ):
+                    refusal = ExecutionAdmissionRefusal(
+                        code="evidence_candidate_mismatch",
+                        capability=alternative.capability,
+                        observed_state="mismatched",
                     )
+            if refusal is None:
+                break
+            alternatives.append(
+                refusal.model_copy(
+                    update={
+                        "tool_name": owned.tool_name,
+                        "requirement_name": owned.requirement.name,
+                    }
                 )
-                continue
-            if executable_claim.valid_until - executable_claim.observed_at > _MAX_LIVE_EVIDENCE_TTL:
-                refusals.append(
-                    ExecutionAdmissionRefusal(
-                        code="overlong_evidence",
-                        executable=executable,
-                        required_state=required_state,
-                        observed_state="live_verified",
-                    )
-                )
+            )
+        else:
+            refusals.extend(alternatives)
 
     return ExecutionAdmissionDecision(
         status="refused" if refusals else "admitted",
@@ -870,6 +841,222 @@ def evaluate_execution_admission(
         evidence=validated_evidence,
         refusals=tuple(refusals),
     )
+
+
+def _capability_requirement_refusal(
+    *,
+    capability: str,
+    required_state: MinimumExecutionEvidence,
+    validated_evidence: ExecutionCapabilityEvidence,
+    checked_at: datetime,
+) -> ExecutionAdmissionRefusal | None:
+    refusals: list[ExecutionAdmissionRefusal] = []
+    claim = validated_evidence.claim_for(capability)
+    if claim is None:
+        refusals.append(
+            ExecutionAdmissionRefusal(
+                code=(
+                    "unclaimed_evidence"
+                    if validated_evidence.unclaimed_reason_code is not None
+                    else "missing_capability"
+                ),
+                capability=capability,
+                required_state=required_state,
+                observed_state=(
+                    "unclaimed"
+                    if validated_evidence.unclaimed_reason_code is not None
+                    else "missing"
+                ),
+                reason_code=validated_evidence.unclaimed_reason_code,
+            )
+        )
+        return refusals[0]
+    if claim.state == "unverified":
+        refusals.append(
+            _claim_refusal(
+                claim,
+                code="unverified_capability",
+                required_state=required_state,
+            )
+        )
+        return refusals[0]
+    if claim.state == "unsupported":
+        refusals.append(
+            _claim_refusal(
+                claim,
+                code="unsupported_capability",
+                required_state=required_state,
+            )
+        )
+        return refusals[0]
+    if (
+        claim.state == "live_verified"
+        and claim.observed_at is not None
+        and claim.observed_at > checked_at + _MAX_EVIDENCE_CLOCK_SKEW
+    ):
+        refusals.append(
+            _claim_refusal(
+                claim,
+                code="future_evidence",
+                required_state=required_state,
+            )
+        )
+        return refusals[0]
+    if (
+        claim.state == "live_verified"
+        and claim.valid_until is not None
+        and claim.valid_until <= checked_at
+    ):
+        refusals.append(
+            _claim_refusal(
+                claim,
+                code="stale_evidence",
+                required_state=required_state,
+                observed_state="stale",
+            )
+        )
+        return refusals[0]
+    if (
+        claim.state == "live_verified"
+        and claim.valid_until is not None
+        and claim.observed_at is not None
+        and claim.valid_until - claim.observed_at > _MAX_LIVE_EVIDENCE_TTL
+    ):
+        refusals.append(
+            _claim_refusal(
+                claim,
+                code="overlong_evidence",
+                required_state=required_state,
+            )
+        )
+        return refusals[0]
+    if claim.state == "available" and claim.observation not in {
+        "available",
+        "supported",
+    }:
+        # Availability proves that an integration path exists; observations
+        # such as reachable or denied assert a concrete runtime condition
+        # and therefore require live-verified evidence. In particular,
+        # reachability cannot prove deny-by-default networking.
+        refusals.append(
+            _claim_refusal(
+                claim,
+                code="contradictory_evidence",
+                required_state=required_state,
+            )
+        )
+        return refusals[0]
+    required_observation = _REQUIRED_LIVE_OBSERVATIONS.get(capability, "supported")
+    if claim.state == "live_verified" and claim.observation != required_observation:
+        refusals.append(
+            _claim_refusal(
+                claim,
+                code="contradictory_evidence",
+                required_state=required_state,
+            )
+        )
+        return refusals[0]
+    if _POSITIVE_EVIDENCE_RANK[claim.state] < _POSITIVE_EVIDENCE_RANK[required_state]:
+        refusals.append(
+            _claim_refusal(
+                claim,
+                code="insufficient_evidence",
+                required_state=required_state,
+            )
+        )
+    return refusals[0] if refusals else None
+
+
+def _executable_requirement_refusal(
+    *,
+    executable: str,
+    stage: ExecutionAdmissionStage,
+    validated_evidence: ExecutionCapabilityEvidence,
+    checked_at: datetime,
+) -> ExecutionAdmissionRefusal | None:
+    tool_evidence = validated_evidence.tool_requirements
+    executable_claim = None if tool_evidence is None else tool_evidence.executable_for(executable)
+    required_state: MinimumExecutionEvidence = (
+        "declared" if stage == "pre_create" else "live_verified"
+    )
+    refusals: list[ExecutionAdmissionRefusal] = []
+    if executable_claim is None:
+        refusals.append(
+            ExecutionAdmissionRefusal(
+                code="missing_capability",
+                executable=executable,
+                required_state=required_state,
+                observed_state="missing",
+            )
+        )
+        return refusals[0]
+    if executable_claim.state == "unverified":
+        refusals.append(
+            ExecutionAdmissionRefusal(
+                code="unverified_capability",
+                executable=executable,
+                required_state=required_state,
+                observed_state="unverified",
+                reason_code=executable_claim.reason_code,
+                remediation_code=executable_claim.remediation_code,
+            )
+        )
+        return refusals[0]
+    if executable_claim.state == "unavailable":
+        refusals.append(
+            ExecutionAdmissionRefusal(
+                code="unsupported_capability",
+                executable=executable,
+                required_state=required_state,
+                observed_state="unsupported",
+                reason_code=executable_claim.reason_code,
+                remediation_code=executable_claim.remediation_code,
+            )
+        )
+        return refusals[0]
+    if stage == "pre_exposure" and executable_claim.state != "live_verified":
+        refusals.append(
+            ExecutionAdmissionRefusal(
+                code="insufficient_evidence",
+                executable=executable,
+                required_state="live_verified",
+                observed_state="declared",
+            )
+        )
+        return refusals[0]
+    if executable_claim.state == "live_verified":
+        assert executable_claim.observed_at is not None
+        assert executable_claim.valid_until is not None
+        if executable_claim.observed_at > checked_at + _MAX_EVIDENCE_CLOCK_SKEW:
+            refusals.append(
+                ExecutionAdmissionRefusal(
+                    code="future_evidence",
+                    executable=executable,
+                    required_state=required_state,
+                    observed_state="live_verified",
+                )
+            )
+            return refusals[0]
+        if executable_claim.valid_until <= checked_at:
+            refusals.append(
+                ExecutionAdmissionRefusal(
+                    code="stale_evidence",
+                    executable=executable,
+                    required_state=required_state,
+                    observed_state="stale",
+                )
+            )
+            return refusals[0]
+        if executable_claim.valid_until - executable_claim.observed_at > _MAX_LIVE_EVIDENCE_TTL:
+            refusals.append(
+                ExecutionAdmissionRefusal(
+                    code="overlong_evidence",
+                    executable=executable,
+                    required_state=required_state,
+                    observed_state="live_verified",
+                )
+            )
+    return refusals[0] if refusals else None
 
 
 def _claim_refusal(
@@ -921,7 +1108,16 @@ def _refused_for_each_requirement(
         )
         for executable in requirements.required_executables
     )
-    refusals = (*capability_refusals, *executable_refusals)
+    tool_refusals = tuple(
+        ExecutionAdmissionRefusal(
+            code=code,
+            observed_state=observed_state,
+            tool_name=item.tool_name,
+            requirement_name=item.requirement.name,
+        )
+        for item in requirements.tool_requirements
+    )
+    refusals = (*capability_refusals, *executable_refusals, *tool_refusals)
     if not refusals:
         refusals = (ExecutionAdmissionRefusal(code=code, observed_state=observed_state),)
     return ExecutionAdmissionDecision(

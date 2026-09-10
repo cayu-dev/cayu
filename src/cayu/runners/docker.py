@@ -9,7 +9,7 @@ import re
 import shlex
 import shutil
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import TYPE_CHECKING, BinaryIO, Literal, cast
@@ -21,8 +21,10 @@ from cayu._validation import (
     require_durable_clean_nonblank,
 )
 from cayu.capabilities import CapabilityDetail
+from cayu.core.tools import ToolExecutableRequirement, copy_tool_executable_probes
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.immutable_inputs import DockerImmutableInputMount
+from cayu.runners._admission_probes import EXECUTABLE_AVAILABILITY_SCRIPT
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -74,6 +76,7 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
     RunnerBinaryStreamCapability,
+    RunnerExecutionAdmissionObserver,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
     attach_cancellation_artifacts,
@@ -88,7 +91,10 @@ from cayu.runners.workloads import (
 )
 
 if TYPE_CHECKING:
-    from cayu.environments.admission import ExecutionEnvironmentAuthority
+    from cayu.environments.admission import (
+        ExecutionEnvironmentAuthority,
+        ExecutionToolRequirementEvidence,
+    )
 from cayu.vaults import (
     SecretEnv,
     SecretRedactor,
@@ -180,6 +186,7 @@ class _DockerRuntimeEvidence:
     immutable_input_mounts: tuple[tuple[str, str], ...]
     observed_at: datetime
     valid_until: datetime
+    executable_probes: tuple[ToolExecutableRequirement, ...] = ()
 
     @property
     def environment_fingerprint(self) -> str:
@@ -194,6 +201,7 @@ class _DockerRuntimeEvidence:
             "restrictions": self.restrictions.model_dump(mode="json"),
             "toolchain_profile_fingerprint": self.toolchain_profile_fingerprint,
             "required_executables": list(self.required_executables),
+            "executable_probes": [probe.fingerprint for probe in self.executable_probes],
             "immutable_input_mounts": [list(value) for value in self.immutable_input_mounts],
         }
         return (
@@ -603,6 +611,7 @@ async def _probe_strict_container(
     required_executables: tuple[str, ...],
     docker_cli_env_allowlist: Sequence[str],
     supervise_guest: bool = True,
+    executable_probes: tuple[ToolExecutableRequirement, ...] = (),
 ) -> tuple[tuple[str, bool], ...]:
     identity = await _run_docker_admission_probe(
         docker_path,
@@ -626,16 +635,57 @@ async def _probe_strict_container(
     )
     if home_probe.exit_code != 0 or home_probe.timed_out:
         raise DockerRuntimeConfigurationError("writable_home_unavailable")
+    return await _probe_container_executables(
+        docker_path,
+        container_id,
+        required_executables=required_executables,
+        executable_probes=executable_probes,
+        docker_cli_env_allowlist=docker_cli_env_allowlist,
+        supervise_guest=supervise_guest,
+    )
+
+
+async def _probe_container_executables(
+    docker_path: str,
+    container_id: str,
+    *,
+    required_executables: tuple[str, ...],
+    executable_probes: tuple[ToolExecutableRequirement, ...],
+    docker_cli_env_allowlist: Sequence[str],
+    supervise_guest: bool = True,
+    cwd: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[tuple[str, bool], ...]:
+    """Observe a typed executable plan through the shared guest probe owner."""
+
     availability: list[tuple[str, bool]] = []
+    probes = {probe.executable: probe for probe in executable_probes}
     for executable in required_executables:
+        probe = probes.get(executable)
         result = await _run_docker_admission_probe(
             docker_path,
             container_id,
-            script=f"command -v {shlex.quote(executable)} >/dev/null 2>&1",
+            script=(
+                EXECUTABLE_AVAILABILITY_SCRIPT
+                if probe is None or probe.probe_arguments is None
+                else "exec " + shlex.join((probe.executable, *probe.probe_arguments))
+            ),
+            argv=("cayu-admission", executable)
+            if probe is None or probe.probe_arguments is None
+            else (),
             docker_cli_env_allowlist=docker_cli_env_allowlist,
             supervise_guest=supervise_guest,
+            cwd=cwd,
+            environment=environment,
         )
-        availability.append((executable, result.exit_code == 0 and not result.timed_out))
+        availability.append(
+            (
+                executable,
+                result.exit_code in ((0,) if probe is None else probe.accepted_exit_codes)
+                and not result.timed_out
+                and not result.cancelled,
+            )
+        )
     return tuple(availability)
 
 
@@ -850,11 +900,14 @@ async def _run_docker(
     *,
     docker_cli_env_allowlist: Sequence[str] = (),
     timeout_s: int | None = None,
+    output_redactor: SecretRedactor | None = None,
 ) -> ExecResult:
     host_env = docker_cli_env(docker_cli_env_allowlist)
     allowlisted_redactor = SecretRedactor(
         tuple(value for name in docker_cli_env_allowlist if (value := host_env.get(name)))
     )
+    if output_redactor is not None:
+        allowlisted_redactor = allowlisted_redactor.merged_with(output_redactor)
     return await run_subprocess(
         SubprocessCommand(argv=[docker_path, *args]),
         env=host_env,
@@ -1052,6 +1105,31 @@ def _docker_probe_command_settled(
     )
 
 
+@dataclass(repr=False)
+class _DockerProbeSettlementState:
+    dispatched: bool = False
+    guest_quiescent: bool = False
+    env_file: str | None = None
+    env_file_identity: tuple[int, int] | None = None
+
+    def retain_env_file(self, path: str) -> None:
+        info = os.stat(path, follow_symlinks=False)
+        self.env_file = path
+        self.env_file_identity = (info.st_dev, info.st_ino)
+
+    def remove_env_file(self) -> None:
+        if self.env_file is not None:
+            with contextlib.suppress(FileNotFoundError):
+                info = os.stat(self.env_file, follow_symlinks=False)
+                if (info.st_dev, info.st_ino) != self.env_file_identity:
+                    raise DockerContainerOwnershipError(
+                        "Docker probe private file identity changed."
+                    )
+                os.unlink(self.env_file)
+            self.env_file = None
+            self.env_file_identity = None
+
+
 def _defer_docker_probe_settlement(
     *,
     container_id: str,
@@ -1059,21 +1137,23 @@ def _defer_docker_probe_settlement(
     handle: _DockerCommandHandle,
     acquisition: CreationLease,
     completion_token: str,
+    state: _DockerProbeSettlementState,
 ) -> asyncio.Task[None]:
     """Retain one exact container fence until a dispatched probe is quiescent."""
 
     from cayu.environments.factory import register_environment_factory_cleanup_retry
 
-    state = {"guest_quiescent": False}
-
-    async def settle() -> None:
-        if state["guest_quiescent"]:
+    async def settle_guest() -> None:
+        if state.guest_quiescent:
+            return
+        if command_task.done() and not state.dispatched:
+            state.guest_quiescent = True
             return
         if _docker_probe_command_settled(
             command_task,
             completion_token=completion_token,
         ):
-            state["guest_quiescent"] = True
+            state.guest_quiescent = True
             return
         cleanup = await cleanup_runner_command_with_diagnostic(
             handle,
@@ -1090,7 +1170,7 @@ def _defer_docker_probe_settlement(
                 command_task,
                 completion_token=completion_token,
             ):
-                state["guest_quiescent"] = True
+                state.guest_quiescent = True
                 return
             raise DockerContainerOwnershipError(
                 "Docker admission probe cleanup did not confirm guest quiescence."
@@ -1099,13 +1179,20 @@ def _defer_docker_probe_settlement(
         # waiter. If this settlement task is itself cancelled while consuming
         # that waiter, an exact retry must not discard the acknowledged fact
         # and attempt to rediscover it from an already-removed pid file.
-        state["guest_quiescent"] = True
+        state.guest_quiescent = True
         # Guest termination is positively acknowledged. Stop retaining the
         # now-irrelevant host CLI waiter and consume its terminal outcome.
         if not command_task.done():
             command_task.cancel()
         with contextlib.suppress(BaseException):
             await command_task
+
+    async def settle() -> None:
+        await settle_guest()
+        if not command_task.done():
+            raise DockerContainerOwnershipError("Docker admission probe CLI is not yet terminal.")
+        # Guest completion does not settle the private host credential file.
+        state.remove_env_file()
 
     task = asyncio.create_task(
         settle(),
@@ -1155,23 +1242,47 @@ async def _run_docker_admission_probe(
     user: str | None = None,
     docker_cli_env_allowlist: Sequence[str],
     supervise_guest: bool,
+    cwd: str | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> ExecResult:
     """Run a probe with guest supervision and exact retained settlement."""
 
     docker_args = ["exec"]
+    if cwd is not None:
+        docker_args.extend(("-w", _validate_guest_cwd(cwd)))
+    command_environment = copy_runner_env(dict(environment or {}), inherit_env=False)
+    environment = None
+    validate_runner_env_file_environment(command_environment)
+    probe_redactor = SecretRedactor(tuple(command_environment.values()))
+    state = _DockerProbeSettlementState()
+
+    async def dispatch(args: list[str]) -> ExecResult:
+        nonlocal command_environment
+        # The command task, not its cancellable caller, owns this file until
+        # the host CLI is terminal. Deferred guest settlement retains that task.
+        with runner_env_file(command_environment, retain_path=state.retain_env_file) as env_file:
+            command_environment = {}
+            if env_file is not None:
+                args = [args[0], "--env-file", env_file, *args[1:]]
+            state.dispatched = True
+            result = await _run_docker(
+                docker_path,
+                args,
+                docker_cli_env_allowlist=docker_cli_env_allowlist,
+                timeout_s=30,
+                output_redactor=probe_redactor,
+            )
+            if (
+                supervise_guest
+                and _docker_admission_probe_completion(result, completion_token=completion_token)
+                is not None
+            ):
+                state.guest_quiescent = True
+            return result
+
     if user is not None:
         docker_args.extend(("-u", user))
     docker_args.extend((container_id, "sh", "-c"))
-    if not supervise_guest:
-        return await _run_docker(
-            docker_path,
-            [*docker_args, script, *argv],
-            docker_cli_env_allowlist=docker_cli_env_allowlist,
-            timeout_s=30,
-        )
-
-    acquisition = acquire_creation_lease("docker", container_id)
-    pid_file = f"/tmp/.cayu-admission-probe-{uuid4().hex}.pid"
     completion_token = f"cayu-admission-probe-complete-{uuid4().hex}"
     probe_command = " ".join(shlex.quote(value) for value in ("sh", "-c", script, *argv))
     # The outer supervisor always exits successfully after recording the inner
@@ -1182,6 +1293,20 @@ async def _run_docker_admission_probe(
         f"printf '\\n%s:%s\\n' {shlex.quote(completion_token)} \"$status\" >&2; "
         "exit 0"
     )
+    if not supervise_guest:
+        # Creation owns whole-container rollback rather than command cleanup.
+        # That owner still needs positive guest completion: a nonzero CLI exit
+        # is not an authenticated probe status and must trigger its rollback.
+        result = await dispatch([*docker_args, command_script, *argv])
+        completed_result = _docker_admission_probe_completion(
+            result, completion_token=completion_token
+        )
+        if completed_result is None:
+            raise DockerRuntimeConfigurationError("admission_probe_completion_unverified")
+        return completed_result
+
+    acquisition = acquire_creation_lease("docker", container_id)
+    pid_file = f"/tmp/.cayu-admission-probe-{uuid4().hex}.pid"
     handle = _DockerCommandHandle(
         docker_path=docker_path,
         name=container_id,
@@ -1191,15 +1316,12 @@ async def _run_docker_admission_probe(
     )
     try:
         command_task = asyncio.create_task(
-            _run_docker(
-                docker_path,
+            dispatch(
                 [
                     *docker_args,
                     _supervised_command_script(command_script, pid_file),
                     *argv,
                 ],
-                docker_cli_env_allowlist=docker_cli_env_allowlist,
-                timeout_s=30,
             ),
             name=f"cayu-docker-admission-probe-{container_id[:12]}",
         )
@@ -1215,6 +1337,7 @@ async def _run_docker_admission_probe(
             handle=handle,
             acquisition=acquisition,
             completion_token=completion_token,
+            state=state,
         )
         current = asyncio.current_task()
         if current is not None and current.cancelling():
@@ -1225,6 +1348,10 @@ async def _run_docker_admission_probe(
         raise error from cancellation
     except BaseException as error:
         if runner_failure_fields(error).get("execution_phase") == "launch":
+            state.guest_quiescent = True
+        if (
+            not state.dispatched or runner_failure_fields(error).get("execution_phase") == "launch"
+        ) and state.env_file is None:
             acquisition.release()
             raise
         settlement = _defer_docker_probe_settlement(
@@ -1233,6 +1360,7 @@ async def _run_docker_admission_probe(
             handle=handle,
             acquisition=acquisition,
             completion_token=completion_token,
+            state=state,
         )
         _attach_docker_probe_settlement(error, settlement)
         raise
@@ -1244,6 +1372,7 @@ async def _run_docker_admission_probe(
             handle=handle,
             acquisition=acquisition,
             completion_token=completion_token,
+            state=state,
         )
         _attach_docker_probe_settlement(error, settlement)
         raise error
@@ -1259,11 +1388,219 @@ async def _run_docker_admission_probe(
             handle=handle,
             acquisition=acquisition,
             completion_token=completion_token,
+            state=state,
         )
         _attach_docker_probe_settlement(error, settlement)
         raise error
     acquisition.release()
     return completed_result
+
+
+@dataclass(repr=False)
+class _DockerToolAdmissionState:
+    executable_evidence: ExecutionToolRequirementEvidence | None = None
+    signature: object = None
+
+
+@dataclass(frozen=True, repr=False)
+class _DockerToolAdmissionObserver(RunnerExecutionAdmissionObserver):
+    runner: DockerRunner
+    state: _DockerToolAdmissionState = field(default_factory=_DockerToolAdmissionState)
+
+    @staticmethod
+    def _capability_identity(base):
+        return (
+            base.schema_version,
+            base.subject,
+            base.environment_fingerprint,
+            base.image_fingerprint,
+            base.toolchain_profile_fingerprint,
+        )
+
+    def _signature(self, base):
+        secret_refs, resolver = normalize_runner_secret_env(
+            self.runner.secret_env,
+            self.runner.secret_resolver,
+            credential_mode=self.runner.credential_mode,
+            allow_raw_secret_env=self.runner._allow_raw_secret_env,
+        )
+        return (
+            self._capability_identity(base),
+            self.runner.container_id,
+            self.runner.image,
+            self.runner.default_cwd,
+            self.runner.docker_path,
+            tuple(self.runner.docker_cli_env_allowlist),
+            tuple(sorted(docker_cli_env(self.runner.docker_cli_env_allowlist).items())),
+            tuple(copy_runner_env(self.runner.env_overlay, inherit_env=False).items()),
+            canonical_durable_json_bytes(
+                {
+                    name: ref.model_dump(mode="json", warnings=False)
+                    for name, ref in secret_refs.items()
+                },
+                "docker_probe_secret_references",
+            ),
+            id(resolver),
+            self.runner.credential_mode,
+            self.runner._allow_raw_secret_env,
+            self.runner._env_overlay_secret_values_present,
+        )
+
+    def _candidate(self, base, image_id=None, executables=()):
+        from cayu.environments.admission import (
+            ExecutionAdmissionCandidate,
+            ExecutionCapabilityEvidence,
+            ExecutionToolRequirementEvidence,
+        )
+
+        fingerprint = (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "capability_identity": list(self._capability_identity(base)),
+                        "container_id": self.runner.container_id,
+                        "image_id": image_id,
+                        "root": self.runner.default_cwd,
+                    },
+                    "docker_tool_observation",
+                )
+            ).hexdigest()
+        )
+        return ExecutionAdmissionCandidate(
+            candidate="docker",
+            evidence=ExecutionCapabilityEvidence.model_validate(
+                {
+                    **base.model_dump(mode="python", warnings=False),
+                    "environment_fingerprint": fingerprint,
+                    "image_fingerprint": image_id,
+                    "tool_requirements": ExecutionToolRequirementEvidence(
+                        environment_fingerprint=fingerprint,
+                        image_fingerprint=image_id,
+                        executables=executables,
+                    ),
+                }
+            ),
+        )
+
+    def snapshot(self):
+        self.runner._ensure_exec_open()
+        if self.runner.container_id is not None:
+            require_creation_cleanup_settled("docker", self.runner.container_id)
+        base = self.runner.execution_capability_evidence()
+        if self.state.executable_evidence is not None:
+            if self._signature(base) != self.state.signature:
+                return None
+            # Only executable observations are cached. Current capability
+            # evidence may withdraw support without changing runtime identity.
+            return self._candidate(
+                base,
+                image_id=self.state.executable_evidence.image_fingerprint,
+                executables=self.state.executable_evidence.executables,
+            )
+        from cayu.environments.admission import ExecutionExecutableEvidence
+
+        probes = {probe.executable: probe for probe in self.requirements.executable_probes()}
+        return self._candidate(
+            base,
+            executables=tuple(
+                ExecutionExecutableEvidence(
+                    executable=name,
+                    state="declared",
+                    requirement_fingerprint=probes[name].fingerprint if name in probes else None,
+                )
+                for name in self.requirements.executable_names()
+            ),
+        )
+
+    async def collect(self):
+        from cayu.environments.admission import ExecutionExecutableEvidence
+
+        self.runner._ensure_exec_open()
+        container_id = self.runner.container_id
+        if container_id is None:
+            raise DockerRuntimeConfigurationError("container_identity_missing")
+        require_creation_cleanup_settled("docker", container_id)
+        signature = self._signature(self.runner.execution_capability_evidence())
+        observed_at = datetime.now(UTC)
+        secret_refs, resolver = normalize_runner_secret_env(
+            self.runner.secret_env,
+            self.runner.secret_resolver,
+            credential_mode=self.runner.credential_mode,
+            allow_raw_secret_env=self.runner._allow_raw_secret_env,
+        )
+        environment = copy_runner_env(self.runner.env_overlay, inherit_env=False)
+        validate_runner_env_file_environment(environment)
+        validate_runner_env_file_environment(dict.fromkeys(secret_refs, ""))
+        # This is the same read-only resolution and overlay precedence as exec.
+        # Resolve before dispatching any guest work, and never publish values or
+        # their digests as admission identity.
+        resolved = (
+            await resolve_secret_env(secret_refs, resolver) if secret_refs and resolver else {}
+        )
+        resolved_environment = merge_secret_env_values({}, resolved)
+        resolved_environment.update(environment)
+        environment = resolved_environment
+        resolved = {}
+        resolved_environment = {}
+
+        async def inspect_identity():
+            inspection = await _inspect_strict_container(
+                self.runner.docker_path,
+                container_id,
+                docker_cli_env_allowlist=self.runner.docker_cli_env_allowlist,
+            )
+            image_id = inspection.get("Image")
+            state = _require_mapping(inspection.get("State"), "container_state_unverified")
+            if (
+                inspection.get("Id") != container_id
+                or type(image_id) is not str
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+                or state.get("Running") is not True
+            ):
+                raise DockerRuntimeConfigurationError("container_identity_unverified")
+            return image_id
+
+        image_id = await inspect_identity()
+        probes = {probe.executable: probe for probe in self.requirements.executable_probes()}
+        availability = await _probe_container_executables(
+            self.runner.docker_path,
+            container_id,
+            required_executables=self.requirements.executable_names(),
+            executable_probes=tuple(probes.values()),
+            docker_cli_env_allowlist=self.runner.docker_cli_env_allowlist,
+            cwd=self.runner.default_cwd,
+            environment=environment,
+        )
+        final_image_id = await inspect_identity()
+        # Use one final capability snapshot for both validation and composition;
+        # a later reread could label the probes with a different native identity.
+        base = self.runner.execution_capability_evidence()
+        if final_image_id != image_id or self._signature(base) != signature:
+            raise DockerRuntimeConfigurationError("container_identity_drift")
+        candidate = self._candidate(
+            base,
+            image_id=image_id,
+            executables=tuple(
+                ExecutionExecutableEvidence(
+                    executable=name,
+                    state="live_verified" if available else "unavailable",
+                    observed_at=observed_at if available else None,
+                    valid_until=observed_at + timedelta(seconds=300) if available else None,
+                    requirement_fingerprint=probes[name].fingerprint if name in probes else None,
+                    reason_code=None if available else "executable_unavailable",
+                    remediation_code=None if available else "install_executable",
+                )
+                for name, available in availability
+            ),
+        )
+        self.state.signature = signature
+        assert candidate.evidence is not None
+        self.state.executable_evidence = candidate.evidence.tool_requirements
+        return candidate
+
+    async def refresh(self):
+        await self.collect()
 
 
 class DockerRunner(Runner, RunnerBinaryStreamCapability):
@@ -1552,6 +1889,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         image_identity: DockerImageIdentity | None = None,
         workload_restrictions: DockerWorkloadRestrictions | None = None,
         required_executables: Sequence[str] = (),
+        executable_probes: Sequence[ToolExecutableRequirement] = (),
         toolchain_profile_fingerprint: str | None = None,
         immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
         allocation_identity: str | None = None,
@@ -1619,7 +1957,16 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             raise ValueError(
                 "Immutable input mounts require strict evidence-bearing Docker creation."
             )
-        executable_requirements = _normalize_required_executables(required_executables)
+        owned_probes = copy_tool_executable_probes(executable_probes)
+        executable_requirements = _normalize_required_executables(
+            tuple(
+                sorted(
+                    set(_normalize_required_executables(required_executables)).union(
+                        probe.executable for probe in owned_probes
+                    )
+                )
+            )
+        )
         if toolchain_profile_fingerprint is not None and (
             type(toolchain_profile_fingerprint) is not str
             or re.fullmatch(r"sha256:[0-9a-f]{64}", toolchain_profile_fingerprint) is None
@@ -1840,6 +2187,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 assert owned_container_id is not None
                 assert owned_image_identity is not None
                 assert owned_restrictions is not None
+                observed_at = datetime.now(UTC)
                 inspection = await _inspect_strict_container(
                     docker,
                     owned_container_id,
@@ -1867,10 +2215,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     owned_container_id,
                     restrictions=owned_restrictions,
                     required_executables=executable_requirements,
+                    executable_probes=owned_probes,
                     docker_cli_env_allowlist=docker_cli_allowlist,
                     supervise_guest=False,
                 )
-                observed_at = datetime.now(UTC)
                 runtime_evidence = _DockerRuntimeEvidence(
                     container_id=owned_container_id,
                     image_id=image_id,
@@ -1883,6 +2231,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     image_identity=owned_image_identity,
                     toolchain_profile_fingerprint=toolchain_profile_fingerprint,
                     required_executables=executable_requirements,
+                    executable_probes=owned_probes,
                     executable_availability=executable_availability,
                     immutable_input_mounts=tuple(
                         (mount.projection_fingerprint, mount.target_path)
@@ -1953,6 +2302,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         seccomp_profile: str | None = None,
         docker_path: str | None = None,
         required_executables: Sequence[str] = (),
+        executable_probes: Sequence[ToolExecutableRequirement] = (),
         toolchain_profile_fingerprint: str | None = None,
         immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
         _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
@@ -1987,7 +2337,16 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             immutable_input_mounts,
             restrictions=owned_restrictions,
         )
-        executable_requirements = _normalize_required_executables(required_executables)
+        owned_probes = copy_tool_executable_probes(executable_probes)
+        executable_requirements = _normalize_required_executables(
+            tuple(
+                sorted(
+                    set(_normalize_required_executables(required_executables)).union(
+                        probe.executable for probe in owned_probes
+                    )
+                )
+            )
+        )
         if toolchain_profile_fingerprint is not None and (
             type(toolchain_profile_fingerprint) is not str
             or re.fullmatch(r"sha256:[0-9a-f]{64}", toolchain_profile_fingerprint) is None
@@ -1997,6 +2356,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             )
         docker = _require_docker(docker_path)
         require_creation_cleanup_settled("docker", container_id)
+        observed_at = datetime.now(UTC)
         inspection = await _inspect_strict_container(
             docker,
             container_id,
@@ -2023,9 +2383,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             container_id,
             restrictions=owned_restrictions,
             required_executables=executable_requirements,
+            executable_probes=owned_probes,
             docker_cli_env_allowlist=(),
         )
-        observed_at = datetime.now(UTC)
         runtime_evidence = _DockerRuntimeEvidence(
             container_id=container_id,
             image_id=image_id,
@@ -2038,6 +2398,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             image_identity=owned_image_identity,
             toolchain_profile_fingerprint=toolchain_profile_fingerprint,
             required_executables=executable_requirements,
+            executable_probes=owned_probes,
             executable_availability=executable_availability,
             immutable_input_mounts=tuple(
                 (mount.projection_fingerprint, mount.target_path) for mount in immutable_mounts
@@ -2113,6 +2474,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 evidence.container_id,
                 restrictions=evidence.restrictions,
                 required_executables=evidence.required_executables,
+                executable_probes=evidence.executable_probes,
                 docker_cli_env_allowlist=self.docker_cli_env_allowlist,
             )
             self._ensure_exec_open()
@@ -2166,6 +2528,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             container_id,
             restrictions=evidence.restrictions,
             required_executables=evidence.required_executables,
+            executable_probes=evidence.executable_probes,
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         self._runtime_evidence = replace(
@@ -2328,12 +2691,16 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             ),
         )
         executable_availability = dict(evidence.executable_availability)
+        probe_fingerprints = {
+            probe.executable: probe.fingerprint for probe in evidence.executable_probes
+        }
         tool_requirements = ExecutionToolRequirementEvidence(
             environment_fingerprint=evidence.environment_fingerprint,
             image_fingerprint=evidence.image_fingerprint,
             executables=tuple(
                 ExecutionExecutableEvidence(
                     executable=executable,
+                    requirement_fingerprint=probe_fingerprints.get(executable),
                     state=(
                         "live_verified" if executable_availability[executable] else "unavailable"
                     ),
@@ -2414,6 +2781,16 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             candidate="docker",
             evidence=self.execution_capability_evidence(),
         )
+
+    def execution_admission_observer(self, requirements):
+        if self._runtime_evidence is not None or not requirements.executable_names():
+            return super().execution_admission_observer(requirements)
+        return _DockerToolAdmissionObserver(self, requirements)
+
+    def execution_admission_candidate_for(self, requirements):
+        if self._runtime_evidence is not None or not requirements.executable_names():
+            return self.execution_admission_candidate()
+        return _DockerToolAdmissionObserver(self, requirements).snapshot()
 
     def workload_authority(self, name: str):
         """Declare a shipped workload only for its exact selected image."""
